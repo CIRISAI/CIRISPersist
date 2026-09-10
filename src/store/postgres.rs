@@ -12904,10 +12904,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             let community_tier =
                 floor.tier() == crate::federation::types::cohort_scope::CryptoTier::CommunityDek;
             if community_tier {
+                // #833 — an evicted binding is an eviction RECORD, not a
+                // bound row; the announcement treats it as absent.
                 let bound = tx
                     .query_opt(
                         "SELECT community_key_id FROM cirislens.federation_community_blob_epoch \
-                          WHERE at_rest_sha256 = $1",
+                          WHERE at_rest_sha256 = $1 AND evicted_at IS NULL",
                         &[&sha_vec],
                     )
                     .await
@@ -12924,7 +12926,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 .query_one(
                     "SELECT (EXISTS(SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) \
                         AND ($2 OR EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                           WHERE at_rest_sha256 = $1))) AS h",
+                                           WHERE at_rest_sha256 = $1 AND evicted_at IS NULL))) AS h",
                     &[&sha_vec, &(!community_tier)],
                 )
                 .await
@@ -13597,7 +13599,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     AND epoch <> COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch WHERE community_key_id = $1), 0) \
                     AND NOT EXISTS ( \
                         SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                         WHERE community_key_id = $1 AND epoch = $2)",
+                         WHERE community_key_id = $1 AND epoch = $2 \
+                           AND evicted_at IS NULL)",
                 &[&community_key_id, &ep],
             )
             .await
@@ -13676,10 +13679,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         // Served by V138's federation_community_blob_epoch_by_community_epoch.
+        // #833 (I31) — a binding the sweep kept as an eviction record is not
+        // an object; only live bindings hold the count above zero.
         let row = client
             .query_one(
                 "SELECT COUNT(*)::bigint AS n FROM cirislens.federation_community_blob_epoch \
-                 WHERE community_key_id = $1 AND epoch = $2",
+                 WHERE community_key_id = $1 AND epoch = $2 AND evicted_at IS NULL",
                 &[&community_key_id, &ep],
             )
             .await
@@ -13823,10 +13828,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        // #833 — LIVE bindings only: an already-evicted binding is a record,
+        // not an object, and a re-run must not re-stamp it.
         let rows = client
             .query(
                 "SELECT at_rest_sha256 FROM cirislens.federation_community_blob_epoch \
-                  WHERE community_key_id = $1 AND epoch = $2",
+                  WHERE community_key_id = $1 AND epoch = $2 AND evicted_at IS NULL",
                 &[&community_key_id, &ep],
             )
             .await
@@ -13893,19 +13900,32 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch tx: {e}")))?;
         lock_community_tx(&tx, community_key_id).await?;
+        // #833 (§11.5, I31) — the bytes and the at-rest grants go; THE
+        // BINDING STAYS, stamped `evicted_at`, so a later read can say
+        // "swept under epoch N" rather than "never ours". Every statement is
+        // scoped to LIVE bindings, so a re-run evicts nothing and never
+        // re-stamps. See the SQLite twin.
+        tx.execute(
+            "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 IN ( \
+                SELECT at_rest_sha256 FROM cirislens.federation_community_blob_epoch \
+                 WHERE community_key_id = $1 AND epoch = $2 AND evicted_at IS NULL)",
+            &[&community_key_id, &ep],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch grants: {e}")))?;
         tx.execute(
             "DELETE FROM cirislens.federation_blobs WHERE sha256 IN ( \
                 SELECT at_rest_sha256 FROM cirislens.federation_community_blob_epoch \
-                 WHERE community_key_id = $1 AND epoch = $2)",
+                 WHERE community_key_id = $1 AND epoch = $2 AND evicted_at IS NULL)",
             &[&community_key_id, &ep],
         )
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("evict epoch blobs: {e}")))?;
         let n = tx
             .execute(
-                "DELETE FROM cirislens.federation_community_blob_epoch \
-                  WHERE community_key_id = $1 AND epoch = $2",
-                &[&community_key_id, &ep],
+                "UPDATE cirislens.federation_community_blob_epoch SET evicted_at = $3 \
+                  WHERE community_key_id = $1 AND epoch = $2 AND evicted_at IS NULL",
+                &[&community_key_id, &ep, &now],
             )
             .await
             .map_err(|e| {
@@ -13915,6 +13935,43 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::BlobError::Backend(format!("evict epoch commit: {e}"))
         })?;
         Ok(n)
+    }
+
+    async fn community_dek_blob_binding(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobEpochBinding>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        let row = client
+            .query_opt(
+                "SELECT community_key_id, epoch, evicted_at \
+                   FROM cirislens.federation_community_blob_epoch \
+                  WHERE at_rest_sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_blob_binding: {e}"))
+            })?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let community_key_id: String =
+            r.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
+        let epoch: i64 = r.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+        let evicted_at = r.safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
+            "evicted_at",
+            crate::federation::BlobError::Backend,
+        )?;
+        Ok(Some(crate::federation::BlobEpochBinding {
+            community_key_id,
+            epoch: u64::try_from(epoch).unwrap_or(0),
+            evicted_at,
+        }))
     }
 
     async fn community_dek_blob_epoch(
@@ -24198,6 +24255,19 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg{}", uuid_like());
         crate::federation::at_rest_cascade::blob_invariants::exercise_i28_announce_refuses_an_evicted_row(&backend, &tag).await;
+    }
+
+    /// §11.10 I31 (#833) — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i31_eviction_is_a_fact_a_reader_is_told_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i31_eviction_is_a_fact_a_reader_is_told(&backend, &tag).await;
     }
 
     /// §11.10 I27 — **one serialization boundary per community, measured by

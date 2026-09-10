@@ -1416,6 +1416,47 @@ lets a caller name one, resolved through `select_signer`) is that key's holder's
 to retract; this node cannot sign a `withdraws` for it and does not pretend to.
 Invariant I9 asserts the own-key case, which is the production shape.
 
+**Eviction is a fact a reader is told; deletion is not (#833).** After a
+retention sweep the first v43 shape reported an evicted community blob as
+"carries no community-DEK binding" — indistinguishable from a sha that was
+never ours, because I19 deletes a blob's satellites with it. The binding was
+deleted for a good reason (a binding that outlives its blob held the epoch's
+object count above zero and made its DEK undestroyable), and a per-blob
+tombstone is unbounded growth, which is what eviction exists to prevent.
+The bounded shape: **the sweep's eviction deletes the blob row and its
+at-rest grants but KEEPS `federation_community_blob_epoch`, stamping
+`evicted_at` (V140, nullable, both dialects)** with the instant the sweep
+was given. `community_dek_epoch_object_count` counts only bindings with
+`evicted_at IS NULL`, so the destroy precondition and I19 are unchanged —
+`delete_blob`, the generic floor, still removes the binding, because only
+the sweep is a *policy* action a reader should be told about. The
+announcement floor (I28) treats an evicted binding as absent. A second
+sweep of the same epoch finds nothing live and evicts nothing, so the
+stamp is written once. Cost: one small row per blob that once existed
+under a community epoch — bounded by the corpus that was.
+
+The read door then has a third answer for a row-less sha, and its position
+in §11.3's order is the guarantee: **after** authorization. A row-less sha
+with a binding is authorized exactly as a live community blob would be —
+by the viewer's grant on the binding's `(community, epoch)` — **or** by the
+viewer being an active occurrence of a member on the community's current
+roster (the set the next emission would wrap to). The second leg is
+load-bearing, not a convenience: the sweep destroys an epoch in the same
+pass that evicts it, and destroy deletes every member-grant row (I5), so
+by the time a member asks, the epoch's own grants are gone; a door that
+authorized by the epoch grant alone would refuse every member `NotGranted`
+and the feature would be reachable only from a test that evicts without
+destroying. A viewer that passes neither leg — a stranger, or a removed
+member whose old grants the destroy erased — gets `NotGranted`, naming only
+the sha and the viewer (I4b holds: the refusal class to a non-grantee does
+not disclose the binding, and it is the same class a stranger gets on a
+live blob). Only an authorized viewer reaches
+`BlobError::Evicted { community_key_id, epoch, evicted_at }`, which names
+the epoch's retention as the reason. A row-less sha with a live binding
+(`evicted_at` NULL) is the state I19 forbids and is reported as `NotHeld`,
+never as evicted; a row-less sha with no binding is `NotHeld` as before —
+"never ours" and "swept" are now different answers.
+
 ### 11.6 The lifecycle is on every consumer surface
 
 `Engine::community_dek_set_key_state`, `Engine::sweep_community_epochs`,
@@ -1504,6 +1545,7 @@ returns the error and the next call derives again (I29).
 | I28 | The community announcement emits only for an existing, bound row; evicted between bind and announce ⇒ `NotHeld`, no row re-inserted. | a bindingless ciphertext row after a raced sweep | C3-2 |
 | I29 | The hardware-master cache stores only a successful derivation; a transient failure is retried on the next call. | one failed derivation at boot ⇒ corpus unavailable until restart | C3-3 |
 | I30 | The retention policy is settable from the Engine and Python, and the Python sweep report carries every `SweepReport` field. | a Python sweep that can never evict; `failed` dropped | C3-4, C3-5 |
+| I31 | The retention sweep keeps the epoch binding and stamps `evicted_at`; the object count ignores evicted bindings; an authorized viewer (epoch grantee or current roster occurrence) reading an evicted sha gets `Evicted{community, epoch, evicted_at}`, a stranger gets `NotGranted`, an unknown sha gets `NotHeld`, and destroy after the sweep still succeeds. | a member's read after a sweep is `NotHeld` ("never ours"); a stranger's read names the epoch; an evicted binding blocks destroy | #833 |
 
 Every one of these is written **before** the corresponding fix and confirmed
 red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
@@ -1524,6 +1566,28 @@ that names the community to lock, and the existence check under that lock —
 and each alone refuses the evicted case, so removing either survives; the
 pair removed together turns I28 red, which is the evidence recorded. A test that is green on
 the code it was written to catch is a report.
+
+**I31 (#833)** was written first and confirmed red on v43.0.0 (`170cc89`),
+failing at its first structural assertion: the sweep deleted the binding.
+Mutation evidence, every restore `cmp`-verified: removing `evicted_at IS
+NULL` from the object count turns I31, I5 and I6 red (sqlite) and I31 and
+I5 red (postgres); removing it from the destroy statement's own `NOT
+EXISTS` predicate turns I31, I5, I6 and I9 red (sqlite) and I31 and I5 red
+(postgres) — that third site was found by the EXISTING witnesses when the
+first two were changed alone, which is what they are for; making the sweep
+delete the binding instead of stamping it turns I31 red on both backends;
+removing the read door's authorization hands a stranger `Evicted` naming the
+community and epoch (I31 red); removing the roster leg refuses a current
+member `NotGranted` after the production sweep (I31 red); removing the grant
+leg refuses a removed member who still holds the epoch grant (I31 red). Two
+edits survive and are recorded rather than dressed up as guards: the
+`evicted_at IS NULL` filter on the sweep's object SELECT (the UPDATE's own
+predicate is the guard; the filter only spares the retraction scan) and the
+same filter on the announcement's binding check (the row-existence check
+refuses an evicted sha alone; the filter is belt to those braces). A
+row-less sha with a LIVE binding — the `None => NotHeld` arm — is the state
+I19 forbids and cannot be constructed through a door, so that arm is
+untested and said so here.
 
 **C2 = the second Codex review (2026-09-09, of `30fde79`).** Nine findings,
 all verified real, six root causes: the row stored the tier's INPUT not the

@@ -1651,10 +1651,28 @@ pub trait BlobStorage: Send + Sync {
     /// v9.0.0 G5 — the `(community_key_id, epoch)` a sealed blob belongs
     /// to, or `None` if the blob carries no community-DEK binding (a
     /// self/family or plaintext blob).
+    ///
+    /// #833 — the binding is a fact about the BYTES (which DEK sealed
+    /// them), so this answers for an evicted binding too; use
+    /// [`community_dek_blob_binding`](Self::community_dek_blob_binding)
+    /// when the eviction stamp matters.
     fn community_dek_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Option<(String, u64)>, BlobError>> + Send;
+
+    /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — the full epoch
+    /// binding row for a sha, eviction stamp included, or `None` if the sha
+    /// was never bound (or its blob was deleted by the generic floor, which
+    /// removes the binding outright).
+    ///
+    /// The read door's answer for a ROW-LESS sha: a binding with
+    /// `evicted_at` set is "swept under this epoch's retention"; no binding
+    /// is "never ours". Told only after authorization.
+    fn community_dek_blob_binding(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<BlobEpochBinding>, BlobError>> + Send;
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10.5) — the lifecycle
     /// state of one `(community, epoch)` DEK.
     ///
@@ -1684,7 +1702,9 @@ pub trait BlobStorage: Send + Sync {
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v43.0.0 (§10.5, §10.9) — how many objects are still sealed under
-    /// `(community, epoch)`.
+    /// `(community, epoch)` **on this node** — bindings whose `evicted_at`
+    /// is NULL. A binding the retention sweep kept as an eviction record
+    /// (#833) is not an object and does not block destroy.
     ///
     /// The DESTROY precondition, and the reason V138 adds
     /// `federation_community_blob_epoch_by_community_epoch`: before that
@@ -1718,9 +1738,13 @@ pub trait BlobStorage: Send + Sync {
     /// tombstone plane, not this call. A caller that treats this as erasure
     /// across the mesh is wrong in a way that matters.
     ///
-    /// Ordering is load-bearing: the bytes and the binding go together, so a
-    /// later `community_dek_epoch_object_count` returns 0 and the DESTROY
-    /// precondition can be satisfied honestly rather than by a stale index.
+    /// #833 (§11.5, I31) — the bytes and the at-rest grants go; **the
+    /// binding stays**, stamped `evicted_at = now`, so a later read can say
+    /// "swept under epoch N" rather than "never ours".
+    /// `community_dek_epoch_object_count` ignores stamped bindings, so the
+    /// DESTROY precondition is satisfied honestly. Only LIVE bindings are
+    /// evicted and counted in the return value: a second run over the same
+    /// epoch returns 0 and never re-stamps.
     fn community_dek_evict_epoch_objects(
         &self,
         community_key_id: &str,
@@ -1916,6 +1940,20 @@ pub struct PutBlobAttestation {
     pub asserted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — one
+/// `federation_community_blob_epoch` row: which `(community, epoch)` DEK
+/// sealed a blob, and whether the retention sweep has evicted the local
+/// copy. `evicted_at` is `None` while the blob row exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobEpochBinding {
+    /// The community whose DEK sealed the bytes.
+    pub community_key_id: String,
+    /// The epoch of that DEK.
+    pub epoch: u64,
+    /// When the retention sweep deleted the local copy; `None` = live.
+    pub evicted_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// v2.3 (CIRISPersist#103) — typed errors from the [`BlobStorage`] trait.
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
@@ -2087,6 +2125,33 @@ pub enum BlobError {
         /// The epoch the writer sealed under.
         epoch: u64,
     },
+
+    /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — the bytes were
+    /// EVICTED by the community's retention sweep. The sha was ours, sealed
+    /// under `(community_key_id, epoch)`, and the sweep deleted the local
+    /// copy at `evicted_at` because the epoch fell outside
+    /// `retain_past_epochs`. Distinct from [`Self::NotHeld`] ("never ours",
+    /// or gone by a non-policy path) so an operator can tell "swept" from
+    /// "wrong handle".
+    ///
+    /// Reachable only AFTER authorization: the viewer holds a grant on the
+    /// epoch, or is an active occurrence of a current roster member. A
+    /// stranger gets [`Self::NotGranted`], which names neither the community
+    /// nor the epoch (I4b).
+    #[error(
+        "blob {sha256_hex} was evicted at {evicted_at} by the retention sweep of community \
+         {community_key_id:?} epoch {epoch} (BLOB_ENCRYPTION_AT_REST.md §11.5)"
+    )]
+    Evicted {
+        /// Hex-encoded at-rest SHA-256 the read targeted.
+        sha256_hex: String,
+        /// The community whose retention policy evicted it.
+        community_key_id: String,
+        /// The epoch the bytes were sealed under.
+        epoch: u64,
+        /// When the sweep evicted the local copy.
+        evicted_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -2110,6 +2175,7 @@ impl BlobError {
             BlobError::DiskPressureProxyRefused { .. } => "blob_disk_pressure_proxy_refused",
             BlobError::QuarantineWithheld { .. } => "blob_quarantine_withheld",
             BlobError::EpochNotCurrent { .. } => "blob_epoch_not_current",
+            BlobError::Evicted { .. } => "blob_evicted",
             BlobError::Backend(_) => "blob_backend",
         }
     }

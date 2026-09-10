@@ -5217,6 +5217,9 @@ impl Engine {
     /// - [`BlobError::NotGranted`] — the viewer holds no grant on that epoch.
     /// - [`BlobError::InvalidArgument`] — the blob carries no community-DEK
     ///   binding, i.e. it is not a community blob.
+    /// - [`BlobError::Evicted`] (#833) — the retention sweep deleted the
+    ///   local copy; told only to a viewer the binding authorizes (an epoch
+    ///   grantee, or an active occurrence on the current roster).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn read_blob_for_community_viewer(
         &self,

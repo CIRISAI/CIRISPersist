@@ -1462,33 +1462,64 @@ pub mod orchestrate {
     /// # Errors
     ///
     /// Propagated from the path taken — [`BlobError::NotHeld`] if absent,
-    /// [`BlobError::NotGranted`] if the viewer holds no grant, and the
-    /// destroyed-epoch refusal if the key material is gone. Each says which
-    /// of those it is; none of them is silently an empty read.
+    /// [`BlobError::NotGranted`] if the viewer holds no grant, the
+    /// destroyed-epoch refusal if the key material is gone, and
+    /// [`BlobError::Evicted`] (#833, I31) if the retention sweep deleted the
+    /// local copy — told only to a viewer the binding authorizes. Each says
+    /// which of those it is; none of them is silently an empty read.
     pub async fn read_any_for_viewer<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::types::cohort_scope::CryptoTier;
         let not_granted = || BlobError::NotGranted {
             sha256_hex: hex::encode(at_rest_sha256),
             viewer_key_id: viewer_key_id.to_owned(),
         };
+        let not_held = || BlobError::NotHeld {
+            sha256_hex: hex::encode(at_rest_sha256),
+        };
 
-        // 1. The ROW says what this is. Absent ⇒ NotHeld. (§11.1) The tier
-        //    is the one the WRITE DOOR RESOLVED and recorded — never
-        //    re-derived here from the scope, which would drop the directory
-        //    axis (the infra carve-out) the door applied (I15).
-        let tier = backend
-            .blob_crypto_tier(at_rest_sha256)
+        // 1. The ROW says what this is. (§11.1) The tier is the one the
+        //    WRITE DOOR RESOLVED and recorded — never re-derived here from
+        //    the scope, which would drop the directory axis (the infra
+        //    carve-out) the door applied (I15).
+        let Some(tier) = backend.blob_crypto_tier(at_rest_sha256).await? else {
+            // No row. Swept, or never ours? (#833, §11.5, I31) The epoch
+            // binding — which the retention sweep KEEPS, stamped — knows;
+            // but it is told only to a viewer who could have read the
+            // blob. So: AUTHORIZE FIRST, on the binding's (community,
+            // epoch), the same order as a live community blob (§11.3). A
+            // stranger gets NotGranted, naming neither (I4b).
+            let Some(binding) = backend.community_dek_blob_binding(at_rest_sha256).await? else {
+                return Err(not_held());
+            };
+            if !crate::federation::community_dek::orchestrate::may_learn_epoch_fate(
+                backend,
+                &binding.community_key_id,
+                binding.epoch,
+                viewer_key_id,
+            )
             .await?
-            .ok_or_else(|| BlobError::NotHeld {
-                sha256_hex: hex::encode(at_rest_sha256),
-            })?;
+            {
+                return Err(not_granted());
+            }
+            return Err(match binding.evicted_at {
+                Some(evicted_at) => BlobError::Evicted {
+                    sha256_hex: hex::encode(at_rest_sha256),
+                    community_key_id: binding.community_key_id,
+                    epoch: binding.epoch,
+                    evicted_at,
+                },
+                // A live binding with no row is the state I19 forbids:
+                // reported as absent, never as swept.
+                None => not_held(),
+            });
+        };
 
         // 2. AUTHORIZE BY TIER, BEFORE TOUCHING THE BODY. (§11.3) The
         //    decision lives above the dispatch so a new tier cannot skip it.
@@ -1534,9 +1565,7 @@ pub mod orchestrate {
         let body = backend
             .get_blob(at_rest_sha256)
             .await?
-            .ok_or_else(|| BlobError::NotHeld {
-                sha256_hex: hex::encode(at_rest_sha256),
-            })?;
+            .ok_or_else(not_held)?;
         let bytes = match body {
             BlobBody::Inline(b) => b,
             BlobBody::External(_) => {
@@ -3308,6 +3337,228 @@ pub mod blob_invariants {
                 .contains(&node_derived),
             "{tag} I28: no holder claim for bytes this node does not hold"
         );
+    }
+
+    // ── I31 ──────────────────────────────────────────────────────────────
+    /// **Eviction is a fact a reader is told; deletion is not.** (#833)
+    ///
+    /// The retention sweep keeps the epoch binding and stamps `evicted_at`;
+    /// the object count ignores evicted bindings so destroy still succeeds;
+    /// an AUTHORIZED viewer reading the evicted sha gets
+    /// `Evicted{community, epoch, evicted_at}`, a stranger gets `NotGranted`
+    /// (naming neither community nor epoch — I4b), an unknown sha gets
+    /// `NotHeld`. Both authorization legs are exercised: the epoch grant
+    /// (a REMOVED member, who keeps the old epoch's grant by AV-70, before
+    /// the epoch is destroyed) and the current roster (a member after the
+    /// production sweep has destroyed the epoch and erased its grants).
+    pub async fn exercise_i31_eviction_is_a_fact_a_reader_is_told<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
+        use crate::federation::community_dek::lifecycle_support::{revoke_member, seed_community};
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, read_for_community_viewer, sweep_rotated_epochs,
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_occ = format!("{tag}-bob-occ-{run}");
+        let stranger = format!("{tag}-stranger-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
+        let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None)
+            .await
+            .unwrap();
+        let e0 = sealed.epoch;
+        let at_rest = sealed.at_rest_sha256;
+
+        // Rotation-on-removal: bob is out; e0 is rotated past. Bob KEEPS his
+        // grant on e0 (AV-70, forward-only) until the epoch is destroyed.
+        revoke_member(backend, &comm, &bob).await;
+        assert!(
+            backend.community_dek_current_epoch(&comm).await.unwrap() > e0,
+            "{tag} I31: precondition — the revocation rotated the epoch"
+        );
+        assert!(
+            backend
+                .community_dek_has_member_grant(&comm, e0, &bob_occ)
+                .await
+                .unwrap(),
+            "{tag} I31: precondition — the removed member still holds the e0 grant (AV-70)"
+        );
+
+        // ── Phase A: evict WITHOUT destroying (the sweep's first half, alone)
+        //    so the epoch-grant leg of the authorization is the one that
+        //    decides.
+        let t_evict = chrono::Utc::now();
+        let n = backend
+            .community_dek_evict_epoch_objects(&comm, e0, &sweeper, t_evict)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "{tag} I31: one object evicted");
+        assert!(
+            !backend.has_blob(&at_rest).await.unwrap(),
+            "{tag} I31: the bytes are gone"
+        );
+        assert_eq!(
+            backend.community_dek_blob_epoch(&at_rest).await.unwrap(),
+            Some((comm.clone(), e0)),
+            "{tag} I31: the sweep DELETED the binding — a later read cannot tell swept from \
+             never-ours"
+        );
+        assert_eq!(
+            backend
+                .community_dek_epoch_object_count(&comm, e0)
+                .await
+                .unwrap(),
+            0,
+            "{tag} I31: an evicted binding is COUNTED as a live object — destroy is blocked \
+             forever"
+        );
+        let again = backend
+            .community_dek_evict_epoch_objects(&comm, e0, &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            again, 0,
+            "{tag} I31: a second eviction of the same epoch re-processed already-evicted \
+             bindings (the stamp must be written once)"
+        );
+
+        // The removed member holds the e0 grant and is NOT on the roster:
+        // authorized by the grant leg alone.
+        let bob_res = read_any_for_viewer(backend, &at_rest, &bob_occ).await;
+        match &bob_res {
+            Err(BlobError::Evicted {
+                community_key_id,
+                epoch,
+                evicted_at,
+                sha256_hex,
+            }) => {
+                assert_eq!(community_key_id, &comm, "{tag} I31: names the community");
+                assert_eq!(*epoch, e0, "{tag} I31: names the epoch");
+                assert_eq!(
+                    sha256_hex,
+                    &hex::encode(at_rest),
+                    "{tag} I31: names the sha"
+                );
+                let skew = (*evicted_at - t_evict).num_milliseconds().abs();
+                assert!(
+                    skew < 1_000,
+                    "{tag} I31: evicted_at {evicted_at} is not the instant the sweep was \
+                     given ({t_evict})"
+                );
+            }
+            other => panic!(
+                "{tag} I31: a REMOVED member who still holds the epoch grant must be told the \
+                 blob was evicted (grant leg); got {other:?}"
+            ),
+        }
+
+        // ── Phase B: the production sweep — evicts (nothing left) and
+        //    DESTROYS e0, erasing every e0 grant (I5). From here the roster
+        //    leg is the only one that can authorize a member.
+        let report = sweep_rotated_epochs(backend, &comm, &sweeper, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(
+            report.destroyed.contains(&e0),
+            "{tag} I31: destroy after the sweep must still succeed — the object count must \
+             ignore evicted bindings; report {report:?}"
+        );
+        assert_eq!(
+            backend.community_dek_key_state(&comm, e0).await.unwrap(),
+            Some(DekKeyState::Destroyed)
+        );
+        assert!(
+            !backend
+                .community_dek_has_member_grant(&comm, e0, &alice_occ)
+                .await
+                .unwrap(),
+            "{tag} I31: precondition — destroy erased the epoch's grants (I5)"
+        );
+
+        // A current member: authorized by the roster leg.
+        let alice_res = read_any_for_viewer(backend, &at_rest, &alice_occ).await;
+        match &alice_res {
+            Err(BlobError::Evicted {
+                community_key_id,
+                epoch,
+                ..
+            }) => {
+                assert_eq!(community_key_id, &comm);
+                assert_eq!(*epoch, e0);
+            }
+            other => panic!(
+                "{tag} I31: a CURRENT member reading a swept sha after the production sweep \
+                 (epoch destroyed, grants gone) must be told it was evicted, not that it was \
+                 never ours; got {other:?}"
+            ),
+        }
+
+        // A stranger: refused, and the refusal names neither community nor
+        // epoch (I4b) — the same class a stranger gets on a live blob.
+        let err = read_any_for_viewer(backend, &at_rest, &stranger)
+            .await
+            .expect_err("a stranger must be refused");
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I31: a stranger must get NotGranted, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(&comm) && !msg.contains("epoch"),
+            "{tag} I31: the refusal to a STRANGER disclosed the binding: {msg}"
+        );
+
+        // The DIRECT community door (`Engine::read_blob_for_community_viewer`
+        // and its PyO3 binding — a production surface) gives the same two
+        // answers: the door is not the only way through.
+        let direct = read_for_community_viewer(backend, &at_rest, &alice_occ).await;
+        assert!(
+            matches!(&direct, Err(BlobError::Evicted { epoch, .. }) if *epoch == e0),
+            "{tag} I31: the direct community door must tell a member the blob was evicted \
+             (it authorized by an epoch grant the destroy erased?); got {direct:?}"
+        );
+        let err = read_for_community_viewer(backend, &at_rest, &stranger)
+            .await
+            .expect_err("a stranger must be refused at the direct door too");
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I31: the direct community door must refuse a stranger NotGranted, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(&comm) && !msg.contains("epoch"),
+            "{tag} I31: the direct door's refusal to a STRANGER disclosed the binding: {msg}"
+        );
+
+        // The removed member, now that destroy erased the e0 grant: not a
+        // grantee, not on the roster ⇒ NotGranted.
+        let err = read_any_for_viewer(backend, &at_rest, &bob_occ)
+            .await
+            .expect_err("a removed member with no surviving grant must be refused");
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I31: a removed member whose grants the destroy erased must get NotGranted, \
+             got {err:?}"
+        );
+
+        // A sha that was never ours: NotHeld, to a member and to a stranger.
+        let random = sha(format!("{tag}-never-ours-{run}").as_bytes());
+        for viewer in [&alice_occ, &stranger] {
+            let err = read_any_for_viewer(backend, &random, viewer)
+                .await
+                .expect_err("an unknown sha must be refused");
+            assert!(
+                matches!(err, BlobError::NotHeld { .. }),
+                "{tag} I31: an unknown sha must be NotHeld for {viewer}, got {err:?}"
+            );
+        }
     }
 }
 
