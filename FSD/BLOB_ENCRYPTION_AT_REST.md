@@ -1107,6 +1107,18 @@ A blob is sealed **before** it is fountained. Fountaining plaintext and
 encrypting afterwards leaves plaintext shards on peers that no subsequent
 rotation can recall, and the tombstone plane cannot un-see them.
 
+**Reach, stated honestly (2026-09-10, from the Edge adoption thread #826).**
+Even for sealed shards, "rotation is not recall" reaches only as far as the
+shard plane's tombstone ceiling — and a ceiling wide enough helps only if
+shards stay under it. Edge's shard plane today has a serve gate and no
+STORE gate: the fountain converger pushes shards toward `target_holders`
+without asking who may hold, so a shard can land on a node outside the
+cohort, and a `Cohort`-ceiling tombstone will not reach it. Until
+CIRISEdge#581 lands, the recall this section relies on is an INTENDED reach,
+not an enforced one; Edge will return with a bound it can defend and it will
+be pinned here as the shard plane's number. CIRISEdge#582 is the mirror —
+what the converger deletes on an unverified holder count.
+
 This is a **gate**, not a convention: the fountain path must refuse a
 plaintext body whose `cohort_scope` resolves to an encrypted tier.
 
