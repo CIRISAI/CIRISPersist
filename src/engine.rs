@@ -4892,6 +4892,7 @@ impl Engine {
                     owner_or_family_key_id,
                     plaintext,
                     media_type,
+                    None,
                 )
                 .await
             }
@@ -4903,6 +4904,7 @@ impl Engine {
                     owner_or_family_key_id,
                     plaintext,
                     media_type,
+                    None,
                 )
                 .await
             }
@@ -4932,6 +4934,13 @@ impl Engine {
     /// cohort. The commons doors (`put_blob_signing`, `put_blob_json`) record
     /// `federation` by construction and cannot be pointed at a private
     /// cohort. That is what makes I1 (§11.10) true rather than checked.
+    ///
+    /// `aad` (#831, §11.2 (7)) — caller-supplied associated data, bound into
+    /// the seal and NEVER stored; [`read_blob_as`](Engine::read_blob_as) must
+    /// be given the same bytes or the open fails. Bind the referencing row
+    /// (author, signed instant, epoch) so a ciphertext lifted onto another
+    /// row does not open there. Refused (`InvalidArgument`) at a plaintext
+    /// tier: nothing to bind to. Pass `None` for the v43 behaviour.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_blob_scoped(
         &self,
@@ -4939,6 +4948,7 @@ impl Engine {
         community_key_id: Option<&str>,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<crate::federation::PutBlobScopedResult, crate::federation::BlobError> {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         match &self.backend {
@@ -4951,6 +4961,7 @@ impl Engine {
                     community_key_id,
                     plaintext,
                     media_type,
+                    aad,
                 )
                 .await
             }
@@ -4963,6 +4974,7 @@ impl Engine {
                     community_key_id,
                     plaintext,
                     media_type,
+                    aad,
                 )
                 .await
             }
@@ -5180,6 +5192,11 @@ impl Engine {
     /// above it, `InvalidArgument` pointing at
     /// [`read_blob_range_as`](Engine::read_blob_range_as). `aad` is the
     /// #831 hook (ignored until CIRISVerify#279 lands).
+    /// `aad` (#831, §11.3 (5)) — the associated data the blob was sealed
+    /// with, if any. A mismatch fails AFTER authorization as a crypto-class
+    /// `Backend` error, never `NotGranted`: the viewer was authorized; the
+    /// bytes did not belong to the row they arrived on. `Some` against a
+    /// plaintext row is refused as at the write door.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn read_blob_as(
         &self,

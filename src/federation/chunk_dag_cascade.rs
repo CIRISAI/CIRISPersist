@@ -1512,7 +1512,7 @@ pub mod invariants {
         {
             use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
             let whole = segment(9, 4000);
-            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None)
+            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None, None)
                 .await
                 .unwrap();
             assert_eq!(

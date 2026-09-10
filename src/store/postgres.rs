@@ -24767,6 +24767,19 @@ mod tests {
         crate::federation::at_rest_cascade::blob_invariants::exercise_i31_eviction_is_a_fact_a_reader_is_told(&backend, &tag).await;
     }
 
+    /// §11.10 I40 — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i40_associated_data_binds_the_seal_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i40_associated_data_binds_the_seal(&backend, &tag).await;
+    }
+
     /// §11.10 I27 — **one serialization boundary per community, measured by
     /// OCCUPANCY.** With the community's transaction lock held from another
     /// session, none of bind / key-state / rotation / eviction / community
@@ -29562,9 +29575,10 @@ mod tests {
             .unwrap();
 
         let plaintext = b"a private note, scoped to self (pg)";
-        let result = encrypt_and_cascade(&backend, SELF, &root, plaintext, Some("text/plain"))
-            .await
-            .unwrap();
+        let result =
+            encrypt_and_cascade(&backend, SELF, &root, plaintext, Some("text/plain"), None)
+                .await
+                .unwrap();
         assert_eq!(result.granted, vec![keyed.clone()]);
         assert_eq!(result.excluded, vec![bare.clone()]);
 
@@ -29720,7 +29734,7 @@ mod tests {
             .await
             .unwrap();
         let plaintext = b"family blob written before bob/carol registered devices (pg)";
-        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None)
+        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None, None)
             .await
             .unwrap();
         assert_eq!(result.granted, vec![alice_p.clone()]);
@@ -30393,7 +30407,7 @@ mod tests {
             .await
             .unwrap();
 
-        let blob1 = encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None)
+        let blob1 = encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None, None)
             .await
             .unwrap();
         assert_eq!(blob1.granted, vec![alice_p.clone()]);
@@ -30442,7 +30456,7 @@ mod tests {
         assert!(looked.members.iter().any(|m| m.key_id == bob));
 
         // Forward path: a NEW write reaches BOTH alice + bob.
-        let blob2 = encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None)
+        let blob2 = encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None, None)
             .await
             .unwrap();
         let mut granted = blob2.granted.clone();

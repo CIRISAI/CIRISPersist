@@ -27885,9 +27885,10 @@ mod tests {
             .unwrap();
 
         let plaintext = b"a private note about the cat, scoped to self";
-        let result = encrypt_and_cascade(&backend, SELF, "root", plaintext, Some("text/plain"))
-            .await
-            .unwrap();
+        let result =
+            encrypt_and_cascade(&backend, SELF, "root", plaintext, Some("text/plain"), None)
+                .await
+                .unwrap();
 
         // The keyed occurrence got a grant; the bare one was fail-secure
         // excluded (no plaintext fallback).
@@ -28029,7 +28030,7 @@ mod tests {
             .unwrap();
 
         let plaintext = b"family grocery list";
-        let result = encrypt_and_cascade(&backend, FAMILY, "fam", plaintext, None)
+        let result = encrypt_and_cascade(&backend, FAMILY, "fam", plaintext, None, None)
             .await
             .unwrap();
 
@@ -28516,6 +28517,15 @@ mod tests {
         .await;
     }
 
+    /// §11.10 I40 — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i40_associated_data_binds_the_seal_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i40_associated_data_binds_the_seal(&backend, "sqlite")
+            .await;
+    }
+
     /// v43.0.0 (§10) — **the full cohort lifecycle on sqlite.**
     ///
     /// create -> encrypt -> decrypt -> ROTATE -> encrypt -> forward secrecy
@@ -28765,6 +28775,7 @@ mod tests {
             "comm",
             first.epoch,
             b"three",
+            None,
             None,
         )
         .await
@@ -30150,7 +30161,7 @@ mod tests {
             .unwrap();
 
         let plaintext = b"a self-scoped note written before the new device joined";
-        let result = encrypt_and_cascade(&backend, SELF, "root", plaintext, None)
+        let result = encrypt_and_cascade(&backend, SELF, "root", plaintext, None, None)
             .await
             .unwrap();
         assert_eq!(result.granted, vec!["occ-old".to_string()]);
@@ -30250,7 +30261,7 @@ mod tests {
             .await
             .unwrap();
         let plaintext = b"family blob written before carol registered a device";
-        let result = encrypt_and_cascade(&backend, FAMILY, "fam", plaintext, None)
+        let result = encrypt_and_cascade(&backend, FAMILY, "fam", plaintext, None, None)
             .await
             .unwrap();
         assert_eq!(result.granted, vec!["alice-phone".to_string()]);
@@ -30355,7 +30366,7 @@ mod tests {
             .unwrap();
 
         // A blob written before bob exists reaches only alice.
-        let blob1 = encrypt_and_cascade(&backend, FAMILY, "fam", b"before bob", None)
+        let blob1 = encrypt_and_cascade(&backend, FAMILY, "fam", b"before bob", None, None)
             .await
             .unwrap();
         assert_eq!(blob1.granted, vec!["alice-phone".to_string()]);
@@ -30470,7 +30481,7 @@ mod tests {
         );
 
         // Forward path (the gap this closes): a NEW write reaches BOTH.
-        let blob2 = encrypt_and_cascade(&backend, FAMILY, "fam", b"after bob", None)
+        let blob2 = encrypt_and_cascade(&backend, FAMILY, "fam", b"after bob", None, None)
             .await
             .unwrap();
         let mut granted = blob2.granted.clone();
@@ -30545,7 +30556,7 @@ mod tests {
             .unwrap();
 
         // Before removal: both occurrences are granted on a write.
-        let before = encrypt_and_cascade(&backend, FAMILY, "fam", b"v1", None)
+        let before = encrypt_and_cascade(&backend, FAMILY, "fam", b"v1", None, None)
             .await
             .unwrap();
         let mut g = before.granted.clone();
@@ -30573,7 +30584,7 @@ mod tests {
 
         // After removal: a NEW write excludes dave (producer stop-wrapping
         // via the *_active enumeration — forward secrecy under a fresh DEK).
-        let after = encrypt_and_cascade(&backend, FAMILY, "fam", b"v2-post-removal", None)
+        let after = encrypt_and_cascade(&backend, FAMILY, "fam", b"v2-post-removal", None, None)
             .await
             .unwrap();
         assert_eq!(after.granted, vec!["alice-phone".to_string()]);

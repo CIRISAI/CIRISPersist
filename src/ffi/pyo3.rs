@@ -12631,7 +12631,14 @@ impl PyEngine {
     /// encrypted tier), `tier`, `epoch` (community only), `granted`,
     /// `excluded`. **Read `excluded`**: members without valid
     /// `encryption_pubkeys` get NO grant, never a plaintext fallback.
-    #[pyo3(signature = (cohort_scope, plaintext_b64, community_key_id=None, media_type=None))]
+    ///
+    /// `aad_b64` (#831, §11.2 (7)) — base64 of caller-supplied associated
+    /// data, bound into the seal and NEVER stored; `read_blob_as` must be
+    /// given the same bytes or the open fails. Bind the referencing row
+    /// (author, signed instant, epoch) so a ciphertext lifted onto another
+    /// row does not open there. Refused (`ValueError`, `blob_invalid_argument`)
+    /// at a plaintext tier: nothing to bind to.
+    #[pyo3(signature = (cohort_scope, plaintext_b64, community_key_id=None, media_type=None, aad_b64=None))]
     fn put_blob_scoped(
         &self,
         py: Python<'_>,
@@ -12639,6 +12646,7 @@ impl PyEngine {
         plaintext_b64: &str,
         community_key_id: Option<&str>,
         media_type: Option<&str>,
+        aad_b64: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -12648,6 +12656,9 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let plaintext = B64.decode(plaintext_b64).map_err(|e| {
                 PyValueError::new_err(format!("put_blob_scoped plaintext_b64 decode: {e}"))
+            })?;
+            let aad = aad_b64.map(|s| B64.decode(s)).transpose().map_err(|e| {
+                PyValueError::new_err(format!("put_blob_scoped aad_b64 decode: {e}"))
             })?;
             let scope = cohort_scope.to_owned();
             let comm = community_key_id.map(str::to_owned);
@@ -12675,6 +12686,7 @@ impl PyEngine {
                                 comm.as_deref(),
                                 &plaintext,
                                 media.as_deref(),
+                                aad.as_deref(),
                             )
                             .await
                         })
@@ -12690,6 +12702,7 @@ impl PyEngine {
                                 comm.as_deref(),
                                 &plaintext,
                                 media.as_deref(),
+                                aad.as_deref(),
                             )
                             .await
                         })
@@ -12913,6 +12926,10 @@ impl PyEngine {
     /// the 64 MiB whole-read cap; above it `ValueError` pointing at
     /// `read_blob_range_as`). `aad_b64` is the #831 hook, ignored until
     /// CIRISVerify#279 lands.
+    /// `aad_b64` (#831, §11.3 (5)) — base64 of the associated data the blob
+    /// was sealed with, if any. A mismatch fails AFTER authorization as a
+    /// backend/crypto error, never `blob_not_granted`: the viewer was
+    /// authorized; the bytes did not belong to the row they arrived on.
     #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, aad_b64=None))]
     fn read_blob_as(
         &self,
@@ -13343,6 +13360,7 @@ impl PyEngine {
                                 &owner,
                                 &plaintext,
                                 media.as_deref(),
+                                None,
                             )
                             .await
                         })
@@ -13357,6 +13375,7 @@ impl PyEngine {
                                 &owner,
                                 &plaintext,
                                 media.as_deref(),
+                                None,
                             )
                             .await
                         })
