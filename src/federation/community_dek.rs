@@ -871,16 +871,19 @@ pub mod orchestrate {
     ///   blob's epoch.
     /// - [`BlobError::InvalidArgument`] if the blob carries no
     ///   community-DEK binding (not a community blob).
+    /// - [`BlobError::Evicted`] (#833, I31) if the retention sweep deleted
+    ///   the local copy — told only to a viewer
+    ///   [`may_learn_epoch_fate`] authorizes; a stranger gets `NotGranted`.
     pub async fn read_for_community_viewer<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
     ) -> Result<Vec<u8>, BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + FederationDirectory + Sync,
     {
-        let (community_key_id, epoch) = backend
-            .community_dek_blob_epoch(at_rest_sha256)
+        let binding = backend
+            .community_dek_blob_binding(at_rest_sha256)
             .await?
             .ok_or_else(|| {
                 BlobError::InvalidArgument(format!(
@@ -888,6 +891,28 @@ pub mod orchestrate {
                     hex::encode(at_rest_sha256)
                 ))
             })?;
+        let (community_key_id, epoch) = (binding.community_key_id, binding.epoch);
+        // #833 (§11.5, I31) — the sweep kept the binding as an eviction
+        // record. This door is a production surface
+        // (`Engine::read_blob_for_community_viewer`, PyO3), so it gives the
+        // same answer as `read_any_for_viewer`: the epoch's own grants are
+        // gone by the time a member asks (destroy erases them, I5), so the
+        // predicate is the two-leg one — and it runs BEFORE the fact is
+        // named.
+        if let Some(evicted_at) = binding.evicted_at {
+            if !may_learn_epoch_fate(backend, &community_key_id, epoch, viewer_key_id).await? {
+                return Err(BlobError::NotGranted {
+                    sha256_hex: hex::encode(at_rest_sha256),
+                    viewer_key_id: viewer_key_id.to_owned(),
+                });
+            }
+            return Err(BlobError::Evicted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                community_key_id,
+                epoch,
+                evicted_at,
+            });
+        }
         // v43.0.0 (§11.3) — AUTHORIZE FIRST. The destroyed-epoch refusal
         // below names the community; a non-grantee must never reach it.
         if !backend

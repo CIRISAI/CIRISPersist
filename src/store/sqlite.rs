@@ -28045,24 +28045,17 @@ mod tests {
             Some(DekKeyState::Destroyed)
         );
 
-        // The consequence that matters: the content is NOT retrievable.
-        //
-        // The observed error is "carries no community-DEK binding" rather
-        // than the destroyed-epoch message, because eviction removes the
-        // binding and the read checks the binding before the bytes. That is
-        // accurate — the object is gone — but it reads identically to a
-        // caller passing a sha that was never a community blob. An operator
-        // cannot tell "evicted by policy" from "wrong handle" after the
-        // fact. Recorded rather than papered over; keeping an eviction
-        // tombstone per blob would be unbounded growth, which is the thing
-        // eviction exists to prevent, so the fix is not obvious and is not
-        // this cut's.
+        // The consequence that matters: the content is NOT retrievable, and
+        // the read SAYS WHY. Before #833 this read reported "carries no
+        // community-DEK binding" — accurate, but identical to a caller
+        // passing a sha that was never a community blob. The sweep now keeps
+        // the binding stamped `evicted_at` (I31), so a member is told the
+        // blob was evicted under this epoch's retention.
         let err = read_for_community_viewer(&backend, &old.at_rest_sha256, "alice-occ")
             .await
             .expect_err("evicted-and-destroyed content must not be readable");
         assert!(
-            matches!(err, crate::federation::BlobError::InvalidArgument(_))
-                || matches!(err, crate::federation::BlobError::NotHeld { .. }),
+            matches!(err, crate::federation::BlobError::Evicted { epoch, .. } if epoch == old.epoch),
             "got: {err}"
         );
         // And the bytes really are gone, not merely unreachable by this path.

@@ -1555,6 +1555,28 @@ and each alone refuses the evicted case, so removing either survives; the
 pair removed together turns I28 red, which is the evidence recorded. A test that is green on
 the code it was written to catch is a report.
 
+**I31 (#833)** was written first and confirmed red on v43.0.0 (`170cc89`),
+failing at its first structural assertion: the sweep deleted the binding.
+Mutation evidence, every restore `cmp`-verified: removing `evicted_at IS
+NULL` from the object count turns I31, I5 and I6 red (sqlite) and I31 and
+I5 red (postgres); removing it from the destroy statement's own `NOT
+EXISTS` predicate turns I31, I5, I6 and I9 red (sqlite) and I31 and I5 red
+(postgres) — that third site was found by the EXISTING witnesses when the
+first two were changed alone, which is what they are for; making the sweep
+delete the binding instead of stamping it turns I31 red on both backends;
+removing the read door's authorization hands a stranger `Evicted` naming the
+community and epoch (I31 red); removing the roster leg refuses a current
+member `NotGranted` after the production sweep (I31 red); removing the grant
+leg refuses a removed member who still holds the epoch grant (I31 red). Two
+edits survive and are recorded rather than dressed up as guards: the
+`evicted_at IS NULL` filter on the sweep's object SELECT (the UPDATE's own
+predicate is the guard; the filter only spares the retraction scan) and the
+same filter on the announcement's binding check (the row-existence check
+refuses an evicted sha alone; the filter is belt to those braces). A
+row-less sha with a LIVE binding — the `None => NotHeld` arm — is the state
+I19 forbids and cannot be constructed through a door, so that arm is
+untested and said so here.
+
 **C2 = the second Codex review (2026-09-09, of `30fde79`).** Nine findings,
 all verified real, six root causes: the row stored the tier's INPUT not the
 tier (C2-1, C2-4); "enabled" was not "current" (C2-2, C2-8); the error path

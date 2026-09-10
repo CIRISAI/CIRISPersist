@@ -5,6 +5,87 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — #833]
+
+**Eviction is a fact a reader is told; deletion is not.** After a retention
+sweep, v43.0.0 reported an evicted community blob as *"carries no
+community-DEK binding"* — indistinguishable from a sha that was never ours
+(`NotHeld`), because the sweep deleted the binding with the bytes. An operator
+could not tell "evicted by policy" from "wrong handle" (CIRISEdge, #826).
+
+### Changed
+
+- **The retention sweep keeps the epoch binding.**
+  `community_dek_evict_epoch_objects` (both backends) deletes the blob row and
+  its at-rest grants but KEEPS `federation_community_blob_epoch`, stamping a
+  new nullable `evicted_at` column (V140, both dialects; no rebuild, no
+  backfill) with the instant the sweep was given. Every statement is scoped to
+  live bindings, so a second run over the same epoch evicts nothing and never
+  re-stamps. `delete_blob` — the generic floor — still removes the binding
+  outright (I19 unchanged): only the sweep marks, because only the sweep is a
+  policy action a reader should be told about. Cost: one small row per blob
+  that once existed under a community epoch — bounded by the corpus that was.
+- **"Bound" means a LIVE binding** at every site that reads it:
+  `community_dek_epoch_object_count`, the destroy statement's own `NOT EXISTS`
+  predicate (the I6 guard — the count is the friendly message, the statement
+  is the door; the existing I5/I6/I9 witnesses caught this third site when the
+  first two were changed alone), the sweep's object select, and the community
+  announcement's binding check (I28: an evicted binding is a record, not a
+  bound row). The destroy precondition is therefore unchanged: destroy after
+  a sweep still succeeds.
+- **`read_blob_as` on a row-less sha now has a third answer, after
+  authorization.** New `BlobError::Evicted { sha256_hex, community_key_id,
+  epoch, evicted_at }` (`kind() = "blob_evicted"`; Python: `ValueError`
+  carrying the token, community and epoch, routed through `blob_err_to_py` —
+  the I13 gate checks it). Reachable only for a viewer the binding authorizes:
+  a member grant on that epoch, **or** an active occurrence of a member on the
+  community's current roster. The second leg is load-bearing, not a
+  convenience — the production sweep destroys an epoch in the same pass it
+  evicts, and destroy erases every member-grant row (I5), so a door that
+  authorized by the epoch grant alone would refuse every member `NotGranted`
+  after the sweep it exists to explain. A stranger, or a removed member whose
+  old grants the destroy erased, gets `NotGranted` naming neither community
+  nor epoch (I4b holds). No binding ⇒ `NotHeld` as before. A row-less sha
+  with a live binding (the state I19 forbids) is `NotHeld`, never `Evicted`.
+- `orchestrate::read_any_for_viewer` now requires `FederationDirectory` on
+  its backend (the roster leg); both production callers (`Engine::read_blob_as`,
+  the PyO3 binding) already hand it one.
+
+### Added
+
+- `BlobStorage::community_dek_blob_binding(sha) -> Option<BlobEpochBinding>`
+  (community, epoch, `evicted_at`) — the read door's answer for a row-less
+  sha. `community_dek_blob_epoch` is unchanged and answers for an evicted
+  binding too: the binding is a fact about the bytes.
+- `community_dek::orchestrate::may_learn_epoch_fate` — the two-leg
+  disclosure predicate. The roster fold it shares with the wrap fan-out
+  (`active_member_occurrences`) is now one function, so "who is a member" has
+  one answer.
+- Invariant **I31** (`FSD/BLOB_ENCRYPTION_AT_REST.md` §11.5, §11.10) with a
+  cross-backend witness `exercise_i31_eviction_is_a_fact_a_reader_is_told`,
+  registered on sqlite and postgres. Written first and confirmed RED on
+  v43.0.0 (the sweep deleted the binding). It exercises both authorization
+  legs: a REMOVED member who still holds the old epoch's grant (AV-70) is told
+  `Evicted` before the epoch is destroyed; a CURRENT member is told `Evicted`
+  after the production sweep destroyed the epoch and erased its grants;
+  a stranger and the removed member (post-destroy) get `NotGranted`; an unknown
+  sha gets `NotHeld`; the sweep's destroy succeeds; a second eviction returns 0.
+
+### Evidence
+
+Every guard above was mutation-verified with the restore `cmp`-checked: the
+count filter (sqlite: I31, I5, I6 red; postgres: I31, I5 red), the destroy
+statement's predicate (sqlite: I31, I5, I6, I9 red; postgres: I31, I5 red),
+stamp-vs-delete (I31 red, both backends), the read door's authorization (a
+stranger is handed `Evicted` — I31 red), the roster leg (a current member is
+refused after the production sweep — I31 red) and the grant leg (a removed
+member holding the epoch grant is refused — I31 red). Two filters survive
+mutation and are recorded as belt, not guard: the sweep's object SELECT (the
+UPDATE predicate guards) and the announcement's binding check (the row check
+guards). The `None => NotHeld` arm for a row-less sha with a live binding is
+a state I19 forbids and no door constructs; it is untested and said so in
+the FSD.
+
 ## [43.0.0] - 2026-09-09
 
 **Blob storage is end-to-end encrypted at rest for all four DEK cohorts, from

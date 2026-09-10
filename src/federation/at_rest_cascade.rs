@@ -3358,7 +3358,7 @@ pub mod blob_invariants {
         use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
         use crate::federation::community_dek::lifecycle_support::{revoke_member, seed_community};
         use crate::federation::community_dek::orchestrate::{
-            encrypt_and_cascade_community, sweep_rotated_epochs,
+            encrypt_and_cascade_community, read_for_community_viewer, sweep_rotated_epochs,
         };
         let run = uuid::Uuid::new_v4().simple().to_string();
         let comm = format!("{tag}-comm-{run}");
@@ -3513,6 +3513,28 @@ pub mod blob_invariants {
         assert!(
             !msg.contains(&comm) && !msg.contains("epoch"),
             "{tag} I31: the refusal to a STRANGER disclosed the binding: {msg}"
+        );
+
+        // The DIRECT community door (`Engine::read_blob_for_community_viewer`
+        // and its PyO3 binding — a production surface) gives the same two
+        // answers: the door is not the only way through.
+        let direct = read_for_community_viewer(backend, &at_rest, &alice_occ).await;
+        assert!(
+            matches!(&direct, Err(BlobError::Evicted { epoch, .. }) if *epoch == e0),
+            "{tag} I31: the direct community door must tell a member the blob was evicted \
+             (it authorized by an epoch grant the destroy erased?); got {direct:?}"
+        );
+        let err = read_for_community_viewer(backend, &at_rest, &stranger)
+            .await
+            .expect_err("a stranger must be refused at the direct door too");
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I31: the direct community door must refuse a stranger NotGranted, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains(&comm) && !msg.contains("epoch"),
+            "{tag} I31: the direct door's refusal to a STRANGER disclosed the binding: {msg}"
         );
 
         // The removed member, now that destroy erased the e0 grant: not a
