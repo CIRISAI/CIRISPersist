@@ -3,8 +3,8 @@
 //! # Mission alignment (MISSION.md §2 — `store/`)
 //!
 //! Same Backend trait surface as the in-memory and Postgres backends.
-//! The SQLite-specific bits — synchronous `rusqlite::Connection`
-//! wrapped in `tokio::task::spawn_blocking`, ISO-8601 TEXT timestamps,
+//! The SQLite-specific bits — synchronous `rusqlite::Connection`s behind
+//! the `read`/`write` dispatcher below, ISO-8601 TEXT timestamps,
 //! TEXT-as-JSON payload column, single-file or `:memory:` storage —
 //! live behind the trait, not through it.
 //!
@@ -18,15 +18,34 @@
 //!
 //! # Implementation notes
 //!
-//! - **Connection model**: a single `rusqlite::Connection` wrapped in
-//!   `Arc<Mutex<…>>`. Phase 1 has one ingest writer per process
-//!   (FSD §3.4 robustness primitive #1: bounded queue, single
-//!   persister consumer); contention on the mutex is structurally
-//!   negligible. A future Phase 2 multi-reader workload would benefit
-//!   from `r2d2-sqlite` pooling.
-//! - **Async adapter**: `tokio::task::spawn_blocking` wraps every SQL
-//!   call. rusqlite is synchronous; spawn_blocking moves the work to
-//!   a tokio worker thread so the main runtime keeps spinning.
+//! - **Connection model** (CIRISPersist#829,
+//!   `FSD/SQLITE_CONNECTION_MODEL.md`): **one writer connection plus a
+//!   pool of N read-only connections under WAL.** The writer is the
+//!   `Arc<Mutex<Connection>>` this file has always had — migrations, the
+//!   PRAGMA block, and every transaction that writes run there. Reads run
+//!   on a reader from [`crate::store::sqlite_conn_model::ReadPool`]; WAL
+//!   serves concurrent readers alongside the one writer, so a long scan no
+//!   longer holds every other caller. `open_in_memory` has zero readers
+//!   (a private `:memory:` database is invisible to a second connection)
+//!   and reads fall back to the writer.
+//!
+//!   The premise this replaced — "one ingest writer per process,
+//!   contention on the mutex is structurally negligible" — was true for a
+//!   lens landing traces and false for every node that serves a read API
+//!   off the same engine: CIRISServer#575 measured a 700× p50 stall on
+//!   `GET /v1/identity` behind a filtered `list_attestations`, and
+//!   CIRISEdge#547 a node that never recovered.
+//! - **Async adapter**: every call goes through
+//!   [`SqliteBackend::read`] / [`SqliteBackend::write`], which run the
+//!   closure — *and its wait for a connection* — on tokio's blocking pool
+//!   via `spawn_blocking` **when a runtime is current**, and inline
+//!   otherwise. The inline arm is CIRISPersist#158's property, kept: a
+//!   cohabiting consumer's statically-linked copy of persist may run on a
+//!   worker whose tokio thread-local is unset, and `spawn_blocking` there
+//!   panics where `Handle::try_current()` merely returns `Err`.
+//!   The from-disk gate in `sqlite_conn_model` (I4) holds every fn in
+//!   this file that touches a connection to its class — nothing here
+//!   locks a connection directly.
 //! - **Migrations**: `refinery` against the `migrations/sqlite/lens/`
 //!   directory. Same migration file naming as postgres
 //!   (`V001__trace_events.sql`, `V003__scrub_envelope.sql`) so refinery

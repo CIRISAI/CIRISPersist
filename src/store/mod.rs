@@ -40,6 +40,12 @@ mod schema_parity;
 pub(crate) mod scope_bind;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+/// CIRISPersist#829 — the SQLite connection model: one writer,
+/// a read pool, and the dispatcher that keeps both off the runtime. The
+/// classification gate over `sqlite.rs` lives here too.
+/// `FSD/SQLITE_CONNECTION_MODEL.md`.
+#[cfg(feature = "sqlite")]
+pub mod sqlite_conn_model;
 pub mod types;
 
 pub use backend::{Backend, InsertReport, PublicKeySample};
