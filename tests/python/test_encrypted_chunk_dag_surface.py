@@ -128,8 +128,27 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
         assert got == plain[2990:3011]
         # The whole read is the content, not the manifest.
         assert base64.b64decode(eng.read_blob_as(manifest, kid)) == plain
-        # `aad_b64` is accepted on every new surface (the #831 hook, inert).
-        assert base64.b64decode(eng.read_blob_range_as(manifest, kid, 0, 9, aad_b64=_b64(b"x"))) == plain[:10]
+        # #831 — associated data is REAL on every new surface: a read
+        # presenting data the seal was not bound to fails after
+        # authorization, as a backend/crypto error, never as not-granted.
+        with pytest.raises(RuntimeError, match="blob_backend"):
+            eng.read_blob_range_as(manifest, kid, 0, 9, aad_b64=_b64(b"x"))
+
+        # And the bound case, end to end on the chunk surface: chunks and
+        # manifest sealed under the same data open under it and only it.
+        bound_stream = "py-831-" + secrets.token_hex(4)
+        row_data = _b64(b"alice\n2026-09-10T00:00:00Z\n0")
+        for seq, seg in enumerate(segs):
+            eng.put_blob_chunk_scoped(
+                "self", bound_stream, seq, _b64(seg), 0, community_key_id=kid, aad_b64=row_data
+            )
+        bound = json.loads(
+            eng.seal_stream_scoped("self", bound_stream, community_key_id=kid, aad_b64=row_data)
+        )["manifest_sha256"]
+        assert base64.b64decode(eng.read_blob_range_as(bound, kid, 2990, 3010, aad_b64=row_data)) == plain[2990:3011]
+        assert base64.b64decode(eng.read_blob_as(bound, kid, aad_b64=row_data)) == plain
+        with pytest.raises(RuntimeError, match="blob_backend"):
+            eng.read_blob_as(bound, kid)
 
         # RFC 9110 bounds against the PLAINTEXT total.
         with pytest.raises(ValueError, match="blob_range_not_satisfiable"):
