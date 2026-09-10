@@ -131,6 +131,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("apply_migration_lock_timeout", Class::Delegates),
     ("as_array", Class::Plumbing),
     ("assemble_chunk_dag_range", Class::Plumbing),
+    // #832 — `build_transaction()…start()`: the REPEATABLE READ transaction
+    // `stream_chunks` opens so the listing and the STH are one snapshot.
+    // Driver plumbing; it cannot refuse anything about the caller's input.
+    ("start", Class::Plumbing),
     ("assemble_fountain_content", Class::Delegates),
     ("authorize_community_growth", Class::Gate),
     ("authorize_family_growth", Class::Gate),
@@ -330,6 +334,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // terms and decides nothing about the row. sqlite's boundary is the
     // connection mutex, taken before any of these doors run.
     ("lock_community_tx", Class::Plumbing),
+    // v44 (#832 on the #829 read pool) — `stream_chunks` reads its listing and
+    // the STH in one deferred transaction on a READ-ONLY connection;
+    // `unchecked_transaction` is the driver's `&Connection` form of BEGIN.
+    ("unchecked_transaction", Class::Plumbing),
     ("lookup_community", Class::Delegates),
     ("lookup_family", Class::Delegates),
     // PR #761 review — occurrence resolution rides the ACTIVE fold: a

@@ -345,7 +345,12 @@ pub mod orchestrate {
     /// already-minted DEK via the self-retention row and only fills in any
     /// member who joined since (idempotent — already-granted members are
     /// skipped). Returns `(dek, granted, excluded)`.
-    async fn ensure_epoch_dek<B>(
+    ///
+    /// #832 (§12.3) — crate-private rather than private: the chunk cascade
+    /// seals each segment under the same epoch DEK the whole-blob cascade
+    /// uses, through this one function, so there is exactly one place that
+    /// mints, recovers and fans out a community DEK.
+    pub(crate) async fn ensure_epoch_dek<B>(
         backend: &B,
         community_key_id: &str,
         epoch: u64,
@@ -473,6 +478,7 @@ pub mod orchestrate {
             community_key_id,
             plaintext,
             media_type,
+            None,
         )
         .await
     }
@@ -488,6 +494,7 @@ pub mod orchestrate {
         community_key_id: &str,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<CommunityCascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -526,6 +533,7 @@ pub mod orchestrate {
                 epoch,
                 plaintext,
                 media_type,
+                aad,
             )
             .await?
             {
@@ -577,6 +585,7 @@ pub mod orchestrate {
         epoch: u64,
         plaintext: &[u8],
         media_type: Option<&str>,
+        aad: Option<&[u8]>,
     ) -> Result<SealOutcome, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -584,8 +593,9 @@ pub mod orchestrate {
         let (dek, granted, excluded) = ensure_epoch_dek(backend, community_key_id, epoch).await?;
 
         // Seal the body under the shared epoch DEK into the self-describing
-        // CRBLOB envelope (same format as self/family).
-        let envelope = seal(&dek, plaintext).map_err(map_at_rest_err)?;
+        // CRBLOB envelope (same format as self/family). `aad` (#831) is bound
+        // into the tag and never stored.
+        let envelope = seal(&dek, plaintext, aad).map_err(map_at_rest_err)?;
         let envelope_bytes = envelope.to_bytes();
         let at_rest_sha256: [u8; 32] = Sha256::digest(&envelope_bytes).into();
 
@@ -940,7 +950,8 @@ pub mod orchestrate {
             }
         };
         let envelope = AtRestEnvelope::from_bytes(&envelope_bytes).map_err(map_at_rest_err)?;
-        read_for_community_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope).await
+        read_for_community_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope, None)
+            .await
     }
 
     /// The decrypt half of [`read_for_community_viewer`], for a caller that
@@ -953,6 +964,7 @@ pub mod orchestrate {
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
         envelope: &AtRestEnvelope,
+        aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
@@ -991,7 +1003,40 @@ pub mod orchestrate {
             })?;
         let content_master = backend.load_or_init_content_master().await?;
         let dek = unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err)?;
-        open(&dek, envelope).map_err(map_at_rest_err)
+        open(&dek, envelope, aad).map_err(map_at_rest_err)
+    }
+
+    /// #832 (§12.4) — recover the epoch DEK a COMMUNITY row was sealed under
+    /// and open it, for a caller that has ALREADY authorized the viewer on
+    /// that row's epoch. The DEK comes from the row's own binding, never from
+    /// the community's current epoch — a chunk sealed before a rotation opens
+    /// under the epoch it was sealed at (I38). Destroyed ⇒ the same
+    /// post-authorization refusal `read_for_community_viewer_sealed` gives.
+    pub(crate) async fn open_community_row_as_persist<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        community_key_id: &str,
+        epoch: u64,
+        envelope: &AtRestEnvelope,
+        aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let wrapped = backend
+            .community_dek_get_self_retention(community_key_id, epoch)
+            .await?
+            .ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
+                     is gone and blob {} is permanently unreadable \
+                     (BLOB_ENCRYPTION_AT_REST.md §11.4)",
+                    hex::encode(at_rest_sha256)
+                ))
+            })?;
+        let content_master = backend.load_or_init_content_master().await?;
+        let dek = unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err)?;
+        open(&dek, envelope, aad).map_err(map_at_rest_err)
     }
 
     /// Emit one `hard_case:recipient_excluded` per fail-secure-excluded
@@ -1411,6 +1456,7 @@ pub mod lifecycle_harness {
             backend,
             &after.at_rest_sha256,
             &alice_occ,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: the cohort-agnostic read: {e}"));
@@ -1423,6 +1469,7 @@ pub mod lifecycle_harness {
             backend,
             &after.at_rest_sha256,
             &bob_occ,
+            None,
         )
         .await
         .expect_err("the generic read must enforce the SAME grant check");

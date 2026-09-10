@@ -79,6 +79,12 @@ mod tests {
             ("sweep_rotated_epochs", "sweep"),
             // C3-4 — the sweep's POLICY, not only the sweep.
             ("community_dek_set_retain_past_epochs", "retain"),
+            // #832 (§12) — the chunk-DAG doors: the encrypted chunk write,
+            // the scoped seal, the decrypting range read, the live handle.
+            ("put_blob_chunk_scoped", "chunk_scoped"),
+            ("seal_stream_scoped", "seal_scoped"),
+            ("read_any_range_for_viewer", "read_blob_range_as"),
+            ("stream_chunks(", "stream_chunks"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {
@@ -115,6 +121,11 @@ mod tests {
             "read_any_for_viewer",
             "set_key_state",
             "sweep_rotated_epochs",
+            // #832
+            "put_blob_chunk_scoped",
+            "seal_stream_scoped",
+            "read_any_range_for_viewer",
+            ".stream_chunks(",
         ];
         // Split the FFI file into `fn` bodies and inspect each one that
         // touches a cascade symbol.
@@ -219,8 +230,9 @@ mod tests {
     #[test]
     fn i14_the_storage_floor_has_no_door() {
         let allowed = [
-            "src/federation/at_rest_cascade.rs", // the self/family cascade
-            "src/federation/community_dek.rs",   // the community cascade
+            "src/federation/at_rest_cascade.rs",   // the self/family cascade
+            "src/federation/community_dek.rs",     // the community cascade
+            "src/federation/chunk_dag_cascade.rs", // #832 — the chunk cascade
         ];
         let mut offenders = Vec::new();
         for entry in walkdir("src") {
@@ -238,6 +250,9 @@ mod tests {
                     ".store_blob_local(",
                     ".put_blob_with_scope(",
                     ".put_blob_signing_at(",
+                    // #832 (§12.3) — the chunk floor and the manifest floor.
+                    ".put_blob_chunk_with_scope(",
+                    ".seal_stream_with_scope(",
                 ]
                 .iter()
                 .any(|m| line.contains(m));
@@ -275,6 +290,159 @@ mod tests {
             "I14: production callers of the storage floor outside the two cascades — each is \
              a door that can place bytes under a cohort without sealing them:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    // ── I36 ──────────────────────────────────────────────────────────────
+    /// §12.4 — **the transfer path never decrypts.**
+    ///
+    /// Every `serve_blob*` facade on the Engine (the whole-blob serve, and
+    /// the ranged serve #821 adds beside it) and both backends'
+    /// `get_blob_range` hand out STORED bytes — ciphertext for a sealed row.
+    /// A decrypt added to any of them would leak plaintext to a relay one
+    /// request at a time with nothing red, so this reads the bodies from
+    /// disk and reds on any decrypting call.
+    #[test]
+    fn i36_the_transfer_path_never_decrypts() {
+        let decrypting = [
+            "open(",
+            "unwrap_dek",
+            "read_any_for_viewer",
+            "read_any_range_for_viewer",
+            "read_for_viewer",
+            "read_for_community_viewer",
+            "aes_gcm::decrypt",
+            "read_dag_for_viewer_authorized",
+        ];
+        let mut offenders = Vec::new();
+        let mut inspected = 0usize;
+        let mut check = |rel: &str, fn_prefix: &str| {
+            let text = production_only(&src(rel));
+            let mut i = 0;
+            while let Some(off) = text[i..].find(fn_prefix) {
+                let start = i + off;
+                // A body ends at the next `\n    }\n` (impl-level indentation).
+                let end = text[start..]
+                    .find("\n    }\n")
+                    .map(|e| start + e)
+                    .unwrap_or(text.len());
+                let body = &text[start..end];
+                let name = body
+                    .trim_start()
+                    .trim_start_matches("pub async fn ")
+                    .trim_start_matches("async fn ")
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("?")
+                    .to_owned();
+                inspected += 1;
+                for d in decrypting {
+                    if body.contains(d) {
+                        offenders.push(format!("  {rel}: fn {name} contains `{d}`"));
+                    }
+                }
+                i = end.max(start + 1);
+            }
+        };
+        check("src/engine.rs", "pub async fn serve_blob");
+        check("src/store/sqlite.rs", "async fn get_blob_range(");
+        check("src/store/postgres.rs", "async fn get_blob_range(");
+        assert!(
+            inspected >= 3,
+            "I36: expected at least serve_blob_to_peer + two get_blob_range bodies, inspected {inspected}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "I36: the transfer path grew a decrypt — a relay would hand plaintext to a peer:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── I39 ──────────────────────────────────────────────────────────────
+    /// §12.7 — **every seal/open surface #832 added carries the `aad` hook
+    /// for #831**, on the orchestrate doors, the Engine facades and the
+    /// Python bindings, so that when CIRISVerify#279 lands, #831 flips
+    /// `seal` / `open` and no surface has to be found.
+    #[test]
+    fn i39_every_new_door_carries_the_aad_hook() {
+        let want: [(&str, &str, &str); 12] = [
+            (
+                "src/federation/at_rest_cascade.rs",
+                "pub fn seal(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/federation/at_rest_cascade.rs",
+                "pub fn open(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/federation/at_rest_cascade.rs",
+                "pub async fn read_any_for_viewer<",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub async fn put_blob_chunk_scoped<",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub async fn seal_stream_scoped<",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/federation/chunk_dag_cascade.rs",
+                "pub async fn read_any_range_for_viewer<",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn read_blob_as(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn read_blob_range_as(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn put_blob_chunk_scoped(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn seal_stream_scoped(",
+                "aad: Option<&[u8]>",
+            ),
+            (
+                "src/ffi/pyo3.rs",
+                "fn read_blob_range_as(",
+                "aad_b64: Option<&str>",
+            ),
+            (
+                "src/ffi/pyo3.rs",
+                "fn seal_stream_scoped(",
+                "aad_b64: Option<&str>",
+            ),
+        ];
+        let mut missing = Vec::new();
+        for (rel, sig, param) in want {
+            let text = production_only(&src(rel));
+            let Some(at) = text.find(sig) else {
+                missing.push(format!("  {rel}: `{sig}` not found"));
+                continue;
+            };
+            let end = text[at..].find(')').map(|e| at + e).unwrap_or(text.len());
+            if !text[at..end].contains(param) {
+                missing.push(format!("  {rel}: `{sig}` lacks `{param}`"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "I39: surfaces without the #831 AAD hook (#831 becomes a hunt, not a flip):\n{}",
+            missing.join("\n")
         );
     }
 

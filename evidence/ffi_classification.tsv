@@ -22,7 +22,7 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=188 deontic=138 structural=40 testimonial=40 procedural=37 ontological=34 epistemic=30 axiotic=19 nomological=16 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=188 deontic=141 testimonial=41 structural=40 procedural=37 ontological=34 epistemic=30 axiotic=19 nomological=16 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -47,144 +47,147 @@ axiotic	descriptive	19	Engine	list_scores
 axiotic	descriptive	19	Engine	put_aggregated_tier	
 axiotic	descriptive	19	Engine	resolve_scores	
 axiotic	descriptive	19	Engine	verify_coord_compare_for_merge	
-deontic	binding	138	Engine	accord_nonce_issued	
-deontic	binding	138	Engine	add_community_member	
-deontic	binding	138	Engine	add_moderator	
-deontic	binding	138	Engine	add_peer_record_json	
-deontic	binding	138	Engine	adopt_scrub_upgrade	
-deontic	binding	138	Engine	apply_replicated_accord_evidence	
-deontic	binding	138	Engine	apply_replicated_attestation	
-deontic	binding	138	Engine	apply_replicated_key_record	
-deontic	binding	138	Engine	bake_assembled_genesis	
-deontic	binding	138	Engine	blackhole_prune_expired_iso	
-deontic	binding	138	Engine	blackhole_record_hit	
-deontic	binding	138	Engine	blackhole_remove	
-deontic	binding	138	Engine	blackhole_upsert	
-deontic	binding	138	Engine	build_corpus_want_v1	
-deontic	binding	138	Engine	build_storage_budget_v1	
-deontic	binding	138	Engine	check_no_moderator_federate_json	
-deontic	binding	138	Engine	cirisnode_cast_vote	
-deontic	binding	138	Engine	cirisnode_process_takedown_admission_json	
-deontic	binding	138	Engine	cirisnode_put_key_grant_json	
-deontic	binding	138	Engine	cirisnode_put_moderation_event	
-deontic	binding	138	Engine	cirisnode_put_promotion_attestation	
-deontic	binding	138	Engine	cirisnode_put_reconsideration_attestation	
-deontic	binding	138	Engine	cirisnode_put_reconsideration_request	
-deontic	binding	138	Engine	cirisnode_put_slashing_attestation	
-deontic	binding	138	Engine	cirisnode_retire_key_grants_json	
-deontic	binding	138	Engine	clear_active_halt	
-deontic	binding	138	Engine	cohort_add_member	
-deontic	binding	138	Engine	cohort_build_membership_change_envelope	
-deontic	binding	138	Engine	cohort_revoke_member	
-deontic	binding	138	Engine	cohort_supersede_group	
-deontic	binding	138	Engine	cohort_supersede_group_with_quorum	
-deontic	binding	138	Engine	cohort_swap_member	
-deontic	binding	138	Engine	cohort_verify_membership_quorum	
-deontic	binding	138	Engine	community_dek_set_key_state	
-deontic	binding	138	Engine	community_dek_set_retain_past_epochs	
-deontic	binding	138	Engine	corpus_want_admits	
-deontic	binding	138	Engine	deregister_federation_key	
-deontic	binding	138	Engine	emit_attestation	
-deontic	binding	138	Engine	emit_attestation_self	
-deontic	binding	138	Engine	enter_mesh	
-deontic	binding	138	Engine	escrow_create	
-deontic	binding	138	Engine	escrow_set_status	
-deontic	binding	138	Engine	evict_actor_json	
-deontic	binding	138	Engine	federation_grant_trust	
-deontic	binding	138	Engine	federation_revoke_trust	
-deontic	binding	138	Engine	file_moderation	
-deontic	binding	138	Engine	get_blob_for_viewer	
-deontic	binding	138	Engine	grant_delegation	
-deontic	binding	138	Engine	grant_trust	
-deontic	binding	138	Engine	has_accord_conferred_role	
-deontic	binding	138	Engine	install_storage_budget_v1	
-deontic	binding	138	Engine	is_load_bearing_json	
-deontic	binding	138	Engine	is_named_moderator_json	
-deontic	binding	138	Engine	is_steward_bound_json	
-deontic	binding	138	Engine	issue_accord_nonce	
-deontic	binding	138	Engine	ledger_advance_head	
-deontic	binding	138	Engine	ledger_register	
-deontic	binding	138	Engine	may_release_copy_json	
-deontic	binding	138	Engine	put_accord_decision_json	
-deontic	binding	138	Engine	put_accord_participation_json	
-deontic	binding	138	Engine	put_accord_proposal_json	
-deontic	binding	138	Engine	put_attestation	
-deontic	binding	138	Engine	put_blob_encrypted_community	
-deontic	binding	138	Engine	put_blob_encrypted_self_family	
-deontic	binding	138	Engine	put_blob_scoped	
-deontic	binding	138	Engine	put_blob_signing	
-deontic	binding	138	Engine	put_community_json	
-deontic	binding	138	Engine	put_edge_detection_event	
-deontic	binding	138	Engine	put_family_json	
-deontic	binding	138	Engine	put_fountain_content	
-deontic	binding	138	Engine	put_identity_occurrence_json	
-deontic	binding	138	Engine	put_org_membership	
-deontic	binding	138	Engine	put_organization	
-deontic	binding	138	Engine	put_partner_record	
-deontic	binding	138	Engine	put_public_key	
-deontic	binding	138	Engine	put_revocation	
-deontic	binding	138	Engine	put_scope_blob	
-deontic	binding	138	Engine	reachable_under_scope	
-deontic	binding	138	Engine	reachable_under_scope_with_reasons	
-deontic	binding	138	Engine	read_blob_as	
-deontic	binding	138	Engine	read_blob_for_community_viewer	
-deontic	binding	138	Engine	register_federation_key	
-deontic	binding	138	Engine	register_public_key	
-deontic	binding	138	Engine	rematerialize_role_withdrawals	
-deontic	binding	138	Engine	remove_moderator	
-deontic	binding	138	Engine	remove_peer_record	
-deontic	binding	138	Engine	resolve_key_statement_standing_json	
-deontic	binding	138	Engine	resolve_mesh_config_json	
-deontic	binding	138	Engine	resolve_quarantine_json	
-deontic	binding	138	Engine	resolve_reverse_quorum_json	
-deontic	binding	138	Engine	resolve_transit_eligibility_json	
-deontic	binding	138	Engine	revoke_delegation	
-deontic	binding	138	Engine	revoke_trust_grant	
-deontic	binding	138	Engine	secrets_decapsulate	
-deontic	binding	138	Engine	secrets_decrypt	
-deontic	binding	138	Engine	secrets_forget_secret	
-deontic	binding	138	Engine	secrets_migrate_to_hardware_key	
-deontic	binding	138	Engine	secrets_process_incoming_text	
-deontic	binding	138	Engine	secrets_recall_secret	
-deontic	binding	138	Engine	secrets_reencrypt_all	
-deontic	binding	138	Engine	secrets_retrieve_secret	
-deontic	binding	138	Engine	secrets_rotate_master_key	
-deontic	binding	138	Engine	secrets_store_detected_secret	
-deontic	binding	138	Engine	secrets_store_secret	
-deontic	binding	138	Engine	secrets_update_filter_config	
-deontic	binding	138	Engine	serve_blob_to_peer_json	
-deontic	binding	138	Engine	service_token_revocation_check	
-deontic	binding	138	Engine	service_token_revocation_record	
-deontic	binding	138	Engine	set_active_halt	
-deontic	binding	138	Engine	set_consent_role	
-deontic	binding	138	Engine	set_multimedia_config_json	
-deontic	binding	138	Engine	set_retention	
-deontic	binding	138	Engine	set_storage_budget_bytes	
-deontic	binding	138	Engine	set_trust_threshold	
-deontic	binding	138	Engine	steward_bind	
-deontic	binding	138	Engine	steward_bind_incapacity	
-deontic	binding	138	Engine	storage_budget_supersedes	
-deontic	binding	138	Engine	supersede_canonical	
-deontic	binding	138	Engine	trust_root_verdict_json	
-deontic	binding	138	Engine	unwrap_dek_v2_b64	
-deontic	binding	138	Engine	update_peer_policy	
-deontic	binding	138	Engine	update_peer_trust	
-deontic	binding	138	Engine	verify_coord_check_observed_region	
-deontic	binding	138	Engine	verify_corpus_want_v1	
-deontic	binding	138	Engine	verify_hybrid	
-deontic	binding	138	Engine	verify_hybrid_via_directory	
-deontic	binding	138	Engine	verify_signed_attestation	
-deontic	binding	138	Engine	verify_signed_key_record	
-deontic	binding	138	Engine	verify_signed_revocation	
-deontic	binding	138	Engine	verify_skill_import_manifest_b64	
-deontic	binding	138	Engine	verify_storage_budget_v1	
-deontic	binding	138	Engine	wa_cert_set_active	
-deontic	binding	138	Engine	wa_cert_upsert	
-deontic	binding	138	Engine	widen_audience	
-deontic	binding	138	Engine	withdraw_canonical_role	
-deontic	binding	138	Engine	wrap_dek_for_recipient_v2_b64	
-deontic	binding	138	ReconsiderDosGuard	admit_filing	
-deontic	binding	138	ReconsiderDosGuard	record_outcome	
+deontic	binding	141	Engine	accord_nonce_issued	
+deontic	binding	141	Engine	add_community_member	
+deontic	binding	141	Engine	add_moderator	
+deontic	binding	141	Engine	add_peer_record_json	
+deontic	binding	141	Engine	adopt_scrub_upgrade	
+deontic	binding	141	Engine	apply_replicated_accord_evidence	
+deontic	binding	141	Engine	apply_replicated_attestation	
+deontic	binding	141	Engine	apply_replicated_key_record	
+deontic	binding	141	Engine	bake_assembled_genesis	
+deontic	binding	141	Engine	blackhole_prune_expired_iso	
+deontic	binding	141	Engine	blackhole_record_hit	
+deontic	binding	141	Engine	blackhole_remove	
+deontic	binding	141	Engine	blackhole_upsert	
+deontic	binding	141	Engine	build_corpus_want_v1	
+deontic	binding	141	Engine	build_storage_budget_v1	
+deontic	binding	141	Engine	check_no_moderator_federate_json	
+deontic	binding	141	Engine	cirisnode_cast_vote	
+deontic	binding	141	Engine	cirisnode_process_takedown_admission_json	
+deontic	binding	141	Engine	cirisnode_put_key_grant_json	
+deontic	binding	141	Engine	cirisnode_put_moderation_event	
+deontic	binding	141	Engine	cirisnode_put_promotion_attestation	
+deontic	binding	141	Engine	cirisnode_put_reconsideration_attestation	
+deontic	binding	141	Engine	cirisnode_put_reconsideration_request	
+deontic	binding	141	Engine	cirisnode_put_slashing_attestation	
+deontic	binding	141	Engine	cirisnode_retire_key_grants_json	
+deontic	binding	141	Engine	clear_active_halt	
+deontic	binding	141	Engine	cohort_add_member	
+deontic	binding	141	Engine	cohort_build_membership_change_envelope	
+deontic	binding	141	Engine	cohort_revoke_member	
+deontic	binding	141	Engine	cohort_supersede_group	
+deontic	binding	141	Engine	cohort_supersede_group_with_quorum	
+deontic	binding	141	Engine	cohort_swap_member	
+deontic	binding	141	Engine	cohort_verify_membership_quorum	
+deontic	binding	141	Engine	community_dek_set_key_state	
+deontic	binding	141	Engine	community_dek_set_retain_past_epochs	
+deontic	binding	141	Engine	corpus_want_admits	
+deontic	binding	141	Engine	deregister_federation_key	
+deontic	binding	141	Engine	emit_attestation	
+deontic	binding	141	Engine	emit_attestation_self	
+deontic	binding	141	Engine	enter_mesh	
+deontic	binding	141	Engine	escrow_create	
+deontic	binding	141	Engine	escrow_set_status	
+deontic	binding	141	Engine	evict_actor_json	
+deontic	binding	141	Engine	federation_grant_trust	
+deontic	binding	141	Engine	federation_revoke_trust	
+deontic	binding	141	Engine	file_moderation	
+deontic	binding	141	Engine	get_blob_for_viewer	
+deontic	binding	141	Engine	grant_delegation	
+deontic	binding	141	Engine	grant_trust	
+deontic	binding	141	Engine	has_accord_conferred_role	
+deontic	binding	141	Engine	install_storage_budget_v1	
+deontic	binding	141	Engine	is_load_bearing_json	
+deontic	binding	141	Engine	is_named_moderator_json	
+deontic	binding	141	Engine	is_steward_bound_json	
+deontic	binding	141	Engine	issue_accord_nonce	
+deontic	binding	141	Engine	ledger_advance_head	
+deontic	binding	141	Engine	ledger_register	
+deontic	binding	141	Engine	may_release_copy_json	
+deontic	binding	141	Engine	put_accord_decision_json	
+deontic	binding	141	Engine	put_accord_participation_json	
+deontic	binding	141	Engine	put_accord_proposal_json	
+deontic	binding	141	Engine	put_attestation	
+deontic	binding	141	Engine	put_blob_chunk_scoped	
+deontic	binding	141	Engine	put_blob_encrypted_community	
+deontic	binding	141	Engine	put_blob_encrypted_self_family	
+deontic	binding	141	Engine	put_blob_scoped	
+deontic	binding	141	Engine	put_blob_signing	
+deontic	binding	141	Engine	put_community_json	
+deontic	binding	141	Engine	put_edge_detection_event	
+deontic	binding	141	Engine	put_family_json	
+deontic	binding	141	Engine	put_fountain_content	
+deontic	binding	141	Engine	put_identity_occurrence_json	
+deontic	binding	141	Engine	put_org_membership	
+deontic	binding	141	Engine	put_organization	
+deontic	binding	141	Engine	put_partner_record	
+deontic	binding	141	Engine	put_public_key	
+deontic	binding	141	Engine	put_revocation	
+deontic	binding	141	Engine	put_scope_blob	
+deontic	binding	141	Engine	reachable_under_scope	
+deontic	binding	141	Engine	reachable_under_scope_with_reasons	
+deontic	binding	141	Engine	read_blob_as	
+deontic	binding	141	Engine	read_blob_for_community_viewer	
+deontic	binding	141	Engine	read_blob_range_as	
+deontic	binding	141	Engine	register_federation_key	
+deontic	binding	141	Engine	register_public_key	
+deontic	binding	141	Engine	rematerialize_role_withdrawals	
+deontic	binding	141	Engine	remove_moderator	
+deontic	binding	141	Engine	remove_peer_record	
+deontic	binding	141	Engine	resolve_key_statement_standing_json	
+deontic	binding	141	Engine	resolve_mesh_config_json	
+deontic	binding	141	Engine	resolve_quarantine_json	
+deontic	binding	141	Engine	resolve_reverse_quorum_json	
+deontic	binding	141	Engine	resolve_transit_eligibility_json	
+deontic	binding	141	Engine	revoke_delegation	
+deontic	binding	141	Engine	revoke_trust_grant	
+deontic	binding	141	Engine	seal_stream_scoped	
+deontic	binding	141	Engine	secrets_decapsulate	
+deontic	binding	141	Engine	secrets_decrypt	
+deontic	binding	141	Engine	secrets_forget_secret	
+deontic	binding	141	Engine	secrets_migrate_to_hardware_key	
+deontic	binding	141	Engine	secrets_process_incoming_text	
+deontic	binding	141	Engine	secrets_recall_secret	
+deontic	binding	141	Engine	secrets_reencrypt_all	
+deontic	binding	141	Engine	secrets_retrieve_secret	
+deontic	binding	141	Engine	secrets_rotate_master_key	
+deontic	binding	141	Engine	secrets_store_detected_secret	
+deontic	binding	141	Engine	secrets_store_secret	
+deontic	binding	141	Engine	secrets_update_filter_config	
+deontic	binding	141	Engine	serve_blob_to_peer_json	
+deontic	binding	141	Engine	service_token_revocation_check	
+deontic	binding	141	Engine	service_token_revocation_record	
+deontic	binding	141	Engine	set_active_halt	
+deontic	binding	141	Engine	set_consent_role	
+deontic	binding	141	Engine	set_multimedia_config_json	
+deontic	binding	141	Engine	set_retention	
+deontic	binding	141	Engine	set_storage_budget_bytes	
+deontic	binding	141	Engine	set_trust_threshold	
+deontic	binding	141	Engine	steward_bind	
+deontic	binding	141	Engine	steward_bind_incapacity	
+deontic	binding	141	Engine	storage_budget_supersedes	
+deontic	binding	141	Engine	supersede_canonical	
+deontic	binding	141	Engine	trust_root_verdict_json	
+deontic	binding	141	Engine	unwrap_dek_v2_b64	
+deontic	binding	141	Engine	update_peer_policy	
+deontic	binding	141	Engine	update_peer_trust	
+deontic	binding	141	Engine	verify_coord_check_observed_region	
+deontic	binding	141	Engine	verify_corpus_want_v1	
+deontic	binding	141	Engine	verify_hybrid	
+deontic	binding	141	Engine	verify_hybrid_via_directory	
+deontic	binding	141	Engine	verify_signed_attestation	
+deontic	binding	141	Engine	verify_signed_key_record	
+deontic	binding	141	Engine	verify_signed_revocation	
+deontic	binding	141	Engine	verify_skill_import_manifest_b64	
+deontic	binding	141	Engine	verify_storage_budget_v1	
+deontic	binding	141	Engine	wa_cert_set_active	
+deontic	binding	141	Engine	wa_cert_upsert	
+deontic	binding	141	Engine	widen_audience	
+deontic	binding	141	Engine	withdraw_canonical_role	
+deontic	binding	141	Engine	wrap_dek_for_recipient_v2_b64	
+deontic	binding	141	ReconsiderDosGuard	admit_filing	
+deontic	binding	141	ReconsiderDosGuard	record_outcome	
 empirical	descriptive	188	Engine	active_community_members_json	
 empirical	descriptive	188	Engine	active_family_members_json	
 empirical	descriptive	188	Engine	attestation_insert_local	
@@ -536,43 +539,44 @@ structural	binding	40	ScoringFactorStream	__anext__
 structural	binding	40	ScoringFactorStream	__iter__	
 structural	binding	40	ScoringFactorStream	__len__	
 structural	binding	40	ScoringFactorStream	__next__	
-testimonial	binding	40	Engine	audit_chain_proof	self_audit
-testimonial	binding	40	Engine	audit_list_entries	self_audit
-testimonial	binding	40	Engine	audit_next_chain_position	self_audit
-testimonial	binding	40	Engine	audit_record_entry	self_audit
-testimonial	binding	40	Engine	audit_verify_all_chains	self_audit
-testimonial	binding	40	Engine	audit_verify_chain	self_audit
-testimonial	binding	40	Engine	cirisnode_put_delivery_attestation	delivery_event
-testimonial	binding	40	Engine	compare_wholeness_witnesses_json	equivocation_evidence
-testimonial	binding	40	Engine	current_sth	log_commitment
-testimonial	binding	40	Engine	delete_traces_for_agent	erasure_effect
-testimonial	binding	40	Engine	delete_traces_for_agent_id_hash	erasure_effect
-testimonial	binding	40	Engine	descend_aggregated_sources	erasure_effect
-testimonial	binding	40	Engine	evict_fountain_content_hard_delete	erasure_effect
-testimonial	binding	40	Engine	hash_chain_gaps	self_audit
-testimonial	binding	40	Engine	latest_stream_sth	log_commitment
-testimonial	binding	40	Engine	ledger_list_fork_evidence	equivocation_evidence
-testimonial	binding	40	Engine	ledger_put_checkpoint	log_commitment
-testimonial	binding	40	Engine	ledger_record_fork_evidence	equivocation_evidence
-testimonial	binding	40	Engine	list_delivery_receipts_for	delivery_event
-testimonial	binding	40	Engine	list_witness_equivocations_json	equivocation_evidence
-testimonial	binding	40	Engine	lookup_signed_record_by_content_hash	upstream_attestation
-testimonial	binding	40	Engine	maintenance_archive_expired	erasure_effect
-testimonial	binding	40	Engine	maintenance_prune_audit_chain	self_audit
-testimonial	binding	40	Engine	next_sequence	self_audit
-testimonial	binding	40	Engine	peek_sequence	self_audit
-testimonial	binding	40	Engine	provenance_chain	self_audit
-testimonial	binding	40	Engine	put_delivery_receipt	delivery_event
-testimonial	binding	40	Engine	put_stream_sth	log_commitment
-testimonial	binding	40	Engine	put_wholeness_witness_json	equivocation_evidence
-testimonial	binding	40	Engine	rebuild_signed_wire_index	upstream_attestation
-testimonial	binding	40	Engine	receive_and_persist	upstream_attestation
-testimonial	binding	40	Engine	run_retention	erasure_effect
-testimonial	binding	40	Engine	seal_stream	log_commitment
-testimonial	binding	40	Engine	stream_consistency_proof	log_commitment
-testimonial	binding	40	Engine	stream_inclusion_proof	log_commitment
-testimonial	binding	40	Engine	sweep_ttl_expired	erasure_effect
-testimonial	binding	40	Engine	trust_grant_consistency_proof	log_commitment
-testimonial	binding	40	Engine	trust_grant_inclusion_proof	log_commitment
-testimonial	binding	40	Engine	tsdb_prune_summaries	erasure_effect
-testimonial	binding	40	Engine	verify_locale_inclusion_json	log_commitment
+testimonial	binding	41	Engine	audit_chain_proof	self_audit
+testimonial	binding	41	Engine	audit_list_entries	self_audit
+testimonial	binding	41	Engine	audit_next_chain_position	self_audit
+testimonial	binding	41	Engine	audit_record_entry	self_audit
+testimonial	binding	41	Engine	audit_verify_all_chains	self_audit
+testimonial	binding	41	Engine	audit_verify_chain	self_audit
+testimonial	binding	41	Engine	cirisnode_put_delivery_attestation	delivery_event
+testimonial	binding	41	Engine	compare_wholeness_witnesses_json	equivocation_evidence
+testimonial	binding	41	Engine	current_sth	log_commitment
+testimonial	binding	41	Engine	delete_traces_for_agent	erasure_effect
+testimonial	binding	41	Engine	delete_traces_for_agent_id_hash	erasure_effect
+testimonial	binding	41	Engine	descend_aggregated_sources	erasure_effect
+testimonial	binding	41	Engine	evict_fountain_content_hard_delete	erasure_effect
+testimonial	binding	41	Engine	hash_chain_gaps	self_audit
+testimonial	binding	41	Engine	latest_stream_sth	log_commitment
+testimonial	binding	41	Engine	ledger_list_fork_evidence	equivocation_evidence
+testimonial	binding	41	Engine	ledger_put_checkpoint	log_commitment
+testimonial	binding	41	Engine	ledger_record_fork_evidence	equivocation_evidence
+testimonial	binding	41	Engine	list_delivery_receipts_for	delivery_event
+testimonial	binding	41	Engine	list_witness_equivocations_json	equivocation_evidence
+testimonial	binding	41	Engine	lookup_signed_record_by_content_hash	upstream_attestation
+testimonial	binding	41	Engine	maintenance_archive_expired	erasure_effect
+testimonial	binding	41	Engine	maintenance_prune_audit_chain	self_audit
+testimonial	binding	41	Engine	next_sequence	self_audit
+testimonial	binding	41	Engine	peek_sequence	self_audit
+testimonial	binding	41	Engine	provenance_chain	self_audit
+testimonial	binding	41	Engine	put_delivery_receipt	delivery_event
+testimonial	binding	41	Engine	put_stream_sth	log_commitment
+testimonial	binding	41	Engine	put_wholeness_witness_json	equivocation_evidence
+testimonial	binding	41	Engine	rebuild_signed_wire_index	upstream_attestation
+testimonial	binding	41	Engine	receive_and_persist	upstream_attestation
+testimonial	binding	41	Engine	run_retention	erasure_effect
+testimonial	binding	41	Engine	seal_stream	log_commitment
+testimonial	binding	41	Engine	stream_chunks_json	log_commitment
+testimonial	binding	41	Engine	stream_consistency_proof	log_commitment
+testimonial	binding	41	Engine	stream_inclusion_proof	log_commitment
+testimonial	binding	41	Engine	sweep_ttl_expired	erasure_effect
+testimonial	binding	41	Engine	trust_grant_consistency_proof	log_commitment
+testimonial	binding	41	Engine	trust_grant_inclusion_proof	log_commitment
+testimonial	binding	41	Engine	tsdb_prune_summaries	erasure_effect
+testimonial	binding	41	Engine	verify_locale_inclusion_json	log_commitment

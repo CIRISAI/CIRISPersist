@@ -14406,16 +14406,23 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
-    async fn put_blob_chunk(
+    async fn put_blob_chunk_with_scope(
         &self,
         stream_id: &str,
         seq: u64,
         body: crate::federation::BlobBody,
         epoch: u64,
+        plaintext_size: u64,
+        cohort_scope: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
+        floor.check_scope(cohort_scope)?;
         let cap = self.inline_bytes_cap();
-        // Validation + hash-on-write (computes the chunk's content SHA).
-        let row = crate::federation::blobs::prepare_stream_chunk_row(&body, cap)?;
+        // Validation + hash-on-write (computes the chunk's content SHA) +
+        // the §12.3 floor check (the body is what the token says it is).
+        let row =
+            crate::federation::blobs::prepare_stream_chunk_row(&body, cap, floor, plaintext_size)?;
         // u64 → i64 binds (tokio_postgres has no ToSql for u64).
         let seq_i64 = i64::try_from(seq).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
@@ -14428,6 +14435,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     .into(),
             )
         })?;
+        let plaintext_i64 = i64::try_from(plaintext_size).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: plaintext_size exceeds i64".into(),
+            )
+        })?;
+        let scope = cohort_scope.to_owned();
+        let tier = floor.tier().as_str().to_owned();
 
         let mut client = self
             .get_client()
@@ -14437,17 +14451,24 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        // §11.4 / I27 — a community bind runs under the community's
+        // serialization boundary, like every other epoch-state operation.
+        if let Some(b) = &binding {
+            lock_community_tx(&tx, &b.community_key_id).await?;
+        }
 
         // 1. The chunk's bytes land as a normal federation_blobs row.
         //    Content-addressed + idempotent: a re-PUT of identical bytes
         //    is a no-op (ON CONFLICT DO NOTHING), exactly like
-        //    store_blob_local / the put_blob_chunks chunk rows.
+        //    store_blob_local / the put_blob_chunks chunk rows. Carries
+        //    the cohort and the tier the door resolved (§11.1 / §12.1).
         let sha_vec = row.sha256.to_vec();
         let media_type_null: Option<String> = None;
         tx.execute(
             "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type\
-             ) VALUES ($1, $2, $3, $4, $5, $6) \
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                cohort_scope, crypto_tier\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (sha256) DO NOTHING",
             &[
                 &sha_vec,
@@ -14456,6 +14477,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 &row.external_ref,
                 &row.size_bytes,
                 &media_type_null,
+                &scope,
+                &tier,
             ],
         )
         .await
@@ -14491,13 +14514,21 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // 3. The stream-index row. The (stream_id, seq) PK enforces
         //    monotonicity — a re-used seq is a PK conflict, mapped to
         //    InvalidArgument (NOT idempotent: the append-only rule).
+        //    V142: the chunk's PLAINTEXT size beside its stored size.
         let inserted = tx
             .execute(
                 "INSERT INTO cirislens.federation_stream_chunks (\
-                    stream_id, seq, chunk_sha, epoch, size_bytes\
-                 ) VALUES ($1, $2, $3, $4, $5) \
+                    stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (stream_id, seq) DO NOTHING",
-                &[&stream_id, &seq_i64, &sha_vec, &epoch_i64, &row.size_bytes],
+                &[
+                    &stream_id,
+                    &seq_i64,
+                    &sha_vec,
+                    &epoch_i64,
+                    &row.size_bytes,
+                    &plaintext_i64,
+                ],
             )
             .await
             .map_err(|e| {
@@ -14511,10 +14542,314 @@ impl crate::federation::BlobStorage for PostgresBackend {
             )));
         }
 
+        // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
+        //    conditional on the epoch still being the community's current
+        //    enabled one. Refused ⇒ the whole append rolls back.
+        if let Some(b) = &binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            let n = tx
+                .execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, epoch) \
+                     SELECT $1, $2, $3 \
+                      WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                                     WHERE community_key_id = $2 AND epoch = $3 \
+                                       AND key_state = 'enabled') \
+                        AND $3 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                                            WHERE community_key_id = $2), 0) \
+                     ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&sha_vec, &b.community_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind: {e}"))
+                })?;
+            let already_row = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
+                                      AND epoch = $3) AS b",
+                    &[&sha_vec, &b.community_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind check: {e}"))
+                })?;
+            let already: bool =
+                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
+            if n == 0 && !already {
+                let _ = tx.rollback().await;
+                return Err(crate::federation::BlobError::EpochNotCurrent {
+                    community_key_id: b.community_key_id.clone(),
+                    epoch: b.epoch,
+                });
+            }
+        }
+
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
         })?;
         Ok(row.sha256)
+    }
+
+    async fn seal_stream_with_scope(
+        &self,
+        stream_id: &str,
+        spec: crate::federation::ManifestRowSpec,
+        media_type: Option<&str>,
+        cohort_scope: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+    ) -> Result<(), crate::federation::BlobError> {
+        floor.check_scope(cohort_scope)?;
+        let cap = self.inline_bytes_cap();
+        if spec.body.len() > cap {
+            return Err(crate::federation::BlobError::InlineSizeExceeded {
+                size: spec.body.len(),
+                cap,
+            });
+        }
+        crate::federation::blobs::verify_inline_hash(&spec.sha256, &spec.body)?;
+        let size_i64 = i64::try_from(spec.size_bytes).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "seal_stream_with_scope: size_bytes exceeds i64".into(),
+            )
+        })?;
+        let expected = i64::try_from(spec.expected_chunk_count).unwrap_or(i64::MAX);
+        let scope = cohort_scope.to_owned();
+        let tier = floor.tier().as_str().to_owned();
+        let media = media_type.map(str::to_owned);
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        if let Some(b) = &binding {
+            lock_community_tx(&tx, &b.community_key_id).await?;
+        }
+        // §12.3 — the door listed N chunks and sealed a manifest over them;
+        // if the stream has moved since, refuse rather than truncate.
+        let count_row = tx
+            .query_one(
+                "SELECT COUNT(*) AS n FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream_with_scope count: {e}"))
+            })?;
+        let count: i64 = count_row.safe_get_with("n", crate::federation::BlobError::Backend)?;
+        if count != expected {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "seal_stream_with_scope: stream {stream_id} has {count} chunk(s) but the manifest \
+                 was built over {}; the stream moved under the seal — list it again \
+                 (BLOB_ENCRYPTION_AT_REST.md §12.3)",
+                spec.expected_chunk_count
+            )));
+        }
+        let sha_vec = spec.sha256.to_vec();
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                cohort_scope, crypto_tier\
+             ) VALUES ($1, 'chunk_dag', $2, NULL, $3, $4, $5, $6) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[&sha_vec, &spec.body, &size_i64, &media, &scope, &tier],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "seal_stream_with_scope manifest insert: {e}"
+            ))
+        })?;
+        if let Some(b) = &binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            let n = tx
+                .execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, epoch) \
+                     SELECT $1, $2, $3 \
+                      WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                                     WHERE community_key_id = $2 AND epoch = $3 \
+                                       AND key_state = 'enabled') \
+                        AND $3 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                                            WHERE community_key_id = $2), 0) \
+                     ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&sha_vec, &b.community_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "seal_stream_with_scope bind: {e}"
+                    ))
+                })?;
+            let already_row = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
+                                      AND epoch = $3) AS b",
+                    &[&sha_vec, &b.community_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "seal_stream_with_scope bind check: {e}"
+                    ))
+                })?;
+            let already: bool =
+                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
+            if n == 0 && !already {
+                let _ = tx.rollback().await;
+                return Err(crate::federation::BlobError::EpochNotCurrent {
+                    community_key_id: b.community_key_id.clone(),
+                    epoch: b.epoch,
+                });
+            }
+        }
+        tx.execute(
+            "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("seal_stream_with_scope sealed_at: {e}"))
+        })?;
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("seal_stream_with_scope commit: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn stream_chunks(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::federation::StreamChunks, crate::federation::BlobError> {
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        // One transaction at REPEATABLE READ: the listing and the STH are
+        // one snapshot (I37). READ COMMITTED would give each statement its
+        // own.
+        let tx = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        let rows = tx
+            .query(
+                "SELECT c.seq, c.chunk_sha, c.epoch, c.size_bytes, c.plaintext_size_bytes, \
+                        b.crypto_tier, b.cohort_scope \
+                   FROM cirislens.federation_stream_chunks c \
+                   JOIN cirislens.federation_blobs b ON b.sha256 = c.chunk_sha \
+                  WHERE c.stream_id = $1 \
+                  ORDER BY c.seq ASC",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("stream_chunks: {e}")))?;
+        let sth_row = tx
+            .query_one(
+                "SELECT MAX(tree_size) AS t FROM cirislens.federation_stream_sth WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("stream_chunks sth: {e}"))
+            })?;
+        let sth: Option<i64> = sth_row.safe_get_with("t", crate::federation::BlobError::Backend)?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("stream_chunks: {e}")))?;
+        let mut chunks = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let seq: i64 = r.safe_get_with("seq", crate::federation::BlobError::Backend)?;
+            let sha_vec: Vec<u8> =
+                r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
+            if sha_vec.len() != 32 {
+                return Err(crate::federation::BlobError::Backend(format!(
+                    "stream_chunks: chunk_sha is {} bytes, expected 32",
+                    sha_vec.len()
+                )));
+            }
+            let mut chunk_sha = [0u8; 32];
+            chunk_sha.copy_from_slice(&sha_vec);
+            let epoch: i64 = r.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+            let size: i64 = r.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+            let plain: i64 = r.safe_get_with(
+                "plaintext_size_bytes",
+                crate::federation::BlobError::Backend,
+            )?;
+            let tier: String =
+                r.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
+            let cohort_scope: String =
+                r.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
+            let crypto_tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&tier)
+                .ok_or_else(|| {
+                    crate::federation::BlobError::Backend(format!(
+                        "stream_chunks: chunk row carries unknown tier {tier:?}"
+                    ))
+                })?;
+            chunks.push(crate::federation::StreamChunkRef {
+                seq: seq.max(0) as u64,
+                chunk_sha,
+                epoch: epoch.max(0) as u64,
+                size_bytes: size.max(0) as u64,
+                plaintext_size: plain.max(0) as u64,
+                crypto_tier,
+                cohort_scope,
+            });
+        }
+        Ok(crate::federation::StreamChunks {
+            chunks,
+            sth_tree_size: sth.map(|n| n.max(0) as u64),
+        })
+    }
+
+    async fn blob_head(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobHead>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT storage_kind, crypto_tier, cohort_scope, size_bytes \
+                   FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[&sha256.to_vec()],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("blob_head: {e}")))?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let storage_kind: String =
+            r.safe_get_with("storage_kind", crate::federation::BlobError::Backend)?;
+        let tier: String = r.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
+        let cohort_scope: String =
+            r.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
+        let size: i64 = r.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+        let crypto_tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&tier)
+            .ok_or_else(|| {
+                crate::federation::BlobError::Backend(format!(
+                    "blob_head: row carries unknown tier {tier:?}"
+                ))
+            })?;
+        Ok(Some(crate::federation::BlobHead {
+            storage_kind,
+            crypto_tier,
+            cohort_scope,
+            size_bytes: size.max(0) as u64,
+        }))
     }
 
     async fn seal_stream(&self, stream_id: &str) -> Result<[u8; 32], crate::federation::BlobError> {
@@ -14528,20 +14863,27 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
 
-        // 1. Read the seq-ordered chunk index for the stream.
+        // 1. Read the seq-ordered chunk index for the stream, joined to
+        //    each chunk ROW's recorded tier (#832 §12.3 / I32 — the commons
+        //    seal refuses a sealed chunk row; the helper checks).
         let index_rows = tx
             .query(
-                "SELECT chunk_sha, size_bytes \
-                   FROM cirislens.federation_stream_chunks \
-                  WHERE stream_id = $1 \
-                  ORDER BY seq ASC",
+                "SELECT c.chunk_sha, c.size_bytes, b.crypto_tier \
+                   FROM cirislens.federation_stream_chunks c \
+                   JOIN cirislens.federation_blobs b ON b.sha256 = c.chunk_sha \
+                  WHERE c.stream_id = $1 \
+                  ORDER BY c.seq ASC",
                 &[&stream_id],
             )
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("seal_stream index read: {e}"))
             })?;
-        let mut chunk_rows: Vec<([u8; 32], i64)> = Vec::with_capacity(index_rows.len());
+        let mut chunk_rows: Vec<(
+            [u8; 32],
+            i64,
+            crate::federation::types::cohort_scope::CryptoTier,
+        )> = Vec::with_capacity(index_rows.len());
         for r in &index_rows {
             let sha_vec: Vec<u8> =
                 r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
@@ -14554,7 +14896,15 @@ impl crate::federation::BlobStorage for PostgresBackend {
             let mut sha = [0u8; 32];
             sha.copy_from_slice(&sha_vec);
             let size: i64 = r.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
-            chunk_rows.push((sha, size));
+            let tier: String =
+                r.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
+            let tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&tier)
+                .ok_or_else(|| {
+                    crate::federation::BlobError::Backend(format!(
+                        "seal_stream: chunk row carries unknown tier {tier:?}"
+                    ))
+                })?;
+            chunk_rows.push((sha, size, tier));
         }
 
         // 2. Build the sealed manifest + the chunk_dag manifest row.
@@ -14985,7 +15335,8 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     SET access_count = access_count + 1, \
                         last_accessed_at = NOW() \
                   WHERE sha256 = $1 \
-                  RETURNING storage_kind, bytes_inline, external_ref, size_bytes, media_type",
+                  RETURNING storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                            crypto_tier",
                 &[&sha_vec],
             )
             .await
@@ -14997,8 +15348,19 @@ impl crate::federation::BlobStorage for PostgresBackend {
         };
         let storage_kind: String =
             row.safe_get_with("storage_kind", crate::federation::BlobError::Backend)?;
+        let crypto_tier: String =
+            row.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
         match storage_kind.as_str() {
             "inline" => {
+                let bytes: Vec<u8> =
+                    row.safe_get_with("bytes_inline", crate::federation::BlobError::Backend)?;
+                Ok(Some(crate::federation::BlobBody::Inline(bytes)))
+            }
+            // #832 (§12.2 / I33) — a SEALED manifest is opaque at the storage
+            // layer: the tier COLUMN says the bytes are an envelope, so hand
+            // them out as inline bytes for a relay to forward. Only the read
+            // door opens them. Dispatch is on the column, never the bytes.
+            "chunk_dag" if crypto_tier != "plaintext" => {
                 let bytes: Vec<u8> =
                     row.safe_get_with("bytes_inline", crate::federation::BlobError::Backend)?;
                 Ok(Some(crate::federation::BlobBody::Inline(bytes)))
@@ -15066,7 +15428,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     SET access_count = access_count + 1, \
                         last_accessed_at = NOW() \
                   WHERE sha256 = $1 \
-                  RETURNING storage_kind, size_bytes, external_ref, media_type",
+                  RETURNING storage_kind, size_bytes, external_ref, media_type, crypto_tier",
                 &[&sha_vec],
             )
             .await
@@ -15078,6 +15440,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
         };
         let storage_kind: String =
             row.safe_get_with("storage_kind", crate::federation::BlobError::Backend)?;
+        let crypto_tier: String =
+            row.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
+        // #832 (§12.2 / I33) — a sealed manifest row is opaque bytes at this
+        // layer (its size_bytes IS the envelope length); serve a substring
+        // exactly as for an inline row. Decided by the tier COLUMN. This
+        // path never decrypts (I36).
+        let opaque_manifest = storage_kind == "chunk_dag" && crypto_tier != "plaintext";
+        let dispatch_kind = if opaque_manifest {
+            "inline"
+        } else {
+            storage_kind.as_str()
+        };
         let size_bytes_i64: i64 =
             row.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
         let size = u64::try_from(size_bytes_i64).map_err(|_| {
@@ -15092,7 +15466,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // 3. Clamp the inclusive end to size-1.
         let end = range_end_inclusive.min(size - 1);
         let len = end - range_start + 1; // >= 1
-        match storage_kind.as_str() {
+        match dispatch_kind {
             "inline" => {
                 // Server-side substring — PG `substring` is 1-indexed, so
                 // FROM = range_start + 1. NEVER loads the whole
@@ -24066,6 +24440,129 @@ mod tests {
         crate::federation::at_rest_cascade::blob_invariants::exercise_i20_the_primary_cannot_be_retired(&backend, &tag).await;
     }
 
+    /// §12.7 I32 (commons half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i32_commons_seal_refuses_a_sealed_chunk_row_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i32_commons_seal_refuses_a_sealed_chunk_row(&backend, &tag).await;
+    }
+
+    /// §12.7 I35 (commons half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i35_whole_read_of_a_dag_is_its_content_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i35_whole_read_of_a_dag_is_its_content(&backend, &tag).await;
+    }
+
+    /// §12.7 I32 (scoped half) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i32_scoped_seal_checks_chunk_rows_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i32_scoped_seal_checks_chunk_rows(&backend, &tag).await;
+    }
+
+    /// §12.7 I33 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i33_sealed_manifest_is_opaque_and_stranger_refused_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i33_sealed_manifest_is_opaque_and_stranger_refused(&backend, &tag).await;
+    }
+
+    /// §12.7 I34 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i34_range_read_maps_plaintext_to_chunks_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i34_range_read_maps_plaintext_to_chunks(&backend, &tag).await;
+    }
+
+    /// §12.7 I34b — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i34b_self_dag_reads_by_grant_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i34b_self_dag_reads_by_grant(
+            &backend, &tag,
+        )
+        .await;
+    }
+
+    /// §12.7 I35 (the cap) — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i35_whole_read_refuses_above_the_cap_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i35_whole_read_refuses_above_the_cap(&backend, &tag).await;
+    }
+
+    /// §12.7 I37 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i37_stream_chunks_is_the_live_handle_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i37_stream_chunks_is_the_live_handle(&backend, &tag).await;
+    }
+
+    /// §12.7 I38 — see `chunk_dag_cascade::invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i38_a_chunk_keeps_its_epoch_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::chunk_dag_cascade::invariants::exercise_i38_a_chunk_keeps_its_epoch(
+            &backend, &tag,
+        )
+        .await;
+    }
+
     /// §11.10 — see `at_rest_cascade::blob_invariants`.
     #[tokio::test]
     async fn blob_invariant_i23_the_door_announces_under_the_signers_derived_key_postgres() {
@@ -24209,7 +24706,7 @@ mod tests {
             "I16: a binding whose blob is gone is removed"
         );
         let r = crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer(
-            &backend, &a, "stranger",
+            &backend, &a, "stranger", None,
         )
         .await;
         assert!(
@@ -24268,6 +24765,19 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg{}", uuid_like());
         crate::federation::at_rest_cascade::blob_invariants::exercise_i31_eviction_is_a_fact_a_reader_is_told(&backend, &tag).await;
+    }
+
+    /// §11.10 I40 — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i40_associated_data_binds_the_seal_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i40_associated_data_binds_the_seal(&backend, &tag).await;
     }
 
     /// §11.10 I27 — **one serialization boundary per community, measured by
@@ -29065,9 +29575,10 @@ mod tests {
             .unwrap();
 
         let plaintext = b"a private note, scoped to self (pg)";
-        let result = encrypt_and_cascade(&backend, SELF, &root, plaintext, Some("text/plain"))
-            .await
-            .unwrap();
+        let result =
+            encrypt_and_cascade(&backend, SELF, &root, plaintext, Some("text/plain"), None)
+                .await
+                .unwrap();
         assert_eq!(result.granted, vec![keyed.clone()]);
         assert_eq!(result.excluded, vec![bare.clone()]);
 
@@ -29223,7 +29734,7 @@ mod tests {
             .await
             .unwrap();
         let plaintext = b"family blob written before bob/carol registered devices (pg)";
-        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None)
+        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None, None)
             .await
             .unwrap();
         assert_eq!(result.granted, vec![alice_p.clone()]);
@@ -29896,7 +30407,7 @@ mod tests {
             .await
             .unwrap();
 
-        let blob1 = encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None)
+        let blob1 = encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None, None)
             .await
             .unwrap();
         assert_eq!(blob1.granted, vec![alice_p.clone()]);
@@ -29945,7 +30456,7 @@ mod tests {
         assert!(looked.members.iter().any(|m| m.key_id == bob));
 
         // Forward path: a NEW write reaches BOTH alice + bob.
-        let blob2 = encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None)
+        let blob2 = encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None, None)
             .await
             .unwrap();
         let mut granted = blob2.granted.clone();
@@ -38361,6 +38872,7 @@ mod tests {
         let s2 = pg_sha256_of(&c2);
         let total = (c0.len() + c1.len() + c2.len()) as u64;
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: total,
             chunks: vec![
@@ -38528,6 +39040,7 @@ mod tests {
         s_ext[..16].copy_from_slice(&nanos.to_be_bytes());
         s_ext[16..].copy_from_slice(&nanos.to_be_bytes());
         let manifest = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: c0.len() as u64 + 100,
             chunks: vec![
@@ -38739,6 +39252,7 @@ mod tests {
 
         // ChunkDag body to put_blob_chunk → InvalidArgument.
         let nested = ChunkManifest {
+            chunk_tier: None,
             v: 1,
             total_size: 4,
             chunks: vec![ChunkRef {
