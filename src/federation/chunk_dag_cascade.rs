@@ -1125,6 +1125,53 @@ pub mod invariants {
             "{tag} I32: a commons stream was sealed as a community DAG: {res:?}"
         );
 
+        // The FLOOR refuses a self-contradicting row (I25): a sealed-tier
+        // token over a body that is not an envelope, and a plaintext token
+        // whose declared size is not the body's.
+        {
+            use crate::federation::{EpochBinding, StorageFloor};
+            let floor_stream = format!("{tag}-floor-{run}");
+            let res = backend
+                .put_blob_chunk_with_scope(
+                    &floor_stream,
+                    0,
+                    BlobBody::Inline(b"not an envelope".to_vec()),
+                    0,
+                    15,
+                    COMMUNITY,
+                    StorageFloor::resolved(CryptoTier::CommunityDek),
+                    Some(EpochBinding {
+                        community_key_id: comm.clone(),
+                        epoch: 0,
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(res, Err(BlobError::InvalidArgument(_))),
+                "{tag} I32: the chunk floor recorded a sealed tier over PLAINTEXT bytes: {res:?}"
+            );
+            assert!(
+                !backend.has_blob(&sha(b"not an envelope")).await.unwrap(),
+                "{tag} I32: refused bytes are not on disk"
+            );
+            let res = backend
+                .put_blob_chunk_with_scope(
+                    &floor_stream,
+                    0,
+                    BlobBody::Inline(b"plain".to_vec()),
+                    0,
+                    4, // lies about the size
+                    COMMUNITY,
+                    StorageFloor::resolved(CryptoTier::Plaintext),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(res, Err(BlobError::InvalidArgument(_))),
+                "{tag} I32: the chunk floor accepted a plaintext_size that is not the body's: {res:?}"
+            );
+        }
+
         // The honest case (its own node key: the helper registers one).
         let good = format!("{tag}-good-{run}");
         let (manifest, _, _) = sealed_community_stream(
@@ -1644,6 +1691,50 @@ pub mod invariants {
             !c1.granted.contains(&bob_occ),
             "{tag} I38: bob is not granted at e1"
         );
+        // I17 at the chunk floor: an append that binds at the rotated-past
+        // epoch (still `enabled` — no sweep ran) is refused as a UNIT: no
+        // blob row, no index row, nothing to orphan.
+        {
+            use crate::federation::at_rest_cascade::{fresh_dek, seal};
+            use crate::federation::{EpochBinding, StorageFloor};
+            assert_eq!(
+                backend.community_dek_key_state(&comm, e0).await.unwrap(),
+                Some(crate::federation::DekKeyState::Enabled),
+                "{tag} I38: precondition — e0 is still enabled"
+            );
+            let stale = seal(&fresh_dek().unwrap(), b"stale", None)
+                .unwrap()
+                .to_bytes();
+            let stale_sha = sha(&stale);
+            let res = backend
+                .put_blob_chunk_with_scope(
+                    &stream,
+                    2,
+                    BlobBody::Inline(stale),
+                    0,
+                    5,
+                    COMMUNITY,
+                    StorageFloor::resolved(CryptoTier::CommunityDek),
+                    Some(EpochBinding {
+                        community_key_id: comm.clone(),
+                        epoch: e0,
+                    }),
+                )
+                .await;
+            assert!(
+                matches!(res, Err(BlobError::EpochNotCurrent { .. })),
+                "{tag} I38: the chunk floor bound a chunk to a rotated-past epoch: {res:?}"
+            );
+            assert!(
+                !backend.has_blob(&stale_sha).await.unwrap(),
+                "{tag} I38: a refused append left its blob row behind"
+            );
+            assert_eq!(
+                backend.stream_chunks(&stream).await.unwrap().chunks.len(),
+                2,
+                "{tag} I38: a refused append left its index row behind"
+            );
+        }
         let sealed = seal_stream_scoped(
             backend,
             &adapter,
