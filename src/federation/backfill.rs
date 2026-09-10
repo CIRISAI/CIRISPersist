@@ -315,11 +315,11 @@ mod sqlite_tests {
                     scrub_signature_classical, scrub_key_id, \
                     scrub_timestamp, persist_row_hash, \
                     trust_type, trust_relationship, trust_domains, \
-                    trusted_by, trusted_at, expires_at\
+                    trusted_by, trusted_at, expires_at, admitted_at\
                  ) VALUES (?1, ?1, 'hybrid', 'agent', ?1, \
                           '2026-01-01T00:00:00Z', '{}', x'00', '', ?1, \
                           '2026-01-01T00:00:00Z', '0', \
-                          ?2, ?3, ?4, ?5, ?6, ?7)",
+                          ?2, ?3, ?4, ?5, ?6, ?7, '2026-01-01T00:00:00Z')",
                 rusqlite::params![
                     pubkey,
                     trust_type,
@@ -348,10 +348,10 @@ mod sqlite_tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, ?1, 'hybrid', 'agent', ?1, \
                           '2026-01-01T00:00:00Z', '{}', x'00', '', ?1, \
-                          '2026-01-01T00:00:00Z', '0')",
+                          '2026-01-01T00:00:00Z', '0', '2026-01-01T00:00:00Z')",
                 rusqlite::params![pubkey],
             )
             .unwrap();

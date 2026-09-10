@@ -269,10 +269,11 @@ mod sqlite_tests {
                     identity_type, identity_ref, valid_from, \
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_key_id, \
-                    scrub_timestamp, persist_row_hash\
+                    scrub_timestamp, persist_row_hash, admitted_at\
                  ) VALUES (?1, 'AAAA', 'hybrid', 'agent', ?1, \
                           '2026-01-01T00:00:00Z', '{}', \
-                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0')",
+                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0', \
+                          '2026-01-01T00:00:00Z')",
                 rusqlite::params![key_id],
             )
             .unwrap();
