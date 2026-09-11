@@ -22,6 +22,8 @@ pub mod memory;
 #[cfg(test)]
 /// CIRISPersist#789 — the crypto-cardinality declaration gate.
 pub(crate) mod crypto_cardinality;
+/// #840 (I43/I44) — the migration-immutability gate and V070's repair.
+mod migration_immutability;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub mod migration_timing;
 /// v31.2.0 (CIRISPersist#670) — **the backend-parity gate.**

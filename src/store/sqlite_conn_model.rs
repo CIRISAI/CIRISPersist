@@ -507,6 +507,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("release_shared_instance_lease", ConnClass::Write),
     ("remove_peer_record", ConnClass::Write),
     ("remove_transport_destination", ConnClass::Write),
+    // #840 (I44) — the V070 checksum repair: a conditional UPDATE on the
+    // schema-history table, run before refinery validates it.
+    ("repair_v070_checksum", ConnClass::Write),
     ("replay_abandoned", ConnClass::Write),
     ("reseal_attestation_v31", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),

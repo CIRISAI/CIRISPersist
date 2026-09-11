@@ -262,6 +262,21 @@ mod migration_guard {
             .insert(dsn.to_owned());
     }
 
+    /// Test-only: forget `dsn`, so the next `run_migrations` re-enters the
+    /// migration phase exactly as a RESTARTED process does.
+    ///
+    /// #840's witnesses need it: both the break (refinery's divergence
+    /// abort) and its repair live INSIDE the phase this guard skips, so a
+    /// second call in the same process would prove nothing about a node
+    /// coming back up.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub(super) fn forget_for_tests(dsn: &str) {
+        migrated()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(dsn);
+    }
+
     /// Count one entry into the migration phase.
     pub(super) fn note_phase_entered() {
         PHASES_ENTERED.fetch_add(1, Ordering::Relaxed);
@@ -439,11 +454,52 @@ async fn lock_community_tx(
 }
 
 impl PostgresBackend {
+    /// Test-only: make the next `run_migrations` behave like a fresh process
+    /// boot. See [`migration_guard::forget_for_tests`].
+    ///
+    /// `pub` under the same cfg as `run_migrations_through` and for the same
+    /// reason: CI lints with `--all-features` on the LIB alone, where a
+    /// `pub(crate)` test helper has no caller and reads as dead code.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub fn forget_migration_guard_for_tests(&self) {
+        migration_guard::forget_for_tests(&self.dsn);
+    }
+
+    /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
+    ///
+    /// Postgres twin of the sqlite repair. Runs on the caller's client, so
+    /// the main boot path executes it INSIDE the migration advisory lock and
+    /// two booting workers cannot race it. Narrow by construction: version
+    /// 70, that name, and the one literal checksum those releases wrote —
+    /// any other divergence still aborts the boot. See
+    /// `FSD/MIGRATION_IMMUTABILITY.md` §3.
+    async fn repair_v070_checksum(
+        client: &tokio_postgres::Client,
+    ) -> Result<u64, tokio_postgres::Error> {
+        use crate::store::migration_immutability as mi;
+        let present: bool = client
+            .query_one(mi::POSTGRES_HISTORY_TABLE_PROBE, &[])
+            .await?
+            .get(0);
+        if !present {
+            return Ok(0);
+        }
+        client
+            .execute(mi::repair_statement(mi::Dialect::Postgres).as_str(), &[])
+            .await
+    }
+
     /// Test-only: apply migrations up to and including `version` (see the
     /// sqlite twin). No advisory lock — a test database has one writer.
     #[cfg(any(test, feature = "test-anchor"))]
     pub async fn run_migrations_through(&self, version: u32) -> Result<(), Error> {
         let mut client = self.dedicated_connect().await?;
+        Self::repair_v070_checksum(&client)
+            .await
+            .map_err(|e| Error::Migration {
+                sqlstate: None,
+                detail: format!("postgres V070 checksum repair (#840): {e}"),
+            })?;
         let mut runner =
             embedded::migrations::runner().set_target(refinery::Target::Version(version as _));
         runner
@@ -1829,6 +1885,19 @@ impl Backend for PostgresBackend {
         // when set, it appends one JSON-Lines entry per migration
         // apply documenting total_wall_us + applied_count +
         // applied_versions. See `crate::store::migration_timing`.
+        // #840 (I44) — BEFORE refinery reads the history table, and inside
+        // the advisory lock this connection holds: a node that applied V070
+        // under v43.0.0–v44.1.0 carries a checksum the shipped file no
+        // longer produces, and refinery would abort the boot here.
+        if let Err(e) = Self::repair_v070_checksum(&lock_client).await {
+            let _ = lock_client
+                .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+                .await;
+            return Err(Error::Migration {
+                sqlstate: None,
+                detail: format!("postgres V070 checksum repair (#840): {e}"),
+            });
+        }
         let migration_started = std::time::Instant::now();
         // v7.0.0 — V079 (the TimescaleDB continuous-aggregate accelerator)
         // is left IMMUTABLE and unmodified, like V001's hypertable guard:
@@ -44997,6 +45066,92 @@ mod tests {
             .map(|_| ());
         crate::federation::admission::ungated_doors_test_support::assert_role_launder_refused(
             "postgres", a, b,
+        );
+    }
+
+    /// **I44 (#840) — a node that recorded the BRICKED V070 checksum boots,
+    /// on postgres.** Sqlite twin:
+    /// [`crate::store::sqlite`]`::i44_a_node_that_recorded_the_bricked_v070_checksum_boots`.
+    ///
+    /// Needs an EMPTY database of its own: it runs migrations twice and
+    /// rewrites a history row between them, which no shared template can
+    /// serve.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn i44_a_node_that_recorded_the_bricked_v070_checksum_boots_postgres() {
+        use crate::store::migration_immutability as mi;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+
+        // Become population B: the history row v43.0.0–v44.1.0 wrote.
+        let client = backend.dedicated_connect().await.expect("client");
+        let touched = client
+            .execute(
+                "UPDATE ciris_persist_schema_history SET checksum = $1 WHERE version = 70",
+                &[&mi::V070_BRICKED_CHECKSUM_POSTGRES],
+            )
+            .await
+            .expect("fixture update");
+        assert_eq!(touched, 1, "the fixture must have moved exactly one row");
+
+        // A RESTART: the migration phase is per process, and both the break
+        // and the repair live inside it.
+        backend.forget_migration_guard_for_tests();
+
+        // The next boot. This is the whole invariant.
+        backend
+            .run_migrations()
+            .await
+            .expect("a node carrying the bricked V070 checksum must boot");
+
+        let after: String = client
+            .query_one(
+                "SELECT checksum FROM ciris_persist_schema_history WHERE version = 70",
+                &[],
+            )
+            .await
+            .expect("read back")
+            .get(0);
+        assert_eq!(
+            after,
+            mi::V070_CANONICAL_CHECKSUM_POSTGRES,
+            "the repair must rewrite the row to the shipped file's checksum"
+        );
+    }
+
+    /// #840 — on postgres too, a divergence that is not #840's still refuses
+    /// to boot. The repair is not a general escape hatch.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn a_divergence_that_is_not_840_still_refuses_to_boot_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let client = backend.dedicated_connect().await.expect("client");
+        let touched = client
+            .execute(
+                "UPDATE ciris_persist_schema_history SET checksum = $1 WHERE version = 70",
+                &[&"1234567890123456789"],
+            )
+            .await
+            .expect("fixture update");
+        assert_eq!(touched, 1);
+        backend.forget_migration_guard_for_tests();
+        let err = backend
+            .run_migrations()
+            .await
+            .expect_err("an unrelated divergence must still abort");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is different than filesystem one"),
+            "expected refinery's divergence refusal, got: {msg}"
         );
     }
 
