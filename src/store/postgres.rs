@@ -454,11 +454,14 @@ async fn lock_community_tx(
 }
 
 impl PostgresBackend {
-    /// Test-only: make the next [`run_migrations`](Self::run_migrations)
-    /// behave like a fresh process boot. See
-    /// [`migration_guard::forget_for_tests`].
+    /// Test-only: make the next `run_migrations` behave like a fresh process
+    /// boot. See [`migration_guard::forget_for_tests`].
+    ///
+    /// `pub` under the same cfg as `run_migrations_through` and for the same
+    /// reason: CI lints with `--all-features` on the LIB alone, where a
+    /// `pub(crate)` test helper has no caller and reads as dead code.
     #[cfg(any(test, feature = "test-anchor"))]
-    pub(crate) fn forget_migration_guard_for_tests(&self) {
+    pub fn forget_migration_guard_for_tests(&self) {
         migration_guard::forget_for_tests(&self.dsn);
     }
 
