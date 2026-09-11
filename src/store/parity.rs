@@ -473,6 +473,13 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("references_attestation_id_from_envelope", Class::Plumbing),
     ("reject_future_dated_community_revocation", Class::Gate),
     ("reload_record_bytes", Class::Plumbing),
+    // #840 (I44) — the V070 checksum repair. PLUMBING, and the reason is
+    // that it cannot refuse anything: one conditional UPDATE whose entire
+    // predicate is this crate's own constants (version 70, that name, one
+    // literal checksum). No caller input reaches it, and a node with nothing
+    // to repair sees a zero-row update. The thing that DOES refuse —
+    // refinery's divergence check — runs immediately after it, untouched.
+    ("repair_v070_checksum", Class::Plumbing),
     ("resolve", Class::Plumbing),
     ("resolve_steward_roster", Class::Gate),
     ("revocation_fold_target", Class::Plumbing),

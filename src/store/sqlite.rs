@@ -158,10 +158,41 @@ pub struct SqliteBackend {
 }
 
 impl SqliteBackend {
+    /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
+    ///
+    /// Those releases shipped V070 with one word changed inside a comment,
+    /// so a database created under them recorded a checksum that the
+    /// (reverted) shipped file no longer produces. Left alone, refinery
+    /// aborts the boot with `DivergentVersion` before anything binds.
+    ///
+    /// Narrow by construction: version 70, that name, and the one literal
+    /// checksum those releases wrote. Any other divergence is a real one and
+    /// still aborts. No-op on a fresh database and on every node that never
+    /// ran a broken release. See `FSD/MIGRATION_IMMUTABILITY.md` §3.
+    pub(crate) async fn repair_v070_checksum(&self) -> Result<usize, Error> {
+        use crate::store::migration_immutability as mi;
+        self.write(|conn| -> Result<usize, rusqlite::Error> {
+            let present: bool = conn
+                .query_row(mi::SQLITE_HISTORY_TABLE_PROBE, [], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+            if !present {
+                return Ok(0);
+            }
+            conn.execute(&mi::repair_statement(mi::Dialect::Sqlite), [])
+        })
+        .await
+        .map_err(|e| Error::Migration {
+            sqlstate: None,
+            detail: format!("sqlite V070 checksum repair (#840): {e}"),
+        })
+    }
+
     /// Test-only: apply migrations up to and including `version`, so a test
     /// can seed rows in the PRE-migration shape and then run the rest.
     #[cfg(any(test, feature = "test-anchor"))]
     pub async fn run_migrations_through(&self, version: u32) -> Result<(), Error> {
+        self.repair_v070_checksum().await?;
         self.write(move |conn| -> Result<(), refinery::Error> {
             embedded::migrations::runner()
                 .set_target(refinery::Target::Version(version as _))
@@ -1021,6 +1052,10 @@ impl Backend for SqliteBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
+        // #840 (I44) — BEFORE refinery reads the history table: a node that
+        // applied V070 under v43.0.0–v44.1.0 carries a checksum the shipped
+        // file no longer produces, and refinery would abort the boot here.
+        self.repair_v070_checksum().await?;
         // refinery's `runner().run(&mut Connection)` is sync; we wrap
         // it in spawn_blocking. SQLite has no advisory-lock equivalent
         // to postgres's `pg_advisory_lock`, but the Phase 1 sovereign-
@@ -22428,6 +22463,88 @@ impl crate::derived::DerivedSchema for SqliteBackend {
 #[cfg(test)]
 mod accord_tests {
     use super::*;
+
+    /// **I44 (#840) — a node that recorded the BRICKED V070 checksum boots.**
+    ///
+    /// `4847ede5` edited a comment inside V070, which changed its refinery
+    /// checksum. Reverting the file un-bricks every node that applied V070
+    /// before that edit — and would brick the nodes that applied it from
+    /// v43.0.0–v44.1.0, which recorded the post-edit value. This drives that
+    /// second population: apply, become it, and boot again.
+    ///
+    /// Without the repair, the second `run_migrations` is
+    /// `DivergentVersion` and the node never starts.
+    #[tokio::test]
+    async fn i44_a_node_that_recorded_the_bricked_v070_checksum_boots() {
+        use crate::store::migration_immutability as mi;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Become population B: the history row v43.0.0–v44.1.0 wrote.
+        let bricked = mi::V070_BRICKED_CHECKSUM_SQLITE;
+        let touched = backend
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = 70",
+                    rusqlite::params![bricked],
+                )
+                .unwrap()
+            })
+            .await;
+        assert_eq!(touched, 1, "the fixture must have moved exactly one row");
+
+        // The next boot. This is the whole invariant.
+        backend
+            .run_migrations()
+            .await
+            .expect("a node carrying the bricked V070 checksum must boot");
+
+        // And it is NORMALISED, not merely tolerated — the next boot after
+        // this one must not depend on the repair running again.
+        let after: String = backend
+            .write(|conn| {
+                conn.query_row(
+                    "SELECT checksum FROM refinery_schema_history WHERE version = 70",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .await;
+        assert_eq!(
+            after,
+            mi::V070_CANONICAL_CHECKSUM_SQLITE,
+            "the repair must rewrite the row to the shipped file's checksum"
+        );
+    }
+
+    /// #840 — the repair is not a general escape hatch: a row that diverged
+    /// for ANY other reason still aborts the boot. A repair that matched on
+    /// version alone would swallow a real schema divergence.
+    #[tokio::test]
+    async fn a_divergence_that_is_not_840_still_refuses_to_boot() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let touched = backend
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE refinery_schema_history SET checksum = ?1 WHERE version = 70",
+                    rusqlite::params!["1234567890123456789"],
+                )
+                .unwrap()
+            })
+            .await;
+        assert_eq!(touched, 1);
+        let err = backend
+            .run_migrations()
+            .await
+            .expect_err("an unrelated divergence must still abort");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is different than filesystem one"),
+            "expected refinery's divergence refusal, got: {msg}"
+        );
+    }
 
     /// #302 — accord live-quorum storage parity on sqlite (shares the
     /// assertion body with memory + pg).

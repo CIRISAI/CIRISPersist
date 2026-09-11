@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.1.1] - 2026-09-11
+
+**A shipped migration's bytes are the contract, comments included.**
+CIRISPersist#840: `4847ede5` (the v43.0.0 FSD rename) changed one word inside
+a SQL **comment** in both dialect copies of
+`V070__ceg_018_at_rest_blob_key_grants.sql`. `refinery` checksums the entire
+file text, so that +1/−1 documentation edit changed the migration's checksum
+and every node that had applied V070 before 2026-09-09 failed validation
+inside `run_migrations`, inside `Engine::with_*`, **before anything binds** —
+on v43.0.0, v43.1.0, v44.0.0 and v44.1.0 alike. It took the CIRIS canonical
+down for ~7 minutes and crash-looped it 16 times (CIRISServer#586). No data
+was damaged. New FSD: `FSD/MIGRATION_IMMUTABILITY.md` (I43, I44).
+
+The failure is structurally invisible to a fresh database — which is every
+test node, every harness node and every CI lane, here and downstream — because
+a fresh apply records the current checksum and has nothing to mismatch. Only a
+node with a past can see it.
+
+### Fixed — the revert, and the half of the repair the revert cannot do
+- **V070 is byte-identical to v42.1.0 again** in both dialects. Its comment
+  therefore names `ENCRYPTED_AT_REST.md`, this document's predecessor under
+  its former name, and it stays that way permanently: a shipped migration
+  names documents as of its own date.
+- **A node that applied V070 from v43.0.0–v44.1.0 also boots.** Those nodes
+  recorded the *post-edit* checksum, so a bare revert would have moved the
+  outage onto them and it would have arrived with the fix. Before refinery
+  validates anything, persist now rewrites a V070 history row carrying that
+  one literal checksum to the shipped file's (I44). It is narrow on purpose —
+  version 70, that exact name, that one checksum — runs inside postgres's
+  existing migration advisory lock, is idempotent, and is a no-op on a fresh
+  database. **Any other divergence still aborts the boot**, with a witness on
+  both backends that proves it.
+
+### Added — the gate, so the class cannot recur
+- `evidence/migration_checksums.tsv` pins `(dialect, version, name, checksum)`
+  for all 270 migration files; `src/store/migration_immutability.rs` recomputes
+  each with refinery's own hasher and compares (I43). Editing a shipped
+  migration reds it with the reason and the remedy: write a new migration.
+  Adding one reds it until the row is added, which is the moment to notice the
+  file is now permanent. The count is asserted both ways, so a gate that finds
+  nothing cannot pass. Hermetic — no tags, no network, no git history — so it
+  behaves identically in a shallow CI clone. Proposed by the CIRIS deploy role
+  while diagnosing the outage.
+- Test-only `forget_migration_guard_for_tests` on the postgres backend: the
+  migration phase is once-per-process, so a witness for a node coming back up
+  has to simulate the restart or it proves nothing.
+
+### Not changed
+The scan behind this cut found two older migrations whose bytes changed after
+their first release — postgres `V001` (0.1.0 → 0.1.2, 2026-04-30) and postgres
+`V059` (3.12.0 → 3.12.1, 2026-06-03). Both were same-day corrections and
+V059's original was *rejected by postgres* (sqlstate 42P17), so no node can
+have recorded it. They are pinned at their current bytes and held there.
+
 ## [44.1.0] - 2026-09-10
 
 **A stream belongs to its first append, and a chunk is bound to its
