@@ -139,18 +139,23 @@ pub(crate) const SQLITE_SUBSEC_OCCURRENCES_SHIPPED: usize = 44;
 #[cfg(test)]
 pub(crate) const SUBSEC_ALLOWED_THROUGH: i32 = 144;
 
-/// #845 — the live-schema rewrite, `type = 'table'` rows only. Run under
-/// `PRAGMA writable_schema = ON`, then bump `schema_version` and
-/// `integrity_check` (the documented procedure for a change `ALTER TABLE`
-/// cannot express).
-#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
-pub(crate) fn portable_default_repair_statement() -> String {
-    format!(
-        "UPDATE sqlite_master SET sql = replace(sql, \"{}\", \"{}\") \
-         WHERE type = 'table' AND sql LIKE '%subsec%'",
-        SQLITE_SUBSEC_DEFAULT, SQLITE_PORTABLE_DEFAULT
-    )
-}
+/// #845 — how many live `CREATE TABLE` statements carry the exact obsolete
+/// default. Bind [`SQLITE_SUBSEC_DEFAULT`] as `?1`. The exact expression,
+/// never the substring: a consumer table with a `subsec_note` column must not
+/// count (Codex, #849).
+#[allow(dead_code)]
+pub(crate) const SQLITE_OBSOLETE_DEFAULT_COUNT: &str =
+    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND instr(sql, ?1) > 0";
+
+/// #845 — the live-schema rewrite, `type = 'table'` rows only. Bind
+/// [`SQLITE_SUBSEC_DEFAULT`] as `?1` and [`SQLITE_PORTABLE_DEFAULT`] as `?2`
+/// — bound, never spelled in double quotes, which `SQLITE_DQS=0` parses as
+/// identifiers (Codex, #849). Run under `PRAGMA writable_schema = ON`, then
+/// bump `schema_version` and `integrity_check` (the documented procedure for a
+/// change `ALTER TABLE` cannot express).
+#[allow(dead_code)]
+pub(crate) const SQLITE_PORTABLE_DEFAULT_REWRITE: &str =
+    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE type = 'table' AND instr(sql, ?1) > 0";
 
 /// #840 (I44) — is the schema-history table present? A fresh database has
 /// none, and the repair must be a silent no-op there rather than an error.

@@ -516,7 +516,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("remove_transport_destination", ConnClass::Write),
     // #845 (I55) — the portable-default repair: a writable_schema rewrite
     // of sqlite_master, run after the migrations.
-    ("repair_portable_defaults", ConnClass::Write),
+    ("repair_portable_defaults_with", ConnClass::Write),
     // #840 (I44) — the V070 checksum repair: a conditional UPDATE on the
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),
@@ -526,6 +526,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("retire_goal", ConnClass::Write),
     ("revocations_for", ConnClass::Read),
     ("revoke_trust", ConnClass::Write),
+    // #845 (I55) — the nine documented steps, in one transaction: a free fn
+    // handed the writer's connection from inside `repair_portable_defaults_with`.
+    ("rewrite_portable_defaults_in_tx", ConnClass::HelperWrite),
     ("run_migrations", ConnClass::Write),
     ("run_migrations_through", ConnClass::Write),
     ("sample_public_keys", ConnClass::Read),

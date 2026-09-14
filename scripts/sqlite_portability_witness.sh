@@ -26,7 +26,8 @@ files = sorted(glob.glob("migrations/sqlite/lens/V*.sql"), key=lambda p: int(re.
 for f in files:
     c.executescript(open(f).read())
 print(f"applied {len(files)} shipped sqlite migrations")
-live = c.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%subsec%'").fetchone()[0]
+COUNT = "SELECT count(*) FROM sqlite_master WHERE type='table' AND instr(sql, ?) > 0"
+live = c.execute(COUNT, (SUBSEC,)).fetchone()[0]
 assert live > 0, "expected shipped schema text to name subsec before the repair"
 probe = "INSERT INTO federation_content_master (id, key_kind, master_key_b64, descriptor) VALUES (0, 'software', 'AAAA', '{}')"
 if old:
@@ -38,12 +39,12 @@ if old:
 # the repair — the same procedure and literals as SqliteBackend::repair_portable_defaults
 v = c.execute("PRAGMA schema_version").fetchone()[0]
 c.execute("PRAGMA writable_schema = ON")
-n = c.execute(f"UPDATE sqlite_master SET sql = replace(sql, \"{SUBSEC}\", \"{PORTABLE}\") WHERE type = 'table' AND sql LIKE '%subsec%'").rowcount
+n = c.execute("UPDATE sqlite_master SET sql = replace(sql, ?, ?) WHERE type = 'table' AND instr(sql, ?) > 0", (SUBSEC, PORTABLE, SUBSEC)).rowcount
 c.execute("PRAGMA writable_schema = OFF")
 c.execute(f"PRAGMA schema_version = {v + 1}")
 ok = c.execute("PRAGMA integrity_check").fetchone()[0]
 assert ok == "ok", ok
-left = c.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND sql LIKE '%subsec%'").fetchone()[0]
+left = c.execute(COUNT, (SUBSEC,)).fetchone()[0]
 assert left == 0, f"{left} table(s) still name subsec"
 print(f"repair rewrote {n} table(s); integrity ok; no subsec remains")
 c.execute(probe)

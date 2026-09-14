@@ -195,6 +195,9 @@ crate, not in the ledger.
 |---|---|---|---|
 | I55 | After `run_migrations` on sqlite, no `CREATE TABLE` text in `sqlite_master` contains `subsec`; an `INSERT` omitting a defaulted timestamp column succeeds and stores the 23-character form; a second run rewrites nothing. | a bookworm host that cannot write; a repair that changes the stored format | behavioural (sqlite), and the bookworm witness |
 | I55b | The repair succeeds on a connection with `SQLITE_DBCONFIG_DEFENSIVE` on, and defensive mode is restored afterwards. | an Apple node whose boot aborts on a refused rewrite; a repair that leaves defensive mode off | behavioural (sqlite) |
+| I55c | The rewrite succeeds with double-quoted strings disabled (`SQLITE_DQS=0` / `SQLITE_DBCONFIG_DQS_*` off): both literals are bound parameters and the statement spells no `"`. | a build that parses `"…"` as an identifier and fails `no such column` | behavioural (sqlite) |
+| I55d | A failed rewrite leaves `writable_schema` OFF and the shipped text untouched; a real repair then succeeds. | a declined repair that leaves the live writer editable for the process | behavioural (sqlite) |
+| I55e | A foreign table whose DDL merely contains the substring `subsec` neither counts nor fails the post-condition: the exact obsolete expression is what is matched. | a consumer column named `subsec_note` aborting every boot on a pre-3.42 host | behavioural (sqlite) |
 | I56 | No migration file after V144, in either dialect, contains `subsec`; the shipped set's count is pinned (44 in sqlite, 0 in postgres). | a new migration that reintroduces the modifier | from-disk |
 | I57 | The shell witness `scripts/sqlite_portability_witness.sh` and the Rust repair carry the same two literals, so what CI proves on 3.40.1 is what the crate does. | a witness that tests a different rewrite | from-disk |
 

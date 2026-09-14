@@ -42,6 +42,16 @@ image. `FSD/MIGRATION_IMMUTABILITY.md` §6, invariants I55–I58.
   Apple node is never bricked to fix a Debian one. On a library where the
   modifier evaluates (>= 3.42) a refused repair is a warning and writes
   proceed; where it is NULL, a refused repair is fatal, stated once.
+  Three refinements from Codex's review of #849, each witnessed red first:
+  the two literals are **bound parameters** (a double-quoted SQL string is
+  an identifier under `SQLITE_DQS=0`, and the rewrite failed `no such
+  column` — I55c); `writable_schema` is turned **off unconditionally**
+  after the attempt (a rolled-back transaction does not reset the
+  connection flag, and a declined repair on a >= 3.42 library would have
+  left the live writer editable for the process — I55d); and the count and
+  post-condition match the **exact obsolete expression**, never the
+  substring (a consumer table with a `subsec_note` column would otherwise
+  have aborted every boot on a pre-3.42 host — I55e).
 - **Nine runtime statements** — the community-DEK epoch rotation
   (`rotated_at`), maintenance locks, incidents, telemetry — now use the
   portable form. On 3.40.1 they wrote NULL into nullable columns silently or
