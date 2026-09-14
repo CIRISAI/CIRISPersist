@@ -304,11 +304,12 @@ pub use admission::{
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
-    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobEpochBinding,
-    BlobError, BlobHead, BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
-    EpochBinding, EvictActorReport, ExternalRef, GroupDekRef, ManifestRowSpec, PutBlobAttestation,
-    PutBlobScopedResult, ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim,
-    StreamHead, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
+    holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
+    BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow, BlobRange, BlobStorage,
+    ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport, ExternalRef,
+    GroupDekRef, ManifestRowSpec, PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult,
+    ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamHead,
+    CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};

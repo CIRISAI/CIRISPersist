@@ -468,6 +468,7 @@ pub mod orchestrate {
         community_key_id: &str,
         plaintext: &[u8],
         media_type: Option<&str>,
+        author_key_id: Option<&str>,
     ) -> Result<CommunityCascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -479,6 +480,7 @@ pub mod orchestrate {
             plaintext,
             media_type,
             None,
+            author_key_id,
         )
         .await
     }
@@ -495,6 +497,7 @@ pub mod orchestrate {
         plaintext: &[u8],
         media_type: Option<&str>,
         aad: Option<&[u8]>,
+        author_key_id: Option<&str>,
     ) -> Result<CommunityCascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -534,6 +537,7 @@ pub mod orchestrate {
                 plaintext,
                 media_type,
                 aad,
+                author_key_id,
             )
             .await?
             {
@@ -578,6 +582,7 @@ pub mod orchestrate {
     /// a public blob). [`encrypt_and_cascade_community`] is the door and
     /// loops over this; it is crate-private so no consumer can seal at an
     /// epoch of its choosing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn seal_store_bind_at<B>(
         backend: &B,
         cohort_scope: &str,
@@ -586,6 +591,7 @@ pub mod orchestrate {
         plaintext: &[u8],
         media_type: Option<&str>,
         aad: Option<&[u8]>,
+        author_key_id: Option<&str>,
     ) -> Result<SealOutcome, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -606,6 +612,9 @@ pub mod orchestrate {
                 media_type,
                 cohort_scope,
                 crate::federation::StorageFloor::resolved(CryptoTier::CommunityDek),
+                // #846 (§5) — the writer; the announce that follows a scoped
+                // put stamps the same key if this was `None`.
+                author_key_id,
             )
             .await?;
         match backend
@@ -1325,9 +1334,10 @@ pub mod lifecycle_harness {
         .await;
 
         // ── 2. ENCRYPT (epoch 0) ─────────────────────────────────────────
-        let before = encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
+        let before =
+            encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
         assert_eq!(
             before.epoch, 0,
             "{tag}: a never-rotated community is epoch 0"
@@ -1353,9 +1363,10 @@ pub mod lifecycle_harness {
         super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
 
         // ── 5. ENCRYPT AGAIN — lands on the NEW epoch ────────────────────
-        let after = encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
+        let after =
+            encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
         assert!(
             after.epoch > before.epoch,
             "{tag}: rotation must advance the epoch ({} -> {})",

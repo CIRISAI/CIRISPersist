@@ -4883,6 +4883,10 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        // #846 (§5) — the row's author is THIS node's derived key (I23).
+        let author = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -4893,6 +4897,7 @@ impl Engine {
                     plaintext,
                     media_type,
                     None,
+                    Some(&author),
                 )
                 .await
             }
@@ -4905,6 +4910,7 @@ impl Engine {
                     plaintext,
                     media_type,
                     None,
+                    Some(&author),
                 )
                 .await
             }
@@ -5152,16 +5158,32 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        // #846 (§5) — the row's author is THIS node's derived key (I23).
+        let author = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                encrypt_and_cascade_community(arc.as_ref(), community_key_id, plaintext, media_type)
-                    .await
+                encrypt_and_cascade_community(
+                    arc.as_ref(),
+                    community_key_id,
+                    plaintext,
+                    media_type,
+                    Some(&author),
+                )
+                .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                encrypt_and_cascade_community(arc.as_ref(), community_key_id, plaintext, media_type)
-                    .await
+                encrypt_and_cascade_community(
+                    arc.as_ref(),
+                    community_key_id,
+                    plaintext,
+                    media_type,
+                    Some(&author),
+                )
+                .await
             }
         }
     }

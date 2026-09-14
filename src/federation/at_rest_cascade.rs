@@ -982,6 +982,7 @@ pub mod orchestrate {
         plaintext: &[u8],
         media_type: Option<&str>,
         aad: Option<&[u8]>,
+        author_key_id: Option<&str>,
     ) -> Result<CascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -1009,6 +1010,10 @@ pub mod orchestrate {
                 crate::federation::StorageFloor::resolved(
                     crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
                 ),
+                // #846 (§5) — the writer, recorded on the row. A self/family
+                // row is never announced, so this is the ONLY place its
+                // author can be written; `None` classifies as proxy.
+                author_key_id,
             )
             .await?;
 
@@ -1960,9 +1965,16 @@ pub mod orchestrate {
                 // §11.2 (5) / I21 — the matcher sees the PLAINTEXT, before sealing.
                 let plain_sha: [u8; 32] = sha2::Sha256::digest(plaintext).into();
                 backend.screen_inline_body(&plain_sha, plaintext).await?;
-                let r =
-                    encrypt_and_cascade(backend, cohort_scope, owner, plaintext, media_type, aad)
-                        .await?;
+                let r = encrypt_and_cascade(
+                    backend,
+                    cohort_scope,
+                    owner,
+                    plaintext,
+                    media_type,
+                    aad,
+                    Some(signer_key_id),
+                )
+                .await?;
                 Ok(PutBlobScopedResult {
                     at_rest_sha256: r.at_rest_sha256,
                     tier,
@@ -1986,6 +1998,7 @@ pub mod orchestrate {
                     plaintext,
                     media_type,
                     aad,
+                    Some(signer_key_id),
                 )
                 .await?;
                 // ANNOUNCE the sealed bytes: community content federates with
@@ -2587,7 +2600,7 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None, None)
             .await
             .unwrap();
 
@@ -2633,7 +2646,7 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, None)
             .await
             .unwrap();
         let epoch = sealed.epoch;
@@ -2708,7 +2721,7 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, None)
             .await
             .unwrap();
         let epoch = sealed.epoch;
@@ -2779,7 +2792,7 @@ pub mod blob_invariants {
         let signer = node_signer(backend, &node).await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None, None)
             .await
             .unwrap();
         // Announce this node as a holder of the sealed bytes (community
@@ -2987,7 +3000,7 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"before", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"before", None, None)
             .await
             .unwrap();
         let old = sealed.epoch;
@@ -3016,7 +3029,7 @@ pub mod blob_invariants {
             1,
             "{tag} I17: the pre-rotation binding is untouched"
         );
-        let again = encrypt_and_cascade_community(backend, &comm, b"after", None)
+        let again = encrypt_and_cascade_community(backend, &comm, b"after", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3034,6 +3047,7 @@ pub mod blob_invariants {
             &comm,
             old,
             b"raced",
+            None,
             None,
             None,
         )
@@ -3100,7 +3114,7 @@ pub mod blob_invariants {
         }
 
         // (a) announce, retract by hand, then sweep: exactly ONE withdraws.
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None, None)
             .await
             .unwrap();
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
@@ -3165,7 +3179,7 @@ pub mod blob_invariants {
         // (b) announce again under a NEW epoch; make the withdraws inadmissible
         //     by handing the sweep a `now` far outside the admission skew; the
         //     bytes and binding must survive and the error must surface.
-        let sealed2 = encrypt_and_cascade_community(backend, &comm, b"newer", None)
+        let sealed2 = encrypt_and_cascade_community(backend, &comm, b"newer", None, None)
             .await
             .unwrap();
         let Some(BlobBody::Inline(bytes2)) =
@@ -3236,7 +3250,7 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3295,7 +3309,7 @@ pub mod blob_invariants {
             &[(&alice, &alice_occ)],
         )
         .await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, None)
             .await
             .unwrap();
         let current = backend.community_dek_current_epoch(&comm).await.unwrap();
@@ -3322,7 +3336,7 @@ pub mod blob_invariants {
             );
         }
         // Still writable.
-        encrypt_and_cascade_community(backend, &comm, b"still fine", None)
+        encrypt_and_cascade_community(backend, &comm, b"still fine", None, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I20: the community is wedged: {e}"));
     }
@@ -3592,6 +3606,7 @@ pub mod blob_invariants {
                     None,
                     scope,
                     StorageFloor::resolved(tier),
+                    None,
                 )
                 .await;
             assert!(
@@ -3632,7 +3647,7 @@ pub mod blob_invariants {
         let node_derived = signer.derived_key_id();
 
         // The cascade half of the door: sealed, stored, bound.
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"raced", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"raced", None, None)
             .await
             .unwrap();
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
@@ -3717,7 +3732,7 @@ pub mod blob_invariants {
         seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
 
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None, None)
             .await
             .unwrap();
         let e0 = sealed.epoch;
@@ -4187,6 +4202,7 @@ pub mod blob_invariants_fixture {
                 crate::federation::StorageFloor::resolved(
                     crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
                 ),
+                None,
             )
             .await
             .expect("floor write");

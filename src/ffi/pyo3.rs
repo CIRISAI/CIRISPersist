@@ -1291,6 +1291,19 @@ impl PyEngine {
         }
     }
 
+    /// #846 (§5 / I23) — this node's DERIVED federation key id, for the
+    /// bindings that must record an author on a row. The same derivation
+    /// `Engine::local_derived_key_id` runs; `ValueError` on a non-Ed25519
+    /// composed signer (#275). Call from inside `py.detach`.
+    fn local_derived_key_id_blocking(&self) -> PyResult<String> {
+        let signer = self.signer.clone();
+        self.runtime.block_on(async move {
+            crate::signing::federation_key_id_of(&*signer)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))
+        })
+    }
+
     /// v6.8.0 (CIRISPersist#149) — proxy-ACCEPT disk-pressure gate.
     /// Returns `Err(DiskPressureProxyRefused)` (mapped to a Permanent
     /// `ValueError` via [`blob_err_to_py`]) when the substrate is at the
@@ -9514,6 +9527,9 @@ impl PyEngine {
                                 crate::federation::StorageFloor::resolved(
                                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                                 ),
+                                // #846 — this door carries no signer; unknown
+                                // classifies as proxy (fail toward evictable).
+                                None,
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -9533,6 +9549,9 @@ impl PyEngine {
                                 crate::federation::StorageFloor::resolved(
                                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                                 ),
+                                // #846 — this door carries no signer; unknown
+                                // classifies as proxy (fail toward evictable).
+                                None,
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -12580,6 +12599,8 @@ impl PyEngine {
             let media = media_type.map(str::to_owned);
             py.detach(move || {
                 use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+                // #846 (§5) — the row's author is this node's derived key (I23).
+                let author = self.local_derived_key_id_blocking()?;
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -12590,6 +12611,7 @@ impl PyEngine {
                                 &community,
                                 &plaintext,
                                 media.as_deref(),
+                                Some(&author),
                             )
                             .await
                         })
@@ -12603,6 +12625,7 @@ impl PyEngine {
                                 &community,
                                 &plaintext,
                                 media.as_deref(),
+                                Some(&author),
                             )
                             .await
                         })
@@ -13433,6 +13456,8 @@ impl PyEngine {
             let media = media_type.map(str::to_owned);
             py.detach(move || {
                 use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+                // #846 (§5) — the row's author is this node's derived key (I23).
+                let author = self.local_derived_key_id_blocking()?;
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -13445,6 +13470,7 @@ impl PyEngine {
                                 &plaintext,
                                 media.as_deref(),
                                 None,
+                                Some(&author),
                             )
                             .await
                         })
@@ -13460,6 +13486,7 @@ impl PyEngine {
                                 &plaintext,
                                 media.as_deref(),
                                 None,
+                                Some(&author),
                             )
                             .await
                         })
@@ -31685,6 +31712,20 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         crate::federation::BlobError::QuarantineWithheld { ref key_id } => {
             PyValueError::new_err(format!("{kind}: {key_id}"))
         }
+        // #846 (§4, I48) — not party to the declared cohort. PERMANENT for
+        // this node (a policy fact, not capacity): place the content with a
+        // member. The declared cohort and community ride in the message —
+        // the caller's own input echoed, never a row.
+        crate::federation::BlobError::NotPartyTo {
+            ref cohort_scope,
+            ref community_key_id,
+        } => PyValueError::new_err(format!(
+            "{kind}: {cohort_scope}{}",
+            community_key_id
+                .as_deref()
+                .map(|c| format!(" community {c}"))
+                .unwrap_or_default()
+        )),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
