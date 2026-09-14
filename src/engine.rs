@@ -933,6 +933,18 @@ fn resolve_row_placement(
     })
 }
 
+/// #846 (`BLOB_REPLICATION.md` §5) — the local-or-family predicate every
+/// proxy classification on this Engine runs: this node's DERIVED key (I23),
+/// or the operator's family predicate. Built once per decision or sweep
+/// cycle; passed to [`is_proxy_content`](crate::federation::is_proxy_content).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn local_or_family_predicate(
+    our_key: String,
+    family: Option<crate::federation::FamilyPredicate>,
+) -> impl Fn(&str) -> bool {
+    move |k: &str| k == our_key || family.as_ref().is_some_and(|f| f(k))
+}
+
 impl Engine {
     /// Construct an Engine with a pre-loaded
     /// [`LocalSigner`](crate::signing::LocalSigner) `Arc` plus a
@@ -1366,33 +1378,6 @@ impl Engine {
         }
     }
 
-    /// v6.8.0 (CIRISPersist#149) — is `attesting_key_id` local-or-family
-    /// (and therefore NEVER refused / never proxy)? Uses the installed
-    /// [`DiskPressureConfig::is_local_or_family`](crate::federation::DiskPressureConfig::is_local_or_family)
-    /// predicate against the local
-    /// signer key_id. With no disk-pressure config installed, only the
-    /// local signer itself is treated as protected. This is the SAME
-    /// classification the force-evict-proxy-first sweep uses.
-    ///
-    /// v9.3.0 (#247) — `attesting_key_id` on a row is the producer's
-    /// DERIVED federation key_id (`<label>-<fp>`), so the local-identity
-    /// comparison is against the local signer's DERIVED id (via the
-    /// preserved [`LocalSigner`](crate::signing::LocalSigner)), not the
-    /// keystore alias. Falls back to the alias when no LocalSigner is
-    /// carried (the `from_shared` cohabitation view).
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub fn is_local_or_family_key(&self, attesting_key_id: &str) -> bool {
-        let signer_key_id = self
-            .local_signer
-            .as_ref()
-            .map(|s| s.derived_key_id())
-            .unwrap_or_else(|| self.signer.current_alias().to_owned());
-        match &self.disk_pressure_config {
-            Some(cfg) => cfg.is_local_or_family(attesting_key_id, &signer_key_id),
-            None => attesting_key_id == signer_key_id,
-        }
-    }
-
     /// v3.6.0 (CIRISPersist#134) — install / replace the media-sharing
     /// operator config. `None` clears it (persist defaults apply).
     ///
@@ -1742,25 +1727,20 @@ impl Engine {
                 .or_insert(att);
         }
 
-        // v6.8.0 (#149): classify each candidate as proxy vs
-        // local/family using the signer's holds_bytes index. A SHA with
-        // a local holds_bytes from a key the engine considers
-        // local-or-family is PROTECTED (evict last under pressure); a
-        // SHA with no local holds_bytes (or one whose attesting key is
-        // not local/family) is PROXY (evict first under pressure).
-        let pressure_cfg = self.disk_pressure_config();
+        // #846 (§5, I49) — classify each candidate on the ROW's author,
+        // through the one predicate. It used to key on the holds_bytes
+        // ATTESTER, which for anything this node adopted is this node —
+        // every relayed blob read as protected. The holds_bytes index above
+        // stays what it is for: the withdraws the sweeper emits for its OWN
+        // announcements. A NULL author (pre-V144, or a signer-less commons
+        // chunk) is unknown ⇒ proxy: fail toward evictable.
+        let (our_key, fam) = self.local_or_family_parts().await?;
+        let local_or_family = local_or_family_predicate(our_key, fam);
         let is_proxy = |candidate: &crate::federation::EvictionCandidate| -> bool {
-            let holds_bytes_type =
-                crate::federation::holds_bytes_attestation_type(&candidate.sha256);
-            match holds_bytes_by_type.get(&holds_bytes_type) {
-                None => true, // no local provenance ⇒ proxy
-                Some(att) => match &pressure_cfg {
-                    Some(dp) => !dp.is_local_or_family(&att.attesting_key_id, &signer_key_id),
-                    // No disk-pressure config installed: anything WE
-                    // attested is local; treat all attested as protected.
-                    None => att.attesting_key_id != signer_key_id,
-                },
-            }
+            crate::federation::is_proxy_content(
+                candidate.author_key_id.as_deref(),
+                &local_or_family,
+            )
         };
 
         // v13.0.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
@@ -4781,6 +4761,12 @@ impl Engine {
     ///
     /// See the trait method's doc-comment for the full rationale —
     /// the JCS-vs-Python silent-correctness trap this method closes.
+    ///
+    /// #846 (`BLOB_REPLICATION.md` §4) — runs [`would_hold`](Self::would_hold)
+    /// first: the commons is everyone's, so this is the #149 rule — a proxy
+    /// write (an author neither local nor family) is refused at the stop
+    /// tier; local + family never. The author is `attesting_key_id`, recorded
+    /// on the row.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_signing(
@@ -4794,19 +4780,20 @@ impl Engine {
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::BlobStorage;
 
-        // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on the
-        // proxy-ACCEPT path. At the stop tier (or tighter) we refuse to
-        // ACCEPT new federation-proxied content (attesting key neither
-        // the local signer nor family). Local + family writes are NEVER
-        // refused — local content is the operator's own data. Reads the
-        // cached snapshot (no statvfs per write).
-        let pressure = self.current_disk_pressure();
-        if pressure.refuses_proxy_writes && !self.is_local_or_family_key(attesting_key_id) {
-            return Err(crate::federation::BlobError::DiskPressureProxyRefused {
-                operation: "accept",
-                tier: pressure.tier.label(),
-            });
-        }
+        // #846 (BLOB_REPLICATION.md §4, I46) — THE WILL DECISION, in its one
+        // place. This is the commons door, and everyone is party to the
+        // commons, so the decision reduces to the #149 pressure rule: a
+        // proxy write (author neither local nor family) is refused at the
+        // stop tier, local + family writes are NEVER refused. The cached
+        // snapshot, no statvfs per write.
+        self.would_hold(&crate::federation::BlobProvenance {
+            author_key_id: attesting_key_id.to_owned(),
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        })
+        .await?;
 
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -4832,6 +4819,230 @@ impl Engine {
                     &**self.signer(),
                     now,
                     attestation_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §5) — this node's derived key and the
+    /// operator's family predicate: the two halves of "local-or-family",
+    /// as the one predicate every proxy classification runs.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn local_or_family_parts(
+        &self,
+    ) -> Result<(String, Option<crate::federation::FamilyPredicate>), crate::federation::BlobError>
+    {
+        let our_key = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
+        let fam = self
+            .disk_pressure_config()
+            .and_then(|c| c.is_family.clone());
+        Ok((our_key, fam))
+    }
+
+    /// #846 (§5) — the row's provenance (delegates to the backend's
+    /// [`blob_provenance`](crate::federation::BlobStorage::blob_provenance)).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn blob_provenance(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobProvenanceRow>, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.blob_provenance(sha256).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.blob_provenance(sha256).await,
+        }
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §4, §6.3, I46) — **the WILL decision as a
+    /// door of its own.** Given content this node MAY hold (Edge's
+    /// `admit_blob_store` decided that), would it hold it *now*? Writes
+    /// nothing, so Edge can ask before fetching whether the fetch is worth
+    /// making. The adopt doors and [`put_blob_signing`](Self::put_blob_signing)
+    /// call the same function; there are not two copies.
+    ///
+    /// `Ok(())` = hold. Refusals are typed and name the axis:
+    /// [`BlobError::NotPartyTo`](crate::federation::BlobError::NotPartyTo) —
+    /// persist never stores data this node is not party to, whatever its
+    /// serve standing; [`BlobError::DiskPressureProxyRefused`](crate::federation::BlobError::DiskPressureProxyRefused)
+    /// `{ operation: "accept" }` — at the stop tier, content held for others
+    /// is refused. A local or family author is always held. Serve standing
+    /// is not consulted here: it governs [`hold_breadth`](Self::hold_breadth),
+    /// never acceptance.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn would_hold(
+        &self,
+        provenance: &crate::federation::BlobProvenance,
+    ) -> Result<(), crate::federation::BlobError> {
+        let (our_key, fam) = self.local_or_family_parts().await?;
+        let ctx = crate::federation::HoldContext {
+            pressure: self.current_disk_pressure(),
+            is_local_or_family: local_or_family_predicate(our_key.clone(), fam),
+            our_key_id: &our_key,
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                crate::federation::would_hold(arc.as_ref(), &ctx, provenance).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                crate::federation::would_hold(arc.as_ref(), &ctx, provenance).await
+            }
+        }
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §4) — **how widely this node holds** within
+    /// the cohorts it is party to. `ForCohort` when this node stands at
+    /// [`ServeTier::MeshServer`](crate::federation::trust_root::ServeTier::MeshServer)
+    /// or above (resolved from persist's own directory, #788), else
+    /// `OnDemand`. Edge's pull scheduler reads it to decide whether to fetch
+    /// everything the cohort may access or only what this node reads. It
+    /// refuses nothing: a server is a node that holds content it IS party to
+    /// but did not create and does not itself need, so members can fetch it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn hold_breadth(
+        &self,
+    ) -> Result<crate::federation::HoldBreadth, crate::federation::BlobError> {
+        use crate::federation::trust_root::{resolve_serve_tier, ServeTier};
+        let our_key = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
+        let tier = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                resolve_serve_tier(arc.as_ref(), &our_key, &our_key).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                resolve_serve_tier(arc.as_ref(), &our_key, &our_key).await
+            }
+        }
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "hold_breadth: serve tier: {e} ({})",
+                e.kind()
+            ))
+        })?;
+        Ok(if tier >= ServeTier::MeshServer {
+            crate::federation::HoldBreadth::ForCohort
+        } else {
+            crate::federation::HoldBreadth::OnDemand
+        })
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §6.1) — **adopt a sealed blob received
+    /// from a peer**: store the `AtRestEnvelope` verbatim at the tier and
+    /// under the `(community, epoch)` binding its provenance declares,
+    /// addressed by the SHA-256 of the ciphertext, and — for
+    /// [`AdoptDisposition::Announce`](crate::federation::AdoptDisposition::Announce)
+    /// — emit `holds_bytes` signed by this node. The receiver-side twin of
+    /// [`serve_blob_to_peer`](Self::serve_blob_to_peer); like it, it never
+    /// opens the envelope (I45).
+    ///
+    /// Order: shape, tier, [`would_hold`](Self::would_hold), then the floor —
+    /// nothing is written before the decision. The binding is the AUTHOR's
+    /// fact: no current-epoch check, no key state required (§3). Idempotent
+    /// on the address. `aad` is carried and not recorded — it is the
+    /// reader's fact at open time (#831). A `self`/`family` provenance can
+    /// never `Announce` (CC 5.2).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_blob(
+        &self,
+        envelope: &[u8],
+        provenance: crate::federation::BlobProvenance,
+        aad: Option<&[u8]>,
+        disposition: crate::federation::AdoptDisposition,
+    ) -> Result<crate::federation::AdoptOutcome, crate::federation::BlobError> {
+        use crate::federation::adopt_cascade::adopt_sealed_blob;
+        let (our_key, fam) = self.local_or_family_parts().await?;
+        let ctx = crate::federation::HoldContext {
+            pressure: self.current_disk_pressure(),
+            is_local_or_family: local_or_family_predicate(our_key.clone(), fam),
+            our_key_id: &our_key,
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                adopt_sealed_blob(
+                    arc.as_ref(),
+                    &**self.signer(),
+                    &ctx,
+                    envelope,
+                    &provenance,
+                    aad,
+                    disposition,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                adopt_sealed_blob(
+                    arc.as_ref(),
+                    &**self.signer(),
+                    &ctx,
+                    envelope,
+                    &provenance,
+                    aad,
+                    disposition,
+                )
+                .await
+            }
+        }
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §6.2, I50) — **adopt one sealed chunk** of
+    /// a stream at `(stream_id, seq)`: the same steps as
+    /// [`adopt_sealed_blob`](Self::adopt_sealed_blob), then the chunk floor
+    /// with the AUTHOR as the stream's owner, so this node can never append
+    /// to a stream it merely holds. The sealed manifest is adopted as a blob.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_chunk(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        envelope: &[u8],
+        epoch: u64,
+        plaintext_size: u64,
+        provenance: crate::federation::BlobProvenance,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::adopt_cascade::adopt_sealed_chunk;
+        let (our_key, fam) = self.local_or_family_parts().await?;
+        let ctx = crate::federation::HoldContext {
+            pressure: self.current_disk_pressure(),
+            is_local_or_family: local_or_family_predicate(our_key.clone(), fam),
+            our_key_id: &our_key,
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                adopt_sealed_chunk(
+                    arc.as_ref(),
+                    &ctx,
+                    stream_id,
+                    seq,
+                    envelope,
+                    epoch,
+                    plaintext_size,
+                    &provenance,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                adopt_sealed_chunk(
+                    arc.as_ref(),
+                    &ctx,
+                    stream_id,
+                    seq,
+                    envelope,
+                    epoch,
+                    plaintext_size,
+                    &provenance,
                 )
                 .await
             }
@@ -4883,6 +5094,10 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        // #846 (§5) — the row's author is THIS node's derived key (I23).
+        let author = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -4893,6 +5108,7 @@ impl Engine {
                     plaintext,
                     media_type,
                     None,
+                    Some(&author),
                 )
                 .await
             }
@@ -4905,6 +5121,7 @@ impl Engine {
                     plaintext,
                     media_type,
                     None,
+                    Some(&author),
                 )
                 .await
             }
@@ -5152,16 +5369,32 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        // #846 (§5) — the row's author is THIS node's derived key (I23).
+        let author = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                encrypt_and_cascade_community(arc.as_ref(), community_key_id, plaintext, media_type)
-                    .await
+                encrypt_and_cascade_community(
+                    arc.as_ref(),
+                    community_key_id,
+                    plaintext,
+                    media_type,
+                    Some(&author),
+                )
+                .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                encrypt_and_cascade_community(arc.as_ref(), community_key_id, plaintext, media_type)
-                    .await
+                encrypt_and_cascade_community(
+                    arc.as_ref(),
+                    community_key_id,
+                    plaintext,
+                    media_type,
+                    Some(&author),
+                )
+                .await
             }
         }
     }
@@ -5915,13 +6148,14 @@ impl Engine {
     /// federation-proxied content to peers while still serving local +
     /// family content.
     ///
-    /// Proxy classification (the SAME local-truth rule the
-    /// force-evict-proxy sweep uses): a blob is PROXY when NONE of its
-    /// local `holds_bytes` attesters
-    /// ([`list_local_holders`](crate::federation::BlobStorage::list_local_holders))
-    /// is local-or-family. A blob with at least one local/family holder
-    /// is protected (served even under pressure). A blob with NO local
-    /// holders at all is treated as proxy (we relay it; shed first).
+    /// Proxy classification (#846, `BLOB_REPLICATION.md` §5 — the SAME rule
+    /// the force-evict sweep and the accept decision use, through
+    /// [`is_proxy_content`](crate::federation::is_proxy_content)): a blob is
+    /// PROXY when the ROW's `author_key_id` is neither this node nor family
+    /// — content held for others. A row with no recorded author (pre-V144)
+    /// is unknown and classifies proxy. It used to key on the `holds_bytes`
+    /// ATTESTER, which for anything this node adopted is this node itself,
+    /// so every relayed blob read as protected.
     ///
     /// On refusal returns
     /// [`BlobError::DiskPressureProxyRefused`](crate::federation::BlobError::DiskPressureProxyRefused)
@@ -5940,9 +6174,17 @@ impl Engine {
         let pressure = self.current_disk_pressure();
         let local_holders = self.list_local_holders(sha256).await?;
         if pressure.refuses_proxy_serves {
-            // Classify: is this proxy content (no local/family holder)?
-            let is_protected = local_holders.iter().any(|k| self.is_local_or_family_key(k));
-            if !is_protected {
+            // #846 (§5, I49) — ONE classification: the ROW's author against
+            // local-or-family, through `is_proxy_content`. A row with no
+            // author (pre-V144) is unknown ⇒ proxy; an absent row is proxy
+            // too, and the NotHeld below answers for it.
+            let (our_key, fam) = self.local_or_family_parts().await?;
+            let local_or_family = local_or_family_predicate(our_key, fam);
+            let author = self
+                .blob_provenance(sha256)
+                .await?
+                .and_then(|p| p.author_key_id);
+            if crate::federation::is_proxy_content(author.as_deref(), &local_or_family) {
                 return Err(crate::federation::BlobError::DiskPressureProxyRefused {
                     operation: "serve",
                     tier: pressure.tier.label(),
@@ -12767,6 +13009,182 @@ mod tests {
             .expect("proxy serve at crit tier should succeed");
     }
 
+    // ─── #846 (BLOB_REPLICATION.md) — the doors through the Engine ───
+
+    /// #846 — a community the engine's node is party to (its derived key
+    /// is a member's occurrence), plus one sealed envelope by `author`
+    /// whose row is then deleted so it can be adopted back. Returns
+    /// `(community, envelope, epoch, sha)`.
+    #[cfg(feature = "sqlite")]
+    async fn party_community_and_envelope(
+        engine: &Engine,
+        author: &str,
+    ) -> (String, Vec<u8>, u64, [u8; 32]) {
+        use crate::federation::at_rest_cascade::blob_invariants as inv;
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        let sq = engine.sqlite_backend().expect("sqlite");
+        let derived = engine.local_derived_key_id().await.unwrap();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("comm-{run}");
+        let alice = format!("alice-{run}");
+        let alice_occ = format!("alice-occ-{run}");
+        seed_community(sq.as_ref(), &comm, &[(&alice, &alice_occ)]).await;
+        inv::join_as_occurrence(sq.as_ref(), &alice, &derived).await;
+        let (env, epoch, sha) =
+            inv::sealed_community_envelope(sq.as_ref(), &comm, b"minutes", author).await;
+        sq.delete_blob(&sha).await.unwrap();
+        (comm, env, epoch, sha)
+    }
+
+    /// #846 I47 through the consumer's door: `Engine::adopt_sealed_blob`
+    /// refuses relay content at the stop tier with the typed refusal, and
+    /// accepts it once pressure clears — the same monitor the #149 tests use.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn adopt_sealed_blob_refuses_relay_content_at_stop_tier_sqlite() {
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::{AdoptDisposition, BlobError, BlobProvenance, BlobStorage};
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        let (comm, env, epoch, sha) = party_community_and_envelope(&engine, "peer-author").await;
+        let (engine, stub, monitor) = attach_disk_pressure(engine, TWO_GIB);
+        stub.set(FOUR_HUNDRED_MIB);
+        monitor.poll_once();
+        assert!(engine.current_disk_pressure().refuses_proxy_writes);
+        let prov = BlobProvenance {
+            author_key_id: "peer-author".into(),
+            cohort_scope: COMMUNITY.into(),
+            community_key_id: Some(comm.clone()),
+            epoch: Some(epoch),
+            tier: CryptoTier::CommunityDek,
+        };
+        let err = engine
+            .adopt_sealed_blob(&env, prov.clone(), None, AdoptDisposition::LocalOnly)
+            .await
+            .expect_err("relay content at stop tier must be refused");
+        match err {
+            BlobError::DiskPressureProxyRefused { operation, tier } => {
+                assert_eq!(operation, "accept");
+                assert_eq!(tier, "stop");
+            }
+            other => panic!("expected DiskPressureProxyRefused, got {other:?}"),
+        }
+        let sq = engine.sqlite_backend().expect("sqlite");
+        assert!(
+            !sq.has_blob(&sha).await.unwrap(),
+            "nothing written on refusal"
+        );
+        // Pressure clears: the same adopt lands, announced by THIS node.
+        stub.set(TWO_GIB);
+        monitor.poll_once();
+        let out = engine
+            .adopt_sealed_blob(&env, prov, None, AdoptDisposition::Announce)
+            .await
+            .expect("party content under normal pressure");
+        assert_eq!(out.sha256, sha);
+        let derived = engine.local_derived_key_id().await.unwrap();
+        assert!(sq.list_holders(&sha).await.unwrap().contains(&derived));
+    }
+
+    /// #846 I49 through the sweep: an ADOPTED relay blob (author = a peer)
+    /// is force-evicted before the node's own content, even when hotter —
+    /// and its holder claim is withdrawn, because the claim is this node's.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn adopted_relay_blob_is_force_evicted_before_local_content_sqlite() {
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::{AdoptDisposition, BlobProvenance, BlobStorage};
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 3).await;
+        let dp = std::sync::Arc::new(crate::federation::DiskPressureConfig {
+            monitor_path: std::path::PathBuf::from("/x"),
+            ..Default::default()
+        });
+        let engine = engine.with_disk_pressure_config_shared(dp);
+        let (comm, env, epoch, sha) = party_community_and_envelope(&engine, "peer-author").await;
+        engine
+            .adopt_sealed_blob(
+                &env,
+                BlobProvenance {
+                    author_key_id: "peer-author".into(),
+                    cohort_scope: COMMUNITY.into(),
+                    community_key_id: Some(comm),
+                    epoch: Some(epoch),
+                    tier: CryptoTier::CommunityDek,
+                },
+                None,
+                AdoptDisposition::Announce,
+            )
+            .await
+            .expect("adopt");
+        let sq = engine.sqlite_backend().expect("sqlite");
+        for _ in 0..20 {
+            let _ = sq.get_blob(&sha).await.unwrap();
+        }
+        let report = engine
+            .sweep_evictions_once_force_proxy()
+            .await
+            .expect("force-proxy sweep");
+        assert!(report.rows_evicted > 0);
+        assert!(
+            !sq.has_blob(&sha).await.unwrap(),
+            "the adopted relay blob survived a force-evict — it classified as protected \
+             (holder-attester classification: the holder IS this node)"
+        );
+        assert!(
+            sq.list_holders(&sha).await.unwrap().is_empty(),
+            "eviction of an adopted blob must withdraw this node's holder claim"
+        );
+        let survivors = {
+            let mut n = 0;
+            for s in &local_shas {
+                if sq.has_blob(s).await.unwrap() {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert!(
+            survivors >= 2,
+            "local content protected; {survivors}/3 survived"
+        );
+    }
+
+    /// #846 §4 — `hold_breadth` is `OnDemand` for a node with no serve
+    /// standing and `ForCohort` once its owner conferred `infra:serve` and
+    /// it claims the role — derived from persist's own directory (#788).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn hold_breadth_follows_serve_standing_sqlite() {
+        use crate::federation::at_rest_cascade::blob_invariants as inv;
+        use crate::federation::HoldBreadth;
+        let engine = Engine::with_replication_config(
+            test_signer(),
+            "sqlite::memory:",
+            crate::federation::ReplicationConfig::default(),
+        )
+        .await
+        .expect("engine");
+        assert_eq!(
+            engine.hold_breadth().await.unwrap(),
+            HoldBreadth::OnDemand,
+            "an unregistered node has no serve standing"
+        );
+        let sq = engine.sqlite_backend().expect("sqlite");
+        let derived = engine.local_derived_key_id().await.unwrap();
+        inv::confer_mesh_server(sq.as_ref(), &derived, "owner-846").await;
+        assert_eq!(
+            engine.hold_breadth().await.unwrap(),
+            HoldBreadth::ForCohort,
+            "an owner-conferred, role-claiming node holds for its cohort"
+        );
+    }
+
     // ── v4.6.0 (CIRISPersist#171, CEG §10.1.5) — attestation_promote:
     //    local-tier self-attestation → federation-tier hybrid-signed row.
 
@@ -18398,6 +18816,63 @@ mod tests {
             matches!(err, crate::federation::BlobError::InvalidArgument(ref m)
                      if m.contains("no community-DEK binding")),
             "the refusal must come from the community read path, got: {err:?}"
+        );
+    }
+
+    /// #843 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §12.11, I54) — **through the
+    /// Engine's own write door, the result names the author who cannot
+    /// read what she wrote.** The backend witness
+    /// (`exercise_i54_the_cascade_result_partitions_the_roster`) proves the
+    /// partition on every backend; this proves the door a consumer holds
+    /// carries it, and that `readable_by_nobody()` is callable on what that
+    /// door returns.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_scoped_reports_the_roster_partition_843() {
+        use crate::federation::community_dek::lifecycle_support::seed_community_shaped;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::cohort_scope::COMMUNITY;
+        use crate::federation::types::identity_type::USER;
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let alias = format!("eng843-{run}");
+        let signer = ts::local_signer(&alias);
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let backend = engine.sqlite_backend().expect("sqlite").clone();
+        // The door announces under the signer's derived key (I23): register
+        // it with the alias's real pubkeys so the announcement verifies.
+        ts::register_hybrid_key_as(backend.as_ref(), &alias, &alias, USER).await;
+        ts::register_hybrid_key_as(backend.as_ref(), &derived, &alias, USER).await;
+
+        let comm = format!("comm-843-{run}");
+        let alice = format!("alice-{run}");
+        let bob = format!("bob-{run}");
+        let bob_phone = format!("bob-phone-{run}");
+        seed_community_shaped(
+            backend.as_ref(),
+            &comm,
+            &[(&alice, &[]), (&bob, &[(&bob_phone, false)])],
+        )
+        .await;
+
+        let res = engine
+            .put_blob_scoped(COMMUNITY, Some(&comm), b"minutes", None, None)
+            .await
+            .expect("community write through the Engine door");
+        assert_eq!(res.granted, Vec::<String>::new());
+        assert_eq!(res.excluded, vec![bob_phone]);
+        assert_eq!(res.roster.excluded, vec![bob], "bob: a device, none usable");
+        assert_eq!(
+            res.roster.absent,
+            vec![alice],
+            "alice — the author, no occurrence — is named ABSENT through the Engine door"
+        );
+        assert!(
+            res.readable_by_nobody(),
+            "the one field to check says nobody can read this"
         );
     }
 

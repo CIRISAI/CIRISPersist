@@ -1113,11 +1113,17 @@ shard plane's tombstone ceiling — and a ceiling wide enough helps only if
 shards stay under it. Edge's shard plane today has a serve gate and no
 STORE gate: the fountain converger pushes shards toward `target_holders`
 without asking who may hold, so a shard can land on a node outside the
-cohort, and a `Cohort`-ceiling tombstone will not reach it. Until
-CIRISEdge#581 lands, the recall this section relies on is an INTENDED reach,
-not an enforced one; Edge will return with a bound it can defend and it will
-be pinned here as the shard plane's number. CIRISEdge#582 is the mirror —
-what the converger deletes on an unverified holder count.
+cohort, and a `Cohort`-ceiling tombstone will not reach it. The store gate
+itself is built — CIRISEdge#581 shipped `admit_blob_store` in edge v23.1.0
+(trust, audience, operator consent; `StoreAndAnnounce` / `StoreLocalOnly` /
+`Refuse`) — and persist's receiver side is `adopt_sealed_blob`
+(`FSD/BLOB_REPLICATION.md` §6, v44.2.0), which stores what the gate admits
+and refuses anything this node is not party to (I48). What is still open is
+ARMING the gate over the converger's push path, which is CIRISEdge#601; until
+that lands the recall this section relies on is an INTENDED reach, not an
+enforced one, and Edge will return with a bound it can defend to be pinned
+here as the shard plane's number. CIRISEdge#582 is the mirror — what the
+converger deletes on an unverified holder count.
 
 This is a **gate**, not a convention: the fountain path must refuse a
 plaintext body whose `cohort_scope` resolves to an encrypted tier.
@@ -1587,6 +1593,7 @@ returns the error and the next call derives again (I29).
 | I40 | Caller-supplied associated data is bound into the seal and never stored: a seal under `A` opens under `A` and fails under `A'` — after authorization (a non-member presenting `A` is `NotGranted`), as a crypto-class error, at both encrypted tiers; `Some(aad)` at a plaintext tier is refused at EVERY seal/open door — whole-blob, chunk write, stream seal, range read. | the `A'` open succeeds; a mismatch surfaces as `NotGranted`; a commons write accepts and drops the data | #830 |
 | I41 | A stream belongs to its first append: the chunk floor records `(cohort_scope, community_key_id, owner = the first attributed writer's derived key id)` on a stream's first chunk, in the chunk's transaction, and refuses every later append that does not match all three — a different writer at its FIRST chunk (nothing stored), a different cohort or community naming the stream's; the refusal never names the owner's key to a non-owner; the scoped seal refuses a non-owner signer and a foreign cohort/community BEFORE I32, and I32 still refuses a mixed stream; an unclaimed (`NULL`-owner: pre-V143 or commons-started) stream is adopted by its first attributed append; V143 backfills every existing stream from its first chunk's row and binding. | two writers interleave on one id; a foreign seal; a refusal that leaks the owner's key id; a legacy stream with no row | #837 |
 | I42 | A chunk is bound to its position: `chunk_aad(caller_aad, stream_id, seq)` — domain-separated, length-prefixed, bytes pinned — is the AAD of every sealed chunk at write; sealed manifest v2 carries `stream_id` and each chunk's `seq` (required, strictly increasing; v1 byte-identical); every reader rebuilds the AAD from the manifest, so a chunk at another index or in another stream's DAG fails as a crypto-class error AFTER authorization (never `NotGranted`); a stream chunk is read by position through `read_stream_chunk_as`, reachable from the Engine and Python. | a swapped manifest opens; a lifted chunk opens in a second stream; a mismatch reported as `NotGranted`; a by-position read nobody can call | #838 |
+| I54 | The cascade result partitions the ROSTER: every active member of the cohort (roster minus effective removals) is exactly one of `roster.granted` (with the occurrences the grant reached) / `roster.excluded` (occurrences present, none usable) / `roster.absent` (no active occurrence at all); the per-occurrence `granted` / `excluded` keep their meaning; `readable_by_nobody()` is a roster fact — true iff no member holds a grant, including when nothing was enumerated and nothing was excluded — and `false` at the plaintext tier; carried by every cascade result, `put_blob_scoped` on both backends, the Engine door and the five Python serializers. | a member with no occurrence named nowhere; "nobody can read" derived from the occurrence list; a removed member reported absent; a commons write reported unreadable; a serializer that drops the partition | #843 |
 
 Every one of these is written **before** the corresponding fix and confirmed
 red — I1–I14 on `fd43e74`, I15–I23 on `30fde79` — and each turns red again
@@ -1683,6 +1690,11 @@ announce-after-cascade window that could re-insert an evicted row (C3-2).
 One is a cache that remembered failure (C3-3). Two are the same shape as
 §11.6's own finding about the first implementation — a surface that
 exposes the operation and not its policy or its report (C3-4, C3-5).
+
+**I54 (#843)** was written first in a PROBE form — asserting only that the
+author of the write was NAMED anywhere in the result — and confirmed RED on
+the v44.1.1 tree on sqlite and postgres: `granted=[] excluded=[…bob-phone…]`,
+alice nowhere. §12.11 carries the mutation record.
 
 ---
 
@@ -2094,6 +2106,91 @@ reader that would use the list index, a positioned-but-unnamed manifest for
 a parser that would lean on the per-chunk check. The table is in the
 CHANGELOG entry for this cut.
 
+### 12.11 The cascade result partitions the ROSTER (#843)
+
+Every cascade enumerated its cohort per **occurrence** and partitioned that
+list into `granted` / `excluded`. A roster member with no active occurrence
+contributed nothing to the list and so appeared in neither. The observed
+result (CIRISServer#590 / CIRISEdge#599): a pair community's write reported
+`granted=[]`, `excluded=["bob-v1-phone"]` — one unrelated device — while
+alice, the author, a founder and the identity the request authenticated,
+was named nowhere, because she had no occurrence. The one field a caller
+reads to answer "who cannot read what I just wrote" answered *bob's phone*
+about content nobody could read, the sender included. The two states have
+different remedies — register a key on a device you have; this identity
+has no content-KEM presence at all — and the API rendered the second as a
+milder version of the first.
+
+**The shape.** `RosterPartition { granted: Vec<MemberGrant>, excluded,
+absent }` rides every cascade result — `CascadeResult`,
+`CommunityCascadeResult`, `PutBlobScopedResult`, `PutChunkScopedResult`,
+`SealStreamScopedResult` — as `roster`, beside the per-occurrence
+`granted` / `excluded`, whose meaning is unchanged:
+
+| list | who | remedy |
+|---|---|---|
+| `roster.granted` | members with at least one granted occurrence, each `MemberGrant { member_key_id, occurrence_key_ids }` naming exactly the occurrences the grant reached | — |
+| `roster.excluded` | members with at least one active occurrence and none usable (no valid `encryption_pubkeys`) | register keys on a device they already have |
+| `roster.absent` | members with NO active occurrence | nothing to name and no key to register: the identity has no content-KEM presence |
+
+The roster is the ACTIVE roster — minus effective removals — so a removed
+member is in none of the three. A granted member's bare device is still in
+the flat `excluded`; the member is not. For `self` the roster is the owner
+identity alone; for `family` the family roster; for `community` /
+`affiliations` the community roster. A plaintext write has no fan-out and
+an empty partition.
+
+**`readable_by_nobody()`** on every result is the one field to check:
+true iff no member holds a grant, and `false` at the plaintext tier, where
+everyone can read. It is a ROSTER fact, not an occurrence count: it is
+true when nothing was enumerated and nothing was excluded — exactly where
+an answer derived from the occurrence list ("every enumerated occurrence
+was excluded") says the opposite. That is invariant **I54** (§11.10).
+
+**One partition.** `at_rest_cascade::orchestrate::partition_roster` is
+pure and the one place every cascade — self/family, community, chunk —
+decides who is granted, excluded or absent. `resolve_recipients` (self /
+family) and `active_member_occurrences` (community; also the roster leg of
+`may_learn_epoch_fate`, §11.5) return members WITH their occurrences, so an
+empty enumeration is still a member on the list. The community cascade's
+private copy of `usable_keys` is gone with it.
+
+**Surfaces.** The five Python cascade serializers — `put_blob_scoped`,
+`put_blob_encrypted_community`, `put_blob_encrypted_self_family`,
+`put_blob_chunk_scoped`, `seal_stream_scoped` — add `roster` and
+`readable_by_nobody`; existing keys are unchanged. A from-disk gate
+(`i54_every_cascade_serializer_carries_the_roster_partition`, the I30
+shape) reds if any of the five drops them.
+
+**Not done here.** `hard_case:recipient_excluded` is still emitted per
+excluded OCCURRENCE; an `absent` member emits nothing, because there is no
+occurrence to key the event on. Whether a member-keyed hard case is wanted
+is a question for the consumers that surfaced #843, not decided by this
+cut.
+
+**Witnesses.** `exercise_i54_the_cascade_result_partitions_the_roster`
+(sqlite + postgres, through `put_blob_scoped`): the #843 roster; a lone
+absent member (nothing enumerated); a mixed roster with a REMOVED member;
+the family and self tiers; a commons write. `put_blob_scoped_reports_the_roster_partition_843`
+through the Engine door. `test_put_blob_scoped_reports_the_roster_partition_843`
+through the wheel: one identity walks absent → excluded → granted.
+Two unit tests on the pure partition.
+
+**Mutation record (§11.10 discipline).**
+
+| # | mutation | site | result |
+|---|---|---|---|
+| a | drop the `absent` partition — a member with no occurrence goes nowhere | `partition_roster` | KILLED — unit test, I54 sqlite (I54/1: alice), Engine door |
+| b | derive `readable_by_nobody` from the occurrence list: `granted.is_empty() && !excluded.is_empty()` ("every enumerated occurrence was excluded") | `PutBlobScopedResult::readable_by_nobody` | KILLED — unit test (an empty roster at a sealed tier), I54 (I54/2: the lone member — nothing enumerated, nothing excluded) |
+| b2 | derive it from the granted occurrences alone: `granted.is_empty()` | same | SURVIVED — an equivalent mutant: a granted occurrence always belongs to a roster member, so "no occurrence granted" and "no member granted" coincide by construction on every constructible input. Recorded, not dressed up: the roster's contribution is what it NAMES (a, c, d), not this bit. |
+| c | drop the member-level `excluded` — a bare-only member goes nowhere | `partition_roster` | KILLED — unit test, I54 (I54/1: bob), Engine door |
+| d | re-introduce the original enumeration: skip a member whose occurrence list is empty | `active_member_occurrences` | KILLED — I54 (I54/1: "alice — on the roster, no occurrence — is ABSENT, and named"), Engine door |
+| e | drop the plaintext-tier exception in `readable_by_nobody` | `PutBlobScopedResult::readable_by_nobody` | KILLED — unit test, I54 (I54/5: a commons write) |
+
+Every restore verified by an empty diff. The wheel test was not run under
+mutation; it asserts the same JSON facts and is BELIEVED to red on a, b
+and d.
+
 ---
 
 ## 13. Summary
@@ -2127,5 +2224,6 @@ ciphertext), the manifest carries plaintext sizes and is sealed under the same
 DEK, the seal door checks chunk ROWS, the range read decrypts per chunk with
 per-epoch authorization, the transfer path never decrypts, and `stream_chunks`
 is the live-stream handle. §12.9–§12.10 (#837, #838) bind a stream to its
-first append and a chunk to its position.
+first append and a chunk to its position. §12.11 (#843) partitions the
+cascade result by roster MEMBER, so a write nobody can read says so.
 

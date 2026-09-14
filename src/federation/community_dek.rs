@@ -146,15 +146,19 @@ pub fn is_infrastructure_community(community: &Community) -> bool {
 /// [`FederationDirectory`]: crate::federation::FederationDirectory
 /// [`BlobStorage`]: crate::federation::blobs::BlobStorage
 pub mod orchestrate {
+    use crate::federation::at_rest_cascade::orchestrate::{
+        partition_roster, GrantReport, MemberOccurrences,
+    };
     use crate::federation::at_rest_cascade::{
         fresh_dek, open, seal, unwrap_dek_for_persist, wrap_dek_for_persist, wrap_dek_v2,
         AtRestEnvelope, AtRestError, DEK_LEN, WRAP_ALGORITHM_V2,
     };
-    use crate::federation::blobs::{BlobBody, BlobError, BlobStorage, DekKeyState};
+    use crate::federation::blobs::{
+        BlobBody, BlobError, BlobStorage, DekKeyState, RosterPartition,
+    };
     use crate::federation::types::cohort_scope::{
         crypto_tier, CryptoTier, AFFILIATIONS, COMMUNITY,
     };
-    use crate::federation::types::EncryptionPubkeys;
     use crate::federation::FederationDirectory;
     use sha2::{Digest, Sha256};
 
@@ -175,6 +179,21 @@ pub mod orchestrate {
         /// plaintext / v1 fallback. Surfaced as
         /// `hard_case:recipient_excluded` by [`emit_excluded_hard_cases`].
         pub excluded: Vec<String>,
+        /// #843 (§12.11, I54) — the same fan-out by roster MEMBER: the
+        /// community roster minus effective removals, each member exactly
+        /// one of granted / excluded / absent. The only view that names a
+        /// member with no active occurrence — the author of the write
+        /// CIRISPersist#843 was opened on.
+        pub roster: RosterPartition,
+    }
+
+    impl CommunityCascadeResult {
+        /// #843 — can NOBODY read what was just written? A roster fact:
+        /// no member holds a grant on this epoch's DEK.
+        #[must_use]
+        pub fn readable_by_nobody(&self) -> bool {
+            self.roster.readable_by_nobody()
+        }
     }
 
     fn map_dir_err(e: crate::federation::Error) -> BlobError {
@@ -185,17 +204,9 @@ pub mod orchestrate {
         BlobError::Backend(format!("community DEK cascade crypto: {e}"))
     }
 
-    /// Valid-now wrap target? A member is excluded unless its occurrence
-    /// carries BOTH encryption-pubkey halves. (Identical predicate to the
-    /// self/family `usable_keys`; replicated locally to keep the surfaces
-    /// independent.)
-    fn usable_keys(keys: &Option<EncryptionPubkeys>) -> Option<&EncryptionPubkeys> {
-        keys.as_ref()
-            .filter(|k| !k.x25519_base64.is_empty() && !k.ml_kem_768_base64.is_empty())
-    }
-
-    /// Resolve the **current** member-occurrence wrap targets of a
-    /// community as `(occurrence_key_id, encryption_pubkeys?)` pairs.
+    /// Resolve the **current** members of a community, each with its
+    /// occurrence wrap targets as `(occurrence_key_id, encryption_pubkeys?)`
+    /// pairs (#843: by MEMBER, so a member with none is still listed).
     ///
     /// Composes [`lookup_community`](FederationDirectory::lookup_community)'s
     /// roster with the membership-revocation table (drop members removed
@@ -206,7 +217,7 @@ pub mod orchestrate {
     async fn resolve_community_members<B>(
         backend: &B,
         community_key_id: &str,
-    ) -> Result<Vec<(String, Option<EncryptionPubkeys>)>, BlobError>
+    ) -> Result<Vec<MemberOccurrences>, BlobError>
     where
         B: FederationDirectory + Sync,
     {
@@ -241,8 +252,10 @@ pub mod orchestrate {
         active_member_occurrences(backend, &community).await
     }
 
-    /// The community's ACTIVE member occurrences: roster minus effective
-    /// revocations, then each remaining identity's active occurrences.
+    /// The community's ACTIVE members, each with its active occurrences:
+    /// roster minus effective revocations, then each remaining identity's
+    /// active occurrences — BY MEMBER (#843), so a member whose enumeration
+    /// is empty is still on the list and the cascade can name it `absent`.
     ///
     /// Active membership = roster minus effective revocations (the
     /// CC 4.4.3.2.2 forward-secrecy read: a removed member is dropped
@@ -257,7 +270,7 @@ pub mod orchestrate {
     async fn active_member_occurrences<B>(
         backend: &B,
         community: &crate::federation::types::Community,
-    ) -> Result<Vec<(String, Option<EncryptionPubkeys>)>, BlobError>
+    ) -> Result<Vec<MemberOccurrences>, BlobError>
     where
         B: FederationDirectory + Sync,
     {
@@ -280,9 +293,12 @@ pub mod orchestrate {
                 .list_identity_occurrences_active(&member.key_id)
                 .await
                 .map_err(map_dir_err)?;
-            for o in occ {
-                out.push((o.occurrence_key_id, o.encryption_pubkeys));
-            }
+            out.push((
+                member.key_id.clone(),
+                occ.into_iter()
+                    .map(|o| (o.occurrence_key_id, o.encryption_pubkeys))
+                    .collect(),
+            ));
         }
         Ok(out)
     }
@@ -331,7 +347,7 @@ pub mod orchestrate {
         Ok(active_member_occurrences(backend, &community)
             .await?
             .iter()
-            .any(|(occ, _)| occ == viewer_key_id))
+            .any(|(_, occurrences)| occurrences.iter().any(|(occ, _)| occ == viewer_key_id)))
     }
 
     /// Mint (or read) the shared DEK for `(community, epoch)` and ensure it
@@ -344,7 +360,8 @@ pub mod orchestrate {
     /// keyless). On a LATER emission in the same epoch it recovers the
     /// already-minted DEK via the self-retention row and only fills in any
     /// member who joined since (idempotent — already-granted members are
-    /// skipped). Returns `(dek, granted, excluded)`.
+    /// skipped). Returns `(dek, report)` — the per-occurrence split and the
+    /// roster partition (#843) from one enumeration.
     ///
     /// #832 (§12.3) — crate-private rather than private: the chunk cascade
     /// seals each segment under the same epoch DEK the whole-blob cascade
@@ -354,7 +371,7 @@ pub mod orchestrate {
         backend: &B,
         community_key_id: &str,
         epoch: u64,
-    ) -> Result<([u8; DEK_LEN], Vec<String>, Vec<String>), BlobError>
+    ) -> Result<([u8; DEK_LEN], GrantReport), BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
@@ -417,36 +434,31 @@ pub mod orchestrate {
 
         // Member fan-out — wrap to each member not already granted; the put
         // is idempotent so a re-emission is a no-op. Fail-secure exclude
-        // the keyless (no grant, surfaced as recipient_excluded).
+        // the keyless (no grant, surfaced as recipient_excluded). #843: the
+        // partition is decided by roster MEMBER in `partition_roster`,
+        // once, for every cascade — a member with no occurrence is `absent`.
         let already: std::collections::HashSet<String> = backend
             .community_dek_member_grant_recipients(community_key_id, epoch)
             .await?
             .into_iter()
             .collect();
-        let mut granted = Vec::new();
-        let mut excluded = Vec::new();
-        for (occ_key_id, keys) in members {
-            match usable_keys(&keys) {
-                Some(k) => {
-                    if !already.contains(&occ_key_id) {
-                        let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, &dek)
-                            .map_err(map_at_rest_err)?;
-                        backend
-                            .community_dek_put_member_grant(
-                                community_key_id,
-                                epoch,
-                                &occ_key_id,
-                                WRAP_ALGORITHM_V2,
-                                &wrapped,
-                            )
-                            .await?;
-                    }
-                    granted.push(occ_key_id);
-                }
-                None => excluded.push(occ_key_id),
+        let (targets, report) = partition_roster(members);
+        for (occ_key_id, k) in targets {
+            if !already.contains(&occ_key_id) {
+                let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, &dek)
+                    .map_err(map_at_rest_err)?;
+                backend
+                    .community_dek_put_member_grant(
+                        community_key_id,
+                        epoch,
+                        &occ_key_id,
+                        WRAP_ALGORITHM_V2,
+                        &wrapped,
+                    )
+                    .await?;
             }
         }
-        Ok((dek, granted, excluded))
+        Ok((dek, report))
     }
 
     /// Encrypt `plaintext` under the community's CURRENT-epoch shared DEK,
@@ -468,6 +480,7 @@ pub mod orchestrate {
         community_key_id: &str,
         plaintext: &[u8],
         media_type: Option<&str>,
+        author_key_id: Option<&str>,
     ) -> Result<CommunityCascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -479,6 +492,7 @@ pub mod orchestrate {
             plaintext,
             media_type,
             None,
+            author_key_id,
         )
         .await
     }
@@ -495,6 +509,7 @@ pub mod orchestrate {
         plaintext: &[u8],
         media_type: Option<&str>,
         aad: Option<&[u8]>,
+        author_key_id: Option<&str>,
     ) -> Result<CommunityCascadeResult, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -534,6 +549,7 @@ pub mod orchestrate {
                 plaintext,
                 media_type,
                 aad,
+                author_key_id,
             )
             .await?
             {
@@ -578,6 +594,7 @@ pub mod orchestrate {
     /// a public blob). [`encrypt_and_cascade_community`] is the door and
     /// loops over this; it is crate-private so no consumer can seal at an
     /// epoch of its choosing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn seal_store_bind_at<B>(
         backend: &B,
         cohort_scope: &str,
@@ -586,11 +603,12 @@ pub mod orchestrate {
         plaintext: &[u8],
         media_type: Option<&str>,
         aad: Option<&[u8]>,
+        author_key_id: Option<&str>,
     ) -> Result<SealOutcome, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let (dek, granted, excluded) = ensure_epoch_dek(backend, community_key_id, epoch).await?;
+        let (dek, report) = ensure_epoch_dek(backend, community_key_id, epoch).await?;
 
         // Seal the body under the shared epoch DEK into the self-describing
         // CRBLOB envelope (same format as self/family). `aad` (#831) is bound
@@ -606,6 +624,9 @@ pub mod orchestrate {
                 media_type,
                 cohort_scope,
                 crate::federation::StorageFloor::resolved(CryptoTier::CommunityDek),
+                // #846 (§5) — the writer; the announce that follows a scoped
+                // put stamps the same key if this was `None`.
+                author_key_id,
             )
             .await?;
         match backend
@@ -615,8 +636,9 @@ pub mod orchestrate {
             Ok(()) => Ok(SealOutcome::Bound(CommunityCascadeResult {
                 at_rest_sha256,
                 epoch,
-                granted,
-                excluded,
+                granted: report.granted,
+                excluded: report.excluded,
+                roster: report.roster,
             })),
             Err(BlobError::EpochNotCurrent { .. }) => {
                 backend.delete_blob(&at_rest_sha256).await?;
@@ -1231,6 +1253,160 @@ pub mod lifecycle_support {
             .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
     }
 
+    /// #843 — seed one roster member in the SHAPE a fixture names: the
+    /// identity, then each `(occurrence, keyed)` pair. `keyed = false` is a
+    /// bare occurrence (no `encryption_pubkeys`, fail-secure excluded); an
+    /// EMPTY slice is the member #843 is about — on the roster, with no
+    /// content-KEM presence at all.
+    pub async fn seed_member_shaped<B>(
+        backend: &B,
+        identity_key_id: &str,
+        occurrences: &[(&str, bool)],
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        ts::register_hybrid_key_as(
+            backend,
+            identity_key_id,
+            identity_key_id,
+            identity_type::USER,
+        )
+        .await;
+        for (occurrence_key_id, keyed) in occurrences {
+            ts::register_hybrid_key_as(
+                backend,
+                occurrence_key_id,
+                occurrence_key_id,
+                identity_type::USER,
+            )
+            .await;
+            let encryption_pubkeys = if *keyed {
+                let (_xp, x_pub, _mp, ml_pub) =
+                    crate::federation::identity_aggregate::mint_content_kem_keypair()
+                        .expect("mint kem");
+                Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                })
+            } else {
+                None
+            };
+            backend
+                .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                    identity_key_id: identity_key_id.to_owned(),
+                    occurrence_key_id: (*occurrence_key_id).to_owned(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys,
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
+        }
+    }
+
+    /// #843 — a community whose roster is given member by member as
+    /// `(identity, &[(occurrence, keyed)])`; see [`seed_member_shaped`].
+    pub async fn seed_community_shaped<B>(
+        backend: &B,
+        community_key_id: &str,
+        members: &[(&str, &[(&str, bool)])],
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+
+        ts::register_hybrid_key_as(
+            backend,
+            community_key_id,
+            community_key_id,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        for (ident, occurrences) in members {
+            seed_member_shaped(backend, ident, occurrences).await;
+        }
+        let roster = members
+            .iter()
+            .map(|(ident, _)| crate::federation::types::CommunityMember {
+                key_id: (*ident).to_owned(),
+                joined_at: chrono::Utc::now(),
+                role: None,
+            })
+            .collect();
+        backend
+            .put_community(ts::sign_community(
+                community_key_id,
+                crate::federation::types::Community {
+                    community_key_id: community_key_id.to_owned(),
+                    community_name: "Shaped Co-op".into(),
+                    members: roster,
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
+    }
+
+    /// #843 — the family twin of [`seed_community_shaped`]: the self/family
+    /// cascade enumerates a family roster the same way the community cascade
+    /// enumerates its members, so the partition must hold there too.
+    pub async fn seed_family_shaped<B>(
+        backend: &B,
+        family_key_id: &str,
+        members: &[(&str, &[(&str, bool)])],
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+
+        ts::register_hybrid_key_as(
+            backend,
+            family_key_id,
+            family_key_id,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        for (ident, occurrences) in members {
+            seed_member_shaped(backend, ident, occurrences).await;
+        }
+        let roster = members
+            .iter()
+            .map(|(ident, _)| crate::federation::types::FamilyMember {
+                key_id: (*ident).to_owned(),
+                joined_at: chrono::Utc::now(),
+                role: None,
+            })
+            .collect();
+        backend
+            .put_family(ts::sign_family(
+                family_key_id,
+                crate::federation::types::Family {
+                    family_key_id: family_key_id.to_owned(),
+                    family_name: "Shaped Household".into(),
+                    members: roster,
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed family {family_key_id}: {e}"));
+    }
+
     /// Revoke a member. The community DEK epoch bump rides this write
     /// transactionally (AV-70), so this single call IS the rotation — there
     /// is no separate "rotate" API to call, and a harness that invented one
@@ -1325,9 +1501,10 @@ pub mod lifecycle_harness {
         .await;
 
         // ── 2. ENCRYPT (epoch 0) ─────────────────────────────────────────
-        let before = encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
+        let before =
+            encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
         assert_eq!(
             before.epoch, 0,
             "{tag}: a never-rotated community is epoch 0"
@@ -1353,9 +1530,10 @@ pub mod lifecycle_harness {
         super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
 
         // ── 5. ENCRYPT AGAIN — lands on the NEW epoch ────────────────────
-        let after = encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
+        let after =
+            encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
         assert!(
             after.epoch > before.epoch,
             "{tag}: rotation must advance the epoch ({} -> {})",

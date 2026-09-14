@@ -1291,43 +1291,64 @@ impl PyEngine {
         }
     }
 
-    /// v6.8.0 (CIRISPersist#149) — proxy-ACCEPT disk-pressure gate.
-    /// Returns `Err(DiskPressureProxyRefused)` (mapped to a Permanent
-    /// `ValueError` via [`blob_err_to_py`]) when the substrate is at the
-    /// stop tier (or tighter) AND `attesting_key_id` is proxy (neither
-    /// the local signer nor family). Local + family writes are NEVER
-    /// refused. No-op when no monitor is installed. Reads the cached
-    /// snapshot from the singleton cell — no statvfs per write.
-    fn disk_pressure_refuse_proxy_accept(&self, attesting_key_id: &str) -> PyResult<()> {
-        let slot = engine_slot();
-        let Some(cell) = slot.as_ref() else {
-            return Ok(());
-        };
-        let monitor = cell
-            .disk_pressure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let Some(monitor) = monitor else {
-            return Ok(());
-        };
-        let snap = monitor.snapshot();
-        if !snap.refuses_proxy_writes {
-            return Ok(());
+    /// #846 (§5 / I23) — this node's DERIVED federation key id, for the
+    /// bindings that must record an author on a row. The same derivation
+    /// `Engine::local_derived_key_id` runs; `ValueError` on a non-Ed25519
+    /// composed signer (#275).
+    ///
+    /// Async on purpose: the blocking wait belongs to the CALLER, inside its
+    /// `py.detach` span, where the #580 gate can see the GIL is released. A
+    /// helper that blocked here would be correct at every call site today and
+    /// invisible to the gate that keeps it so.
+    async fn local_derived_key_id_async(&self) -> PyResult<String> {
+        crate::signing::federation_key_id_of(&*self.signer)
+            .await
+            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))
+    }
+
+    /// #846 (BLOB_REPLICATION.md §4, I46) — an [`Engine`](crate::Engine) view
+    /// of this `PyEngine` carrying the process-singleton's disk-pressure
+    /// monitor, for the doors that run the WILL decision. The same shape
+    /// `EngineCell::engine_view` builds; no second pool, runtime or signer.
+    fn hold_engine_view(&self) -> crate::Engine {
+        let mut engine = crate::Engine::from_shared_with_local(
+            self.engine_dispatch(),
+            self.signer.clone(),
+            self.local_signer.clone(),
+        );
+        let monitor = engine_slot().as_ref().and_then(|cell| {
+            cell.disk_pressure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        if let Some(monitor) = monitor {
+            engine = engine
+                .with_disk_pressure_config_shared(monitor.config())
+                .with_disk_pressure_state_shared(monitor.subscribe());
         }
-        // Classify proxy vs local/family using the monitor's config
-        // predicate against the cell's signer key.
-        let cfg = monitor.config();
-        let is_protected = cfg.is_local_or_family(attesting_key_id, &cell.signer_key_id);
-        if is_protected {
-            return Ok(());
-        }
-        Err(blob_err_to_py(
-            crate::federation::BlobError::DiskPressureProxyRefused {
-                operation: "accept",
-                tier: snap.tier.label(),
-            },
-        ))
+        engine
+    }
+
+    /// v6.8.0 (CIRISPersist#149) / #846 — the accept decision for a COMMONS
+    /// write from Python, through the one WILL door
+    /// ([`Engine::would_hold`](crate::Engine::would_hold)): everyone is
+    /// party to the commons, so this is the #149 pressure rule — a proxy
+    /// write is refused at the stop tier, local + family never. Reads the
+    /// cached snapshot; no statvfs per write.
+    ///
+    /// Async on purpose — see [`Self::local_derived_key_id_async`]: the
+    /// caller blocks on it inside its own `py.detach` span.
+    async fn would_hold_commons_async(&self, attesting_key_id: &str) -> PyResult<()> {
+        let engine = self.hold_engine_view();
+        let provenance = crate::federation::BlobProvenance {
+            author_key_id: attesting_key_id.to_owned(),
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        };
+        engine.would_hold(&provenance).await.map_err(blob_err_to_py)
     }
 
     /// v4.0 (FSD §11) — map this PyEngine's backend dispatch to the
@@ -9435,11 +9456,14 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let payload = parse_put_blob_payload(payload_json)?;
-            // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on
-            // the proxy-ACCEPT path. Same rule as `put_blob_signing`:
-            // refuse a proxy write at stop tier; local + family writes
-            // proceed.
-            self.disk_pressure_refuse_proxy_accept(&payload.attestation.attesting_key_id)?;
+            // #846 (I46) — the WILL decision, through the one door. Same
+            // rule as `put_blob_signing`: a proxy write is refused at the
+            // stop tier; local + family writes proceed.
+            let attester = payload.attestation.attesting_key_id.clone();
+            py.detach(move || {
+                self.runtime
+                    .block_on(self.would_hold_commons_async(&attester))
+            })?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -9514,6 +9538,9 @@ impl PyEngine {
                                 crate::federation::StorageFloor::resolved(
                                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                                 ),
+                                // #846 — this door carries no signer; unknown
+                                // classifies as proxy (fail toward evictable).
+                                None,
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -9533,6 +9560,9 @@ impl PyEngine {
                                 crate::federation::StorageFloor::resolved(
                                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                                 ),
+                                // #846 — this door carries no signer; unknown
+                                // classifies as proxy (fail toward evictable).
+                                None,
                             )
                             .await
                             .map_err(blob_err_to_py)
@@ -12554,10 +12584,12 @@ impl PyEngine {
     ///
     /// `plaintext_b64` is the CLEARTEXT — persist seals it here. Returns the
     /// cascade result as JSON: `at_rest_sha256` (hex), `epoch`, `granted`,
-    /// `excluded`. `excluded` is the fail-secure list — members with no
-    /// valid `encryption_pubkeys` get NO grant, never a plaintext fallback,
-    /// and a caller that ignores this field is ignoring who cannot read what
-    /// it just wrote.
+    /// `excluded`, `roster`, `readable_by_nobody`. `excluded` is the
+    /// fail-secure list — occurrences with no valid `encryption_pubkeys` get
+    /// NO grant, never a plaintext fallback. #843: `roster` partitions the
+    /// community's MEMBERS (`granted` with their occurrences / `excluded` /
+    /// `absent` — no active occurrence at all), and `readable_by_nobody` is
+    /// the one field to check: true iff no member holds a grant.
     #[pyo3(signature = (community_key_id, plaintext_b64, media_type=None))]
     fn put_blob_encrypted_community(
         &self,
@@ -12580,6 +12612,8 @@ impl PyEngine {
             let media = media_type.map(str::to_owned);
             py.detach(move || {
                 use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+                // #846 (§5) — the row's author is this node's derived key (I23).
+                let author = self.runtime.block_on(self.local_derived_key_id_async())?;
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -12590,6 +12624,7 @@ impl PyEngine {
                                 &community,
                                 &plaintext,
                                 media.as_deref(),
+                                Some(&author),
                             )
                             .await
                         })
@@ -12603,17 +12638,21 @@ impl PyEngine {
                                 &community,
                                 &plaintext,
                                 media.as_deref(),
+                                Some(&author),
                             )
                             .await
                         })
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = res.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(res.at_rest_sha256),
                     "epoch": res.epoch,
                     "granted": res.granted,
                     "excluded": res.excluded,
+                    "roster": res.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -12629,8 +12668,12 @@ impl PyEngine {
     ///
     /// Returns JSON: `at_rest_sha256` (hex — of the CIPHERTEXT for an
     /// encrypted tier), `tier`, `epoch` (community only), `granted`,
-    /// `excluded`. **Read `excluded`**: members without valid
-    /// `encryption_pubkeys` get NO grant, never a plaintext fallback.
+    /// `excluded`, `roster`, `readable_by_nobody`. **Read
+    /// `readable_by_nobody`** (#843): true iff no roster member holds a
+    /// grant — including when the author has no occurrence to name.
+    /// `excluded` lists occurrences without valid `encryption_pubkeys` (NO
+    /// grant, never a plaintext fallback); `roster` partitions the MEMBERS
+    /// into `granted` (with their occurrences) / `excluded` / `absent`.
     ///
     /// `aad_b64` (#831, §11.2 (7)) — base64 of caller-supplied associated
     /// data, bound into the seal and NEVER stored; `read_blob_as` must be
@@ -12709,12 +12752,15 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(r.at_rest_sha256),
                     "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "granted": r.granted,
                     "excluded": r.excluded,
+                    "roster": r.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13038,6 +13084,125 @@ impl PyEngine {
         })
     }
 
+    /// #846 (`BLOB_REPLICATION.md` §6.1) — **adopt a sealed blob received
+    /// from a peer**: store the `AtRestEnvelope` verbatim at the tier and
+    /// under the `(community, epoch)` binding its provenance declares, and
+    /// — for `"announce"` — emit `holds_bytes` signed by this node. Never
+    /// opens the envelope (I45); the binding is the author's fact (no
+    /// current-epoch check, no key state required — §3).
+    ///
+    /// Payload JSON:
+    /// ```json
+    /// {
+    ///   "envelope_b64": "<the AtRestEnvelope bytes, verbatim>",
+    ///   "author_key_id": "<attesting_key_id of the referencing attestation>",
+    ///   "cohort_scope": "community",
+    ///   "community_key_id": "<community | owner/family key | null>",
+    ///   "epoch": 3,
+    ///   "tier": "community_dek | invisible_encrypted",
+    ///   "aad_b64": "<optional; carried, not recorded>",
+    ///   "disposition": "announce | local_only"
+    /// }
+    /// ```
+    /// Returns JSON `{"sha256": "<hex>", "announced": bool}`. Refusals
+    /// keep their `BlobError` class: `blob_not_party_to`,
+    /// `blob_disk_pressure_proxy_refused`, `blob_invalid_argument`.
+    fn adopt_sealed_blob_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptSealedBlobWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_blob_json decode: {e}"))
+            })?;
+            let envelope = B64.decode(&wire.envelope_b64).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_blob_json envelope_b64 decode: {e}"))
+            })?;
+            let aad = decode_aad_b64(wire.aad_b64.as_deref())?;
+            let disposition = match wire.disposition.as_str() {
+                "announce" => crate::federation::AdoptDisposition::Announce,
+                "local_only" => crate::federation::AdoptDisposition::LocalOnly,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "adopt_sealed_blob_json disposition {other:?}: expected \"announce\" or \
+                         \"local_only\""
+                    )))
+                }
+            };
+            let provenance = wire.provenance.into_provenance("adopt_sealed_blob_json")?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let out = runtime
+                    .block_on(async move {
+                        engine
+                            .adopt_sealed_blob(&envelope, provenance, aad.as_deref(), disposition)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({
+                    "sha256": hex::encode(out.sha256),
+                    "announced": out.announced,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §6.3) — **the WILL decision as a door**,
+    /// asked before a fetch: would this node hold content with this
+    /// provenance, now? Writes nothing. Payload JSON is the provenance
+    /// half of `adopt_sealed_blob_json` (`author_key_id`, `cohort_scope`,
+    /// `community_key_id`, `epoch`, `tier`). Returns `{"hold": true}` or
+    /// `{"hold": false, "kind": "<blob_not_party_to | blob_disk_pressure_proxy_refused>",
+    /// "reason": "<message>"}` — a refusal is the ANSWER, not an error; a
+    /// backend failure raises with its `BlobError` class.
+    fn would_hold_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let wire: ProvenanceWire = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("would_hold_json decode: {e}")))?;
+            let provenance = wire.into_provenance("would_hold_json")?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let decision =
+                    runtime.block_on(async move { engine.would_hold(&provenance).await });
+                match decision {
+                    Ok(()) => Ok(serde_json::json!({ "hold": true }).to_string()),
+                    Err(
+                        e @ (crate::federation::BlobError::NotPartyTo { .. }
+                        | crate::federation::BlobError::DiskPressureProxyRefused { .. }),
+                    ) => Ok(serde_json::json!({
+                        "hold": false,
+                        "kind": e.kind(),
+                        "reason": e.to_string(),
+                    })
+                    .to_string()),
+                    Err(e) => Err(blob_err_to_py(e)),
+                }
+            })
+        })
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §4) — **how widely this node holds** within
+    /// the cohorts it is party to: `"for_cohort"` when it stands at
+    /// `ServeTier::MeshServer` or above, else `"on_demand"`. Edge's pull
+    /// scheduler reads it; it refuses nothing.
+    fn hold_breadth(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(async move { engine.hold_breadth().await })
+                    .map(|b| b.label().to_owned())
+                    .map_err(blob_err_to_py)
+            })
+        })
+    }
+
     /// #832 (§12.3) — **append one plaintext segment to a live stream at
     /// `cohort_scope`, sealed where the tier requires it.** The chunk twin of
     /// `put_blob_scoped`: `plaintext_b64` in, the tier resolved from the
@@ -13048,8 +13213,10 @@ impl PyEngine {
     /// epoch binding, reported as `epoch` in the result.
     ///
     /// Returns JSON: `chunk_sha256` (hex — of the CIPHERTEXT at a sealed
-    /// tier), `tier`, `epoch` (community only), `granted`, `excluded`.
-    /// `aad_b64` (#831): the data the content was sealed under, if any.
+    /// tier), `tier`, `epoch` (community only), `granted`, `excluded`,
+    /// `roster`, `readable_by_nobody` (#843 — the roster partition and the
+    /// one field to check). `aad_b64` (#831): the data the content was
+    /// sealed under, if any.
     #[pyo3(signature = (cohort_scope, stream_id, seq, plaintext_b64, epoch, community_key_id=None, aad_b64=None))]
     #[allow(clippy::too_many_arguments)]
     fn put_blob_chunk_scoped(
@@ -13125,12 +13292,15 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "chunk_sha256": hex::encode(r.chunk_sha256),
                     "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "granted": r.granted,
                     "excluded": r.excluded,
+                    "roster": r.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13145,7 +13315,9 @@ impl PyEngine {
     ///
     /// Returns JSON: `manifest_sha256` (hex — the DAG's content address),
     /// `tier`, `epoch`, `chunk_count`, `total_size` (plaintext), `granted`,
-    /// `excluded`. `aad_b64` (#831) binds the manifest's seal.
+    /// `excluded`, `roster`, `readable_by_nobody` (#843 — the roster
+    /// partition and the one field to check). `aad_b64` (#831) binds the
+    /// manifest's seal.
     #[pyo3(signature = (cohort_scope, stream_id, community_key_id=None, media_type=None, aad_b64=None))]
     fn seal_stream_scoped(
         &self,
@@ -13210,6 +13382,7 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "manifest_sha256": hex::encode(r.manifest_sha256),
                     "tier": r.tier.as_str(),
@@ -13218,6 +13391,8 @@ impl PyEngine {
                     "total_size": r.total_size,
                     "granted": r.granted,
                     "excluded": r.excluded,
+                    "roster": r.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13433,6 +13608,8 @@ impl PyEngine {
             let media = media_type.map(str::to_owned);
             py.detach(move || {
                 use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+                // #846 (§5) — the row's author is this node's derived key (I23).
+                let author = self.runtime.block_on(self.local_derived_key_id_async())?;
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -13445,6 +13622,7 @@ impl PyEngine {
                                 &plaintext,
                                 media.as_deref(),
                                 None,
+                                Some(&author),
                             )
                             .await
                         })
@@ -13460,16 +13638,20 @@ impl PyEngine {
                                 &plaintext,
                                 media.as_deref(),
                                 None,
+                                Some(&author),
                             )
                             .await
                         })
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = res.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(res.at_rest_sha256),
                     "granted": res.granted,
                     "excluded": res.excluded,
+                    "roster": res.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13616,12 +13798,16 @@ impl PyEngine {
             // #140) to a shared `select_signer` helper.
             let attesting_key_id_owned = attesting_key_id.to_string();
 
-            // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on
-            // the proxy-ACCEPT path. At stop tier (or tighter) refuse a
-            // proxy write (attesting key neither the local signer nor
-            // family). Local + family writes are NEVER refused. Reads the
-            // cached snapshot (no statvfs per write).
-            self.disk_pressure_refuse_proxy_accept(&attesting_key_id_owned)?;
+            // #846 (I46) — the WILL decision, through the one door. At the
+            // stop tier a proxy write (attesting key neither the local
+            // signer nor family) is refused; local + family never.
+            {
+                let attester = attesting_key_id_owned.clone();
+                py.detach(move || {
+                    self.runtime
+                        .block_on(self.would_hold_commons_async(&attester))
+                })?;
+            }
 
             let signer = self.select_signer(&attesting_key_id_owned);
             let media_type_owned = media_type.map(str::to_owned);
@@ -31685,6 +31871,20 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         crate::federation::BlobError::QuarantineWithheld { ref key_id } => {
             PyValueError::new_err(format!("{kind}: {key_id}"))
         }
+        // #846 (§4, I48) — not party to the declared cohort. PERMANENT for
+        // this node (a policy fact, not capacity): place the content with a
+        // member. The declared cohort and community ride in the message —
+        // the caller's own input echoed, never a row.
+        crate::federation::BlobError::NotPartyTo {
+            ref cohort_scope,
+            ref community_key_id,
+        } => PyValueError::new_err(format!(
+            "{kind}: {cohort_scope}{}",
+            community_key_id
+                .as_deref()
+                .map(|c| format!(" community {c}"))
+                .unwrap_or_default()
+        )),
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
@@ -31758,6 +31958,48 @@ struct PutBlobJsonWire {
 
 /// v2.3 (CIRISPersist#103) — Decode the `put_blob_json` payload into
 /// the trait-call argument shape.
+/// #846 — the provenance half of the adopt / would-hold wire.
+#[derive(serde::Deserialize)]
+struct ProvenanceWire {
+    author_key_id: String,
+    cohort_scope: String,
+    #[serde(default)]
+    community_key_id: Option<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
+    tier: String,
+}
+
+impl ProvenanceWire {
+    fn into_provenance(self, door: &str) -> PyResult<crate::federation::BlobProvenance> {
+        let tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&self.tier)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "{door} tier {:?}: expected plaintext | invisible_encrypted | community_dek",
+                    self.tier
+                ))
+            })?;
+        Ok(crate::federation::BlobProvenance {
+            author_key_id: self.author_key_id,
+            cohort_scope: self.cohort_scope,
+            community_key_id: self.community_key_id,
+            epoch: self.epoch,
+            tier,
+        })
+    }
+}
+
+/// #846 — `adopt_sealed_blob_json`'s wire shape.
+#[derive(serde::Deserialize)]
+struct AdoptSealedBlobWire {
+    envelope_b64: String,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
+    #[serde(default)]
+    aad_b64: Option<String>,
+    disposition: String,
+}
+
 fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
     let wire: PutBlobJsonWire = serde_json::from_str(json)
         .map_err(|e| PyValueError::new_err(format!("put_blob_json decode: {e}")))?;

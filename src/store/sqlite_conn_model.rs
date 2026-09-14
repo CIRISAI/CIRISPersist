@@ -243,6 +243,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
     ("adopt_scrub_upgrade", ConnClass::Write),
+    // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
+    // one transaction.
+    ("adopt_sealed_blob_at", ConnClass::Write),
     ("aggregate_audit_chain", ConnClass::Read),
     ("aggregate_llm_costs", ConnClass::Read),
     ("aggregate_scoring_factors_rollup_batch", ConnClass::Read),
@@ -260,6 +263,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("blackhole_upsert", ConnClass::Write),
     ("blob_cohort_scope", ConnClass::Read),
     ("blob_crypto_tier", ConnClass::Read),
+    // #846 (§5) — the row's author / cohort / community, columns only.
+    ("blob_provenance", ConnClass::Read),
     ("cancel_outbound", ConnClass::Write),
     ("check_revocation_anti_rollback_sqlite", ConnClass::Read),
     ("claim_pending_outbound", ConnClass::Write),
@@ -458,7 +463,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_aggregated_tier", ConnClass::Write),
     ("put_at_rest_grant", ConnClass::Write),
     ("put_attestation_with_origin", ConnClass::Write),
-    ("put_blob_chunk_with_scope", ConnClass::Write),
+    // #846 — the chunk floor's ONE body; `put_blob_chunk_with_scope` and
+    // `adopt_sealed_chunk_at` delegate to it and touch no connection.
+    ("put_blob_chunk_floor", ConnClass::Write),
     ("seal_stream_with_scope", ConnClass::Write),
     ("blob_head", ConnClass::Read),
     ("stream_chunks", ConnClass::Read),

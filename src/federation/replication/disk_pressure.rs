@@ -19,7 +19,12 @@
 //!   keep local + family.
 //! - **Stop** (`<= stop_free_bytes`) — refuse to ACCEPT new
 //!   federation-proxied content AND refuse to SERVE proxied content to
-//!   peers.
+//!   peers. The accept refusal is enforced in ONE place —
+//!   [`super::hold::would_hold`], which `Engine::put_blob_signing` and the
+//!   adopt doors run (`FSD/BLOB_REPLICATION.md` §4, I46) — beside the
+//!   party-to axis: content this node is not party to is refused at every
+//!   tier, and "proxy" means *held for others* (the row's author is
+//!   neither local nor family — [`super::hold::is_proxy_content`]).
 //! - **HostAtRisk** (`<= host_at_risk_bytes`) — loudest; everything
 //!   stop does, plus stop accepting new attestations referencing blobs
 //!   we don't already hold (read-mostly until pressure clears).
@@ -88,7 +93,8 @@ impl PressureTier {
     }
 
     /// True once we should refuse to ACCEPT new proxy-attested content
-    /// (stop tier and tighter).
+    /// (stop tier and tighter). Read by [`super::hold::would_hold`] and
+    /// nowhere else (I46).
     pub fn refuses_proxy_writes(&self) -> bool {
         *self >= PressureTier::Stop
     }

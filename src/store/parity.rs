@@ -451,10 +451,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("prepare", Class::Plumbing),
     ("prepare_chunk_rows", Class::Plumbing),
     ("prepare_decision", Class::Gate),
+    // #846 — rebuilds and ADMITS a holds_bytes row from the caller's signed
+    // components (runs `check_put_blob_admission`): it refuses caller input.
+    ("prepare_holds_bytes_row", Class::Gate),
     ("prepare_proposal", Class::Gate),
     ("prepare_sealed_manifest_row", Class::Plumbing),
     ("prepare_stream_chunk_row", Class::Plumbing),
     ("project_route", Class::Plumbing),
+    // #846 — the chunk floor's one body; the write door and the adopt door
+    // both run its sequence.
+    ("put_blob_chunk_floor", Class::Delegates),
     ("put_family_local", Class::Delegates),
     ("put_transport_destination", Class::Delegates),
     ("query", Class::Plumbing),

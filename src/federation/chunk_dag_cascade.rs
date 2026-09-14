@@ -22,7 +22,7 @@
 //! `StorageFloor` token, unconstructible outside the crate (I22); I14 lists
 //! this file as the floor's only permitted caller.
 
-use crate::federation::blobs::{BlobBody, BlobError, BlobStorage};
+use crate::federation::blobs::{BlobBody, BlobError, BlobStorage, RosterPartition};
 use crate::federation::types::cohort_scope::CryptoTier;
 
 /// §12.4 — the largest content the WHOLE-read door (`read_any_for_viewer`)
@@ -77,6 +77,18 @@ pub struct PutChunkScopedResult {
     pub granted: Vec<String>,
     /// Occurrences fail-secure excluded (no valid `encryption_pubkeys`).
     pub excluded: Vec<String>,
+    /// #843 (§12.11, I54) — the same fan-out by roster MEMBER. Empty at
+    /// the plaintext tier.
+    pub roster: RosterPartition,
+}
+
+impl PutChunkScopedResult {
+    /// #843 — can NOBODY read this chunk? `false` at the plaintext tier;
+    /// otherwise a roster fact.
+    #[must_use]
+    pub fn readable_by_nobody(&self) -> bool {
+        self.tier != CryptoTier::Plaintext && self.roster.readable_by_nobody()
+    }
 }
 
 /// What `seal_stream_scoped` did.
@@ -97,6 +109,18 @@ pub struct SealStreamScopedResult {
     pub granted: Vec<String>,
     /// Occurrences fail-secure excluded.
     pub excluded: Vec<String>,
+    /// #843 (§12.11, I54) — the same fan-out by roster MEMBER. Empty at
+    /// the plaintext tier.
+    pub roster: RosterPartition,
+}
+
+impl SealStreamScopedResult {
+    /// #843 — can NOBODY read this DAG's manifest? `false` at the plaintext
+    /// tier; otherwise a roster fact.
+    #[must_use]
+    pub fn readable_by_nobody(&self) -> bool {
+        self.tier != CryptoTier::Plaintext && self.roster.readable_by_nobody()
+    }
 }
 
 /// The doors and the reads. Free functions over any backend that is both a
@@ -212,6 +236,7 @@ pub mod orchestrate {
                     epoch: None,
                     granted: Vec::new(),
                     excluded: Vec::new(),
+                    roster: RosterPartition::default(),
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -236,14 +261,14 @@ pub mod orchestrate {
                         claim(),
                     )
                     .await?;
-                let (granted, excluded) =
-                    grant_dek_to_cohort(backend, &sha, cohort_scope, owner, &dek).await?;
+                let report = grant_dek_to_cohort(backend, &sha, cohort_scope, owner, &dek).await?;
                 Ok(PutChunkScopedResult {
                     chunk_sha256: sha,
                     tier,
                     epoch: None,
-                    granted,
-                    excluded,
+                    granted: report.granted,
+                    excluded: report.excluded,
+                    roster: report.roster,
                 })
             }
             CryptoTier::CommunityDek => {
@@ -253,8 +278,7 @@ pub mod orchestrate {
                 let mut last_epoch = 0;
                 for _ in 0..EPOCH_RACE_ATTEMPTS {
                     let dek_epoch = backend.community_dek_current_epoch(comm).await?;
-                    let (dek, granted, excluded) =
-                        ensure_epoch_dek(backend, comm, dek_epoch).await?;
+                    let (dek, report) = ensure_epoch_dek(backend, comm, dek_epoch).await?;
                     let envelope =
                         seal(&dek, plaintext, Some(&bound_aad)).map_err(map_at_rest_err)?;
                     match backend
@@ -279,8 +303,9 @@ pub mod orchestrate {
                                 chunk_sha256: sha,
                                 tier,
                                 epoch: Some(dek_epoch),
-                                granted,
-                                excluded,
+                                granted: report.granted,
+                                excluded: report.excluded,
+                                roster: report.roster,
                             })
                         }
                         Err(BlobError::EpochNotCurrent { .. }) => {
@@ -412,6 +437,7 @@ pub mod orchestrate {
                     total_size,
                     granted: Vec::new(),
                     excluded: Vec::new(),
+                    roster: RosterPartition::default(),
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -439,16 +465,16 @@ pub mod orchestrate {
                         None,
                     )
                     .await?;
-                let (granted, excluded) =
-                    grant_dek_to_cohort(backend, &sha, cohort_scope, owner, &dek).await?;
+                let report = grant_dek_to_cohort(backend, &sha, cohort_scope, owner, &dek).await?;
                 Ok(SealStreamScopedResult {
                     manifest_sha256: sha,
                     tier,
                     epoch: None,
                     chunk_count,
                     total_size,
-                    granted,
-                    excluded,
+                    granted: report.granted,
+                    excluded: report.excluded,
+                    roster: report.roster,
                 })
             }
             CryptoTier::CommunityDek => {
@@ -458,8 +484,7 @@ pub mod orchestrate {
                 let mut last_epoch = 0;
                 for _ in 0..EPOCH_RACE_ATTEMPTS {
                     let dek_epoch = backend.community_dek_current_epoch(comm).await?;
-                    let (dek, granted, excluded) =
-                        ensure_epoch_dek(backend, comm, dek_epoch).await?;
+                    let (dek, report) = ensure_epoch_dek(backend, comm, dek_epoch).await?;
                     let body = seal(&dek, &jcs, aad).map_err(map_at_rest_err)?.to_bytes();
                     let sha: [u8; 32] = Sha256::digest(&body).into();
                     match backend
@@ -505,8 +530,9 @@ pub mod orchestrate {
                                 epoch: Some(dek_epoch),
                                 chunk_count,
                                 total_size,
-                                granted,
-                                excluded,
+                                granted: report.granted,
+                                excluded: report.excluded,
+                                roster: report.roster,
                             });
                         }
                         Err(BlobError::EpochNotCurrent { .. }) => {
@@ -1308,7 +1334,7 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"segment 0", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"segment 0", None, None)
             .await
             .unwrap();
         let Some(BlobBody::Inline(sealed_bytes)) =
@@ -1790,7 +1816,7 @@ pub mod invariants {
         {
             use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
             let whole = segment(9, 4000);
-            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None, None)
+            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None, None, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2735,7 +2761,7 @@ pub mod invariants {
         // DEK (reached the way the door reaches it) and stored through the
         // floor as a second DAG over the stream.
         let epoch = backend.community_dek_current_epoch(&comm).await.unwrap();
-        let (dek, _, _) = ensure_epoch_dek(backend, &comm, epoch).await.unwrap();
+        let (dek, _) = ensure_epoch_dek(backend, &comm, epoch).await.unwrap();
         let swapped = ChunkManifest {
             v: CHUNK_MANIFEST_VERSION_SEALED,
             total_size: 300,

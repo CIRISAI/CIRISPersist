@@ -35,6 +35,7 @@
 pub mod accord_carriage;
 pub mod accord_quorum;
 pub mod admission;
+pub mod adopt_cascade;
 pub mod age;
 pub mod at_rest_cascade;
 /// v36.0.0 (CIRISPersist#624) — the typed, pre-write replicated
@@ -304,12 +305,13 @@ pub use admission::{
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
-    holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobEpochBinding,
-    BlobError, BlobHead, BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
-    EpochBinding, EvictActorReport, ExternalRef, GroupDekRef, ManifestRowSpec, PutBlobAttestation,
-    PutBlobScopedResult, ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim,
-    StreamHead, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
-    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
+    BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow, BlobRange, BlobStorage,
+    ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport, ExternalRef,
+    GroupDekRef, ManifestRowSpec, MemberGrant, PreparedHoldsBytes, PutBlobAttestation,
+    PutBlobScopedResult, RosterPartition, ScopeBlobSymbol, StorageFloor, StreamChunkRef,
+    StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
+    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
@@ -377,6 +379,13 @@ pub use replication::{
 // must not be welded to an internal module layout. Definition stays beside the
 // logic that produces it (the `register::KeyRefusalReason` precedent from #565).
 pub use replication::admission::{PeerQuotaRefusal, PeerQuotaRefused};
+// #846 (BLOB_REPLICATION.md §4/§6) — the provenance a consumer declares to the
+// adopt doors and the breadth answer it reads; named here so a Rust consumer
+// does not have to path into `replication::hold`.
+pub use adopt_cascade::{AdoptDisposition, AdoptOutcome};
+pub use replication::hold::{
+    is_audience, is_proxy_content, would_hold, BlobProvenance, HoldBreadth, HoldContext,
+};
 // v25.1.0 (CIRISPersist#569) — same rationale as `PeerQuotaRefusal` above:
 // `Error::ConsentGateRefused` carries these, so a consumer must not have to
 // name a path into `admission` to match on the error it was handed.

@@ -143,6 +143,7 @@ Engine	add_community_member	deontic
 Engine	add_moderator	deontic	
 Engine	add_peer_record_json	deontic	
 Engine	adopt_scrub_upgrade	deontic	
+Engine	adopt_sealed_blob_json	deontic	
 Engine	age_band_fine_json	epistemic	
 Engine	age_band_json	epistemic	
 Engine	aggregate_audit_chain	axiotic	
@@ -345,6 +346,7 @@ Engine	has_accord_conferred_role	deontic
 Engine	has_blob_json	empirical	
 Engine	hash_chain_gaps	testimonial	self_audit
 Engine	heartbeat_occurrence	ontological	
+Engine	hold_breadth	procedural	
 Engine	incident_correlate	empirical	
 Engine	incident_list	empirical	
 Engine	incident_record	empirical	
@@ -671,6 +673,7 @@ Engine	wa_cert_upsert	deontic
 Engine	wholeness_witness_root_hex	pragmatic	
 Engine	widen_audience	deontic	
 Engine	withdraw_canonical_role	deontic	
+Engine	would_hold_json	deontic	
 Engine	wrap_dek_for_recipient_v2_b64	deontic	
 MODULE	_test_inject_panic	structural	
 MODULE	engine_teardown_wait	structural	
