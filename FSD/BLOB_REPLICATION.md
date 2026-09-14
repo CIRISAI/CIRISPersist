@@ -179,8 +179,9 @@ MAY hold, do we hold it *now*, on *this* node:
 | input | source | rule |
 |---|---|---|
 | **backpressure** | the cached `DiskPressureSnapshot` (#149) | at `Stop` and tighter, non-local, non-family content is refused with `DiskPressureProxyRefused { operation: "accept" }`; local and family content is **never** refused ("don't block local writes ever") |
-| **role** | `resolve_serve_tier(directory, our key, our key)` (#788) | content we are **audience** for is held by right of audience, whatever our serve standing. Content we are **not** audience for — a pure relay hold — is accepted only by a node with serve standing (`ServeTier >= MeshServer`). A node nobody conferred `infra:serve` on does not volunteer as a relay. |
-| **provenance class** | the author key on the meaning, against the local/family predicate | decides which of the two rules above applies, and is recorded on the row (§5) |
+| **party** | `is_audience(directory, provenance)` — this node's own rosters | **a node never holds content it is not party to.** If no cohort this node belongs to may access the attestation that grants possession and view of the blob, the adopt is refused, typed `NotPartyTo`, always. There is no relay exception and no serve-role exception. Commons is party-to for everyone and plaintext, so the holder inspects the bytes. |
+| **role** | `resolve_serve_tier(directory, our key, our key)` (#788) | governs the **breadth** of holding, never permission. A node with serve standing (`ServeTier >= MeshServer`) is a *server*: it holds content it is party to but did not create and does not itself need, so other members of the cohort can fetch it. A node without serve standing holds what it reads. Exposed as `hold_breadth() -> OnDemand | ForCohort` for Edge's pull scheduler; `would_hold` does not consult it. |
+| **provenance class** | the author key on the meaning, against the local/family predicate | decides whether backpressure applies (§5 records it on the row) |
 
 The order is: MAY before bytes move (it is Edge's, it precedes the fetch);
 WILL at the door, after the bytes arrived and their hash verified, before the
@@ -188,13 +189,21 @@ row is written. WILL is cheap — one cached snapshot, one directory read for th
 serve tier — and its refusals are typed, name the axis, and disclose nothing
 about the content (I4b's class).
 
-**Why role at all.** Without it, "backpressure" is the only thing standing
-between a node and holding the whole federation's commons: any peer above the
-trust threshold could push relay content onto any node until the disk filled,
-and #737 notes the trust threshold is zero when nobody configured it. The
-Constitution already keys serving of the one role-projected family (`trace:*`)
-on `infra:serve`; holding what one is not audience for is the same act one hop
-earlier.
+**Why "party to" is the rule, and why it is stricter than the Constitution's
+floor.** CC 4.4.3.2.1 permits non-member holders of community content — they
+keep or evict on cleartext provenance without reading. Persist chooses not to
+be one. **We never store data we are not party to**: every blob this node
+holds is one it could open and inspect, because it is a member of a cohort
+the granting attestation admits, or the content is commons plaintext. That is
+how a node avoids storing illegal or immoral content *unknowingly* — not by a
+trust score (which #737 notes defaults to zero) and not by a relay role, but by
+never holding bytes it has no standing to look at. The Constitution's
+provenance-only keep/evict is the floor for the federation; this is persist's
+posture on it, and it is the stricter one.
+
+"Server" does not loosen this. A server is a node that holds what it is party
+to but did not create and does not need, for the cohort's benefit — breadth,
+not permission.
 
 ## 5. Author is not holder
 
@@ -218,8 +227,8 @@ predicate:
   leaves the rest NULL, which the predicate treats as *unknown* → proxy
   (fail-toward-evictable, never toward protected).
 - `is_proxy_content(row)` — ONE predicate: `author_key_id` is not
-  local-or-family **and** this node is not audience for the row's cohort. It
-  replaces the holder-attester scan in the force-evict sweep, the serve
+  local-or-family (content we are party to but hold for others; non-party
+  content is never present, §4). It replaces the holder-attester scan in the force-evict sweep, the serve
   refusal and the accept decision, so all three agree by construction (I49).
 
 ## 6. The doors
@@ -283,8 +292,8 @@ Numbering continues the at-rest series (I1–I42) and #840's (I43–I44).
 | I45 | The adopt path never decrypts: `adopt_sealed_blob`, `adopt_sealed_chunk` and everything they call contain no `open(`, `open_aad(`, `unwrap_dek` or `read_any` (from-disk, the I36 shape). | a receiver that peeks at what it relays | `blob_surface_gates` |
 | I46 | The WILL decision runs on every consumer-reachable accept door and exists in exactly one place: `adopt_sealed_blob`, `adopt_sealed_chunk` and `put_blob_signing` all call `would_hold`; no other site reads `refuses_proxy_writes` (from-disk). | a door that accepts under `Stop` | `blob_surface_gates` |
 | I47 | Under `Stop` pressure a non-local, non-family adopt is refused `DiskPressureProxyRefused { operation: "accept" }` and nothing is written; a local or family adopt succeeds at every tier. | a full disk that still takes relay content; a node that refuses its own family | behavioural, both backends |
-| I48 | A node with `ServeTier::None` refuses to adopt content it is not audience for (`RelayRequiresServeStanding`, typed); it adopts content it is audience for regardless of serve standing; a `MeshServer` node adopts both. | a nobody-node filling with commons; a member refused its own community's bytes | behavioural, both backends |
-| I49 | `is_proxy_content` is the one classification: the force-evict sweep, `serve_blob_to_peer` and `would_hold` all call it; an adopted non-audience blob classifies proxy; a `NULL` author classifies proxy. | an adopted relay blob that survives a force-evict; a proxy blob served under `Stop` | from-disk + behavioural |
+| I48 | A node never adopts content it is not party to: a non-audience adopt is refused `NotPartyTo`, typed, regardless of serve standing; an audience adopt succeeds regardless of serve standing; `would_hold` contains no `resolve_serve_tier` / `ServeTier` read (from-disk). Role reaches consumers only as `hold_breadth()`. | a relay holding a community's bytes without membership; a member refused its own community's bytes; a serve-role node admitting non-party content | behavioural + from-disk |
+| I49 | `is_proxy_content` is the one classification — *party to, but the author is not local-or-family* (held for others): the force-evict sweep, `serve_blob_to_peer` and `would_hold` all call it; an adopted blob authored elsewhere classifies proxy; a `NULL` author classifies proxy. | an adopted blob that survives a force-evict; a proxy blob served under `Stop` | from-disk + behavioural |
 | I50 | An adopted stream chunk's stream row records the AUTHOR's derived key as owner; a later append by the adopter is refused as a foreign writer (I41 carried across nodes). | a relay that takes over a stream it holds | behavioural |
 | I51 | An adopted `CommunityDek` blob is readable by a viewer holding a grant for its declared epoch and refused `NotGranted` for one who does not, with no key state for that epoch on the adopting node required for the adopt itself. | an adopt that needs the receiver to already be a member; an adopted blob that opens for anyone | behavioural |
 | I52 | `Announce` emits `holds_bytes` carrying `author_key_id` and `community_key_id` in the clear; `LocalOnly` emits nothing; self/family provenance can never `Announce` (CC 5.2, refused before the floor). | a holder claim a relay cannot keep/evict on; an announced family blob | behavioural |
@@ -315,7 +324,9 @@ check is mutated once to prove the witness measures it and not a neighbour.
 - **CIRISEdge** (#601): after `admit_blob_store` returns `StoreAndAnnounce` or
   `StoreLocalOnly`, fetch, then call `adopt_sealed_blob` (or the chunk twin)
   with the `BlobMeaning` provenance and the disposition — carried, not
-  re-derived. `would_hold` is available before the fetch. The FountainContent
+  re-derived. `would_hold` is available before the fetch; `hold_breadth`
+  tells the pull scheduler whether this node pulls the cohort's corpus
+  (server) or only what it reads (member). The FountainContent
   ceiling narrows to `Cohort` when the store gate is armed, as #601 gap 2 says.
 - **CIRISServer** (#594): nothing new is required of Server for this cut. #843
   ships beside it.
@@ -326,9 +337,8 @@ check is mutated once to prove the witness measures it and not a neighbour.
 ## 10. Versioning
 
 **v44.2.0**, MINOR. Additive: the three doors, `BlobProvenance`,
-`HoldDecision`, `RelayRequiresServeStanding`, `federation_blobs.author_key_id`
-(V144, nullable, backfilled). One behaviour change, stated: a node with no serve
-standing now refuses to accept content it is not audience for, on
-`put_blob_signing` as well as the new doors. Today that content is accepted by
-anyone above a trust threshold that defaults to zero; after this cut it is
-accepted by the nodes the mesh conferred that role on.
+`HoldDecision`, `NotPartyTo`, `hold_breadth`, `federation_blobs.author_key_id`
+(V144, nullable). One behaviour change, stated: a node now refuses to accept
+content it is not party to — no cohort it belongs to may access the granting
+attestation — on `put_blob_signing` as well as the new doors. Today that
+content is accepted by anyone above a trust threshold that defaults to zero.
