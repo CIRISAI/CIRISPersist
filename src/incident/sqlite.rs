@@ -266,7 +266,7 @@ impl IncidentService for SqliteIncidentBackend {
                 tx.execute(
                     "UPDATE cirislens_incident_records SET \
                         occurrences = occurrences + 1, \
-                        last_seen_at = datetime('now', 'subsec') \
+                        last_seen_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
                      WHERE incident_id = ?1",
                     params![existing_id],
                 )

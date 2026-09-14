@@ -188,6 +188,66 @@ impl SqliteBackend {
         })
     }
 
+    /// #845 (`FSD/MIGRATION_IMMUTABILITY.md` §6, I55) — rewrite every live
+    /// `CREATE TABLE` default naming the `subsec` modifier to the portable
+    /// `strftime('%Y-%m-%d %H:%M:%f', 'now')`, which yields byte-identical
+    /// text on every SQLite this crate has linked.
+    ///
+    /// Thirty-seven `NOT NULL` timestamp columns across twenty-one SHIPPED
+    /// migrations carry the modifier; SQLite < 3.42 (Debian bookworm 3.40.1,
+    /// Ubuntu 22.04 3.37) evaluates it to NULL and every insert relying on
+    /// the default fails `NOT NULL` — the first encrypted-at-rest write dies
+    /// at `federation_content_master.created_at` (CIRISEdge#600). The files
+    /// are immutable (#840) and `ALTER TABLE` cannot change a default, so the
+    /// schema TEXT is corrected here, by SQLite's documented procedure for
+    /// changes `ALTER` cannot express: `writable_schema`, rewrite
+    /// `sqlite_master.sql`, bump `schema_version` so every connection
+    /// reloads, `integrity_check`.
+    ///
+    /// Idempotent and cheap: a no-op when no `subsec` remains (every boot but
+    /// the first). A repair that leaves any `subsec` behind, or whose
+    /// `integrity_check` is not `ok`, aborts the boot rather than leaving a
+    /// schema half-repaired. Returns the number of tables rewritten.
+    pub(crate) async fn repair_portable_defaults(&self) -> Result<usize, Error> {
+        use crate::store::migration_immutability as mi;
+        self.write(|conn| -> Result<usize, rusqlite::Error> {
+            const COUNT: &str =
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND sql LIKE '%subsec%'";
+            let before: i64 = conn.query_row(COUNT, [], |r| r.get(0))?;
+            if before == 0 {
+                return Ok(0);
+            }
+            let version: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+            conn.execute_batch("PRAGMA writable_schema = ON")?;
+            let rewritten = conn.execute(&mi::portable_default_repair_statement(), [])?;
+            conn.execute_batch("PRAGMA writable_schema = OFF")?;
+            conn.execute_batch(&format!("PRAGMA schema_version = {}", version + 1))?;
+            let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            if integrity != "ok" {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!("portable-default repair: integrity_check answered {integrity:?}")
+                        .into(),
+                ));
+            }
+            let after: i64 = conn.query_row(COUNT, [], |r| r.get(0))?;
+            if after != 0 {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!(
+                        "portable-default repair: {after} CREATE TABLE statement(s) still name \
+                         `subsec` after rewriting {rewritten}"
+                    )
+                    .into(),
+                ));
+            }
+            Ok(rewritten)
+        })
+        .await
+        .map_err(|e| Error::Migration {
+            sqlstate: None,
+            detail: format!("sqlite portable-default repair (#845): {e}"),
+        })
+    }
+
     /// Test-only: apply migrations up to and including `version`, so a test
     /// can seed rows in the PRE-migration shape and then run the rest.
     #[cfg(any(test, feature = "test-anchor"))]
@@ -203,7 +263,10 @@ impl SqliteBackend {
         .map_err(|e| Error::Migration {
             sqlstate: None,
             detail: format!("sqlite migrations through V{version}: {e}"),
-        })
+        })?;
+        // #845 — the same repair the full run applies, so a test seeding rows
+        // through a defaulted column behaves as production does.
+        self.repair_portable_defaults().await.map(|_| ())
     }
 
     /// Shared WRITER handle. Used by sibling modules
@@ -1085,6 +1148,11 @@ impl Backend for SqliteBackend {
             sqlstate: None,
             detail: format!("sqlite migrations: {e}"),
         })?;
+
+        // #845 (I55) — AFTER the shipped migrations, BEFORE any write: the
+        // live schema's `subsec` defaults are rewritten to the portable form,
+        // or SQLite < 3.42 refuses every insert that relies on them.
+        self.repair_portable_defaults().await?;
 
         // #226 (V094) — backfill shard_key for legacy rows, before the
         // engine serves any write. See `backfill_trace_dedup_shard_keys`.
@@ -7615,9 +7683,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // is harmless (the DEK is minted lazily on next emission).
             tx.execute(
                 "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, rotated_at) \
-                 VALUES (?1, 1, datetime('now', 'subsec')) \
+                 VALUES (?1, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
                  ON CONFLICT (community_key_id) DO UPDATE SET \
-                    epoch = epoch + 1, rotated_at = datetime('now', 'subsec')",
+                    epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
                 rusqlite::params![row.community_key_id],
             )?;
             tx.commit()
@@ -12513,9 +12581,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 // Upsert: epoch 0 → first bump yields 1; subsequent bumps +1.
                 conn.execute(
                 "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, rotated_at) \
-                 VALUES (?1, 1, datetime('now', 'subsec')) \
+                 VALUES (?1, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
                  ON CONFLICT (community_key_id) DO UPDATE SET \
-                    epoch = epoch + 1, rotated_at = datetime('now', 'subsec')",
+                    epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
                 rusqlite::params![community],
             )?;
                 conn.query_row(
@@ -22750,6 +22818,62 @@ impl crate::derived::DerivedSchema for SqliteBackend {
 #[cfg(test)]
 mod accord_tests {
     use super::*;
+
+    /// **I55 (#845) — after migrations, no live schema default depends on
+    /// the `subsec` modifier, and an insert that relies on a defaulted
+    /// timestamp column succeeds and stores the 23-character form.**
+    ///
+    /// On SQLite < 3.42 the `subsec` modifier makes `datetime()` NULL and every such
+    /// insert fails `NOT NULL` (Debian bookworm, CIRISEdge#600). This host
+    /// runs a newer SQLite, so the behavioural half is proved by the
+    /// bookworm witness (`scripts/sqlite_portability_witness.sh`); what this
+    /// test proves is that the REPAIR ran — the schema text no longer names
+    /// the modifier — and that the format it writes is unchanged.
+    #[tokio::test]
+    async fn i55_no_live_schema_default_depends_on_subsec_after_migrations() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let remaining: i64 = backend
+            .write(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND sql LIKE '%subsec%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .await;
+        assert_eq!(
+            remaining, 0,
+            "{remaining} live CREATE TABLE statement(s) still name the `subsec` modifier — \
+             on SQLite < 3.42 every insert relying on them fails NOT NULL (#845)"
+        );
+        // The repair is idempotent: a second pass rewrites nothing.
+        let rewritten = backend.repair_portable_defaults().await.unwrap();
+        assert_eq!(rewritten, 0, "a second repair pass must be a no-op");
+        // An insert that relies on the default still works and stores the
+        // same 23-character form the modifier produced.
+        let (len, text): (i64, String) = backend
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO federation_content_master (id, key_kind, master_key_b64, descriptor) \
+                     VALUES (0, 'software', 'AAAA', '{}') ON CONFLICT (id) DO NOTHING",
+                    [],
+                )
+                .unwrap();
+                conn.query_row(
+                    "SELECT length(created_at), created_at FROM federation_content_master WHERE id = 0",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            })
+            .await;
+        assert_eq!(
+            len, 23,
+            "created_at must keep the YYYY-MM-DD HH:MM:SS.SSS form, got {text:?}"
+        );
+    }
 
     /// **I44 (#840) — a node that recorded the BRICKED V070 checksum boots.**
     ///

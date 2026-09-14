@@ -48,7 +48,7 @@
 //! # Lock-expiry semantics across backends
 //!
 //! Both PG and SQLite stamp `locked_at` server-side (`NOW()` on PG,
-//! `datetime('now', 'subsec')` on SQLite — both UTC). Both backends
+//! the portable `strftime('%Y-%m-%d %H:%M:%f','now')` on SQLite (#845) — both UTC). Both backends
 //! evaluate "is this lock expired?" server-side in the same
 //! statement that does the acquire, using the same server clock.
 //! This guarantees that on a given wall-clock moment, both backends

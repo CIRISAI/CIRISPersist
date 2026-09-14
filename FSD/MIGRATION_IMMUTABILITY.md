@@ -115,3 +115,87 @@ after their first release: postgres `V001__trace_events.sql` (0.1.0 → 0.1.2,
 original was **rejected by postgres** (sqlstate 42P17) so no node can have
 recorded it. Neither is live today. They are pinned at their current bytes,
 which is what any surviving node has, and the gate holds them there from here.
+
+## 6. Schema text a shipped migration cannot change: the portable-default repair (#845)
+
+Thirty-seven `NOT NULL` timestamp columns across twenty-one shipped sqlite
+migrations, V010 through V143, default to `datetime('now', 'subsec')` — the
+systematic sqlite translation of postgres's `NOW()`. The `subsec` modifier
+was added in SQLite 3.42.0. Below that, an unrecognised modifier does not
+error: `datetime()` returns **NULL**, silently, and the `INSERT` that relied
+on the default meets `NOT NULL`. Debian bookworm — current stable — ships
+3.40.1; Ubuntu 22.04 ships 3.37. On either, the first encrypted-at-rest
+write fails at `federation_content_master.created_at` and nothing after it
+succeeds. Every CI lane runs a newer SQLite, so the class was invisible until
+CIRISEdge's mesh harness ran on a bookworm image (CIRISEdge#600).
+
+### 6.1 Why neither obvious fix is available
+
+- The migrations that declare the defaults have **shipped**. §2 forbids
+  editing them, and #840 is what editing one costs.
+- SQLite cannot `ALTER COLUMN … SET DEFAULT`. The sanctioned rebuild recipe
+  (§11 of the at-rest FSD, the V136/V141 shape) rebuilds a table to change a
+  column; for a DEFAULT *expression* on twenty-odd tables carrying indexes,
+  foreign keys and a self-FK, that is a large, risky operation to change text
+  that stores nothing.
+
+### 6.2 The repair
+
+A DEFAULT expression is schema **text**. SQLite documents a procedure for
+schema changes `ALTER TABLE` cannot express: under `PRAGMA writable_schema`,
+rewrite the `sql` column of `sqlite_master`, bump `schema_version` so every
+connection reloads, and `integrity_check`. Persist runs exactly that, once,
+idempotently, after refinery on every boot:
+
+```
+datetime('now', 'subsec')   →   strftime('%Y-%m-%d %H:%M:%f', 'now')
+```
+
+The replacement yields byte-identical text (`YYYY-MM-DD HH:MM:SS.SSS`, 23
+characters) on every SQLite this crate has ever linked, so existing rows,
+cursors and readers see no difference. The rewrite touches `type = 'table'`
+rows only, is a no-op when no `subsec` remains (a fresh database after the
+first boot, every later boot), and is followed by an `integrity_check` that
+must answer `ok` and a post-condition that no `subsec` remains — either
+failing aborts the boot loudly rather than leaving a schema half-repaired.
+
+It lives beside the #840 repair (`repair_v070_checksum`) and for the same
+reason: a shipped migration is immutable, so what a shipped migration got
+wrong is corrected at the boundary where the database meets the current
+crate, not in the ledger.
+
+### 6.3 Invariants
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I55 | After `run_migrations` on sqlite, no `CREATE TABLE` text in `sqlite_master` contains `subsec`; an `INSERT` omitting a defaulted timestamp column succeeds and stores the 23-character form; a second run rewrites nothing. | a bookworm host that cannot write; a repair that changes the stored format | behavioural (sqlite), and the bookworm witness |
+| I56 | No migration file after V144, in either dialect, contains `subsec`; the shipped set's count is pinned (44 in sqlite, 0 in postgres). | a new migration that reintroduces the modifier | from-disk |
+| I57 | The shell witness `scripts/sqlite_portability_witness.sh` and the Rust repair carry the same two literals, so what CI proves on 3.40.1 is what the crate does. | a witness that tests a different rewrite | from-disk |
+
+The bookworm witness runs the shipped sqlite migrations and the repair
+through Debian's own `libsqlite3` 3.40.1 in a `debian:bookworm-slim`
+container, asserts the pre-repair `NOT NULL` failure, then the post-repair
+success. It is the only place in the stack a pre-3.42 SQLite runs, which is
+the reason it exists.
+
+### 6.4 The rule going forward
+
+`subsec` is never written into a migration again. New timestamp defaults use
+the portable form. The floor this crate supports is what Debian stable ships;
+a modifier newer than that floor is a portability bug whether or not CI can
+see it.
+
+### 6.5 Statements, not only defaults
+
+The audit that built the repair found a second class the repair cannot
+reach: nine runtime SQL statements in `src/` evaluated
+`datetime('now', 'subsec')` directly — the community-DEK epoch rotation
+(`rotated_at`), maintenance locks, incident records, telemetry locks and
+workers. On 3.40.1 those wrote NULL silently into a nullable column, or failed
+`NOT NULL`. They are source, so they are simply changed to the portable form;
+what keeps them changed is I58.
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I58 | The `subsec` modifier appears in no source file except the one that owns the two literals — doc comments included, so the old spelling is never copied out of one. | a new statement or default that evaluates the modifier at runtime | from-disk |
+

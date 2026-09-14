@@ -5,6 +5,59 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.2.1] - 2026-09-14
+
+**Every encrypted-at-rest write failed on Debian stable, and now does not.**
+CIRISPersist#845, from CIRISEdge#600: thirty-seven `NOT NULL` timestamp
+columns across twenty-one shipped sqlite migrations default to
+`datetime('now', 'subsec')`, and nine runtime statements evaluated the same
+expression directly. The `subsec` modifier exists from SQLite 3.42; below it,
+`datetime()` returns NULL **silently**, and the first insert that relies on
+the default — `federation_content_master.created_at`, on the first community
+write — fails `NOT NULL`. Debian bookworm ships 3.40.1, Ubuntu 22.04 ships
+3.37, and every CI lane in the stack ran a newer SQLite, so the class was
+invisible for twenty-one migrations until a mesh harness ran on a bookworm
+image. `FSD/MIGRATION_IMMUTABILITY.md` §6, invariants I55–I58.
+
+### Fixed
+- **The live schema is repaired at boot, not the shipped files.** The
+  migrations are immutable (#840) and `ALTER TABLE` cannot change a default,
+  so `SqliteBackend::repair_portable_defaults` runs after refinery on every
+  boot and rewrites each live `CREATE TABLE` default from
+  `datetime('now', 'subsec')` to `strftime('%Y-%m-%d %H:%M:%f', 'now')` —
+  **byte-identical output** (`YYYY-MM-DD HH:MM:SS.SSS`) on every SQLite this
+  crate has linked, so existing rows, cursors and readers see no change and
+  sub-second precision is kept. SQLite's documented procedure for a change
+  `ALTER` cannot express: `writable_schema`, rewrite `sqlite_master.sql`,
+  bump `schema_version` so every pooled connection reloads,
+  `integrity_check`. Idempotent — a no-op on every boot but the first — and
+  loud: a repair that leaves any `subsec` behind, or whose `integrity_check`
+  is not `ok`, aborts the boot.
+- **Nine runtime statements** — the community-DEK epoch rotation
+  (`rotated_at`), maintenance locks, incidents, telemetry — now use the
+  portable form. On 3.40.1 they wrote NULL into nullable columns silently or
+  failed `NOT NULL`; the schema repair cannot reach a statement.
+
+### Added
+- Witnesses: **I55** (after migrations no live `CREATE TABLE` names `subsec`;
+  a second pass rewrites nothing; an insert relying on the default stores the
+  23-character form), **I56** (no migration after V144 names `subsec` in
+  either dialect; the shipped count, 44, is pinned), **I57**
+  (`scripts/sqlite_portability_witness.sh` carries the crate's two literals),
+  **I58** (the modifier appears in no source file but the one that owns the
+  constants — doc comments included, so nobody copies the old spelling).
+- **A CI job that runs a pre-3.42 SQLite** — `sqlite portability (debian
+  bookworm, libsqlite3 3.40.1)`, a `debian:bookworm-slim` container that
+  applies the shipped sqlite migrations and the repair through Debian's own
+  libsqlite3 and asserts the pre-repair `NOT NULL` refusal, then the
+  post-repair success. No Rust build; seconds. It is the only place in the
+  stack a pre-3.42 SQLite runs, which is the reason it exists.
+
+### Not changed
+- Postgres (`TIMESTAMPTZ NOT NULL DEFAULT NOW()`) was never affected.
+- The shipped migration files are byte-identical; `evidence/migration_checksums.tsv`
+  is unchanged.
+
 ## [44.2.0] - 2026-09-14
 
 **A node can now store a sealed blob it received from a peer, and it never

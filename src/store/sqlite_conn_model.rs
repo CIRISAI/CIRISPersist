@@ -514,6 +514,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("release_shared_instance_lease", ConnClass::Write),
     ("remove_peer_record", ConnClass::Write),
     ("remove_transport_destination", ConnClass::Write),
+    // #845 (I55) — the portable-default repair: a writable_schema rewrite
+    // of sqlite_master, run after the migrations.
+    ("repair_portable_defaults", ConnClass::Write),
     // #840 (I44) — the V070 checksum repair: a conditional UPDATE on the
     // schema-history table, run before refinery validates it.
     ("repair_v070_checksum", ConnClass::Write),

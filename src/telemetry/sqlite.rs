@@ -357,7 +357,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 .execute(
                     "INSERT INTO cirisgraph_consolidation_locks (\
                         period_start, period_end, tenant_id, locked_by, locked_at\
-                     ) VALUES (?1, ?2, ?3, ?4, datetime('now', 'subsec')) \
+                     ) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
                      ON CONFLICT (period_start, tenant_id) DO NOTHING",
                     params![
                         period_start_str,
@@ -372,7 +372,7 @@ impl TelemetryService for SqliteTelemetryBackend {
                 // AV-53 stale-lock auto-break.
                 let stale_sql = format!(
                     "UPDATE cirisgraph_consolidation_locks SET \
-                        locked_by = ?1, locked_at = datetime('now', 'subsec') \
+                        locked_by = ?1, locked_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
                      WHERE period_start = ?2 AND tenant_id = ?3 \
                        AND locked_at < datetime('now', '-{STALE_LOCK_SECONDS} seconds')"
                 );
@@ -610,7 +610,7 @@ impl TelemetryService for SqliteTelemetryBackend {
         (move || -> Result<std::collections::HashMap<String, u64>, Error> {
             let guard = conn.lock();
             // SQLite cirisgraph_edges.created_at uses the
-            // `datetime('now', 'subsec')` default which produces
+            // portable `strftime('%Y-%m-%d %H:%M:%f','now')` default (#845) which produces
             // the space-separated form
             // `YYYY-MM-DD HH:MM:SS.sss` — not RFC 3339. A raw
             // lex compare against our RFC-3339-formatted bounds
@@ -1564,7 +1564,7 @@ mod tests {
                 .execute(
                     "INSERT INTO cirisgraph_consolidation_locks \
                      (period_start, period_end, tenant_id, locked_by, locked_at) \
-                     VALUES (?1, ?2, ?3, 'planted-worker', datetime('now', 'subsec'))",
+                     VALUES (?1, ?2, ?3, 'planted-worker', strftime('%Y-%m-%d %H:%M:%f', 'now'))",
                     params![
                         fmt_datetime(period_start),
                         fmt_datetime(period_end),

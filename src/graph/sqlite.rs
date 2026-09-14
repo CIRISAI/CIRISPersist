@@ -196,7 +196,7 @@ fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, Error> {
     // SQLite stores RFC 3339 / SQLite-default `YYYY-MM-DD HH:MM:SS.sssssssss`
     // depending on how the row was written. chrono's `parse_from_rfc3339`
     // handles the rusqlite-emit shape; for the column-default
-    // `datetime('now', 'subsec')` form (which uses SQLite's space
+    // `strftime('%Y-%m-%d %H:%M:%f','now')` form (which uses SQLite's space
     // separator), normalize to RFC 3339 first.
     let normalized = if s.contains('T') {
         s.to_owned()
