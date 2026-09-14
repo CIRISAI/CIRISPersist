@@ -1113,11 +1113,17 @@ shard plane's tombstone ceiling — and a ceiling wide enough helps only if
 shards stay under it. Edge's shard plane today has a serve gate and no
 STORE gate: the fountain converger pushes shards toward `target_holders`
 without asking who may hold, so a shard can land on a node outside the
-cohort, and a `Cohort`-ceiling tombstone will not reach it. Until
-CIRISEdge#581 lands, the recall this section relies on is an INTENDED reach,
-not an enforced one; Edge will return with a bound it can defend and it will
-be pinned here as the shard plane's number. CIRISEdge#582 is the mirror —
-what the converger deletes on an unverified holder count.
+cohort, and a `Cohort`-ceiling tombstone will not reach it. The store gate
+itself is built — CIRISEdge#581 shipped `admit_blob_store` in edge v23.1.0
+(trust, audience, operator consent; `StoreAndAnnounce` / `StoreLocalOnly` /
+`Refuse`) — and persist's receiver side is `adopt_sealed_blob`
+(`FSD/BLOB_REPLICATION.md` §6, v44.2.0), which stores what the gate admits
+and refuses anything this node is not party to (I48). What is still open is
+ARMING the gate over the converger's push path, which is CIRISEdge#601; until
+that lands the recall this section relies on is an INTENDED reach, not an
+enforced one, and Edge will return with a bound it can defend to be pinned
+here as the shard plane's number. CIRISEdge#582 is the mirror — what the
+converger deletes on an unverified holder count.
 
 This is a **gate**, not a convention: the fountain path must refuse a
 plaintext body whose `cohort_scope` resolves to an encrypted tier.

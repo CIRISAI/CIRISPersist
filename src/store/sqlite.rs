@@ -13949,7 +13949,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         p.row.asserted_at.to_rfc3339(),
                         Option::<String>::None,
                         p.envelope_text,
-                        p.row.original_content_hash,
+                        // BYTES, as every holds_bytes insert binds it (the
+                        // hex is the row's TEXT view; readers decode bytes).
+                        p.original_content_hash,
                         p.row.scrub_signature_classical,
                         p.row.scrub_signature_pqc,
                         p.row.scrub_key_id,

@@ -4275,7 +4275,7 @@ pub mod blob_invariants {
 
     /// #846 — a sealed community envelope to adopt: cascades `body` under
     /// `comm` on this backend and returns `(envelope bytes, epoch, sha)`.
-    async fn sealed_community_envelope<B>(
+    pub async fn sealed_community_envelope<B>(
         backend: &B,
         comm: &str,
         body: &[u8],

@@ -7,7 +7,7 @@
 //! *State on a node changes ONLY via a hybrid-Strict-verified claim by a
 //! signer resolved against our OWN registered directory — never
 //! sender-supplied material, a stored flag, a caller-passed roster, or bare
-//! FK existence* (FSD `CEG_REPLICATION_MODEL.md` §0). Before this cut six
+//! FK existence* (CIRISServer `FSD/CEG_REPLICATION_MODEL.md` §0). Before this cut six
 //! inbound `put_*` planes admitted on FK-existence alone (the classical
 //! edges E1/E2/E4/E9), plus a local-tier exemption that poisoned the
 //! trust-root walk (E5).
