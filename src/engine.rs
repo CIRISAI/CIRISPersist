@@ -18401,6 +18401,63 @@ mod tests {
         );
     }
 
+    /// #843 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §12.11, I54) — **through the
+    /// Engine's own write door, the result names the author who cannot
+    /// read what she wrote.** The backend witness
+    /// (`exercise_i54_the_cascade_result_partitions_the_roster`) proves the
+    /// partition on every backend; this proves the door a consumer holds
+    /// carries it, and that `readable_by_nobody()` is callable on what that
+    /// door returns.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_blob_scoped_reports_the_roster_partition_843() {
+        use crate::federation::community_dek::lifecycle_support::seed_community_shaped;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::cohort_scope::COMMUNITY;
+        use crate::federation::types::identity_type::USER;
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let alias = format!("eng843-{run}");
+        let signer = ts::local_signer(&alias);
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let backend = engine.sqlite_backend().expect("sqlite").clone();
+        // The door announces under the signer's derived key (I23): register
+        // it with the alias's real pubkeys so the announcement verifies.
+        ts::register_hybrid_key_as(backend.as_ref(), &alias, &alias, USER).await;
+        ts::register_hybrid_key_as(backend.as_ref(), &derived, &alias, USER).await;
+
+        let comm = format!("comm-843-{run}");
+        let alice = format!("alice-{run}");
+        let bob = format!("bob-{run}");
+        let bob_phone = format!("bob-phone-{run}");
+        seed_community_shaped(
+            backend.as_ref(),
+            &comm,
+            &[(&alice, &[]), (&bob, &[(&bob_phone, false)])],
+        )
+        .await;
+
+        let res = engine
+            .put_blob_scoped(COMMUNITY, Some(&comm), b"minutes", None, None)
+            .await
+            .expect("community write through the Engine door");
+        assert_eq!(res.granted, Vec::<String>::new());
+        assert_eq!(res.excluded, vec![bob_phone]);
+        assert_eq!(res.roster.excluded, vec![bob], "bob: a device, none usable");
+        assert_eq!(
+            res.roster.absent,
+            vec![alice],
+            "alice — the author, no occurrence — is named ABSENT through the Engine door"
+        );
+        assert!(
+            res.readable_by_nobody(),
+            "the one field to check says nobody can read this"
+        );
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn self_at_login_lands_full_flow() {

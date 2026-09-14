@@ -844,11 +844,75 @@ pub fn wrap_dek_v2(
 /// [`Engine`]: crate::Engine
 pub mod orchestrate {
     use super::*;
-    use crate::federation::blobs::{BlobBody, BlobError, BlobStorage};
+    use crate::federation::blobs::{
+        BlobBody, BlobError, BlobStorage, MemberGrant, RosterPartition,
+    };
     use crate::federation::types::cohort_scope::{CryptoTier, FAMILY, SELF};
     use crate::federation::types::EncryptionPubkeys;
     use crate::federation::FederationDirectory;
     use sha2::{Digest, Sha256};
+
+    /// #843 — one cohort member as the directory enumerates it: the identity
+    /// key and its ACTIVE occurrences with their keys. An empty occurrence
+    /// list is a member the cascade cannot reach at all.
+    pub(crate) type MemberOccurrences = (String, Vec<(String, Option<EncryptionPubkeys>)>);
+
+    /// #843 — what the fan-out half of a cascade reports: the per-occurrence
+    /// split (`granted` / `excluded`) AND the roster partition, from one
+    /// enumeration.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub(crate) struct GrantReport {
+        pub granted: Vec<String>,
+        pub excluded: Vec<String>,
+        pub roster: RosterPartition,
+    }
+
+    /// #843 (§12.11, I54) — **partition the enumerated roster.** Pure, and
+    /// the ONE place every cascade (self/family, community, chunk) decides
+    /// who is granted, excluded or absent, so the invariant has one home:
+    ///
+    /// - a member with no occurrence is `absent` (nothing to wrap to);
+    /// - a member with occurrences but no usable keys is `excluded`, and
+    ///   each bare occurrence is in the flat `excluded`;
+    /// - a member with at least one usable occurrence is `granted` with
+    ///   exactly those occurrences, its bare ones still in the flat
+    ///   `excluded`.
+    ///
+    /// Returns the wrap targets (occurrence + keys, roster order) beside
+    /// the report; the caller wraps and stores, and must store to EVERY
+    /// target or fail — the report is what the write will have done.
+    pub(crate) fn partition_roster(
+        members: Vec<MemberOccurrences>,
+    ) -> (Vec<(String, EncryptionPubkeys)>, GrantReport) {
+        let mut targets = Vec::new();
+        let mut report = GrantReport::default();
+        for (member_key_id, occurrences) in members {
+            if occurrences.is_empty() {
+                report.roster.absent.push(member_key_id);
+                continue;
+            }
+            let mut granted_here = Vec::new();
+            for (occ_key_id, keys) in occurrences {
+                match usable_keys(&keys) {
+                    Some(k) => {
+                        targets.push((occ_key_id.clone(), k.clone()));
+                        report.granted.push(occ_key_id.clone());
+                        granted_here.push(occ_key_id);
+                    }
+                    None => report.excluded.push(occ_key_id),
+                }
+            }
+            if granted_here.is_empty() {
+                report.roster.excluded.push(member_key_id);
+            } else {
+                report.roster.granted.push(MemberGrant {
+                    member_key_id,
+                    occurrence_key_ids: granted_here,
+                });
+            }
+        }
+        (targets, report)
+    }
 
     /// Outcome of an [`encrypt_and_cascade`] write.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,6 +928,20 @@ pub mod orchestrate {
         /// They get NO grant — the content stays unreachable to them
         /// until they register keys; never a plaintext fallback.
         pub excluded: Vec<String>,
+        /// #843 (§12.11, I54) — the same fan-out by roster MEMBER: for
+        /// `self` the owner identity alone, for `family` the family roster
+        /// minus effective removals. The only view that names a member with
+        /// no active occurrence.
+        pub roster: RosterPartition,
+    }
+
+    impl CascadeResult {
+        /// #843 — can NOBODY read what was just written? A roster fact:
+        /// no member holds a grant.
+        #[must_use]
+        pub fn readable_by_nobody(&self) -> bool {
+            self.roster.readable_by_nobody()
+        }
     }
 
     fn map_dir_err(e: crate::federation::Error) -> BlobError {
@@ -883,17 +961,20 @@ pub mod orchestrate {
             .filter(|k| !k.x25519_base64.is_empty() && !k.ml_kem_768_base64.is_empty())
     }
 
-    /// Resolve the active recipient occurrences for a self/family write,
-    /// as `(occurrence_key_id, encryption_pubkeys?)` pairs.
+    /// Resolve the active recipients for a self/family write, BY MEMBER:
+    /// each roster identity with its `(occurrence_key_id,
+    /// encryption_pubkeys?)` pairs (#843 — a member with none is still
+    /// listed, so the result can name it).
     ///
-    /// - `self`: `list_identity_occurrences_active(owner_or_family_key_id)`.
-    /// - `family`: every active occurrence of every current member
-    ///   identity in the named family roster.
+    /// - `self`: the owner alone, with
+    ///   `list_identity_occurrences_active(owner_or_family_key_id)`.
+    /// - `family`: every current member identity in the named family
+    ///   roster, each with its active occurrences.
     async fn resolve_recipients<B>(
         backend: &B,
         cohort_scope: &str,
         owner_or_family_key_id: &str,
-    ) -> Result<Vec<(String, Option<EncryptionPubkeys>)>, BlobError>
+    ) -> Result<Vec<MemberOccurrences>, BlobError>
     where
         B: FederationDirectory + Sync,
     {
@@ -903,10 +984,12 @@ pub mod orchestrate {
                     .list_identity_occurrences_active(owner_or_family_key_id)
                     .await
                     .map_err(map_dir_err)?;
-                Ok(occ
-                    .into_iter()
-                    .map(|o| (o.occurrence_key_id, o.encryption_pubkeys))
-                    .collect())
+                Ok(vec![(
+                    owner_or_family_key_id.to_owned(),
+                    occ.into_iter()
+                        .map(|o| (o.occurrence_key_id, o.encryption_pubkeys))
+                        .collect(),
+                )])
             }
             FAMILY => {
                 let family = backend
@@ -946,9 +1029,12 @@ pub mod orchestrate {
                         .list_identity_occurrences_active(&member.key_id)
                         .await
                         .map_err(map_dir_err)?;
-                    for o in occ {
-                        out.push((o.occurrence_key_id, o.encryption_pubkeys));
-                    }
+                    out.push((
+                        member.key_id.clone(),
+                        occ.into_iter()
+                            .map(|o| (o.occurrence_key_id, o.encryption_pubkeys))
+                            .collect(),
+                    ));
                 }
                 Ok(out)
             }
@@ -1014,7 +1100,7 @@ pub mod orchestrate {
 
         // 3 + 4. Self-retention + recipient fan-out (shared with the chunk
         //        cascade, §12.3: a chunk row gets exactly these grants).
-        let (granted, excluded) = grant_dek_to_cohort(
+        let report = grant_dek_to_cohort(
             backend,
             &at_rest_sha256,
             cohort_scope,
@@ -1025,15 +1111,17 @@ pub mod orchestrate {
 
         Ok(CascadeResult {
             at_rest_sha256,
-            granted,
-            excluded,
+            granted: report.granted,
+            excluded: report.excluded,
+            roster: report.roster,
         })
     }
 
     /// The grant half of the self/family cascade: persist's content-master
     /// self-retention wrap for `at_rest_sha256`, then a v2 wrap of `dek` to
     /// every active recipient occurrence whose keys are usable, fail-secure
-    /// excluding the rest. Returns `(granted, excluded)`.
+    /// excluding the rest. Returns the [`GrantReport`] — the per-occurrence
+    /// split and the roster partition (#843).
     ///
     /// #832 (§12.3) — factored out so a sealed CHUNK row and a sealed
     /// MANIFEST row receive precisely the grants a whole blob does, from the
@@ -1045,7 +1133,7 @@ pub mod orchestrate {
         cohort_scope: &str,
         owner_or_family_key_id: &str,
         dek: &[u8; DEK_LEN],
-    ) -> Result<(Vec<String>, Vec<String>), BlobError>
+    ) -> Result<GrantReport, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
@@ -1065,31 +1153,20 @@ pub mod orchestrate {
 
         // Recipient cascade — wrap the DEK to each active recipient whose
         // occurrence carries valid encryption_pubkeys; fail-secure exclude
-        // the rest (no plaintext / v1 fallback).
+        // the rest (no plaintext / v1 fallback). #843: the partition is
+        // decided by roster MEMBER in `partition_roster`, once, for every
+        // cascade.
         let recipients = resolve_recipients(backend, cohort_scope, owner_or_family_key_id).await?;
+        let (targets, report) = partition_roster(recipients);
         let v2_algo = WRAP_ALGORITHM_V2;
-        let mut granted = Vec::new();
-        let mut excluded = Vec::new();
-        for (occ_key_id, keys) in recipients {
-            match usable_keys(&keys) {
-                Some(k) => {
-                    let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, dek)
-                        .map_err(map_at_rest_err)?;
-                    backend
-                        .put_at_rest_grant(
-                            at_rest_sha256,
-                            &occ_key_id,
-                            v2_algo,
-                            &wrapped,
-                            cohort_scope,
-                        )
-                        .await?;
-                    granted.push(occ_key_id);
-                }
-                None => excluded.push(occ_key_id),
-            }
+        for (occ_key_id, k) in targets {
+            let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, dek)
+                .map_err(map_at_rest_err)?;
+            backend
+                .put_at_rest_grant(at_rest_sha256, &occ_key_id, v2_algo, &wrapped, cohort_scope)
+                .await?;
         }
-        Ok((granted, excluded))
+        Ok(report)
     }
 
     /// One newcomer's wrap target for the [`rekey_for_newcomers`] walk:
@@ -1948,6 +2025,7 @@ pub mod orchestrate {
                     epoch: None,
                     granted: Vec::new(),
                     excluded: Vec::new(),
+                    roster: RosterPartition::default(),
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -1969,6 +2047,7 @@ pub mod orchestrate {
                     epoch: None,
                     granted: r.granted,
                     excluded: r.excluded,
+                    roster: r.roster,
                 })
             }
             CryptoTier::CommunityDek => {
@@ -2015,6 +2094,7 @@ pub mod orchestrate {
                     epoch: Some(r.epoch),
                     granted: r.granted,
                     excluded: r.excluded,
+                    roster: r.roster,
                 })
             }
         }
@@ -2118,6 +2198,131 @@ pub mod orchestrate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #843 (§12.11, I54) — the partition, on the pure function every
+    /// cascade shares. Each member lands in exactly one list; a granted
+    /// member's bare device stays in the flat `excluded`.
+    #[test]
+    fn partition_roster_puts_every_member_in_exactly_one_list_843() {
+        use super::orchestrate::partition_roster;
+        use crate::federation::types::EncryptionPubkeys;
+        use crate::federation::MemberGrant;
+        let keyed = || {
+            Some(EncryptionPubkeys {
+                x25519_base64: "x".into(),
+                ml_kem_768_base64: "m".into(),
+            })
+        };
+        let half = || {
+            Some(EncryptionPubkeys {
+                x25519_base64: "x".into(),
+                ml_kem_768_base64: String::new(),
+            })
+        };
+        let members = vec![
+            ("absent".to_owned(), vec![]),
+            (
+                "bare".to_owned(),
+                vec![("bare-1".to_owned(), None), ("bare-2".to_owned(), half())],
+            ),
+            (
+                "mixed".to_owned(),
+                vec![
+                    ("mixed-old".to_owned(), None),
+                    ("mixed-new".to_owned(), keyed()),
+                ],
+            ),
+            ("keyed".to_owned(), vec![("keyed-1".to_owned(), keyed())]),
+        ];
+        let (targets, r) = partition_roster(members);
+        assert_eq!(
+            targets.iter().map(|(o, _)| o.as_str()).collect::<Vec<_>>(),
+            ["mixed-new", "keyed-1"],
+            "the wrap targets are exactly the granted occurrences, roster order"
+        );
+        assert_eq!(r.granted, ["mixed-new", "keyed-1"]);
+        assert_eq!(r.excluded, ["bare-1", "bare-2", "mixed-old"]);
+        assert_eq!(r.roster.absent, ["absent"]);
+        assert_eq!(r.roster.excluded, ["bare"]);
+        assert_eq!(
+            r.roster.granted,
+            vec![
+                MemberGrant {
+                    member_key_id: "mixed".into(),
+                    occurrence_key_ids: vec!["mixed-new".into()],
+                },
+                MemberGrant {
+                    member_key_id: "keyed".into(),
+                    occurrence_key_ids: vec!["keyed-1".into()],
+                },
+            ]
+        );
+        assert!(!r.roster.readable_by_nobody());
+        let mut seen: Vec<&str> = r
+            .roster
+            .granted
+            .iter()
+            .map(|g| g.member_key_id.as_str())
+            .chain(r.roster.excluded.iter().map(String::as_str))
+            .chain(r.roster.absent.iter().map(String::as_str))
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            ["absent", "bare", "keyed", "mixed"],
+            "exactly once each"
+        );
+    }
+
+    /// #843 — `readable_by_nobody` is a ROSTER fact: true when every member
+    /// is absent (nothing enumerated, nothing excluded) exactly as when every
+    /// occurrence is bare; and `false` at the plaintext tier, where there is
+    /// no fan-out and everyone can read.
+    #[test]
+    fn readable_by_nobody_is_a_roster_fact_843() {
+        use super::orchestrate::partition_roster;
+        use crate::federation::types::cohort_scope::CryptoTier;
+        use crate::federation::{PutBlobScopedResult, RosterPartition};
+        let (_, all_absent) = partition_roster(vec![("a".into(), vec![]), ("b".into(), vec![])]);
+        assert!(all_absent.granted.is_empty() && all_absent.excluded.is_empty());
+        assert!(
+            all_absent.roster.readable_by_nobody(),
+            "nothing enumerated, nothing excluded, and nobody can read"
+        );
+        let (_, all_bare) = partition_roster(vec![("a".into(), vec![("a-1".into(), None)])]);
+        assert!(all_bare.roster.readable_by_nobody());
+        let (_, empty) = partition_roster(vec![]);
+        assert!(
+            empty.roster.readable_by_nobody(),
+            "an empty roster grants nobody"
+        );
+
+        let plain = PutBlobScopedResult {
+            at_rest_sha256: [0; 32],
+            tier: CryptoTier::Plaintext,
+            epoch: None,
+            granted: vec![],
+            excluded: vec![],
+            roster: RosterPartition::default(),
+        };
+        assert!(
+            !plain.readable_by_nobody(),
+            "a plaintext row has no fan-out and is readable by everyone"
+        );
+        let sealed = PutBlobScopedResult {
+            tier: CryptoTier::CommunityDek,
+            ..plain.clone()
+        };
+        assert!(
+            sealed.readable_by_nobody(),
+            "the same empty roster at a sealed tier"
+        );
+        let sealed_self = PutBlobScopedResult {
+            tier: CryptoTier::InvisibleEncrypted,
+            ..plain
+        };
+        assert!(sealed_self.readable_by_nobody());
+    }
 
     #[test]
     fn envelope_round_trips_through_bytes() {
@@ -4160,33 +4365,57 @@ pub mod blob_invariants {
         );
     }
 
-    // ── I54 (#843) — PROBE FORM ─────────────────────────────────────────
-    /// **The cascade result partitions the ROSTER.** A member with no active
-    /// occurrence must be NAMED by the result; today the result enumerates
-    /// occurrences, so such a member is in neither `granted` nor `excluded`.
+    // ── I54 (#843) ───────────────────────────────────────────────────────
+    /// **The cascade result partitions the ROSTER: every active member is
+    /// exactly one of granted / excluded / absent, and readable-by-nobody
+    /// is a roster fact.**
+    ///
+    /// Written first in a PROBE form (asserting only that the author was
+    /// NAMED anywhere in the result) and confirmed RED on sqlite and
+    /// postgres against the v44.1.1 tree: `granted=[] excluded=[bob-phone]`,
+    /// alice nowhere. Five rosters through THE write door
+    /// (`put_blob_scoped`):
+    ///
+    /// 1. community {alice: no occurrence, bob: one bare} — the #843 case;
+    /// 2. community {lone: no occurrence} — NOTHING enumerated, nothing
+    ///    excluded, and still nobody can read: the vacuous-truth trap an
+    ///    answer derived from the occurrence list falls into;
+    /// 3. community {carol: keyed + bare, dave: keyed, erin: REMOVED} — a
+    ///    granted member keeps its bare device in the flat `excluded`, and
+    ///    a removed member is not `absent` (the roster is the ACTIVE one);
+    /// 4. family {fay: no occurrence, gus: bare} and self {owner: none} —
+    ///    the self/family cascade, same partition;
+    /// 5. a commons write, readable by everyone, which must not say
+    ///    otherwise.
     pub async fn exercise_i54_the_cascade_result_partitions_the_roster<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
-        use crate::federation::community_dek::lifecycle_support::seed_community_shaped;
-        use crate::federation::types::cohort_scope::COMMUNITY;
+        use crate::federation::community_dek::lifecycle_support::{
+            revoke_member, seed_community_shaped, seed_family_shaped, seed_member_shaped,
+        };
+        use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY, FEDERATION, SELF};
+        use crate::federation::{MemberGrant, RosterPartition};
         let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let none: Vec<String> = Vec::new();
+        let no_grants: Vec<MemberGrant> = Vec::new();
+
+        // 1. The #843 case: alice on the roster with NO occurrence; bob with
+        //    one bare occurrence.
         let comm = format!("{tag}-843-{run}");
         let alice = format!("{tag}-alice-{run}");
         let bob = format!("{tag}-bob-{run}");
         let bob_phone = format!("{tag}-bob-phone-{run}");
-        let node = format!("{tag}-node-{run}");
-        // alice: on the roster, NO occurrence. bob: one bare occurrence.
         seed_community_shaped(
             backend,
             &comm,
             &[(&alice, &[]), (&bob, &[(&bob_phone, false)])],
         )
         .await;
-        let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-
         let res = put_blob_scoped(
             backend,
             &adapter,
@@ -4197,23 +4426,201 @@ pub mod blob_invariants {
             None,
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I54: community write: {e}"));
-        assert_eq!(
-            res.granted,
-            Vec::<String>::new(),
-            "{tag} I54: nobody granted"
-        );
+        .unwrap_or_else(|e| panic!("{tag} I54/1: community write: {e}"));
+        assert_eq!(res.granted, none, "{tag} I54/1: no occurrence granted");
         assert_eq!(
             res.excluded,
             vec![bob_phone.clone()],
-            "{tag} I54: bob's phone excluded"
+            "{tag} I54/1: bob's phone is the excluded OCCURRENCE (unchanged meaning)"
         );
-        let rendered = format!("{res:?}");
+        assert_eq!(
+            res.roster.granted, no_grants,
+            "{tag} I54/1: no member granted"
+        );
+        assert_eq!(
+            res.roster.excluded,
+            vec![bob.clone()],
+            "{tag} I54/1: bob — has a device, none usable — is the excluded MEMBER"
+        );
+        assert_eq!(
+            res.roster.absent,
+            vec![alice.clone()],
+            "{tag} I54/1: alice — on the roster, no occurrence — is ABSENT, and named"
+        );
         assert!(
-            rendered.contains(alice.as_str()),
-            "{tag} I54: the AUTHOR alice — on the roster, no occurrence — is named NOWHERE \
-             in the result; a caller reading `excluded` sees one unrelated device while \
-             nobody at all can read the content: {rendered}"
+            res.readable_by_nobody(),
+            "{tag} I54/1: nobody can read this, and the result says so"
+        );
+
+        // 2. Nothing enumerated at all.
+        let comm2 = format!("{tag}-843-lone-{run}");
+        let lone = format!("{tag}-lone-{run}");
+        seed_community_shaped(backend, &comm2, &[(&lone, &[])]).await;
+        let res2 = put_blob_scoped(
+            backend,
+            &adapter,
+            COMMUNITY,
+            Some(&comm2),
+            b"lone",
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I54/2: community write: {e}"));
+        assert_eq!(res2.granted, none, "{tag} I54/2");
+        assert_eq!(res2.excluded, none, "{tag} I54/2: nothing to exclude");
+        assert_eq!(res2.roster.excluded, none, "{tag} I54/2");
+        assert_eq!(
+            res2.roster.absent,
+            vec![lone.clone()],
+            "{tag} I54/2: the lone member is absent"
+        );
+        assert!(
+            res2.readable_by_nobody(),
+            "{tag} I54/2: nothing was enumerated and nothing was excluded — an answer \
+             derived from the occurrence list says everyone can read; the roster says nobody"
+        );
+
+        // 3. Mixed devices, and a REMOVED member.
+        let comm3 = format!("{tag}-843-mixed-{run}");
+        let carol = format!("{tag}-carol-{run}");
+        let carol_laptop = format!("{tag}-carol-laptop-{run}");
+        let carol_old = format!("{tag}-carol-old-{run}");
+        let dave = format!("{tag}-dave-{run}");
+        let dave_phone = format!("{tag}-dave-phone-{run}");
+        let erin = format!("{tag}-erin-{run}");
+        let erin_phone = format!("{tag}-erin-phone-{run}");
+        seed_community_shaped(
+            backend,
+            &comm3,
+            &[
+                (&carol, &[(&carol_laptop, true), (&carol_old, false)]),
+                (&dave, &[(&dave_phone, true)]),
+                (&erin, &[(&erin_phone, true)]),
+            ],
+        )
+        .await;
+        revoke_member(backend, &comm3, &erin).await;
+        let res3 = put_blob_scoped(
+            backend,
+            &adapter,
+            COMMUNITY,
+            Some(&comm3),
+            b"mixed",
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I54/3: community write: {e}"));
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(&res3.granted),
+            sorted(&[carol_laptop.clone(), dave_phone.clone()]),
+            "{tag} I54/3: the usable occurrences are granted"
+        );
+        assert_eq!(
+            res3.excluded,
+            vec![carol_old.clone()],
+            "{tag} I54/3: carol's bare device stays in the flat excluded"
+        );
+        let mut grants = res3.roster.granted.clone();
+        grants.sort_by(|a, b| a.member_key_id.cmp(&b.member_key_id));
+        let mut want = vec![
+            MemberGrant {
+                member_key_id: carol.clone(),
+                occurrence_key_ids: vec![carol_laptop.clone()],
+            },
+            MemberGrant {
+                member_key_id: dave.clone(),
+                occurrence_key_ids: vec![dave_phone.clone()],
+            },
+        ];
+        want.sort_by(|a, b| a.member_key_id.cmp(&b.member_key_id));
+        assert_eq!(
+            grants, want,
+            "{tag} I54/3: each granted member names exactly the occurrences the grant reached"
+        );
+        assert_eq!(
+            res3.roster.excluded, none,
+            "{tag} I54/3: carol has a bare device AND a usable one: granted, not excluded"
+        );
+        assert_eq!(
+            res3.roster.absent, none,
+            "{tag} I54/3: erin was REMOVED — not absent; the roster is the ACTIVE roster"
+        );
+        assert!(
+            !res3.readable_by_nobody(),
+            "{tag} I54/3: two members can read"
+        );
+        let rendered = format!("{res3:?}");
+        assert!(
+            !rendered.contains(erin.as_str()) && !rendered.contains(erin_phone.as_str()),
+            "{tag} I54/3: a removed member is named nowhere: {rendered}"
+        );
+
+        // 4. The self/family cascade partitions the same way.
+        let fam = format!("{tag}-fam-{run}");
+        let fay = format!("{tag}-fay-{run}");
+        let gus = format!("{tag}-gus-{run}");
+        let gus_phone = format!("{tag}-gus-phone-{run}");
+        seed_family_shaped(
+            backend,
+            &fam,
+            &[(&fay, &[]), (&gus, &[(&gus_phone, false)])],
+        )
+        .await;
+        let res4 = put_blob_scoped(backend, &adapter, FAMILY, Some(&fam), b"list", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I54/4: family write: {e}"));
+        assert_eq!(res4.granted, none, "{tag} I54/4");
+        assert_eq!(res4.excluded, vec![gus_phone.clone()], "{tag} I54/4");
+        assert_eq!(
+            res4.roster.excluded,
+            vec![gus.clone()],
+            "{tag} I54/4: gus excluded"
+        );
+        assert_eq!(
+            res4.roster.absent,
+            vec![fay.clone()],
+            "{tag} I54/4: fay absent"
+        );
+        assert!(
+            res4.readable_by_nobody(),
+            "{tag} I54/4: a family nobody can read"
+        );
+
+        let owner = format!("{tag}-owner-{run}");
+        seed_member_shaped(backend, &owner, &[]).await;
+        let res5 = put_blob_scoped(backend, &adapter, SELF, Some(&owner), b"note", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I54/4: self write: {e}"));
+        assert_eq!(
+            res5.roster.absent,
+            vec![owner.clone()],
+            "{tag} I54/4: a self write by an identity with no occurrence names it absent"
+        );
+        assert!(
+            res5.readable_by_nobody(),
+            "{tag} I54/4: the owner cannot read her own note"
+        );
+
+        // 5. A commons write is readable by everyone.
+        let res6 = put_blob_scoped(backend, &adapter, FEDERATION, None, b"public", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I54/5: commons write: {e}"));
+        assert_eq!(
+            res6.roster,
+            RosterPartition::default(),
+            "{tag} I54/5: no fan-out"
+        );
+        assert!(
+            !res6.readable_by_nobody(),
+            "{tag} I54/5: a plaintext row is readable by everyone; an empty roster must not \
+             say otherwise"
         );
     }
 }
