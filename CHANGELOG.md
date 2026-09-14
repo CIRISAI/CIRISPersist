@@ -110,6 +110,15 @@ code and mutation-verified after it.
   `CEG_REPLICATION_MODEL.md`; `replication/mod.rs` states the #737 posture;
   `disk_pressure.rs` names the door its stop tier is enforced on.
 
+### Fixed — the pre-push hook tested nothing on a branch's first push
+`scripts/hooks/pre-push` diffed the working tree against the pushed tip for a
+NEW ref (`git diff --name-only <commit>`), which on a clean tree is empty, so
+every first push of a branch read "no Rust files in pushed range" and skipped
+`cargo test --features postgres,pyo3,server --lib`. That is how this
+release's own #580 gate red (a `block_on` in a helper outside any
+`py.detach` span, every caller detached) reached CI instead of the hook. The
+hook now tests the range the branch adds over `origin/main`.
+
 ### #843 — the cascade result partitions the roster
 
 **The cascade result partitions the ROSTER, and `readable_by_nobody` is the

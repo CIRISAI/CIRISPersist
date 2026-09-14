@@ -1294,14 +1294,16 @@ impl PyEngine {
     /// #846 (§5 / I23) — this node's DERIVED federation key id, for the
     /// bindings that must record an author on a row. The same derivation
     /// `Engine::local_derived_key_id` runs; `ValueError` on a non-Ed25519
-    /// composed signer (#275). Call from inside `py.detach`.
-    fn local_derived_key_id_blocking(&self) -> PyResult<String> {
-        let signer = self.signer.clone();
-        self.runtime.block_on(async move {
-            crate::signing::federation_key_id_of(&*signer)
-                .await
-                .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))
-        })
+    /// composed signer (#275).
+    ///
+    /// Async on purpose: the blocking wait belongs to the CALLER, inside its
+    /// `py.detach` span, where the #580 gate can see the GIL is released. A
+    /// helper that blocked here would be correct at every call site today and
+    /// invisible to the gate that keeps it so.
+    async fn local_derived_key_id_async(&self) -> PyResult<String> {
+        crate::signing::federation_key_id_of(&*self.signer)
+            .await
+            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))
     }
 
     /// #846 (BLOB_REPLICATION.md §4, I46) — an [`Engine`](crate::Engine) view
@@ -1333,9 +1335,11 @@ impl PyEngine {
     /// ([`Engine::would_hold`](crate::Engine::would_hold)): everyone is
     /// party to the commons, so this is the #149 pressure rule — a proxy
     /// write is refused at the stop tier, local + family never. Reads the
-    /// cached snapshot; no statvfs per write. Called from inside
-    /// `py.detach`.
-    fn refuse_unless_would_hold_commons(&self, attesting_key_id: &str) -> PyResult<()> {
+    /// cached snapshot; no statvfs per write.
+    ///
+    /// Async on purpose — see [`Self::local_derived_key_id_async`]: the
+    /// caller blocks on it inside its own `py.detach` span.
+    async fn would_hold_commons_async(&self, attesting_key_id: &str) -> PyResult<()> {
         let engine = self.hold_engine_view();
         let provenance = crate::federation::BlobProvenance {
             author_key_id: attesting_key_id.to_owned(),
@@ -1344,9 +1348,7 @@ impl PyEngine {
             epoch: None,
             tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
         };
-        self.runtime
-            .block_on(async move { engine.would_hold(&provenance).await })
-            .map_err(blob_err_to_py)
+        engine.would_hold(&provenance).await.map_err(blob_err_to_py)
     }
 
     /// v4.0 (FSD §11) — map this PyEngine's backend dispatch to the
@@ -9458,7 +9460,10 @@ impl PyEngine {
             // rule as `put_blob_signing`: a proxy write is refused at the
             // stop tier; local + family writes proceed.
             let attester = payload.attestation.attesting_key_id.clone();
-            py.detach(move || self.refuse_unless_would_hold_commons(&attester))?;
+            py.detach(move || {
+                self.runtime
+                    .block_on(self.would_hold_commons_async(&attester))
+            })?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -12608,7 +12613,7 @@ impl PyEngine {
             py.detach(move || {
                 use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
                 // #846 (§5) — the row's author is this node's derived key (I23).
-                let author = self.local_derived_key_id_blocking()?;
+                let author = self.runtime.block_on(self.local_derived_key_id_async())?;
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -13604,7 +13609,7 @@ impl PyEngine {
             py.detach(move || {
                 use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
                 // #846 (§5) — the row's author is this node's derived key (I23).
-                let author = self.local_derived_key_id_blocking()?;
+                let author = self.runtime.block_on(self.local_derived_key_id_async())?;
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -13798,7 +13803,10 @@ impl PyEngine {
             // signer nor family) is refused; local + family never.
             {
                 let attester = attesting_key_id_owned.clone();
-                py.detach(move || self.refuse_unless_would_hold_commons(&attester))?;
+                py.detach(move || {
+                    self.runtime
+                        .block_on(self.would_hold_commons_async(&attester))
+                })?;
             }
 
             let signer = self.select_signer(&attesting_key_id_owned);

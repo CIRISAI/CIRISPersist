@@ -30,8 +30,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         continue
     fi
     if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
-        # New ref; test the full local_sha tip.
-        RANGES+=("$local_sha")
+        # New ref. NOT "$local_sha" alone: `git diff --name-only <commit>`
+        # diffs the WORKING TREE against it, which on a clean tree is empty,
+        # so every first push of a branch read "no Rust files in pushed
+        # range" and skipped the tests (v44.2.0's #580 red reached CI this
+        # way). Test what the branch adds over main; fall back to the tip's
+        # own parent when main is unknown.
+        base="$(git merge-base origin/main "$local_sha" 2>/dev/null || git rev-parse "$local_sha^" 2>/dev/null || true)"
+        if [ -n "$base" ]; then
+            RANGES+=("$base..$local_sha")
+        else
+            RANGES+=("$local_sha^!")
+        fi
     else
         # Update; test the new range.
         RANGES+=("$remote_sha..$local_sha")
