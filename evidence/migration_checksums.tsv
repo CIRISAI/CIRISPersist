@@ -273,3 +273,5 @@ postgres	140	blob_epoch_binding_evicted_at	10761959340563611754
 postgres	141	admitted_at_not_null	11407500967395387812
 postgres	142	stream_chunk_plaintext_size	6302461759728476371
 postgres	143	federation_streams	15129467152383940322
+sqlite	144	blob_author_key_id	17069550609889699245
+postgres	144	blob_author_key_id	2981934974851927183
