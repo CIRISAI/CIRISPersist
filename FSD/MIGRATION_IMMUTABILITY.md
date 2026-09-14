@@ -141,11 +141,16 @@ CIRISEdge's mesh harness ran on a bookworm image (CIRISEdge#600).
 
 ### 6.2 The repair
 
-A DEFAULT expression is schema **text**. SQLite documents a procedure for
-schema changes `ALTER TABLE` cannot express: under `PRAGMA writable_schema`,
-rewrite the `sql` column of `sqlite_master`, bump `schema_version` so every
-connection reloads, and `integrity_check`. Persist runs exactly that, once,
-idempotently, after refinery on every boot:
+A DEFAULT expression is schema **text**. SQLite's ALTER TABLE documentation
+("Making Other Kinds Of Table Schema Changes") gives a nine-step procedure it
+calls *appropriate for removing CHECK or FOREIGN KEY or NOT NULL constraints,
+or adding, removing, or changing default values on a column* — this case by
+name — and reserves the twelve-step table rebuild for changes that affect
+on-disk content. The nine steps, in the documented order: start a
+transaction; read `schema_version`; `PRAGMA writable_schema = ON`; `UPDATE
+sqlite_schema SET sql = …`; `PRAGMA schema_version = X+1`; `PRAGMA
+writable_schema = OFF`; `integrity_check`; commit. Persist runs exactly that,
+once, idempotently, after refinery on every boot:
 
 ```
 datetime('now', 'subsec')   →   strftime('%Y-%m-%d %H:%M:%f', 'now')
@@ -159,6 +164,26 @@ first boot, every later boot), and is followed by an `integrity_check` that
 must answer `ok` and a post-condition that no `subsec` remains — either
 failing aborts the boot loudly rather than leaving a schema half-repaired.
 
+**Defensive mode.** Apple's `libsqlite3.dylib` enables
+`SQLITE_DBCONFIG_DEFENSIVE` by default for processes linked on or after macOS
+11, and macOS / iOS link the system library. Defensive mode refuses
+`writable_schema = ON` and makes `schema_version = N` a silent no-op — both
+documented. The repair therefore disables defensive mode for the rewrite
+through the C-level `sqlite3_db_config` (the only way; there is no SQL for
+it) and restores it afterwards whatever happened in between (I55b). The
+documented caution — a syntax error in the rewritten text corrupts the
+schema — is met three ways: the rewrite is a fixed substring substitution of
+one literal for another, it runs inside the transaction so a refusal at any
+step leaves the shipped text untouched, and it is exercised on a blank
+database by I55/I55b on every test run and on a real 3.40.1 by the bookworm
+witness on every CI run.
+
+**Required versus normalisation.** The repair first asks the library whether
+`datetime('now', 'subsec')` is NULL. Where it is (< 3.42), a refused repair
+is fatal, stated once and loudly, because the node could not write anyway.
+Where it is not, a refused repair is a warning and writes proceed on the
+shipped text.
+
 It lives beside the #840 repair (`repair_v070_checksum`) and for the same
 reason: a shipped migration is immutable, so what a shipped migration got
 wrong is corrected at the boundary where the database meets the current
@@ -169,6 +194,7 @@ crate, not in the ledger.
 | # | invariant | falsified by | gate |
 |---|---|---|---|
 | I55 | After `run_migrations` on sqlite, no `CREATE TABLE` text in `sqlite_master` contains `subsec`; an `INSERT` omitting a defaulted timestamp column succeeds and stores the 23-character form; a second run rewrites nothing. | a bookworm host that cannot write; a repair that changes the stored format | behavioural (sqlite), and the bookworm witness |
+| I55b | The repair succeeds on a connection with `SQLITE_DBCONFIG_DEFENSIVE` on, and defensive mode is restored afterwards. | an Apple node whose boot aborts on a refused rewrite; a repair that leaves defensive mode off | behavioural (sqlite) |
 | I56 | No migration file after V144, in either dialect, contains `subsec`; the shipped set's count is pinned (44 in sqlite, 0 in postgres). | a new migration that reintroduces the modifier | from-disk |
 | I57 | The shell witness `scripts/sqlite_portability_witness.sh` and the Rust repair carry the same two literals, so what CI proves on 3.40.1 is what the crate does. | a witness that tests a different rewrite | from-disk |
 

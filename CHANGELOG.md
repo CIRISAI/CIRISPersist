@@ -23,7 +23,10 @@ image. `FSD/MIGRATION_IMMUTABILITY.md` §6, invariants I55–I58.
 - **The live schema is repaired at boot, not the shipped files.** The
   migrations are immutable (#840) and `ALTER TABLE` cannot change a default,
   so `SqliteBackend::repair_portable_defaults` runs after refinery on every
-  boot and rewrites each live `CREATE TABLE` default from
+  boot — SQLite's own documented nine-step procedure for *changing default
+  values on a column* (`lang_altertable.html`, "Making Other Kinds Of Table
+  Schema Changes"), in its order, in one transaction — and rewrites each
+  live `CREATE TABLE` default from
   `datetime('now', 'subsec')` to `strftime('%Y-%m-%d %H:%M:%f', 'now')` —
   **byte-identical output** (`YYYY-MM-DD HH:MM:SS.SSS`) on every SQLite this
   crate has linked, so existing rows, cursors and readers see no change and
@@ -32,7 +35,13 @@ image. `FSD/MIGRATION_IMMUTABILITY.md` §6, invariants I55–I58.
   bump `schema_version` so every pooled connection reloads,
   `integrity_check`. Idempotent — a no-op on every boot but the first — and
   loud: a repair that leaves any `subsec` behind, or whose `integrity_check`
-  is not `ok`, aborts the boot.
+  is not `ok`, aborts the boot. **Apple's system SQLite enables defensive
+  mode by default** (macOS 11+, iOS), which refuses `writable_schema` and
+  silently ignores `schema_version = N`; the repair disables it for the
+  rewrite through `sqlite3_db_config` and restores it after (I55b), so an
+  Apple node is never bricked to fix a Debian one. On a library where the
+  modifier evaluates (>= 3.42) a refused repair is a warning and writes
+  proceed; where it is NULL, a refused repair is fatal, stated once.
 - **Nine runtime statements** — the community-DEK epoch rotation
   (`rotated_at`), maintenance locks, incidents, telemetry — now use the
   portable form. On 3.40.1 they wrote NULL into nullable columns silently or

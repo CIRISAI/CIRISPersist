@@ -210,6 +210,7 @@ impl SqliteBackend {
     /// schema half-repaired. Returns the number of tables rewritten.
     pub(crate) async fn repair_portable_defaults(&self) -> Result<usize, Error> {
         use crate::store::migration_immutability as mi;
+        use rusqlite::config::DbConfig;
         self.write(|conn| -> Result<usize, rusqlite::Error> {
             const COUNT: &str =
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND sql LIKE '%subsec%'";
@@ -217,29 +218,86 @@ impl SqliteBackend {
             if before == 0 {
                 return Ok(0);
             }
-            let version: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
-            conn.execute_batch("PRAGMA writable_schema = ON")?;
-            let rewritten = conn.execute(&mi::portable_default_repair_statement(), [])?;
-            conn.execute_batch("PRAGMA writable_schema = OFF")?;
-            conn.execute_batch(&format!("PRAGMA schema_version = {}", version + 1))?;
-            let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-            if integrity != "ok" {
-                return Err(rusqlite::Error::ToSqlConversionFailure(
-                    format!("portable-default repair: integrity_check answered {integrity:?}")
-                        .into(),
-                ));
+            // Is the repair REQUIRED on this library, or a normalisation? On
+            // SQLite >= 3.42 the modifier evaluates and a refusal below is
+            // survivable; below 3.42 it is NULL and a refusal means this node
+            // cannot write at all — say so once, loudly, rather than let every
+            // insert fail NOT NULL one at a time.
+            let required: bool =
+                conn.query_row(mi::SQLITE_SUBSEC_IS_NULL_PROBE, [], |r| r.get(0))?;
+            // Apple builds its system SQLite with DEFENSIVE on, and macOS /
+            // iOS link the system library. Defensive mode refuses
+            // `writable_schema = ON` and makes `schema_version = N` a silent
+            // no-op (both documented), so it is turned off for the rewrite and
+            // put back whatever happens in between.
+            let was_defensive = conn
+                .db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+                .unwrap_or(false);
+            if was_defensive {
+                conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)?;
             }
-            let after: i64 = conn.query_row(COUNT, [], |r| r.get(0))?;
-            if after != 0 {
-                return Err(rusqlite::Error::ToSqlConversionFailure(
+            // The nine steps of SQLite's documented "simpler procedure" for
+            // changing a column default (lang_altertable.html, "Making Other
+            // Kinds Of Table Schema Changes"), in its order: transaction,
+            // read schema_version, writable_schema ON, UPDATE sqlite_schema,
+            // schema_version = X+1, writable_schema OFF, integrity_check,
+            // commit. A transaction, so a refusal at any step leaves the
+            // shipped text exactly as it was.
+            let outcome = (|| -> Result<usize, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let version: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+                tx.execute_batch("PRAGMA writable_schema = ON")?;
+                let rewritten = tx.execute(&mi::portable_default_repair_statement(), [])?;
+                tx.execute_batch(&format!("PRAGMA schema_version = {}", version + 1))?;
+                tx.execute_batch("PRAGMA writable_schema = OFF")?;
+                let integrity: String = tx.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+                if integrity != "ok" {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!("portable-default repair: integrity_check answered {integrity:?}")
+                            .into(),
+                    ));
+                }
+                let after: i64 = tx.query_row(COUNT, [], |r| r.get(0))?;
+                if after != 0 {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        format!(
+                            "portable-default repair: {after} CREATE TABLE statement(s) still name \
+                             the modifier after rewriting {rewritten}"
+                        )
+                        .into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(rewritten)
+            })();
+            if was_defensive {
+                // Best effort: the rewrite is committed or rolled back either
+                // way, and a failure to re-arm defensive mode is not a reason
+                // to fail the boot.
+                let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
+            }
+            match outcome {
+                Ok(n) => Ok(n),
+                Err(e) if !required => {
+                    tracing::warn!(
+                        error = %e,
+                        remaining = before,
+                        "portable-default repair declined by this SQLite; the modifier evaluates \
+                         here (>= 3.42) so writes proceed — schema text left as shipped (#845)"
+                    );
+                    Ok(0)
+                }
+                Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(
                     format!(
-                        "portable-default repair: {after} CREATE TABLE statement(s) still name \
-                         `subsec` after rewriting {rewritten}"
+                        "this SQLite ({}) evaluates the subsec modifier to NULL and the schema \
+                         repair was refused: {e}. Every insert relying on a defaulted timestamp \
+                         column would fail NOT NULL. Upgrade libsqlite3 to >= 3.42 or allow \
+                         writable_schema (#845)",
+                        rusqlite::version()
                     )
                     .into(),
-                ));
+                )),
             }
-            Ok(rewritten)
         })
         .await
         .map_err(|e| Error::Migration {
@@ -22872,6 +22930,52 @@ mod accord_tests {
         assert_eq!(
             len, 23,
             "created_at must keep the YYYY-MM-DD HH:MM:SS.SSS form, got {text:?}"
+        );
+    }
+
+    /// **I55b (#845) — the repair succeeds on a DEFENSIVE connection.**
+    ///
+    /// Apple builds its system SQLite with `SQLITE_DBCONFIG_DEFENSIVE` on,
+    /// and macOS / iOS link the system library. Defensive mode refuses
+    /// `writable_schema` edits ("table sqlite_master may not be modified").
+    /// A repair that aborted the boot on that refusal would brick every
+    /// Apple node to fix Debian's — so the repair disables defensive mode
+    /// for the rewrite and restores it after.
+    #[tokio::test]
+    async fn i55b_the_repair_succeeds_on_a_defensive_connection() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend
+            .write(|conn| {
+                conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+                    .unwrap()
+            })
+            .await;
+        backend
+            .run_migrations()
+            .await
+            .expect("migrations + repair must succeed with defensive mode on");
+        let (remaining, defensive): (i64, bool) = backend
+            .write(|conn| {
+                let n = conn
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND sql LIKE '%subsec%'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let d = conn
+                    .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+                    .unwrap();
+                (n, d)
+            })
+            .await;
+        assert_eq!(
+            remaining, 0,
+            "the rewrite must have happened under defensive mode"
+        );
+        assert!(
+            defensive,
+            "defensive mode must be RESTORED after the repair"
         );
     }
 

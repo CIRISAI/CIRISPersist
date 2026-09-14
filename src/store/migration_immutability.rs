@@ -125,6 +125,10 @@ pub(crate) const SQLITE_SUBSEC_DEFAULT: &str = "datetime('now', 'subsec')";
 /// #845 — the portable replacement: byte-identical output
 /// (`YYYY-MM-DD HH:MM:SS.SSS`) on every SQLite this crate has linked.
 #[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
+/// #845 — does THIS library evaluate the modifier? `true` means NULL, i.e.
+/// the repair is required rather than a normalisation.
+pub(crate) const SQLITE_SUBSEC_IS_NULL_PROBE: &str = "SELECT datetime('now', 'subsec') IS NULL";
+#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
 pub(crate) const SQLITE_PORTABLE_DEFAULT: &str = "strftime('%Y-%m-%d %H:%M:%f', 'now')";
 /// #845 — how many times the shipped sqlite migrations (V001–V144) name the
 /// modifier. Pinned so the from-disk gate can tell "a new file added one"
