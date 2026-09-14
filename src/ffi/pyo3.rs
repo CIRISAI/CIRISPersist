@@ -1304,43 +1304,49 @@ impl PyEngine {
         })
     }
 
-    /// v6.8.0 (CIRISPersist#149) — proxy-ACCEPT disk-pressure gate.
-    /// Returns `Err(DiskPressureProxyRefused)` (mapped to a Permanent
-    /// `ValueError` via [`blob_err_to_py`]) when the substrate is at the
-    /// stop tier (or tighter) AND `attesting_key_id` is proxy (neither
-    /// the local signer nor family). Local + family writes are NEVER
-    /// refused. No-op when no monitor is installed. Reads the cached
-    /// snapshot from the singleton cell — no statvfs per write.
-    fn disk_pressure_refuse_proxy_accept(&self, attesting_key_id: &str) -> PyResult<()> {
-        let slot = engine_slot();
-        let Some(cell) = slot.as_ref() else {
-            return Ok(());
-        };
-        let monitor = cell
-            .disk_pressure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        let Some(monitor) = monitor else {
-            return Ok(());
-        };
-        let snap = monitor.snapshot();
-        if !snap.refuses_proxy_writes {
-            return Ok(());
+    /// #846 (BLOB_REPLICATION.md §4, I46) — an [`Engine`](crate::Engine) view
+    /// of this `PyEngine` carrying the process-singleton's disk-pressure
+    /// monitor, for the doors that run the WILL decision. The same shape
+    /// `EngineCell::engine_view` builds; no second pool, runtime or signer.
+    fn hold_engine_view(&self) -> crate::Engine {
+        let mut engine = crate::Engine::from_shared_with_local(
+            self.engine_dispatch(),
+            self.signer.clone(),
+            self.local_signer.clone(),
+        );
+        let monitor = engine_slot().as_ref().and_then(|cell| {
+            cell.disk_pressure
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        });
+        if let Some(monitor) = monitor {
+            engine = engine
+                .with_disk_pressure_config_shared(monitor.config())
+                .with_disk_pressure_state_shared(monitor.subscribe());
         }
-        // Classify proxy vs local/family using the monitor's config
-        // predicate against the cell's signer key.
-        let cfg = monitor.config();
-        let is_protected = cfg.is_local_or_family(attesting_key_id, &cell.signer_key_id);
-        if is_protected {
-            return Ok(());
-        }
-        Err(blob_err_to_py(
-            crate::federation::BlobError::DiskPressureProxyRefused {
-                operation: "accept",
-                tier: snap.tier.label(),
-            },
-        ))
+        engine
+    }
+
+    /// v6.8.0 (CIRISPersist#149) / #846 — the accept decision for a COMMONS
+    /// write from Python, through the one WILL door
+    /// ([`Engine::would_hold`](crate::Engine::would_hold)): everyone is
+    /// party to the commons, so this is the #149 pressure rule — a proxy
+    /// write is refused at the stop tier, local + family never. Reads the
+    /// cached snapshot; no statvfs per write. Called from inside
+    /// `py.detach`.
+    fn refuse_unless_would_hold_commons(&self, attesting_key_id: &str) -> PyResult<()> {
+        let engine = self.hold_engine_view();
+        let provenance = crate::federation::BlobProvenance {
+            author_key_id: attesting_key_id.to_owned(),
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+        };
+        self.runtime
+            .block_on(async move { engine.would_hold(&provenance).await })
+            .map_err(blob_err_to_py)
     }
 
     /// v4.0 (FSD §11) — map this PyEngine's backend dispatch to the
@@ -9448,11 +9454,11 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let payload = parse_put_blob_payload(payload_json)?;
-            // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on
-            // the proxy-ACCEPT path. Same rule as `put_blob_signing`:
-            // refuse a proxy write at stop tier; local + family writes
-            // proceed.
-            self.disk_pressure_refuse_proxy_accept(&payload.attestation.attesting_key_id)?;
+            // #846 (I46) — the WILL decision, through the one door. Same
+            // rule as `put_blob_signing`: a proxy write is refused at the
+            // stop tier; local + family writes proceed.
+            let attester = payload.attestation.attesting_key_id.clone();
+            py.detach(move || self.refuse_unless_would_hold_commons(&attester))?;
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -13061,6 +13067,125 @@ impl PyEngine {
         })
     }
 
+    /// #846 (`BLOB_REPLICATION.md` §6.1) — **adopt a sealed blob received
+    /// from a peer**: store the `AtRestEnvelope` verbatim at the tier and
+    /// under the `(community, epoch)` binding its provenance declares, and
+    /// — for `"announce"` — emit `holds_bytes` signed by this node. Never
+    /// opens the envelope (I45); the binding is the author's fact (no
+    /// current-epoch check, no key state required — §3).
+    ///
+    /// Payload JSON:
+    /// ```json
+    /// {
+    ///   "envelope_b64": "<the AtRestEnvelope bytes, verbatim>",
+    ///   "author_key_id": "<attesting_key_id of the referencing attestation>",
+    ///   "cohort_scope": "community",
+    ///   "community_key_id": "<community | owner/family key | null>",
+    ///   "epoch": 3,
+    ///   "tier": "community_dek | invisible_encrypted",
+    ///   "aad_b64": "<optional; carried, not recorded>",
+    ///   "disposition": "announce | local_only"
+    /// }
+    /// ```
+    /// Returns JSON `{"sha256": "<hex>", "announced": bool}`. Refusals
+    /// keep their `BlobError` class: `blob_not_party_to`,
+    /// `blob_disk_pressure_proxy_refused`, `blob_invalid_argument`.
+    fn adopt_sealed_blob_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptSealedBlobWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_blob_json decode: {e}"))
+            })?;
+            let envelope = B64.decode(&wire.envelope_b64).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_blob_json envelope_b64 decode: {e}"))
+            })?;
+            let aad = decode_aad_b64(wire.aad_b64.as_deref())?;
+            let disposition = match wire.disposition.as_str() {
+                "announce" => crate::federation::AdoptDisposition::Announce,
+                "local_only" => crate::federation::AdoptDisposition::LocalOnly,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "adopt_sealed_blob_json disposition {other:?}: expected \"announce\" or \
+                         \"local_only\""
+                    )))
+                }
+            };
+            let provenance = wire.provenance.into_provenance("adopt_sealed_blob_json")?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let out = runtime
+                    .block_on(async move {
+                        engine
+                            .adopt_sealed_blob(&envelope, provenance, aad.as_deref(), disposition)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({
+                    "sha256": hex::encode(out.sha256),
+                    "announced": out.announced,
+                })
+                .to_string())
+            })
+        })
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §6.3) — **the WILL decision as a door**,
+    /// asked before a fetch: would this node hold content with this
+    /// provenance, now? Writes nothing. Payload JSON is the provenance
+    /// half of `adopt_sealed_blob_json` (`author_key_id`, `cohort_scope`,
+    /// `community_key_id`, `epoch`, `tier`). Returns `{"hold": true}` or
+    /// `{"hold": false, "kind": "<blob_not_party_to | blob_disk_pressure_proxy_refused>",
+    /// "reason": "<message>"}` — a refusal is the ANSWER, not an error; a
+    /// backend failure raises with its `BlobError` class.
+    fn would_hold_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let wire: ProvenanceWire = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("would_hold_json decode: {e}")))?;
+            let provenance = wire.into_provenance("would_hold_json")?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let decision =
+                    runtime.block_on(async move { engine.would_hold(&provenance).await });
+                match decision {
+                    Ok(()) => Ok(serde_json::json!({ "hold": true }).to_string()),
+                    Err(
+                        e @ (crate::federation::BlobError::NotPartyTo { .. }
+                        | crate::federation::BlobError::DiskPressureProxyRefused { .. }),
+                    ) => Ok(serde_json::json!({
+                        "hold": false,
+                        "kind": e.kind(),
+                        "reason": e.to_string(),
+                    })
+                    .to_string()),
+                    Err(e) => Err(blob_err_to_py(e)),
+                }
+            })
+        })
+    }
+
+    /// #846 (`BLOB_REPLICATION.md` §4) — **how widely this node holds** within
+    /// the cohorts it is party to: `"for_cohort"` when it stands at
+    /// `ServeTier::MeshServer` or above, else `"on_demand"`. Edge's pull
+    /// scheduler reads it; it refuses nothing.
+    fn hold_breadth(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(async move { engine.hold_breadth().await })
+                    .map(|b| b.label().to_owned())
+                    .map_err(blob_err_to_py)
+            })
+        })
+    }
+
     /// #832 (§12.3) — **append one plaintext segment to a live stream at
     /// `cohort_scope`, sealed where the tier requires it.** The chunk twin of
     /// `put_blob_scoped`: `plaintext_b64` in, the tier resolved from the
@@ -13643,12 +13768,13 @@ impl PyEngine {
             // #140) to a shared `select_signer` helper.
             let attesting_key_id_owned = attesting_key_id.to_string();
 
-            // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on
-            // the proxy-ACCEPT path. At stop tier (or tighter) refuse a
-            // proxy write (attesting key neither the local signer nor
-            // family). Local + family writes are NEVER refused. Reads the
-            // cached snapshot (no statvfs per write).
-            self.disk_pressure_refuse_proxy_accept(&attesting_key_id_owned)?;
+            // #846 (I46) — the WILL decision, through the one door. At the
+            // stop tier a proxy write (attesting key neither the local
+            // signer nor family) is refused; local + family never.
+            {
+                let attester = attesting_key_id_owned.clone();
+                py.detach(move || self.refuse_unless_would_hold_commons(&attester))?;
+            }
 
             let signer = self.select_signer(&attesting_key_id_owned);
             let media_type_owned = media_type.map(str::to_owned);
@@ -31799,6 +31925,48 @@ struct PutBlobJsonWire {
 
 /// v2.3 (CIRISPersist#103) — Decode the `put_blob_json` payload into
 /// the trait-call argument shape.
+/// #846 — the provenance half of the adopt / would-hold wire.
+#[derive(serde::Deserialize)]
+struct ProvenanceWire {
+    author_key_id: String,
+    cohort_scope: String,
+    #[serde(default)]
+    community_key_id: Option<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
+    tier: String,
+}
+
+impl ProvenanceWire {
+    fn into_provenance(self, door: &str) -> PyResult<crate::federation::BlobProvenance> {
+        let tier = crate::federation::types::cohort_scope::CryptoTier::parse_str(&self.tier)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "{door} tier {:?}: expected plaintext | invisible_encrypted | community_dek",
+                    self.tier
+                ))
+            })?;
+        Ok(crate::federation::BlobProvenance {
+            author_key_id: self.author_key_id,
+            cohort_scope: self.cohort_scope,
+            community_key_id: self.community_key_id,
+            epoch: self.epoch,
+            tier,
+        })
+    }
+}
+
+/// #846 — `adopt_sealed_blob_json`'s wire shape.
+#[derive(serde::Deserialize)]
+struct AdoptSealedBlobWire {
+    envelope_b64: String,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
+    #[serde(default)]
+    aad_b64: Option<String>,
+    disposition: String,
+}
+
 fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
     let wire: PutBlobJsonWire = serde_json::from_str(json)
         .map_err(|e| PyValueError::new_err(format!("put_blob_json decode: {e}")))?;

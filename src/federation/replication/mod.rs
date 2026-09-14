@@ -44,6 +44,7 @@ pub mod cache_mode;
 // free-byte tiers + injectable statvfs source; defaults ON).
 pub mod disk_pressure;
 pub mod eviction;
+pub mod hold;
 pub mod trust_scoring;
 
 pub use admission::AdmissionGate;
@@ -59,6 +60,10 @@ pub use disk_pressure::{
 pub use eviction::{
     EvictionCandidate, EvictionDecay, EvictionSweeper, SweepReport, DEFAULT_SWEEP_BATCH,
     MIN_SWEEP_INTERVAL,
+};
+pub use hold::{
+    audience_memberships, is_audience, is_audience_of, is_proxy_content, would_hold,
+    BlobProvenance, HoldBreadth, HoldContext,
 };
 pub use trust_scoring::{
     aggregate_trust_score, MemoryTrustScoring, TrustScoring, TrustScoringError,
