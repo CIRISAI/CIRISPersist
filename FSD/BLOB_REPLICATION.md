@@ -1,7 +1,7 @@
 # FSD: Blob Replication — the holder plane, and the decision to hold
 
-**Status:** Proposed (design locked on the thread that lit the mesh, 2026-09-14;
-this document is the spec for v44.2.0)
+**Status:** Implemented in v44.2.0 (design locked 2026-09-14; the operator's
+party-to correction applied before the build reached §4)
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
 **Created:** 2026-09-14
 **Repo:** `~/CIRISPersist`
@@ -189,7 +189,9 @@ MAY hold, do we hold it *now*, on *this* node:
 
 The order is: MAY before bytes move (it is Edge's, it precedes the fetch);
 WILL at the door, after the bytes arrived and their hash verified, before the
-row is written. WILL is cheap — one cached snapshot, one directory read for the
+row is written. Within WILL, **party before pressure**: a permanent refusal is
+named before a transient one, so a caller never retries a `NotPartyTo` as if
+the disk might clear. WILL is cheap — one cached snapshot, one directory read for the
 serve tier — and its refusals are typed, name the axis, and disclose nothing
 about the content (I4b's class).
 
@@ -300,7 +302,7 @@ Numbering continues the at-rest series (I1–I42) and #840's (I43–I44).
 | I49 | `is_proxy_content` is the one classification — *party to, but the author is not local-or-family* (held for others): the force-evict sweep, `serve_blob_to_peer` and `would_hold` all call it; an adopted blob authored elsewhere classifies proxy; a `NULL` author classifies proxy. | an adopted blob that survives a force-evict; a proxy blob served under `Stop` | from-disk + behavioural |
 | I50 | An adopted stream chunk's stream row records the AUTHOR's derived key as owner; a later append by the adopter is refused as a foreign writer (I41 carried across nodes). | a relay that takes over a stream it holds | behavioural |
 | I51 | An adopted `CommunityDek` blob is readable by a viewer holding a grant for its declared epoch and refused `NotGranted` for one who does not, with no key state for that epoch on the adopting node required for the adopt itself. | an adopt that needs the receiver to already be a member; an adopted blob that opens for anyone | behavioural |
-| I52 | `Announce` emits `holds_bytes` carrying `author_key_id` and `community_key_id` in the clear; `LocalOnly` emits nothing; self/family provenance can never `Announce` (CC 5.2, refused before the floor). | a holder claim a relay cannot keep/evict on; an announced family blob | behavioural |
+| I52 | `Announce` emits this node's `holds_bytes` claim (the unchanged v31 envelope — embedding provenance would move its preimage) and the row carries the cleartext provenance beside it (`author_key_id`, `community_key_id`, readable through `blob_provenance`); `LocalOnly` emits nothing; self/family provenance can never `Announce` (CC 5.2, refused before the floor). | a holder claim with no provenance a member can keep/evict on; an announced family blob | behavioural |
 | I53 | No source or FSD text in the blob and replication modules claims "unobservable", "undiscoverable", "metadata privacy" or "traffic-analysis" resistance (CC 1.13.3; from-disk). | a docstring that overclaims | `blob_surface_gates` |
 
 Each is written RED before the code that makes it green, and each load-bearing
