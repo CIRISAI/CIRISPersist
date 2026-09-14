@@ -10,8 +10,9 @@ plane — Server-owned, implemented here as `replication_policy.rs` and pinned b
 `REPLICATION_POLICY_HASH`) and `FSD/BLOB_ENCRYPTION_AT_REST.md` (what a blob
 IS at rest). Neither covers what this one does: how a blob **moves**, and who
 decides to **hold** it.
-**Risk:** Additive doors and one behaviour change on relay accept, stated in
-§7. No on-disk format change to existing rows; one new nullable column.
+**Risk:** Additive doors and one behaviour change on accept — non-party
+content is now refused — stated in §10. No on-disk format change to existing
+rows; one new nullable column.
 
 ---
 
@@ -140,11 +141,14 @@ Two rules that follow from the model and are easy to get wrong:
 
 - **The binding is the author's fact, not ours.** I17 says a *write* must bind
   the current epoch. An *adopt* records the epoch the bytes were sealed under,
-  which may be past, and may be an epoch this node holds no grant for at all —
-  a relay holds on provenance alone (CC 4.4.3.2.1). Reads then behave exactly as
-  for any row at that tier: a viewer with a grant opens; anyone else gets the
-  typed refusal (`NotGranted`, or `Evicted` if it was swept). Adopt does not
-  consult key state and does not require the epoch to be current.
+  which may be past, and may be an epoch this node holds no grant for — a
+  member admitted after epoch E is party to the community and may hold E's
+  bytes for the members who can open them (§4), without a grant of its own.
+  Reads then behave exactly as for any row at that tier: a viewer with a grant
+  opens; anyone else gets the typed refusal (`NotGranted`, or `Evicted` if it
+  was swept). Adopt does not consult key state and does not require the epoch
+  to be current. What it does require is that this node be **party to** the
+  cohort (§4) — a node outside the community never adopts its bytes.
 - **A stream chunk keeps its original owner.** I41 says a stream belongs to its
   first append. Across nodes the first append is the author's, so an adopted
   chunk's stream row records the AUTHOR's derived key as `owner_key_id`, never
