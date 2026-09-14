@@ -129,10 +129,10 @@ pub(crate) const SQLITE_PORTABLE_DEFAULT: &str = "strftime('%Y-%m-%d %H:%M:%f', 
 /// #845 — how many times the shipped sqlite migrations (V001–V144) name the
 /// modifier. Pinned so the from-disk gate can tell "a new file added one"
 /// from "the shipped set".
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(test)] // pure pin, no backend needed — the five no-backend axes compile tests too
 pub(crate) const SQLITE_SUBSEC_OCCURRENCES_SHIPPED: usize = 44;
 /// #845 — the last migration version that may contain `subsec`.
-#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+#[cfg(test)]
 pub(crate) const SUBSEC_ALLOWED_THROUGH: i32 = 144;
 
 /// #845 — the live-schema rewrite, `type = 'table'` rows only. Run under
