@@ -4159,6 +4159,63 @@ pub mod blob_invariants {
             "{tag} I40: the commons DAG is still public without data"
         );
     }
+
+    // ── I54 (#843) — PROBE FORM ─────────────────────────────────────────
+    /// **The cascade result partitions the ROSTER.** A member with no active
+    /// occurrence must be NAMED by the result; today the result enumerates
+    /// occurrences, so such a member is in neither `granted` nor `excluded`.
+    pub async fn exercise_i54_the_cascade_result_partitions_the_roster<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
+        use crate::federation::community_dek::lifecycle_support::seed_community_shaped;
+        use crate::federation::types::cohort_scope::COMMUNITY;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-843-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_phone = format!("{tag}-bob-phone-{run}");
+        let node = format!("{tag}-node-{run}");
+        // alice: on the roster, NO occurrence. bob: one bare occurrence.
+        seed_community_shaped(
+            backend,
+            &comm,
+            &[(&alice, &[]), (&bob, &[(&bob_phone, false)])],
+        )
+        .await;
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+
+        let res = put_blob_scoped(
+            backend,
+            &adapter,
+            COMMUNITY,
+            Some(&comm),
+            b"minutes",
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I54: community write: {e}"));
+        assert_eq!(
+            res.granted,
+            Vec::<String>::new(),
+            "{tag} I54: nobody granted"
+        );
+        assert_eq!(
+            res.excluded,
+            vec![bob_phone.clone()],
+            "{tag} I54: bob's phone excluded"
+        );
+        let rendered = format!("{res:?}");
+        assert!(
+            rendered.contains(alice.as_str()),
+            "{tag} I54: the AUTHOR alice — on the roster, no occurrence — is named NOWHERE \
+             in the result; a caller reading `excluded` sees one unrelated device while \
+             nobody at all can read the content: {rendered}"
+        );
+    }
 }
 
 /// Fixture-only access to the storage floor for [`blob_invariants`].

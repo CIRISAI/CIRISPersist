@@ -1231,6 +1231,160 @@ pub mod lifecycle_support {
             .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
     }
 
+    /// #843 — seed one roster member in the SHAPE a fixture names: the
+    /// identity, then each `(occurrence, keyed)` pair. `keyed = false` is a
+    /// bare occurrence (no `encryption_pubkeys`, fail-secure excluded); an
+    /// EMPTY slice is the member #843 is about — on the roster, with no
+    /// content-KEM presence at all.
+    pub async fn seed_member_shaped<B>(
+        backend: &B,
+        identity_key_id: &str,
+        occurrences: &[(&str, bool)],
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        ts::register_hybrid_key_as(
+            backend,
+            identity_key_id,
+            identity_key_id,
+            identity_type::USER,
+        )
+        .await;
+        for (occurrence_key_id, keyed) in occurrences {
+            ts::register_hybrid_key_as(
+                backend,
+                occurrence_key_id,
+                occurrence_key_id,
+                identity_type::USER,
+            )
+            .await;
+            let encryption_pubkeys = if *keyed {
+                let (_xp, x_pub, _mp, ml_pub) =
+                    crate::federation::identity_aggregate::mint_content_kem_keypair()
+                        .expect("mint kem");
+                Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                })
+            } else {
+                None
+            };
+            backend
+                .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                    identity_key_id: identity_key_id.to_owned(),
+                    occurrence_key_id: (*occurrence_key_id).to_owned(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys,
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("seed occurrence {occurrence_key_id}: {e}"));
+        }
+    }
+
+    /// #843 — a community whose roster is given member by member as
+    /// `(identity, &[(occurrence, keyed)])`; see [`seed_member_shaped`].
+    pub async fn seed_community_shaped<B>(
+        backend: &B,
+        community_key_id: &str,
+        members: &[(&str, &[(&str, bool)])],
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+
+        ts::register_hybrid_key_as(
+            backend,
+            community_key_id,
+            community_key_id,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        for (ident, occurrences) in members {
+            seed_member_shaped(backend, ident, occurrences).await;
+        }
+        let roster = members
+            .iter()
+            .map(|(ident, _)| crate::federation::types::CommunityMember {
+                key_id: (*ident).to_owned(),
+                joined_at: chrono::Utc::now(),
+                role: None,
+            })
+            .collect();
+        backend
+            .put_community(ts::sign_community(
+                community_key_id,
+                crate::federation::types::Community {
+                    community_key_id: community_key_id.to_owned(),
+                    community_name: "Shaped Co-op".into(),
+                    members: roster,
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed community {community_key_id}: {e}"));
+    }
+
+    /// #843 — the family twin of [`seed_community_shaped`]: the self/family
+    /// cascade enumerates a family roster the same way the community cascade
+    /// enumerates its members, so the partition must hold there too.
+    pub async fn seed_family_shaped<B>(
+        backend: &B,
+        family_key_id: &str,
+        members: &[(&str, &[(&str, bool)])],
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+
+        ts::register_hybrid_key_as(
+            backend,
+            family_key_id,
+            family_key_id,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        for (ident, occurrences) in members {
+            seed_member_shaped(backend, ident, occurrences).await;
+        }
+        let roster = members
+            .iter()
+            .map(|(ident, _)| crate::federation::types::FamilyMember {
+                key_id: (*ident).to_owned(),
+                joined_at: chrono::Utc::now(),
+                role: None,
+            })
+            .collect();
+        backend
+            .put_family(ts::sign_family(
+                family_key_id,
+                crate::federation::types::Family {
+                    family_key_id: family_key_id.to_owned(),
+                    family_name: "Shaped Household".into(),
+                    members: roster,
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("seed family {family_key_id}: {e}"));
+    }
+
     /// Revoke a member. The community DEK epoch bump rides this write
     /// transactionally (AV-70), so this single call IS the rotation — there
     /// is no separate "rotate" API to call, and a harness that invented one
