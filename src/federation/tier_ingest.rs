@@ -2773,7 +2773,7 @@ pub mod test_support {
     }
 
     /// The unsealed skeleton [`put_delegates_to`] / [`put_retraction`] share.
-    fn bare_attestation(
+    pub fn bare_attestation(
         id: &str,
         attester: &str,
         attested: &str,

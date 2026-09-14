@@ -25468,6 +25468,87 @@ mod tests {
         crate::federation::at_rest_cascade::blob_invariants::exercise_i40_associated_data_binds_the_seal(&backend, &tag).await;
     }
 
+    /// BLOB_REPLICATION.md §7 I47 — Stop pressure refuses relay content, never local or family — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i47_pressure_refuses_proxy_never_local_or_family_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i47_pressure_refuses_proxy_never_local_or_family(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I48 — never adopts non-party content, whatever the serve standing — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i48_never_adopts_non_party_content_whatever_the_serve_standing_postgres(
+    ) {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i48_never_adopts_non_party_content_whatever_the_serve_standing(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I49 — an adopted blob classifies proxy; a NULL author classifies proxy — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i49_an_adopted_blob_classifies_proxy_and_a_null_author_is_proxy_postgres(
+    ) {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i49_an_adopted_blob_classifies_proxy_and_a_null_author_is_proxy(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I50 — an adopted stream keeps its author as owner — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i50_an_adopted_stream_keeps_its_author_as_owner_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i50_an_adopted_stream_keeps_its_author_as_owner(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I51 — adopt needs no key state; reads dispatch on grants — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i51_adopt_needs_no_key_state_and_reads_dispatch_on_grants_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i51_adopt_needs_no_key_state_and_reads_dispatch_on_grants(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I52 — Announce emits the holder claim; self/family never announce — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i52_announce_emits_the_holder_claim_and_self_family_never_announce_postgres(
+    ) {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i52_announce_emits_the_holder_claim_and_self_family_never_announce(&backend, &tag).await;
+    }
+
     /// §11.10 I41 — see `chunk_dag_cascade::invariants`.
     #[tokio::test]
     async fn blob_invariant_i41_a_stream_belongs_to_its_first_append_postgres() {

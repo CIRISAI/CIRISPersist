@@ -4174,6 +4174,897 @@ pub mod blob_invariants {
             "{tag} I40: the commons DAG is still public without data"
         );
     }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // #846 (`FSD/BLOB_REPLICATION.md` §7) — I47..I52, the holder plane.
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// #846 — a [`HoldContext`](crate::federation::HoldContext) for one case:
+    /// `stop` selects the Stop-tier snapshot, `family` the keys the operator
+    /// predicate treats as family. The Engine builds the production one from
+    /// its signer and its disk-pressure monitor; this is the same shape.
+    pub fn hold_ctx<'a>(
+        stop: bool,
+        our_key_id: &'a str,
+        family: &'a [String],
+    ) -> crate::federation::HoldContext<'a, impl Fn(&str) -> bool + 'a> {
+        use crate::federation::{DiskPressureSnapshot, PressureTier};
+        let pressure = if stop {
+            DiskPressureSnapshot {
+                free_bytes: 0,
+                tier: PressureTier::Stop,
+                refuses_proxy_writes: true,
+                refuses_proxy_serves: true,
+                force_evicts_proxy: true,
+            }
+        } else {
+            DiskPressureSnapshot::normal()
+        };
+        crate::federation::HoldContext {
+            pressure,
+            is_local_or_family: move |k: &str| k == our_key_id || family.iter().any(|f| f == k),
+            our_key_id,
+        }
+    }
+
+    /// #846 — make `occurrence_key_id` (already registered) an ACTIVE
+    /// occurrence of `identity_key_id`, so the audience walk resolves the
+    /// node's principal to that identity. `seed_member` re-registers both
+    /// keys with fresh pubkeys, which would break a signer's registered row;
+    /// this writes only the occurrence.
+    pub async fn join_as_occurrence<B>(backend: &B, identity_key_id: &str, occurrence_key_id: &str)
+    where
+        B: FederationDirectory + Sync,
+    {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let (_xp, x_pub, _mp, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint kem");
+        backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: identity_key_id.to_owned(),
+                occurrence_key_id: occurrence_key_id.to_owned(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                }),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("join {occurrence_key_id} to {identity_key_id}: {e}"));
+    }
+
+    /// #846 — a node standing at `ServeTier::MeshServer`: registered as a
+    /// NODE claiming `infra:serve`, with a live owner-binding from
+    /// `owner_key_id` bearing that scope (the #788 fixture, in one call).
+    /// Returns nothing; the caller asserts the tier as its precondition.
+    pub async fn confer_mesh_server<B>(backend: &B, server_key_id: &str, owner_key_id: &str)
+    where
+        B: FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
+        ts::register_user_role_key(backend, owner_key_id).await;
+        ts::register_identity_key(backend, server_key_id, "node,infra:serve").await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut binding = ts::bare_attestation(
+            &id,
+            owner_key_id,
+            server_key_id,
+            &serde_json::json!({
+                "id": id,
+                "kind": "delegates_to",
+                "dimension": owner_binding::DIMENSION,
+                "delegation_purpose": owner_binding::PURPOSE,
+                "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            }),
+        );
+        binding.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+        ts::seal_row_in_place(owner_key_id, &mut binding);
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("confer infra:serve on {server_key_id}: {e}"));
+    }
+
+    /// #846 — a sealed community envelope to adopt: cascades `body` under
+    /// `comm` on this backend and returns `(envelope bytes, epoch, sha)`.
+    async fn sealed_community_envelope<B>(
+        backend: &B,
+        comm: &str,
+        body: &[u8],
+        author: &str,
+    ) -> (Vec<u8>, u64, [u8; 32])
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        let sealed = encrypt_and_cascade_community(backend, comm, body, None, Some(author))
+            .await
+            .expect("seal under the community DEK");
+        let Some(BlobBody::Inline(env)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
+        else {
+            panic!("sealed row is inline");
+        };
+        (env, sealed.epoch, sealed.at_rest_sha256)
+    }
+
+    fn community_provenance(
+        author: &str,
+        comm: &str,
+        epoch: u64,
+    ) -> crate::federation::BlobProvenance {
+        crate::federation::BlobProvenance {
+            author_key_id: author.to_owned(),
+            cohort_scope: crate::federation::types::cohort_scope::COMMUNITY.to_owned(),
+            community_key_id: Some(comm.to_owned()),
+            epoch: Some(epoch),
+            tier: crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
+        }
+    }
+
+    // ── I47 ──────────────────────────────────────────────────────────────
+    /// **Under `Stop` pressure a non-local, non-family adopt is refused
+    /// `DiskPressureProxyRefused { operation: "accept" }` and nothing is
+    /// written; a local or family adopt succeeds at every tier.**
+    ///
+    /// A full disk that still takes relay content, or a node that refuses
+    /// its own family, would each fail this.
+    pub async fn exercise_i47_pressure_refuses_proxy_never_local_or_family<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        use crate::federation::types::cohort_scope::{CryptoTier, SELF};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let our = signer.derived_key_id();
+        let family = vec![format!("{tag}-fam-{run}")];
+        let peer = format!("{tag}-peer-{run}");
+        // A community this node is party to (our key is alice's occurrence).
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        join_as_occurrence(backend, &alice, &our).await;
+
+        // Three envelopes, one per author class, all at the community tier.
+        let (env_peer, epoch, sha_peer) =
+            sealed_community_envelope(backend, &comm, b"peer's minutes", &peer).await;
+        backend.delete_blob(&sha_peer).await.unwrap();
+        let (env_fam, _, sha_fam) =
+            sealed_community_envelope(backend, &comm, b"family minutes", &family[0]).await;
+        backend.delete_blob(&sha_fam).await.unwrap();
+        let (env_ours, _, sha_ours) =
+            sealed_community_envelope(backend, &comm, b"our minutes", &our).await;
+        backend.delete_blob(&sha_ours).await.unwrap();
+
+        // STOP: the peer's content is refused, typed, and nothing lands.
+        let stop = hold_ctx(true, &our, &family);
+        let prov = community_provenance(&peer, &comm, epoch);
+        let err = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &stop,
+            &env_peer,
+            &prov,
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect_err(&format!(
+            "{tag} I47: a full disk ACCEPTED relay content — the #149 stop tier was not \
+             enforced on the adopt door"
+        ));
+        match err {
+            BlobError::DiskPressureProxyRefused { operation, tier } => {
+                assert_eq!(operation, "accept", "{tag} I47: the accept axis");
+                assert_eq!(tier, "stop", "{tag} I47: the tier label");
+            }
+            other => panic!("{tag} I47: expected DiskPressureProxyRefused, got {other:?}"),
+        }
+        assert!(
+            !backend.has_blob(&sha_peer).await.unwrap(),
+            "{tag} I47: a refused adopt wrote the row"
+        );
+        // STOP: family and local content is NEVER refused, at both sealed tiers.
+        for (env, author, sha, label) in [
+            (&env_fam, family[0].as_str(), sha_fam, "family"),
+            (&env_ours, our.as_str(), sha_ours, "local"),
+        ] {
+            let prov = community_provenance(author, &comm, epoch);
+            let out = adopt_sealed_blob(
+                backend,
+                &adapter,
+                &stop,
+                env,
+                &prov,
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{tag} I47: {label} content refused under Stop — \"don't block local \
+                        writes ever\": {e}"
+                )
+            });
+            assert_eq!(out.sha256, sha, "{tag} I47: {label} adopted at its address");
+        }
+        // …and at the self tier (InvisibleEncrypted), for a local author.
+        {
+            use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+            let owner = format!("{tag}-owner-{run}");
+            let owner_occ = format!("{tag}-owner-occ-{run}");
+            crate::federation::community_dek::lifecycle_support::seed_member(
+                backend, &owner, &owner_occ,
+            )
+            .await;
+            let r = encrypt_and_cascade(backend, SELF, &owner, b"own note", None, None, Some(&our))
+                .await
+                .unwrap();
+            let Some(BlobBody::Inline(env)) = backend.get_blob(&r.at_rest_sha256).await.unwrap()
+            else {
+                panic!("inline");
+            };
+            backend.delete_blob(&r.at_rest_sha256).await.unwrap();
+            let prov = crate::federation::BlobProvenance {
+                author_key_id: our.clone(),
+                cohort_scope: SELF.to_owned(),
+                community_key_id: Some(owner.clone()),
+                epoch: None,
+                tier: CryptoTier::InvisibleEncrypted,
+            };
+            adopt_sealed_blob(
+                backend,
+                &adapter,
+                &stop,
+                &env,
+                &prov,
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag} I47: a local self-tier adopt refused under Stop: {e}")
+            });
+        }
+        // NORMAL: the same peer content is accepted.
+        let normal = hold_ctx(false, &our, &family);
+        adopt_sealed_blob(
+            backend,
+            &adapter,
+            &normal,
+            &env_peer,
+            &prov,
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I47: party content refused under Normal pressure: {e}"));
+        assert!(backend.has_blob(&sha_peer).await.unwrap());
+    }
+
+    // ── I48 ──────────────────────────────────────────────────────────────
+    /// **A node never adopts content it is not party to; content it is
+    /// party to is adopted regardless of serve standing.** Serve standing
+    /// changes nothing on either side: a `MeshServer` that is not a member
+    /// is refused exactly as a nobody-node is.
+    pub async fn exercise_i48_never_adopts_non_party_content_whatever_the_serve_standing<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        use crate::federation::trust_root::{resolve_serve_tier, ServeTier};
+        use crate::federation::types::cohort_scope::{CryptoTier, SELF};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let our = signer.derived_key_id();
+        let peer = format!("{tag}-peer-{run}");
+        let family: Vec<String> = Vec::new();
+
+        // Two communities: ours (we are alice's occurrence) and theirs.
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        join_as_occurrence(backend, &alice, &our).await;
+        let theirs = format!("{tag}-theirs-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_occ = format!("{tag}-bob-occ-{run}");
+        seed_community(backend, &theirs, &[(&bob, &bob_occ)]).await;
+
+        let (env_theirs, ep_theirs, sha_theirs) =
+            sealed_community_envelope(backend, &theirs, b"their minutes", &peer).await;
+        backend.delete_blob(&sha_theirs).await.unwrap();
+        let (env_ours, ep_ours, sha_ours) =
+            sealed_community_envelope(backend, &comm, b"our minutes", &peer).await;
+        backend.delete_blob(&sha_ours).await.unwrap();
+
+        // Precondition: this node has NO serve standing.
+        assert_eq!(
+            resolve_serve_tier(backend, &our, &our).await.unwrap(),
+            ServeTier::None,
+            "{tag} I48: precondition — a nobody-node"
+        );
+        let ctx = hold_ctx(false, &our, &family);
+        // (a) not party ⇒ refused, typed, naming only the declared cohort +
+        //     community; nothing written.
+        let prov = community_provenance(&peer, &theirs, ep_theirs);
+        let err = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env_theirs,
+            &prov,
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect_err(&format!(
+            "{tag} I48: a node ADOPTED content of a community it is not a member of — it now \
+             holds bytes it cannot open or judge"
+        ));
+        match &err {
+            BlobError::NotPartyTo {
+                cohort_scope,
+                community_key_id,
+            } => {
+                assert_eq!(cohort_scope, "community");
+                assert_eq!(community_key_id.as_deref(), Some(theirs.as_str()));
+            }
+            other => panic!("{tag} I48: expected NotPartyTo, got {other:?}"),
+        }
+        assert!(
+            !backend.has_blob(&sha_theirs).await.unwrap(),
+            "{tag} I48: a refused adopt wrote the row"
+        );
+        // (b) a self-tier envelope by a stranger is not ours either.
+        {
+            use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+            let r =
+                encrypt_and_cascade(backend, SELF, &bob, b"bob's note", None, None, Some(&peer))
+                    .await
+                    .unwrap();
+            let Some(BlobBody::Inline(env)) = backend.get_blob(&r.at_rest_sha256).await.unwrap()
+            else {
+                panic!("inline");
+            };
+            backend.delete_blob(&r.at_rest_sha256).await.unwrap();
+            let prov = crate::federation::BlobProvenance {
+                author_key_id: peer.clone(),
+                cohort_scope: SELF.to_owned(),
+                community_key_id: Some(bob.clone()),
+                epoch: None,
+                tier: CryptoTier::InvisibleEncrypted,
+            };
+            let err = adopt_sealed_blob(
+                backend,
+                &adapter,
+                &ctx,
+                &env,
+                &prov,
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect_err(&format!(
+                "{tag} I48: a stranger's self-tier content was adopted"
+            ));
+            assert!(
+                matches!(err, BlobError::NotPartyTo { ref cohort_scope, .. } if cohort_scope == SELF),
+                "{tag} I48: {err:?}"
+            );
+        }
+        // (c) party ⇒ adopted, with no serve standing at all.
+        let prov_ours = community_provenance(&peer, &comm, ep_ours);
+        adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env_ours,
+            &prov_ours,
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{tag} I48: a MEMBER was refused its own community's bytes for want of serve \
+                    standing — role governs breadth, never acceptance: {e}"
+            )
+        });
+        // (d) a MeshServer that is NOT a member is refused exactly the same.
+        let server = format!("{tag}-server-{run}");
+        let owner = format!("{tag}-owner-{run}");
+        confer_mesh_server(backend, &server, &owner).await;
+        assert_eq!(
+            resolve_serve_tier(backend, &server, &server).await.unwrap(),
+            ServeTier::MeshServer,
+            "{tag} I48: precondition — serve standing conferred"
+        );
+        let server_ctx = hold_ctx(false, &server, &family);
+        let err = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &server_ctx,
+            &env_theirs,
+            &prov,
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect_err(&format!(
+            "{tag} I48: serve standing let a non-member hold a community's bytes — there is no \
+             relay exception"
+        ));
+        assert!(
+            matches!(err, BlobError::NotPartyTo { .. }),
+            "{tag} I48: {err:?}"
+        );
+        assert!(!backend.has_blob(&sha_theirs).await.unwrap());
+    }
+
+    // ── I49 ──────────────────────────────────────────────────────────────
+    /// **`is_proxy_content` is the one classification**, behavioural half:
+    /// an adopted blob by another author classifies proxy on its row, a
+    /// locally cascaded blob classifies protected, a row with no author
+    /// classifies proxy, and the serve door refuses the adopted one under
+    /// `Stop` while serving the local one.
+    pub async fn exercise_i49_an_adopted_blob_classifies_proxy_and_a_null_author_is_proxy<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        use crate::federation::is_proxy_content;
+        use crate::federation::types::cohort_scope::{CryptoTier, FEDERATION};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let our = signer.derived_key_id();
+        let peer = format!("{tag}-peer-{run}");
+        let family: Vec<String> = Vec::new();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        join_as_occurrence(backend, &alice, &our).await;
+        let local = |k: &str| k == our;
+
+        // A locally cascaded row: author = us ⇒ protected.
+        let (_, _, sha_local) = sealed_community_envelope(backend, &comm, b"ours", &our).await;
+        let row = backend
+            .blob_provenance(&sha_local)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.author_key_id.as_deref(), Some(our.as_str()));
+        assert_eq!(row.community_key_id.as_deref(), Some(comm.as_str()));
+        assert!(
+            !is_proxy_content(row.author_key_id.as_deref(), local),
+            "{tag} I49: our own row classified proxy"
+        );
+        // An adopted row by a peer: author = peer ⇒ proxy.
+        let (env, epoch, sha_peer) =
+            sealed_community_envelope(backend, &comm, b"theirs", &peer).await;
+        backend.delete_blob(&sha_peer).await.unwrap();
+        let ctx = hold_ctx(false, &our, &family);
+        adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env,
+            &community_provenance(&peer, &comm, epoch),
+            None,
+            AdoptDisposition::Announce,
+        )
+        .await
+        .unwrap();
+        let row = backend
+            .blob_provenance(&sha_peer)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.author_key_id.as_deref(), Some(peer.as_str()));
+        assert!(
+            is_proxy_content(row.author_key_id.as_deref(), local),
+            "{tag} I49: an adopted relay blob classified PROTECTED — it would survive a \
+             force-evict and be served under Stop. (The holds_bytes attester is this node; \
+             the classification must read the AUTHOR.)"
+        );
+        // A row with no author (the signer-less commons door) ⇒ proxy.
+        let body = format!("{tag} unattributed {run}").into_bytes();
+        let sha_none = sha(&body);
+        backend
+            .store_blob_local(
+                &sha_none,
+                BlobBody::Inline(body),
+                None,
+                FEDERATION,
+                crate::federation::StorageFloor::resolved(CryptoTier::Plaintext),
+                None,
+            )
+            .await
+            .unwrap();
+        let row = backend
+            .blob_provenance(&sha_none)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.author_key_id, None);
+        assert!(
+            is_proxy_content(row.author_key_id.as_deref(), local),
+            "{tag} I49: an unknown author classified protected — fail toward evictable"
+        );
+    }
+
+    // ── I50 ──────────────────────────────────────────────────────────────
+    /// **An adopted stream chunk's stream row records the AUTHOR as owner;
+    /// a later append by the adopter is refused as a foreign writer.** I41
+    /// carried across nodes: a relay cannot take over a stream it holds.
+    pub async fn exercise_i50_an_adopted_stream_keeps_its_author_as_owner<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::adopt_cascade::adopt_sealed_chunk;
+        use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        use crate::federation::types::cohort_scope::COMMUNITY;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        // Two members of one community: the AUTHOR and the ADOPTER.
+        let author_node = format!("{tag}-author-{run}");
+        let author_signer = node_signer(backend, &author_node).await;
+        let author_adapter = crate::signing::LocalSignerHardwareAdapter::new(author_signer.clone());
+        let author = author_signer.derived_key_id();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let our = signer.derived_key_id();
+        let family: Vec<String> = Vec::new();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let bob_occ = format!("{tag}-bob-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
+        join_as_occurrence(backend, &alice, &our).await;
+        join_as_occurrence(backend, &bob, &author).await;
+
+        // The author appends seq 0 to its own stream: a sealed chunk.
+        let src_stream = format!("{tag}-src-{run}");
+        let put = put_blob_chunk_scoped(
+            backend,
+            &author_adapter,
+            COMMUNITY,
+            Some(&comm),
+            &src_stream,
+            0,
+            b"segment 0",
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+        let epoch = put.epoch.expect("community chunk carries its epoch");
+        let Some(BlobBody::Inline(env)) = backend.get_blob(&put.chunk_sha256).await.unwrap() else {
+            panic!("chunk inline");
+        };
+        // The adopter holds it under the AUTHOR's stream id, as received.
+        let stream = format!("{tag}-adopted-{run}");
+        let ctx = hold_ctx(false, &our, &family);
+        let prov = community_provenance(&author, &comm, epoch);
+        // The chunk row already exists (same backend); the ADOPTED stream is
+        // a new stream id, so the floor's stream row is written here.
+        let sha = adopt_sealed_chunk(backend, &ctx, &stream, 0, &env, 1, 9, &prov)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I50: adopt chunk: {e}"));
+        assert_eq!(sha, put.chunk_sha256);
+        let head = backend
+            .stream_chunks(&stream)
+            .await
+            .unwrap()
+            .stream
+            .expect("stream row");
+        assert_eq!(
+            head.owner_key_id.as_deref(),
+            Some(author.as_str()),
+            "{tag} I50: the adopted stream's owner is not the AUTHOR — a relay could take it over"
+        );
+        assert_eq!(head.community_key_id.as_deref(), Some(comm.as_str()));
+        // The adopter — a member, with a signer — cannot append as if it owned it.
+        let err = put_blob_chunk_scoped(
+            backend,
+            &adapter,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            1,
+            b"hijack",
+            1,
+            None,
+        )
+        .await
+        .expect_err(&format!(
+            "{tag} I50: the ADOPTER appended to a stream it merely holds — the stream's owner \
+             must be the author (I41 across nodes)"
+        ));
+        assert!(
+            matches!(err, BlobError::InvalidArgument(_)),
+            "{tag} I50: refused as a foreign writer, got {err:?}"
+        );
+        assert!(
+            !err.to_string().contains(&author),
+            "{tag} I50: the refusal named the owner: {err}"
+        );
+        // The author itself still can (it owns the stream on every node).
+        put_blob_chunk_scoped(
+            backend,
+            &author_adapter,
+            COMMUNITY,
+            Some(&comm),
+            &stream,
+            1,
+            b"segment 1",
+            1,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I50: the author refused its own stream: {e}"));
+    }
+
+    // ── I51 ──────────────────────────────────────────────────────────────
+    /// **An adopt needs no key state for the declared epoch; reads dispatch
+    /// on grants.** (a) An envelope declared for an epoch this node holds NO
+    /// DEK row for is adopted, bound as declared. (b) An adopted
+    /// `CommunityDek` blob is readable by a viewer holding a grant on its
+    /// declared epoch and refused `NotGranted` for one who does not — also
+    /// after the community has ROTATED past that epoch, which a *write*
+    /// (I17) would refuse.
+    pub async fn exercise_i51_adopt_needs_no_key_state_and_reads_dispatch_on_grants<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        use crate::federation::community_dek::orchestrate::read_for_community_viewer;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let our = signer.derived_key_id();
+        let peer = format!("{tag}-peer-{run}");
+        let family: Vec<String> = Vec::new();
+        let ctx = hold_ctx(false, &our, &family);
+
+        // (a) A community with a roster but NO key state at all.
+        let ghost = format!("{tag}-ghost-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &ghost, &[(&alice, &alice_occ)]).await;
+        join_as_occurrence(backend, &alice, &our).await;
+        assert_eq!(
+            backend.community_dek_key_state(&ghost, 7).await.unwrap(),
+            None,
+            "{tag} I51: precondition — no key state for the ghost epoch"
+        );
+        // Bytes sealed elsewhere (another community's DEK stands in for the
+        // author node's), declared for (ghost, 7).
+        let comm = format!("{tag}-comm-{run}");
+        let carol = format!("{tag}-carol-{run}");
+        let carol_occ = format!("{tag}-carol-occ-{run}");
+        seed_community(backend, &comm, &[(&carol, &carol_occ)]).await;
+        let (env_a, _, sha_a) = sealed_community_envelope(backend, &comm, b"far away", &peer).await;
+        backend.delete_blob(&sha_a).await.unwrap();
+        let out = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env_a,
+            &community_provenance(&peer, &ghost, 7),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "{tag} I51: an adopt REQUIRED key state for the declared epoch — a relay \
+                    could not hold what it cannot open: {e}"
+            )
+        });
+        let binding = backend
+            .community_dek_blob_binding(&out.sha256)
+            .await
+            .unwrap()
+            .expect("bound as declared");
+        assert_eq!(
+            (binding.community_key_id.as_str(), binding.epoch),
+            (ghost.as_str(), 7)
+        );
+        assert_eq!(
+            backend.community_dek_key_state(&ghost, 7).await.unwrap(),
+            None,
+            "{tag} I51: the adopt minted key state it had no business minting"
+        );
+
+        // (b) Grants decide the read. Seal under `ghost` — our own community,
+        //     whose first cascade mints its epoch E (alice is granted) —
+        //     ROTATE past E, adopt the E envelope back, read. (An occurrence
+        //     resolves to ONE principal, so the party-to walk is alice's.)
+        let body = b"minutes sealed at the old epoch".to_vec();
+        let (env_b, old_epoch, sha_b) =
+            sealed_community_envelope(backend, &ghost, &body, &peer).await;
+        backend.delete_blob(&sha_b).await.unwrap();
+        let new_epoch = backend.community_dek_bump_epoch(&ghost).await.unwrap();
+        assert!(new_epoch > old_epoch, "{tag} I51: precondition — rotated");
+        // A WRITE at the old epoch is refused (I17); the ADOPT is not (§3).
+        assert!(
+            backend
+                .community_dek_bind_blob_epoch(&sha_b, &ghost, old_epoch)
+                .await
+                .is_err(),
+            "{tag} I51: precondition — I17 refuses a write-bind at the old epoch"
+        );
+        let out = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env_b,
+            &community_provenance(&peer, &ghost, old_epoch),
+            None,
+            AdoptDisposition::Announce,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I51: adopt at a rotated-past epoch refused: {e}"));
+        assert_eq!(out.sha256, sha_b);
+        let got = read_for_community_viewer(backend, &sha_b, &alice_occ)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{tag} I51: a grantee of the declared epoch could not open the adopted \
+                        blob: {e}"
+                )
+            });
+        assert_eq!(
+            got, body,
+            "{tag} I51: the adopted bytes open to the right plaintext"
+        );
+        let stranger = format!("{tag}-stranger-{run}");
+        let err = read_for_community_viewer(backend, &sha_b, &stranger)
+            .await
+            .expect_err(&format!("{tag} I51: an adopted blob opened for a stranger"));
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I51: {err:?}"
+        );
+    }
+
+    // ── I52 ──────────────────────────────────────────────────────────────
+    /// **`Announce` emits `holds_bytes` by THIS node beside the cleartext
+    /// provenance; `LocalOnly` emits nothing; self/family provenance can
+    /// never `Announce`.** The provenance a holder keeps or evicts on —
+    /// `author_key_id`, `community_key_id` — is readable in the clear from
+    /// the row (`blob_provenance`) the claim announces; the signed claim's
+    /// preimage is unchanged (v31, #652).
+    pub async fn exercise_i52_announce_emits_the_holder_claim_and_self_family_never_announce<B>(
+        backend: &B,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::adopt_cascade::{adopt_sealed_blob, AdoptDisposition};
+        use crate::federation::community_dek::lifecycle_support::seed_community;
+        use crate::federation::types::cohort_scope::{CryptoTier, FAMILY, SELF};
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("{tag}-node-{run}");
+        let signer = node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
+        let our = signer.derived_key_id();
+        let peer = format!("{tag}-peer-{run}");
+        let family: Vec<String> = Vec::new();
+        let ctx = hold_ctx(false, &our, &family);
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let alice_occ = format!("{tag}-alice-occ-{run}");
+        seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
+        join_as_occurrence(backend, &alice, &our).await;
+
+        // Announce: this node is a holder, and the provenance is in the clear.
+        let (env1, epoch, sha1) = sealed_community_envelope(backend, &comm, b"one", &peer).await;
+        backend.delete_blob(&sha1).await.unwrap();
+        let out = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env1,
+            &community_provenance(&peer, &comm, epoch),
+            None,
+            AdoptDisposition::Announce,
+        )
+        .await
+        .unwrap();
+        assert!(out.announced);
+        let holders = backend.list_holders(&sha1).await.unwrap();
+        assert!(
+            holders.contains(&our),
+            "{tag} I52: Announce did not name this node as a holder: {holders:?}"
+        );
+        assert!(
+            !holders.contains(&peer),
+            "{tag} I52: the claim named the AUTHOR as holder — author is not holder"
+        );
+        let row = backend.blob_provenance(&sha1).await.unwrap().expect("row");
+        assert_eq!(row.author_key_id.as_deref(), Some(peer.as_str()));
+        assert_eq!(row.community_key_id.as_deref(), Some(comm.as_str()));
+        // LocalOnly: nothing announced.
+        let (env2, _, sha2) = sealed_community_envelope(backend, &comm, b"two", &peer).await;
+        backend.delete_blob(&sha2).await.unwrap();
+        let out = adopt_sealed_blob(
+            backend,
+            &adapter,
+            &ctx,
+            &env2,
+            &community_provenance(&peer, &comm, epoch),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .unwrap();
+        assert!(!out.announced);
+        assert!(
+            backend.list_holders(&sha2).await.unwrap().is_empty(),
+            "{tag} I52: LocalOnly emitted a holder claim"
+        );
+        // self / family + Announce: refused BEFORE the floor (CC 5.2).
+        for scope in [SELF, FAMILY] {
+            let prov = crate::federation::BlobProvenance {
+                author_key_id: our.clone(),
+                cohort_scope: scope.to_owned(),
+                community_key_id: Some(format!("{tag}-owner-{run}")),
+                epoch: None,
+                tier: CryptoTier::InvisibleEncrypted,
+            };
+            let err = adopt_sealed_blob(
+                backend,
+                &adapter,
+                &ctx,
+                &env2,
+                &prov,
+                None,
+                AdoptDisposition::Announce,
+            )
+            .await
+            .expect_err(&format!(
+                "{tag} I52: an announced {scope} blob — structurally invisible content got a \
+                 holder claim"
+            ));
+            assert!(
+                matches!(err, BlobError::InvalidArgument(_)),
+                "{tag} I52: {err:?}"
+            );
+        }
+    }
 }
 
 /// Fixture-only access to the storage floor for [`blob_invariants`].
