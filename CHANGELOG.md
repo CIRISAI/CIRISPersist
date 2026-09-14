@@ -88,6 +88,91 @@ Every restore verified by an empty diff. The wheel test was not run under
 mutation; it asserts the same JSON facts and is BELIEVED to red on a, b
 and d.
 
+
+## [Unreleased — #846]
+
+**A node can now store a sealed blob it received from a peer, and it never
+stores data it is not party to.** `FSD/BLOB_REPLICATION.md` wrote down the
+holder plane and found the one door missing for the light-up: every write
+door persist had was wrong for received ciphertext — `put_blob` stored it as
+a plaintext-tier row, `put_blob_scoped` re-sealed, `store_blob_local`
+announced nothing (§3). No sealed blob had ever been stored by a node that did
+not seal it. This cut adds the receiver-side twin of `serve_blob_to_peer`
+(`adopt_sealed_blob`, `adopt_sealed_chunk`), the WILL decision as a door of
+its own (`would_hold`), and the one fact the proxy classification was missing
+— the row's AUTHOR (§5). Invariants I45–I53, each witnessed RED before the
+code and mutation-verified after it.
+
+### Added
+- **`federation_blobs.author_key_id`** (V144, both dialects, nullable, NOT
+  backfilled — no pre-V144 row records who authored it, and a guess would be
+  a fact). Every write door records it: the writer's derived key for a local
+  write (I23), the holder claim's attesting key for `put_blob`, the claimed
+  owner for a chunk, the stream's owner for a manifest, the declared
+  provenance for an adopt. `store_blob_local`, `encrypt_and_cascade` and the
+  community cascade take it as a parameter; `put_blob_with_scope` stamps a
+  NULL author on announce.
+- **`is_proxy_content`** (`replication::hold`) — the ONE classification: a
+  row is proxy when its author is neither this node nor family; `NULL` is
+  unknown and classifies proxy (fail toward evictable). The force-evict
+  sweep, `serve_blob_to_peer` and `would_hold` call it (I49). The sweep used
+  to key on the `holds_bytes` ATTESTER, which for anything a node adopted is
+  the node itself — every relayed blob read as protected.
+- **`Engine::would_hold(&BlobProvenance)`** / `would_hold_json` — the WILL
+  decision (§4): a local or family author is held always; content this node
+  is not party to is refused `BlobError::NotPartyTo` (typed, naming only the
+  declared cohort and community); at the stop tier, content held for others
+  is refused `DiskPressureProxyRefused { operation: "accept" }`. It exists in
+  one place and every accept door runs it (I46, from-disk).
+- **`Engine::adopt_sealed_blob` / `adopt_sealed_chunk`** and
+  `adopt_sealed_blob_json` — store a received `AtRestEnvelope` verbatim at
+  the declared tier, under the declared `(community, epoch)` binding with NO
+  current-epoch check and no key state required (§3, I51), the author
+  recorded, the stream row naming the AUTHOR as owner so the adopter can
+  never append to it (I50), and — for `Announce` — a `holds_bytes` claim by
+  this node in the same transaction (I52). `self`/`family` provenance can
+  never announce (CC 5.2). Never an `open(` on the path (I45, from-disk).
+  `aad` is accepted and not recorded: it is the reader's fact at open time.
+- **`Engine::hold_breadth()`** / `hold_breadth` — `OnDemand` or `ForCohort`,
+  from `resolve_serve_tier` (#788). Serve standing governs how WIDELY a node
+  holds within the cohorts it is party to; it never gates acceptance (I48,
+  from-disk: `would_hold` and the adopt path name no serve tier).
+- `BlobStorage::adopt_sealed_blob_at` / `adopt_sealed_chunk_at` /
+  `blob_provenance`; `BlobProvenanceRow`; `sign_holds_bytes_claim` and
+  `prepare_holds_bytes_row`, so the signing door and the adopt door cannot
+  drift on what a holder claim is. `EvictionCandidate.author_key_id` replaces
+  the never-populated `attesting_key_id`.
+- From-disk gates I45 / I46 / I48 / I49 / I53 in `blob_surface_gates`; the
+  I8 reachability list carries the three new doors.
+
+### Changed — stated behaviour change
+- **A node now refuses to accept content it is not party to** — no cohort it
+  belongs to may access the granting attestation — typed `NotPartyTo`, on
+  the adopt doors and `put_blob_signing` alike (the commons is everyone's,
+  so `put_blob_signing`'s behaviour reduces to the #149 pressure rule).
+  Previously anyone above a trust threshold that defaults to zero (#737)
+  could place relay content on any node. There is no relay exception and no
+  serve-role exception: a "server" holds content it IS party to but did not
+  create, so members can fetch it — it never holds bytes it could not open
+  and inspect (CC 4.4.3.2.1).
+- `Engine::is_local_or_family_key` is removed (clean break): the predicate
+  is built once per decision from the derived key and the family predicate,
+  and only `is_proxy_content` consumes it. PyO3's private pressure check in
+  `put_blob_json` / `put_blob_signing` now runs `would_hold`.
+- The chunk floor is ONE body per backend (`put_blob_chunk_floor`) with a
+  `bind_as_declared` switch; `put_blob_chunk_with_scope` and
+  `adopt_sealed_chunk_at` delegate to it, so the I41 stream-claim logic is
+  spelled once.
+- `serve_blob_to_peer`'s proxy classification reads the row's author, not
+  the holder attester.
+
+### Docs
+- `FSD/BLOB_ENCRYPTION_AT_REST.md` §10.8 re-pointed: CIRISEdge#581's store
+  gate is built (edge v23.1.0); arming it over the converger is #601.
+- `replication_policy.rs` names CIRISServer as the owner of
+  `CEG_REPLICATION_MODEL.md`; `replication/mod.rs` states the #737 posture;
+  `disk_pressure.rs` names the door its stop tier is enforced on.
+
 ## [44.1.1] - 2026-09-11
 
 **A shipped migration's bytes are the contract, comments included.**

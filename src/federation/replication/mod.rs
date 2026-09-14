@@ -8,6 +8,14 @@
 //! signed `withdraws` attestation per evicted blob so consumers don't
 //! refetch stale references from the federation directory.
 //!
+//! **The trust gate is not the accept decision.** An unconfigured gate is
+//! a threshold of ZERO (#737): it admits every peer above nothing. What
+//! decides whether this node holds content at all is
+//! [`hold::would_hold`] (`FSD/BLOB_REPLICATION.md` §4) — persist never
+//! stores data this node is not party to, and at the stop tier refuses
+//! content held for others. The trust gate screens WHO may announce; the
+//! WILL decision screens WHAT lands.
+//!
 //! # Module shape
 //!
 //! - [`ReplicationConfig`] — operator knobs (threshold, recursion depth,
@@ -44,6 +52,7 @@ pub mod cache_mode;
 // free-byte tiers + injectable statvfs source; defaults ON).
 pub mod disk_pressure;
 pub mod eviction;
+pub mod hold;
 pub mod trust_scoring;
 
 pub use admission::AdmissionGate;
@@ -59,6 +68,10 @@ pub use disk_pressure::{
 pub use eviction::{
     EvictionCandidate, EvictionDecay, EvictionSweeper, SweepReport, DEFAULT_SWEEP_BATCH,
     MIN_SWEEP_INTERVAL,
+};
+pub use hold::{
+    audience_memberships, is_audience, is_audience_of, is_proxy_content, would_hold,
+    BlobProvenance, HoldBreadth, HoldContext,
 };
 pub use trust_scoring::{
     aggregate_trust_score, MemoryTrustScoring, TrustScoring, TrustScoringError,

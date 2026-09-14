@@ -1042,6 +1042,13 @@ pub trait BlobStorage: Send + Sync {
     /// which dispatches here when
     /// [`suppresses_holds_bytes`](crate::federation::types::cohort_scope::suppresses_holds_bytes)
     /// is true.
+    ///
+    /// #846 (`BLOB_REPLICATION.md` §5) — `author_key_id` is recorded on the
+    /// row: the writer's DERIVED federation key id for a local write (I23).
+    /// `None` is recorded as NULL, which [`is_proxy_content`] treats as
+    /// unknown ⇒ proxy; a cascade that knows its writer must say so.
+    ///
+    /// [`is_proxy_content`]: crate::federation::replication::hold::is_proxy_content
     fn store_blob_local(
         &self,
         sha256: &[u8; 32],
@@ -1049,7 +1056,67 @@ pub trait BlobStorage: Send + Sync {
         media_type: Option<&str>,
         cohort_scope: &str,
         floor: StorageFloor,
+        author_key_id: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #846 (`BLOB_REPLICATION.md` §6.1, I45/I51/I52) — **the adopt floor.**
+    /// Store a sealed [`AtRestEnvelope`](crate::federation::at_rest_cascade::AtRestEnvelope)
+    /// received from a peer VERBATIM, addressed by the SHA-256 of its bytes,
+    /// with `crypto_tier` from the token, `cohort_scope` and `author_key_id`
+    /// AS DECLARED, the `(community, epoch)` binding AS DECLARED — with **no
+    /// current-epoch check** (the I17 rule governs a *write*; an adopt records
+    /// the epoch the author sealed under, which may be past and may be one
+    /// this node holds no key state for) — and, when `announce` is `Some`,
+    /// the `holds_bytes` row, all in ONE transaction. Returns the address.
+    ///
+    /// Idempotent on the address (first-write-wins on the row and the
+    /// binding); the holder claim is inserted on every announcing call.
+    /// Nothing here opens the envelope: a from-disk gate (I45) holds that.
+    ///
+    /// Requires a [`StorageFloor`] — unconstructible outside the crate
+    /// (I22); in-crate, only the adopt cascade may call it (I14).
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_sealed_blob_at(
+        &self,
+        envelope_bytes: Vec<u8>,
+        media_type: Option<&str>,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: StorageFloor,
+        binding: Option<EpochBinding>,
+        announce: Option<PutBlobAttestation>,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
+    /// #846 (§6.2, I50) — **the adopt floor's chunk twin.** The same row and
+    /// binding rules as [`adopt_sealed_blob_at`](Self::adopt_sealed_blob_at)
+    /// for one sealed chunk at `(stream_id, seq)`, through the same
+    /// stream-claim logic as [`put_blob_chunk_with_scope`](Self::put_blob_chunk_with_scope)
+    /// with the AUTHOR as the claimed owner: the stream row is written
+    /// insert-if-absent naming the author, so a later append by the adopter
+    /// is refused as a foreign writer (I41 carried across nodes). The
+    /// binding is written as declared, no current-epoch check.
+    #[allow(clippy::too_many_arguments)]
+    fn adopt_sealed_chunk_at(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        envelope_bytes: Vec<u8>,
+        epoch: u64,
+        plaintext_size: u64,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: StorageFloor,
+        binding: Option<EpochBinding>,
+    ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
+    /// #846 (§5, I49) — the row's PROVENANCE, for the proxy classification:
+    /// its `author_key_id` (NULL = unknown), the cohort it was stored under,
+    /// and the community its epoch binding names, or `None` if absent.
+    /// Columns only; nothing sniffs bytes (I2).
+    fn blob_provenance(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<BlobProvenanceRow>, BlobError>> + Send;
 
     /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
     /// with the row's `cohort_scope` and resolved `crypto_tier` recorded.
@@ -1612,16 +1679,6 @@ pub trait BlobStorage: Send + Sync {
         Self: Sync,
     {
         async move {
-            use base64::engine::general_purpose::STANDARD as B64;
-            use base64::Engine as _;
-            use sha2::{Digest, Sha256};
-
-            if attesting_key_id.is_empty() {
-                return Err(BlobError::InvalidArgument(
-                    "attesting_key_id is empty".into(),
-                ));
-            }
-
             // v43.0.0 (§11.2 (5) / I21) — the matcher screens PLAINTEXT, once.
             // A plaintext-tier token means these bytes are the plaintext and
             // this floor is their first stop; a sealed-tier token means they
@@ -1632,57 +1689,10 @@ pub trait BlobStorage: Send + Sync {
                     self.screen_inline_body(sha256, inline).await?;
                 }
             }
-
-            // v31.0.0 (CIRISPersist#652) — the v31-SHAPED envelope: the #598
-            // instants and the #643 mirror ride the bytes this signer is about
-            // to sign. `put_blob` rebuilds these exact bytes from the same
-            // four inputs, so persist still verifies the caller signed the row
-            // it is storing. `now` is BOTH instants here because the signing
-            // helper mints the claim and signs it in one motion — a caller
-            // that wants to assert an older claim uses `put_blob` directly and
-            // states `asserted_at` itself.
-            let envelope = holds_bytes_attestation_envelope(
-                sha256,
-                attesting_key_id,
-                &attestation_id.to_string(),
-                now,
-            );
-            // v4.6 (#176) — produce-side gate (Python pre-cut, JCS post-cut).
-            let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
-                .map_err(|e| {
-                    BlobError::InvalidArgument(format!("canonicalize holds_bytes envelope: {e}"))
-                })?;
-            let original_content_hash_hex = hex::encode(Sha256::digest(&canonical_bytes));
-
-            let sig_bytes = signer
-                .sign(&canonical_bytes)
-                .await
-                .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
-            let scrub_signature_classical = B64.encode(&sig_bytes);
-            // v9.3.0 (#247) — the holds_bytes `scrub_key_id` FKs to
-            // `federation_keys(key_id)`, which is the DERIVED wire key_id
-            // (`<label>-<fp>`), NOT the keystore alias `current_alias()`.
-            // Using the alias FK-violated on every node whose alias ≠
-            // derived id (the same class as `attestation_promote` #247).
-            let signer_pubkey = signer.public_key().await.map_err(|e| {
-                BlobError::AttestationEmissionFailed(format!(
-                    "holds_bytes derive scrub_key_id (signer public_key): {e}"
-                ))
-            })?;
-            let scrub_key_id =
-                ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &signer_pubkey);
-
-            let att = PutBlobAttestation {
-                attesting_key_id: attesting_key_id.to_string(),
-                attestation_id: attestation_id.to_string(),
-                original_content_hash_hex,
-                scrub_signature_classical,
-                scrub_signature_pqc: None,
-                scrub_key_id,
-                scrub_timestamp: now,
-                asserted_at: now,
-            };
-
+            // #846 — the claim is signed by the one helper the adopt door
+            // also uses, so what a holder claim IS has one spelling.
+            let att = sign_holds_bytes_claim(signer, sha256, attesting_key_id, attestation_id, now)
+                .await?;
             self.put_blob_with_scope(sha256, body, media_type, att, cohort_scope, floor)
                 .await
         }
@@ -2459,6 +2469,151 @@ pub struct BlobEpochBinding {
     pub evicted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// #846 (`BLOB_REPLICATION.md` §5) — what [`BlobStorage::blob_provenance`]
+/// reads off a row: the facts the proxy classification and the serve
+/// refusal decide on. None of them is a byte of content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobProvenanceRow {
+    /// `federation_blobs.author_key_id` — the attesting key of the
+    /// attestation the blob is a projection of; `None` = unknown (a
+    /// pre-V144 row, or a commons chunk written by the signer-less door).
+    pub author_key_id: Option<String>,
+    /// The cohort the write named (V139).
+    pub cohort_scope: String,
+    /// The community the row's epoch binding names, if it has one.
+    pub community_key_id: Option<String>,
+}
+
+/// #846 (`BLOB_REPLICATION.md` §6.1) — sign the `holds_bytes` claim for
+/// `sha256` under `signer`, exactly as [`BlobStorage::put_blob_signing_at`]
+/// does: the v31-shaped envelope, the produce-side canonicalizer, the
+/// signer's DERIVED key id as `scrub_key_id` (I23). One function, so the
+/// signing door and the adopt door cannot drift on what a holder claim is.
+pub async fn sign_holds_bytes_claim(
+    signer: &dyn ciris_keyring::HardwareSigner,
+    sha256: &[u8; 32],
+    attesting_key_id: &str,
+    attestation_id: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<PutBlobAttestation, BlobError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    if attesting_key_id.is_empty() {
+        return Err(BlobError::InvalidArgument(
+            "attesting_key_id is empty".into(),
+        ));
+    }
+    // v31.0.0 (CIRISPersist#652) — the v31-SHAPED envelope: the #598
+    // instants and the #643 mirror ride the bytes this signer is about
+    // to sign. `put_blob` rebuilds these exact bytes from the same
+    // four inputs, so persist still verifies the caller signed the row
+    // it is storing. `now` is BOTH instants here because the signing
+    // helper mints the claim and signs it in one motion — a caller
+    // that wants to assert an older claim uses `put_blob` directly and
+    // states `asserted_at` itself.
+    let envelope = holds_bytes_attestation_envelope(
+        sha256,
+        attesting_key_id,
+        &attestation_id.to_string(),
+        now,
+    );
+    // v4.6 (#176) — produce-side gate (Python pre-cut, JCS post-cut).
+    let canonical_bytes =
+        crate::verify::canonical::ceg_produce_canonicalize(&envelope).map_err(|e| {
+            BlobError::InvalidArgument(format!("canonicalize holds_bytes envelope: {e}"))
+        })?;
+    let original_content_hash_hex = hex::encode(Sha256::digest(&canonical_bytes));
+
+    let sig_bytes = signer
+        .sign(&canonical_bytes)
+        .await
+        .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
+    let scrub_signature_classical = B64.encode(&sig_bytes);
+    // v9.3.0 (#247) — the holds_bytes `scrub_key_id` FKs to
+    // `federation_keys(key_id)`, which is the DERIVED wire key_id
+    // (`<label>-<fp>`), NOT the keystore alias `current_alias()`.
+    // Using the alias FK-violated on every node whose alias ≠
+    // derived id (the same class as `attestation_promote` #247).
+    let signer_pubkey = signer.public_key().await.map_err(|e| {
+        BlobError::AttestationEmissionFailed(format!(
+            "holds_bytes derive scrub_key_id (signer public_key): {e}"
+        ))
+    })?;
+    let scrub_key_id =
+        ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &signer_pubkey);
+
+    Ok(PutBlobAttestation {
+        attesting_key_id: attesting_key_id.to_string(),
+        attestation_id: attestation_id.to_string(),
+        original_content_hash_hex,
+        scrub_signature_classical,
+        scrub_signature_pqc: None,
+        scrub_key_id,
+        scrub_timestamp: now,
+        asserted_at: now,
+    })
+}
+
+/// #846 — a `holds_bytes` row a backend inserts verbatim: the admitted
+/// [`Attestation`](crate::federation::Attestation) plus the two serialized
+/// columns both dialects store beside it. Built by
+/// [`prepare_holds_bytes_row`], which runs the same admission check the
+/// `put_blob` door runs, so the adopt floor's announce is admitted on the
+/// same terms as every other holder claim.
+#[derive(Debug, Clone)]
+pub struct PreparedHoldsBytes {
+    /// The admitted row, every column populated.
+    pub row: crate::federation::Attestation,
+    /// `attestation_envelope` as stored (JSON text).
+    pub envelope_text: String,
+    /// `original_content_hash` decoded from the caller's hex.
+    pub original_content_hash: Vec<u8>,
+}
+
+/// #846 — rebuild and ADMIT the `holds_bytes` row for `sha256` from the
+/// caller's signed components (the `put_blob` door's own steps: rebuild the
+/// envelope from the row identity, verify the caller signed those bytes,
+/// stamp the row hash). Refuses exactly what `put_blob` refuses.
+// The admission check it runs exists only with a backend (a witness module
+// that calls plumbing carries the backend cfg; this helper is that plumbing).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn prepare_holds_bytes_row(
+    sha256: &[u8; 32],
+    attestation: &PutBlobAttestation,
+) -> Result<PreparedHoldsBytes, BlobError> {
+    let original_content_hash =
+        hex::decode(&attestation.original_content_hash_hex).map_err(|e| {
+            BlobError::InvalidArgument(format!("original_content_hash hex decode: {e}"))
+        })?;
+    let mut row = holds_bytes_attestation_row(
+        sha256,
+        &attestation.attesting_key_id,
+        &attestation.attestation_id,
+        attestation.asserted_at,
+    );
+    row.original_content_hash = attestation.original_content_hash_hex.clone();
+    row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
+    row.scrub_signature_pqc = attestation.scrub_signature_pqc.clone();
+    row.scrub_key_id = attestation.scrub_key_id.clone();
+    row.scrub_timestamp = attestation.scrub_timestamp;
+    check_put_blob_admission(
+        &row,
+        &attestation.original_content_hash_hex,
+        chrono::Utc::now(),
+    )?;
+    row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)
+        .map_err(|e| BlobError::Backend(format!("persist_row_hash: {e}")))?;
+    let envelope_text = serde_json::to_string(&row.attestation_envelope)
+        .map_err(|e| BlobError::Backend(format!("envelope serialize: {e}")))?;
+    Ok(PreparedHoldsBytes {
+        row,
+        envelope_text,
+        original_content_hash,
+    })
+}
+
 /// v2.3 (CIRISPersist#103) — typed errors from the [`BlobStorage`] trait.
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
@@ -2657,6 +2812,31 @@ pub enum BlobError {
         /// When the sweep evicted the local copy.
         evicted_at: chrono::DateTime<chrono::Utc>,
     },
+
+    /// #846 (`BLOB_REPLICATION.md` §4, I48) — **persist never stores data
+    /// this node is not party to.** The provenance names a cohort no
+    /// membership of this node may access — a `self`/`family` row whose
+    /// author is neither local nor family, or a `community`/`affiliations`
+    /// row whose community this node's principal is not an active member
+    /// of — so the accept is refused before anything is written, whatever
+    /// this node's serve standing. Every blob a node holds is one it could
+    /// open and inspect (CC 4.4.3.2.1); a relay exception would be a node
+    /// holding bytes it cannot judge. PERMANENT for this node: the peer
+    /// should place the content with a member.
+    ///
+    /// Names the cohort and the community the CALLER declared — its own
+    /// input echoed back, never a row (I4b's class).
+    #[error(
+        "not party to {cohort_scope} content{}: this node holds nothing it cannot access \
+         (BLOB_REPLICATION.md §4)",
+        community_key_id.as_deref().map(|c| format!(" of community {c:?}")).unwrap_or_default()
+    )]
+    NotPartyTo {
+        /// The declared cohort.
+        cohort_scope: String,
+        /// The declared community, for `community` / `affiliations`.
+        community_key_id: Option<String>,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -2681,6 +2861,7 @@ impl BlobError {
             BlobError::QuarantineWithheld { .. } => "blob_quarantine_withheld",
             BlobError::EpochNotCurrent { .. } => "blob_epoch_not_current",
             BlobError::Evicted { .. } => "blob_evicted",
+            BlobError::NotPartyTo { .. } => "blob_not_party_to",
             BlobError::Backend(_) => "blob_backend",
         }
     }

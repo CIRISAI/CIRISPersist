@@ -12941,10 +12941,14 @@ impl crate::federation::BlobStorage for PostgresBackend {
 
         let sha_vec = sha256.to_vec();
         if floor.tier() == crate::federation::types::cohort_scope::CryptoTier::Plaintext {
+            // #846 (§5) — the row records its AUTHOR: the attesting key of
+            // the holder claim, which for a local write is the writer's
+            // derived key (I23) and for a proxy write the peer's.
             tx.execute(
                 "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, cohort_scope, crypto_tier\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    cohort_scope, crypto_tier, author_key_id\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (sha256) DO NOTHING",
                 &[
                     &sha_vec,
@@ -12955,6 +12959,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &media_type,
                     &scope,
                     &tier,
+                    &attestation.attesting_key_id,
                 ],
             )
             .await
@@ -13005,6 +13010,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 let _ = tx.rollback().await;
                 return Err(not_held());
             }
+            // #846 (§5) — a sealed row is stored by a cascade and announced
+            // here; the announce names the writer, so a row the cascade
+            // could not attribute (NULL) takes the announcer's key. An
+            // author already recorded is never overwritten.
+            tx.execute(
+                "UPDATE cirislens.federation_blobs SET author_key_id = $2 \
+                  WHERE sha256 = $1 AND author_key_id IS NULL",
+                &[&sha_vec, &attestation.attesting_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("announce author: {e}")))?;
         }
 
         // Holder attestation. Insert is idempotent at the
@@ -13172,10 +13188,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
         media_type: Option<&str>,
         cohort_scope: &str,
         floor: crate::federation::StorageFloor,
+        author_key_id: Option<&str>,
     ) -> Result<(), crate::federation::BlobError> {
         floor.check_scope(cohort_scope)?;
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
+        let author = author_key_id.map(str::to_owned);
         // v4.1 (Cut B) — ChunkDag is a multi-row manifest; routed through
         // put_blob_chunks, never store_blob_local.
         if matches!(body, crate::federation::BlobBody::ChunkDag(_)) {
@@ -13216,8 +13234,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
         client
             .execute(
                 "INSERT INTO cirislens.federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, cohort_scope, crypto_tier\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    cohort_scope, crypto_tier, author_key_id\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (sha256) DO NOTHING",
                 &[
                     &sha_vec,
@@ -13226,9 +13245,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &external_ref_opt,
                     &size_bytes_i64,
                     &media_type,
-                &scope,
-                &tier,
-            ],
+                    &scope,
+                    &tier,
+                    &author,
+                ],
             )
             .await
             .map_err(|e| {
@@ -14487,258 +14507,59 @@ impl crate::federation::BlobStorage for PostgresBackend {
         binding: Option<crate::federation::EpochBinding>,
         claim: crate::federation::StreamClaim,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
-        floor.check_scope(cohort_scope)?;
-        let cap = self.inline_bytes_cap();
-        // Validation + hash-on-write (computes the chunk's content SHA) +
-        // the §12.3 floor check (the body is what the token says it is).
-        let row =
-            crate::federation::blobs::prepare_stream_chunk_row(&body, cap, floor, plaintext_size)?;
-        // u64 → i64 binds (tokio_postgres has no ToSql for u64).
-        let seq_i64 = i64::try_from(seq).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
-            )
-        })?;
-        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is BIGINT"
-                    .into(),
-            )
-        })?;
-        let plaintext_i64 = i64::try_from(plaintext_size).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: plaintext_size exceeds i64".into(),
-            )
-        })?;
-        let scope = cohort_scope.to_owned();
-        let tier = floor.tier().as_str().to_owned();
-
-        let mut client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
-        // §11.4 / I27 — a community bind runs under the community's
-        // serialization boundary, like every other epoch-state operation.
-        if let Some(b) = &binding {
-            lock_community_tx(&tx, &b.community_key_id).await?;
-        }
-
-        // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in this
-        //    transaction, then compared: a stream belongs to its first
-        //    append. ON CONFLICT DO NOTHING waits on a concurrent first
-        //    append's transaction, and the SELECT that follows is a new
-        //    statement under READ COMMITTED, so the loser compares against
-        //    the winner's row. Refused ⇒ rollback, nothing stored. A NULL
-        //    owner (unclaimed) is adopted by the first attributed claim.
-        tx.execute(
-            "INSERT INTO cirislens.federation_streams \
-                (stream_id, cohort_scope, community_key_id, owner_key_id) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (stream_id) DO NOTHING",
-            &[
-                &stream_id,
-                &scope,
-                &claim.community_key_id,
-                &claim.owner_key_id,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk stream row: {e}"))
-        })?;
-        let head = tx
-            .query_one(
-                "SELECT cohort_scope, community_key_id, owner_key_id \
-                   FROM cirislens.federation_streams WHERE stream_id = $1",
-                &[&stream_id],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk stream head: {e}"))
-            })?;
-        let s_cohort: String =
-            head.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
-        let s_comm: Option<String> =
-            head.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
-        let s_owner: Option<String> =
-            head.safe_get_with("owner_key_id", crate::federation::BlobError::Backend)?;
-        if s_cohort != scope || s_comm != claim.community_key_id {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::blobs::stream_elsewhere_refusal(
+        // #832 (§12.3 / I17) — a WRITE binds the current epoch.
+        let sha = self
+            .put_blob_chunk_floor(
                 stream_id,
-                &s_cohort,
-                s_comm.as_deref(),
+                seq,
+                body,
+                epoch,
+                plaintext_size,
                 cohort_scope,
-                claim.community_key_id.as_deref(),
-            ));
-        }
-        let foreign = match (&s_owner, &claim.owner_key_id) {
-            (None, None) => false,
-            (Some(owner), Some(mine)) => owner != mine,
-            (None, Some(mine)) => {
-                // Adopt. The predicate makes two adopters resolve to one.
-                let n = tx
-                    .execute(
-                        "UPDATE cirislens.federation_streams SET owner_key_id = $2 \
-                          WHERE stream_id = $1 AND owner_key_id IS NULL",
-                        &[&stream_id, mine],
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::federation::BlobError::Backend(format!(
-                            "put_blob_chunk stream adopt: {e}"
-                        ))
-                    })?;
-                n == 0
-            }
-            (Some(_), None) => true,
+                floor,
+                binding,
+                claim,
+                false,
+            )
+            .await?;
+        Ok(sha)
+    }
+
+    async fn adopt_sealed_chunk_at(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        envelope_bytes: Vec<u8>,
+        epoch: u64,
+        plaintext_size: u64,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        // #846 (§6.2, I50) — the AUTHOR is the claimed owner: the stream row
+        // is written insert-if-absent naming the author, so the adopter can
+        // never append to it as its own (I41 carried across nodes). The
+        // binding is written AS DECLARED (no current-epoch check).
+        let claim = crate::federation::StreamClaim {
+            community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
+            owner_key_id: Some(author_key_id.to_owned()),
         };
-        if foreign {
-            let _ = tx.rollback().await;
-            return Err(crate::federation::blobs::stream_foreign_refusal(
+        let sha = self
+            .put_blob_chunk_floor(
                 stream_id,
-                &s_cohort,
-                s_comm.as_deref(),
-            ));
-        }
-
-        // 1. The chunk's bytes land as a normal federation_blobs row.
-        //    Content-addressed + idempotent: a re-PUT of identical bytes
-        //    is a no-op (ON CONFLICT DO NOTHING), exactly like
-        //    store_blob_local / the put_blob_chunks chunk rows. Carries
-        //    the cohort and the tier the door resolved (§11.1 / §12.1).
-        let sha_vec = row.sha256.to_vec();
-        let media_type_null: Option<String> = None;
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec,
-                &row.storage_kind,
-                &row.bytes_inline,
-                &row.external_ref,
-                &row.size_bytes,
-                &media_type_null,
-                &scope,
-                &tier,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk blob insert: {e}"))
-        })?;
-
-        // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the STREAM
-        //    nonce's per-epoch counter_be must never wrap. A given
-        //    (stream_id, epoch) holds at most MAX_CHUNKS_PER_EPOCH chunks;
-        //    past that the producer MUST roll the epoch. Checked in-tx so
-        //    a concurrent append can't slip past the cap.
-        let epoch_chunk_count: i64 = tx
-            .query_one(
-                "SELECT COUNT(*) FROM cirislens.federation_stream_chunks \
-                  WHERE stream_id = $1 AND epoch = $2",
-                &[&stream_id, &epoch_i64],
+                seq,
+                crate::federation::BlobBody::Inline(envelope_bytes),
+                epoch,
+                plaintext_size,
+                cohort_scope,
+                floor,
+                binding,
+                claim,
+                true,
             )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk epoch count: {e}"))
-            })?
-            .get(0);
-        if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at \
-                 MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch (STREAM-nonce counter \
-                 exhaustion, CEG §10.5.3)",
-                crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
-            )));
-        }
-
-        // 3. The stream-index row. The (stream_id, seq) PK enforces
-        //    monotonicity — a re-used seq is a PK conflict, mapped to
-        //    InvalidArgument (NOT idempotent: the append-only rule).
-        //    V142: the chunk's PLAINTEXT size beside its stored size.
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_stream_chunks (\
-                    stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
-                 ) VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (stream_id, seq) DO NOTHING",
-                &[
-                    &stream_id,
-                    &seq_i64,
-                    &sha_vec,
-                    &epoch_i64,
-                    &row.size_bytes,
-                    &plaintext_i64,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk index insert: {e}"))
-            })?;
-        if inserted == 0 {
-            // PK conflict on (stream_id, seq) — monotonicity violation.
-            // Roll back the whole txn (the blob row too, if it was new).
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "stream {stream_id} seq {seq} already exists"
-            )));
-        }
-
-        // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
-        //    conditional on the epoch still being the community's current
-        //    enabled one. Refused ⇒ the whole append rolls back.
-        if let Some(b) = &binding {
-            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-            let n = tx
-                .execute(
-                    "INSERT INTO cirislens.federation_community_blob_epoch \
-                        (at_rest_sha256, community_key_id, epoch) \
-                     SELECT $1, $2, $3 \
-                      WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
-                                     WHERE community_key_id = $2 AND epoch = $3 \
-                                       AND key_state = 'enabled') \
-                        AND $3 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
-                                            WHERE community_key_id = $2), 0) \
-                     ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    &[&sha_vec, &b.community_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind: {e}"))
-                })?;
-            let already_row = tx
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
-                                      AND epoch = $3) AS b",
-                    &[&sha_vec, &b.community_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind check: {e}"))
-                })?;
-            let already: bool =
-                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
-            if n == 0 && !already {
-                let _ = tx.rollback().await;
-                return Err(crate::federation::BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id.clone(),
-                    epoch: b.epoch,
-                });
-            }
-        }
-
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
-        })?;
-        Ok(row.sha256)
+            .await?;
+        Ok(sha)
     }
 
     async fn seal_stream_with_scope(
@@ -14802,13 +14623,17 @@ impl crate::federation::BlobStorage for PostgresBackend {
             )));
         }
         let sha_vec = spec.sha256.to_vec();
+        // #846 (§5) — the manifest's author is the stream's owner: the first
+        // attributed writer (I41), read from the stream row in this
+        // transaction. NULL for an unclaimed stream.
         tx.execute(
             "INSERT INTO cirislens.federation_blobs (\
                 sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier\
-             ) VALUES ($1, 'chunk_dag', $2, NULL, $3, $4, $5, $6) \
+                cohort_scope, crypto_tier, author_key_id\
+             ) VALUES ($1, 'chunk_dag', $2, NULL, $3, $4, $5, $6, \
+                       (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $7)) \
              ON CONFLICT (sha256) DO NOTHING",
-            &[&sha_vec, &spec.body, &size_i64, &media, &scope, &tier],
+            &[&sha_vec, &spec.body, &size_i64, &media, &scope, &tier, &stream_id],
         )
         .await
         .map_err(|e| {
@@ -14981,6 +14806,192 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("stream_chunk_at: {e}")))?;
         row.as_ref().map(pg_stream_chunk_ref).transpose()
+    }
+
+    async fn adopt_sealed_blob_at(
+        &self,
+        envelope_bytes: Vec<u8>,
+        media_type: Option<&str>,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+        announce: Option<crate::federation::PutBlobAttestation>,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use sha2::Digest as _;
+        floor.check_scope(cohort_scope)?;
+        let cap = self.inline_bytes_cap();
+        if envelope_bytes.len() > cap {
+            return Err(crate::federation::BlobError::InlineSizeExceeded {
+                size: envelope_bytes.len(),
+                cap,
+            });
+        }
+        // The address is the SHA-256 of the CIPHERTEXT, computed here from
+        // the bytes that are stored — never trusted from the sender.
+        let sha256: [u8; 32] = sha2::Sha256::digest(&envelope_bytes).into();
+        let size_i64 = i64::try_from(envelope_bytes.len()).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
+            )
+        })?;
+        // The holder claim is admitted on the same terms as `put_blob`'s.
+        let prepared = match announce.as_ref() {
+            Some(a) => Some(crate::federation::blobs::prepare_holds_bytes_row(
+                &sha256, a,
+            )?),
+            None => None,
+        };
+        let sha_vec = sha256.to_vec();
+        let scope = cohort_scope.to_owned();
+        let tier = floor.tier().as_str().to_owned();
+        let media = media_type.map(str::to_owned);
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        // I27 — the binding is epoch state; take the community's boundary.
+        if let Some(b) = &binding {
+            lock_community_tx(&tx, &b.community_key_id).await?;
+        }
+        // 1. The row, verbatim bytes, tier from the token, cohort and author
+        //    AS DECLARED. First-write-wins on the address.
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                cohort_scope, crypto_tier, author_key_id\
+             ) VALUES ($1, 'inline', $2, NULL, $3, $4, $5, $6, $7) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &sha_vec,
+                &envelope_bytes,
+                &size_i64,
+                &media,
+                &scope,
+                &tier,
+                &author_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at insert: {e}"))
+        })?;
+        // 2. The binding AS DECLARED (§3): the epoch the author sealed under,
+        //    which may be past and may be one this node holds no key state
+        //    for. No `enabled` check, no current-epoch check.
+        if let Some(b) = &binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO cirislens.federation_community_blob_epoch \
+                    (at_rest_sha256, community_key_id, epoch) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING",
+                &[&sha_vec, &b.community_key_id, &ep],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at bind: {e}"))
+            })?;
+        }
+        // 3. The holder claim, signed by THIS node (§6.1 (4)), in the same
+        //    transaction as the row it announces.
+        if let Some(p) = &prepared {
+            let expires_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
+            let pqc_completed_at_null: Option<chrono::DateTime<chrono::Utc>> = None;
+            let admitted_at = self
+                .next_plane_position(&tx, "federation_attestations")
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("serve position: {e}"))
+                })?;
+            tx.execute(
+                "INSERT INTO cirislens.federation_attestations (\
+                    attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                    cohort_scope, admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                &[
+                    &p.row.attestation_id,
+                    &p.row.attesting_key_id,
+                    &p.row.attested_key_id,
+                    &p.row.attestation_type,
+                    &p.row.asserted_at,
+                    &expires_at_null,
+                    &p.envelope_text,
+                    &p.original_content_hash,
+                    &p.row.scrub_signature_classical,
+                    &p.row.scrub_signature_pqc,
+                    &p.row.scrub_key_id,
+                    &p.row.scrub_timestamp,
+                    &pqc_completed_at_null,
+                    &p.row.persist_row_hash,
+                    &p.row.tier,
+                    &p.row.cohort_scope,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("foreign key") || msg.contains("violates foreign key") {
+                    crate::federation::BlobError::AttestationEmissionFailed(format!(
+                        "FK violation on holds_bytes attestation: {msg}"
+                    ))
+                } else if msg.contains("duplicate key") {
+                    crate::federation::BlobError::AttestationEmissionFailed(format!(
+                        "attestation_id collision: {msg}"
+                    ))
+                } else {
+                    crate::federation::BlobError::Backend(format!(
+                        "adopt_sealed_blob_at announce: {msg}"
+                    ))
+                }
+            })?;
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at commit: {e}"))
+        })?;
+        Ok(sha256)
+    }
+
+    async fn blob_provenance(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<crate::federation::BlobProvenanceRow>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = sha256.to_vec();
+        let row = client
+            .query_opt(
+                "SELECT b.author_key_id, b.cohort_scope, e.community_key_id \
+                   FROM cirislens.federation_blobs b \
+                   LEFT JOIN cirislens.federation_community_blob_epoch e \
+                          ON e.at_rest_sha256 = b.sha256 \
+                  WHERE b.sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("blob_provenance: {e}")))?;
+        row.map(|r| {
+            Ok(crate::federation::BlobProvenanceRow {
+                author_key_id: r
+                    .safe_get_with("author_key_id", crate::federation::BlobError::Backend)?,
+                cohort_scope: r
+                    .safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?,
+                community_key_id: r
+                    .safe_get_with("community_key_id", crate::federation::BlobError::Backend)?,
+            })
+        })
+        .transpose()
     }
 
     async fn blob_head(
@@ -16219,6 +16230,291 @@ async fn pg_load_stream_chunk_hashes(
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
 
 impl PostgresBackend {
+    /// #832 (§12.3) / #846 (§6.2) — **the chunk floor, shared by the write
+    /// door and the adopt door.** One body, so the I41 stream-claim logic has
+    /// one spelling. `bind_as_declared` selects the binding rule: `false` is
+    /// the write rule (the epoch must be the community's CURRENT enabled one,
+    /// I17); `true` is the adopt rule (record the epoch the author sealed
+    /// under, whatever this node knows about it).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn put_blob_chunk_floor(
+        &self,
+        stream_id: &str,
+        seq: u64,
+        body: crate::federation::BlobBody,
+        epoch: u64,
+        plaintext_size: u64,
+        cohort_scope: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+        claim: crate::federation::StreamClaim,
+        bind_as_declared: bool,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage as _;
+        floor.check_scope(cohort_scope)?;
+        let cap = self.inline_bytes_cap();
+        // Validation + hash-on-write (computes the chunk's content SHA) +
+        // the §12.3 floor check (the body is what the token says it is).
+        let row =
+            crate::federation::blobs::prepare_stream_chunk_row(&body, cap, floor, plaintext_size)?;
+        // u64 → i64 binds (tokio_postgres has no ToSql for u64).
+        let seq_i64 = i64::try_from(seq).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
+            )
+        })?;
+        let epoch_i64 = i64::try_from(epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is BIGINT"
+                    .into(),
+            )
+        })?;
+        let plaintext_i64 = i64::try_from(plaintext_size).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "put_blob_chunk: plaintext_size exceeds i64".into(),
+            )
+        })?;
+        let scope = cohort_scope.to_owned();
+        let tier = floor.tier().as_str().to_owned();
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        // §11.4 / I27 — a community bind runs under the community's
+        // serialization boundary, like every other epoch-state operation.
+        if let Some(b) = &binding {
+            lock_community_tx(&tx, &b.community_key_id).await?;
+        }
+
+        // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in this
+        //    transaction, then compared: a stream belongs to its first
+        //    append. ON CONFLICT DO NOTHING waits on a concurrent first
+        //    append's transaction, and the SELECT that follows is a new
+        //    statement under READ COMMITTED, so the loser compares against
+        //    the winner's row. Refused ⇒ rollback, nothing stored. A NULL
+        //    owner (unclaimed) is adopted by the first attributed claim.
+        tx.execute(
+            "INSERT INTO cirislens.federation_streams \
+                (stream_id, cohort_scope, community_key_id, owner_key_id) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (stream_id) DO NOTHING",
+            &[
+                &stream_id,
+                &scope,
+                &claim.community_key_id,
+                &claim.owner_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk stream row: {e}"))
+        })?;
+        let head = tx
+            .query_one(
+                "SELECT cohort_scope, community_key_id, owner_key_id \
+                   FROM cirislens.federation_streams WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk stream head: {e}"))
+            })?;
+        let s_cohort: String =
+            head.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
+        let s_comm: Option<String> =
+            head.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
+        let s_owner: Option<String> =
+            head.safe_get_with("owner_key_id", crate::federation::BlobError::Backend)?;
+        if s_cohort != scope || s_comm != claim.community_key_id {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::blobs::stream_elsewhere_refusal(
+                stream_id,
+                &s_cohort,
+                s_comm.as_deref(),
+                cohort_scope,
+                claim.community_key_id.as_deref(),
+            ));
+        }
+        let foreign = match (&s_owner, &claim.owner_key_id) {
+            (None, None) => false,
+            (Some(owner), Some(mine)) => owner != mine,
+            (None, Some(mine)) => {
+                // Adopt. The predicate makes two adopters resolve to one.
+                let n = tx
+                    .execute(
+                        "UPDATE cirislens.federation_streams SET owner_key_id = $2 \
+                          WHERE stream_id = $1 AND owner_key_id IS NULL",
+                        &[&stream_id, mine],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "put_blob_chunk stream adopt: {e}"
+                        ))
+                    })?;
+                n == 0
+            }
+            (Some(_), None) => true,
+        };
+        if foreign {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::blobs::stream_foreign_refusal(
+                stream_id,
+                &s_cohort,
+                s_comm.as_deref(),
+            ));
+        }
+
+        // 1. The chunk's bytes land as a normal federation_blobs row.
+        //    Content-addressed + idempotent: a re-PUT of identical bytes
+        //    is a no-op (ON CONFLICT DO NOTHING), exactly like
+        //    store_blob_local / the put_blob_chunks chunk rows. Carries
+        //    the cohort and the tier the door resolved (§11.1 / §12.1).
+        let sha_vec = row.sha256.to_vec();
+        let media_type_null: Option<String> = None;
+        // #846 (§5) — the chunk's author is the claimed owner.
+        tx.execute(
+            "INSERT INTO cirislens.federation_blobs (\
+                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                cohort_scope, crypto_tier, author_key_id\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (sha256) DO NOTHING",
+            &[
+                &sha_vec,
+                &row.storage_kind,
+                &row.bytes_inline,
+                &row.external_ref,
+                &row.size_bytes,
+                &media_type_null,
+                &scope,
+                &tier,
+                &claim.owner_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk blob insert: {e}"))
+        })?;
+
+        // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the STREAM
+        //    nonce's per-epoch counter_be must never wrap. A given
+        //    (stream_id, epoch) holds at most MAX_CHUNKS_PER_EPOCH chunks;
+        //    past that the producer MUST roll the epoch. Checked in-tx so
+        //    a concurrent append can't slip past the cap.
+        let epoch_chunk_count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM cirislens.federation_stream_chunks \
+                  WHERE stream_id = $1 AND epoch = $2",
+                &[&stream_id, &epoch_i64],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk epoch count: {e}"))
+            })?
+            .get(0);
+        if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at \
+                 MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch (STREAM-nonce counter \
+                 exhaustion, CEG §10.5.3)",
+                crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
+            )));
+        }
+
+        // 3. The stream-index row. The (stream_id, seq) PK enforces
+        //    monotonicity — a re-used seq is a PK conflict, mapped to
+        //    InvalidArgument (NOT idempotent: the append-only rule).
+        //    V142: the chunk's PLAINTEXT size beside its stored size.
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_stream_chunks (\
+                    stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (stream_id, seq) DO NOTHING",
+                &[
+                    &stream_id,
+                    &seq_i64,
+                    &sha_vec,
+                    &epoch_i64,
+                    &row.size_bytes,
+                    &plaintext_i64,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk index insert: {e}"))
+            })?;
+        if inserted == 0 {
+            // PK conflict on (stream_id, seq) — monotonicity violation.
+            // Roll back the whole txn (the blob row too, if it was new).
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream {stream_id} seq {seq} already exists"
+            )));
+        }
+
+        // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
+        //    conditional on the epoch still being the community's current
+        //    enabled one. Refused ⇒ the whole append rolls back.
+        if let Some(b) = &binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            // #846 (§3) — an ADOPT records the binding as the author's fact,
+            // with no key-state precondition; a WRITE binds the current
+            // enabled epoch (I17).
+            let bind_sql = if bind_as_declared {
+                "INSERT INTO cirislens.federation_community_blob_epoch \
+                    (at_rest_sha256, community_key_id, epoch) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING"
+            } else {
+                "INSERT INTO cirislens.federation_community_blob_epoch \
+                    (at_rest_sha256, community_key_id, epoch) \
+                 SELECT $1, $2, $3 \
+                  WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                                 WHERE community_key_id = $2 AND epoch = $3 \
+                                   AND key_state = 'enabled') \
+                    AND $3 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                                        WHERE community_key_id = $2), 0) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING"
+            };
+            let n = tx
+                .execute(bind_sql, &[&sha_vec, &b.community_key_id, &ep])
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind: {e}"))
+                })?;
+            let already_row = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
+                                      AND epoch = $3) AS b",
+                    &[&sha_vec, &b.community_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind check: {e}"))
+                })?;
+            let already: bool =
+                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
+            if n == 0 && !already {
+                let _ = tx.rollback().await;
+                return Err(crate::federation::BlobError::EpochNotCurrent {
+                    community_key_id: b.community_key_id.clone(),
+                    epoch: b.epoch,
+                });
+            }
+        }
+
+        tx.commit().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
+        })?;
+        Ok(row.sha256)
+    }
+
     /// v3.4.0 (CIRISPersist#123) — fetch the next `limit` eviction
     /// candidates ordered ASC by the full decay-weighted score
     /// `(access_count + 1) * exp(-ln(2) * Δt_secs / half_life_secs)`.
@@ -16240,7 +16536,8 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
         let rows = client
             .query(
-                "SELECT sha256, size_bytes, access_count, last_accessed_at, media_type \
+                "SELECT sha256, size_bytes, access_count, last_accessed_at, media_type, \
+                        author_key_id \
                  FROM cirislens.federation_blobs \
                  ORDER BY \
                    (access_count + 1)::float8 * \
@@ -16272,15 +16569,16 @@ impl PostgresBackend {
                 row.safe_get_with("last_accessed_at", crate::federation::BlobError::Backend)?;
             let media_type: Option<String> =
                 row.safe_get_with("media_type", crate::federation::BlobError::Backend)?;
+            let author_key_id: Option<String> =
+                row.safe_get_with("author_key_id", crate::federation::BlobError::Backend)?;
             out.push(crate::federation::EvictionCandidate {
                 sha256: sha,
                 size_bytes: size_bytes.max(0) as u64,
                 access_count: access_count.max(0) as u64,
                 last_accessed_at,
-                // v6.8.0 (#149): provenance resolved Engine-side from
-                // the signer's holds_bytes index (no attesting_key_id
-                // column on federation_blobs).
-                attesting_key_id: None,
+                // #846 (§5): provenance is the ROW's author (V144),
+                // classified Engine-side by `is_proxy_content`.
+                author_key_id,
                 // v13.0.0 (§Q B5, #370): the corpus-class token the
                 // Engine matches against the installed pinned_class set.
                 media_type,
@@ -25183,6 +25481,87 @@ mod tests {
         crate::federation::at_rest_cascade::blob_invariants::exercise_i54_the_cascade_result_partitions_the_roster(&backend, &tag).await;
     }
 
+    /// BLOB_REPLICATION.md §7 I47 — Stop pressure refuses relay content, never local or family — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i47_pressure_refuses_proxy_never_local_or_family_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i47_pressure_refuses_proxy_never_local_or_family(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I48 — never adopts non-party content, whatever the serve standing — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i48_never_adopts_non_party_content_whatever_the_serve_standing_postgres(
+    ) {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i48_never_adopts_non_party_content_whatever_the_serve_standing(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I49 — an adopted blob classifies proxy; a NULL author classifies proxy — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i49_an_adopted_blob_classifies_proxy_and_a_null_author_is_proxy_postgres(
+    ) {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i49_an_adopted_blob_classifies_proxy_and_a_null_author_is_proxy(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I50 — an adopted stream keeps its author as owner — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i50_an_adopted_stream_keeps_its_author_as_owner_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i50_an_adopted_stream_keeps_its_author_as_owner(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I51 — adopt needs no key state; reads dispatch on grants — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i51_adopt_needs_no_key_state_and_reads_dispatch_on_grants_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i51_adopt_needs_no_key_state_and_reads_dispatch_on_grants(&backend, &tag).await;
+    }
+
+    /// BLOB_REPLICATION.md §7 I52 — Announce emits the holder claim; self/family never announce — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i52_announce_emits_the_holder_claim_and_self_family_never_announce_postgres(
+    ) {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg{}", uuid_like());
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i52_announce_emits_the_holder_claim_and_self_family_never_announce(&backend, &tag).await;
+    }
+
     /// §11.10 I41 — see `chunk_dag_cascade::invariants`.
     #[tokio::test]
     async fn blob_invariant_i41_a_stream_belongs_to_its_first_append_postgres() {
@@ -25244,7 +25623,7 @@ mod tests {
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let node_derived = signer.derived_key_id();
         // Seed: one sealed object at epoch 0, then rotate so epoch 0 is past.
-        let sealed = encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None)
+        let sealed = encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None, None)
             .await
             .unwrap();
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
@@ -30004,10 +30383,17 @@ mod tests {
             .unwrap();
 
         let plaintext = b"a private note, scoped to self (pg)";
-        let result =
-            encrypt_and_cascade(&backend, SELF, &root, plaintext, Some("text/plain"), None)
-                .await
-                .unwrap();
+        let result = encrypt_and_cascade(
+            &backend,
+            SELF,
+            &root,
+            plaintext,
+            Some("text/plain"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.granted, vec![keyed.clone()]);
         assert_eq!(result.excluded, vec![bare.clone()]);
 
@@ -30163,7 +30549,7 @@ mod tests {
             .await
             .unwrap();
         let plaintext = b"family blob written before bob/carol registered devices (pg)";
-        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None, None)
+        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None, None, None)
             .await
             .unwrap();
         assert_eq!(result.granted, vec![alice_p.clone()]);
@@ -30351,10 +30737,15 @@ mod tests {
             .put_community(community(&comm, vec![&alice, &bob], None))
             .await
             .unwrap();
-        let r0 =
-            encrypt_and_cascade_community(&backend, &comm, b"minutes (pg)", Some("text/plain"))
-                .await
-                .unwrap();
+        let r0 = encrypt_and_cascade_community(
+            &backend,
+            &comm,
+            b"minutes (pg)",
+            Some("text/plain"),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(r0.epoch, 0);
         assert_eq!(r0.granted, vec![alice_p.clone()]);
         assert_eq!(r0.excluded, vec![bob_p.clone()]);
@@ -30395,7 +30786,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            encrypt_and_cascade_community(&backend, &infra, b"root", None)
+            encrypt_and_cascade_community(&backend, &infra, b"root", None, None)
                 .await
                 .unwrap_err(),
             crate::federation::BlobError::InvalidArgument(_)
@@ -30418,9 +30809,10 @@ mod tests {
             ))
             .await
             .unwrap();
-        let fake = encrypt_and_cascade_community(&backend, &fakeinfra, b"not canonical", None)
-            .await
-            .expect("unauthorized infra label must NOT opt out of the DEK cascade");
+        let fake =
+            encrypt_and_cascade_community(&backend, &fakeinfra, b"not canonical", None, None)
+                .await
+                .expect("unauthorized infra label must NOT opt out of the DEK cascade");
         assert_eq!(fake.epoch, 0);
         assert_eq!(fake.granted, vec![alice_p.clone()]);
         assert!(backend
@@ -30449,7 +30841,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(backend.community_dek_current_epoch(&comm).await.unwrap(), 1);
-        let r1 = encrypt_and_cascade_community(&backend, &comm, b"post-removal (pg)", None)
+        let r1 = encrypt_and_cascade_community(&backend, &comm, b"post-removal (pg)", None, None)
             .await
             .unwrap();
         assert_eq!(r1.epoch, 1);
@@ -30836,9 +31228,10 @@ mod tests {
             .await
             .unwrap();
 
-        let blob1 = encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None, None)
-            .await
-            .unwrap();
+        let blob1 =
+            encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None, None, None)
+                .await
+                .unwrap();
         assert_eq!(blob1.granted, vec![alice_p.clone()]);
 
         backend
@@ -30885,9 +31278,10 @@ mod tests {
         assert!(looked.members.iter().any(|m| m.key_id == bob));
 
         // Forward path: a NEW write reaches BOTH alice + bob.
-        let blob2 = encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None, None)
-            .await
-            .unwrap();
+        let blob2 =
+            encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None, None, None)
+                .await
+                .unwrap();
         let mut granted = blob2.granted.clone();
         granted.sort();
         let mut want = vec![alice_p.clone(), bob_p.clone()];
@@ -33535,6 +33929,7 @@ mod tests {
                 crate::federation::StorageFloor::resolved(
                     crate::federation::types::cohort_scope::CryptoTier::Plaintext,
                 ),
+                None,
             )
             .await
             .expect("store_blob_local");

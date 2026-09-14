@@ -1105,3 +1105,108 @@ def test_put_blob_scoped_reports_the_roster_partition_843() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_would_hold_adopt_and_hold_breadth_846() -> None:
+    """#846 (`BLOB_REPLICATION.md` §4 / §6) — the three doors are reachable
+    from Python and keep their ``BlobError`` class. ``would_hold_json``
+    answers ``hold: false`` with ``blob_not_party_to`` for a community this
+    node is not a member of and ``hold: true`` for the commons (everyone is
+    party to it); ``adopt_sealed_blob_json`` refuses bytes without the
+    envelope shape and a bad disposition before anything is written;
+    ``hold_breadth()`` is ``on_demand`` for a node nobody conferred
+    ``infra:serve`` on. Skips on a non-sqlite wheel."""
+    import base64
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        eng.register_self_federation_key("agent", "ref", None, None, None)
+        peer = "peer-" + secrets.token_hex(4)
+
+        # Not party to a community we are not a member of: the answer, not an error.
+        theirs = json.loads(
+            eng.would_hold_json(
+                json.dumps(
+                    {
+                        "author_key_id": peer,
+                        "cohort_scope": "community",
+                        "community_key_id": "comm-" + secrets.token_hex(4),
+                        "epoch": 1,
+                        "tier": "community_dek",
+                    }
+                )
+            )
+        )
+        assert theirs["hold"] is False
+        assert theirs["kind"] == "blob_not_party_to"
+
+        # The commons is everyone's: held under normal pressure.
+        commons = json.loads(
+            eng.would_hold_json(
+                json.dumps({"author_key_id": peer, "cohort_scope": "federation", "tier": "plaintext"})
+            )
+        )
+        assert commons == {"hold": True}
+
+        # Adopt: bytes without the envelope shape are an input error, class kept.
+        with pytest.raises(ValueError) as ei:
+            eng.adopt_sealed_blob_json(
+                json.dumps(
+                    {
+                        "envelope_b64": base64.b64encode(b"not an envelope").decode(),
+                        "author_key_id": peer,
+                        "cohort_scope": "federation",
+                        "tier": "plaintext",
+                        "disposition": "local_only",
+                    }
+                )
+            )
+        assert "blob_invalid_argument" in str(ei.value)
+
+        # A bad disposition is refused before the door is reached.
+        with pytest.raises(ValueError) as ei:
+            eng.adopt_sealed_blob_json(
+                json.dumps(
+                    {
+                        "envelope_b64": base64.b64encode(b"x").decode(),
+                        "author_key_id": peer,
+                        "cohort_scope": "community",
+                        "tier": "community_dek",
+                        "disposition": "maybe",
+                    }
+                )
+            )
+        assert "disposition" in str(ei.value)
+
+        # Serve standing governs breadth, and nobody conferred any.
+        assert eng.hold_breadth() == "on_demand"
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

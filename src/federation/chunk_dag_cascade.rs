@@ -1334,7 +1334,7 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"segment 0", None)
+        let sealed = encrypt_and_cascade_community(backend, &comm, b"segment 0", None, None)
             .await
             .unwrap();
         let Some(BlobBody::Inline(sealed_bytes)) =
@@ -1816,7 +1816,7 @@ pub mod invariants {
         {
             use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
             let whole = segment(9, 4000);
-            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None, None)
+            let r = encrypt_and_cascade(backend, SELF, &owner, &whole, None, None, None)
                 .await
                 .unwrap();
             assert_eq!(

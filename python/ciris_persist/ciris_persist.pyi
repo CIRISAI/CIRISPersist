@@ -591,6 +591,9 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
+    def adopt_sealed_blob_json(self, payload_json: str) -> str:
+        """(derived) deontic — #846 (BLOB_REPLICATION.md §6.1) — adopt a sealed blob received from a peer: store the AtRestEnvelope verbatim at the tier and under the (community,..."""
+
     def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
         """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
 
@@ -1578,6 +1581,9 @@ class Engine:
 
     def withdraw_canonical_role(self, key_id: str, proposal_digest: str) -> None:
         """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — withdraw the canonical role from key_id (the DESTRUCTIVE Trust Root op). proposal_digest..."""
+
+    def would_hold_json(self, payload_json: str) -> str:
+        """(derived) deontic — #846 (BLOB_REPLICATION.md §6.3) — the WILL decision as a door, asked before a fetch: would this node hold content with this provenance, now? Writes..."""
 
     def wrap_dek_for_recipient_v2_b64(self, recipient_x25519_pub_b64: str, recipient_ml_kem_pub_b64: str, dek_b64: str) -> str:
         """(derived) deontic — v4.x (CIRISPersist#142 Cut C3b, CEG §10.5.3) — wrap a 32-byte DEK under wrap_algorithm: v2 (X25519 + ML-KEM-768 hybrid PQC), the mandatory wrap for..."""
@@ -3550,6 +3556,9 @@ class Engine:
 
     def evict_fountain_content_to_tier(self, content_id: str, corpus_kind: str, tier: str) -> int:
         """(derived) procedural — v8.0.0 (CIRISPersist#227) — evict a content unit's symbols to a named fountain tier ("full" | "t2" | "t3" | "t4" | "t5"), dropping by retention_pri..."""
+
+    def hold_breadth(self) -> str:
+        """(derived) procedural — #846 (BLOB_REPLICATION.md §4) — how widely this node holds within the cohorts it is party to: "for_cohort" when it stands at ServeTier::MeshServer..."""
 
     def lock_get(self, lock_key: str) -> str | None:
         """v1.5.15 — Read current lock state. Returns the

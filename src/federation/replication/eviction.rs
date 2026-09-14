@@ -91,15 +91,16 @@ pub struct EvictionCandidate {
     /// Wall-clock of the most recent read hit (or first_seen_at for
     /// never-read rows).
     pub last_accessed_at: chrono::DateTime<chrono::Utc>,
-    /// v6.8.0 (CIRISPersist#149) — the `attesting_key_id` of the
-    /// most-recent `holds_bytes` attestation this engine emitted for
-    /// the SHA, when known. Used by the disk-pressure
-    /// force-evict-proxy-first hint to classify a candidate as
-    /// local/family (protected) vs federation/proxy (evict first).
-    /// `None` ⇒ provenance unknown; treated as proxy under pressure
-    /// (fail-toward-eviction is safe: an unattributed blob we can
-    /// re-fetch is the right thing to shed first).
-    pub attesting_key_id: Option<String>,
+    /// #846 (`BLOB_REPLICATION.md` §5, I49) — the row's `author_key_id`:
+    /// the attesting key of the attestation the blob is a projection of.
+    /// The disk-pressure force-evict-proxy-first hint classifies on it
+    /// through [`is_proxy_content`](crate::federation::replication::hold::is_proxy_content):
+    /// local/family author ⇒ protected, anything else ⇒ proxy (evict
+    /// first). `None` ⇒ unknown, treated as proxy (fail-toward-eviction is
+    /// safe: an unattributed blob we can re-fetch is the right thing to
+    /// shed first). Replaces the v6.8.0 `attesting_key_id`, which classified
+    /// on the HOLDER — always this node for anything it adopted.
+    pub author_key_id: Option<String>,
     /// v13.0.0 (§Q B5 / CIRISPersist#370) — the row's
     /// `federation_blobs.media_type`, the substrate's per-blob corpus-class
     /// token. The sweep matches it against the installed

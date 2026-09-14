@@ -89,6 +89,13 @@ mod tests {
             // chunk is bound to where it was written, this is the only door
             // that opens one outside its manifest.
             ("read_stream_chunk_as", "read_stream_chunk_as"),
+            // #846 (BLOB_REPLICATION.md §6) — the adopt doors and the WILL
+            // decision: a node that cannot store what it pulls has no
+            // holder plane, and a scheduler that cannot ask before fetching
+            // fetches blind.
+            ("adopt_sealed_blob(", "adopt_sealed_blob"),
+            ("would_hold(", "would_hold"),
+            ("hold_breadth(", "hold_breadth"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {
@@ -130,6 +137,10 @@ mod tests {
             "seal_stream_scoped",
             "read_any_range_for_viewer",
             ".stream_chunks(",
+            // #846
+            ".adopt_sealed_blob(",
+            ".would_hold(",
+            ".hold_breadth(",
         ];
         // Split the FFI file into `fn` bodies and inspect each one that
         // touches a cascade symbol.
@@ -509,6 +520,395 @@ mod tests {
             missing.is_empty(),
             "I39: surfaces without the #831 AAD hook (#831 becomes a hunt, not a flip):\n{}",
             missing.join("\n")
+        );
+    }
+
+    // ── I45 ──────────────────────────────────────────────────────────────
+    /// `BLOB_REPLICATION.md` §7 — **the adopt path never decrypts.** The
+    /// receiver-side twin of I36: `adopt_sealed_blob`, `adopt_sealed_chunk`,
+    /// the Engine facades and both backends' adopt floors hand the envelope
+    /// to the row verbatim. A receiver that peeks at what it relays would be
+    /// a decrypt with nothing red, so the bodies are read from disk.
+    #[test]
+    fn i45_the_adopt_path_never_decrypts() {
+        let decrypting = [
+            "open(",
+            "open_aad(",
+            "unwrap_dek",
+            "read_any",
+            "read_for_viewer",
+            "read_for_community_viewer",
+            "aes_gcm::decrypt",
+        ];
+        let mut offenders = Vec::new();
+        let mut inspected = 0usize;
+        let mut check = |rel: &str, fn_prefix: &str, end_marker: &str| {
+            let text = production_only(&src(rel));
+            let mut i = 0;
+            while let Some(off) = text[i..].find(fn_prefix) {
+                let start = i + off;
+                let end = text[start..]
+                    .find(end_marker)
+                    .map(|e| start + e)
+                    .unwrap_or(text.len());
+                let body = &text[start..end];
+                inspected += 1;
+                for d in decrypting {
+                    if body.contains(d) {
+                        offenders.push(format!("  {rel}: `{fn_prefix}` contains `{d}`"));
+                    }
+                }
+                i = end.max(start + 1);
+            }
+        };
+        // The orchestration (module-level fns end at `\n}\n`).
+        check(
+            "src/federation/adopt_cascade.rs",
+            "pub async fn adopt_sealed_blob<",
+            "\n}\n",
+        );
+        check(
+            "src/federation/adopt_cascade.rs",
+            "pub async fn adopt_sealed_chunk<",
+            "\n}\n",
+        );
+        check(
+            "src/federation/adopt_cascade.rs",
+            "fn resolve_adopt(",
+            "\n}\n",
+        );
+        // The Engine facades and the floors (impl-level fns end at `\n    }\n`).
+        check(
+            "src/engine.rs",
+            "pub async fn adopt_sealed_blob(",
+            "\n    }\n",
+        );
+        check(
+            "src/engine.rs",
+            "pub async fn adopt_sealed_chunk(",
+            "\n    }\n",
+        );
+        for rel in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+            check(rel, "async fn adopt_sealed_blob_at(", "\n    }\n");
+            check(rel, "async fn adopt_sealed_chunk_at(", "\n    }\n");
+            check(rel, "async fn put_blob_chunk_floor(", "\n    }\n");
+        }
+        assert_eq!(
+            inspected, 11,
+            "I45: expected 3 orchestration + 2 Engine + 6 floor bodies, inspected {inspected} — \
+             a door this gate cannot find is a door it cannot hold"
+        );
+        assert!(
+            offenders.is_empty(),
+            "I45: the adopt path grew a decrypt — a receiver would peek at what it relays:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── I46 ──────────────────────────────────────────────────────────────
+    /// `BLOB_REPLICATION.md` §7 — **the WILL decision runs on every
+    /// consumer-reachable accept door and exists in exactly one place.**
+    /// `adopt_sealed_blob`, `adopt_sealed_chunk` and `put_blob_signing` all
+    /// call `would_hold`; no production site outside `hold.rs` (the
+    /// decision) and `disk_pressure.rs` (the snapshot's producer) reads
+    /// `refuses_proxy_writes` — a second copy of the accept rule is the
+    /// door that accepts under `Stop`.
+    #[test]
+    fn i46_the_will_decision_has_one_home_and_every_accept_door_runs_it() {
+        let fn_body = |rel: &str, sig: &str, end_marker: &str| -> String {
+            let text = production_only(&src(rel));
+            let at = text
+                .find(sig)
+                .unwrap_or_else(|| panic!("I46: `{sig}` not found in {rel}"));
+            let end = text[at..]
+                .find(end_marker)
+                .map(|e| at + e)
+                .unwrap_or(text.len());
+            text[at..end].to_owned()
+        };
+        let mut missing = Vec::new();
+        for (rel, sig, end, call) in [
+            (
+                "src/federation/adopt_cascade.rs",
+                "pub async fn adopt_sealed_blob<",
+                "\n}\n",
+                "would_hold(",
+            ),
+            (
+                "src/federation/adopt_cascade.rs",
+                "pub async fn adopt_sealed_chunk<",
+                "\n}\n",
+                "would_hold(",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn put_blob_signing(",
+                "\n    }\n",
+                ".would_hold(",
+            ),
+        ] {
+            if !fn_body(rel, sig, end).contains(call) {
+                missing.push(format!("  {rel}: `{sig}` does not call `{call}`"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "I46: accept doors that do not run the WILL decision:\n{}",
+            missing.join("\n")
+        );
+        let allowed = [
+            "src/federation/replication/hold.rs",
+            "src/federation/replication/disk_pressure.rs",
+            // this file: its own vocabulary
+            "src/federation/blob_surface_gates.rs",
+        ];
+        let mut offenders = Vec::new();
+        for entry in walkdir("src") {
+            let rel = entry
+                .strip_prefix(&format!("{}/", env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or(&entry)
+                .to_owned();
+            if !rel.ends_with(".rs") || allowed.contains(&rel.as_str()) {
+                continue;
+            }
+            let text = production_only(&std::fs::read_to_string(&entry).unwrap());
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // A REPORT of the snapshot (the Python `disk_pressure_state`
+                // dict) is not a decision; a read in a condition is.
+                if t.starts_with("//") || line.contains("set_item(") {
+                    continue;
+                }
+                if line.contains("refuses_proxy_writes") {
+                    offenders.push(format!("  {rel}:{} {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "I46: production sites reading `refuses_proxy_writes` outside the WILL decision — \
+             each is a second accept rule that will drift from the first:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── I48 (the correction) ─────────────────────────────────────────────
+    /// **Serve standing never gates ACCEPT.** Role governs the BREADTH of
+    /// holding (`hold_breadth`), not permission: a node that is party to
+    /// content holds it whatever its serve tier, and a node that is not
+    /// party to it refuses whatever its serve tier. `would_hold` and the
+    /// adopt path therefore name no serve tier.
+    #[test]
+    fn i48_would_hold_and_the_adopt_path_consult_no_serve_tier() {
+        let serve = ["resolve_serve_tier", "ServeTier"];
+        let mut offenders = Vec::new();
+        for (rel, sig, end) in [
+            (
+                "src/federation/replication/hold.rs",
+                "pub async fn would_hold<",
+                "\n}\n",
+            ),
+            (
+                "src/federation/replication/hold.rs",
+                "pub async fn is_audience<",
+                "\n}\n",
+            ),
+            (
+                "src/federation/adopt_cascade.rs",
+                "pub async fn adopt_sealed_blob<",
+                "\n}\n",
+            ),
+            (
+                "src/federation/adopt_cascade.rs",
+                "pub async fn adopt_sealed_chunk<",
+                "\n}\n",
+            ),
+            ("src/engine.rs", "pub async fn would_hold(", "\n    }\n"),
+            (
+                "src/engine.rs",
+                "pub async fn adopt_sealed_blob(",
+                "\n    }\n",
+            ),
+            (
+                "src/engine.rs",
+                "pub async fn adopt_sealed_chunk(",
+                "\n    }\n",
+            ),
+        ] {
+            let text = production_only(&src(rel));
+            let at = text
+                .find(sig)
+                .unwrap_or_else(|| panic!("I48: `{sig}` not found in {rel}"));
+            let stop = text[at..].find(end).map(|e| at + e).unwrap_or(text.len());
+            let body = &text[at..stop];
+            for s in serve {
+                if body.contains(s) {
+                    offenders.push(format!("  {rel}: `{sig}` names `{s}`"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "I48: the accept decision consults serve standing — a role would then gate what a \
+             party-to node may hold, or admit what a non-party node may not:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── I49 ──────────────────────────────────────────────────────────────
+    /// `BLOB_REPLICATION.md` §5 — **`is_proxy_content` is the one
+    /// classification.** The force-evict sweep, `serve_blob_to_peer` and
+    /// `would_hold` call it, and no production site outside `hold.rs` runs
+    /// the local-or-family predicate for a proxy decision of its own.
+    #[test]
+    fn i49_is_proxy_content_is_the_one_classification() {
+        let engine = production_only(&src("src/engine.rs"));
+        let hold = production_only(&src("src/federation/replication/hold.rs"));
+        let body = |text: &str, sig: &str, end: &str| -> String {
+            let at = text
+                .find(sig)
+                .unwrap_or_else(|| panic!("I49: `{sig}` not found"));
+            let stop = text[at..].find(end).map(|e| at + e).unwrap_or(text.len());
+            text[at..stop].to_owned()
+        };
+        let mut missing = Vec::new();
+        for (name, b) in [
+            (
+                "Engine::sweep_evictions_once_inner",
+                body(&engine, "async fn sweep_evictions_once_inner(", "\n    }\n"),
+            ),
+            (
+                "Engine::serve_blob_to_peer",
+                body(&engine, "pub async fn serve_blob_to_peer(", "\n    }\n"),
+            ),
+            (
+                "hold::would_hold",
+                body(&hold, "pub async fn would_hold<", "\n}\n"),
+            ),
+        ] {
+            if !b.contains("is_proxy_content(") {
+                missing.push(format!("  {name} does not call is_proxy_content"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "I49: proxy decisions not made through the one predicate:\n{}",
+            missing.join("\n")
+        );
+        // No production site outside the decision module runs the predicate
+        // for itself. The Engine's `is_local_or_family_key` and the config's
+        // `is_local_or_family` are definitions; a CALL to either is a second
+        // classification.
+        let mut offenders = Vec::new();
+        for entry in walkdir("src") {
+            let rel = entry
+                .strip_prefix(&format!("{}/", env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or(&entry)
+                .to_owned();
+            if !rel.ends_with(".rs")
+                || rel == "src/federation/replication/hold.rs"
+                || rel == "src/federation/replication/disk_pressure.rs"
+                || rel == "src/federation/blob_surface_gates.rs"
+            {
+                continue;
+            }
+            let text = production_only(&std::fs::read_to_string(&entry).unwrap());
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("pub fn ") || t.starts_with("fn ") {
+                    continue;
+                }
+                if line.contains(".is_local_or_family(")
+                    || line.contains(".is_local_or_family_key(")
+                {
+                    offenders.push(format!("  {rel}:{} {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "I49: sites classifying proxy content with their own predicate call — each will \
+             drift from is_proxy_content:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── I53 ──────────────────────────────────────────────────────────────
+    /// `BLOB_REPLICATION.md` §2 / CC 1.13.3 — **persist claims exactly two
+    /// privacy properties** — content-holding confidentiality and
+    /// cohort-scoped visibility — and nothing more. No source or FSD text in
+    /// the blob and replication modules claims unobservability,
+    /// undiscoverability, metadata privacy or traffic-analysis resistance.
+    #[test]
+    fn i53_no_privacy_overclaim_in_the_blob_and_replication_text() {
+        let overclaims = [
+            "unobservable",
+            "undiscoverable",
+            "metadata privacy",
+            "metadata-private",
+            "metadata private",
+            "traffic analysis",
+            "traffic-analysis",
+        ];
+        let mut files: Vec<String> = walkdir("src/federation/replication");
+        files.extend(
+            [
+                "src/federation/blobs.rs",
+                "src/federation/adopt_cascade.rs",
+                "src/federation/at_rest_cascade.rs",
+                "src/federation/community_dek.rs",
+                "src/federation/chunk_dag_cascade.rs",
+                "src/federation/namespace/mod.rs",
+                "src/federation/replication_policy.rs",
+                "FSD/BLOB_REPLICATION.md",
+                "FSD/BLOB_ENCRYPTION_AT_REST.md",
+            ]
+            .into_iter()
+            .map(|r| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join(r)
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+        );
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            scanned += 1;
+            let rel = path
+                .strip_prefix(&format!("{}/", env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or(&path)
+                .to_owned();
+            for (n, line) in text.lines().enumerate() {
+                let lower = line.to_ascii_lowercase();
+                // The gate's own vocabulary, and the FSD sentence that names
+                // the words persist must NOT use, are not claims.
+                // …and one FSD sentence about WRITE ORDERING ("ordering is
+                // unobservable through a door"), which is not a privacy
+                // claim: it says a staged row cannot be seen mid-write.
+                if lower.contains("i53")
+                    || lower.contains("never \"unobservable\"")
+                    || lower.contains("overclaim")
+                    || lower.contains("ordering is unobservable")
+                {
+                    continue;
+                }
+                for w in overclaims {
+                    if lower.contains(w) {
+                        offenders.push(format!("  {rel}:{} `{w}`: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(scanned >= 10, "I53: scanned only {scanned} files");
+        assert!(
+            offenders.is_empty(),
+            "I53: text claiming a privacy property persist does not provide (CC 1.13.3 names \
+             exactly two):\n{}",
+            offenders.join("\n")
         );
     }
 
