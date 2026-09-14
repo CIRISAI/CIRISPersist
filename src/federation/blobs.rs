@@ -2515,6 +2515,9 @@ pub struct PreparedHoldsBytes {
 /// caller's signed components (the `put_blob` door's own steps: rebuild the
 /// envelope from the row identity, verify the caller signed those bytes,
 /// stamp the row hash). Refuses exactly what `put_blob` refuses.
+// The admission check it runs exists only with a backend (a witness module
+// that calls plumbing carries the backend cfg; this helper is that plumbing).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn prepare_holds_bytes_row(
     sha256: &[u8; 32],
     attestation: &PutBlobAttestation,
