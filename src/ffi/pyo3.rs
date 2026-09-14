@@ -12554,10 +12554,12 @@ impl PyEngine {
     ///
     /// `plaintext_b64` is the CLEARTEXT — persist seals it here. Returns the
     /// cascade result as JSON: `at_rest_sha256` (hex), `epoch`, `granted`,
-    /// `excluded`. `excluded` is the fail-secure list — members with no
-    /// valid `encryption_pubkeys` get NO grant, never a plaintext fallback,
-    /// and a caller that ignores this field is ignoring who cannot read what
-    /// it just wrote.
+    /// `excluded`, `roster`, `readable_by_nobody`. `excluded` is the
+    /// fail-secure list — occurrences with no valid `encryption_pubkeys` get
+    /// NO grant, never a plaintext fallback. #843: `roster` partitions the
+    /// community's MEMBERS (`granted` with their occurrences / `excluded` /
+    /// `absent` — no active occurrence at all), and `readable_by_nobody` is
+    /// the one field to check: true iff no member holds a grant.
     #[pyo3(signature = (community_key_id, plaintext_b64, media_type=None))]
     fn put_blob_encrypted_community(
         &self,
@@ -12609,11 +12611,14 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = res.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(res.at_rest_sha256),
                     "epoch": res.epoch,
                     "granted": res.granted,
                     "excluded": res.excluded,
+                    "roster": res.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -12629,8 +12634,12 @@ impl PyEngine {
     ///
     /// Returns JSON: `at_rest_sha256` (hex — of the CIPHERTEXT for an
     /// encrypted tier), `tier`, `epoch` (community only), `granted`,
-    /// `excluded`. **Read `excluded`**: members without valid
-    /// `encryption_pubkeys` get NO grant, never a plaintext fallback.
+    /// `excluded`, `roster`, `readable_by_nobody`. **Read
+    /// `readable_by_nobody`** (#843): true iff no roster member holds a
+    /// grant — including when the author has no occurrence to name.
+    /// `excluded` lists occurrences without valid `encryption_pubkeys` (NO
+    /// grant, never a plaintext fallback); `roster` partitions the MEMBERS
+    /// into `granted` (with their occurrences) / `excluded` / `absent`.
     ///
     /// `aad_b64` (#831, §11.2 (7)) — base64 of caller-supplied associated
     /// data, bound into the seal and NEVER stored; `read_blob_as` must be
@@ -12709,12 +12718,15 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(r.at_rest_sha256),
                     "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "granted": r.granted,
                     "excluded": r.excluded,
+                    "roster": r.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13048,8 +13060,10 @@ impl PyEngine {
     /// epoch binding, reported as `epoch` in the result.
     ///
     /// Returns JSON: `chunk_sha256` (hex — of the CIPHERTEXT at a sealed
-    /// tier), `tier`, `epoch` (community only), `granted`, `excluded`.
-    /// `aad_b64` (#831): the data the content was sealed under, if any.
+    /// tier), `tier`, `epoch` (community only), `granted`, `excluded`,
+    /// `roster`, `readable_by_nobody` (#843 — the roster partition and the
+    /// one field to check). `aad_b64` (#831): the data the content was
+    /// sealed under, if any.
     #[pyo3(signature = (cohort_scope, stream_id, seq, plaintext_b64, epoch, community_key_id=None, aad_b64=None))]
     #[allow(clippy::too_many_arguments)]
     fn put_blob_chunk_scoped(
@@ -13125,12 +13139,15 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "chunk_sha256": hex::encode(r.chunk_sha256),
                     "tier": r.tier.as_str(),
                     "epoch": r.epoch,
                     "granted": r.granted,
                     "excluded": r.excluded,
+                    "roster": r.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13145,7 +13162,9 @@ impl PyEngine {
     ///
     /// Returns JSON: `manifest_sha256` (hex — the DAG's content address),
     /// `tier`, `epoch`, `chunk_count`, `total_size` (plaintext), `granted`,
-    /// `excluded`. `aad_b64` (#831) binds the manifest's seal.
+    /// `excluded`, `roster`, `readable_by_nobody` (#843 — the roster
+    /// partition and the one field to check). `aad_b64` (#831) binds the
+    /// manifest's seal.
     #[pyo3(signature = (cohort_scope, stream_id, community_key_id=None, media_type=None, aad_b64=None))]
     fn seal_stream_scoped(
         &self,
@@ -13210,6 +13229,7 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "manifest_sha256": hex::encode(r.manifest_sha256),
                     "tier": r.tier.as_str(),
@@ -13218,6 +13238,8 @@ impl PyEngine {
                     "total_size": r.total_size,
                     "granted": r.granted,
                     "excluded": r.excluded,
+                    "roster": r.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })
@@ -13466,10 +13488,13 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                let readable_by_nobody = res.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(res.at_rest_sha256),
                     "granted": res.granted,
                     "excluded": res.excluded,
+                    "roster": res.roster,
+                    "readable_by_nobody": readable_by_nobody,
                 })
                 .to_string())
             })

@@ -5,6 +5,89 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — #843]
+
+**The cascade result partitions the ROSTER, and `readable_by_nobody` is the
+one field to check.** `FSD/BLOB_ENCRYPTION_AT_REST.md` §12.11, invariant
+I54. Additive on every surface: no existing key or field changes meaning.
+
+### The defect (CIRISPersist#843, from CIRISServer#590 / CIRISEdge#599)
+
+Every cascade enumerated its cohort per OCCURRENCE and partitioned that
+list into `granted` / `excluded`. A roster member with no active occurrence
+contributed nothing and appeared in neither. A pair community's write
+reported `granted=[]`, `excluded=["bob-v1-phone"]` — one unrelated device —
+while the author, alice, a founder and the authenticated identity, was
+named nowhere, because she had no occurrence. The one field a caller reads
+to answer "who cannot read what I just wrote" answered *bob's phone* about
+content NOBODY could read, the sender included. The two states have
+different remedies, and the API rendered the second as a milder version of
+the first.
+
+### Added
+- **`RosterPartition { granted: Vec<MemberGrant>, excluded, absent }`** as
+  `roster` on every cascade result — `CascadeResult`,
+  `CommunityCascadeResult`, `PutBlobScopedResult`, `PutChunkScopedResult`,
+  `SealStreamScopedResult`. Every ACTIVE member of the cohort (roster minus
+  effective removals) is in exactly one list: `granted` with the
+  occurrences the grant reached; `excluded` — occurrences present, none
+  usable; `absent` — NO active occurrence at all (NEW: nothing to name, no
+  key to register). The per-occurrence `granted` / `excluded` keep their
+  meaning; a granted member's bare device is still in the flat `excluded`.
+- **`readable_by_nobody()`** on each result: a roster fact — true iff no
+  member holds a grant — and `false` at the plaintext tier. It is true when
+  nothing was enumerated and nothing was excluded, which is where an answer
+  derived from the occurrence list says the opposite.
+- **Python**: `put_blob_scoped`, `put_blob_encrypted_community`,
+  `put_blob_encrypted_self_family`, `put_blob_chunk_scoped`,
+  `seal_stream_scoped` JSON gain `roster` (`{granted: [{member_key_id,
+  occurrence_key_ids}], excluded, absent}`) and `readable_by_nobody`.
+  The from-disk gate I54 (`blob_surface_gates.rs`) reds if any of the five
+  drops them.
+- Fixture helpers `seed_member_shaped` / `seed_community_shaped` /
+  `seed_family_shaped` (`community_dek::lifecycle_support`) take the roster
+  member by member, so an EMPTY occurrence list — the #843 shape — is
+  expressible.
+
+### Changed
+- **One partition.** `at_rest_cascade::orchestrate::partition_roster` is
+  pure and shared by the self/family, community and chunk cascades;
+  `resolve_recipients` and `active_member_occurrences` return members WITH
+  their occurrences (crate-private signatures). The community cascade's
+  private copy of `usable_keys` is gone.
+
+### Not changed
+- `hard_case:recipient_excluded` is still per excluded OCCURRENCE; an
+  `absent` member emits no hard case (there is no occurrence to key it on).
+  Recorded in §12.11 as a question for the consumers that surfaced #843.
+
+### Witnesses
+- I54 (`exercise_i54_the_cascade_result_partitions_the_roster`) — written
+  first in a PROBE form (the author NAMED anywhere in the result) and RED on
+  the v44.1.1 tree on sqlite and postgres: `granted=[]
+  excluded=[…bob-phone…]`, alice nowhere. Final form, through
+  `put_blob_scoped` on both backends: the #843 roster; a lone absent member
+  (nothing enumerated); a mixed roster with a REMOVED member (not `absent`
+  — the roster is the active one; named nowhere); the family and self
+  tiers; a commons write (readable by everyone). Through the Engine door
+  (`put_blob_scoped_reports_the_roster_partition_843`, sqlite) and the
+  wheel (`test_put_blob_scoped_reports_the_roster_partition_843`: one
+  identity walks absent → excluded → granted, then reads).
+- Mutation record:
+
+| # | mutation | site | result |
+|---|---|---|---|
+| a | drop the `absent` partition — a member with no occurrence goes nowhere | `partition_roster` | KILLED — unit test, I54 sqlite (I54/1: alice), Engine door |
+| b | derive `readable_by_nobody` from the occurrence list: `granted.is_empty() && !excluded.is_empty()` ("every enumerated occurrence was excluded") | `PutBlobScopedResult::readable_by_nobody` | KILLED — unit test (an empty roster at a sealed tier), I54 (I54/2: the lone member — nothing enumerated, nothing excluded) |
+| b2 | derive it from the granted occurrences alone: `granted.is_empty()` | same | SURVIVED — an equivalent mutant: a granted occurrence always belongs to a roster member, so "no occurrence granted" and "no member granted" coincide by construction on every constructible input. Recorded, not dressed up: the roster's contribution is what it NAMES (a, c, d), not this bit. |
+| c | drop the member-level `excluded` — a bare-only member goes nowhere | `partition_roster` | KILLED — unit test, I54 (I54/1: bob), Engine door |
+| d | re-introduce the original enumeration: skip a member whose occurrence list is empty | `active_member_occurrences` | KILLED — I54 (I54/1: "alice — on the roster, no occurrence — is ABSENT, and named"), Engine door |
+| e | drop the plaintext-tier exception in `readable_by_nobody` | `PutBlobScopedResult::readable_by_nobody` | KILLED — unit test, I54 (I54/5: a commons write) |
+
+Every restore verified by an empty diff. The wheel test was not run under
+mutation; it asserts the same JSON facts and is BELIEVED to red on a, b
+and d.
+
 ## [44.1.1] - 2026-09-11
 
 **A shipped migration's bytes are the contract, comments included.**

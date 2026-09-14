@@ -28964,6 +28964,15 @@ mod tests {
             .await;
     }
 
+    /// §11.10 I54 (#843) — see `at_rest_cascade::blob_invariants`.
+    #[tokio::test]
+    async fn blob_invariant_i54_the_cascade_result_partitions_the_roster_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::at_rest_cascade::blob_invariants::exercise_i54_the_cascade_result_partitions_the_roster(&backend, "sqlite")
+            .await;
+    }
+
     /// §11.10 I41 — see `chunk_dag_cascade::invariants`.
     #[tokio::test]
     async fn blob_invariant_i41_a_stream_belongs_to_its_first_append_sqlite() {

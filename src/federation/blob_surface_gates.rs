@@ -231,6 +231,52 @@ mod tests {
         }
     }
 
+    // ── I54 ──────────────────────────────────────────────────────────────
+    /// §12.11 (#843) — **every Python cascade-result serializer carries the
+    /// roster partition and `readable_by_nobody`.** The Rust structs carry
+    /// them by type; a JSON serializer carries only what it names, and the
+    /// consumer #843 was opened on reads JSON. Same shape as I30: a
+    /// serializer that drops a field is a report over a fact it hides.
+    #[test]
+    fn i54_every_cascade_serializer_carries_the_roster_partition() {
+        let ffi = production_only(&src("src/ffi/pyo3.rs"));
+        let bindings = [
+            "fn put_blob_encrypted_community(",
+            "fn put_blob_scoped(",
+            "fn put_blob_chunk_scoped(",
+            "fn seal_stream_scoped(",
+            "fn put_blob_encrypted_self_family(",
+        ];
+        let keys = [
+            "\"granted\"",
+            "\"excluded\"",
+            "\"roster\"",
+            "\"readable_by_nobody\"",
+        ];
+        let mut missing = Vec::new();
+        for func in bindings {
+            let at = ffi
+                .find(func)
+                .unwrap_or_else(|| panic!("I54: {func} binding"));
+            let end = ffi[at..]
+                .find("\n    }\n")
+                .map(|e| at + e)
+                .unwrap_or(ffi.len());
+            let body = &ffi[at..end];
+            for key in keys {
+                if !body.contains(key) {
+                    missing.push(format!("  {func} lacks {key}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "I54: cascade-result serializers without the roster partition — a Python caller \
+             cannot learn that nobody can read what it just wrote:\n{}",
+            missing.join("\n")
+        );
+    }
+
     #[test]
     fn i14_the_storage_floor_has_no_door() {
         let allowed = [

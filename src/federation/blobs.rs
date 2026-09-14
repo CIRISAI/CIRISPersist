@@ -575,6 +575,52 @@ impl DekKeyState {
     }
 }
 
+/// #843 (`BLOB_ENCRYPTION_AT_REST.md` §12.11, I54) — one roster MEMBER that
+/// holds a grant, with the occurrences the grant reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MemberGrant {
+    /// The member's identity `key_id` — the name on the roster.
+    pub member_key_id: String,
+    /// The member's active occurrences that received a wrap of the DEK.
+    /// Never empty: a member with no granted occurrence is `excluded` or
+    /// `absent`, not here.
+    pub occurrence_key_ids: Vec<String>,
+}
+
+/// #843 (`BLOB_ENCRYPTION_AT_REST.md` §12.11, I54) — **the cascade result
+/// partitions the ROSTER.**
+///
+/// Every active member of the cohort a write fanned out to is in exactly
+/// one of these three lists. The per-occurrence `granted` / `excluded`
+/// lists beside this on each result answer "which DEVICE"; this answers
+/// "which PERSON", and it is the only view that can name a member with
+/// nothing to enumerate — the case CIRISPersist#843 was opened on, where
+/// `excluded` named one unrelated device while nobody, the author
+/// included, could read the content.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RosterPartition {
+    /// Members with at least one granted occurrence.
+    pub granted: Vec<MemberGrant>,
+    /// Members with at least one active occurrence and NO usable one —
+    /// every occurrence lacked valid `encryption_pubkeys`. The remedy is a
+    /// key registration on a device they already have.
+    pub excluded: Vec<String>,
+    /// Members with NO active occurrence at all. Nothing to name, no key
+    /// to register: the identity has no content-KEM presence.
+    pub absent: Vec<String>,
+}
+
+impl RosterPartition {
+    /// True iff NO member holds a grant. A roster fact, not an occurrence
+    /// count: it is true when every member is absent (nothing was
+    /// enumerated, nothing was excluded) exactly as when every enumerated
+    /// occurrence was bare.
+    #[must_use]
+    pub fn readable_by_nobody(&self) -> bool {
+        self.granted.is_empty()
+    }
+}
+
 /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.2) — what
 /// [`Engine::put_blob_scoped`](crate::Engine::put_blob_scoped) returns,
 /// uniform across tiers.
@@ -592,6 +638,21 @@ pub struct PutBlobScopedResult {
     /// `encryption_pubkeys`. Never a plaintext fallback. A caller that
     /// ignores this is ignoring who cannot read what it just wrote.
     pub excluded: Vec<String>,
+    /// #843 (§12.11, I54) — the same fan-out by roster MEMBER. Empty at
+    /// the plaintext tier, where there is no fan-out.
+    pub roster: RosterPartition,
+}
+
+impl PutBlobScopedResult {
+    /// #843 — can NOBODY read what was just written? `false` at the
+    /// plaintext tier (anyone can); otherwise a roster fact — no member
+    /// holds a grant — through [`RosterPartition::readable_by_nobody`].
+    /// **This is the one field to check.**
+    #[must_use]
+    pub fn readable_by_nobody(&self) -> bool {
+        self.tier != crate::federation::types::cohort_scope::CryptoTier::Plaintext
+            && self.roster.readable_by_nobody()
+    }
 }
 
 /// v4.1 (CIRISPersist#142, Cut A) — the result of a
