@@ -485,6 +485,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // literal checksum). No caller input reaches it, and a node with nothing
     // to repair sees a zero-row update. The thing that DOES refuse —
     // refinery's divergence check — runs immediately after it, untouched.
+    // #845 (I55) — the portable-default repair. PLUMBING for the same
+    // reason as its #840 neighbour: no caller input reaches it; it rewrites
+    // schema text by this crate's own two literals and refuses nothing.
+    ("repair_portable_defaults", Class::Plumbing),
     ("repair_v070_checksum", Class::Plumbing),
     ("resolve", Class::Plumbing),
     ("resolve_steward_roster", Class::Gate),

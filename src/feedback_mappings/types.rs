@@ -39,7 +39,7 @@ pub struct FeedbackMapping {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback_type: Option<String>,
     /// Wall-clock time the feedback was recorded. NOT NULL with a
-    /// `NOW()` / `datetime('now', 'subsec')` default so callers
+    /// `NOW()` / portable `strftime` (#845) default so callers
     /// can omit it and get a server-side timestamp.
     pub created_at: DateTime<Utc>,
 }

@@ -118,6 +118,45 @@ pub(crate) fn repair_statement(dialect: Dialect) -> String {
     )
 }
 
+/// #845 (`FSD/MIGRATION_IMMUTABILITY.md` §6) — the default expression twenty-one
+/// shipped sqlite migrations wrote, which SQLite < 3.42 evaluates to NULL.
+#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
+pub(crate) const SQLITE_SUBSEC_DEFAULT: &str = "datetime('now', 'subsec')";
+/// #845 — the portable replacement: byte-identical output
+/// (`YYYY-MM-DD HH:MM:SS.SSS`) on every SQLite this crate has linked.
+#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
+/// #845 — does THIS library evaluate the modifier? `true` means NULL, i.e.
+/// the repair is required rather than a normalisation.
+pub(crate) const SQLITE_SUBSEC_IS_NULL_PROBE: &str = "SELECT datetime('now', 'subsec') IS NULL";
+#[allow(dead_code)] // live under `sqlite`; dead under `postgres` alone — same posture as the V070 constants
+pub(crate) const SQLITE_PORTABLE_DEFAULT: &str = "strftime('%Y-%m-%d %H:%M:%f', 'now')";
+/// #845 — how many times the shipped sqlite migrations (V001–V144) name the
+/// modifier. Pinned so the from-disk gate can tell "a new file added one"
+/// from "the shipped set".
+#[cfg(test)] // pure pin, no backend needed — the five no-backend axes compile tests too
+pub(crate) const SQLITE_SUBSEC_OCCURRENCES_SHIPPED: usize = 44;
+/// #845 — the last migration version that may contain `subsec`.
+#[cfg(test)]
+pub(crate) const SUBSEC_ALLOWED_THROUGH: i32 = 144;
+
+/// #845 — how many live `CREATE TABLE` statements carry the exact obsolete
+/// default. Bind [`SQLITE_SUBSEC_DEFAULT`] as `?1`. The exact expression,
+/// never the substring: a consumer table with a `subsec_note` column must not
+/// count (Codex, #849).
+#[allow(dead_code)]
+pub(crate) const SQLITE_OBSOLETE_DEFAULT_COUNT: &str =
+    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND instr(sql, ?1) > 0";
+
+/// #845 — the live-schema rewrite, `type = 'table'` rows only. Bind
+/// [`SQLITE_SUBSEC_DEFAULT`] as `?1` and [`SQLITE_PORTABLE_DEFAULT`] as `?2`
+/// — bound, never spelled in double quotes, which `SQLITE_DQS=0` parses as
+/// identifiers (Codex, #849). Run under `PRAGMA writable_schema = ON`, then
+/// bump `schema_version` and `integrity_check` (the documented procedure for a
+/// change `ALTER TABLE` cannot express).
+#[allow(dead_code)]
+pub(crate) const SQLITE_PORTABLE_DEFAULT_REWRITE: &str =
+    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE type = 'table' AND instr(sql, ?1) > 0";
+
 /// #840 (I44) — is the schema-history table present? A fresh database has
 /// none, and the repair must be a silent no-op there rather than an error.
 #[allow(dead_code)]
@@ -377,6 +416,119 @@ mod tests {
             assert_eq!(m_canon.version() as i32, V070_VERSION);
             assert_eq!(m_canon.name(), V070_NAME);
         }
+    }
+
+    /// **I56 (#845) — no migration after V144 names `subsec`, and the shipped
+    /// set's count is pinned.** A new file that reintroduces the modifier
+    /// reds here before it reaches a bookworm host.
+    #[test]
+    fn no_migration_after_v144_uses_subsec() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut shipped = 0usize;
+        let mut offenders = Vec::new();
+        for dialect in ["sqlite", "postgres"] {
+            let dir = root.join(dialect).join("lens");
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.extension().is_none_or(|x| x != "sql") {
+                    continue;
+                }
+                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                let version: i32 = stem
+                    .trim_start_matches('V')
+                    .split("__")
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("unparseable migration name {stem}"));
+                let n = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .matches("subsec")
+                    .count();
+                if version <= SUBSEC_ALLOWED_THROUGH {
+                    shipped += n;
+                } else if n > 0 {
+                    offenders.push(format!("{dialect}/{stem}: {n}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "`subsec` reintroduced after V{SUBSEC_ALLOWED_THROUGH} — SQLite < 3.42 (Debian bookworm) \
+             evaluates it to NULL (#845). Use {SQLITE_PORTABLE_DEFAULT:?}. Offenders:\n  {}",
+            offenders.join("\n  ")
+        );
+        assert_eq!(
+            shipped, SQLITE_SUBSEC_OCCURRENCES_SHIPPED,
+            "the shipped set's `subsec` count moved — a shipped migration was edited (#840) or \
+             the pin is stale"
+        );
+    }
+
+    /// **I57 (#845) — the bookworm witness script and the Rust repair carry
+    /// the same two literals**, so what CI proves on 3.40.1 is what the
+    /// crate does.
+    #[test]
+    fn the_bookworm_witness_carries_the_repair_literals() {
+        let script = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("scripts/sqlite_portability_witness.sh"),
+        )
+        .expect("scripts/sqlite_portability_witness.sh");
+        assert!(
+            script.contains(SQLITE_SUBSEC_DEFAULT),
+            "the witness must name the shipped default {SQLITE_SUBSEC_DEFAULT:?}"
+        );
+        assert!(
+            script.contains(SQLITE_PORTABLE_DEFAULT),
+            "the witness must apply the crate's replacement {SQLITE_PORTABLE_DEFAULT:?}"
+        );
+    }
+
+    /// **I58 (#845) — the `subsec` modifier appears in no source file but
+    /// this one.** Nine runtime statements evaluated it directly (the
+    /// community-DEK epoch rotation, maintenance locks, incidents,
+    /// telemetry); on SQLite < 3.42 those wrote NULL into `rotated_at` and
+    /// friends, or failed `NOT NULL`, and the schema repair cannot reach a
+    /// statement. Doc comments are held to it too, so nobody copies the
+    /// old spelling out of one.
+    #[test]
+    fn the_subsec_modifier_appears_in_no_source_but_this_file() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let me = root.join("store/migration_immutability.rs");
+        let mut offenders = Vec::new();
+        for f in files {
+            if f == me {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            for (i, line) in text.lines().enumerate() {
+                if line.contains("'subsec'") {
+                    offenders.push(format!(
+                        "{}:{}",
+                        f.strip_prefix(&root).unwrap().display(),
+                        i + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the `subsec` modifier is NULL on SQLite < 3.42 (#845); use \
+             {SQLITE_PORTABLE_DEFAULT:?}. Found at:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 
     /// The repair names one version, one name and one checksum, and writes

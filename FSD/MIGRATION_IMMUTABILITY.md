@@ -115,3 +115,121 @@ after their first release: postgres `V001__trace_events.sql` (0.1.0 → 0.1.2,
 original was **rejected by postgres** (sqlstate 42P17) so no node can have
 recorded it. Neither is live today. They are pinned at their current bytes,
 which is what any surviving node has, and the gate holds them there from here.
+
+## 6. Schema text a shipped migration cannot change: the portable-default repair (#845)
+
+Thirty-seven `NOT NULL` timestamp columns across twenty-one shipped sqlite
+migrations, V010 through V143, default to `datetime('now', 'subsec')` — the
+systematic sqlite translation of postgres's `NOW()`. The `subsec` modifier
+was added in SQLite 3.42.0. Below that, an unrecognised modifier does not
+error: `datetime()` returns **NULL**, silently, and the `INSERT` that relied
+on the default meets `NOT NULL`. Debian bookworm — current stable — ships
+3.40.1; Ubuntu 22.04 ships 3.37. On either, the first encrypted-at-rest
+write fails at `federation_content_master.created_at` and nothing after it
+succeeds. Every CI lane runs a newer SQLite, so the class was invisible until
+CIRISEdge's mesh harness ran on a bookworm image (CIRISEdge#600).
+
+### 6.1 Why neither obvious fix is available
+
+- The migrations that declare the defaults have **shipped**. §2 forbids
+  editing them, and #840 is what editing one costs.
+- SQLite cannot `ALTER COLUMN … SET DEFAULT`. The sanctioned rebuild recipe
+  (§11 of the at-rest FSD, the V136/V141 shape) rebuilds a table to change a
+  column; for a DEFAULT *expression* on twenty-odd tables carrying indexes,
+  foreign keys and a self-FK, that is a large, risky operation to change text
+  that stores nothing.
+
+### 6.2 The repair
+
+A DEFAULT expression is schema **text**. SQLite's ALTER TABLE documentation
+("Making Other Kinds Of Table Schema Changes") gives a nine-step procedure it
+calls *appropriate for removing CHECK or FOREIGN KEY or NOT NULL constraints,
+or adding, removing, or changing default values on a column* — this case by
+name — and reserves the twelve-step table rebuild for changes that affect
+on-disk content. The nine steps, in the documented order: start a
+transaction; read `schema_version`; `PRAGMA writable_schema = ON`; `UPDATE
+sqlite_schema SET sql = …`; `PRAGMA schema_version = X+1`; `PRAGMA
+writable_schema = OFF`; `integrity_check`; commit. Persist runs exactly that,
+once, idempotently, after refinery on every boot:
+
+```
+datetime('now', 'subsec')   →   strftime('%Y-%m-%d %H:%M:%f', 'now')
+```
+
+The replacement yields byte-identical text (`YYYY-MM-DD HH:MM:SS.SSS`, 23
+characters) on every SQLite this crate has ever linked, so existing rows,
+cursors and readers see no difference. The rewrite touches `type = 'table'`
+rows only, is a no-op when no `subsec` remains (a fresh database after the
+first boot, every later boot), and is followed by an `integrity_check` that
+must answer `ok` and a post-condition that no `subsec` remains — either
+failing aborts the boot loudly rather than leaving a schema half-repaired.
+
+**Defensive mode.** Apple's `libsqlite3.dylib` enables
+`SQLITE_DBCONFIG_DEFENSIVE` by default for processes linked on or after macOS
+11, and macOS / iOS link the system library. Defensive mode refuses
+`writable_schema = ON` and makes `schema_version = N` a silent no-op — both
+documented. The repair therefore disables defensive mode for the rewrite
+through the C-level `sqlite3_db_config` (the only way; there is no SQL for
+it) and restores it afterwards whatever happened in between (I55b). The
+documented caution — a syntax error in the rewritten text corrupts the
+schema — is met three ways: the rewrite is a fixed substring substitution of
+one literal for another, it runs inside the transaction so a refusal at any
+step leaves the shipped text untouched, and it is exercised on a blank
+database by I55/I55b on every test run and on a real 3.40.1 by the bookworm
+witness on every CI run.
+
+**Required versus normalisation.** The repair first asks the library whether
+`datetime('now', 'subsec')` is NULL. A *refusal* — the connection will not
+accept schema writes, told by reading `PRAGMA writable_schema` back after
+setting it — is the one outcome that depends on the answer: fatal where the
+modifier is NULL (< 3.42), because the node could not write anyway; a
+warning where it evaluates, with writes proceeding on the shipped text.
+Every other failure — an I/O error, a failed commit, a non-`ok`
+`integrity_check` — propagates on every library, because a boot must not
+proceed on a half-known schema.
+
+It lives beside the #840 repair (`repair_v070_checksum`) and for the same
+reason: a shipped migration is immutable, so what a shipped migration got
+wrong is corrected at the boundary where the database meets the current
+crate, not in the ledger.
+
+### 6.3 Invariants
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I55 | After `run_migrations` on sqlite, no `CREATE TABLE` text in `sqlite_master` contains `subsec`; an `INSERT` omitting a defaulted timestamp column succeeds and stores the 23-character form; a second run rewrites nothing. | a bookworm host that cannot write; a repair that changes the stored format | behavioural (sqlite), and the bookworm witness |
+| I55b | The repair succeeds on a connection with `SQLITE_DBCONFIG_DEFENSIVE` on, and defensive mode is restored afterwards. | an Apple node whose boot aborts on a refused rewrite; a repair that leaves defensive mode off | behavioural (sqlite) |
+| I55c | The rewrite succeeds with double-quoted strings disabled (`SQLITE_DQS=0` / `SQLITE_DBCONFIG_DQS_*` off): both literals are bound parameters and the statement spells no `"`. | a build that parses `"…"` as an identifier and fails `no such column` | behavioural (sqlite) |
+| I55d | A failed rewrite leaves `writable_schema` OFF and the shipped text untouched, and the failure **propagates on every library** — an I/O error, a failed commit or a non-`ok` `integrity_check` is never downgraded. | a declined repair that leaves the live writer editable; a boot that proceeds on a half-known schema | behavioural (sqlite) |
+| I55f | A **refusal** — the connection will not accept schema writes, detected by reading `PRAGMA writable_schema` back after setting it, never by matching an error message — is the one outcome downgraded to a warning where the modifier evaluates, and is fatal where it is NULL. | a refusal mistaken for an error, or an error mistaken for a refusal | behavioural (sqlite) |
+| I55e | A foreign table whose DDL merely contains the substring `subsec` neither counts nor fails the post-condition: the exact obsolete expression is what is matched. | a consumer column named `subsec_note` aborting every boot on a pre-3.42 host | behavioural (sqlite) |
+| I56 | No migration file after V144, in either dialect, contains `subsec`; the shipped set's count is pinned (44 in sqlite, 0 in postgres). | a new migration that reintroduces the modifier | from-disk |
+| I57 | The shell witness `scripts/sqlite_portability_witness.sh` and the Rust repair carry the same two literals, so what CI proves on 3.40.1 is what the crate does. | a witness that tests a different rewrite | from-disk |
+
+The bookworm witness runs the shipped sqlite migrations and the repair
+through Debian's own `libsqlite3` 3.40.1 in a `debian:bookworm-slim`
+container, asserts the pre-repair `NOT NULL` failure, then the post-repair
+success. It is the only place in the stack a pre-3.42 SQLite runs, which is
+the reason it exists.
+
+### 6.4 The rule going forward
+
+`subsec` is never written into a migration again. New timestamp defaults use
+the portable form. The floor this crate supports is what Debian stable ships;
+a modifier newer than that floor is a portability bug whether or not CI can
+see it.
+
+### 6.5 Statements, not only defaults
+
+The audit that built the repair found a second class the repair cannot
+reach: nine runtime SQL statements in `src/` evaluated
+`datetime('now', 'subsec')` directly — the community-DEK epoch rotation
+(`rotated_at`), maintenance locks, incident records, telemetry locks and
+workers. On 3.40.1 those wrote NULL silently into a nullable column, or failed
+`NOT NULL`. They are source, so they are simply changed to the portable form;
+what keeps them changed is I58.
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I58 | The `subsec` modifier appears in no source file except the one that owns the two literals — doc comments included, so the old spelling is never copied out of one. | a new statement or default that evaluates the modifier at runtime | from-disk |
+

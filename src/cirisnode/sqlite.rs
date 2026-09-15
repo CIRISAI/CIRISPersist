@@ -21,7 +21,8 @@
 //! - `TIMESTAMPTZ` becomes `TEXT` in RFC 3339 microsecond form.
 //! - `DOUBLE PRECISION` becomes `REAL`.
 //! - `BOOLEAN` becomes `INTEGER 0/1` (rusqlite auto-converts).
-//! - `NOW()` becomes `datetime('now', 'subsec')` embedded in SQL.
+//! - `NOW()` becomes the portable `strftime('%Y-%m-%d %H:%M:%f','now')` embedded in SQL
+//!   (never the `subsec` modifier — SQLite < 3.42 evaluates it to NULL, #845).
 //! - `SELECT … FOR UPDATE` becomes `BEGIN IMMEDIATE` (RESERVED lock).
 //!
 //! The signature-verification helper [`super::verify::verify_envelope_signed`]

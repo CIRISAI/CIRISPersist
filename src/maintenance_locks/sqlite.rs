@@ -4,9 +4,9 @@
 //! Mirrors the v1.5.15 Postgres impl. Dialect translations:
 //!
 //!   TIMESTAMPTZ                         → TEXT (RFC 3339 +
-//!                                          `datetime('now', 'subsec')`)
+//!                                          the portable `strftime('%Y-%m-%d %H:%M:%f','now')`)
 //!   JSONB                               → TEXT (raw JSON string)
-//!   NOW()                               → `datetime('now', 'subsec')` (the
+//!   NOW()                               → `strftime('%Y-%m-%d %H:%M:%f','now')` (the
 //!                                          stored format) or
 //!                                          `julianday('now')` (for
 //!                                          interval arithmetic)
@@ -17,7 +17,7 @@
 //!                                          shape as PG)
 //!
 //! Both arms server-stamp `locked_at` against the same clock (PG:
-//! `NOW()`; SQLite: `datetime('now', 'subsec')`) and gate the
+//! `NOW()`; SQLite: the portable `strftime` form, #845) and gate the
 //! steal-the-stale-lock decision server-side in the same statement
 //! that does the acquire. This guarantees lock-expiry semantics
 //! match on both backends for any wall-clock moment.
@@ -65,7 +65,7 @@ fn map_sqlite_error(e: rusqlite::Error, op: &str) -> Error {
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Error> {
-    // `datetime('now', 'subsec')` emits the `YYYY-MM-DD HH:MM:SS.SSS`
+    // `strftime('%Y-%m-%d %H:%M:%f','now')` emits the `YYYY-MM-DD HH:MM:SS.SSS`
     // shape without a trailing `Z` — same `' '`-separated form used
     // by other substrates. Normalize to RFC 3339 before parsing.
     let normalized = if s.contains('T') {
@@ -176,7 +176,7 @@ impl MaintenanceLockService for SqliteMaintenanceLockBackend {
                     "INSERT INTO cirislens_maintenance_locks (\
                         lock_key, locked_by, locked_at, \
                         lock_timeout_seconds, metadata\
-                     ) VALUES (?1, ?2, datetime('now', 'subsec'), ?3, ?4) \
+                     ) VALUES (?1, ?2, strftime('%Y-%m-%d %H:%M:%f', 'now'), ?3, ?4) \
                      ON CONFLICT (lock_key) DO UPDATE SET \
                         locked_by            = excluded.locked_by, \
                         locked_at            = excluded.locked_at, \

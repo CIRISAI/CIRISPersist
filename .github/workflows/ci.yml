@@ -1351,6 +1351,26 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - run: cargo deny check
 
+  # CIRISPersist#845 (FSD/MIGRATION_IMMUTABILITY.md §6, I55) — the ONLY place
+  # in the stack a pre-3.42 SQLite runs. Every other lane is ubuntu-latest
+  # (SQLite 3.45+), where `datetime('now','subsec')` works; Debian bookworm —
+  # current stable, what edge's mesh images and Pi-class hosts run — ships
+  # 3.40.1, where it is NULL and every insert relying on a defaulted timestamp
+  # column fails NOT NULL. This job applies the shipped sqlite migrations and
+  # the crate's portable-default repair through Debian's own libsqlite3 and
+  # asserts the pre-repair refusal and the post-repair success. No Rust
+  # build: the witness is the migration SQL + the repair's two literals, and
+  # the from-disk gate I57 pins those literals to the crate's.
+  sqlite-portability:
+    name: sqlite portability (debian bookworm, libsqlite3 3.40.1)
+    runs-on: ubuntu-latest
+    container: debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 git ca-certificates >/dev/null
+      - uses: actions/checkout@v6
+      - name: witness (pre-3.42 refusal, repair, post-repair success)
+        run: bash scripts/sqlite_portability_witness.sh
+
   # Build the abi3-py311 wheel via maturin. Per
   # PLATFORM_ARCHITECTURE.md §3.5: one wheel per (os, arch) pair.
   #
