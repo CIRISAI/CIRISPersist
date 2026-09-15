@@ -296,7 +296,7 @@ mod tests {
     use crate::cirisnode::media_sharing::{LegalBasis, TakedownNoticePayload};
     use crate::federation::types::{KeyRecord, SignedKeyRecord};
     use crate::federation::{BlobBody, BlobStorage, FederationDirectory};
-    use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+    use crate::signing::LocalSigner;
     use crate::store::backend::Backend;
     use crate::store::sqlite::SqliteBackend;
     use chrono::Utc;
@@ -383,12 +383,6 @@ mod tests {
         crate::federation::tier_ingest::test_support::local_signer(alias)
     }
 
-    /// Wrap a test LocalSigner as a `&dyn HardwareSigner` for the
-    /// classical-only `put_blob_signing` (holds_bytes) seeding path.
-    fn blob_signer(local: &std::sync::Arc<LocalSigner>) -> LocalSignerHardwareAdapter {
-        LocalSignerHardwareAdapter::new(local.clone())
-    }
-
     async fn seed_backend(actors: &[&str]) -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
@@ -426,7 +420,7 @@ mod tests {
                 BlobBody::Inline(payload.to_vec()),
                 None,
                 actor,
-                &blob_signer(signer),
+                signer,
                 Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -458,7 +452,7 @@ mod tests {
                 BlobBody::Inline(payload.to_vec()),
                 None,
                 "holder-stale",
-                &blob_signer(&h),
+                &h,
                 stale_ts,
                 uuid::Uuid::new_v4(),
             )

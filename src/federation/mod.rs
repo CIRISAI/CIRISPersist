@@ -88,6 +88,10 @@ pub mod key_grant;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// CIRISPersist#851 §20.5 — I79: the holder claim is hybrid-signed when a
+// LocalSigner exists, so peers admit it at the federation-tier gate.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod claim_signing_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
@@ -556,11 +560,38 @@ fn assert_change_envelope_matches(
 /// because a leg that cannot compile is a leg that proves nothing.
 pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
     for sid in subject_key_ids {
-        if sid.is_empty() || sid.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err(Error::InvalidArgument(format!(
+        // CC 2.3.2.1 (the CC 2.3 audit) — each malformed subject "MUST be
+        // refused at the gate, never normalized into acceptance". The
+        // consequence of admitting one is silent and permanent: a subject
+        // nobody can ever match under withdraws rules 2/3, so the row is
+        // unrevocable and no error is raised anywhere — the fail-silent
+        // class. Refused here: empty, uppercase, ANY whitespace (leading,
+        // trailing or internal), and a `canonical:` id that is not exactly
+        // `canonical:sha256:<64 lowercase hex>` (a wrong hash family or a
+        // short digest can never be produced by the canonicalizer, so it can
+        // never be matched either).
+        let malformed = |why: &str| {
+            Err(Error::InvalidArgument(format!(
                 "subject_key_ids element must be a canonical lowercase key_id \
-                 (CC 2.6.3 / §0.6); got {sid:?}"
-            )));
+                 (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
+            )))
+        };
+        if sid.is_empty() {
+            return malformed("empty");
+        }
+        if sid.bytes().any(|b| b.is_ascii_uppercase()) {
+            return malformed("uppercase");
+        }
+        if sid.chars().any(char::is_whitespace) {
+            return malformed("whitespace");
+        }
+        if let Some(rest) = sid.strip_prefix("canonical:") {
+            let Some(digest) = rest.strip_prefix("sha256:") else {
+                return malformed("canonical id is not sha256");
+            };
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return malformed("canonical sha256 digest is not 64 lowercase hex");
+            }
         }
     }
     Ok(())
@@ -2095,6 +2126,18 @@ pub trait FederationDirectory: Send + Sync {
             "list_signed_identity_occurrences_for not implemented for this backend".into(),
         ))
     }
+
+    /// CIRISPersist#851 (PR #852 review, round three) — EVERY occurrence row
+    /// bound under `occurrence_key_id`, whatever identity each names. The
+    /// table's key is `(identity_key_id, occurrence_key_id)`, so one key may
+    /// be bound under several identities (ownership moved, a stale row left);
+    /// [`Self::lookup_identity_for_occurrence`] returns one of them, and a
+    /// revocation check that read only that one would miss the other's
+    /// revocation. Empty when the key is bound nowhere.
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error>;
 
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns `None` if the key is

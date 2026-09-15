@@ -445,6 +445,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_family", ConnClass::Read),
     ("lookup_freshness_floor", ConnClass::Read),
     ("lookup_identity_for_occurrence", ConnClass::Read),
+    (
+        "list_identity_occurrences_by_occurrence_key",
+        ConnClass::Read,
+    ),
     ("lookup_keys_for_identity", ConnClass::Read),
     ("lookup_public_key", ConnClass::Read),
     ("lookup_role_withdrawal", ConnClass::Read),

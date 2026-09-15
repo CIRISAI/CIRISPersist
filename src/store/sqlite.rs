@@ -6287,6 +6287,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })
     }
 
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let key = occurrence_key_id.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::IdentityOccurrence>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT identity_key_id, occurrence_key_id, device_class, \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
+                     FROM federation_identity_occurrences \
+                     WHERE occurrence_key_id = ?1 ORDER BY identity_key_id",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_identity_occurrence)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_identity_occurrences_by_occurrence_key: {e}"
+            ))
+        })
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -37964,8 +37990,8 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                "actor-a",
-                &blob_signer(&signer),
+                &signer.derived_key_id(),
+                &signer,
                 stale_ts,
                 uuid::Uuid::new_v4(),
             )
@@ -37974,7 +38000,7 @@ mod tests {
         let holders = backend.list_holders(&sha).await.unwrap();
         assert_eq!(
             holders,
-            vec!["actor-a".to_string()],
+            vec![signer.derived_key_id()],
             "list_holders must include local writer even with stale attestation"
         );
     }
@@ -38031,8 +38057,8 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                "host-a",
-                &blob_signer(&signer),
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -38040,7 +38066,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             backend.list_holders(&sha).await.unwrap(),
-            vec!["host-a".to_string()],
+            vec![signer.derived_key_id()],
             "cohort_scope=federation must announce holds_bytes"
         );
     }
@@ -38064,8 +38090,8 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    "host-a",
-                    &blob_signer(&signer),
+                    &signer.derived_key_id(),
+                    &signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -38091,8 +38117,8 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes),
                 None,
-                "host-a",
-                &blob_signer(&signer),
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -38511,14 +38537,6 @@ mod tests {
         crate::federation::tier_ingest::test_support::local_signer(alias)
     }
 
-    /// Wrap a test LocalSigner as a `&dyn HardwareSigner` for the
-    /// classical-only `put_blob_signing` (holds_bytes) seeding path.
-    fn blob_signer(
-        local: &std::sync::Arc<crate::signing::LocalSigner>,
-    ) -> crate::signing::LocalSignerHardwareAdapter {
-        crate::signing::LocalSignerHardwareAdapter::new(local.clone())
-    }
-
     async fn evict_test_backend_with_actors(actors: &[&str]) -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
@@ -38553,7 +38571,6 @@ mod tests {
         tag: &str,
     ) -> Vec<[u8; 32]> {
         use crate::federation::{BlobBody, BlobStorage};
-        let hw = blob_signer(signer);
         let mut shas = Vec::with_capacity(n);
         for i in 0..n {
             let bytes = format!("{actor}-{tag}-{i}").into_bytes();
@@ -38563,8 +38580,8 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    actor,
-                    &hw,
+                    &signer.derived_key_id(),
+                    signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -38584,13 +38601,19 @@ mod tests {
         let shas_b = seed_blobs(&backend, "actor-b", &signer_b, 2, "main").await;
 
         use crate::federation::BlobStorage;
-        let mut held_a = backend.list_held_by("actor-a").await.unwrap();
+        let mut held_a = backend
+            .list_held_by(&signer.derived_key_id())
+            .await
+            .unwrap();
         held_a.sort();
         let mut expected_a = shas_a.clone();
         expected_a.sort();
         assert_eq!(held_a, expected_a, "A's holdings");
 
-        let mut held_b = backend.list_held_by("actor-b").await.unwrap();
+        let mut held_b = backend
+            .list_held_by(&signer_b.derived_key_id())
+            .await
+            .unwrap();
         held_b.sort();
         let mut expected_b = shas_b.clone();
         expected_b.sort();
@@ -38607,14 +38630,17 @@ mod tests {
 
         // Look up the holds_bytes attestation_id we just emitted.
         use crate::federation::FederationDirectory;
-        let atts = backend.list_attestations_by("actor-a").await.unwrap();
+        let atts = backend
+            .list_attestations_by(&signer.derived_key_id())
+            .await
+            .unwrap();
         let holds_bytes = atts
             .into_iter()
             .find(|a| {
                 a.attestation_type
                     .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
             })
-            .expect("holds_bytes from actor-a");
+            .expect("holds_bytes from actor-a's derived key");
         let withdraws = structural_composer_attestation(
             &uuid::Uuid::new_v4().to_string(),
             "actor-a",
@@ -38647,7 +38673,7 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor("actor-a", &signer_a, chrono::Utc::now())
+            .evict_actor(&signer_a.derived_key_id(), &signer_a, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
@@ -38706,7 +38732,7 @@ mod tests {
         ));
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor("actor-a", &failing, chrono::Utc::now())
+            .evict_actor(&real_signer.derived_key_id(), &failing, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 1, "blob still evicted");

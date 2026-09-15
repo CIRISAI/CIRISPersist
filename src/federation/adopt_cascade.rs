@@ -111,10 +111,14 @@ fn resolve_adopt(
 /// A `self` / `family` provenance can never announce (CC 5.2 — no holder
 /// claim is ever emitted for structurally invisible content); it is refused
 /// before the floor (I52).
+///
+/// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+/// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+/// hybrid-signed so peers admit it.
 #[allow(clippy::too_many_arguments)]
 pub async fn adopt_sealed_blob<B, F>(
     backend: &B,
-    signer: &dyn ciris_keyring::HardwareSigner,
+    local: &crate::signing::LocalSigner,
     ctx: &HoldContext<'_, F>,
     envelope: &[u8],
     provenance: &BlobProvenance,
@@ -144,7 +148,7 @@ where
         // derived key, never the author's.
         Some(
             crate::federation::blobs::sign_holds_bytes_claim(
-                signer,
+                local,
                 &sha256,
                 ctx.our_key_id,
                 uuid::Uuid::new_v4(),

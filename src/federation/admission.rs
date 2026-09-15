@@ -4471,12 +4471,16 @@ pub async fn verify_signed_identity_occurrence(
                 ))
             })
     };
-    let td_env = env.get("transport_destination").ok_or_else(|| {
-        Error::InvalidArgument(
-            "signed identity_occurrence must carry a transport_destination (occurrence-KEX #418)"
-                .into(),
-        )
-    })?;
+    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — the CONTENT-ONLY form: no
+    // transport destination (the node's transport identity lives on its own
+    // plane), content-KEM pubkeys REQUIRED, verified as the signed revocation
+    // is (hybrid 1-of-1 over JCS(envelope) against the pinned key), then the
+    // same `signer_acts_for` — with the owner-binding lift for a node signing
+    // its own occurrence. Transport-bound occurrences keep #418's path below.
+    let td_env = match env.get("transport_destination") {
+        Some(v) if !v.is_null() => v,
+        _ => return verify_content_only_identity_occurrence(directory, signed).await,
+    };
     let transport_destination = TransportDestination {
         reticulum_x25519_pubkey_base64: str_field(td_env, "reticulum_x25519_pubkey")?,
         reticulum_ed25519_pubkey_base64: str_field(td_env, "reticulum_ed25519_pubkey")?,
@@ -4540,6 +4544,14 @@ pub async fn verify_signed_identity_occurrence(
         return Err(diverges("encryption_pubkeys"));
     }
 
+    // PR #852 review — a producer that stamps `asserted_at` into the
+    // envelope (every persist producer does) binds the typed instant too.
+    if let Some(at) = env.get("asserted_at").and_then(|v| v.as_str()) {
+        if !same_instant_ms(at, row.asserted_at) {
+            return Err(diverges("asserted_at"));
+        }
+        super::operational::check_skew_bound(row.asserted_at, chrono::Utc::now())?;
+    }
     // (3) Verify the hybrid signature against the signer's PINNED federation key.
     let Some(signer_key) = directory
         .lookup_public_key(&signed.attesting_key_id)
@@ -4585,6 +4597,178 @@ pub async fn verify_signed_identity_occurrence(
     .await
 }
 
+/// PR #852 review (rounds one and four) — an envelope instant (RFC 3339)
+/// equals a typed instant at millisecond precision, the producer's, AND the
+/// typed instant carries nothing below the millisecond: the signature covers
+/// the millisecond rendering only, and `IdentityOccurrenceRevocation::revokes`
+/// compares the typed instant exactly, so an unsigned sub-millisecond part
+/// would let a relay move an occurrence across a same-millisecond revocation.
+/// Unparseable ⇒ not equal.
+fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool {
+    typed.timestamp_subsec_nanos() % 1_000_000 == 0
+        && chrono::DateTime::parse_from_rfc3339(envelope)
+            .map(|e| e.timestamp_millis() == typed.timestamp_millis())
+            .unwrap_or(false)
+}
+
+/// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.2) — the content-only signed
+/// occurrence gate: the envelope carries `encryption_pubkeys` and no
+/// `transport_destination`. Verified exactly as
+/// [`verify_signed_identity_occurrence_revocation`] verifies its envelope:
+/// 1. the typed projection EQUALS the envelope (ids, KEM pubkeys — both
+///    halves — and `transport_binding: None`);
+/// 2. the hybrid signature over `JCS(signed_envelope)` at threshold 1-of-1
+///    against the PINNED federation pubkeys of `attesting_key_id`;
+/// 3. [`check_signer_acts_for`] with the row's own occurrence key, so a node
+///    may vouch for its own occurrence through a live owner binding.
+async fn verify_content_only_identity_occurrence(
+    directory: &dyn super::FederationDirectory,
+    signed: &crate::federation::types::SignedIdentityOccurrence,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+    let row = &signed.identity_occurrence;
+    let env = &signed.signed_envelope;
+    let str_field = |k: &str| -> Result<String, Error> {
+        env.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed identity_occurrence envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
+        ))
+    };
+    // (1) The envelope must carry the content-KEM pubkeys — a content-only
+    // occurrence with neither transport nor keys binds nothing.
+    let Some(enc) = env.get("encryption_pubkeys").filter(|e| !e.is_null()) else {
+        return Err(Error::InvalidArgument(
+            "signed identity_occurrence must carry a transport_destination (occurrence-KEX \
+             #418) or encryption_pubkeys (content-only, CIRISPersist#851)"
+                .into(),
+        ));
+    };
+    let env_enc = (
+        enc.get("x25519_base64")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| diverges("encryption_pubkeys.x25519_base64"))?,
+        enc.get("ml_kem_768_base64")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| diverges("encryption_pubkeys.ml_kem_768_base64"))?,
+    );
+    if str_field("identity_key_id")? != row.identity_key_id {
+        return Err(diverges("identity_key_id"));
+    }
+    if str_field("occurrence_key_id")? != row.occurrence_key_id {
+        return Err(diverges("occurrence_key_id"));
+    }
+    // The envelope's attester IS the wrapper's signer (the transport-bound
+    // path's SubjectMismatch rule) — the signed bytes and the persisted
+    // attribution name one principal (PR #852 review round two).
+    if str_field("attesting_key_id")? != signed.attesting_key_id {
+        return Err(diverges("attesting_key_id"));
+    }
+    if row.transport_binding.is_some() {
+        return Err(diverges("transport_destination"));
+    }
+    let row_enc = row
+        .encryption_pubkeys
+        .as_ref()
+        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
+    if row_enc.as_ref() != Some(&env_enc) {
+        return Err(diverges("encryption_pubkeys"));
+    }
+    // Every persisted field the backends read back — `asserted_at` is the
+    // last-signed-wins / revocation-freshness clock — is bound to the
+    // envelope, or a relay could forward-date a typed row under a valid
+    // signature (PR #852 review). Instants compare at millisecond precision,
+    // the producer's.
+    if str_field("device_class")? != row.device_class {
+        return Err(diverges("device_class"));
+    }
+    if !same_instant_ms(&str_field("asserted_at")?, row.asserted_at) {
+        return Err(diverges("asserted_at"));
+    }
+    // The signed instant is bounded: a compromised node with a live binding
+    // must not date its occurrence into the future to out-rank authentic
+    // replacements and escape a later revocation (PR #852 review, round
+    // five). The same clock-skew tolerance every stamped write gets.
+    super::operational::check_skew_bound(row.asserted_at, chrono::Utc::now())?;
+    match (
+        env.get("valid_until").filter(|v| !v.is_null()),
+        row.valid_until,
+    ) {
+        (None, None) => {}
+        (Some(v), Some(t)) if v.as_str().is_some_and(|v| same_instant_ms(v, t)) => {}
+        _ => return Err(diverges("valid_until")),
+    }
+    match (
+        env.get("hardware_attestation").filter(|v| !v.is_null()),
+        row.hardware_attestation.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(v), Some(h)) if v.as_str() == Some(h) => {}
+        _ => return Err(diverges("hardware_attestation")),
+    }
+    // (2) Hybrid signature over JCS(envelope), 1-of-1 against the pinned key.
+    // Hybrid-ONLY (operator directive; CC 5.3.2.4.3.1): a signature without
+    // its ML-DSA-65 half is refused before any verification is attempted —
+    // never verified classically.
+    if signed.signature.mldsa65_signature_base64.is_none() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence for {} carries no ML-DSA-65 signature; the plane is \
+             hybrid-only (CC 5.3.2.4.3.1)",
+            row.occurrence_key_id
+        )));
+    }
+    let Some(signer_key) = directory
+        .lookup_public_key(&signed.attesting_key_id)
+        .await?
+    else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
+            signed.attesting_key_id
+        )));
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
+        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+    })?;
+    let members = [ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let sigs = [ThresholdSignature {
+        member_id: signed.attesting_key_id.clone(),
+        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
+        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
+    }];
+    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence for {} not authentic (hybrid 1-of-1 over JCS(envelope) \
+             failed against the pinned key of {})",
+            row.occurrence_key_id, signed.attesting_key_id
+        )));
+    }
+    // (3) signer_acts_for, with the owner-binding lift for the row's own key.
+    check_signer_acts_for(
+        directory,
+        &signed.attesting_key_id,
+        &row.identity_key_id,
+        "identity_occurrence",
+    )
+    .await
+}
+
 /// v16.0.0 (#421) — **THE `signer_acts_for` check**, shared by the signed
 /// occurrence AND signed revocation gates (one authorization rule, one place):
 /// `attesting_key_id` may act for `identity_key_id` iff it IS that identity's
@@ -4601,16 +4785,34 @@ async fn check_signer_acts_for(
     if attesting_key_id == identity_key_id {
         return Ok(());
     }
-    let acts_for = matches!(
+    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2; PR #852 review, rounds
+    // two–five) — who may vouch for `identity_key_id` besides itself:
+    // - a NODE-role key ONLY through its live owner binding (`owner_of`) —
+    //   for its own occurrence and for any sibling key alike; never through
+    //   an occurrence row a prior admission left, so a withdrawn or lapsed
+    //   binding, or a revoked node, vouches for nothing;
+    // - any other key through the ACTIVE occurrence fold of the identity
+    //   (revocations applied), never a raw historical row.
+    let is_node = directory
+        .lookup_public_key(attesting_key_id)
+        .await?
+        .is_some_and(|k| {
+            k.identity_type == super::types::identity_type::NODE
+                || k.claims_role(super::types::identity_type::NODE)
+        });
+    let acts_for = if is_node {
+        owner_of(directory, attesting_key_id).await?.as_deref() == Some(identity_key_id)
+    } else {
         directory
-            .lookup_identity_for_occurrence(attesting_key_id)
-            .await?,
-        Some(sig_occ) if sig_occ.identity_key_id == identity_key_id
-    );
+            .list_identity_occurrences_active(identity_key_id)
+            .await?
+            .iter()
+            .any(|o| o.occurrence_key_id == attesting_key_id)
+    };
     if !acts_for {
         return Err(Error::SignatureInvalid(format!(
             "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \
-             nor an active occurrence of it"
+             nor an active occurrence of it, nor a node it owns"
         )));
     }
     Ok(())
@@ -7474,6 +7676,24 @@ pub async fn check_withdraws_admission(
         // Target not locally present — defer authority to read side.
         return Ok(None);
     };
+    // CC 3 (CIRISPersist#851 / the CC 2.3 audit) — a `withdraws` naming a
+    // `key_grant:*` row is REFUSED, not admitted inert. The Constitution is
+    // explicit that a shared key cannot be retroactively un-shared, so
+    // persist cannot honour the claim; admitting it would leave a row that
+    // every reader ignores — a revocation the emitter believes took effect
+    // and that nothing enforces (the fail-silent class). The honest verdict
+    // is at the gate. Forward secrecy on this axis is ROTATION (§15): bump
+    // the epoch, and the next seal is unreadable to the removed party.
+    if target
+        .attestation_type
+        .starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "withdraws names a key_grant row ({}) — a shared key cannot be retroactively \
+             un-shared (CC 3); rotate the epoch instead (BLOB_REPLICATION.md §15)",
+            target.attestation_type
+        )));
+    }
     // Scope discriminator: a `holds_bytes:sha256:*` target is a
     // content-location directory entry whose `withdraws` is emitted by a
     // separately-authorized moderation / host self-attestation path

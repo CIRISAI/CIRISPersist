@@ -368,6 +368,19 @@ def test_register_self_then_put_blob_signing_275() -> None:
             str(uuid.uuid4()),
         )
 
+        # CIRISPersist#851 §20.5 (PR #852 review) — the commons door's
+        # holds_bytes claim carries its PQC half when the engine has a PQC
+        # LocalSigner, so a peer's federation-tier ingest admits it; without
+        # one it stays classical (I80). Read back through a host door.
+        rows = json.loads(eng.list_attestations_by(kid))
+        claims = [r for r in rows if str(r.get("attestation_type", "")).startswith("holds_bytes:")]
+        assert claims, "the holds_bytes claim is stored under the derived id"
+        has_pqc_key = json.loads(eng.lookup_keys_for_identity("ref"))[0].get("pubkey_ml_dsa_65_base64")
+        if has_pqc_key:
+            assert all(r.get("scrub_signature_pqc") for r in claims), (
+                "a PQC-capable engine must announce a HYBRID holds_bytes claim (#851 §20.5)"
+            )
+
         # #295 — local_derived_key_id() returns the SAME registered/verified
         # derived id (the footgun-free one), distinct from the bare alias.
         assert eng.local_derived_key_id() == kid

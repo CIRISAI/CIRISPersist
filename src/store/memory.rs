@@ -5092,6 +5092,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_identity_occurrences
+            .values()
+            .filter(|o| o.occurrence_key_id == occurrence_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.identity_key_id.cmp(&b.identity_key_id));
+        Ok(rows)
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,

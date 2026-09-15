@@ -548,7 +548,10 @@ impl PostgresBackend {
                 sqlstate: None,
                 detail: format!("postgres minter-sentinel resolution (#848): count: {e}"),
             })?;
-        let remaining: i64 = row.get("n");
+        let remaining: i64 = row.safe_get_with("n", |detail| Error::Migration {
+            sqlstate: None,
+            detail,
+        })?;
         if remaining != 0 {
             let _ = tx.rollback().await;
             return Err(Error::Migration {
@@ -6867,6 +6870,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?;
         rows.into_iter()
             .map(pg_row_to_signed_identity_occurrence)
+            .collect()
+    }
+
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
+                 FROM cirislens.federation_identity_occurrences \
+                 WHERE occurrence_key_id = $1 ORDER BY identity_key_id",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_identity_occurrences_by_occurrence_key: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_identity_occurrence)
             .collect()
     }
 
@@ -13550,7 +13581,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("community_dek_key_grant_dirty: {e}"))
             })?;
-        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+        Ok(match row {
+            Some(r) => r.safe_get_with(0, crate::federation::BlobError::Backend)?,
+            None => false,
+        })
     }
 
     async fn community_dek_key_grant_watermark(
@@ -13576,7 +13610,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     "community_dek_key_grant_watermark: {e}"
                 ))
             })?;
-        Ok(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0))
+        row.safe_get_with(0, crate::federation::BlobError::Backend)
     }
 
     async fn community_dek_mark_key_grant_emitted(
@@ -13636,10 +13670,14 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     "community_dek_list_key_grant_dirty: {e}"
                 ))
             })?;
-        Ok(rows
-            .iter()
-            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u64))
-            .collect())
+        rows.iter()
+            .map(|r| {
+                let community: String =
+                    r.safe_get_with(0, crate::federation::BlobError::Backend)?;
+                let epoch: i64 = r.safe_get_with(1, crate::federation::BlobError::Backend)?;
+                Ok((community, epoch as u64))
+            })
+            .collect()
     }
 
     async fn blob_key_grant_dirty(
@@ -13667,7 +13705,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("blob_key_grant_dirty: {e}"))
             })?;
-        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+        Ok(match row {
+            Some(r) => r.safe_get_with(0, crate::federation::BlobError::Backend)?,
+            None => false,
+        })
     }
 
     async fn blob_key_grant_watermark(
@@ -13690,7 +13731,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("blob_key_grant_watermark: {e}"))
             })?;
-        Ok(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0))
+        row.safe_get_with(0, crate::federation::BlobError::Backend)
     }
 
     async fn blob_mark_key_grant_emitted(
@@ -13740,10 +13781,21 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("blob_list_key_grant_dirty: {e}"))
             })?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| <[u8; 32]>::try_from(r.get::<_, Vec<u8>>(0).as_slice()).ok())
-            .collect())
+        // A row that cannot be decoded is an error, never a silently shorter
+        // dirty list — the sweep would report success and the blob's set
+        // would never be carried (PR #852 review).
+        rows.iter()
+            .map(|r| {
+                let v =
+                    r.safe_get_with::<Vec<u8>, _, _, _>(0, crate::federation::BlobError::Backend)?;
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(format!(
+                        "blob_list_key_grant_dirty: sha256 is {} bytes, not 32",
+                        v.len()
+                    ))
+                })
+            })
+            .collect()
     }
 
     async fn key_grant_pending_put(
@@ -26408,7 +26460,7 @@ mod tests {
         )
         .await;
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
-        let node_derived = signer.derived_key_id();
+        let _node_derived = signer.derived_key_id();
         // Seed: one sealed object at epoch 0, then rotate so epoch 0 is past.
         let sealed =
             encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None, Some(&node))
@@ -26475,10 +26527,8 @@ mod tests {
                 let c = comm.clone();
                 let sha = sealed.at_rest_sha256;
                 let bytes = bytes.clone();
-                let key = node_derived.clone();
                 let s = signer.clone();
                 Box::pin(async move {
-                    let ad = crate::signing::LocalSignerHardwareAdapter::new(s);
                     let _ = &c;
                     format!(
                         "{:?}",
@@ -26488,8 +26538,8 @@ mod tests {
                             &sha,
                             BlobBody::Inline(bytes),
                             None,
-                            &key,
-                            &ad,
+                            &s.derived_key_id(),
+                            &s,
                             chrono::Utc::now(),
                             uuid::Uuid::new_v4(),
                         )
@@ -41720,14 +41770,6 @@ mod tests {
         crate::federation::tier_ingest::test_support::local_signer(alias)
     }
 
-    /// Wrap a test LocalSigner as a `&dyn HardwareSigner` for the
-    /// classical-only `put_blob_signing` (holds_bytes) seeding path.
-    fn pg_blob_signer(
-        local: &std::sync::Arc<crate::signing::LocalSigner>,
-    ) -> crate::signing::LocalSignerHardwareAdapter {
-        crate::signing::LocalSignerHardwareAdapter::new(local.clone())
-    }
-
     /// Seed `n` blobs from `actor` via the trait `put_blob_signing`
     /// path; each payload is uniquified with `uuid_like()` so PG SHAs
     /// don't collide across concurrent tests on the shared DB.
@@ -41739,7 +41781,6 @@ mod tests {
         tag: &str,
     ) -> Vec<[u8; 32]> {
         use crate::federation::{BlobBody, BlobStorage};
-        let hw = pg_blob_signer(signer);
         let mut shas = Vec::with_capacity(n);
         for i in 0..n {
             let bytes = format!("{actor}-{tag}-{i}-{}", uuid_like()).into_bytes();
@@ -41749,8 +41790,8 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    actor,
-                    &hw,
+                    &signer.derived_key_id(),
+                    signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -41780,13 +41821,19 @@ mod tests {
         let shas_b = pg_seed_blobs_for_actor(&backend, &actor_b, &signer_b, 2, "main").await;
 
         use crate::federation::BlobStorage;
-        let mut held_a = backend.list_held_by(&actor_a).await.unwrap();
+        let mut held_a = backend
+            .list_held_by(&signer_a.derived_key_id())
+            .await
+            .unwrap();
         held_a.sort();
         let mut expected_a = shas_a.clone();
         expected_a.sort();
         assert_eq!(held_a, expected_a, "A's holdings");
 
-        let mut held_b = backend.list_held_by(&actor_b).await.unwrap();
+        let mut held_b = backend
+            .list_held_by(&signer_b.derived_key_id())
+            .await
+            .unwrap();
         held_b.sort();
         let mut expected_b = shas_b.clone();
         expected_b.sort();
@@ -41813,7 +41860,10 @@ mod tests {
         let shas = pg_seed_blobs_for_actor(&backend, &actor, &signer, 1, "withdrawn").await;
 
         use crate::federation::FederationDirectory;
-        let atts = backend.list_attestations_by(&actor).await.unwrap();
+        let atts = backend
+            .list_attestations_by(&signer.derived_key_id())
+            .await
+            .unwrap();
         let holds_bytes = atts
             .into_iter()
             .find(|a| {
@@ -41873,7 +41923,7 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&actor_a, &signer_a, chrono::Utc::now())
+            .evict_actor(&signer_a.derived_key_id(), &signer_a, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
@@ -41915,7 +41965,7 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&actor, &signer, chrono::Utc::now())
+            .evict_actor(&signer.derived_key_id(), &signer, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report, crate::federation::EvictActorReport::default());
@@ -41947,7 +41997,7 @@ mod tests {
         ));
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor(&actor, &failing, chrono::Utc::now())
+            .evict_actor(&real_signer.derived_key_id(), &failing, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 1, "blob still evicted");

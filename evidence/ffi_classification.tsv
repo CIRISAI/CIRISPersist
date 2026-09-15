@@ -90,6 +90,7 @@ deontic	binding	146	Engine	emit_attestation
 deontic	binding	146	Engine	emit_attestation_self	
 deontic	binding	146	Engine	emit_key_grant	
 deontic	binding	146	Engine	emit_pending_key_grants	
+deontic	binding	146	Engine	publish_self_occurrence	
 deontic	binding	146	Engine	enter_mesh	
 deontic	binding	146	Engine	escrow_create	
 deontic	binding	146	Engine	escrow_set_status	

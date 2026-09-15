@@ -2027,8 +2027,8 @@ pub mod lifecycle_harness {
                 &before.at_rest_sha256,
                 crate::federation::BlobBody::Inline(sealed0),
                 None,
-                &sweeper_id,
-                &crate::signing::LocalSignerHardwareAdapter::new(sweeper.clone()),
+                &sweeper.derived_key_id(),
+                &sweeper,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
