@@ -1546,31 +1546,36 @@ pub mod two_node {
         );
         // (5) PR #852 review — the occurrence row alone never vouches: on a
         // backend that holds the admitted row but NO owner binding, the same
-        // node's self-signed re-submission is refused.
-        let other = crate::store::sqlite::SqliteBackend::open_in_memory()
-            .await
-            .unwrap();
-        crate::store::Backend::run_migrations(&other).await.unwrap();
-        // The same node (same alias ⇒ same deterministic signer and key),
-        // registered on the fresh backend with its REAL pubkeys.
-        let twin = node_as(&other, alias, crate::federation::types::identity_type::NODE).await;
-        assert_eq!(twin.key, n.key);
-        ts::register_identity_key(&other, &alice, USER).await;
-        other
-            .put_identity_occurrence_local(admitted.identity_occurrence.clone())
-            .await
-            .unwrap();
-        let (i, e, at) = content_only(&alice);
-        let err = other
-            .put_identity_occurrence(sign(i, e, at).await)
-            .await
-            .expect_err(
+        // node's self-signed re-submission is refused. (An in-memory sqlite
+        // twin, so this leg runs under the sqlite feature only.)
+        #[cfg(feature = "sqlite")]
+        {
+            let other = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            crate::store::Backend::run_migrations(&other).await.unwrap();
+            // The same node (same alias ⇒ same deterministic signer and key),
+            // registered on the fresh backend with its REAL pubkeys.
+            let twin = node_as(&other, alias, crate::federation::types::identity_type::NODE).await;
+            assert_eq!(twin.key, n.key);
+            ts::register_identity_key(&other, &alice, USER).await;
+            other
+                .put_identity_occurrence_local(admitted.identity_occurrence.clone())
+                .await
+                .unwrap();
+            let (i, e, at) = content_only(&alice);
+            let err = other
+                .put_identity_occurrence(sign(i, e, at).await)
+                .await
+                .expect_err(
                 "{tag} I76: the row a prior admission left never vouches without the live binding",
             );
-        assert!(
-            err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
-            "{tag} I76: {err}"
-        );
+            assert!(
+                err.to_string().contains("neither identity")
+                    || err.to_string().contains("acts for"),
+                "{tag} I76: {err}"
+            );
+        }
     }
 
     /// **I60b — a set from a minter occurrence that is no longer active is
