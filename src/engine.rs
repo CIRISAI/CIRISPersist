@@ -4977,6 +4977,9 @@ impl Engine {
         aad: Option<&[u8]>,
         disposition: crate::federation::AdoptDisposition,
     ) -> Result<crate::federation::AdoptOutcome, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::adopt_cascade::adopt_sealed_blob;
         let (our_key, fam) = self.local_or_family_parts().await?;
         let ctx = crate::federation::HoldContext {
@@ -5029,6 +5032,9 @@ impl Engine {
         plaintext_size: u64,
         provenance: crate::federation::BlobProvenance,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::adopt_cascade::adopt_sealed_chunk;
         let (our_key, fam) = self.local_or_family_parts().await?;
         let ctx = crate::federation::HoldContext {
@@ -5112,6 +5118,9 @@ impl Engine {
         crate::federation::at_rest_cascade::orchestrate::CascadeResult,
         crate::federation::BlobError,
     > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
         // #846 (§5) — the row's author is THIS node's derived key (I23).
         let author = self.local_derived_key_id().await.map_err(|e| {
@@ -5194,6 +5203,9 @@ impl Engine {
         media_type: Option<&str>,
         aad: Option<&[u8]>,
     ) -> Result<crate::federation::PutBlobScopedResult, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5249,6 +5261,9 @@ impl Engine {
         &self,
         axis: &crate::federation::key_grant::KeyGrantAxis,
     ) -> Result<Option<String>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::key_grant::build_set_for_axis;
         let set = match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5287,6 +5302,9 @@ impl Engine {
         &self,
         set: crate::federation::key_grant::SignedKeyGrantSet,
     ) -> Result<crate::federation::key_grant::KeyGrantAdmission, crate::federation::Error> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::key_grant::admit_replicated_key_grant;
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5302,6 +5320,28 @@ impl Engine {
     /// `run_v31_migration_at_boot`, which needs the signer for the same
     /// reason. Runs before any read; a sentinel that survives aborts the
     /// boot. Idempotent: a no-op on every boot but the first after V145.
+    /// #848 (I66) — **resolve V145's minter sentinel before the first door
+    /// that reads or writes the community-DEK plane.** The DSN constructors
+    /// resolve at boot; an `Engine` over a shared backend
+    /// ([`from_shared`](Self::from_shared) / [`from_shared_with_local`]) is
+    /// synchronous and cannot, so every DEK-plane door calls this first: an
+    /// atomic load once the backend reports resolved, the same resolver
+    /// otherwise — and a survivor fails THIS call (fail-secure) rather than
+    /// leaving old bindings unreadable in silence (CIRISPersist#850 review).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn ensure_minter_sentinels_resolved(&self) -> Result<(), EngineError> {
+        let resolved = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.minter_sentinel_resolved(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.minter_sentinel_resolved(),
+        };
+        if resolved {
+            return Ok(());
+        }
+        self.resolve_minter_sentinels_at_boot().await
+    }
+
     async fn resolve_minter_sentinels_at_boot(&self) -> Result<(), EngineError> {
         // No Ed25519 federation identity ⇒ nothing to resolve TO — but a
         // sentinel that exists is still a minter of nobody, and the boot must
@@ -5347,6 +5387,9 @@ impl Engine {
         epoch: u64,
         state: crate::federation::DekKeyState,
     ) -> Result<(), crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::community_dek::orchestrate::set_key_state;
         let minter = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
@@ -5374,6 +5417,9 @@ impl Engine {
         community_key_id: &str,
         retain_past_epochs: Option<u64>,
     ) -> Result<(), crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::BlobStorage as _;
         // #848 — the policy rides this node's own pointer row.
         let minter = self.local_derived_key_id().await.map_err(|e| {
@@ -5521,6 +5567,9 @@ impl Engine {
         crate::federation::community_dek::orchestrate::CommunityCascadeResult,
         crate::federation::BlobError,
     > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         // #846 (§5) — the row's author is THIS node's derived key (I23).
         let author = self.local_derived_key_id().await.map_err(|e| {
@@ -5601,6 +5650,9 @@ impl Engine {
         viewer_key_id: &str,
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::at_rest_cascade::orchestrate::read_any_for_viewer;
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5633,6 +5685,9 @@ impl Engine {
         range_end_inclusive: u64,
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::chunk_dag_cascade::orchestrate::read_any_range_for_viewer;
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5686,6 +5741,9 @@ impl Engine {
         crate::federation::chunk_dag_cascade::PutChunkScopedResult,
         crate::federation::BlobError,
     > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::chunk_dag_cascade::orchestrate::put_blob_chunk_scoped;
         // #837 — the WRITER is this Engine's signer, the same one
         // `seal_stream_scoped` seals under, so the stream's owner and its
@@ -5745,6 +5803,9 @@ impl Engine {
         viewer_key_id: &str,
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::chunk_dag_cascade::orchestrate::read_stream_chunk_as;
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5776,6 +5837,9 @@ impl Engine {
         crate::federation::chunk_dag_cascade::SealStreamScopedResult,
         crate::federation::BlobError,
     > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::chunk_dag_cascade::orchestrate::seal_stream_scoped;
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5865,6 +5929,9 @@ impl Engine {
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
     ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::community_dek::orchestrate::read_for_community_viewer;
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5906,7 +5973,7 @@ impl Engine {
     > {
         use crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add;
         let now = chrono::Utc::now();
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 rekey_family_member_add(
@@ -5927,7 +5994,21 @@ impl Engine {
                 )
                 .await
             }
+        }?;
+        // #848 §14 (CIRISPersist#850 review) — a retroactive ADD writes new
+        // per-blob wraps for existing self/family ciphertext; each changed
+        // blob's FULL content-axis set is emitted so the newcomer's remote
+        // node receives the key for historical bytes through the same path a
+        // fresh write uses.
+        for sha in &r.changed_blobs {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: crate::federation::types::cohort_scope::FAMILY.to_owned(),
+                owner_key_id: family_key_id.to_owned(),
+            })
+            .await?;
         }
+        Ok(r)
     }
 
     /// #249 Cut G4 (§7) — forward-secrecy re-key on **community** member
@@ -5956,6 +6037,9 @@ impl Engine {
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
     ) -> Result<u64, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
         use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke;
         let now = chrono::Utc::now();
         // #848 (§15) — the revoker's explicit bump is of THIS node's own
@@ -6013,7 +6097,7 @@ impl Engine {
     > {
         use crate::federation::at_rest_cascade::orchestrate::rekey_self_occurrence_add;
         let now = chrono::Utc::now();
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 rekey_self_occurrence_add(
@@ -6034,7 +6118,21 @@ impl Engine {
                 )
                 .await
             }
+        }?;
+        // #848 §14 (CIRISPersist#850 review) — a retroactive ADD writes new
+        // per-blob wraps for existing self/family ciphertext; each changed
+        // blob's FULL content-axis set is emitted so the newcomer's remote
+        // node receives the key for historical bytes through the same path a
+        // fresh write uses.
+        for sha in &r.changed_blobs {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                owner_key_id: identity_key_id.to_owned(),
+            })
+            .await?;
         }
+        Ok(r)
     }
 
     /// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — drive the full

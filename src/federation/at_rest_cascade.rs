@@ -1255,6 +1255,11 @@ pub mod orchestrate {
         /// valid `encryption_pubkeys`. They receive NO grant on ANY blob
         /// in the set; the caller emits `hard_case:recipient_excluded`.
         pub excluded: Vec<String>,
+        /// #848 §14 — the blobs on which at least one NEW grant was written,
+        /// in walk order. Each is a content-axis `KeyGrant` set the caller
+        /// must emit (the full set, re-read), or the newcomer's remote node
+        /// never receives the key for historical bytes (CIRISPersist#850).
+        pub changed_blobs: Vec<[u8; 32]>,
     }
 
     /// The **retroactive key-grant ADD re-wrap** (CIRISPersist#161 Ask 2/4,
@@ -1330,12 +1335,15 @@ pub mod orchestrate {
                 blobs_scanned: blobs.len(),
                 granted,
                 excluded,
+                changed_blobs: Vec::new(),
             });
         }
 
         let content_master = backend.load_or_init_content_master().await?;
 
+        let mut changed_blobs: Vec<[u8; 32]> = Vec::new();
         for sha in &blobs {
+            let mut changed = false;
             // Which keyed newcomers still need a grant on this blob?
             let already: std::collections::HashSet<String> = backend
                 .list_at_rest_grant_recipients(sha)
@@ -1397,6 +1405,10 @@ pub mod orchestrate {
                     .put_at_rest_grant(sha, occ_key_id, WRAP_ALGORITHM_V2, &wrapped, cohort_scope)
                     .await?;
                 granted[i].1 += 1;
+                changed = true;
+            }
+            if changed {
+                changed_blobs.push(*sha);
             }
         }
 
@@ -1404,6 +1416,7 @@ pub mod orchestrate {
             blobs_scanned: blobs.len(),
             granted,
             excluded,
+            changed_blobs,
         })
     }
 

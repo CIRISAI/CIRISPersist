@@ -121,6 +121,38 @@ invariants I59–I67, each a two-node witness driven on sqlite and postgres.
   from-disk I67: the only `DELETE` on the member-grant table is the epoch
   destroy, at-rest grant deletes ride blob deletion only.
 
+### Review round (PR #850, Codex) — five findings, all built and witnessed
+- **A content-axis set that arrives before its bytes projects NOTHING
+  (§13).** The author is not yet known, so the signer cannot be checked
+  against it; a recipient who knows the DEK could have granted an outsider by
+  speaking first. The carrier row is admitted (`KeyGrantAdmission.pending`),
+  and `adopt_sealed_blob` — the moment the row names its author — projects
+  every stored content set *the author signed*
+  (`key_grant::project_pending_content_grants`, `AdoptOutcome.pending_wraps`,
+  `adopt_sealed_blob_json` → `pending_wraps`). Order independence is kept by
+  reconciliation, not by projecting an unverifiable set. I65 rewritten to that
+  order with the adversarial leg (a forged set naming an outsider never
+  projects, before or after the bytes).
+- **Occurrence membership is folded at the set's `asserted_at`**, like the
+  community-removal fold, not at the wall clock. The attestation plane's
+  cohort gate still asks about the signer NOW and stays that way:
+  `asserted_at` is signer-chosen, and a revoked occurrence must never regain
+  admission by back-dating. I60b witnesses both gates by their typed reasons.
+- **A retroactive ADD emits (§14).** `RekeyResult.changed_blobs` names every
+  blob a `rekey_for_newcomers` walk granted anew on; `rekey_family_member_add`
+  / `rekey_self_occurrence_add` (and `self_at_login` through it) emit each
+  changed blob's FULL content-axis set. I68.
+- **Every Python write door emits.** `put_blob_encrypted_community` and
+  `put_blob_encrypted_self_family` now emit after their cascades, through the
+  one helper all five doors share. I69 (from disk).
+- **An `Engine` over a shared backend resolves V145's sentinel at its first
+  DEK-plane door.** `from_shared` / `from_shared_with_local` keep their
+  synchronous signatures (CIRISEdge constructs through them); the backend
+  records that the repair ran, and each of the sixteen doors that touch the
+  community-DEK plane checks it first — an atomic load thereafter, the same
+  resolver otherwise, and a survivor fails THAT door with the sentinel named
+  rather than leaving bindings silently unreadable. I66d, I66e (from disk).
+
 ### Consumer-visible (read before adopting)
 - **An encrypted write now needs a node that can EMIT.** `put_blob_encrypted_*`,
   `put_blob_scoped` at an encrypted tier, `put_blob_chunk_scoped` and

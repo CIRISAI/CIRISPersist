@@ -471,6 +471,21 @@ as well. The `removed_at > minted_at` compare on the CURRENT epoch remains as
 the backstop for a removal that reached the roster without that bump; in
 process it is unreachable, and is stated as BELIEVED in the cut's report.
 
+**Implementation note (PR #850 review).** A content-axis set that arrives
+before its bytes is *admitted and not projected*: the blob row is what names
+the author, so until it exists the signer cannot be checked against the
+author, and a recipient who knows the DEK could otherwise grant an outsider by
+speaking first. The carrier row is stored (`KeyGrantAdmission.pending`), and
+the adopt path — the moment the row names its author — projects every stored
+content set the author signed (`project_pending_content_grants`); a set
+signed by anyone else stays a stored attestation and grants nothing. Order
+independence is kept by reconciliation, never by projecting an unverifiable
+set (I65). The epoch-axis membership check folds occurrence revocations at
+the row's `asserted_at`, as the community-removal fold does; the attestation
+plane's cohort gate asks about the signer *now* and must stay there —
+`asserted_at` is signer-chosen, and a revoked occurrence must not regain
+admission by back-dating (I60b).
+
 ## 14. Emission: the full set, every time, supersedable
 
 - **Epoch axis.** When `ensure_epoch_dek` mints (C, M, E), and after every
@@ -482,6 +497,14 @@ process it is unreachable, and is stated as BELIEVED in the cut's report.
   idempotent on every receiver (§13).
 - **Content axis.** After `encrypt_and_cascade` (self / family) the author
   emits one `KeyGrant` for the blob carrying every occurrence grant.
+
+**Implementation note (PR #850 review).** A retroactive ADD
+(`rekey_for_newcomers`, reached by `rekey_family_member_add`,
+`rekey_self_occurrence_add` and `self_at_login`) writes new per-blob wraps for
+existing self/family ciphertext; it reports each changed blob
+(`RekeyResult.changed_blobs`) and the Engine door emits that blob's full
+content-axis set (I68). Every Python write door — the two specialized doors
+included — emits through one helper (I69).
 
 ## 15. Rotation on admitted removal — every minter, its own counter
 
@@ -511,6 +534,14 @@ node — but SQL cannot know the node's key. V145 writes the sentinel
 the sentinel to the node's own derived key, idempotently, before any read.
 A row still carrying the sentinel after that step aborts the boot.
 
+**Implementation note (PR #850 review).** `Engine::from_shared` /
+`from_shared_with_local` are synchronous and cannot resolve the sentinel at
+construction (CIRISEdge constructs through them). The backend records that
+`repair_minter_sentinel` completed, and every Engine door that touches the
+community-DEK plane checks it first — an atomic load thereafter, the same
+resolver otherwise; a survivor fails that door with the sentinel named,
+never a silently unreadable binding (I66d, I66e).
+
 ## 17. Reads
 
 `community_dek_blob_epoch(sha)` returns `(community, minter, epoch)`;
@@ -535,6 +566,12 @@ door. No shared directory.
 | I65 | Content axis: the owner's second occurrence on B opens a self blob sealed on A once A's set is admitted on B. | a person's other device that cannot read their own content | behavioural, two nodes |
 | I66 | A pre-V145 database resolves every `__this_node__` sentinel to the node's own key at boot, its existing content still opens, and a sentinel that survives aborts the boot. | a silent minter of nobody | behavioural (sqlite + postgres) |
 | I67 | No production path removes a grant within an epoch; the only forward-secrecy mechanism is rotation (from-disk: no `DELETE` on the grant tables outside the epoch destroy sweep). | an un-share | from-disk |
+| I60b | A set from a minter occurrence revoked after the set's `asserted_at` passes the KeyGrant fold (at `asserted_at`) and is refused by the attestation plane's cohort gate (at now); a set asserted after the revocation is refused by the fold itself. | a revoked occurrence regaining admission by back-dating; or a fold at the wall clock | behavioural, two-node, typed reasons |
+| I65 (revised) | A content set admitted before its bytes is `pending` and projects nothing; a forged set from a recipient naming an outsider never projects; the adopt projects the author's set; the outsider stays `NotGranted`. | a recipient granting an outsider by speaking first | behavioural, two-node |
+| I66d | An `Engine` built by `from_shared*` over a V145-migrated backend resolves the sentinel at its first DEK-plane door; a survivor fails that door with the sentinel named. | a shared-backend host with silently unreadable bindings | behavioural, sqlite file |
+| I66e | Every Engine door that touches the community-DEK plane calls the resolver first (from disk, sixteen doors). | a door added without the check | from-disk |
+| I68 | `rekey_self_occurrence_add` names each changed blob and emits its full content set; a second walk changes and emits nothing. | a newcomer device with local grants and no key on its remote node | behavioural, Engine door |
+| I69 | Every Python write door — the two specialized ones included — calls the one emission helper (from disk). | bytes stored through Python with no set on the cursor | from-disk |
 
 ## 19. What Edge and Server do
 

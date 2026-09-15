@@ -227,6 +227,11 @@ pub struct KeyGrantAdmission {
     /// How many grant rows this admit INSERTED (a union: already-held rows
     /// count zero, so a re-applied set reports 0 here and is still `Ok`).
     pub wraps_written: usize,
+    /// Content axis only: the bytes have not arrived, so the author is not
+    /// yet known and the set was NOT projected — the carrier row is stored
+    /// and [`project_pending_content_grants`] projects it (if the author
+    /// signed it) when the adopt names the author (§13).
+    pub pending: bool,
 }
 
 fn refuse(reason: KeyGrantRefusalReason, detail: impl Into<String>) -> Error {
@@ -639,10 +644,20 @@ where
         if member.key_id == signer {
             return Ok(true);
         }
-        let occurrences = directory
-            .list_identity_occurrences_active(&member.key_id)
+        // Folded at `as_of`, not at the wall clock: a set emitted while its
+        // minter occurrence was active, delivered after that occurrence was
+        // revoked, is a valid historical set (CIRISPersist#850 review).
+        let revs = directory
+            .list_identity_occurrence_revocations_for(&member.key_id)
             .await?;
-        if occurrences.iter().any(|o| o.occurrence_key_id == signer) {
+        let occurrences = directory
+            .list_identity_occurrences_for(&member.key_id)
+            .await?;
+        if occurrences
+            .iter()
+            .filter(|o| !revs.iter().any(|r| r.revokes(o, as_of)))
+            .any(|o| o.occurrence_key_id == signer)
+        {
             return Ok(true);
         }
     }
@@ -656,9 +671,13 @@ where
 /// 2. The signer of record is the row's `scrub_key_id`, and it must equal
 ///    `attesting_key_id`: a set speaks for exactly the party that signed it.
 /// 3. Epoch axis: signer == `minter_key_id`, and an active member occurrence
-///    of the community at `asserted_at` per the roster fold. Content axis:
-///    signer == the blob row's `author_key_id` when the row is present; an
-///    absent row is accepted (order independence).
+///    of the community at `asserted_at` per the roster fold (occurrence
+///    revocations folded at `asserted_at` too; the attestation plane's
+///    cohort gate is the backstop at now — `asserted_at` is signer-chosen).
+///    Content axis: signer == the blob row's `author_key_id` when the row is
+///    present; when it is absent the set is **pending** — the carrier row is
+///    admitted and nothing is projected until the adopt names the author
+///    ([`project_pending_content_grants`]; PR #850 review).
 /// 4. The attestation plane admits the carrier row —
 ///    [`apply_replicated_attestation`](FederationDirectory::apply_replicated_attestation),
 ///    which runs the hybrid-Strict federation-tier ingest gate against THIS
@@ -705,6 +724,7 @@ where
     // The signer of record is the scrub key — the one the plane's ingest
     // gate verifies against OUR directory. A set is self-spoken.
     let signer = row.scrub_key_id.as_str();
+    let mut pending = false;
     if signer.is_empty() || signer != row.attesting_key_id {
         return Err(refuse(
             KeyGrantRefusalReason::SignerNotSelf,
@@ -746,18 +766,31 @@ where
                 .ok()
                 .and_then(|v| v.try_into().ok())
                 .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
-            if let Some(prov) = backend.blob_provenance(&sha).await.map_err(map_blob_err)? {
-                if let Some(author) = prov.author_key_id.as_deref() {
-                    if author != signer {
-                        return Err(refuse(
-                            KeyGrantRefusalReason::SignerNotAuthor,
-                            format!(
-                                "signer {signer:?} is not the author {author:?} of blob \
-                                 {at_rest_sha256}"
-                            ),
-                        ));
-                    }
+            match backend
+                .blob_provenance(&sha)
+                .await
+                .map_err(map_blob_err)?
+                .and_then(|p| p.author_key_id)
+            {
+                Some(author) if author != signer => {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::SignerNotAuthor,
+                        format!(
+                            "signer {signer:?} is not the author {author:?} of blob \
+                             {at_rest_sha256}"
+                        ),
+                    ));
                 }
+                Some(_) => {}
+                // The bytes have not arrived: the author is not yet known
+                // to this node, so the signer cannot be checked against it.
+                // The carrier row is admitted (it is a signed attestation
+                // like any other) and NOTHING is projected — a recipient who
+                // knows the DEK must not be able to grant an outsider by
+                // speaking first. `project_pending_content_grants` projects
+                // the sets the AUTHOR signed once the adopt names the author
+                // (order independence, kept; CIRISPersist#850 review).
+                None => pending = true,
             }
         }
     }
@@ -783,6 +816,15 @@ where
         }
     }
 
+    if pending {
+        return Ok(KeyGrantAdmission {
+            wraps_offered: parsed.wraps.len(),
+            axis: parsed.axis,
+            attestation: outcome,
+            wraps_written: 0,
+            pending: true,
+        });
+    }
     // The projection: every wrap, a union.
     let wraps_written = match &parsed.axis {
         KeyGrantAxis::Epoch {
@@ -813,7 +855,63 @@ where
         axis: parsed.axis,
         attestation: outcome,
         wraps_written,
+        pending: false,
     })
+}
+
+/// §13 — **project the content-axis sets that were admitted before their
+/// bytes.** Called by the adopt path the moment a blob row exists with its
+/// author known: every stored `key_grant:content:v1` row for `sha256`
+/// *signed by `author_key_id`* is projected as a union; a row signed by
+/// anyone else stays a stored attestation and grants nothing (the same
+/// `SignerNotAuthor` verdict [`admit_replicated_key_grant`] gives when the
+/// row is present). Idempotent — `ON CONFLICT DO NOTHING` under it, like
+/// every projection. Returns the number of wraps written.
+pub async fn project_pending_content_grants<B>(
+    backend: &B,
+    sha256: &[u8; 32],
+    cohort_scope: &str,
+    author_key_id: &str,
+) -> Result<usize, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
+    let want = hex::encode(sha256);
+    let mut written = 0usize;
+    for row in backend.list_attestations_by(author_key_id).await? {
+        if row.attestation_type != KEY_GRANT_CONTENT_ATTESTATION_TYPE
+            || row.scrub_key_id != author_key_id
+        {
+            continue;
+        }
+        let Ok(parsed) = KeyGrantSet::from_attestation(&row) else {
+            continue;
+        };
+        let KeyGrantAxis::Content {
+            at_rest_sha256,
+            cohort_scope: set_scope,
+            ..
+        } = &parsed.axis
+        else {
+            continue;
+        };
+        if *at_rest_sha256 != want || set_scope != cohort_scope {
+            continue;
+        }
+        if parsed
+            .wraps
+            .iter()
+            .any(|w| w.wrap_algorithm != WRAP_ALGORITHM_V2)
+        {
+            continue;
+        }
+        written += backend
+            .put_at_rest_grants(sha256, cohort_scope, &parsed.wraps)
+            .await
+            .map_err(map_blob_err)?;
+    }
+    Ok(written)
 }
 
 #[cfg(test)]

@@ -907,6 +907,41 @@ pub mod two_node {
             "{tag} I65: the second device is granted"
         );
         let sha = sealed.at_rest_sha256;
+        // (1) A FORGED content set from the second device — a recipient who
+        // knows the DEK — naming an outsider, delivered BEFORE the bytes.
+        // The author is not yet known here, so the signer cannot be checked
+        // against it: the carrier is stored, NOTHING is projected (§13,
+        // PR #850 review) — and nothing ever will be, see (3).
+        let outsider = format!("{tag}-outsider-{run}");
+        let forged = KeyGrantSet {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: SELF.into(),
+                owner_key_id: owner.clone(),
+            },
+            wraps: vec![crate::federation::GrantWrap {
+                recipient_key_id: outsider.clone(),
+                wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+                wrapped_dek: "{}".into(),
+            }],
+        };
+        let forged_admission =
+            admit_replicated_key_grant(a2.backend, sign_set_unstored(&a2.signer, &forged).await)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I65: a set before its bytes is stored: {e}"));
+        assert!(
+            forged_admission.pending && forged_admission.wraps_written == 0,
+            "{tag} I65: before the bytes, a content set projects NOTHING: {forged_admission:?}"
+        );
+        assert!(
+            a2.backend
+                .get_at_rest_grant(&sha, &outsider)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I65: the outsider has no grant row"
+        );
+        // (2) The AUTHOR's set, also before the bytes: pending, nothing yet.
         let emitted =
             emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, SELF, &owner)
                 .await
@@ -923,12 +958,16 @@ pub mod two_node {
             hex::encode(sha)
         );
         assert!(
+            admission.pending && admission.wraps_written == 0,
+            "{tag} I65: the author's set is pending until the bytes name the author: {admission:?}"
+        );
+        assert!(
             a2.backend
                 .get_at_rest_grant(&sha, &a2.key)
                 .await
                 .unwrap()
-                .is_some(),
-            "{tag} I65: the second device's grant row landed"
+                .is_none(),
+            "{tag} I65: nothing projects before the author is known"
         );
         // The second device's operator names the first as family (#846 §4):
         // that is what makes it party to the owner's own content.
@@ -944,6 +983,33 @@ pub mod two_node {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I65: the second device adopts: {e}"));
+        // (3) The adopt named the author: the author's set projected, the
+        // forged one did not and never will (order independence, kept).
+        assert!(
+            a2.backend
+                .get_at_rest_grant(&sha, &a2.key)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I65: the second device's grant row landed with the bytes"
+        );
+        assert!(
+            a2.backend
+                .get_at_rest_grant(&sha, &outsider)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I65: a set the author did not sign never projects"
+        );
+        // (4) A re-delivered author set after the bytes projects directly —
+        // the row is present, the author is checked, every wrap already held.
+        let again = carry_key_grant(a, a2, &emitted.attestation_id)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I65: re-delivery: {e}"));
+        assert!(
+            !again.pending && again.wraps_written == 0,
+            "{tag} I65: {again:?}"
+        );
         assert!(
             a2.backend
                 .get_at_rest_grant(&sha, crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
@@ -965,6 +1031,105 @@ pub mod two_node {
         assert!(
             matches!(err, BlobError::NotGranted { .. }),
             "{tag} I65: {err:?}"
+        );
+        let err = read_any_for_viewer(a2.backend, &sha, &outsider, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I65: the outsider the forged set named stays refused: {err:?}"
+        );
+    }
+
+    /// **I60b — a set from a minter occurrence that is no longer active is
+    /// refused, even one asserted before the revocation — and by the RIGHT
+    /// gate.** The KeyGrant check folds membership at the row's
+    /// `asserted_at` (consistent with the community-removal fold, §13): a set
+    /// asserted while the occurrence was active passes it. The attestation
+    /// plane's cohort gate then asks about the signer NOW and refuses — and
+    /// that gate must stay at now: `asserted_at` is signer-chosen, so a
+    /// revoked occurrence must never regain admission by back-dating. The
+    /// two legs give different typed reasons, which is what makes the fold
+    /// observable: early → the plane's own refusal (the fold passed); late →
+    /// `signer_not_active_member` (the fold refused first).
+    /// Ruled on PR #850's review.
+    pub async fn exercise_i60b_delayed_set_survives_a_later_occurrence_revocation<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        seed_community_everywhere(&[a, b], &comm, &[(&alice, Some(a)), (&bob, Some(b))]).await;
+        encrypt_and_cascade_community(a.backend, &comm, b"while active", None, Some(&a.key))
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I60b: A seals: {e}"));
+        let early = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+            .await
+            .unwrap()
+            .expect("A holds wraps");
+        let early_row = a
+            .backend
+            .get_attestation(&early.attestation_id)
+            .await
+            .unwrap()
+            .expect("the early row");
+        // B learns that A's occurrence was revoked AFTER the early set was
+        // asserted (and before now).
+        b.backend
+            .put_identity_occurrence_revocation_local(
+                crate::federation::types::IdentityOccurrenceRevocation {
+                    identity_key_id: alice.clone(),
+                    occurrence_key_id: a.key.clone(),
+                    revoked_at: chrono::Utc::now(),
+                    effective_at: early_row.asserted_at + chrono::Duration::milliseconds(1),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I60b: B records the revocation: {e}"));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let err = carry_key_grant(a, b, &early.attestation_id)
+            .await
+            .expect_err("{tag} I60b: the plane's cohort gate refuses a revoked occurrence");
+        // The plane's write-path gate propagates as its own error, not as a
+        // typed KeyGrant refusal: the fold at `asserted_at` PASSED, and the
+        // refusal names the plane's membership gate.
+        assert!(
+            !matches!(err, Error::KeyGrantRefused { .. }),
+            "{tag} I60b: the fold at asserted_at must pass a set asserted while active: {err}"
+        );
+        assert!(
+            err.to_string().contains("not a member"),
+            "{tag} I60b: the plane's cohort gate (at now) is what refuses: {err}"
+        );
+        assert!(
+            !b.backend
+                .community_dek_has_member_grant(&comm, &a.key, 0, &b.key)
+                .await
+                .unwrap(),
+            "{tag} I60b: nothing projected"
+        );
+        // The same minter, speaking AFTER the revocation: the fold itself
+        // refuses, before the plane is asked.
+        let late = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+            .await
+            .unwrap()
+            .expect("A still holds wraps");
+        assert_ne!(late.attestation_id, early.attestation_id);
+        let err = carry_key_grant(a, b, &late.attestation_id)
+            .await
+            .expect_err("{tag} I60b: a set asserted after the revocation is refused");
+        assert_eq!(
+            refusal_reason(&err),
+            "signer_not_active_member",
+            "{tag} I60b: {err}"
         );
     }
 }
@@ -1080,6 +1245,91 @@ mod tests {
     }
 
     /// Strip `#[cfg(test)] mod` regions from a source file.
+    /// The body of `fn NAME(` in `text`, up to the next method at the same
+    /// indentation (its doc comment included, which is harmless).
+    fn method_body<'t>(text: &'t str, name: &str) -> &'t str {
+        let start = text
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} is defined"));
+        let rest = &text[start + 1..];
+        let end = [
+            "\n    pub async fn ",
+            "\n    pub fn ",
+            "\n    async fn ",
+            "\n    fn ",
+            "\n}\n",
+        ]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .map(|i| start + 1 + i)
+        .unwrap_or(text.len());
+        &text[start..end]
+    }
+
+    /// **I69 (from disk) — every Python write door emits** (PR #850
+    /// review: the two specialized doors did not). Each `#[pymethods]` door
+    /// calls the one emission helper.
+    #[test]
+    fn i69_every_python_write_door_emits_the_key_grant_set() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("src/ffi/pyo3.rs")).unwrap();
+        let prod = production_only(&text);
+        for door in [
+            "put_blob_scoped",
+            "put_blob_encrypted_community",
+            "put_blob_encrypted_self_family",
+            "put_blob_chunk_scoped",
+            "seal_stream_scoped",
+        ] {
+            assert!(
+                method_body(&prod, door).contains("emit_key_grant_axis_async"),
+                "I69: PyEngine::{door} must emit the KeyGrant set after its cascade (§14)"
+            );
+        }
+    }
+
+    /// **I66e (from disk) — every DEK-plane door of the Engine resolves the
+    /// sentinel first**, so an `Engine` built by `from_shared*` (which cannot
+    /// repair synchronously) is repaired at its first such door. And **I68's
+    /// carrier**: both retroactive-ADD doors consume `changed_blobs`.
+    #[test]
+    fn i66e_every_dek_plane_door_resolves_the_sentinel_first() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("src/engine.rs")).unwrap();
+        let prod = production_only(&text);
+        for door in [
+            "put_blob_scoped",
+            "put_blob_encrypted_community",
+            "put_blob_encrypted_self_family",
+            "put_blob_chunk_scoped",
+            "seal_stream_scoped",
+            "read_blob_as",
+            "read_blob_range_as",
+            "read_stream_chunk_as",
+            "read_blob_for_community_viewer",
+            "adopt_sealed_blob",
+            "adopt_sealed_chunk",
+            "apply_replicated_key_grant",
+            "emit_key_grant",
+            "community_dek_set_key_state",
+            "community_dek_set_retain_past_epochs",
+            "rekey_community_member_revoke",
+        ] {
+            assert!(
+                method_body(&prod, door).contains("ensure_minter_sentinels_resolved()"),
+                "I66e: Engine::{door} must resolve V145's sentinel before touching the DEK plane"
+            );
+        }
+        for door in ["rekey_family_member_add", "rekey_self_occurrence_add"] {
+            let body = method_body(&prod, door);
+            assert!(
+                body.contains("changed_blobs") && body.contains("emit_key_grant("),
+                "I68: Engine::{door} must emit each changed blob's content set (§14)"
+            );
+        }
+    }
+
     fn production_only(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut depth = 0i32;
@@ -1312,6 +1562,86 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+        /// **I66d — an `Engine` over a SHARED backend resolves the sentinel
+        /// at its first DEK-plane door** (PR #850 review). `from_shared*` are
+        /// synchronous and cannot repair; the first door does, and a
+        /// survivor fails THAT door rather than leaving bindings unreadable.
+        #[tokio::test]
+        async fn i66_from_shared_resolves_the_sentinel_at_the_first_door_sqlite() {
+            use std::sync::Arc;
+            let dir = tempfile::tempdir().unwrap();
+            for survivor in [false, true] {
+                let path = dir.path().join(format!("shared-{survivor}.db"));
+                let sha = {
+                    let backend = SqliteBackend::open(path.to_string_lossy().to_string())
+                        .await
+                        .unwrap();
+                    backend.run_migrations_through(144).await.unwrap();
+                    seed_pre_v145(&backend).await
+                };
+                let backend = SqliteBackend::open(path.to_string_lossy().to_string())
+                    .await
+                    .unwrap();
+                backend.run_migrations().await.unwrap();
+                assert_eq!(sentinel_rows(&backend), 4, "I66d: V145 wrote the sentinel");
+                let local = crate::federation::tier_ingest::test_support::local_signer(&format!(
+                    "i66d-{survivor}"
+                ));
+                let key = local.derived_key_id();
+                if survivor {
+                    // The resolved row already exists: the sentinel cannot
+                    // resolve onto it.
+                    let conn = backend.conn_handle();
+                    let conn = conn.lock();
+                    conn.execute(
+                        "INSERT INTO federation_community_dek \
+                            (community_key_id, minter_key_id, epoch, wrap_algorithm, wrapped_dek) \
+                         VALUES ('legacy-comm', ?1, 1, 'aes256_gcm_content_master', 'x')",
+                        rusqlite::params![key],
+                    )
+                    .unwrap();
+                }
+                let backend = Arc::new(backend);
+                let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+                    crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+                );
+                let engine = crate::Engine::from_shared_with_local(
+                    crate::engine::BackendDispatch::Sqlite(backend.clone()),
+                    signer,
+                    Some(local),
+                );
+                assert_eq!(
+                    sentinel_rows(&backend),
+                    4,
+                    "I66d: a synchronous constructor resolves nothing"
+                );
+                let read = engine
+                    .read_blob_for_community_viewer(&sha, "viewer-occ")
+                    .await;
+                if survivor {
+                    let err = read.expect_err("I66d: a survivor fails the first door");
+                    assert!(
+                        err.to_string().contains("minter-sentinel"),
+                        "I66d: the failure names the sentinel resolution: {err}"
+                    );
+                } else {
+                    assert_eq!(
+                        read.expect("I66d: the first door resolved and read"),
+                        b"pre-V145 minutes"
+                    );
+                    assert_eq!(
+                        sentinel_rows(&backend),
+                        0,
+                        "I66d: resolved at the first door"
+                    );
+                    assert_eq!(
+                        backend.community_dek_blob_epoch(&sha).await.unwrap(),
+                        Some(("legacy-comm".into(), key.clone(), 1)),
+                        "I66d: the binding's minter is the shared engine's own key"
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "postgres")]
@@ -1483,6 +1813,16 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn i60b_delayed_set_survives_a_later_occurrence_revocation_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node(&ba, "i60b-a").await;
+            let b = node(&bb, "i60b-b").await;
+            introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
+            exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "sqlite")
+                .await;
+        }
+
+        #[tokio::test]
         async fn i61_end_to_end_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node(&ba, "i61-a").await;
@@ -1526,6 +1866,122 @@ mod tests {
             let a2 = node(&bb, "i65-a2").await;
             introduce(&[&a, &a2], &["i65-a", "i65-a2"]).await;
             exercise_i65_content_axis_second_device(&a, &a2, "sqlite").await;
+        }
+
+        /// **I68 — a retroactive ADD emits each changed blob's content set**
+        /// (PR #850 review). `rekey_self_occurrence_add` writes new per-blob
+        /// wraps for a newcomer device; the Engine door emits the FULL
+        /// content-axis set for every blob it changed, so the newcomer's
+        /// remote node receives the key for historical bytes through the
+        /// same path a fresh write uses. Idempotent: a second walk changes
+        /// nothing and emits nothing.
+        #[tokio::test]
+        async fn i68_rekey_for_a_newcomer_emits_each_changed_blobs_content_set_sqlite() {
+            use crate::federation::key_grant::{
+                KeyGrantAxis, KeyGrantSet, KEY_GRANT_CONTENT_ATTESTATION_TYPE,
+            };
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::cohort_scope::SELF;
+            use crate::federation::types::identity_type::USER;
+            use crate::federation::{BlobStorage, EncryptionPubkeys, FederationDirectory};
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("i68-node-{run}");
+            let engine =
+                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+                    .await
+                    .unwrap();
+            engine
+                .register_self_federation_key(USER, &alias, None, serde_json::json!({}), vec![])
+                .await
+                .unwrap();
+            let sq = engine.sqlite_backend().unwrap().clone();
+            let me = engine.local_derived_key_id().await.unwrap();
+            let kem =
+                |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                    x25519_base64: id.x25519_pubkey_b64,
+                    ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+                };
+            let owner = format!("i68-owner-{run}");
+            ts::register_hybrid_key_as(sq.as_ref(), &owner, &owner, USER).await;
+            let occurrence =
+                |occ: &str, pk: EncryptionPubkeys| crate::federation::types::IdentityOccurrence {
+                    identity_key_id: owner.clone(),
+                    occurrence_key_id: occ.to_owned(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys: Some(pk),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                };
+            sq.put_identity_occurrence_local(occurrence(
+                &me,
+                kem(sq.load_or_init_content_kem_identity().await.unwrap()),
+            ))
+            .await
+            .unwrap();
+            let r = engine
+                .put_blob_encrypted_self_family(SELF, &owner, b"photo", None)
+                .await
+                .expect("I68: the owner's first device seals");
+            let sha = r.at_rest_sha256;
+            let sets_for = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
+                let mut out: Vec<KeyGrantSet> = Vec::new();
+                for row in sq.list_attestations_by(&me).await.unwrap() {
+                    if row.attestation_type != KEY_GRANT_CONTENT_ATTESTATION_TYPE {
+                        continue;
+                    }
+                    let set = KeyGrantSet::from_attestation(&row).unwrap();
+                    if matches!(&set.axis, KeyGrantAxis::Content { at_rest_sha256, .. } if *at_rest_sha256 == hex::encode(sha))
+                    {
+                        out.push(set);
+                    }
+                }
+                out
+            };
+            let before = sets_for(sq.clone(), me.clone()).await;
+            assert_eq!(before.len(), 1, "I68: the write emitted one content set");
+            // A NEW device of the owner, with its own content-KEM identity.
+            let other = fresh().await;
+            let dev2 = format!("i68-dev2-{run}");
+            ts::register_hybrid_key_as(sq.as_ref(), &dev2, &dev2, USER).await;
+            sq.put_identity_occurrence_local(occurrence(
+                &dev2,
+                kem(other.load_or_init_content_kem_identity().await.unwrap()),
+            ))
+            .await
+            .unwrap();
+            let rk = engine
+                .rekey_self_occurrence_add(&owner, std::slice::from_ref(&dev2))
+                .await
+                .expect("I68: the retroactive add");
+            assert_eq!(
+                rk.changed_blobs,
+                vec![sha],
+                "I68: the walk names the blob it changed"
+            );
+            assert!(sq.get_at_rest_grant(&sha, &dev2).await.unwrap().is_some());
+            let after = sets_for(sq.clone(), me.clone()).await;
+            assert_eq!(
+                after.len(),
+                2,
+                "I68: the rekey emitted the blob's content set"
+            );
+            assert!(
+                after
+                    .iter()
+                    .any(|s| s.wraps.iter().any(|w| w.recipient_key_id == dev2)
+                        && s.wraps.iter().any(|w| w.recipient_key_id == me)),
+                "I68: the emitted set is the FULL set — the new device AND the first"
+            );
+            // Idempotent: nothing changed, nothing emitted.
+            let rk2 = engine
+                .rekey_self_occurrence_add(&owner, std::slice::from_ref(&dev2))
+                .await
+                .unwrap();
+            assert!(rk2.changed_blobs.is_empty(), "I68: {rk2:?}");
+            assert_eq!(sets_for(sq.clone(), me.clone()).await.len(), 2);
         }
 
         /// I61 through the CONSUMER-HELD doors: two `Engine`s, each its own
@@ -1710,6 +2166,19 @@ mod tests {
             let b = node(&bb, "i60-b").await;
             introduce(&[&a, &b], &["i60-a", "i60-b"]).await;
             exercise_i60_forged_set_refused(&a, &b, "postgres").await;
+        }
+
+        #[tokio::test]
+        async fn i60b_delayed_set_survives_a_later_occurrence_revocation_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node(&ba, "i60b-a").await;
+            let b = node(&bb, "i60b-b").await;
+            introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
+            exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "postgres")
+                .await;
         }
 
         #[tokio::test]

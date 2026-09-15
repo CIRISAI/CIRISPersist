@@ -121,6 +121,11 @@ pub struct SqliteBackend {
     /// the host via `set_node_key_id`. `None` until told, and gates that need
     /// it MUST fail secure rather than invent one.
     node_key_id: std::sync::RwLock<Option<String>>,
+    /// #848 (I66) — set once [`Self::repair_minter_sentinel`] has run to
+    /// completion on this backend; an `Engine` built over a shared backend
+    /// (`from_shared*`) resolves lazily at its first DEK-plane door when
+    /// this is still false (CIRISPersist#850 review).
+    minter_sentinel_resolved: std::sync::atomic::AtomicBool,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no gate (bootstrap-permissive). See
     /// [`SqliteBackend::set_admission_gate`].
@@ -436,7 +441,7 @@ impl SqliteBackend {
         node_key_id: Option<&str>,
     ) -> Result<usize, Error> {
         let node = node_key_id.map(str::to_owned);
-        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+        let n = self.write(move |conn| -> Result<usize, rusqlite::Error> {
             let tx = conn.transaction()?;
             let mut n = 0usize;
             if let Some(node) = &node {
@@ -480,7 +485,10 @@ impl SqliteBackend {
         .map_err(|e| Error::Migration {
             sqlstate: None,
             detail: format!("sqlite minter-sentinel resolution (#848): {e}"),
-        })
+        })?;
+        self.minter_sentinel_resolved
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(n)
     }
 
     /// Test-only: apply migrations up to and including `version`, so a test
@@ -660,6 +668,7 @@ impl SqliteBackend {
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
             node_key_id: std::sync::RwLock::new(None),
+            minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -775,6 +784,12 @@ impl SqliteBackend {
     /// its own identity is a backend that can be told the wrong one.
     pub fn set_node_key_id(&self, key_id: impl Into<String>) {
         *self.node_key_id.write().expect("node_key_id lock") = Some(key_id.into());
+    }
+
+    /// #848 — has [`Self::repair_minter_sentinel`] completed on this backend?
+    pub fn minter_sentinel_resolved(&self) -> bool {
+        self.minter_sentinel_resolved
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Snapshot the currently-installed hardware-attestation policy.

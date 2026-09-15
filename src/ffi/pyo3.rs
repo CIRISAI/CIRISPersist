@@ -1296,6 +1296,50 @@ impl PyEngine {
     /// `Engine::local_derived_key_id` runs; `ValueError` on a non-Ed25519
     /// composed signer (#275).
     ///
+    /// #848 (§14) — **the emission every Python write door performs after
+    /// a cascade that minted or granted anew** (CIRISPersist#850 review: the
+    /// specialized doors `put_blob_encrypted_community` /
+    /// `put_blob_encrypted_self_family` emitted nothing). The set is signed
+    /// by the LocalSigner (the hybrid signer this engine has) and stored
+    /// through the attestation plane so it replicates; an engine that cannot
+    /// sign it says so rather than leaving members with bytes and no key.
+    /// `async` — the caller blocks inside `py.detach` (CIRISPersist#580).
+    async fn emit_key_grant_axis_async(
+        &self,
+        axis: &crate::federation::key_grant::KeyGrantAxis,
+    ) -> PyResult<()> {
+        let local = self.local_signer.clone().ok_or_else(|| {
+            blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                "the key_grant set for this write cannot be emitted: this engine has no \
+                 LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the bytes are \
+                 stored and the key cannot follow them"
+                    .into(),
+            ))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(pg) => {
+                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                    pg.as_ref(),
+                    &local,
+                    axis,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(sq) => {
+                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                    sq.as_ref(),
+                    &local,
+                    axis,
+                )
+                .await
+            }
+        }
+        .map(|_| ())
+        .map_err(federation_err_to_py)
+    }
+
     /// Async on purpose: the blocking wait belongs to the CALLER, inside its
     /// `py.detach` span, where the #580 gate can see the GIL is released. A
     /// helper that blocked here would be correct at every call site today and
@@ -6157,7 +6201,9 @@ impl PyEngine {
     /// member at `asserted_at`) or the blob's author (content axis, when the
     /// row is present); every wrap must be v2. Returns the
     /// `KeyGrantAdmission` as JSON: `axis`, the attestation plane's
-    /// `attestation` outcome, `wraps_offered`, `wraps_written` (a union: a
+    /// `attestation` outcome, `wraps_offered`, `pending` (content axis, the
+    /// bytes have not arrived: the carrier is stored, nothing projected until
+    /// the adopt names the author — §13), `wraps_written` (a union: a
     /// re-applied set writes 0 and is still admitted). A refusal is a
     /// `federation_key_grant_refused` error naming its reason.
     fn apply_replicated_key_grant(
@@ -12770,6 +12816,7 @@ impl PyEngine {
                 use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
                 // #846 (§5) — the row's author is this node's derived key (I23).
                 let author = self.runtime.block_on(self.local_derived_key_id_async())?;
+                let community_for_axis = community.clone();
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -12801,6 +12848,17 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                // #848 (§14) — the key follows the bytes (mirrors
+                // `Engine::put_blob_encrypted_community`).
+                if res.fanout_changed {
+                    runtime.block_on(self.emit_key_grant_axis_async(
+                        &crate::federation::key_grant::KeyGrantAxis::Epoch {
+                            community_key_id: community_for_axis,
+                            minter_key_id: res.minter_key_id.clone(),
+                            epoch: res.epoch,
+                        },
+                    ))?;
+                }
                 let readable_by_nobody = res.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(res.at_rest_sha256),
@@ -12914,41 +12972,7 @@ impl PyEngine {
                 // replicates. An engine that cannot sign it says so rather than
                 // leaving members with bytes and no key.
                 if let Some(axis) = r.key_grant_emission.as_ref() {
-                    let local = self.local_signer.clone().ok_or_else(|| {
-                        blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                            "the key_grant set for this write cannot be emitted: this engine has \
-                             no LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the \
-                             bytes are stored and the key cannot follow them"
-                                .into(),
-                        ))
-                    })?;
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => {
-                            let backend = pg.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => {
-                            let backend = sq.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                    }
-                    .map_err(federation_err_to_py)?;
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
                 }
                 let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
@@ -13329,7 +13353,10 @@ impl PyEngine {
     ///   "disposition": "announce | local_only"
     /// }
     /// ```
-    /// Returns JSON `{"sha256": "<hex>", "announced": bool}`. Refusals
+    /// Returns JSON `{"sha256": "<hex>", "announced": bool, "pending_wraps":
+    /// n}` — `pending_wraps` counts content-axis grants projected from
+    /// `KeyGrant` sets the author signed that arrived before the bytes (§13).
+    /// Refusals
     /// keep their `BlobError` class: `blob_not_party_to`,
     /// `blob_disk_pressure_proxy_refused`, `blob_invalid_argument`.
     fn adopt_sealed_blob_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
@@ -13368,6 +13395,7 @@ impl PyEngine {
                 Ok(serde_json::json!({
                     "sha256": hex::encode(out.sha256),
                     "announced": out.announced,
+                    "pending_wraps": out.pending_wraps,
                 })
                 .to_string())
             })
@@ -13523,41 +13551,7 @@ impl PyEngine {
                 // replicates. An engine that cannot sign it says so rather than
                 // leaving members with bytes and no key.
                 if let Some(axis) = r.key_grant_emission.as_ref() {
-                    let local = self.local_signer.clone().ok_or_else(|| {
-                        blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                            "the key_grant set for this write cannot be emitted: this engine has \
-                             no LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the \
-                             bytes are stored and the key cannot follow them"
-                                .into(),
-                        ))
-                    })?;
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => {
-                            let backend = pg.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => {
-                            let backend = sq.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                    }
-                    .map_err(federation_err_to_py)?;
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
                 }
                 let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
@@ -13655,41 +13649,7 @@ impl PyEngine {
                 // replicates. An engine that cannot sign it says so rather than
                 // leaving members with bytes and no key.
                 if let Some(axis) = r.key_grant_emission.as_ref() {
-                    let local = self.local_signer.clone().ok_or_else(|| {
-                        blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                            "the key_grant set for this write cannot be emitted: this engine has \
-                             no LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the \
-                             bytes are stored and the key cannot follow them"
-                                .into(),
-                        ))
-                    })?;
-                    match &self.backend {
-                        #[cfg(feature = "postgres")]
-                        BackendDispatch::Postgres(pg) => {
-                            let backend = pg.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                        #[cfg(feature = "sqlite")]
-                        BackendDispatch::Sqlite(sq) => {
-                            let backend = sq.clone();
-                            runtime.block_on(async move {
-                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
-                                    backend.as_ref(),
-                                    &local,
-                                    axis,
-                                )
-                                .await
-                            })
-                        }
-                    }
-                    .map_err(federation_err_to_py)?;
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
                 }
                 let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
@@ -13919,6 +13879,7 @@ impl PyEngine {
                 use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
                 // #846 (§5) — the row's author is this node's derived key (I23).
                 let author = self.runtime.block_on(self.local_derived_key_id_async())?;
+                let (scope_for_axis, owner_for_axis) = (scope.clone(), owner.clone());
                 let res = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -13954,6 +13915,15 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                // #848 (§14, content axis) — a fresh per-write DEK is always a
+                // new set (mirrors `Engine::put_blob_encrypted_self_family`).
+                runtime.block_on(self.emit_key_grant_axis_async(
+                    &crate::federation::key_grant::KeyGrantAxis::Content {
+                        at_rest_sha256: hex::encode(res.at_rest_sha256),
+                        cohort_scope: scope_for_axis,
+                        owner_key_id: owner_for_axis,
+                    },
+                ))?;
                 let readable_by_nobody = res.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(res.at_rest_sha256),

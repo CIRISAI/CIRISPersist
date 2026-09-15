@@ -45,6 +45,9 @@ pub struct AdoptOutcome {
     pub sha256: [u8; 32],
     /// Whether a `holds_bytes` claim was emitted.
     pub announced: bool,
+    /// Content-axis wraps projected from `KeyGrant` sets that arrived before
+    /// the bytes and were signed by the author (§13; 0 when none waited).
+    pub pending_wraps: usize,
 }
 
 /// Shape and tier checks shared by the blob and chunk doors: the bytes must
@@ -163,9 +166,23 @@ where
             claim,
         )
         .await?;
+    // #848 §13 (CIRISPersist#850 review) — the row now names its author:
+    // project every content-axis `KeyGrant` set the AUTHOR signed that
+    // arrived before the bytes. A set signed by anyone else stays a stored
+    // attestation and grants nothing. Order independence is kept here, not
+    // by projecting an unverifiable set at admission.
+    let pending_wraps = crate::federation::key_grant::project_pending_content_grants(
+        backend,
+        &sha256,
+        &provenance.cohort_scope,
+        &provenance.author_key_id,
+    )
+    .await
+    .map_err(|e| BlobError::Backend(format!("pending key_grant projection: {e}")))?;
     Ok(AdoptOutcome {
         sha256,
         announced: announce,
+        pending_wraps,
     })
 }
 
