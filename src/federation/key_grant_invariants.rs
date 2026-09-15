@@ -1512,6 +1512,102 @@ pub mod two_node {
                 "{tag} I77 (5): {err}"
             );
         }
+        // (6) PR #852 round three — one occurrence key under TWO identities
+        // (ownership moved alice → bob; alice's row left, inserted FIRST so a
+        // LIMIT-1 lookup would return it): bob's row revoked, bob's binding
+        // live and alice's absent. The revocation on ANY row is final.
+        #[cfg(feature = "sqlite")]
+        {
+            let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            crate::store::Backend::run_migrations(&d).await.unwrap();
+            ts::register_hybrid_key_as(
+                &d,
+                &a.key,
+                "i77-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            ts::register_identity_key(&d, &alice, USER).await;
+            ts::register_identity_key(&d, &bob, USER).await;
+            ts::register_hybrid_key_as(&d, &comm, &comm, USER).await;
+            d.put_community(ts::sign_community(
+                &comm,
+                crate::federation::types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "Principal Co-op".into(),
+                    members: [&alice, &bob]
+                        .into_iter()
+                        .map(|k| crate::federation::types::CommunityMember {
+                            key_id: k.clone(),
+                            joined_at: chrono::Utc::now(),
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+            let long_ago = chrono::Utc::now() - chrono::Duration::seconds(30);
+            for ident in [&alice, &bob] {
+                d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                    identity_key_id: ident.clone(),
+                    occurrence_key_id: a.key.clone(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: long_ago,
+                    valid_until: None,
+                    encryption_pubkeys: Some(a.kem.clone()),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                })
+                .await
+                .unwrap();
+            }
+            d.apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-d-{run}"), &bob, &a.key),
+            })
+            .await
+            .unwrap();
+            d.put_identity_occurrence_revocation_local(
+                crate::federation::types::IdentityOccurrenceRevocation {
+                    identity_key_id: bob.clone(),
+                    occurrence_key_id: a.key.clone(),
+                    revoked_at: chrono::Utc::now(),
+                    effective_at: chrono::Utc::now(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let newest = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+                .await
+                .unwrap()
+                .expect("A still holds wraps");
+            let row3 = a
+                .backend
+                .get_attestation(&newest.attestation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let err = admit_replicated_key_grant(&d, SignedKeyGrantSet { attestation: row3 })
+                .await
+                .expect_err("{tag} I77 (6): a revocation on ANY row for the key is final");
+            assert_eq!(
+                refusal_reason(&err),
+                "signer_not_active_member",
+                "{tag} I77 (6): {err}"
+            );
+        }
     }
 
     /// **I76 (#851 §20.2) — the content-only signed occurrence.** A node

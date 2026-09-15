@@ -2856,6 +2856,12 @@ pub async fn sign_holds_bytes_claim(
     // producer: `PqcNotConfigured` falls through to the classical path
     // below (the same bytes, signed by `signer`, no PQC half) exactly as
     // before; any other signing error propagates.
+    // The LocalSigner signs only when it IS the claimed attester: an Engine
+    // whose composed `signer` and `local_signer` are different identities
+    // (`from_shared_with_local`) would otherwise announce a row signed by one
+    // key and attributed to another, which every peer refuses (PR #852
+    // review, round three). Otherwise the classical path, as before.
+    let pqc = pqc.filter(|l| l.derived_key_id() == attesting_key_id);
     let hybrid = match pqc {
         Some(local) => match local.sign_hybrid(&canonical_bytes).await {
             Ok(sig) => Some((

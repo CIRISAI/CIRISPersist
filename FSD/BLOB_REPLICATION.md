@@ -705,6 +705,14 @@ form consults the LIVE owner binding on every admission and never the
 occurrence row a prior admission left, so a withdrawn or lapsed binding
 stops vouching the moment it dies (I76, legs 4 and 5).
 
+**Implementation note (PR #852 review, round three).** The occurrence
+table's key is `(identity, occurrence)`, so one key may be bound under several
+identities; admission checks revocations across EVERY row for the minter's
+key (`list_identity_occurrences_by_occurrence_key`), never one row of them
+(I77 6). The `holds_bytes` claim's LocalSigner signs only when its derived id
+is the claimed attester; a different local identity falls to the classical
+path under the attester (I81).
+
 ### 20.3 The door: a node publishes its own occurrence
 
 `Engine::publish_self_occurrence(identity_key_id, device_class)` /

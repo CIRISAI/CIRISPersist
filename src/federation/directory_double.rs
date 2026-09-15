@@ -776,6 +776,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.lookup_family(family_key_id).await
     }
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        if let Some(e) = self.faulted("list_identity_occurrences_by_occurrence_key") {
+            return Err(e);
+        }
+        self.inner
+            .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
+            .await
+    }
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,

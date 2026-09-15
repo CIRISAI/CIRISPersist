@@ -81,6 +81,18 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
 - **The content-only gate binds the envelope's `attesting_key_id` to the
   wrapper's** (the transport-bound path's SubjectMismatch rule). I76 (6).
 
+### Review round three (PR #852, Codex) — two P1s
+- **A revocation on ANY row bound under the minter's key is final.** The
+  occurrence table is keyed `(identity, occurrence)`, so one key may be bound
+  under several identities (ownership moved, a stale row left) and
+  `lookup_identity_for_occurrence` returns one of them. New floor
+  `list_identity_occurrences_by_occurrence_key` (all four directories);
+  KeyGrant admission checks every row's revocations before the lift. I77 (6).
+- **The LocalSigner signs a claim only when it is the claimed attester.** An
+  Engine whose composed `signer` and `local_signer` are different identities
+  (`from_shared_with_local`) fell to a row signed by one key and attributed
+  to another; now the classical path under the attester. I81.
+
 ### Fixed
 - **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
   A write door's claim was stored at federation tier with a classical-only

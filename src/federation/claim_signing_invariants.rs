@@ -176,6 +176,48 @@ mod tests {
     /// back to the classical path — no error, no PQC half, and the SAME
     /// classical signature the signer-only path produces (Ed25519 is
     /// deterministic), so the fallback IS the pre-#851 claim.
+    /// **I81 (PR #852 review, round three) — the LocalSigner signs a claim
+    /// only when it IS the claimed attester.** An Engine whose composed
+    /// `signer` and `local_signer` are different identities must not announce
+    /// a row signed by one key and attributed to another (every peer would
+    /// refuse it): the claim falls to the classical path under the attester.
+    #[tokio::test]
+    async fn i81_a_local_signer_that_is_not_the_attester_does_not_sign_the_claim() {
+        use crate::federation::blobs::sign_holds_bytes_claim;
+        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        let attester = crate::federation::tier_ingest::test_support::local_signer("i81-attester");
+        let other = crate::federation::tier_ingest::test_support::local_signer("i81-other");
+        assert_ne!(attester.derived_key_id(), other.derived_key_id());
+        let adapter = LocalSignerHardwareAdapter::new(attester.clone());
+        let key = attester.derived_key_id();
+        let sha = [0x81u8; 32];
+        let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
+        let claim = sign_holds_bytes_claim(&adapter, Some(&*other), &sha, &key, id, now)
+            .await
+            .expect("I81: a foreign LocalSigner is ignored, never used");
+        assert!(
+            claim.scrub_signature_pqc.is_none(),
+            "I81: no PQC half from a key that is not the attester"
+        );
+        assert_eq!(claim.scrub_key_id, key, "I81: attributed to the attester");
+        let classical = sign_holds_bytes_claim(&adapter, None, &sha, &key, id, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim.scrub_signature_classical, classical.scrub_signature_classical,
+            "I81: the classical path under the attester, byte-identical"
+        );
+        // And the attester's own LocalSigner does sign hybrid.
+        let own = sign_holds_bytes_claim(&adapter, Some(&*attester), &sha, &key, id, now)
+            .await
+            .unwrap();
+        assert!(
+            own.scrub_signature_pqc.is_some(),
+            "I81: the attester's own key signs hybrid"
+        );
+        let _ = LocalSigner::from_parts; // the I80 constructor stays in scope for symmetry
+    }
+
     #[tokio::test]
     async fn i80_a_pqc_less_local_signer_keeps_the_classical_claim() {
         use crate::federation::blobs::sign_holds_bytes_claim;

@@ -6287,6 +6287,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })
     }
 
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let key = occurrence_key_id.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::IdentityOccurrence>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT identity_key_id, occurrence_key_id, device_class, \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
+                     FROM federation_identity_occurrences \
+                     WHERE occurrence_key_id = ?1 ORDER BY identity_key_id",
+                )?;
+                let rows = stmt.query_map([&key], sqlite_row_to_identity_occurrence)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_identity_occurrences_by_occurrence_key: {e}"
+            ))
+        })
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,

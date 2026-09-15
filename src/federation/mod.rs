@@ -2100,6 +2100,18 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// CIRISPersist#851 (PR #852 review, round three) — EVERY occurrence row
+    /// bound under `occurrence_key_id`, whatever identity each names. The
+    /// table's key is `(identity_key_id, occurrence_key_id)`, so one key may
+    /// be bound under several identities (ownership moved, a stale row left);
+    /// [`Self::lookup_identity_for_occurrence`] returns one of them, and a
+    /// revocation check that read only that one would miss the other's
+    /// revocation. Empty when the key is bound nowhere.
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error>;
+
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns `None` if the key is
     /// not bound as an occurrence.

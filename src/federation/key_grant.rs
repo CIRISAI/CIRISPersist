@@ -852,12 +852,18 @@ where
     //   occurrence row a prior admission left — withdrawing the binding
     //   removes the node's authority the moment it dies;
     // - a device occurrence lifts to its identity as before.
-    let occurrence = directory.lookup_identity_for_occurrence(signer).await?;
-    if let Some(o) = &occurrence {
+    // EVERY row bound under the signer's key, whatever identity each names
+    // (the table's key is (identity, occurrence); a moved ownership leaves a
+    // stale row): a revocation effective at `as_of` on ANY of them is final
+    // (PR #852 review, round three).
+    for o in directory
+        .list_identity_occurrences_by_occurrence_key(signer)
+        .await?
+    {
         let revs = directory
             .list_identity_occurrence_revocations_for(&o.identity_key_id)
             .await?;
-        if revs.iter().any(|r| r.revokes(o, as_of)) {
+        if revs.iter().any(|r| r.revokes(&o, as_of)) {
             return Ok(false);
         }
     }

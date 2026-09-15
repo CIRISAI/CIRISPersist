@@ -6873,6 +6873,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
+                 FROM cirislens.federation_identity_occurrences \
+                 WHERE occurrence_key_id = $1 ORDER BY identity_key_id",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_identity_occurrences_by_occurrence_key: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_identity_occurrence)
+            .collect()
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
