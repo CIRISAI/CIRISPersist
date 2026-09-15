@@ -548,6 +548,23 @@ pub enum DekKeyState {
     Destroyed,
 }
 
+/// #848 (§12–§14) — one recipient's wrap, as it rides a `KeyGrant` set and
+/// as it lands in a grant table: `{ recipient_occurrence_key_id,
+/// wrap_algorithm, wrapped_dek }` (CC 3 `key_grant`). `wrapped_dek` is the
+/// `KeyGrantWrapV2` JSON envelope; `wrap_algorithm` is always
+/// [`WRAP_ALGORITHM_V2`](crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2)
+/// on an admitted row (the table CHECK and the admission door both refuse
+/// anything else).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrantWrap {
+    /// The recipient occurrence's federation key id.
+    pub recipient_key_id: String,
+    /// The wrap algorithm token (v2 only).
+    pub wrap_algorithm: String,
+    /// The wrap envelope, verbatim.
+    pub wrapped_dek: String,
+}
+
 impl DekKeyState {
     /// The stored wire token. **Stable** — it is a CHECK-constrained column
     /// value in V138, so a rename is a migration, not an edit.
@@ -641,6 +658,14 @@ pub struct PutBlobScopedResult {
     /// #843 (§12.11, I54) — the same fan-out by roster MEMBER. Empty at
     /// the plaintext tier, where there is no fan-out.
     pub roster: RosterPartition,
+    /// #848 (`BLOB_REPLICATION.md` §14) — the `KeyGrant` set the DOOR must
+    /// emit after this write, if any: the epoch axis when the community
+    /// fan-out minted or granted anew, the content axis for every
+    /// self/family write. `None` at the plaintext tier, or when a community
+    /// write changed no grant (the set already replicated). The cascade
+    /// cannot sign; the Engine / PyO3 door that holds the hybrid signer
+    /// emits through the attestation store so the set replicates.
+    pub key_grant_emission: Option<crate::federation::key_grant::KeyGrantAxis>,
 }
 
 impl PutBlobScopedResult {
@@ -787,6 +812,11 @@ pub struct StreamClaim {
 pub struct EpochBinding {
     /// The community whose DEK sealed the row.
     pub community_key_id: String,
+    /// #848 (§11) — the occurrence whose cascade MINTED the epoch: an epoch
+    /// belongs to its minter, so `(community, epoch)` names nothing without
+    /// it. For a local seal this is the author (the node's derived key); for
+    /// an adopted row it is the provenance's author, as declared.
+    pub minter_key_id: String,
     /// The epoch the row was sealed under.
     pub epoch: u64,
 }
@@ -1820,6 +1850,136 @@ pub trait BlobStorage: Send + Sync {
         cohort_scope: &str,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// #848 (§13, `Projection::KeyGrants`, content axis) — **write every wrap
+    /// of an admitted content-axis `KeyGrant` set in ONE transaction, as a
+    /// UNION** (`ON CONFLICT DO NOTHING` per row). Order-independent: the
+    /// blob row need not exist yet — the grants are opaque and are read
+    /// when the bytes arrive (§13). Returns the rows inserted. The signer
+    /// rule is the admission door's; this is the floor.
+    fn put_at_rest_grants(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        wraps: &[GrantWrap],
+    ) -> impl Future<Output = Result<usize, BlobError>> + Send;
+
+    /// #848 (§14, content axis) — every at-rest grant on `at_rest_sha256`
+    /// WITH its wrap, excluding persist's own
+    /// [`PERSIST_SELF_RECIPIENT`](crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
+    /// self-retention row (a content-master wrap is useless to a peer and
+    /// must never leave the node), ordered by recipient. What the author's
+    /// content-axis `KeyGrant` emission carries.
+    fn list_at_rest_grants(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<GrantWrap>, BlobError>> + Send;
+
+    /// #848 §14 (V146, PR #850 review) — **is the epoch's `KeyGrant` set
+    /// DIRTY?** True when at least one member grant exists under
+    /// `(community, minter, epoch)` and the epoch's `key_grant_emitted_at`
+    /// is NULL or not later than the newest grant's `created_at`. A door that
+    /// died between its cascade and its emission leaves the axis dirty; the
+    /// next door — or the boot sweep — emits.
+    fn community_dek_key_grant_dirty(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
+    /// #848 §14 (V146) — the epoch's grant WATERMARK: the newest member
+    /// grant's `created_at` under `(community, minter, epoch)`, `None` when
+    /// there is none. Read BEFORE a set is built, so every grant the set
+    /// carries is at or before it and every grant it missed is after it.
+    fn community_dek_key_grant_watermark(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<chrono::DateTime<chrono::Utc>>, BlobError>> + Send;
+
+    /// #848 §14 (V146) — stamp `key_grant_emitted_at` on the epoch's
+    /// self-retention row with the WATERMARK the emitted set was built at —
+    /// never the wall clock, so a grant that landed between the snapshot and
+    /// the mark keeps the axis dirty (PR #850 review, round three). Never
+    /// moves the stamp backwards.
+    fn community_dek_mark_key_grant_emitted(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #848 §14 (V146) — every dirty epoch `minter_key_id` minted, as
+    /// `(community_key_id, epoch)`; what the boot sweep emits.
+    fn community_dek_list_key_grant_dirty(
+        &self,
+        minter_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<(String, u64)>, BlobError>> + Send;
+
+    /// #848 §14 (V146) — content axis: is the blob's set dirty? True when at
+    /// least one non-self at-rest grant exists and the blob row's
+    /// `key_grant_emitted_at` is NULL or not later than the newest grant.
+    fn blob_key_grant_dirty(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
+    /// #848 §14 (V146) — the blob's grant watermark: the newest non-self
+    /// at-rest grant's `created_at`, `None` when there is none.
+    fn blob_key_grant_watermark(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<chrono::DateTime<chrono::Utc>>, BlobError>> + Send;
+
+    /// #848 §14 (V146) — stamp the blob row's `key_grant_emitted_at` with the
+    /// watermark the emitted set was built at (see the epoch twin).
+    fn blob_mark_key_grant_emitted(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #848 §14 (V146) — every dirty `invisible_encrypted` blob
+    /// `author_key_id` authored; what the boot sweep emits on the content
+    /// axis.
+    fn blob_list_key_grant_dirty(
+        &self,
+        author_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
+
+    /// #848 §13 (V146) — record a content-axis set admitted before its bytes
+    /// (`federation_key_grant_pending`): the adopt takes it by `(sha, scope)`.
+    /// Idempotent on the attestation id.
+    fn key_grant_pending_put(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+        signer_key_id: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #848 §13 (V146) — every pending row for `(sha, scope)` as
+    /// `(attestation_id, signer_key_id)`, oldest first. Read only: a row is
+    /// deleted by [`Self::key_grant_pending_delete`] after its projection
+    /// succeeds (or after a definitive non-author verdict), so a failed
+    /// projection leaves the work pending for the next adopt (PR #850
+    /// review, round three).
+    fn key_grant_pending_list(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, BlobError>> + Send;
+
+    /// #848 §13 (V146) — retire one pending row. Idempotent.
+    fn key_grant_pending_delete(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
     /// v4.14.0 (CIRISPersist#152) — fetch the at-rest grant for
     /// `(at_rest_sha256, recipient_key_id)`, returning
     /// `(wrap_algorithm, wrapped_dek)` or `None` if no grant exists (the
@@ -1841,6 +2001,11 @@ pub trait BlobStorage: Send + Sync {
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
 
+    /// PR #850 review (round three) — restricted to blobs THIS node
+    /// self-retains (`__persist_self__` wrap present): a peer-authored blob
+    /// adopted here carries only recipient wraps, and the retroactive-ADD
+    /// walk can neither recover its DEK nor emit its author-signed set — the
+    /// author's node does that for the newcomer.
     /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
     /// **retroactive-ADD** enumeration: distinct `at_rest_sha256` of every
     /// blob in `cohort_scope` that **any** of `recipient_key_ids` already
@@ -1904,6 +2069,24 @@ pub trait BlobStorage: Send + Sync {
         &self,
     ) -> impl Future<
         Output = Result<crate::federation::identity_aggregate::ContentKemIdentity, BlobError>,
+    > + Send;
+
+    /// #848 (§13, §17) — **the recipient-decrypt path V073 stored the sealed
+    /// privates for.** Unseal this node's content-KEM private halves under
+    /// the content master and return them with the ML-KEM public half (the
+    /// decapsulation needs all three). Minted on first call exactly as
+    /// [`load_or_init_content_kem_identity`](Self::load_or_init_content_kem_identity)
+    /// — the same row, the same first-write-wins.
+    ///
+    /// Used only to open a wrap addressed to an occurrence whose
+    /// `encryption_pubkeys` are THIS node's content-KEM identity — a member's
+    /// own device opening a peer-minted epoch, or the owner's second device
+    /// opening a self blob sealed elsewhere. The material never leaves the
+    /// process and is never returned across the FFI.
+    fn load_content_kem_private_halves(
+        &self,
+    ) -> impl Future<
+        Output = Result<crate::federation::identity_aggregate::ContentKemPrivate, BlobError>,
     > + Send;
 
     /// List the `key_id`s of every **currently-live** attester that
@@ -2074,9 +2257,15 @@ pub trait BlobStorage: Send + Sync {
     /// `federation_community_dek_epoch` (0 if the community has no row
     /// yet — a community that has never been rotated). The cascade seals
     /// new emissions under this epoch's DEK.
+    ///
+    /// #848 (§11) — PER MINTER: the pointer is `(community_key_id,
+    /// minter_key_id)`. Only this node's own key ever has a row on this node
+    /// (a foreign minter's counter is its own to advance); callers pass the
+    /// node's derived key as the minter.
     fn community_dek_current_epoch(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 
     /// v9.0.0 G5 (CC 4.4.3.2.2) — advance the community DEK epoch by one
@@ -2087,9 +2276,14 @@ pub trait BlobStorage: Send + Sync {
     /// revocation row is itself idempotent); a double-bump only wastes an
     /// epoch number (a fresh DEK is minted lazily on next emission, so an
     /// unused epoch costs nothing).
+    ///
+    /// #848 (§15) — bumps `minter_key_id`'s OWN counter: the revoker's
+    /// explicit rotation. Every other minter rotates its own counter before
+    /// its next seal after admitting the removal (`ensure_epoch_dek`).
     fn community_dek_bump_epoch(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 
     /// v9.0.0 G5 — persist's content-master self-retention wrap of the
@@ -2098,9 +2292,15 @@ pub trait BlobStorage: Send + Sync {
     /// `nonce(12) || aes256_gcm(content_master, dek)`. Idempotent on the
     /// `(community_key_id, epoch)` PK (first-write-wins): the epoch DEK is
     /// minted once.
+    ///
+    /// #848 (§16) — keyed `(community, minter, epoch)`; the row's `minted_at`
+    /// is stamped by the floor at insert (the instant §15 compares a removal
+    /// against). Only this node mints here, so `minter_key_id` is the node's
+    /// derived key on every production call.
     fn community_dek_put_self_retention(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         wrapped_dek: &str,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
@@ -2109,11 +2309,28 @@ pub trait BlobStorage: Send + Sync {
     /// `(community_key_id, epoch)`, or `None` if the epoch DEK has not
     /// been minted yet (the cascade mints it on first emission in the
     /// epoch).
+    ///
+    /// #848 — `(community, minter, epoch)`. `None` for an epoch a PEER
+    /// minted: this node holds no self-retention for it, only the wrap
+    /// addressed to its own occurrence (see
+    /// [`community_dek_member_grant_wrap`](Self::community_dek_member_grant_wrap)).
     fn community_dek_get_self_retention(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<Option<String>, BlobError>> + Send;
+
+    /// #848 (§15) — when `(community, minter, epoch)` was minted on this
+    /// node, or `None` if it has no self-retention row here. `ensure_epoch_dek`
+    /// compares this against the roster fold's latest `removed_at`: a removal
+    /// newer than the mint rotates the minter's counter before the next seal.
+    fn community_dek_minted_at(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<chrono::DateTime<chrono::Utc>>, BlobError>> + Send;
 
     /// v9.0.0 G5 — record one per-member v2 wrap of the
     /// `(community_key_id, epoch)` DEK (the cascade fan-out, written once
@@ -2122,44 +2339,102 @@ pub trait BlobStorage: Send + Sync {
     /// [`crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2`] (the DB
     /// CHECK rejects anything else — the substrate's v2-only guarantee).
     /// Idempotent on `(community_key_id, epoch, member_key_id)`.
+    ///
+    /// #848 — keyed `(community, minter, epoch, member)`.
     fn community_dek_put_member_grant(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         member_key_id: &str,
         wrap_algorithm: &str,
         wrapped_dek: &str,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// #848 (§13, `Projection::KeyGrants`) — **write every wrap of an
+    /// admitted epoch-axis `KeyGrant` set, in ONE transaction, as a UNION**:
+    /// `ON CONFLICT DO NOTHING` per row, so a grant once admitted is never
+    /// removed or overwritten by a later set, and re-applying a set is a
+    /// no-op. Returns how many rows were inserted. No keyring is consulted:
+    /// every recipient's wrap is stored, and the read door finds the
+    /// viewer's row later (§13).
+    ///
+    /// Enforces nothing about the SIGNER — that is the admission door's
+    /// (`key_grant::admit_replicated_key_grant`); this is the floor it lands
+    /// on. The `wrap_algorithm` CHECK on the table is the v2-only guarantee.
+    fn community_dek_put_member_grants(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        wraps: &[GrantWrap],
+    ) -> impl Future<Output = Result<usize, BlobError>> + Send;
+
     /// v9.0.0 G5 — member occurrence key_ids already holding a grant on
     /// `(community_key_id, epoch)`. The cascade uses this to skip members
     /// already wrapped (idempotent re-key) and tests assert the
     /// fail-secure exclusion shape against it.
+    ///
+    /// #848 — `(community, minter, epoch)`.
     fn community_dek_member_grant_recipients(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// #848 (§14) — every member grant on `(community, minter, epoch)` WITH
+    /// its wrap, ordered by recipient: the full enumeration a `KeyGrant`
+    /// emission carries. The minter emits everything it holds, every time
+    /// (re-emission is idempotent on receivers, §13), so the set is read
+    /// from the floor rather than accumulated in memory.
+    fn community_dek_member_grants_for_epoch(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Vec<GrantWrap>, BlobError>> + Send;
 
     /// v9.0.0 G5 — does `member_key_id` hold a v2 grant on
     /// `(community_key_id, epoch)`? The read-side authorization predicate
     /// for [`crate::federation::community_dek::orchestrate::read_for_community_viewer`].
+    ///
+    /// #848 (§17) — `(community, minter, epoch, viewer)`.
     fn community_dek_has_member_grant(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         member_key_id: &str,
     ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
+    /// #848 (§13, §17) — the viewer's OWN wrap on `(community, minter,
+    /// epoch)`: `(wrap_algorithm, wrapped_dek)`, or `None`. This is what a
+    /// member's node opens a PEER-minted epoch with: it holds no
+    /// self-retention for that epoch, so the DEK is recovered from the wrap
+    /// addressed to the viewer occurrence, with the private KEM half this
+    /// node keeps for it ([`load_content_kem_private_halves`](Self::load_content_kem_private_halves)).
+    fn community_dek_member_grant_wrap(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+    ) -> impl Future<Output = Result<Option<(String, String)>, BlobError>> + Send;
 
     /// v9.0.0 G5 — bind a sealed at-rest blob to the
     /// `(community_key_id, epoch)` whose DEK sealed it, so a read recovers
     /// the right epoch DEK. A blob is sealed under exactly one epoch
     /// (current at emission); rotation never re-seals it (forward-only).
     /// Idempotent on the `at_rest_sha256` PK.
+    ///
+    /// #848 — binds `(community, minter, epoch)`; the current-and-enabled
+    /// check (I17) is against the MINTER's own pointer and key state.
     fn community_dek_bind_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
@@ -2171,10 +2446,13 @@ pub trait BlobStorage: Send + Sync {
     /// them), so this answers for an evicted binding too; use
     /// [`community_dek_blob_binding`](Self::community_dek_blob_binding)
     /// when the eviction stamp matters.
+    ///
+    /// #848 (§17) — returns `(community, minter, epoch)`: the blob's full key
+    /// identity, which every read dispatches on.
     fn community_dek_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<(String, u64)>, BlobError>> + Send;
+    ) -> impl Future<Output = Result<Option<(String, String, u64)>, BlobError>> + Send;
 
     /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — the full epoch
     /// binding row for a sha, eviction stamp included, or `None` if the sha
@@ -2195,9 +2473,13 @@ pub trait BlobStorage: Send + Sync {
     /// dependency (§10.4). Without per-key state, "stop sealing under this
     /// epoch" and "destroy this epoch's key" are the same operation, and
     /// only one of them is recoverable.
+    ///
+    /// #848 — `(community, minter, epoch)`; key state is PER MINTER
+    /// (`BLOB_ENCRYPTION_AT_REST.md` §10.5).
     fn community_dek_key_state(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<Option<DekKeyState>, BlobError>> + Send;
 
@@ -2209,9 +2491,13 @@ pub trait BlobStorage: Send + Sync {
     /// [`community_dek::orchestrate::set_key_state`](crate::federation::community_dek::orchestrate::set_key_state),
     /// which is what callers should use. A `destroyed` written through here
     /// over live content orphans that content rather than erasing it.
+    ///
+    /// #848 — `(community, minter, epoch)`; the CURRENT-epoch refusal is
+    /// against the minter's own pointer.
     fn community_dek_set_key_state(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         state: DekKeyState,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
@@ -2226,16 +2512,23 @@ pub trait BlobStorage: Send + Sync {
     /// index this was a full table scan, and **a precondition that is
     /// expensive to check is one that gets skipped** — while the thing it
     /// guards is unrecoverable.
+    ///
+    /// #848 — `(community, minter, epoch)`.
     fn community_dek_epoch_object_count(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> impl Future<Output = Result<u64, BlobError>> + Send;
     /// v43.0.0 (§10.7) — every `(epoch, state)` this community has a DEK for,
     /// ascending. The sweep's input.
+    ///
+    /// #848 — the epochs `minter_key_id` minted for the community on this
+    /// node (the sweep runs over this node's own counter).
     fn community_dek_epochs(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> impl Future<Output = Result<Vec<(u64, DekKeyState)>, BlobError>> + Send;
 
     /// v43.0.0 (§10.7) — **delete the LOCAL copies of every object sealed at
@@ -2260,9 +2553,13 @@ pub trait BlobStorage: Send + Sync {
     /// DESTROY precondition is satisfied honestly. Only LIVE bindings are
     /// evicted and counted in the return value: a second run over the same
     /// epoch returns 0 and never re-stamps.
+    ///
+    /// #848 — `(community, minter, epoch)`: only objects sealed under THIS
+    /// minter's epoch are swept by this minter's retention policy.
     fn community_dek_evict_epoch_objects(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         signer: &crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
@@ -2276,9 +2573,12 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// Opt-in on purpose: deletion is irreversible, so it happens only where
     /// an operator has said how much history to keep.
+    ///
+    /// #848 — the policy rides the minter's pointer row `(community, minter)`.
     fn community_dek_retain_past_epochs(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> impl Future<Output = Result<Option<u64>, BlobError>> + Send;
 
     /// v43.0.0 (§11.6) — every community this node holds a DEK epoch record
@@ -2289,9 +2589,12 @@ pub trait BlobStorage: Send + Sync {
 
     /// v43.0.0 (§10.7) — set the community's past-epoch retention policy.
     /// `None` restores retain-indefinitely.
+    ///
+    /// #848 — on the minter's pointer row `(community, minter)`.
     fn community_dek_set_retain_past_epochs(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         retain: Option<u64>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
@@ -2463,6 +2766,9 @@ pub struct PutBlobAttestation {
 pub struct BlobEpochBinding {
     /// The community whose DEK sealed the bytes.
     pub community_key_id: String,
+    /// #848 (§11) — the minter of that DEK: the blob's key identity is
+    /// `(community, minter, epoch)`, and the minter is the row's author.
+    pub minter_key_id: String,
     /// The epoch of that DEK.
     pub epoch: u64,
     /// When the retention sweep deleted the local copy; `None` = live.

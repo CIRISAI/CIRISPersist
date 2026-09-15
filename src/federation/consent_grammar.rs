@@ -187,7 +187,14 @@ pub fn consent_transferability(
         // `payload.kinds` grant would let an end-user consent decision
         // narrow (or purport to widen) the carriage of the quorum that
         // governs the whole mesh.
-        | K::AccordQuorumEvidence => Transferability::StructuralPlane,
+        | K::AccordQuorumEvidence
+        // CIRISPersist#848 — a `KeyGrant` set is key material
+        // addressed to its recipients, opaque to everyone else, and its
+        // audience is the AXIS's (SelfOwn / Cohort), never a consent grant's:
+        // an end-user grant could neither widen a wrap set (nobody outside
+        // the cohort has a recipient in it) nor narrow one (CC 3: existing
+        // key_grants cannot be un-shared).
+        | K::KeyGrant => Transferability::StructuralPlane,
     }
 }
 
@@ -513,8 +520,14 @@ pub fn consent_grammar_sha256() -> String {
 /// principles, restriction ops, audiences — is unchanged; what changed is the
 /// closed set of kinds a grant may name. Previous value:
 /// `2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05`.
+/// CIRISPersist#848 — re-pinned for the same reason: the 16th kind
+/// ([`KeyGrant`](super::replication_policy::EnvelopeKind::KeyGrant),
+/// classified `StructuralPlane`) joins `kind_transferability`. The grammar is
+/// unchanged. Previous value:
+/// `b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f`
+/// (v31.1.0 – v44.2.1).
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f";
+    "79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

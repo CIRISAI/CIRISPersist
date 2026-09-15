@@ -80,6 +80,9 @@ pub struct PutChunkScopedResult {
     /// #843 (§12.11, I54) — the same fan-out by roster MEMBER. Empty at
     /// the plaintext tier.
     pub roster: RosterPartition,
+    /// #848 (§14) — the `KeyGrant` set the door emits after this append, if
+    /// the fan-out changed (see `PutBlobScopedResult::key_grant_emission`).
+    pub key_grant_emission: Option<crate::federation::key_grant::KeyGrantAxis>,
 }
 
 impl PutChunkScopedResult {
@@ -112,6 +115,9 @@ pub struct SealStreamScopedResult {
     /// #843 (§12.11, I54) — the same fan-out by roster MEMBER. Empty at
     /// the plaintext tier.
     pub roster: RosterPartition,
+    /// #848 (§14) — the `KeyGrant` set the door emits after this seal, if
+    /// the fan-out changed (see `PutBlobScopedResult::key_grant_emission`).
+    pub key_grant_emission: Option<crate::federation::key_grant::KeyGrantAxis>,
 }
 
 impl SealStreamScopedResult {
@@ -139,7 +145,7 @@ pub mod orchestrate {
         StreamClaim, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
     };
     use crate::federation::community_dek::orchestrate::{
-        ensure_epoch_dek, open_community_row_as_persist, read_for_community_viewer_sealed,
+        ensure_epoch_dek, open_community_row_for_viewer, read_for_community_viewer_sealed,
     };
     use crate::federation::{FederationDirectory, StorageFloor};
     use sha2::{Digest, Sha256};
@@ -237,6 +243,7 @@ pub mod orchestrate {
                     granted: Vec::new(),
                     excluded: Vec::new(),
                     roster: RosterPartition::default(),
+                    key_grant_emission: None,
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -269,6 +276,13 @@ pub mod orchestrate {
                     granted: report.granted,
                     excluded: report.excluded,
                     roster: report.roster,
+                    // #848 (§14, content axis) — a fresh per-chunk DEK is a
+                    // new set every time.
+                    key_grant_emission: Some(crate::federation::key_grant::KeyGrantAxis::Content {
+                        at_rest_sha256: hex::encode(sha),
+                        cohort_scope: cohort_scope.to_owned(),
+                        owner_key_id: owner.to_owned(),
+                    }),
                 })
             }
             CryptoTier::CommunityDek => {
@@ -276,11 +290,15 @@ pub mod orchestrate {
                     BlobError::InvalidArgument("community_key_id required".into())
                 })?;
                 let mut last_epoch = 0;
+                // #848 (§11) — the minter is the writer (I23).
+                let minter = owner_key_id.as_str();
                 for _ in 0..EPOCH_RACE_ATTEMPTS {
-                    let dek_epoch = backend.community_dek_current_epoch(comm).await?;
-                    let (dek, report) = ensure_epoch_dek(backend, comm, dek_epoch).await?;
+                    let dek_epoch = backend.community_dek_current_epoch(comm, minter).await?;
+                    let ensured = ensure_epoch_dek(backend, comm, minter, dek_epoch).await?;
+                    let dek_epoch = ensured.epoch;
                     let envelope =
-                        seal(&dek, plaintext, Some(&bound_aad)).map_err(map_at_rest_err)?;
+                        seal(&ensured.dek, plaintext, Some(&bound_aad)).map_err(map_at_rest_err)?;
+                    let report = ensured.report;
                     match backend
                         .put_blob_chunk_with_scope(
                             stream_id,
@@ -292,6 +310,7 @@ pub mod orchestrate {
                             StorageFloor::resolved(CryptoTier::CommunityDek),
                             Some(EpochBinding {
                                 community_key_id: comm.to_owned(),
+                                minter_key_id: minter.to_owned(),
                                 epoch: dek_epoch,
                             }),
                             claim(),
@@ -306,6 +325,13 @@ pub mod orchestrate {
                                 granted: report.granted,
                                 excluded: report.excluded,
                                 roster: report.roster,
+                                key_grant_emission: ensured.changed.then(|| {
+                                    crate::federation::key_grant::KeyGrantAxis::Epoch {
+                                        community_key_id: comm.to_owned(),
+                                        minter_key_id: minter.to_owned(),
+                                        epoch: dek_epoch,
+                                    }
+                                }),
                             })
                         }
                         Err(BlobError::EpochNotCurrent { .. }) => {
@@ -438,6 +464,7 @@ pub mod orchestrate {
                     granted: Vec::new(),
                     excluded: Vec::new(),
                     roster: RosterPartition::default(),
+                    key_grant_emission: None,
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -475,6 +502,13 @@ pub mod orchestrate {
                     granted: report.granted,
                     excluded: report.excluded,
                     roster: report.roster,
+                    // #848 (§14, content axis) — the sealed manifest has its
+                    // own per-write DEK and grants; a new set every time.
+                    key_grant_emission: Some(crate::federation::key_grant::KeyGrantAxis::Content {
+                        at_rest_sha256: hex::encode(sha),
+                        cohort_scope: cohort_scope.to_owned(),
+                        owner_key_id: owner.to_owned(),
+                    }),
                 })
             }
             CryptoTier::CommunityDek => {
@@ -482,10 +516,16 @@ pub mod orchestrate {
                     BlobError::InvalidArgument("community_key_id required".into())
                 })?;
                 let mut last_epoch = 0;
+                // #848 (§11) — the minter is the sealer (I23).
+                let minter = signer_key_id.as_str();
                 for _ in 0..EPOCH_RACE_ATTEMPTS {
-                    let dek_epoch = backend.community_dek_current_epoch(comm).await?;
-                    let (dek, report) = ensure_epoch_dek(backend, comm, dek_epoch).await?;
-                    let body = seal(&dek, &jcs, aad).map_err(map_at_rest_err)?.to_bytes();
+                    let dek_epoch = backend.community_dek_current_epoch(comm, minter).await?;
+                    let ensured = ensure_epoch_dek(backend, comm, minter, dek_epoch).await?;
+                    let dek_epoch = ensured.epoch;
+                    let report = ensured.report;
+                    let body = seal(&ensured.dek, &jcs, aad)
+                        .map_err(map_at_rest_err)?
+                        .to_bytes();
                     let sha: [u8; 32] = Sha256::digest(&body).into();
                     match backend
                         .seal_stream_with_scope(
@@ -501,6 +541,7 @@ pub mod orchestrate {
                             StorageFloor::resolved(CryptoTier::CommunityDek),
                             Some(EpochBinding {
                                 community_key_id: comm.to_owned(),
+                                minter_key_id: minter.to_owned(),
                                 epoch: dek_epoch,
                             }),
                         )
@@ -533,6 +574,13 @@ pub mod orchestrate {
                                 granted: report.granted,
                                 excluded: report.excluded,
                                 roster: report.roster,
+                                key_grant_emission: ensured.changed.then(|| {
+                                    crate::federation::key_grant::KeyGrantAxis::Epoch {
+                                        community_key_id: comm.to_owned(),
+                                        minter_key_id: minter.to_owned(),
+                                        epoch: dek_epoch,
+                                    }
+                                }),
                             });
                         }
                         Err(BlobError::EpochNotCurrent { .. }) => {
@@ -582,8 +630,8 @@ pub mod orchestrate {
             if tier == CryptoTier::CommunityDek {
                 let comm = community_key_id.unwrap_or_default();
                 match backend.community_dek_blob_epoch(&c.chunk_sha).await? {
-                    Some((bound, _)) if bound == comm => {}
-                    Some((bound, _)) => {
+                    Some((bound, _, _)) if bound == comm => {}
+                    Some((bound, _, _)) => {
                         return Err(BlobError::InvalidArgument(format!(
                             "seal_stream_scoped: chunk seq {} is bound to community {bound:?}, not \
                              {comm:?} (BLOB_ENCRYPTION_AT_REST.md §12.3, I32)",
@@ -831,7 +879,7 @@ pub mod orchestrate {
         match tier {
             CryptoTier::Plaintext => Ok(bytes),
             CryptoTier::InvisibleEncrypted => {
-                read_for_viewer_sealed(backend, sha256, &envelope, aad).await
+                read_for_viewer_sealed(backend, sha256, viewer_key_id, &envelope, aad).await
             }
             CryptoTier::CommunityDek => {
                 read_for_community_viewer_sealed(backend, sha256, viewer_key_id, &envelope, aad)
@@ -967,7 +1015,7 @@ pub mod orchestrate {
         let mut out = Vec::with_capacity((end - start + 1) as usize);
         // I38 — per-epoch authorization memo for a community DAG: one grant
         // lookup per distinct epoch in the range, not one per chunk.
-        let mut authorized_epochs: std::collections::HashSet<(String, u64)> =
+        let mut authorized_epochs: std::collections::HashSet<(String, String, u64)> =
             std::collections::HashSet::new();
         // #838 (§12.10) — the manifest names the position every chunk was
         // sealed at; the parser guarantees both fields for v2.
@@ -1029,7 +1077,7 @@ pub mod orchestrate {
         tier: CryptoTier,
         viewer_key_id: &str,
         bound_aad: &[u8],
-        authorized_epochs: &mut std::collections::HashSet<(String, u64)>,
+        authorized_epochs: &mut std::collections::HashSet<(String, String, u64)>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
@@ -1091,13 +1139,21 @@ pub mod orchestrate {
                         viewer_key_id: viewer_key_id.to_owned(),
                     });
                 }
-                read_for_viewer_sealed(backend, chunk_sha, &envelope, Some(bound_aad)).await
+                read_for_viewer_sealed(
+                    backend,
+                    chunk_sha,
+                    viewer_key_id,
+                    &envelope,
+                    Some(bound_aad),
+                )
+                .await
             }
             CryptoTier::CommunityDek => {
                 // The chunk's OWN binding names the DEK that sealed it — a
                 // pre-rotation chunk opens under its old epoch (I38) — and the
-                // viewer must hold a grant on that epoch.
-                let (community, epoch) = backend
+                // viewer must hold a grant on that epoch. #848 — the binding
+                // is `(community, minter, epoch)`.
+                let (community, minter, epoch) = backend
                     .community_dek_blob_epoch(chunk_sha)
                     .await?
                     .ok_or_else(|| {
@@ -1107,10 +1163,10 @@ pub mod orchestrate {
                             hex::encode(chunk_sha)
                         ))
                     })?;
-                let key = (community.clone(), epoch);
+                let key = (community.clone(), minter.clone(), epoch);
                 if !authorized_epochs.contains(&key) {
                     if !backend
-                        .community_dek_has_member_grant(&community, epoch, viewer_key_id)
+                        .community_dek_has_member_grant(&community, &minter, epoch, viewer_key_id)
                         .await?
                     {
                         return Err(BlobError::NotGranted {
@@ -1120,11 +1176,13 @@ pub mod orchestrate {
                     }
                     authorized_epochs.insert(key);
                 }
-                open_community_row_as_persist(
+                open_community_row_for_viewer(
                     backend,
                     chunk_sha,
                     &community,
+                    &minter,
                     epoch,
+                    viewer_key_id,
                     &envelope,
                     Some(bound_aad),
                 )
@@ -1330,13 +1388,15 @@ pub mod invariants {
     {
         use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
         let run = uuid::Uuid::new_v4().simple().to_string();
+        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"segment 0", None, None)
-            .await
-            .unwrap();
+        let sealed =
+            encrypt_and_cascade_community(backend, &comm, b"segment 0", None, Some(&minter))
+                .await
+                .unwrap();
         let Some(BlobBody::Inline(sealed_bytes)) =
             backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
         else {
@@ -1384,6 +1444,7 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
+        let minter = signer.derived_key_id();
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
 
         let owner = crate::signing::federation_key_id_of(&adapter)
@@ -1490,6 +1551,7 @@ pub mod invariants {
                     StorageFloor::resolved(CryptoTier::CommunityDek),
                     Some(EpochBinding {
                         community_key_id: comm.clone(),
+                        minter_key_id: minter.clone(),
                         epoch: 0,
                     }),
                     StreamClaim::default(),
@@ -2128,6 +2190,7 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
+        let minter = signer.derived_key_id();
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
         let stream = format!("{tag}-stream-{run}");
         let seg0 = segment(21, 900);
@@ -2176,15 +2239,19 @@ pub mod invariants {
             "{tag} I38: bob is not granted at e1"
         );
         // I17 at the chunk floor: an append that binds at the rotated-past
-        // epoch (still `enabled` — no sweep ran) is refused as a UNIT: no
-        // blob row, no index row, nothing to orphan.
+        // epoch is refused as a UNIT: no blob row, no index row, nothing to
+        // orphan. #848 (§15, I63): the seal at e1 above DISABLED e0 — a
+        // removal was admitted after e0 was minted, and "rotated past" now
+        // means it at the next seal, not at the next sweep. The floor's
+        // refusal below is therefore doubly grounded (pointer AND state);
+        // what it measures is that the append lands as a unit or not at all.
         {
             use crate::federation::at_rest_cascade::{fresh_dek, seal};
             use crate::federation::{EpochBinding, StorageFloor, StreamClaim};
             assert_eq!(
-                backend.community_dek_key_state(&comm, e0).await.unwrap(),
-                Some(crate::federation::DekKeyState::Enabled),
-                "{tag} I38: precondition — e0 is still enabled"
+                backend.community_dek_key_state(&comm, &minter, e0).await.unwrap(),
+                Some(crate::federation::DekKeyState::Disabled),
+                "{tag} I38: precondition — e0 was disabled by the seal that rotated past it (#848 §15)"
             );
             let stale = seal(&fresh_dek().unwrap(), b"stale", None)
                 .unwrap()
@@ -2201,6 +2268,7 @@ pub mod invariants {
                     StorageFloor::resolved(CryptoTier::CommunityDek),
                     Some(EpochBinding {
                         community_key_id: comm.clone(),
+                        minter_key_id: minter.clone(),
                         epoch: e0,
                     }),
                     StreamClaim {
@@ -2247,7 +2315,7 @@ pub mod invariants {
                 .community_dek_blob_epoch(&c0.chunk_sha256)
                 .await
                 .unwrap(),
-            Some((comm.clone(), e0)),
+            Some((comm.clone(), minter.clone(), e0)),
             "{tag} I38: chunk 0 stays bound to e0"
         );
         assert_eq!(
@@ -2255,11 +2323,11 @@ pub mod invariants {
                 .community_dek_blob_epoch(&c1.chunk_sha256)
                 .await
                 .unwrap(),
-            Some((comm.clone(), e1))
+            Some((comm.clone(), minter.clone(), e1))
         );
         assert_eq!(
             backend.community_dek_blob_epoch(&manifest).await.unwrap(),
-            Some((comm.clone(), e1))
+            Some((comm.clone(), minter.clone(), e1))
         );
 
         // Alice (both epochs) reads the whole DAG — chunk 0 opens under e0's
@@ -2735,6 +2803,9 @@ pub mod invariants {
             .await,
         );
         let owner = crate::signing::federation_key_id_of(&writer).await.unwrap();
+        // #848 — the writer IS the minter (I23): the floor is driven below
+        // under the epoch the door minted for this key.
+        let minter = owner.clone();
         let stream = format!("{tag}-stream-{run}");
         let segs = [segment(31, 100), segment(32, 200)];
         let (manifest, shas, plain) =
@@ -2760,8 +2831,14 @@ pub mod invariants {
         // now claiming the other's position — sealed under the community's
         // DEK (reached the way the door reaches it) and stored through the
         // floor as a second DAG over the stream.
-        let epoch = backend.community_dek_current_epoch(&comm).await.unwrap();
-        let (dek, _) = ensure_epoch_dek(backend, &comm, epoch).await.unwrap();
+        let epoch = backend
+            .community_dek_current_epoch(&comm, &minter)
+            .await
+            .unwrap();
+        let dek = ensure_epoch_dek(backend, &comm, &minter, epoch)
+            .await
+            .unwrap()
+            .dek;
         let swapped = ChunkManifest {
             v: CHUNK_MANIFEST_VERSION_SEALED,
             total_size: 300,
@@ -2798,6 +2875,7 @@ pub mod invariants {
                 StorageFloor::resolved(CryptoTier::CommunityDek),
                 Some(EpochBinding {
                     community_key_id: comm.clone(),
+                    minter_key_id: minter.clone(),
                     epoch,
                 }),
             )
@@ -2846,6 +2924,7 @@ pub mod invariants {
                 StorageFloor::resolved(CryptoTier::CommunityDek),
                 Some(EpochBinding {
                     community_key_id: comm.clone(),
+                    minter_key_id: minter.clone(),
                     epoch,
                 }),
                 StreamClaim {

@@ -210,6 +210,50 @@ pub struct ContentKemIdentity {
     pub ml_kem_768_pubkey_b64: String,
 }
 
+/// #848 (`BLOB_REPLICATION.md` §13, §17) — this node's content-KEM PRIVATE
+/// halves, unsealed, plus the ML-KEM public half the decapsulation needs.
+/// Returned only by
+/// [`load_content_kem_private_halves`](crate::federation::blobs::BlobStorage::load_content_kem_private_halves)
+/// to the in-process read door that opens a wrap addressed to this node's
+/// own occurrence. Never serialized, never crosses the FFI; the `Debug` impl
+/// prints nothing of the material.
+pub struct ContentKemPrivate {
+    /// X25519 private key (32 raw bytes).
+    pub x25519_priv: [u8; 32],
+    /// ML-KEM-768 private key (raw bytes).
+    pub ml_kem_768_priv: Vec<u8>,
+    /// ML-KEM-768 public key (raw bytes) — `ciris_crypto`'s decapsulation
+    /// takes it beside the private half.
+    pub ml_kem_768_pub: Vec<u8>,
+}
+
+impl std::fmt::Debug for ContentKemPrivate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ContentKemPrivate { .. }")
+    }
+}
+
+/// #848 — unseal a content-KEM private half sealed by
+/// [`seal_content_kem_private`] (base64 of `nonce(12) ‖ aes256_gcm(master, sk)`).
+pub fn unseal_content_kem_private(
+    content_master: &[u8; 32],
+    sealed_b64: &str,
+) -> Result<Vec<u8>, crate::federation::BlobError> {
+    use crate::federation::at_rest_cascade::NONCE_LEN;
+    let raw = B64.decode(sealed_b64).map_err(|e| {
+        crate::federation::BlobError::Backend(format!("content-kem unseal base64: {e}"))
+    })?;
+    if raw.len() < NONCE_LEN {
+        return Err(crate::federation::BlobError::Backend(
+            "content-kem unseal: sealed value shorter than a nonce".into(),
+        ));
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&raw[..NONCE_LEN]);
+    ciris_crypto::aes_gcm::decrypt(content_master, &nonce, &raw[NONCE_LEN..])
+        .map_err(|e| crate::federation::BlobError::Backend(format!("content-kem unseal: {e}")))
+}
+
 /// v5.5.0 (CIRISPersist#199) — validate the caller-supplied RET-transport
 /// pubkeys for [`crate::Engine::local_identity_aggregate`]. persist does not
 /// reach into edge (it is the substrate); the cohabiting consumer reads

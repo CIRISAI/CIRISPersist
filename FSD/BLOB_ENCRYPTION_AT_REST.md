@@ -1044,6 +1044,17 @@ Every DEK row gains a state:
 | `disabled` | no | yes | rotated past; AV-70's original behaviour, now one state among three |
 | `destroyed` | no | **no** | key material gone |
 
+**Key state is per MINTER (v44.3.0, #848 — `BLOB_REPLICATION.md` §11,
+§16).** The keyset above is keyed `(community_key_id, minter_key_id, epoch)`,
+not `(community, epoch)`: an epoch belongs to the occurrence whose cascade
+minted it, so two members writing at the same epoch number are two keysets,
+not a fork, and each minter's `enabled` / `disabled` / `destroyed` is its own.
+Only this node's own mints have key state here; a peer's epoch is known
+through the wraps it granted (`federation_community_dek_member_grants`, keyed
+the same way) and is opened with this node's content-KEM private half. A
+minter rotates its own counter — and disables the epoch it rotated past — on
+admitting a removal newer than the epoch's `minted_at` (§15 there).
+
 **The DESTROY precondition — non-negotiable.** An epoch may move to
 `destroyed` only when **every object sealed under it has been either
 re-sealed under a live epoch or evicted from every holder**. Destroying a
@@ -1065,6 +1076,15 @@ The substrate already has the one primitive that reaches every holder.
 plane's `tombstone_ceiling` regardless of scope**, precisely so a
 retraction can never be out-run by the record it retracts — *anywhere a
 copy could have travelled*. Eviction-on-rotate rides that plane.
+
+**The KEY reaches every holder the same way (v44.3.0, #848).** The wraps
+travel on the attestation plane as `EnvelopeKind::KeyGrant` sets — one per
+`(community, minter, epoch)` for the community tiers, one per blob for
+self / family — projected `Cohort` / `SelfOwn` by the `KeyGrant` plane and
+never retracted (CC 3: a publisher cannot retroactively un-share; forward
+secrecy is by rotation). A holder that adopted the bytes and admitted the set
+opens them with its own occurrence's private half; one that admitted no set
+carrying it is `NotGranted` until one lands (`BLOB_REPLICATION.md` §12–§14).
 
 **Consequence, and it needs a gate:** the blob/shard plane's
 `tombstone_ceiling` must be **at least as wide as shards can travel**. A

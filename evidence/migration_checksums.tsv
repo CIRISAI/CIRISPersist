@@ -275,3 +275,7 @@ postgres	142	stream_chunk_plaintext_size	6302461759728476371
 postgres	143	federation_streams	15129467152383940322
 sqlite	144	blob_author_key_id	17069550609889699245
 postgres	144	blob_author_key_id	2981934974851927183
+sqlite	145	per_minter_dek_epochs	2052565029181169971
+postgres	145	per_minter_dek_epochs	5338137089296522457
+sqlite	146	key_grant_emission_ledger	8838517352252356577
+postgres	146	key_grant_emission_ledger	16998603888556472534

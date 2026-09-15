@@ -283,6 +283,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
+    // #848 — the recipient-decrypt path: the identity floor is another door
+    // (it mints on first call, first-write-wins), and unsealing our OWN
+    // sealed private halves fails only on corrupt material — the substrate's
+    // terms, never a policy question about the caller's row.
+    ("load_or_init_content_kem_identity", Class::Delegates),
+    ("unseal_content_kem_private", Class::Plumbing),
     // v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.2) — the content-master row
     // read, in both SQL backends. PLUMBING: it is a single-row SELECT that
     // can fail only on the substrate's own terms (driver, lock, row

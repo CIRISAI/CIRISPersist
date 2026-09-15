@@ -121,6 +121,11 @@ pub struct SqliteBackend {
     /// the host via `set_node_key_id`. `None` until told, and gates that need
     /// it MUST fail secure rather than invent one.
     node_key_id: std::sync::RwLock<Option<String>>,
+    /// #848 (I66) — set once [`Self::repair_minter_sentinel`] has run to
+    /// completion on this backend; an `Engine` built over a shared backend
+    /// (`from_shared*`) resolves lazily at its first DEK-plane door when
+    /// this is still false (CIRISPersist#850 review).
+    minter_sentinel_resolved: std::sync::atomic::AtomicBool,
     /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate.
     /// `None` = no gate (bootstrap-permissive). See
     /// [`SqliteBackend::set_admission_gate`].
@@ -246,6 +251,22 @@ fn rewrite_portable_defaults_in_tx(
     }
     tx.commit()?;
     Ok(RewriteOutcome::Rewritten(rewritten))
+}
+
+/// #848 — parse an instant this backend stores as TEXT: RFC 3339 (what every
+/// writer in this crate stamps) or the bare `YYYY-MM-DD HH:MM:SS[.SSS]` a
+/// column DEFAULT produced (V145's `minted_at` backfill copies `created_at`,
+/// which was defaulted). Both are UTC. `None` if neither shape parses.
+pub(crate) fn parse_sqlite_instant(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(d.with_timezone(&chrono::Utc));
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(naive.and_utc());
+        }
+    }
+    None
 }
 
 impl SqliteBackend {
@@ -393,6 +414,81 @@ impl SqliteBackend {
             sqlstate: None,
             detail: format!("sqlite portable-default repair (#845): {e}"),
         })
+    }
+
+    /// #848 (`BLOB_REPLICATION.md` §16, I66) — **resolve the V145 minter
+    /// sentinel to this node's own key.**
+    ///
+    /// V145 re-keys every community-DEK table on `minter_key_id` and backfills
+    /// the sentinel `__this_node__` where SQL cannot know the minter — every
+    /// existing key-state row on a node was minted by that node, but the
+    /// node's derived federation key lives in the signer, not the database.
+    /// This runs from the Engine's construction path the moment the backend
+    /// and the signer exist together (beside `run_v31_migration_at_boot`,
+    /// which needs the signer for the same reason), BEFORE any read.
+    ///
+    /// Idempotent and cheap: a no-op on every boot but the first. A sentinel
+    /// that survives — because the UPDATE could not apply — ABORTS THE BOOT: a
+    /// minter of nobody is a key nobody can be asked for, and a read that
+    /// dispatched on it would name an epoch that belongs to no one. Returns
+    /// the rows resolved.
+    ///
+    /// `node_key_id = None` — the Engine could not derive a key (no Ed25519
+    /// identity): nothing is resolved, but a sentinel that exists still
+    /// aborts. Fail-secure both ways.
+    pub(crate) async fn repair_minter_sentinel(
+        &self,
+        node_key_id: Option<&str>,
+    ) -> Result<usize, Error> {
+        let node = node_key_id.map(str::to_owned);
+        let n = self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let mut n = 0usize;
+            if let Some(node) = &node {
+                for table in [
+                    "federation_community_dek_epoch",
+                    "federation_community_dek",
+                    "federation_community_dek_member_grants",
+                    "federation_community_blob_epoch",
+                ] {
+                    n += tx.execute(
+                        &format!(
+                            "UPDATE {table} SET minter_key_id = ?1 WHERE minter_key_id = ?2"
+                        ),
+                        rusqlite::params![node, crate::federation::key_grant::MINTER_SENTINEL],
+                    )?;
+                }
+            }
+            let remaining: i64 = tx.query_row(
+                "SELECT (SELECT COUNT(*) FROM federation_community_dek_epoch WHERE minter_key_id = ?1) \
+                      + (SELECT COUNT(*) FROM federation_community_dek WHERE minter_key_id = ?1) \
+                      + (SELECT COUNT(*) FROM federation_community_dek_member_grants WHERE minter_key_id = ?1) \
+                      + (SELECT COUNT(*) FROM federation_community_blob_epoch WHERE minter_key_id = ?1)",
+                rusqlite::params![crate::federation::key_grant::MINTER_SENTINEL],
+                |r| r.get(0),
+            )?;
+            if remaining != 0 {
+                return Err(rusqlite::Error::ToSqlConversionFailure(
+                    format!(
+                        "{remaining} community-DEK row(s) still carry the V145 minter sentinel \
+                         after resolution to {node:?} (None = no Ed25519 identity to resolve \
+                         to); a minter of nobody cannot be served \
+                         (CIRISPersist#848, BLOB_REPLICATION.md §16)"
+                    )
+                    .into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(n)
+        })
+        .await
+        .map_err(|e| Error::Migration {
+            sqlstate: None,
+            detail: format!("sqlite minter-sentinel resolution (#848): {e}"),
+        })?;
+        self.minter_sentinel_resolved
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(n)
     }
 
     /// Test-only: apply migrations up to and including `version`, so a test
@@ -572,6 +668,7 @@ impl SqliteBackend {
                 crate::federation::HardwareAttestationPolicy::default(),
             )),
             node_key_id: std::sync::RwLock::new(None),
+            minter_sentinel_resolved: std::sync::atomic::AtomicBool::new(false),
             admission_gate: std::sync::RwLock::new(None),
             self_key_id: std::sync::RwLock::new(None),
             peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
@@ -687,6 +784,12 @@ impl SqliteBackend {
     /// its own identity is a backend that can be told the wrong one.
     pub fn set_node_key_id(&self, key_id: impl Into<String>) {
         *self.node_key_id.write().expect("node_key_id lock") = Some(key_id.into());
+    }
+
+    /// #848 — has [`Self::repair_minter_sentinel`] completed on this backend?
+    pub fn minter_sentinel_resolved(&self) -> bool {
+        self.minter_sentinel_resolved
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Snapshot the currently-installed hardware-attestation policy.
@@ -7760,6 +7863,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = revocation.authority_key_id;
         let scrub_signature_classical = revocation.scrub_signature_classical;
         let scrub_signature_pqc = revocation.scrub_signature_pqc;
+        // #848 (§15) — the counter the rotation-on-removal bump advances is
+        // THIS node's own; the Engine tells the backend who it is at boot.
+        let node_key: Option<String> = self.node_key_id.read().expect("node_key_id lock").clone();
         // v21.1.0 (CIRISPersist#507b) — computed before the transaction
         // closure moves everything.
         let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -7828,12 +7934,40 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // only — blobs already sealed under the old epoch keep their
             // grants. A spurious extra bump only skips an epoch number, which
             // is harmless (the DEK is minted lazily on next emission).
+            //
+            // #848 (§15) — PER MINTER: every counter on this node is one
+            // THIS node owns (a peer's epoch never has a self-retention row
+            // or a pointer here), so all of them advance. A minter that has
+            // minted (a self-retention row) but never rotated has no pointer
+            // row yet — epoch 0 is implicit — so its pointer is materialised
+            // at 0 first and then advanced with the rest; and this node's own
+            // counter advances even before it has minted, when the node key
+            // is known. `ensure_epoch_dek`'s removal-vs-mint compare (§15) is
+            // the backstop for a removal admitted where none of this ran.
             tx.execute(
-                "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, rotated_at) \
-                 VALUES (?1, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
-                 ON CONFLICT (community_key_id) DO UPDATE SET \
-                    epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+                "INSERT INTO federation_community_dek_epoch \
+                    (community_key_id, minter_key_id, epoch, rotated_at) \
+                 SELECT DISTINCT community_key_id, minter_key_id, 0, \
+                        strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                   FROM federation_community_dek WHERE community_key_id = ?1 \
+                 ON CONFLICT (community_key_id, minter_key_id) DO NOTHING",
                 rusqlite::params![row.community_key_id],
+            )?;
+            if let Some(node) = &node_key {
+                tx.execute(
+                    "INSERT INTO federation_community_dek_epoch \
+                        (community_key_id, minter_key_id, epoch, rotated_at) \
+                     VALUES (?1, ?2, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
+                     ON CONFLICT (community_key_id, minter_key_id) DO UPDATE SET \
+                        epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+                    rusqlite::params![row.community_key_id, node],
+                )?;
+            }
+            tx.execute(
+                "UPDATE federation_community_dek_epoch \
+                    SET epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                  WHERE community_key_id = ?1 AND (?2 IS NULL OR minter_key_id <> ?2)",
+                rusqlite::params![row.community_key_id, node_key],
             )?;
             tx.commit()
         })
@@ -12188,6 +12322,19 @@ fn scope_blob_symbol_from_sqlite_row(
     })
 }
 
+/// #848 §14 (V146) — the ledger's TEXT instant, byte-compatible with the
+/// grant tables' `created_at` default (`strftime('%Y-%m-%d %H:%M:%f','now')`,
+/// millisecond precision) so `<=` in SQL compares what the watermark read.
+fn format_ledger_instant(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+fn parse_ledger_instant(t: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
 impl crate::federation::BlobStorage for SqliteBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -12696,17 +12843,394 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(out)
     }
 
+    async fn put_at_rest_grants(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        wraps: &[crate::federation::GrantWrap],
+    ) -> Result<usize, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let scope = cohort_scope.to_owned();
+        let wraps = wraps.to_vec();
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            // #848 (§13) — one transaction, a UNION (`DO NOTHING` per row);
+            // no blob row is required (order independence).
+            let tx = conn.transaction()?;
+            let mut inserted = 0usize;
+            for w in &wraps {
+                inserted += tx.execute(
+                    "INSERT INTO federation_blob_key_grants (\
+                        at_rest_sha256, recipient_key_id, wrap_algorithm, wrapped_dek, cohort_scope\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT (at_rest_sha256, recipient_key_id) DO NOTHING",
+                    rusqlite::params![
+                        sha_vec,
+                        w.recipient_key_id,
+                        w.wrap_algorithm,
+                        w.wrapped_dek,
+                        scope
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("put_at_rest_grants: {e}")))
+    }
+
+    async fn community_dek_key_grant_dirty(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        self.read(move |conn| -> Result<bool, rusqlite::Error> {
+            // Dirty: a grant exists AND (never emitted OR a grant is NEWER than
+            // the stamped watermark). The stamp IS the snapshot's newest
+            // `created_at`, so equality means "carried"; a grant landing in
+            // that same millisecond after the snapshot is the one window the
+            // ledger cannot see — its own door emits (PR #850, round three).
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federation_community_dek_member_grants g \
+                               WHERE g.community_key_id = d.community_key_id \
+                                 AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
+                        AND (d.key_grant_emitted_at IS NULL \
+                             OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
+                                 FROM federation_community_dek_member_grants g \
+                                WHERE g.community_key_id = d.community_key_id \
+                                  AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
+                   FROM federation_community_dek d \
+                  WHERE d.community_key_id = ?1 AND d.minter_key_id = ?2 AND d.epoch = ?3",
+                rusqlite::params![c, m, e],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(false))
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_key_grant_dirty: {e}"))
+        })
+    }
+
+    async fn community_dek_key_grant_watermark(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT MAX(created_at) FROM federation_community_dek_member_grants \
+                  WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                rusqlite::params![c, m, e],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_key_grant_watermark: {e}"))
+        })
+        .map(|t| t.and_then(|t| parse_ledger_instant(&t)))
+    }
+
+    async fn community_dek_mark_key_grant_emitted(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        let w = format_ledger_instant(watermark);
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_community_dek \
+                    SET key_grant_emitted_at = ?4 \
+                  WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < ?4)",
+                rusqlite::params![c, m, e, w],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_mark_key_grant_emitted: {e}"
+            ))
+        })
+    }
+
+    async fn community_dek_list_key_grant_dirty(
+        &self,
+        minter_key_id: &str,
+    ) -> Result<Vec<(String, u64)>, crate::federation::BlobError> {
+        let m = minter_key_id.to_owned();
+        self.read(move |conn| -> Result<Vec<(String, u64)>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT d.community_key_id, d.epoch FROM federation_community_dek d \
+                  WHERE d.minter_key_id = ?1 \
+                    AND EXISTS(SELECT 1 FROM federation_community_dek_member_grants g \
+                                WHERE g.community_key_id = d.community_key_id \
+                                  AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
+                    AND (d.key_grant_emitted_at IS NULL \
+                         OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
+                             FROM federation_community_dek_member_grants g \
+                            WHERE g.community_key_id = d.community_key_id \
+                              AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
+                  ORDER BY d.community_key_id, d.epoch",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![m], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_list_key_grant_dirty: {e}"
+            ))
+        })
+    }
+
+    async fn blob_key_grant_dirty(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<bool, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(move |conn| -> Result<bool, rusqlite::Error> {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federation_blob_key_grants g \
+                               WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2) \
+                        AND (b.key_grant_emitted_at IS NULL \
+                             OR b.key_grant_emitted_at < (SELECT MAX(g.created_at) \
+                                 FROM federation_blob_key_grants g \
+                                WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2)) \
+                   FROM federation_blobs b WHERE b.sha256 = ?1",
+                rusqlite::params![sha_vec, sentinel],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(false))
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("blob_key_grant_dirty: {e}")))
+    }
+
+    async fn blob_key_grant_watermark(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT MAX(created_at) FROM federation_blob_key_grants \
+                  WHERE at_rest_sha256 = ?1 AND recipient_key_id != ?2",
+                rusqlite::params![sha_vec, sentinel],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("blob_key_grant_watermark: {e}"))
+        })
+        .map(|t| t.and_then(|t| parse_ledger_instant(&t)))
+    }
+
+    async fn blob_mark_key_grant_emitted(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let w = format_ledger_instant(watermark);
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_blobs \
+                    SET key_grant_emitted_at = ?2 \
+                  WHERE sha256 = ?1 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < ?2)",
+                rusqlite::params![sha_vec, w],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("blob_mark_key_grant_emitted: {e}"))
+        })
+    }
+
+    async fn blob_list_key_grant_dirty(
+        &self,
+        author_key_id: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        let author = author_key_id.to_owned();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(move |conn| -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT b.sha256 FROM federation_blobs b \
+                  WHERE b.author_key_id = ?1 AND b.crypto_tier = 'invisible_encrypted' \
+                    AND EXISTS(SELECT 1 FROM federation_blob_key_grants g \
+                                WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2) \
+                    AND (b.key_grant_emitted_at IS NULL \
+                         OR b.key_grant_emitted_at < (SELECT MAX(g.created_at) \
+                             FROM federation_blob_key_grants g \
+                            WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2)) \
+                  ORDER BY b.sha256",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![author, sentinel], |r| {
+                let v: Vec<u8> = r.get(0)?;
+                Ok(v)
+            })?;
+            let mut out = Vec::new();
+            for v in rows {
+                let v = v?;
+                if let Ok(a) = <[u8; 32]>::try_from(v.as_slice()) {
+                    out.push(a);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("blob_list_key_grant_dirty: {e}"))
+        })
+    }
+
+    async fn key_grant_pending_put(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+        signer_key_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let (scope, id, signer) = (
+            cohort_scope.to_owned(),
+            attestation_id.to_owned(),
+            signer_key_id.to_owned(),
+        );
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "INSERT INTO federation_key_grant_pending \
+                    (at_rest_sha256, cohort_scope, attestation_id, signer_key_id) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (at_rest_sha256, cohort_scope, attestation_id) DO NOTHING",
+                rusqlite::params![sha_vec, scope, id, signer],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_put: {e}")))
+    }
+
+    async fn key_grant_pending_list(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let scope = cohort_scope.to_owned();
+        self.read(move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, signer_key_id FROM federation_key_grant_pending \
+                  WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2 ORDER BY created_at, attestation_id",
+            )?;
+            let it = stmt.query_map(rusqlite::params![sha_vec, scope], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            it.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_list: {e}")))
+    }
+
+    async fn key_grant_pending_delete(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let (scope, id) = (cohort_scope.to_owned(), attestation_id.to_owned());
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "DELETE FROM federation_key_grant_pending \
+                  WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2 AND attestation_id = ?3",
+                rusqlite::params![sha_vec, scope, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("key_grant_pending_delete: {e}"))
+        })
+    }
+
+    async fn list_at_rest_grants(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Vec<crate::federation::GrantWrap>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::GrantWrap>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT recipient_key_id, wrap_algorithm, wrapped_dek \
+                       FROM federation_blob_key_grants \
+                      WHERE at_rest_sha256 = ?1 AND recipient_key_id != ?2 \
+                      ORDER BY recipient_key_id",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![sha_vec, sentinel], |r| {
+                        Ok(crate::federation::GrantWrap {
+                            recipient_key_id: r.get(0)?,
+                            wrap_algorithm: r.get(1)?,
+                            wrapped_dek: r.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("list_at_rest_grants: {e}")))
+    }
+
     // ── v9.0.0 G5 (CC 4.4.3.2.1 / 4.4.3.2.2) community DEK cascade ──
+    // #848 (BLOB_REPLICATION.md §11, §16) — every floor here is keyed on the
+    // MINTER: an epoch belongs to the occurrence whose cascade minted it, so
+    // `(community, epoch)` names nothing without `minter_key_id`.
     async fn community_dek_current_epoch(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> Result<u64, crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let epoch = self
             .read(move |conn| -> Result<Option<i64>, rusqlite::Error> {
                 conn.query_row(
-                    "SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1",
-                    rusqlite::params![community],
+                    "SELECT epoch FROM federation_community_dek_epoch \
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2",
+                    rusqlite::params![community, minter],
                     |r| r.get::<_, i64>(0),
                 )
                 .optional()
@@ -12721,21 +13245,25 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_bump_epoch(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> Result<u64, crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let new_epoch = self
             .write(move |conn| -> Result<i64, rusqlite::Error> {
                 // Upsert: epoch 0 → first bump yields 1; subsequent bumps +1.
                 conn.execute(
-                "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, rotated_at) \
-                 VALUES (?1, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
-                 ON CONFLICT (community_key_id) DO UPDATE SET \
-                    epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
-                rusqlite::params![community],
-            )?;
+                    "INSERT INTO federation_community_dek_epoch \
+                        (community_key_id, minter_key_id, epoch, rotated_at) \
+                     VALUES (?1, ?2, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
+                     ON CONFLICT (community_key_id, minter_key_id) DO UPDATE SET \
+                        epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
+                    rusqlite::params![community, minter],
+                )?;
                 conn.query_row(
-                    "SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1",
-                    rusqlite::params![community],
+                    "SELECT epoch FROM federation_community_dek_epoch \
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2",
+                    rusqlite::params![community, minter],
                     |r| r.get::<_, i64>(0),
                 )
             })
@@ -12749,20 +13277,25 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_put_self_retention(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         wrapped_dek: &str,
     ) -> Result<(), crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = epoch as i64;
         let wrapped = wrapped_dek.to_owned();
         let alg = crate::federation::at_rest_cascade::WRAP_ALGORITHM_CONTENT_MASTER.to_owned();
+        // #848 (§15) — `minted_at` is stamped HERE, as RFC 3339, so the
+        // rotation compare reads one format on every row this crate writes.
+        let minted_at = chrono::Utc::now().to_rfc3339();
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "INSERT INTO federation_community_dek (\
-                    community_key_id, epoch, wrap_algorithm, wrapped_dek\
-                 ) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT (community_key_id, epoch) DO NOTHING",
-                rusqlite::params![community, ep, alg, wrapped],
+                    community_key_id, minter_key_id, epoch, wrap_algorithm, wrapped_dek, minted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (community_key_id, minter_key_id, epoch) DO NOTHING",
+                rusqlite::params![community, minter, ep, alg, wrapped, minted_at],
             )?;
             Ok(())
         })
@@ -12776,17 +13309,19 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_get_self_retention(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> Result<Option<String>, crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = epoch as i64;
         let row = self
             .read(
                 move |conn| -> Result<Option<Option<String>>, rusqlite::Error> {
                     conn.query_row(
                         "SELECT wrapped_dek FROM federation_community_dek \
-                 WHERE community_key_id = ?1 AND epoch = ?2",
-                        rusqlite::params![community, ep],
+                         WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                        rusqlite::params![community, minter, ep],
                         |r| r.get::<_, Option<String>>(0),
                     )
                     .optional()
@@ -12801,15 +13336,50 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(row.flatten())
     }
 
+    async fn community_dek_minted_at(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
+        let ep = epoch as i64;
+        let raw = self
+            .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT minted_at FROM federation_community_dek \
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                    rusqlite::params![community, minter, ep],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_minted_at: {e}"))
+            })?;
+        raw.map(|s| {
+            crate::store::sqlite::parse_sqlite_instant(&s).ok_or_else(|| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_minted_at: {s:?} is neither RFC 3339 nor a SQLite instant"
+                ))
+            })
+        })
+        .transpose()
+    }
+
     async fn community_dek_put_member_grant(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         member_key_id: &str,
         wrap_algorithm: &str,
         wrapped_dek: &str,
     ) -> Result<(), crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = epoch as i64;
         let member = member_key_id.to_owned();
         let alg = wrap_algorithm.to_owned();
@@ -12817,10 +13387,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "INSERT INTO federation_community_dek_member_grants (\
-                    community_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (community_key_id, epoch, member_key_id) DO NOTHING",
-                rusqlite::params![community, ep, member, alg, wrapped],
+                    community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (community_key_id, minter_key_id, epoch, member_key_id) DO NOTHING",
+                rusqlite::params![community, minter, ep, member, alg, wrapped],
             )?;
             Ok(())
         })
@@ -12831,21 +13401,68 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(())
     }
 
+    async fn community_dek_put_member_grants(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        wraps: &[crate::federation::GrantWrap],
+    ) -> Result<usize, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
+        let ep = epoch as i64;
+        let wraps = wraps.to_vec();
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            // #848 (§13) — ONE transaction, a UNION: every row is
+            // `DO NOTHING` on the key, so nothing already admitted is
+            // touched and a re-applied set writes zero rows.
+            let tx = conn.transaction()?;
+            let mut inserted = 0usize;
+            for w in &wraps {
+                inserted += tx.execute(
+                    "INSERT INTO federation_community_dek_member_grants (\
+                        community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT (community_key_id, minter_key_id, epoch, member_key_id) DO NOTHING",
+                    rusqlite::params![
+                        community,
+                        minter,
+                        ep,
+                        w.recipient_key_id,
+                        w.wrap_algorithm,
+                        w.wrapped_dek
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_put_member_grants: {e}"))
+        })
+    }
+
     async fn community_dek_member_grant_recipients(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> Result<Vec<String>, crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = epoch as i64;
         let out = self
             .read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT member_key_id FROM federation_community_dek_member_grants \
-                 WHERE community_key_id = ?1 AND epoch = ?2 ORDER BY member_key_id",
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                     ORDER BY member_key_id",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![community, ep], |r| r.get::<_, String>(0))?
+                    .query_map(rusqlite::params![community, minter, ep], |r| {
+                        r.get::<_, String>(0)
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
@@ -12858,21 +13475,61 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(out)
     }
 
+    async fn community_dek_member_grants_for_epoch(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<crate::federation::GrantWrap>, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
+        let ep = epoch as i64;
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::GrantWrap>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT member_key_id, wrap_algorithm, wrapped_dek \
+                       FROM federation_community_dek_member_grants \
+                      WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                      ORDER BY member_key_id",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![community, minter, ep], |r| {
+                        Ok(crate::federation::GrantWrap {
+                            recipient_key_id: r.get(0)?,
+                            wrap_algorithm: r.get(1)?,
+                            wrapped_dek: r.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_member_grants_for_epoch: {e}"
+            ))
+        })
+    }
+
     async fn community_dek_has_member_grant(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         member_key_id: &str,
     ) -> Result<bool, crate::federation::BlobError> {
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = epoch as i64;
         let member = member_key_id.to_owned();
         let found = self
             .read(move |conn| -> Result<bool, rusqlite::Error> {
                 conn.query_row(
                     "SELECT 1 FROM federation_community_dek_member_grants \
-                 WHERE community_key_id = ?1 AND epoch = ?2 AND member_key_id = ?3",
-                    rusqlite::params![community, ep, member],
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                       AND member_key_id = ?4",
+                    rusqlite::params![community, minter, ep, member],
                     |_| Ok(()),
                 )
                 .optional()
@@ -12887,27 +13544,61 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(found)
     }
 
+    async fn community_dek_member_grant_wrap(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+    ) -> Result<Option<(String, String)>, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
+        let ep = epoch as i64;
+        let member = member_key_id.to_owned();
+        self.read(
+            move |conn| -> Result<Option<(String, String)>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT wrap_algorithm, wrapped_dek FROM federation_community_dek_member_grants \
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                       AND member_key_id = ?4",
+                    rusqlite::params![community, minter, ep, member],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_member_grant_wrap: {e}"))
+        })
+    }
+
     async fn community_dek_bind_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> Result<(), crate::federation::BlobError> {
         let sha_vec = at_rest_sha256.to_vec();
         let community = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let (inserted, already) = self.write(move |conn| -> Result<(usize, bool), rusqlite::Error> {
             // v43.0.0 (§11.4) — BIND IS CONDITIONAL ON `enabled`, in the same
             // statement. The other half of the bind/destroy exclusion.
+            // #848 — against the MINTER's own key state and pointer.
             let n = conn.execute(
-                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                 SELECT ?1, ?2, ?3 \
+                "INSERT INTO federation_community_blob_epoch \
+                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                 SELECT ?1, ?2, ?3, ?4 \
                   WHERE EXISTS (SELECT 1 FROM federation_community_dek \
-                                 WHERE community_key_id = ?2 AND epoch = ?3 \
+                                 WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
                                    AND key_state = 'enabled') \
-                   AND ?3 = COALESCE((SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?2), 0) \
+                   AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                       WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
                  ON CONFLICT (at_rest_sha256) DO NOTHING",
-                rusqlite::params![sha_vec, community, ep],
+                rusqlite::params![sha_vec, community, minter, ep],
             )?;
             let already: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1)",
@@ -12931,16 +13622,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_key_state(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> Result<Option<crate::federation::DekKeyState>, crate::federation::BlobError> {
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let raw = self
             .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
                 conn.query_row(
                     "SELECT key_state FROM federation_community_dek \
-                 WHERE community_key_id = ?1 AND epoch = ?2",
-                    rusqlite::params![comm, ep],
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                    rusqlite::params![comm, minter, ep],
                     |r| r.get::<_, String>(0),
                 )
                 .optional()
@@ -12956,11 +13649,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_set_key_state(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         state: crate::federation::DekKeyState,
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::DekKeyState;
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let token = state.as_str();
         let destroying = state == DekKeyState::Destroyed;
@@ -12979,25 +13674,28 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 // kept as an eviction record is not an object. This is the
                 // same predicate as `community_dek_epoch_object_count`; the
                 // count is the friendly message, this statement is the guard.
+                // #848 — all of it on the MINTER's `(community, minter, epoch)`.
                 tx.execute(
                     "UPDATE federation_community_dek \
                         SET key_state = 'destroyed', wrapped_dek = NULL \
-                      WHERE community_key_id = ?1 AND epoch = ?2 \
+                      WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
                         AND key_state <> 'destroyed' \
-                        AND epoch <> COALESCE((SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1), 0) \
+                        AND epoch <> COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                                WHERE community_key_id = ?1 AND minter_key_id = ?2), 0) \
                         AND NOT EXISTS ( \
                             SELECT 1 FROM federation_community_blob_epoch \
-                             WHERE community_key_id = ?1 AND epoch = ?2 \
+                             WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
                                AND evicted_at IS NULL)",
-                    rusqlite::params![comm, ep],
+                    rusqlite::params![comm, minter, ep],
                 )?
             } else {
                 tx.execute(
-                    "UPDATE federation_community_dek SET key_state = ?3 \
-                      WHERE community_key_id = ?1 AND epoch = ?2 \
+                    "UPDATE federation_community_dek SET key_state = ?4 \
+                      WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
                         AND key_state <> 'destroyed' \
-                        AND (?4 OR epoch <> COALESCE((SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1), 0))",
-                    rusqlite::params![comm, ep, token, enabling],
+                        AND (?5 OR epoch <> COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                                       WHERE community_key_id = ?1 AND minter_key_id = ?2), 0))",
+                    rusqlite::params![comm, minter, ep, token, enabling],
                 )?
             };
             if n == 0 {
@@ -13006,10 +13704,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
             }
             if destroying {
                 // Every wrap goes with the state, in the same transaction.
+                // #848 (I67) — this is the ONE production DELETE on the grant
+                // table: the epoch-destroy sweep. Nothing else un-grants.
                 tx.execute(
                     "DELETE FROM federation_community_dek_member_grants \
-                      WHERE community_key_id = ?1 AND epoch = ?2",
-                    rusqlite::params![comm, ep],
+                      WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                    rusqlite::params![comm, minter, ep],
                 )?;
             }
             tx.commit()?;
@@ -13022,13 +13722,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
             return Ok(());
         }
         // Zero rows: say which of the causes, for the caller.
-        let current_epoch = self.community_dek_current_epoch(community_key_id).await?;
+        let current_epoch = self
+            .community_dek_current_epoch(community_key_id, minter_key_id)
+            .await?;
         match self
-            .community_dek_key_state(community_key_id, epoch)
+            .community_dek_key_state(community_key_id, minter_key_id, epoch)
             .await?
         {
             None => Err(crate::federation::BlobError::InvalidArgument(format!(
-                "no community DEK at ({community_key_id:?}, epoch {epoch})"
+                "no community DEK at ({community_key_id:?}, minter {minter_key_id:?}, epoch {epoch})"
             ))),
             Some(DekKeyState::Destroyed) => {
                 Err(crate::federation::BlobError::InvalidArgument(format!(
@@ -13045,7 +13747,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             }
             Some(_) if destroying => {
                 let n = self
-                    .community_dek_epoch_object_count(community_key_id, epoch)
+                    .community_dek_epoch_object_count(community_key_id, minter_key_id, epoch)
                     .await?;
                 Err(crate::federation::BlobError::InvalidArgument(format!(
                     "refusing to destroy community {community_key_id:?} epoch {epoch}: {n} \
@@ -13061,19 +13763,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_epoch_object_count(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
     ) -> Result<u64, crate::federation::BlobError> {
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
         let n = self
             .read(move |conn| -> Result<i64, rusqlite::Error> {
-                // Served by V138's federation_community_blob_epoch_by_community_epoch.
+                // Served by V145's federation_community_blob_epoch_by_community_epoch.
                 // #833 (I31) — a binding the sweep kept as an eviction record is
                 // not an object; only live bindings hold the count above zero.
                 conn.query_row(
                     "SELECT COUNT(*) FROM federation_community_blob_epoch \
-                 WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL",
-                    rusqlite::params![comm, ep],
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                       AND evicted_at IS NULL",
+                    rusqlite::params![comm, minter, ep],
                     |r| r.get::<_, i64>(0),
                 )
             })
@@ -13090,15 +13795,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_retain_past_epochs(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> Result<Option<u64>, crate::federation::BlobError> {
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let v = self
             .read(
                 move |conn| -> Result<Option<Option<i64>>, rusqlite::Error> {
                     conn.query_row(
                         "SELECT retain_past_epochs FROM federation_community_dek_epoch \
-                 WHERE community_key_id = ?1",
-                        rusqlite::params![comm],
+                         WHERE community_key_id = ?1 AND minter_key_id = ?2",
+                        rusqlite::params![comm, minter],
                         |r| r.get::<_, Option<i64>>(0),
                     )
                     .optional()
@@ -13116,13 +13823,15 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_communities(&self) -> Result<Vec<String>, crate::federation::BlobError> {
         self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
             let mut st = conn.prepare(
-                "SELECT community_key_id FROM federation_community_dek_epoch ORDER BY community_key_id",
+                "SELECT DISTINCT community_key_id FROM federation_community_dek_epoch \
+                 ORDER BY community_key_id",
             )?;
             let out: Vec<String> = st
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(out)
-        }).await
+        })
+        .await
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!("community_dek_communities: {e}"))
         })
@@ -13131,19 +13840,24 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_set_retain_past_epochs(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         retain: Option<u64>,
     ) -> Result<(), crate::federation::BlobError> {
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let v: Option<i64> = retain.and_then(|n| i64::try_from(n).ok());
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
-                "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, retain_past_epochs) \
-                 VALUES (?1, 0, ?2) \
-                 ON CONFLICT (community_key_id) DO UPDATE SET retain_past_epochs = excluded.retain_past_epochs",
-                rusqlite::params![comm, v],
+                "INSERT INTO federation_community_dek_epoch \
+                    (community_key_id, minter_key_id, epoch, retain_past_epochs) \
+                 VALUES (?1, ?2, 0, ?3) \
+                 ON CONFLICT (community_key_id, minter_key_id) \
+                 DO UPDATE SET retain_past_epochs = excluded.retain_past_epochs",
+                rusqlite::params![comm, minter, v],
             )?;
             Ok(())
-        }).await
+        })
+        .await
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!(
                 "community_dek_set_retain_past_epochs: {e}"
@@ -13154,16 +13868,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_epochs(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
     ) -> Result<Vec<(u64, crate::federation::DekKeyState)>, crate::federation::BlobError> {
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let rows = self
             .read(move |conn| -> Result<Vec<(i64, String)>, rusqlite::Error> {
                 let mut st = conn.prepare(
                     "SELECT epoch, key_state FROM federation_community_dek \
-                 WHERE community_key_id = ?1 ORDER BY epoch ASC",
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 ORDER BY epoch ASC",
                 )?;
                 let out = st
-                    .query_map(rusqlite::params![comm], |r| {
+                    .query_map(rusqlite::params![comm, minter], |r| {
                         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -13184,6 +13900,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_evict_epoch_objects(
         &self,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         signer: &crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
@@ -13191,18 +13908,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
         use crate::federation::FederationDirectory as _;
         let ep = i64::try_from(epoch).unwrap_or(i64::MAX);
 
-        // 1. What is sealed at this epoch (served by V138's reverse index).
+        // 1. What is sealed at this epoch (served by V145's reverse index).
         //    #833 — LIVE bindings only: an already-evicted binding is a
         //    record, not an object, and a re-run must not re-stamp it.
         let sha_hexes: std::collections::HashSet<String> = {
             let comm = community_key_id.to_owned();
+            let minter = minter_key_id.to_owned();
             self.read(move |conn| -> Result<Vec<Vec<u8>>, rusqlite::Error> {
                 let mut st = conn.prepare(
                     "SELECT at_rest_sha256 FROM federation_community_blob_epoch \
-                      WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL",
+                      WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                        AND evicted_at IS NULL",
                 )?;
                 let out: Vec<Vec<u8>> = st
-                    .query_map(rusqlite::params![comm, ep], |r| r.get::<_, Vec<u8>>(0))?
+                    .query_map(rusqlite::params![comm, minter, ep], |r| {
+                        r.get::<_, Vec<u8>>(0)
+                    })?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(out)
             })
@@ -13267,6 +13988,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         //    rather than "never ours". Every statement is scoped to LIVE
         //    bindings, so a re-run evicts nothing and never re-stamps.
         let comm = community_key_id.to_owned();
+        let minter = minter_key_id.to_owned();
         let stamp = now.to_rfc3339();
         let n = self
             .write(move |conn| -> Result<usize, rusqlite::Error> {
@@ -13274,19 +13996,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 tx.execute(
                     "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 IN ( \
                     SELECT at_rest_sha256 FROM federation_community_blob_epoch \
-                     WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL)",
-                    rusqlite::params![comm, ep],
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                       AND evicted_at IS NULL)",
+                    rusqlite::params![comm, minter, ep],
                 )?;
                 tx.execute(
                     "DELETE FROM federation_blobs WHERE sha256 IN ( \
                     SELECT at_rest_sha256 FROM federation_community_blob_epoch \
-                     WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL)",
-                    rusqlite::params![comm, ep],
+                     WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                       AND evicted_at IS NULL)",
+                    rusqlite::params![comm, minter, ep],
                 )?;
                 let n = tx.execute(
-                    "UPDATE federation_community_blob_epoch SET evicted_at = ?3 \
-                  WHERE community_key_id = ?1 AND epoch = ?2 AND evicted_at IS NULL",
-                    rusqlite::params![comm, ep, stamp],
+                    "UPDATE federation_community_blob_epoch SET evicted_at = ?4 \
+                      WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                        AND evicted_at IS NULL",
+                    rusqlite::params![comm, minter, ep, stamp],
                 )?;
                 tx.commit()?;
                 Ok(n)
@@ -13303,29 +14028,29 @@ impl crate::federation::BlobStorage for SqliteBackend {
         at_rest_sha256: &[u8; 32],
     ) -> Result<Option<crate::federation::BlobEpochBinding>, crate::federation::BlobError> {
         let sha_vec = at_rest_sha256.to_vec();
+        type Row = (String, String, i64, Option<String>);
         let row = self
-            .read(
-                move |conn| -> Result<Option<(String, i64, Option<String>)>, rusqlite::Error> {
-                    conn.query_row(
-                        "SELECT community_key_id, epoch, evicted_at \
-                           FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
-                        rusqlite::params![sha_vec],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, i64>(1)?,
-                                r.get::<_, Option<String>>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                },
-            )
+            .read(move |conn| -> Result<Option<Row>, rusqlite::Error> {
+                conn.query_row(
+                    "SELECT community_key_id, minter_key_id, epoch, evicted_at \
+                       FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
+                    rusqlite::params![sha_vec],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("community_dek_blob_binding: {e}"))
             })?;
-        let Some((community_key_id, epoch, evicted)) = row else {
+        let Some((community_key_id, minter_key_id, epoch, evicted)) = row else {
             return Ok(None);
         };
         // A stamp this backend wrote (`to_rfc3339`) that does not parse is
@@ -13344,6 +14069,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .transpose()?;
         Ok(Some(crate::federation::BlobEpochBinding {
             community_key_id,
+            minter_key_id,
             epoch: u64::try_from(epoch).unwrap_or(0),
             evicted_at,
         }))
@@ -13352,16 +14078,22 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],
-    ) -> Result<Option<(String, u64)>, crate::federation::BlobError> {
+    ) -> Result<Option<(String, String, u64)>, crate::federation::BlobError> {
         let sha_vec = at_rest_sha256.to_vec();
         let row = self
             .read(
-                move |conn| -> Result<Option<(String, i64)>, rusqlite::Error> {
+                move |conn| -> Result<Option<(String, String, i64)>, rusqlite::Error> {
                     conn.query_row(
-                        "SELECT community_key_id, epoch FROM federation_community_blob_epoch \
-                 WHERE at_rest_sha256 = ?1",
+                        "SELECT community_key_id, minter_key_id, epoch \
+                           FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
                         rusqlite::params![sha_vec],
-                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        },
                     )
                     .optional()
                 },
@@ -13370,7 +14102,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("community_dek_blob_epoch: {e}"))
             })?;
-        Ok(row.map(|(c, e)| (c, e.max(0) as u64)))
+        Ok(row.map(|(c, m, e)| (c, m, e.max(0) as u64)))
     }
 
     // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
@@ -13546,9 +14278,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     })
                     .collect();
                 let sql = format!(
-                    "SELECT DISTINCT at_rest_sha256 FROM federation_blob_key_grants \
-                 WHERE cohort_scope = ?1 AND recipient_key_id IN ({}) \
-                 ORDER BY at_rest_sha256",
+                    "SELECT DISTINCT g.at_rest_sha256 FROM federation_blob_key_grants g \
+                 WHERE g.cohort_scope = ?1 AND g.recipient_key_id IN ({}) \
+                   AND EXISTS (SELECT 1 FROM federation_blob_key_grants s \
+                                WHERE s.at_rest_sha256 = g.at_rest_sha256 \
+                                  AND s.recipient_key_id = '__persist_self__') \
+                 ORDER BY g.at_rest_sha256",
                     placeholders.join(", ")
                 );
                 let mut stmt = conn.prepare(&sql)?;
@@ -13719,6 +14454,55 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(ContentKemIdentity {
             x25519_pubkey_b64: stored_x,
             ml_kem_768_pubkey_b64: stored_ml,
+        })
+    }
+
+    async fn load_content_kem_private_halves(
+        &self,
+    ) -> Result<
+        crate::federation::identity_aggregate::ContentKemPrivate,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::identity_aggregate::{
+            unseal_content_kem_private, ContentKemPrivate,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        // Same row, same first-write-wins: mint if absent.
+        let identity = self.load_or_init_content_kem_identity().await?;
+        let content_master = self.load_or_init_content_master().await?;
+        let (x_sealed, ml_sealed) = self
+            .read(move |conn| -> Result<(String, String), rusqlite::Error> {
+                conn.query_row(
+                    "SELECT content_x25519_privkey_sealed_b64, content_ml_kem_768_privkey_sealed_b64 \
+                       FROM federation_content_kem_identity WHERE id = 0",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "load_content_kem_private_halves: {e}"
+                ))
+            })?;
+        let x_priv_v = unseal_content_kem_private(&content_master, &x_sealed)?;
+        let x25519_priv: [u8; 32] = x_priv_v.try_into().map_err(|v: Vec<u8>| {
+            crate::federation::BlobError::Backend(format!(
+                "load_content_kem_private_halves: x25519 private is {} bytes, expected 32",
+                v.len()
+            ))
+        })?;
+        let ml_kem_768_priv = unseal_content_kem_private(&content_master, &ml_sealed)?;
+        let ml_kem_768_pub = B64.decode(&identity.ml_kem_768_pubkey_b64).map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "load_content_kem_private_halves: ml-kem pubkey base64: {e}"
+            ))
+        })?;
+        Ok(ContentKemPrivate {
+            x25519_priv,
+            ml_kem_768_priv,
+            ml_kem_768_pub,
         })
     }
 
@@ -13903,20 +14687,25 @@ impl crate::federation::BlobStorage for SqliteBackend {
             )?;
             if let Some(b) = &bind {
                 let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                // #848 — the manifest binds `(community, minter, epoch)`,
+                // current-and-enabled against the MINTER's own state.
                 let n = tx.execute(
-                    "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                     SELECT ?1, ?2, ?3 \
+                    "INSERT INTO federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     SELECT ?1, ?2, ?3, ?4 \
                       WHERE EXISTS (SELECT 1 FROM federation_community_dek \
-                                     WHERE community_key_id = ?2 AND epoch = ?3 \
+                                     WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
                                        AND key_state = 'enabled') \
-                       AND ?3 = COALESCE((SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?2), 0) \
+                       AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                           WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
                      ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    rusqlite::params![sha_vec, b.community_key_id, ep],
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
                 )?;
                 let already: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 AND epoch = ?3)",
-                    rusqlite::params![sha_vec, b.community_key_id, ep],
+                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 \
+                                      AND minter_key_id = ?3 AND epoch = ?4)",
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
                     |r| r.get(0),
                 )?;
                 if n == 0 && !already {
@@ -14134,11 +14923,13 @@ impl crate::federation::BlobStorage for SqliteBackend {
             //    key state for. No `enabled` check, no current-epoch check.
             if let Some(b) = &binding {
                 let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                // #848 — the minter is the AUTHOR, as declared (§11).
                 tx.execute(
-                    "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                     VALUES (?1, ?2, ?3) \
+                    "INSERT INTO federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     VALUES (?1, ?2, ?3, ?4) \
                      ON CONFLICT (at_rest_sha256) DO NOTHING",
-                    rusqlite::params![sha_vec, b.community_key_id, ep],
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
                 )?;
             }
             // 3. The holder claim, signed by THIS node (§6.1 (4)), in the
@@ -15758,31 +16549,36 @@ impl SqliteBackend {
             //    append rolls back: no blob row, no index row, no orphan.
             if let Some(b) = &bind {
                 let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                // #848 — every chunk binds `(community, minter, epoch)`.
                 let n = if bind_as_declared {
                     // #846 (§3) — the binding is the AUTHOR's fact: recorded
                     // as declared, with no key-state precondition.
                     tx.execute(
-                        "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                         VALUES (?1, ?2, ?3) \
+                        "INSERT INTO federation_community_blob_epoch \
+                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                         VALUES (?1, ?2, ?3, ?4) \
                          ON CONFLICT (at_rest_sha256) DO NOTHING",
-                        rusqlite::params![sha_vec, b.community_key_id, ep],
+                        rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
                     )?
                 } else {
                     tx.execute(
-                        "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
-                         SELECT ?1, ?2, ?3 \
+                        "INSERT INTO federation_community_blob_epoch \
+                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                         SELECT ?1, ?2, ?3, ?4 \
                           WHERE EXISTS (SELECT 1 FROM federation_community_dek \
-                                         WHERE community_key_id = ?2 AND epoch = ?3 \
+                                         WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
                                            AND key_state = 'enabled') \
-                           AND ?3 = COALESCE((SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?2), 0) \
+                           AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                               WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
                          ON CONFLICT (at_rest_sha256) DO NOTHING",
-                        rusqlite::params![sha_vec, b.community_key_id, ep],
+                        rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
                     )?
                 };
                 let already: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 AND epoch = ?3)",
-                    rusqlite::params![sha_vec, b.community_key_id, ep],
+                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 \
+                                      AND minter_key_id = ?3 AND epoch = ?4)",
+                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
                     |r| r.get(0),
                 )?;
                 if n == 0 && !already {
@@ -29229,6 +30025,8 @@ mod tests {
     ) -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // #848 — the fixture node IS the minter of every epoch it mints.
+        backend.set_node_key_id("comm-node");
         let mut comm_key = fed_key("comm", "comm", "comm");
         if comm_authorized {
             comm_key.identity_type =
@@ -29930,15 +30728,22 @@ mod tests {
         use crate::federation::{BlobStorage, DekKeyState};
 
         let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // #848 — the sweep runs over the SIGNER's own counter, so the node
+        // that mints here is the sweeper.
+        let sweeper = test_signer_for("sweeper");
+        let minter = sweeper.derived_key_id();
+        backend.set_node_key_id(&minter);
         let old = encrypt_and_cascade_community(&backend, "comm", b"old minutes", None, None)
             .await
             .unwrap();
-        backend.community_dek_bump_epoch("comm").await.unwrap();
+        backend
+            .community_dek_bump_epoch("comm", &minter)
+            .await
+            .unwrap();
         encrypt_and_cascade_community(&backend, "comm", b"new minutes", None, None)
             .await
             .unwrap();
 
-        let sweeper = test_signer_for("sweeper");
         let report = sweep_rotated_epochs(&backend, "comm", &sweeper, chrono::Utc::now())
             .await
             .unwrap();
@@ -29963,7 +30768,7 @@ mod tests {
         // still readable. That is the whole difference.
         assert_eq!(
             backend
-                .community_dek_key_state("comm", old.epoch)
+                .community_dek_key_state("comm", &minter, old.epoch)
                 .await
                 .unwrap(),
             Some(DekKeyState::Disabled)
@@ -29989,10 +30794,18 @@ mod tests {
         use crate::federation::{BlobStorage, DekKeyState};
 
         let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // #848 — the sweep runs over the SIGNER's own counter, so the node
+        // that mints here is the sweeper.
+        let sweeper = test_signer_for("sweeper");
+        let minter = sweeper.derived_key_id();
+        backend.set_node_key_id(&minter);
         let old = encrypt_and_cascade_community(&backend, "comm", b"old minutes", None, None)
             .await
             .unwrap();
-        backend.community_dek_bump_epoch("comm").await.unwrap();
+        backend
+            .community_dek_bump_epoch("comm", &minter)
+            .await
+            .unwrap();
         let new = encrypt_and_cascade_community(&backend, "comm", b"new minutes", None, None)
             .await
             .unwrap();
@@ -30009,7 +30822,6 @@ mod tests {
             .unwrap();
         }
 
-        let sweeper = test_signer_for("sweeper");
         let report = sweep_rotated_epochs(&backend, "comm", &sweeper, chrono::Utc::now())
             .await
             .unwrap();
@@ -30022,7 +30834,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .community_dek_key_state("comm", old.epoch)
+                .community_dek_key_state("comm", &minter, old.epoch)
                 .await
                 .unwrap(),
             Some(DekKeyState::Destroyed)
@@ -30077,11 +30889,20 @@ mod tests {
 
         // I20 — the door acts on a rotated-past epoch; the live-content
         // refusal is what this test is about, so rotate first.
-        backend.community_dek_bump_epoch("comm").await.unwrap();
-        // The precondition is unmet: one object is sealed at this epoch.
-        let err = set_key_state(&backend, "comm", sealed.epoch, DekKeyState::Destroyed)
+        backend
+            .community_dek_bump_epoch("comm", "comm-node")
             .await
-            .expect_err("destroying an epoch with live content must be refused");
+            .unwrap();
+        // The precondition is unmet: one object is sealed at this epoch.
+        let err = set_key_state(
+            &backend,
+            "comm",
+            "comm-node",
+            sealed.epoch,
+            DekKeyState::Destroyed,
+        )
+        .await
+        .expect_err("destroying an epoch with live content must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("still sealed under it") && msg.contains("ORPHAN"),
@@ -30090,12 +30911,18 @@ mod tests {
 
         // Disabling is always allowed — that is AV-70's ratified behaviour,
         // and it is what you do INSTEAD when content is still live.
-        set_key_state(&backend, "comm", sealed.epoch, DekKeyState::Disabled)
-            .await
-            .expect("disabling an epoch with live content is fine");
+        set_key_state(
+            &backend,
+            "comm",
+            "comm-node",
+            sealed.epoch,
+            DekKeyState::Disabled,
+        )
+        .await
+        .expect("disabling an epoch with live content is fine");
         assert_eq!(
             backend
-                .community_dek_key_state("comm", sealed.epoch)
+                .community_dek_key_state("comm", "comm-node", sealed.epoch)
                 .await
                 .unwrap(),
             Some(DekKeyState::Disabled)
@@ -30132,10 +30959,19 @@ mod tests {
         let first = encrypt_and_cascade_community(&backend, "comm", b"one", None, None)
             .await
             .unwrap();
-        let next = backend.community_dek_bump_epoch("comm").await.unwrap();
-        set_key_state(&backend, "comm", first.epoch, DekKeyState::Disabled)
+        let next = backend
+            .community_dek_bump_epoch("comm", "comm-node")
             .await
             .unwrap();
+        set_key_state(
+            &backend,
+            "comm",
+            "comm-node",
+            first.epoch,
+            DekKeyState::Disabled,
+        )
+        .await
+        .unwrap();
 
         let two = encrypt_and_cascade_community(&backend, "comm", b"two", None, None)
             .await
@@ -30146,6 +30982,7 @@ mod tests {
             &backend,
             crate::federation::types::cohort_scope::COMMUNITY,
             "comm",
+            "comm-node",
             first.epoch,
             b"three",
             None,
@@ -30187,17 +31024,23 @@ mod tests {
         }
 
         // I20 — destroy acts on a rotated-past epoch, never the current one.
-        backend.community_dek_bump_epoch("comm").await.unwrap();
-        set_key_state(&backend, "comm", 0, DekKeyState::Destroyed)
+        backend
+            .community_dek_bump_epoch("comm", "comm-node")
+            .await
+            .unwrap();
+        set_key_state(&backend, "comm", "comm-node", 0, DekKeyState::Destroyed)
             .await
             .expect("an emptied epoch destroys");
         assert_eq!(
-            backend.community_dek_key_state("comm", 0).await.unwrap(),
+            backend
+                .community_dek_key_state("comm", "comm-node", 0)
+                .await
+                .unwrap(),
             Some(DekKeyState::Destroyed)
         );
 
         // Terminal: no transition brings the key material back.
-        let err = set_key_state(&backend, "comm", 0, DekKeyState::Enabled)
+        let err = set_key_state(&backend, "comm", "comm-node", 0, DekKeyState::Enabled)
             .await
             .expect_err("destroyed must be terminal");
         assert!(
@@ -30238,16 +31081,16 @@ mod tests {
 
         // Granted member's grant exists and is v2; keyless member has NONE.
         let recips = backend
-            .community_dek_member_grant_recipients("comm", 0)
+            .community_dek_member_grant_recipients("comm", "comm-node", 0)
             .await
             .unwrap();
         assert_eq!(recips, vec!["alice-occ".to_string()]);
         assert!(backend
-            .community_dek_has_member_grant("comm", 0, "alice-occ")
+            .community_dek_has_member_grant("comm", "comm-node", 0, "alice-occ")
             .await
             .unwrap());
         assert!(!backend
-            .community_dek_has_member_grant("comm", 0, "bob-occ")
+            .community_dek_has_member_grant("comm", "comm-node", 0, "bob-occ")
             .await
             .unwrap());
 
@@ -30304,7 +31147,7 @@ mod tests {
         ));
         // No epoch-0 DEK was minted for the infra community.
         assert!(backend
-            .community_dek_get_self_retention("comm", 0)
+            .community_dek_get_self_retention("comm", "comm-node", 0)
             .await
             .unwrap()
             .is_none());
@@ -30338,7 +31181,7 @@ mod tests {
         assert_eq!(result.granted, vec!["alice-occ".to_string()]);
         // An epoch-0 DEK self-retention row WAS minted (cascade ran).
         assert!(backend
-            .community_dek_get_self_retention("comm", 0)
+            .community_dek_get_self_retention("comm", "comm-node", 0)
             .await
             .unwrap()
             .is_some());
@@ -30380,7 +31223,10 @@ mod tests {
         );
         // No bump on rejection.
         assert_eq!(
-            backend.community_dek_current_epoch("comm").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             0
         );
         // Non-future revocation accepted → epoch bumps.
@@ -30389,7 +31235,10 @@ mod tests {
             .await
             .expect("non-future revocation accepted");
         assert_eq!(
-            backend.community_dek_current_epoch("comm").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             1
         );
     }
@@ -30449,7 +31298,10 @@ mod tests {
         assert_eq!(active, via_community);
 
         assert_eq!(
-            backend.community_dek_current_epoch("comm").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             0
         );
         backend
@@ -30470,7 +31322,10 @@ mod tests {
             .await
             .expect("affiliations revoke_member");
         assert_eq!(
-            backend.community_dek_current_epoch("comm").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             1,
             "affiliations removal bumps the CommunityDek epoch (forward secrecy)"
         );
@@ -30656,7 +31511,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            backend.community_dek_current_epoch("comm").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             1
         );
 
@@ -30691,7 +31549,7 @@ mod tests {
         // Forward-only: the PRE-rotation blob is UNCHANGED — bob keeps the
         // grant he already had on epoch 0 and can still read it.
         assert!(backend
-            .community_dek_has_member_grant("comm", 0, "bob-occ")
+            .community_dek_has_member_grant("comm", "comm-node", 0, "bob-occ")
             .await
             .unwrap());
         assert_eq!(
@@ -30729,8 +31587,8 @@ mod tests {
             let v1_rejected = conn
                 .execute(
                     "INSERT INTO federation_community_dek_member_grants \
-                     (community_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek) \
-                     VALUES ('comm', 0, 'mallory', 'v1', 'x')",
+                     (community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek) \
+                     VALUES ('comm', 'comm-node', 0, 'mallory', 'v1', 'x')",
                     [],
                 )
                 .is_err();
