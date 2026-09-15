@@ -807,6 +807,65 @@ pub async fn federation_key_id_of(
     ))
 }
 
+/// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.3) — a [`LocalSigner`] as
+/// verify-core's [`SelfSigner`](ciris_verify_core::self_at_login::SelfSigner),
+/// so the node can produce the occurrence-plane envelopes
+/// (`produce_signed_identity_occurrence`) with the same bound hybrid form
+/// (`sign_bound`: Ed25519 over the bytes, ML-DSA-65 over bytes ‖ ed25519_sig)
+/// the gates verify. Borrows the signer; caches only the derived key id.
+pub struct LocalSelfSigner<'a> {
+    signer: &'a LocalSigner,
+    key_id: String,
+}
+
+impl<'a> LocalSelfSigner<'a> {
+    /// Borrow `signer` as a [`SelfSigner`](ciris_verify_core::self_at_login::SelfSigner).
+    pub fn new(signer: &'a LocalSigner) -> Self {
+        Self {
+            signer,
+            key_id: signer.derived_key_id(),
+        }
+    }
+}
+
+fn integrity(e: impl std::fmt::Display) -> ciris_verify_core::VerifyError {
+    ciris_verify_core::VerifyError::IntegrityError {
+        message: e.to_string(),
+    }
+}
+
+#[async_trait::async_trait]
+impl ciris_verify_core::self_at_login::SelfSigner for LocalSelfSigner<'_> {
+    fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    async fn ed25519_public_key(&self) -> Result<Vec<u8>, ciris_verify_core::VerifyError> {
+        Ok(self.signer.ed25519_public_key_bytes().to_vec())
+    }
+
+    async fn mldsa65_public_key(&self) -> Result<Vec<u8>, ciris_verify_core::VerifyError> {
+        let b64 = self
+            .signer
+            .pqc_public_key_b64()
+            .await
+            .map_err(integrity)?
+            .ok_or_else(|| integrity("LocalSelfSigner: no ML-DSA-65 key configured"))?;
+        B64.decode(b64).map_err(integrity)
+    }
+
+    async fn sign_bound(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(String, String), ciris_verify_core::VerifyError> {
+        let sig = self.signer.sign_hybrid(bytes).await.map_err(integrity)?;
+        Ok((
+            B64.encode(&sig.classical.signature),
+            B64.encode(&sig.pqc.signature),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,64 +1144,5 @@ mod tests {
             "a PQC signature over the raw message (unbound) must FAIL Strict — \
              if this passes, the bound rule has silently weakened"
         );
-    }
-}
-
-/// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.3) — a [`LocalSigner`] as
-/// verify-core's [`SelfSigner`](ciris_verify_core::self_at_login::SelfSigner),
-/// so the node can produce the occurrence-plane envelopes
-/// (`produce_signed_identity_occurrence`) with the same bound hybrid form
-/// (`sign_bound`: Ed25519 over the bytes, ML-DSA-65 over bytes ‖ ed25519_sig)
-/// the gates verify. Borrows the signer; caches only the derived key id.
-pub struct LocalSelfSigner<'a> {
-    signer: &'a LocalSigner,
-    key_id: String,
-}
-
-impl<'a> LocalSelfSigner<'a> {
-    /// Borrow `signer` as a [`SelfSigner`](ciris_verify_core::self_at_login::SelfSigner).
-    pub fn new(signer: &'a LocalSigner) -> Self {
-        Self {
-            signer,
-            key_id: signer.derived_key_id(),
-        }
-    }
-}
-
-fn integrity(e: impl std::fmt::Display) -> ciris_verify_core::VerifyError {
-    ciris_verify_core::VerifyError::IntegrityError {
-        message: e.to_string(),
-    }
-}
-
-#[async_trait::async_trait]
-impl ciris_verify_core::self_at_login::SelfSigner for LocalSelfSigner<'_> {
-    fn key_id(&self) -> &str {
-        &self.key_id
-    }
-
-    async fn ed25519_public_key(&self) -> Result<Vec<u8>, ciris_verify_core::VerifyError> {
-        Ok(self.signer.ed25519_public_key_bytes().to_vec())
-    }
-
-    async fn mldsa65_public_key(&self) -> Result<Vec<u8>, ciris_verify_core::VerifyError> {
-        let b64 = self
-            .signer
-            .pqc_public_key_b64()
-            .await
-            .map_err(integrity)?
-            .ok_or_else(|| integrity("LocalSelfSigner: no ML-DSA-65 key configured"))?;
-        B64.decode(b64).map_err(integrity)
-    }
-
-    async fn sign_bound(
-        &self,
-        bytes: &[u8],
-    ) -> Result<(String, String), ciris_verify_core::VerifyError> {
-        let sig = self.signer.sign_hybrid(bytes).await.map_err(integrity)?;
-        Ok((
-            B64.encode(&sig.classical.signature),
-            B64.encode(&sig.pqc.signature),
-        ))
     }
 }

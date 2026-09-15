@@ -4785,6 +4785,10 @@ impl Engine {
     /// See the trait method's doc-comment for the full rationale —
     /// the JCS-vs-Python silent-correctness trap this method closes.
     ///
+    /// CIRISPersist#851 §20.5: a classical-only claim is confined to local
+    /// tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is hybrid-signed
+    /// so peers admit it — this door reaches the commons floor with it.
+    ///
     /// #846 (`BLOB_REPLICATION.md` §4) — runs [`would_hold`](Self::would_hold)
     /// first: the commons is everyone's, so this is the #149 rule — a proxy
     /// write (an author neither local nor family) is refused at the stop
@@ -4821,12 +4825,21 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                arc.put_blob_signing(
+                // CIRISPersist#851 §20.5 — the commons form of the floor,
+                // reached with this Engine's LocalSigner so the claim is
+                // hybrid-signed (the trait's `put_blob_signing` default stays
+                // classical for signer-only callers).
+                arc.put_blob_signing_at(
+                    crate::federation::types::cohort_scope::FEDERATION,
+                    crate::federation::StorageFloor::resolved(
+                        crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                    ),
                     sha256,
                     body,
                     media_type,
                     attesting_key_id,
                     &**self.signer(),
+                    self.local_signer.as_deref(),
                     now,
                     attestation_id,
                 )
@@ -4834,12 +4847,21 @@ impl Engine {
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                arc.put_blob_signing(
+                // CIRISPersist#851 §20.5 — the commons form of the floor,
+                // reached with this Engine's LocalSigner so the claim is
+                // hybrid-signed (the trait's `put_blob_signing` default stays
+                // classical for signer-only callers).
+                arc.put_blob_signing_at(
+                    crate::federation::types::cohort_scope::FEDERATION,
+                    crate::federation::StorageFloor::resolved(
+                        crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                    ),
                     sha256,
                     body,
                     media_type,
                     attesting_key_id,
                     &**self.signer(),
+                    self.local_signer.as_deref(),
                     now,
                     attestation_id,
                 )
@@ -4973,6 +4995,10 @@ impl Engine {
     /// on the address. `aad` is carried and not recorded — it is the
     /// reader's fact at open time (#831). A `self`/`family` provenance can
     /// never `Announce` (CC 5.2).
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn adopt_sealed_blob(
         &self,
@@ -4997,6 +5023,7 @@ impl Engine {
                 adopt_sealed_blob(
                     arc.as_ref(),
                     &**self.signer(),
+                    self.local_signer.as_deref(),
                     &ctx,
                     envelope,
                     &provenance,
@@ -5010,6 +5037,7 @@ impl Engine {
                 adopt_sealed_blob(
                     arc.as_ref(),
                     &**self.signer(),
+                    self.local_signer.as_deref(),
                     &ctx,
                     envelope,
                     &provenance,
@@ -5198,6 +5226,10 @@ impl Engine {
     /// (author, signed instant, epoch) so a ciphertext lifted onto another
     /// row does not open there. Refused (`InvalidArgument`) at a plaintext
     /// tier: nothing to bind to. Pass `None` for the v43 behaviour.
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_blob_scoped(
         &self,
@@ -5217,6 +5249,7 @@ impl Engine {
                 put_blob_scoped(
                     arc.as_ref(),
                     &*self.signer,
+                    self.local_signer.as_deref(),
                     cohort_scope,
                     community_key_id,
                     plaintext,
@@ -5230,6 +5263,7 @@ impl Engine {
                 put_blob_scoped(
                     arc.as_ref(),
                     &*self.signer,
+                    self.local_signer.as_deref(),
                     cohort_scope,
                     community_key_id,
                     plaintext,
@@ -5962,6 +5996,10 @@ impl Engine {
     /// seals it under the DAG's DEK, stores it, and announces `holds_bytes`
     /// under this Engine's signer at `Plaintext` / `CommunityDek`. Returns
     /// the DAG's content address. `aad` (#831) binds the manifest's seal.
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn seal_stream_scoped(
         &self,
@@ -5984,6 +6022,7 @@ impl Engine {
                 seal_stream_scoped(
                     arc.as_ref(),
                     &*self.signer,
+                    self.local_signer.as_deref(),
                     cohort_scope,
                     community_key_id,
                     stream_id,
@@ -5997,6 +6036,7 @@ impl Engine {
                 seal_stream_scoped(
                     arc.as_ref(),
                     &*self.signer,
+                    self.local_signer.as_deref(),
                     cohort_scope,
                     community_key_id,
                     stream_id,

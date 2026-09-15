@@ -88,6 +88,10 @@ pub mod key_grant;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// CIRISPersist#851 §20.5 — I79: the holder claim is hybrid-signed when a
+// LocalSigner exists, so peers admit it at the federation-tier gate.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod claim_signing_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
