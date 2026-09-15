@@ -2852,18 +2852,28 @@ pub async fn sign_holds_bytes_claim(
     // hybrid's classical half, the PQC half rides `scrub_signature_pqc`,
     // and `scrub_key_id` is the signer's derived id. Without one, the
     // classical-only claim stays confined to local tier.
-    let (scrub_signature_classical, scrub_signature_pqc, scrub_key_id) = match pqc {
-        Some(local) => {
-            let sig = local
-                .sign_hybrid(&canonical_bytes)
-                .await
-                .map_err(|e| BlobError::AttestationEmissionFailed(format!("sign_hybrid: {e}")))?;
-            (
+    // A `LocalSigner` built without a PQC signer is a classical-only
+    // producer: `PqcNotConfigured` falls through to the classical path
+    // below (the same bytes, signed by `signer`, no PQC half) exactly as
+    // before; any other signing error propagates.
+    let hybrid = match pqc {
+        Some(local) => match local.sign_hybrid(&canonical_bytes).await {
+            Ok(sig) => Some((
                 B64.encode(&sig.classical.signature),
                 Some(B64.encode(&sig.pqc.signature)),
                 local.derived_key_id(),
-            )
-        }
+            )),
+            Err(crate::signing::LocalSignerError::PqcNotConfigured) => None,
+            Err(e) => {
+                return Err(BlobError::AttestationEmissionFailed(format!(
+                    "sign_hybrid: {e}"
+                )))
+            }
+        },
+        None => None,
+    };
+    let (scrub_signature_classical, scrub_signature_pqc, scrub_key_id) = match hybrid {
+        Some(signed) => signed,
         None => {
             let sig_bytes = signer
                 .sign(&canonical_bytes)

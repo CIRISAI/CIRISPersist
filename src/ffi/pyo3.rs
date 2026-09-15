@@ -1291,6 +1291,18 @@ impl PyEngine {
         }
     }
 
+    /// CIRISPersist#851 §20.5 — the hybrid half of
+    /// [`select_signer`](Self::select_signer): the LocalSigner exactly when
+    /// it is the one `select_signer` chose, so a holder claim signed
+    /// classical by the local key carries its PQC half too and peers admit
+    /// it.
+    fn select_pqc(&self, attesting_key_id: &str) -> Option<Arc<crate::signing::LocalSigner>> {
+        self.local_signer
+            .as_ref()
+            .filter(|ls| ls.key_id() == attesting_key_id)
+            .cloned()
+    }
+
     /// #846 (§5 / I23) — this node's DERIVED federation key id, for the
     /// bindings that must record an author on a row. The same derivation
     /// `Engine::local_derived_key_id` runs; `ValueError` on a non-Ed25519
@@ -14300,6 +14312,7 @@ impl PyEngine {
             }
 
             let signer = self.select_signer(&attesting_key_id_owned);
+            let pqc = self.select_pqc(&attesting_key_id_owned);
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {
@@ -14308,13 +14321,21 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // CIRISPersist#851 §20.5 — the commons floor with the
+                        // LocalSigner (when it is the attesting key), so the
+                        // claim is hybrid-signed and peers admit it.
                         backend
-                            .put_blob_signing(
+                            .put_blob_signing_at(
+                                crate::federation::types::cohort_scope::FEDERATION,
+                                crate::federation::StorageFloor::resolved(
+                                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                                ),
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
                                 &attesting_key_id_owned,
                                 &*signer,
+                                pqc.as_deref(),
                                 now,
                                 attestation_id,
                             )
@@ -14327,13 +14348,21 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // CIRISPersist#851 §20.5 — the commons floor with the
+                        // LocalSigner (when it is the attesting key), so the
+                        // claim is hybrid-signed and peers admit it.
                         backend
-                            .put_blob_signing(
+                            .put_blob_signing_at(
+                                crate::federation::types::cohort_scope::FEDERATION,
+                                crate::federation::StorageFloor::resolved(
+                                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                                ),
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
                                 &attesting_key_id_owned,
                                 &*signer,
+                                pqc.as_deref(),
                                 now,
                                 attestation_id,
                             )
