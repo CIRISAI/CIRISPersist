@@ -32,15 +32,11 @@
 -- that survives that step ABORTS THE BOOT: a minter of nobody would be a key
 -- nobody can be asked for.
 --
--- The blob binding follows the DEK it was sealed under, never the row's author
--- on its own: a binding whose (community, epoch) has a local DEK row was
--- minted HERE — pre-V145 every local DEK was this node's, whatever key the row
--- names as author (a node whose signer rotated since the write would otherwise
--- bind old content to a minter that holds no DEK, and lose it) — so it takes
--- the sentinel with the DEK rows it belongs to. A binding with NO local DEK
--- row was adopted (#846: the bytes arrived, the key never did) and names its
--- author, who IS the minter; an adopted row with a NULL author takes the
--- sentinel too (nothing better is known). PR #850 review, round three.
+-- The blob binding is the one table whose minter SQL CAN know: the blob row's
+-- `author_key_id` (V144) is the minter wherever it is non-NULL — an adopted
+-- blob (#846) names its author, and the author IS the minter. NULL authors
+-- (pre-V144 rows, or commons chunks written by the signer-less door) take the
+-- sentinel.
 --
 -- HOW (the V136 rebuild shape)
 -- ----------------------------
@@ -177,14 +173,8 @@ INSERT INTO federation_community_blob_epoch
     (at_rest_sha256, community_key_id, minter_key_id, epoch, created_at, evicted_at)
 SELECT s.at_rest_sha256,
        s.community_key_id,
-       CASE
-           WHEN EXISTS (SELECT 1 FROM federation_community_dek d
-                         WHERE d.community_key_id = s.community_key_id
-                           AND d.epoch = s.epoch)
-           THEN '__this_node__'
-           ELSE COALESCE((SELECT b.author_key_id FROM federation_blobs b
-                           WHERE b.sha256 = s.at_rest_sha256), '__this_node__')
-       END,
+       COALESCE((SELECT b.author_key_id FROM federation_blobs b
+                  WHERE b.sha256 = s.at_rest_sha256), '__this_node__'),
        s.epoch,
        s.created_at,
        s.evicted_at

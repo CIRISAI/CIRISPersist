@@ -864,6 +864,7 @@ where
     // gate verifies against OUR directory. A set is self-spoken.
     let signer = row.scrub_key_id.as_str();
     let mut pending = false;
+    let mut retire_after_projection: Option<([u8; 32], String)> = None;
     if signer.is_empty() || signer != row.attesting_key_id {
         return Err(refuse(
             KeyGrantRefusalReason::SignerNotSelf,
@@ -1015,12 +1016,10 @@ where
             }
             Some(_) => {
                 // The bytes arrived meanwhile: project directly (below) and
-                // retire this set's index row — the adopt may also project
+                // retire this set's index row only AFTER the union write
+                // succeeds (PR #850, round four) — the adopt may also project
                 // it; both paths are unions.
-                backend
-                    .key_grant_pending_delete(&sha, cohort_scope, &row_id)
-                    .await
-                    .map_err(map_blob_err)?;
+                retire_after_projection = Some((sha, cohort_scope.clone()));
             }
         }
     }
@@ -1049,6 +1048,12 @@ where
                 .map_err(map_blob_err)?
         }
     };
+    if let Some((sha, scope)) = retire_after_projection {
+        backend
+            .key_grant_pending_delete(&sha, &scope, &row_id)
+            .await
+            .map_err(map_blob_err)?;
+    }
     Ok(KeyGrantAdmission {
         wraps_offered: parsed.wraps.len(),
         axis: parsed.axis,

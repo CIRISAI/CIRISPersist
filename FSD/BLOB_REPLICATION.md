@@ -584,12 +584,16 @@ community-DEK plane checks it first — an atomic load thereafter, the same
 resolver otherwise; a survivor fails that door with the sentinel named,
 never a silently unreadable binding (I66d, I66e).
 
-**Implementation note (PR #850 review, round three) — V145's binding
-rule.** A pre-V145 binding whose `(community, epoch)` has a local DEK row was
-minted here and takes the sentinel with its DEK rows, whatever author the row
-names (a rotated signer must not strand old content); only a binding with no
-local DEK row — an adopted blob — names its author as minter. V145 was
-unreleased; its manifest rows are re-pinned.
+**Ruling (PR #850 review, rounds three and four) — a pre-V145 binding is its
+author's.** V145 binds each pre-V145 blob to the row's `author_key_id` (the
+author is the minter) and NULL authors to the sentinel. A node whose signer
+rotated since a write does not keep that content under its new key: the
+derived key is the occurrence (one-key identity), a rotated signer is a new
+occurrence, old epochs belong to the old one, and a new occurrence opening an
+old one's epoch without a grant is what the gates forbid. The read refuses —
+nothing is stranded silently. Binding by the local DEK instead (tried in
+round three) would also mis-bind a pre-V145 adopted blob whose epoch number
+collides with a local one. An adopter binding by author is therefore exact.
 
 ## 17. Reads
 
@@ -625,7 +629,7 @@ door. No shared directory.
 | I71 | A removal with a future `effective_at`, a bump-and-seal in between (minted after `removed_at`, before `effective_at`, X still granted), then after `effective_at` the next seal rotates that epoch, disables it, excludes X. | an epoch minted in the skew window kept forever | behavioural, two-node |
 | I72 | Both adopt doors project the pending content sets once the row names its author (from disk). | a chunk's set that arrived first, never projected | from-disk |
 | I74 | The ledger's stamp is the snapshot watermark: a grant newer than the emitted snapshot keeps the axis dirty; a stamp at the newest grant cleans it; an older stamp never re-dirties. | a concurrent grant hidden behind a wall-clock stamp | behavioural, floor, both dialects' predicate |
-| I66 (extended) | A pre-V145 local binding authored by an old signer resolves to the node; an adopted binding keeps its author. | a rotated signer stranding old content | behavioural, sqlite file |
+| I66 (extended) | A pre-V145 binding authored by an old signer stays the old occurrence's and refuses under the new key; a NULL-author row resolves to the node; an adopted binding keeps its author. | a new occurrence opening an old one's epoch; silent stranding | behavioural, sqlite file |
 | I65 (5) | A retroactive ADD on the adopting node skips the peer-authored blob and grants the new device nothing there. | a rekey aborting on adopted content | behavioural, two-node |
 
 ## 19. What Edge and Server do

@@ -200,12 +200,18 @@ invariants I59–I67, each a two-node witness driven on sqlite and postgres.
   recipient wraps and the walk can neither recover its DEK nor emit its
   author-signed set — it is skipped, never an abort (`self_at_login`
   included). I65 (5).
-- **V145's binding rule (unreleased, re-pinned).** A pre-V145 binding whose
-  `(community, epoch)` has a local DEK row was minted HERE and takes the
-  sentinel with its DEK rows — whatever author the row names, so a node whose
-  signer rotated since the write keeps its content; only a binding with no
-  local DEK row (an adopted blob) names its author as minter. I66 seeds an
-  old-signer row and an adopted row.
+- **Ruled, not changed: a pre-V145 binding is its AUTHOR's.** Round three
+  changed V145 to bind every blob under a local DEK row to the node's current
+  key so a rotated signer keeps its old content; round four showed why that
+  is wrong twice over — it also mis-binds a pre-V145 *adopted* blob whose
+  epoch number collides with a local one, and under persist's identity model
+  the derived key IS the occurrence: a rotated signer is a new occurrence,
+  old epochs belong to the old one, and a new key reading an old occurrence's
+  epoch without a grant is what the gates forbid. V145 is back to its original
+  bytes (author rule; original manifest rows). I66 seeds an old-signer row
+  and an adopted row: the first stays the old occurrence's and its content
+  refuses under the new key — never silently stranded — the second keeps its
+  peer author. The adopter binding by author is therefore right.
 
 ### Consumer-visible (read before adopting)
 - **An encrypted write now needs a node that can EMIT.** `put_blob_encrypted_*`,

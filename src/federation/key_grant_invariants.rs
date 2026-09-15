@@ -1644,6 +1644,20 @@ mod tests {
             sha
         }
 
+        /// The sha of the seeded row authored by `old-signer-A`.
+        fn old_signer_sha(backend: &SqliteBackend) -> [u8; 32] {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let v: Vec<u8> = conn
+                .query_row(
+                    "SELECT sha256 FROM federation_blobs WHERE author_key_id = 'old-signer-A'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            v.try_into().unwrap()
+        }
+
         /// The minter V145 + the boot gave each pre-V145 binding under
         /// `legacy-comm` at `epoch`, keyed by the row's author.
         fn binding_minters(backend: &SqliteBackend, epoch: i64) -> Vec<(String, String)> {
@@ -1686,14 +1700,14 @@ mod tests {
             backend.run_migrations().await.unwrap();
             assert_eq!(
                 sentinel_rows(&backend),
-                5,
+                4,
                 "I66: V145 wrote the sentinel on every re-keyed row (SQL cannot know the node)"
             );
             let n = backend
                 .repair_minter_sentinel(Some("node-x"))
                 .await
                 .unwrap();
-            assert_eq!(n, 5, "I66: every sentinel resolved");
+            assert_eq!(n, 4, "I66: every sentinel resolved");
             assert_eq!(sentinel_rows(&backend), 0);
             assert_eq!(
                 backend
@@ -1788,21 +1802,33 @@ mod tests {
             .expect("I66: the boot resolves the sentinel and succeeds");
             let sq = engine.sqlite_backend().unwrap();
             assert_eq!(sentinel_rows(sq), 0, "I66: no sentinel survives the boot");
-            // PR #850 round three — bindings follow the DEK they were sealed
-            // under: both local rows (NULL author, and the OLD signer's)
-            // resolve to this node; the adopted row keeps its author.
+            // PR #850 rounds three/four — the binding is the AUTHOR's, and the
+            // author is the minter: a NULL-author row (pre-V144) resolves to
+            // this node; a row an OLD signer authored stays the old
+            // occurrence's — a rotated signer is a new occurrence, and a new
+            // occurrence does not open an old one's epoch without a grant
+            // (fail-secure, never silent: the read refuses); an adopted row
+            // keeps its peer author.
             assert_eq!(
                 binding_minters(sq, 1),
                 vec![
                     (String::new(), key.clone()),
-                    ("old-signer-A".to_owned(), key.clone())
+                    ("old-signer-A".to_owned(), "old-signer-A".to_owned())
                 ],
-                "I66: pre-V145 local bindings resolve to the node whatever author the row names"
+                "I66: pre-V145 bindings: NULL author → the node; an old signer's row stays its own"
             );
             assert_eq!(
                 binding_minters(sq, 7),
                 vec![("peer-P".to_owned(), "peer-P".to_owned())],
-                "I66: an adopted binding (no local DEK) keeps its author as minter"
+                "I66: an adopted binding keeps its author as minter"
+            );
+            let old_sha = old_signer_sha(sq);
+            assert!(
+                sq.community_dek_blob_epoch(&old_sha).await.unwrap().is_some()
+                    && read_for_community_viewer(sq.as_ref(), &old_sha, "viewer-occ")
+                        .await
+                        .is_err(),
+                "I66: the old occurrence's content refuses under the new key — not silently stranded, refused"
             );
             assert_eq!(
                 sq.community_dek_current_epoch("legacy-comm", &key)
@@ -1838,7 +1864,7 @@ mod tests {
                     .await
                     .unwrap();
                 backend.run_migrations().await.unwrap();
-                assert_eq!(sentinel_rows(&backend), 5, "I66d: V145 wrote the sentinel");
+                assert_eq!(sentinel_rows(&backend), 4, "I66d: V145 wrote the sentinel");
                 let local = crate::federation::tier_ingest::test_support::local_signer(&format!(
                     "i66d-{survivor}"
                 ));
@@ -1867,7 +1893,7 @@ mod tests {
                 );
                 assert_eq!(
                     sentinel_rows(&backend),
-                    5,
+                    4,
                     "I66d: a synchronous constructor resolves nothing"
                 );
                 let read = engine
