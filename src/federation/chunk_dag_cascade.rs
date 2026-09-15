@@ -523,7 +523,9 @@ pub mod orchestrate {
                     let ensured = ensure_epoch_dek(backend, comm, minter, dek_epoch).await?;
                     let dek_epoch = ensured.epoch;
                     let report = ensured.report;
-                    let body = seal(&ensured.dek, &jcs, aad).map_err(map_at_rest_err)?.to_bytes();
+                    let body = seal(&ensured.dek, &jcs, aad)
+                        .map_err(map_at_rest_err)?
+                        .to_bytes();
                     let sha: [u8; 32] = Sha256::digest(&body).into();
                     match backend
                         .seal_stream_with_scope(
@@ -1137,8 +1139,14 @@ pub mod orchestrate {
                         viewer_key_id: viewer_key_id.to_owned(),
                     });
                 }
-                read_for_viewer_sealed(backend, chunk_sha, viewer_key_id, &envelope, Some(bound_aad))
-                    .await
+                read_for_viewer_sealed(
+                    backend,
+                    chunk_sha,
+                    viewer_key_id,
+                    &envelope,
+                    Some(bound_aad),
+                )
+                .await
             }
             CryptoTier::CommunityDek => {
                 // The chunk's OWN binding names the DEK that sealed it — a
@@ -1385,9 +1393,10 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
-        let sealed = encrypt_and_cascade_community(backend, &comm, b"segment 0", None, Some(&minter))
-            .await
-            .unwrap();
+        let sealed =
+            encrypt_and_cascade_community(backend, &comm, b"segment 0", None, Some(&minter))
+                .await
+                .unwrap();
         let Some(BlobBody::Inline(sealed_bytes)) =
             backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
         else {
@@ -1435,7 +1444,7 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
-            let minter = signer.derived_key_id();
+        let minter = signer.derived_key_id();
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
 
         let owner = crate::signing::federation_key_id_of(&adapter)
@@ -2181,7 +2190,7 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
-            let minter = signer.derived_key_id();
+        let minter = signer.derived_key_id();
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
         let stream = format!("{tag}-stream-{run}");
         let seg0 = segment(21, 900);
@@ -2822,8 +2831,14 @@ pub mod invariants {
         // now claiming the other's position — sealed under the community's
         // DEK (reached the way the door reaches it) and stored through the
         // floor as a second DAG over the stream.
-        let epoch = backend.community_dek_current_epoch(&comm, &minter).await.unwrap();
-        let dek = ensure_epoch_dek(backend, &comm, &minter, epoch).await.unwrap().dek;
+        let epoch = backend
+            .community_dek_current_epoch(&comm, &minter)
+            .await
+            .unwrap();
+        let dek = ensure_epoch_dek(backend, &comm, &minter, epoch)
+            .await
+            .unwrap()
+            .dek;
         let swapped = ChunkManifest {
             v: CHUNK_MANIFEST_VERSION_SEALED,
             total_size: 300,

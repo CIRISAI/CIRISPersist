@@ -1925,8 +1925,7 @@ pub mod orchestrate {
                         hex::encode(at_rest_sha256)
                     ))
                 })?;
-                read_for_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope, aad)
-                    .await
+                read_for_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope, aad).await
             }
             CryptoTier::CommunityDek => {
                 let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
@@ -2175,13 +2174,13 @@ pub mod orchestrate {
                     .await?;
                 // #848 (§14, epoch axis) — emitted when the fan-out minted or
                 // granted anew; otherwise the set already replicated.
-                let key_grant_emission = r.fanout_changed.then(|| {
-                    crate::federation::key_grant::KeyGrantAxis::Epoch {
-                        community_key_id: comm.to_owned(),
-                        minter_key_id: r.minter_key_id.clone(),
-                        epoch: r.epoch,
-                    }
-                });
+                let key_grant_emission =
+                    r.fanout_changed
+                        .then(|| crate::federation::key_grant::KeyGrantAxis::Epoch {
+                            community_key_id: comm.to_owned(),
+                            minter_key_id: r.minter_key_id.clone(),
+                            epoch: r.epoch,
+                        });
                 Ok(PutBlobScopedResult {
                     at_rest_sha256: r.at_rest_sha256,
                     tier,
@@ -2992,7 +2991,10 @@ pub mod blob_invariants {
         );
 
         // I20 — destroy acts only on an epoch rotation has left behind.
-        backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         backend
             .community_dek_evict_epoch_objects(&comm, &minter, epoch, &sweeper, chrono::Utc::now())
@@ -3061,7 +3063,10 @@ pub mod blob_invariants {
         );
 
         // Rotate (I20), empty + destroy, THEN try to bind a late arrival.
-        backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         backend
             .community_dek_evict_epoch_objects(&comm, &minter, epoch, &sweeper, chrono::Utc::now())
@@ -3158,7 +3163,10 @@ pub mod blob_invariants {
         );
 
         // Rotate past it and authorize deletion, then sweep.
-        backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         backend
             .community_dek_set_retain_past_epochs(&comm, &minter, Some(0))
             .await
@@ -3331,10 +3339,16 @@ pub mod blob_invariants {
             .await
             .unwrap();
         let old = sealed.epoch;
-        let new = backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        let new = backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         assert!(new > old, "{tag} I17: precondition — rotated");
         assert_eq!(
-            backend.community_dek_key_state(&comm, &minter, old).await.unwrap(),
+            backend
+                .community_dek_key_state(&comm, &minter, old)
+                .await
+                .unwrap(),
             Some(DekKeyState::Enabled),
             "{tag} I17: precondition — the rotated-past epoch is STILL enabled (no sweep ran)"
         );
@@ -3488,13 +3502,22 @@ pub mod blob_invariants {
             "{tag} I18: precondition"
         );
 
-        backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         backend
             .community_dek_set_retain_past_epochs(&comm, &minter, Some(0))
             .await
             .unwrap();
         let n = backend
-            .community_dek_evict_epoch_objects(&comm, &minter, sealed.epoch, &signer, chrono::Utc::now())
+            .community_dek_evict_epoch_objects(
+                &comm,
+                &minter,
+                sealed.epoch,
+                &signer,
+                chrono::Utc::now(),
+            )
             .await
             .unwrap_or_else(|e| panic!("{tag} I18(a): evict after a manual retraction: {e}"));
         assert_eq!(n, 1, "{tag} I18(a): evicted");
@@ -3532,7 +3555,10 @@ pub mod blob_invariants {
             )
             .await
             .unwrap();
-        backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
         let res = backend
             .community_dek_evict_epoch_objects(&comm, &minter, sealed2.epoch, &signer, far_future)
@@ -3643,12 +3669,17 @@ pub mod blob_invariants {
         let sealed = encrypt_and_cascade_community(backend, &comm, b"x", None, Some(&minter))
             .await
             .unwrap();
-        let current = backend.community_dek_current_epoch(&comm, &minter).await.unwrap();
+        let current = backend
+            .community_dek_current_epoch(&comm, &minter)
+            .await
+            .unwrap();
         assert_eq!(sealed.epoch, current);
 
         for to in [DekKeyState::Disabled, DekKeyState::Destroyed] {
             assert!(
-                set_key_state(backend, &comm, &minter, current, to).await.is_err(),
+                set_key_state(backend, &comm, &minter, current, to)
+                    .await
+                    .is_err(),
                 "{tag} I20: the door let the CURRENT epoch be moved to {to:?} — the pointer \
                  keeps naming it and every later write fails in ensure_epoch_dek"
             );
@@ -3800,7 +3831,10 @@ pub mod blob_invariants {
         let minter = signer.derived_key_id();
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         assert!(matcher.refuse, "{tag} I21b: fixture — a refusing matcher");
-        let epoch = backend.community_dek_current_epoch(&comm, &minter).await.unwrap();
+        let epoch = backend
+            .community_dek_current_epoch(&comm, &minter)
+            .await
+            .unwrap();
         let res = put_blob_scoped(
             backend,
             &adapter,
@@ -3988,14 +4022,23 @@ pub mod blob_invariants {
             panic!("{tag} I28: sealed blob is inline");
         };
         // A rotation + retention sweep evicts it before the door announces.
-        backend.community_dek_bump_epoch(&comm, &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &minter)
+            .await
+            .unwrap();
         backend
             .community_dek_set_retain_past_epochs(&comm, &minter, Some(0))
             .await
             .unwrap();
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
         let n = backend
-            .community_dek_evict_epoch_objects(&comm, &minter, sealed.epoch, &sweeper, chrono::Utc::now())
+            .community_dek_evict_epoch_objects(
+                &comm,
+                &minter,
+                sealed.epoch,
+                &sweeper,
+                chrono::Utc::now(),
+            )
             .await
             .unwrap();
         assert_eq!(n, 1, "{tag} I28: precondition — evicted");
@@ -4078,7 +4121,11 @@ pub mod blob_invariants {
         // grant on e0 (AV-70, forward-only) until the epoch is destroyed.
         revoke_member(backend, &comm, &bob).await;
         assert!(
-            backend.community_dek_current_epoch(&comm, &minter).await.unwrap() > e0,
+            backend
+                .community_dek_current_epoch(&comm, &minter)
+                .await
+                .unwrap()
+                > e0,
             "{tag} I31: precondition — the revocation rotated the epoch"
         );
         assert!(
@@ -4181,7 +4228,10 @@ pub mod blob_invariants {
              ignore evicted bindings; report {report:?}"
         );
         assert_eq!(
-            backend.community_dek_key_state(&comm, &minter, e0).await.unwrap(),
+            backend
+                .community_dek_key_state(&comm, &minter, e0)
+                .await
+                .unwrap(),
             Some(DekKeyState::Destroyed)
         );
         assert!(
@@ -5461,7 +5511,10 @@ pub mod blob_invariants {
         seed_community(backend, &ghost, &[(&alice, &alice_occ)]).await;
         join_as_occurrence(backend, &alice, &our).await;
         assert_eq!(
-            backend.community_dek_key_state(&ghost, &minter, 7).await.unwrap(),
+            backend
+                .community_dek_key_state(&ghost, &minter, 7)
+                .await
+                .unwrap(),
             None,
             "{tag} I51: precondition — no key state for the ghost epoch"
         );
@@ -5499,7 +5552,10 @@ pub mod blob_invariants {
             (ghost.as_str(), 7)
         );
         assert_eq!(
-            backend.community_dek_key_state(&ghost, &minter, 7).await.unwrap(),
+            backend
+                .community_dek_key_state(&ghost, &minter, 7)
+                .await
+                .unwrap(),
             None,
             "{tag} I51: the adopt minted key state it had no business minting"
         );
@@ -5512,7 +5568,10 @@ pub mod blob_invariants {
         let (env_b, old_epoch, sha_b) =
             sealed_community_envelope(backend, &ghost, &body, &peer).await;
         backend.delete_blob(&sha_b).await.unwrap();
-        let new_epoch = backend.community_dek_bump_epoch(&ghost, &minter).await.unwrap();
+        let new_epoch = backend
+            .community_dek_bump_epoch(&ghost, &minter)
+            .await
+            .unwrap();
         assert!(new_epoch > old_epoch, "{tag} I51: precondition — rotated");
         // A WRITE at the old epoch is refused (I17); the ADOPT is not (§3).
         assert!(

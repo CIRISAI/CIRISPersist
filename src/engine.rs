@@ -5259,14 +5259,17 @@ impl Engine {
         let Some(set) = set else {
             return Ok(None);
         };
-        self.emit_attestation_self(set.emit_input())
-            .await
-            .map(Some)
-            .map_err(|e| {
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "key_grant set for {axis:?} could not be emitted — the bytes are stored, the                      key cannot follow them until this succeeds ({e})"
-                ))
-            })
+        // A community with no live moderator may not federate at all
+        // (`key_grant::emission_outcome`): nothing to carry, the write stands.
+        crate::federation::key_grant::emission_outcome(
+            self.emit_attestation_self(set.emit_input()).await,
+        )
+        .map_err(|e| {
+            crate::federation::BlobError::AttestationEmissionFailed(format!(
+                "key_grant set for {axis:?} could not be emitted — the bytes are stored, the \
+                 key cannot follow them until this succeeds ({e})"
+            ))
+        })
     }
 
     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a

@@ -315,15 +315,12 @@ impl KeyGrantSet {
             (KEY_GRANT_EPOCH_ATTESTATION_TYPE, "epoch") => KeyGrantAxis::Epoch {
                 community_key_id: field("community_key_id")?,
                 minter_key_id: field("minter_key_id")?,
-                epoch: env
-                    .get("epoch")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        refuse(
-                            KeyGrantRefusalReason::Malformed,
-                            "key_grant envelope lacks an unsigned `epoch`",
-                        )
-                    })?,
+                epoch: env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        "key_grant envelope lacks an unsigned `epoch`",
+                    )
+                })?,
             },
             (KEY_GRANT_CONTENT_ATTESTATION_TYPE, "content") => {
                 let at_rest_sha256 = field("at_rest_sha256")?;
@@ -349,7 +346,9 @@ impl KeyGrantSet {
             (t, a) => {
                 return Err(refuse(
                     KeyGrantRefusalReason::Malformed,
-                    format!("attestation_type {t:?} and envelope axis {a:?} do not name one key_grant axis"),
+                    format!(
+                    "attestation_type {t:?} and envelope axis {a:?} do not name one key_grant axis"
+                ),
                 ))
             }
         };
@@ -403,6 +402,33 @@ impl KeyGrantSet {
 
 fn map_blob_err(e: BlobError) -> Error {
     Error::Backend(format!("key_grant: {e}"))
+}
+
+/// §14 — what an emission attempt means for the caller. A community that
+/// has lost (or never had) a live steward-bound moderator MAY NOT federate
+/// at moderated capability (CC 4.5.4 / §11.11), and the attestation plane
+/// refuses every federation-tier row keyed on it — on this node and on every
+/// peer. A `KeyGrant` for such a community therefore has nowhere to go: no
+/// peer could be party to its bytes, and the local write is still whole
+/// (the minter reads through its own self-retention). That ONE verdict is
+/// reported as `Ok(None)` with a warning rather than failing the write;
+/// every other failure — a signer that cannot sign, a row the plane refuses
+/// for what THIS node did — propagates, because then the bytes are stored
+/// and the key cannot follow them.
+pub fn emission_outcome<T>(r: Result<T, Error>) -> Result<Option<T>, Error> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(Error::CommunityHasNoModerator { community_key_id }) => {
+            tracing::warn!(
+                community = %community_key_id,
+                "key_grant set not emitted: the community has no live moderator and may not \
+                 federate at moderated capability (CC 4.5.4); nothing outside this node can be \
+                 party to its content until one is appointed"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// §14 — the FULL epoch-axis set for `(community, minter, epoch)` as this
@@ -481,9 +507,14 @@ where
     else {
         return Ok(None);
     };
-    crate::federation::attestation_emit::emit_with_local_signer(backend, signer, set.emit_input())
-        .await
-        .map(Some)
+    emission_outcome(
+        crate::federation::attestation_emit::emit_with_local_signer(
+            backend,
+            signer,
+            set.emit_input(),
+        )
+        .await,
+    )
 }
 
 /// §14 — emit the full content-axis set for one self/family blob authored
@@ -504,9 +535,14 @@ where
     else {
         return Ok(None);
     };
-    crate::federation::attestation_emit::emit_with_local_signer(backend, signer, set.emit_input())
-        .await
-        .map(Some)
+    emission_outcome(
+        crate::federation::attestation_emit::emit_with_local_signer(
+            backend,
+            signer,
+            set.emit_input(),
+        )
+        .await,
+    )
 }
 
 /// §14 — the full set for an emission axis a write door reported
@@ -561,9 +597,14 @@ where
     else {
         return Ok(None);
     };
-    crate::federation::attestation_emit::emit_with_local_signer(backend, signer, set.emit_input())
-        .await
-        .map(Some)
+    emission_outcome(
+        crate::federation::attestation_emit::emit_with_local_signer(
+            backend,
+            signer,
+            set.emit_input(),
+        )
+        .await,
+    )
 }
 
 /// §12 — is `signer` an ACTIVE member occurrence (or member identity) of
@@ -836,7 +877,8 @@ mod tests {
             if let Some(w) = env["wraps"].as_array().and_then(|a| a.first()) {
                 assert!(w.get("recipient_occurrence_key_id").is_some());
             }
-            let back = KeyGrantSet::from_attestation(&row(set.axis.attestation_type(), env)).unwrap();
+            let back =
+                KeyGrantSet::from_attestation(&row(set.axis.attestation_type(), env)).unwrap();
             assert_eq!(back, set);
         }
     }
@@ -860,7 +902,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            Error::KeyGrantRefused { reason: "malformed", .. }
+            Error::KeyGrantRefused {
+                reason: "malformed",
+                ..
+            }
         ));
     }
 }

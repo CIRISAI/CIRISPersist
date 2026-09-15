@@ -13497,7 +13497,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(out)
-        }).await
+        })
+        .await
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!("community_dek_communities: {e}"))
         })
@@ -13522,7 +13523,8 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 rusqlite::params![comm, minter, v],
             )?;
             Ok(())
-        }).await
+        })
+        .await
         .map_err(|e| {
             crate::federation::BlobError::Backend(format!(
                 "community_dek_set_retain_past_epochs: {e}"
@@ -14125,7 +14127,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
         crate::federation::identity_aggregate::ContentKemPrivate,
         crate::federation::BlobError,
     > {
-        use crate::federation::identity_aggregate::{unseal_content_kem_private, ContentKemPrivate};
+        use crate::federation::identity_aggregate::{
+            unseal_content_kem_private, ContentKemPrivate,
+        };
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         // Same row, same first-write-wins: mint if absent.
@@ -30396,7 +30400,10 @@ mod tests {
         let old = encrypt_and_cascade_community(&backend, "comm", b"old minutes", None, None)
             .await
             .unwrap();
-        backend.community_dek_bump_epoch("comm", &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch("comm", &minter)
+            .await
+            .unwrap();
         encrypt_and_cascade_community(&backend, "comm", b"new minutes", None, None)
             .await
             .unwrap();
@@ -30459,7 +30466,10 @@ mod tests {
         let old = encrypt_and_cascade_community(&backend, "comm", b"old minutes", None, None)
             .await
             .unwrap();
-        backend.community_dek_bump_epoch("comm", &minter).await.unwrap();
+        backend
+            .community_dek_bump_epoch("comm", &minter)
+            .await
+            .unwrap();
         let new = encrypt_and_cascade_community(&backend, "comm", b"new minutes", None, None)
             .await
             .unwrap();
@@ -30543,11 +30553,20 @@ mod tests {
 
         // I20 — the door acts on a rotated-past epoch; the live-content
         // refusal is what this test is about, so rotate first.
-        backend.community_dek_bump_epoch("comm", "comm-node").await.unwrap();
-        // The precondition is unmet: one object is sealed at this epoch.
-        let err = set_key_state(&backend, "comm", "comm-node", sealed.epoch, DekKeyState::Destroyed)
+        backend
+            .community_dek_bump_epoch("comm", "comm-node")
             .await
-            .expect_err("destroying an epoch with live content must be refused");
+            .unwrap();
+        // The precondition is unmet: one object is sealed at this epoch.
+        let err = set_key_state(
+            &backend,
+            "comm",
+            "comm-node",
+            sealed.epoch,
+            DekKeyState::Destroyed,
+        )
+        .await
+        .expect_err("destroying an epoch with live content must be refused");
         let msg = err.to_string();
         assert!(
             msg.contains("still sealed under it") && msg.contains("ORPHAN"),
@@ -30556,9 +30575,15 @@ mod tests {
 
         // Disabling is always allowed — that is AV-70's ratified behaviour,
         // and it is what you do INSTEAD when content is still live.
-        set_key_state(&backend, "comm", "comm-node", sealed.epoch, DekKeyState::Disabled)
-            .await
-            .expect("disabling an epoch with live content is fine");
+        set_key_state(
+            &backend,
+            "comm",
+            "comm-node",
+            sealed.epoch,
+            DekKeyState::Disabled,
+        )
+        .await
+        .expect("disabling an epoch with live content is fine");
         assert_eq!(
             backend
                 .community_dek_key_state("comm", "comm-node", sealed.epoch)
@@ -30598,10 +30623,19 @@ mod tests {
         let first = encrypt_and_cascade_community(&backend, "comm", b"one", None, None)
             .await
             .unwrap();
-        let next = backend.community_dek_bump_epoch("comm", "comm-node").await.unwrap();
-        set_key_state(&backend, "comm", "comm-node", first.epoch, DekKeyState::Disabled)
+        let next = backend
+            .community_dek_bump_epoch("comm", "comm-node")
             .await
             .unwrap();
+        set_key_state(
+            &backend,
+            "comm",
+            "comm-node",
+            first.epoch,
+            DekKeyState::Disabled,
+        )
+        .await
+        .unwrap();
 
         let two = encrypt_and_cascade_community(&backend, "comm", b"two", None, None)
             .await
@@ -30654,12 +30688,18 @@ mod tests {
         }
 
         // I20 — destroy acts on a rotated-past epoch, never the current one.
-        backend.community_dek_bump_epoch("comm", "comm-node").await.unwrap();
+        backend
+            .community_dek_bump_epoch("comm", "comm-node")
+            .await
+            .unwrap();
         set_key_state(&backend, "comm", "comm-node", 0, DekKeyState::Destroyed)
             .await
             .expect("an emptied epoch destroys");
         assert_eq!(
-            backend.community_dek_key_state("comm", "comm-node", 0).await.unwrap(),
+            backend
+                .community_dek_key_state("comm", "comm-node", 0)
+                .await
+                .unwrap(),
             Some(DekKeyState::Destroyed)
         );
 
@@ -30847,7 +30887,10 @@ mod tests {
         );
         // No bump on rejection.
         assert_eq!(
-            backend.community_dek_current_epoch("comm", "comm-node").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             0
         );
         // Non-future revocation accepted → epoch bumps.
@@ -30856,7 +30899,10 @@ mod tests {
             .await
             .expect("non-future revocation accepted");
         assert_eq!(
-            backend.community_dek_current_epoch("comm", "comm-node").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             1
         );
     }
@@ -30916,7 +30962,10 @@ mod tests {
         assert_eq!(active, via_community);
 
         assert_eq!(
-            backend.community_dek_current_epoch("comm", "comm-node").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             0
         );
         backend
@@ -30937,7 +30986,10 @@ mod tests {
             .await
             .expect("affiliations revoke_member");
         assert_eq!(
-            backend.community_dek_current_epoch("comm", "comm-node").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             1,
             "affiliations removal bumps the CommunityDek epoch (forward secrecy)"
         );
@@ -31123,7 +31175,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            backend.community_dek_current_epoch("comm", "comm-node").await.unwrap(),
+            backend
+                .community_dek_current_epoch("comm", "comm-node")
+                .await
+                .unwrap(),
             1
         );
 

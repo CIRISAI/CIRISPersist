@@ -150,9 +150,8 @@ pub mod orchestrate {
         partition_roster, GrantReport, MemberOccurrences,
     };
     use crate::federation::at_rest_cascade::{
-        fresh_dek, open, seal, unwrap_dek_for_persist, unwrap_dek_v2_json,
-        wrap_dek_for_persist, wrap_dek_v2, AtRestEnvelope, AtRestError, DEK_LEN,
-        WRAP_ALGORITHM_V2,
+        fresh_dek, open, seal, unwrap_dek_for_persist, unwrap_dek_v2_json, wrap_dek_for_persist,
+        wrap_dek_v2, AtRestEnvelope, AtRestError, DEK_LEN, WRAP_ALGORITHM_V2,
     };
     use crate::federation::blobs::{
         BlobBody, BlobError, BlobStorage, DekKeyState, RosterPartition,
@@ -1210,8 +1209,11 @@ pub mod orchestrate {
                     hex::encode(at_rest_sha256)
                 ))
             })?;
-        let (community_key_id, minter_key_id, epoch) =
-            (binding.community_key_id, binding.minter_key_id, binding.epoch);
+        let (community_key_id, minter_key_id, epoch) = (
+            binding.community_key_id,
+            binding.minter_key_id,
+            binding.epoch,
+        );
         // #833 (§11.5, I31) — the sweep kept the binding as an eviction
         // record. This door is a production surface
         // (`Engine::read_blob_for_community_viewer`, PyO3), so it gives the
@@ -1815,10 +1817,15 @@ pub mod lifecycle_harness {
         .await;
 
         // ── 2. ENCRYPT (epoch 0) ─────────────────────────────────────────
-        let before =
-            encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None, Some(&minter))
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
+        let before = encrypt_and_cascade_community(
+            backend,
+            &comm,
+            b"pre-rotation minutes",
+            None,
+            Some(&minter),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
         assert_eq!(
             before.epoch, 0,
             "{tag}: a never-rotated community is epoch 0"
@@ -1844,10 +1851,15 @@ pub mod lifecycle_harness {
         super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
 
         // ── 5. ENCRYPT AGAIN — lands on the NEW epoch ────────────────────
-        let after =
-            encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None, Some(&minter))
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
+        let after = encrypt_and_cascade_community(
+            backend,
+            &comm,
+            b"post-rotation minutes",
+            None,
+            Some(&minter),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
         assert!(
             after.epoch > before.epoch,
             "{tag}: rotation must advance the epoch ({} -> {})",
@@ -1900,9 +1912,15 @@ pub mod lifecycle_harness {
 
         // And it cannot be destroyed while its content is live: destroying
         // would ORPHAN the blob, not erase it.
-        let err = set_key_state(backend, &comm, &minter, before.epoch, DekKeyState::Destroyed)
-            .await
-            .expect_err("destroying an epoch with live content must be refused");
+        let err = set_key_state(
+            backend,
+            &comm,
+            &minter,
+            before.epoch,
+            DekKeyState::Destroyed,
+        )
+        .await
+        .expect_err("destroying an epoch with live content must be refused");
         assert!(
             err.to_string().contains("still sealed under it"),
             "{tag}: the refusal must name the precondition, got: {err}"

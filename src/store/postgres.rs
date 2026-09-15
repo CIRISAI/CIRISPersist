@@ -526,9 +526,7 @@ impl PostgresBackend {
                     .await
                     .map_err(|e| Error::Migration {
                         sqlstate: None,
-                        detail: format!(
-                            "postgres minter-sentinel resolution (#848): {table}: {e}"
-                        ),
+                        detail: format!("postgres minter-sentinel resolution (#848): {table}: {e}"),
                     })? as usize;
             }
         }
@@ -8513,9 +8511,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "community DEK rotation-on-removal: {e}"
-                ))
+                crate::federation::Error::Backend(format!("community DEK rotation-on-removal: {e}"))
             })?;
         }
         tx.execute(
@@ -14856,7 +14852,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
         crate::federation::identity_aggregate::ContentKemPrivate,
         crate::federation::BlobError,
     > {
-        use crate::federation::identity_aggregate::{unseal_content_kem_private, ContentKemPrivate};
+        use crate::federation::identity_aggregate::{
+            unseal_content_kem_private, ContentKemPrivate,
+        };
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         // Same row, same first-write-wins: mint if absent.
@@ -26091,15 +26089,19 @@ mod tests {
         let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let node_derived = signer.derived_key_id();
         // Seed: one sealed object at epoch 0, then rotate so epoch 0 is past.
-        let sealed = encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None, Some(&node))
-            .await
-            .unwrap();
+        let sealed =
+            encrypt_and_cascade_community(backend.as_ref(), &comm, b"x", None, Some(&node))
+                .await
+                .unwrap();
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(&sealed.at_rest_sha256).await.unwrap()
         else {
             panic!("inline");
         };
         let past = sealed.epoch;
-        backend.community_dek_bump_epoch(&comm, &node).await.unwrap();
+        backend
+            .community_dek_bump_epoch(&comm, &node)
+            .await
+            .unwrap();
         backend
             .community_dek_set_retain_past_epochs(&comm, &node, Some(0))
             .await
@@ -26130,7 +26132,8 @@ mod tests {
                 Box::pin(async move {
                     format!(
                         "{:?}",
-                        b.community_dek_bind_blob_epoch(&[7u8; 32], &c, &m, past).await
+                        b.community_dek_bind_blob_epoch(&[7u8; 32], &c, &m, past)
+                            .await
                     )
                 })
             }),

@@ -94,7 +94,11 @@ invariants I59–I67, each a two-node witness driven on sqlite and postgres.
   `key_grant_emission` names it); `Engine::emit_key_grant` /
   `PyEngine.emit_key_grant` re-emit on demand. A node that cannot sign the
   set says so (`AttestationEmissionFailed`) rather than leaving members with
-  bytes and no key.
+  bytes and no key. One verdict is not an error: a community with no live
+  steward-bound moderator may not federate at moderated capability (CC 4.5.4
+  / §11.11) — the attestation plane refuses every row keyed on it, here and
+  on every peer — so its `KeyGrant` has nowhere to go; the write stands, the
+  emission is skipped with a warning (`key_grant::emission_outcome`).
 - **The recipient-decrypt path V073 stored the sealed privates for.** A
   member's node opens a peer-minted epoch — and the owner's second device its
   own self content (I65) — from the wrap addressed to its occurrence, with

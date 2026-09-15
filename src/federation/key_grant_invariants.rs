@@ -107,17 +107,19 @@ pub mod two_node {
                 ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
                 if let Some(o) = occ {
                     n.backend
-                        .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
-                            identity_key_id: (*ident).to_owned(),
-                            occurrence_key_id: o.key.clone(),
-                            device_class: crate::federation::types::device_class::SERVER.into(),
-                            hardware_attestation: None,
-                            asserted_at: chrono::Utc::now(),
-                            valid_until: None,
-                            encryption_pubkeys: Some(o.kem.clone()),
-                            transport_binding: None,
-                            persist_row_hash: String::new(),
-                        })
+                        .put_identity_occurrence_local(
+                            crate::federation::types::IdentityOccurrence {
+                                identity_key_id: (*ident).to_owned(),
+                                occurrence_key_id: o.key.clone(),
+                                device_class: crate::federation::types::device_class::SERVER.into(),
+                                hardware_attestation: None,
+                                asserted_at: chrono::Utc::now(),
+                                valid_until: None,
+                                encryption_pubkeys: Some(o.kem.clone()),
+                                transport_binding: None,
+                                persist_row_hash: String::new(),
+                            },
+                        )
                         .await
                         .unwrap_or_else(|e| panic!("occurrence {} of {ident}: {e}", o.key));
                 }
@@ -259,9 +261,10 @@ pub mod two_node {
         ts::register_hybrid_key_as(b.backend, &mallory_key, &mallory_alias, USER).await;
 
         // A mints (C, A, 0) and wraps to both nodes' occurrences.
-        let sealed = encrypt_and_cascade_community(a.backend, &comm, b"minutes", None, Some(&a.key))
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I60: A seals: {e}"));
+        let sealed =
+            encrypt_and_cascade_community(a.backend, &comm, b"minutes", None, Some(&a.key))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I60: A seals: {e}"));
         let honest = crate::federation::key_grant::build_epoch_set(a.backend, &comm, &a.key, 0)
             .await
             .unwrap()
@@ -292,7 +295,11 @@ pub mod two_node {
         let err = admit_replicated_key_grant(b.backend, sign_set_unstored(&mallory, &own).await)
             .await
             .expect_err("a non-member's set must be refused");
-        assert_eq!(refusal_reason(&err), "signer_not_active_member", "{tag} I60: {err}");
+        assert_eq!(
+            refusal_reason(&err),
+            "signer_not_active_member",
+            "{tag} I60: {err}"
+        );
 
         // (3) A wrap that is not v2, signed by the honest minter.
         let mut v1 = honest.clone();
@@ -300,7 +307,11 @@ pub mod two_node {
         let err = admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &v1).await)
             .await
             .expect_err("a non-v2 wrap must be refused");
-        assert_eq!(refusal_reason(&err), "wrap_algorithm_not_v2", "{tag} I60: {err}");
+        assert_eq!(
+            refusal_reason(&err),
+            "wrap_algorithm_not_v2",
+            "{tag} I60: {err}"
+        );
 
         // (4) A community B has never heard of: the signer cannot be an
         //     active member of a roster B does not hold.
@@ -315,7 +326,11 @@ pub mod two_node {
         let err = admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &ghost).await)
             .await
             .expect_err("a set for an unknown community must be refused");
-        assert_eq!(refusal_reason(&err), "signer_not_active_member", "{tag} I60: {err}");
+        assert_eq!(
+            refusal_reason(&err),
+            "signer_not_active_member",
+            "{tag} I60: {err}"
+        );
 
         // Nothing was projected by any refusal.
         assert!(
@@ -350,9 +365,10 @@ pub mod two_node {
 
         // A seals under (C, A, 0) — the fan-out wraps to B's occurrence
         // with B's OWN content-KEM pubkeys, which only B can open.
-        let sealed = encrypt_and_cascade_community(a.backend, &comm, b"the minutes", None, Some(&a.key))
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I61: A seals: {e}"));
+        let sealed =
+            encrypt_and_cascade_community(a.backend, &comm, b"the minutes", None, Some(&a.key))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I61: A seals: {e}"));
         assert_eq!(sealed.minter_key_id, a.key, "{tag} I61: A is the minter");
         assert!(
             sealed.granted.contains(&b.key),
@@ -365,7 +381,10 @@ pub mod two_node {
         let err = read_any_for_viewer(b.backend, &sha, &b.key, None)
             .await
             .expect_err("{tag} I61: nothing has crossed yet");
-        assert!(matches!(err, BlobError::NotHeld { .. }), "{tag} I61: got {err:?}");
+        assert!(
+            matches!(err, BlobError::NotHeld { .. }),
+            "{tag} I61: got {err:?}"
+        );
 
         // A emits the FULL set for (C, A, 0) through its attestation store.
         let emitted = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
@@ -388,9 +407,18 @@ pub mod two_node {
                 .unwrap(),
             "{tag} I61: B's occurrence holds a grant on (C, A, 0) after admission"
         );
-        let adopted = carry_bytes(a, b, &sha, COMMUNITY, &comm, Some(0), CryptoTier::CommunityDek, &[])
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I61: B adopts the bytes: {e}"));
+        let adopted = carry_bytes(
+            a,
+            b,
+            &sha,
+            COMMUNITY,
+            &comm,
+            Some(0),
+            CryptoTier::CommunityDek,
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I61: B adopts the bytes: {e}"));
         assert_eq!(adopted, sha);
         assert_eq!(
             b.backend.community_dek_blob_epoch(&sha).await.unwrap(),
@@ -411,7 +439,10 @@ pub mod two_node {
         let got = read_any_for_viewer(b.backend, &sha, &b.key, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I61: B's member opens A's blob on B: {e}"));
-        assert_eq!(got, b"the minutes", "{tag} I61: the plaintext, on the other node");
+        assert_eq!(
+            got, b"the minutes",
+            "{tag} I61: the plaintext, on the other node"
+        );
 
         // A non-member on B is NotGranted, naming nothing.
         let stranger = format!("{tag}-stranger-{run}");
@@ -467,18 +498,31 @@ pub mod two_node {
             .expect("wraps");
 
         // (1) The set BEFORE the bytes: stored, nothing lost.
-        let first = carry_key_grant(a, b, &emitted.attestation_id).await.unwrap();
-        assert!(first.wraps_written >= 2, "{tag} I62: first admit writes: {first:?}");
+        let first = carry_key_grant(a, b, &emitted.attestation_id)
+            .await
+            .unwrap();
+        assert!(
+            first.wraps_written >= 2,
+            "{tag} I62: first admit writes: {first:?}"
+        );
         let before: Vec<String> = b
             .backend
             .community_dek_member_grant_recipients(&comm, &a.key, 0)
             .await
             .unwrap();
-        assert!(before.contains(&b.key) && before.contains(&a.key), "{tag} I62: {before:?}");
+        assert!(
+            before.contains(&b.key) && before.contains(&a.key),
+            "{tag} I62: {before:?}"
+        );
 
         // (2) Re-apply the SAME set: idempotent, nothing removed.
-        let again = carry_key_grant(a, b, &emitted.attestation_id).await.unwrap();
-        assert_eq!(again.wraps_written, 0, "{tag} I62: a re-applied set writes nothing new");
+        let again = carry_key_grant(a, b, &emitted.attestation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.wraps_written, 0,
+            "{tag} I62: a re-applied set writes nothing new"
+        );
         assert_eq!(
             b.backend
                 .community_dek_member_grant_recipients(&comm, &a.key, 0)
@@ -489,29 +533,40 @@ pub mod two_node {
         );
 
         // (3) A SUPERSET (a late recipient) adds and keeps.
-        let mut superset = crate::federation::key_grant::build_epoch_set(a.backend, &comm, &a.key, 0)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut superset =
+            crate::federation::key_grant::build_epoch_set(a.backend, &comm, &a.key, 0)
+                .await
+                .unwrap()
+                .unwrap();
         let late = format!("{tag}-late-occ-{run}");
         superset.wraps.push(GrantWrap {
             recipient_key_id: late.clone(),
             wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
             wrapped_dek: "{\"algorithm\":\"x25519_mlkem768_aes256_gcm_hkdf_sha256\"}".into(),
         });
-        let sup = admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &superset).await)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I62: superset: {e}"));
-        assert_eq!(sup.wraps_written, 1, "{tag} I62: exactly the late wrap is new");
+        let sup =
+            admit_replicated_key_grant(b.backend, sign_set_unstored(&a.signer, &superset).await)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I62: superset: {e}"));
+        assert_eq!(
+            sup.wraps_written, 1,
+            "{tag} I62: exactly the late wrap is new"
+        );
         let after: Vec<String> = b
             .backend
             .community_dek_member_grant_recipients(&comm, &a.key, 0)
             .await
             .unwrap();
         for prior in &before {
-            assert!(after.contains(prior), "{tag} I62: {prior} was dropped by a superset");
+            assert!(
+                after.contains(prior),
+                "{tag} I62: {prior} was dropped by a superset"
+            );
         }
-        assert!(after.contains(&late), "{tag} I62: the late recipient was added");
+        assert!(
+            after.contains(&late),
+            "{tag} I62: the late recipient was added"
+        );
 
         // (4) A SUBSET later (a partial re-emission) removes nothing.
         let subset = KeyGrantSet {
@@ -531,11 +586,22 @@ pub mod two_node {
         );
 
         // (5) Now the bytes arrive — and open.
-        carry_bytes(a, b, &sha, COMMUNITY, &comm, Some(0), CryptoTier::CommunityDek, &[])
-            .await
-            .unwrap();
+        carry_bytes(
+            a,
+            b,
+            &sha,
+            COMMUNITY,
+            &comm,
+            Some(0),
+            CryptoTier::CommunityDek,
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            read_any_for_viewer(b.backend, &sha, &b.key, None).await.unwrap(),
+            read_any_for_viewer(b.backend, &sha, &b.key, None)
+                .await
+                .unwrap(),
             b"v1",
             "{tag} I62: a set admitted before its bytes is read when they arrive"
         );
@@ -579,7 +645,10 @@ pub mod two_node {
             .await
             .unwrap();
         assert_eq!(first.epoch, 0);
-        assert!(first.granted.contains(&x_occ), "{tag} I63: X granted at B's e0");
+        assert!(
+            first.granted.contains(&x_occ),
+            "{tag} I63: X granted at B's e0"
+        );
         let e0_minted = b
             .backend
             .community_dek_minted_at(&comm, &b.key, 0)
@@ -591,7 +660,10 @@ pub mod two_node {
         // replicated revocation through its directory door — the only way a
         // removal reaches a non-revoker.
         let removed_at = chrono::Utc::now();
-        assert!(removed_at >= e0_minted, "{tag} I63: the removal is newer than the mint");
+        assert!(
+            removed_at >= e0_minted,
+            "{tag} I63: the removal is newer than the mint"
+        );
         let rev = ts::sign_community_membership_revocation(
             &comm,
             crate::federation::types::CommunityMembershipRevocation {
@@ -604,7 +676,10 @@ pub mod two_node {
                 persist_row_hash: String::new(),
             },
         );
-        a.backend.put_community_membership_revocation(rev.clone()).await.unwrap();
+        a.backend
+            .put_community_membership_revocation(rev.clone())
+            .await
+            .unwrap();
         b.backend
             .put_community_membership_revocation(rev)
             .await
@@ -633,10 +708,11 @@ pub mod two_node {
             "{tag} I63: X is absent from B's new set: {:?}",
             second.granted
         );
-        let new_set = crate::federation::key_grant::build_epoch_set(b.backend, &comm, &b.key, second.epoch)
-            .await
-            .unwrap()
-            .expect("B holds wraps at the new epoch");
+        let new_set =
+            crate::federation::key_grant::build_epoch_set(b.backend, &comm, &b.key, second.epoch)
+                .await
+                .unwrap()
+                .expect("B holds wraps at the new epoch");
         assert!(
             new_set.wraps.iter().all(|w| w.recipient_key_id != x_occ),
             "{tag} I63: the new KeyGrant set carries no wrap for X"
@@ -676,7 +752,10 @@ pub mod two_node {
         // Both A and C advance their OWN counters to 3.
         for n in [a, c] {
             for _ in 0..3 {
-                n.backend.community_dek_bump_epoch(&comm, &n.key).await.unwrap();
+                n.backend
+                    .community_dek_bump_epoch(&comm, &n.key)
+                    .await
+                    .unwrap();
             }
         }
         let from_a = encrypt_and_cascade_community(a.backend, &comm, b"from A", None, Some(&a.key))
@@ -685,7 +764,11 @@ pub mod two_node {
         let from_c = encrypt_and_cascade_community(c.backend, &comm, b"from C", None, Some(&c.key))
             .await
             .unwrap();
-        assert_eq!((from_a.epoch, from_c.epoch), (3, 3), "{tag} I64: both at epoch 3");
+        assert_eq!(
+            (from_a.epoch, from_c.epoch),
+            (3, 3),
+            "{tag} I64: both at epoch 3"
+        );
         assert_ne!(from_a.at_rest_sha256, from_c.at_rest_sha256);
 
         for (n, epoch_holder) in [(a, &from_a), (c, &from_c)] {
@@ -710,24 +793,42 @@ pub mod two_node {
             .unwrap();
         }
         // Two grants, two DEKs, one epoch number — both open on B.
-        assert!(b.backend.community_dek_has_member_grant(&comm, &a.key, 3, &b.key).await.unwrap());
-        assert!(b.backend.community_dek_has_member_grant(&comm, &c.key, 3, &b.key).await.unwrap());
+        assert!(b
+            .backend
+            .community_dek_has_member_grant(&comm, &a.key, 3, &b.key)
+            .await
+            .unwrap());
+        assert!(b
+            .backend
+            .community_dek_has_member_grant(&comm, &c.key, 3, &b.key)
+            .await
+            .unwrap());
         assert_eq!(
-            read_any_for_viewer(b.backend, &from_a.at_rest_sha256, &b.key, None).await.unwrap(),
+            read_any_for_viewer(b.backend, &from_a.at_rest_sha256, &b.key, None)
+                .await
+                .unwrap(),
             b"from A",
             "{tag} I64: A's content at (C, A, 3)"
         );
         assert_eq!(
-            read_any_for_viewer(b.backend, &from_c.at_rest_sha256, &b.key, None).await.unwrap(),
+            read_any_for_viewer(b.backend, &from_c.at_rest_sha256, &b.key, None)
+                .await
+                .unwrap(),
             b"from C",
             "{tag} I64: C's content at (C, C, 3)"
         );
         assert_eq!(
-            b.backend.community_dek_blob_epoch(&from_a.at_rest_sha256).await.unwrap(),
+            b.backend
+                .community_dek_blob_epoch(&from_a.at_rest_sha256)
+                .await
+                .unwrap(),
             Some((comm.clone(), a.key.clone(), 3))
         );
         assert_eq!(
-            b.backend.community_dek_blob_epoch(&from_c.at_rest_sha256).await.unwrap(),
+            b.backend
+                .community_dek_blob_epoch(&from_c.at_rest_sha256)
+                .await
+                .unwrap(),
             Some((comm.clone(), c.key.clone(), 3))
         );
     }
@@ -767,15 +868,27 @@ pub mod two_node {
             }
         }
         // A seals a self blob: fresh DEK, wrapped to both devices.
-        let sealed = encrypt_and_cascade(a.backend, SELF, &owner, b"my photo", None, None, Some(&a.key))
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I65: A seals self: {e}"));
-        assert!(sealed.granted.contains(&a2.key), "{tag} I65: the second device is granted");
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            SELF,
+            &owner,
+            b"my photo",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I65: A seals self: {e}"));
+        assert!(
+            sealed.granted.contains(&a2.key),
+            "{tag} I65: the second device is granted"
+        );
         let sha = sealed.at_rest_sha256;
-        let emitted = emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, SELF, &owner)
-            .await
-            .unwrap()
-            .expect("wraps");
+        let emitted =
+            emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, SELF, &owner)
+                .await
+                .unwrap()
+                .expect("wraps");
         let admission = carry_key_grant(a, a2, &emitted.attestation_id)
             .await
             .unwrap_or_else(|e| panic!("{tag} I65: the second device admits the set: {e}"));
@@ -787,7 +900,11 @@ pub mod two_node {
             hex::encode(sha)
         );
         assert!(
-            a2.backend.get_at_rest_grant(&sha, &a2.key).await.unwrap().is_some(),
+            a2.backend
+                .get_at_rest_grant(&sha, &a2.key)
+                .await
+                .unwrap()
+                .is_some(),
             "{tag} I65: the second device's grant row landed"
         );
         // The second device's operator names the first as family (#846 §4):
@@ -800,7 +917,7 @@ pub mod two_node {
             &owner,
             None,
             CryptoTier::InvisibleEncrypted,
-            &[a.key.clone()],
+            std::slice::from_ref(&a.key),
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I65: the second device adopts: {e}"));
@@ -822,7 +939,10 @@ pub mod two_node {
         let err = read_any_for_viewer(a2.backend, &sha, &format!("{tag}-stranger-{run}"), None)
             .await
             .unwrap_err();
-        assert!(matches!(err, BlobError::NotGranted { .. }), "{tag} I65: {err:?}");
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I65: {err:?}"
+        );
     }
 }
 
@@ -836,7 +956,11 @@ mod tests {
     fn i59_key_grant_is_the_sixteenth_kind_with_the_stated_policy_row() {
         use crate::federation::replication_policy::*;
         assert_eq!(EnvelopeKind::ALL.len(), 16);
-        assert_eq!(EnvelopeKind::ALL[15], EnvelopeKind::KeyGrant, "appended, never inserted");
+        assert_eq!(
+            EnvelopeKind::ALL[15],
+            EnvelopeKind::KeyGrant,
+            "appended, never inserted"
+        );
         assert_eq!(EnvelopeKind::KeyGrant.as_str(), "KeyGrant");
         let p = policy_for(EnvelopeKind::KeyGrant);
         assert_eq!(p.signer, SignerSource::RegisteredSigner);
@@ -872,8 +996,14 @@ mod tests {
     fn i67_no_production_delete_on_the_grant_tables_outside_destroy() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for (file, table) in [
-            ("src/store/sqlite.rs", "federation_community_dek_member_grants"),
-            ("src/store/postgres.rs", "cirislens.federation_community_dek_member_grants"),
+            (
+                "src/store/sqlite.rs",
+                "federation_community_dek_member_grants",
+            ),
+            (
+                "src/store/postgres.rs",
+                "cirislens.federation_community_dek_member_grants",
+            ),
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
             let prod = production_only(&text);
@@ -893,7 +1023,10 @@ mod tests {
         }
         for (file, table) in [
             ("src/store/sqlite.rs", "federation_blob_key_grants"),
-            ("src/store/postgres.rs", "cirislens.federation_blob_key_grants"),
+            (
+                "src/store/postgres.rs",
+                "cirislens.federation_blob_key_grants",
+            ),
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
             let prod = production_only(&text);
@@ -1044,7 +1177,10 @@ mod tests {
                 4,
                 "I66: V145 wrote the sentinel on every re-keyed row (SQL cannot know the node)"
             );
-            let n = backend.repair_minter_sentinel(Some("node-x")).await.unwrap();
+            let n = backend
+                .repair_minter_sentinel(Some("node-x"))
+                .await
+                .unwrap();
             assert_eq!(n, 4, "I66: every sentinel resolved");
             assert_eq!(sentinel_rows(&backend), 0);
             assert_eq!(
@@ -1076,7 +1212,13 @@ mod tests {
                 b"pre-V145 minutes"
             );
             // Idempotent.
-            assert_eq!(backend.repair_minter_sentinel(Some("node-x")).await.unwrap(), 0);
+            assert_eq!(
+                backend
+                    .repair_minter_sentinel(Some("node-x"))
+                    .await
+                    .unwrap(),
+                0
+            );
             // A sentinel that cannot resolve — the resolved row already
             // exists — aborts, and the sentinel is not silently left behind.
             {
@@ -1104,7 +1246,10 @@ mod tests {
                 .repair_minter_sentinel(None)
                 .await
                 .expect_err("I66: no key to resolve to must not mean the sentinel is ignored");
-            assert!(err.to_string().contains("None = no Ed25519 identity"), "{err}");
+            assert!(
+                err.to_string().contains("None = no Ed25519 identity"),
+                "{err}"
+            );
         }
 
         /// The boot path itself: `Engine::with_signer` on a pre-V145 file
@@ -1115,7 +1260,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("pre-v145.db");
             {
-                let backend = SqliteBackend::open(path.to_string_lossy().to_string()).await.unwrap();
+                let backend = SqliteBackend::open(path.to_string_lossy().to_string())
+                    .await
+                    .unwrap();
                 backend.run_migrations_through(144).await.unwrap();
                 seed_pre_v145(&backend).await;
             }
@@ -1130,7 +1277,9 @@ mod tests {
             let sq = engine.sqlite_backend().unwrap();
             assert_eq!(sentinel_rows(sq), 0, "I66: no sentinel survives the boot");
             assert_eq!(
-                sq.community_dek_current_epoch("legacy-comm", &key).await.unwrap(),
+                sq.community_dek_current_epoch("legacy-comm", &key)
+                    .await
+                    .unwrap(),
                 1,
                 "I66: the pointer belongs to the engine's own derived key"
             );
@@ -1179,7 +1328,9 @@ mod tests {
             let master = backend.load_or_init_content_master().await.unwrap();
             let dek = fresh_dek().unwrap();
             let wrapped = wrap_dek_for_persist(&master, &dek).unwrap();
-            let envelope = seal(&dek, b"pre-V145 minutes (pg)", None).unwrap().to_bytes();
+            let envelope = seal(&dek, b"pre-V145 minutes (pg)", None)
+                .unwrap()
+                .to_bytes();
             let sha: [u8; 32] = sha2::Sha256::digest(&envelope).into();
             {
                 let client = backend.get_client().await.unwrap();
@@ -1232,12 +1383,22 @@ mod tests {
                     .unwrap();
             }
             backend.run_migrations().await.unwrap();
-            assert_eq!(count(&backend).await, 4, "I66 (pg): the sentinel on every re-keyed row");
-            let n = backend.repair_minter_sentinel(Some("node-x")).await.unwrap();
+            assert_eq!(
+                count(&backend).await,
+                4,
+                "I66 (pg): the sentinel on every re-keyed row"
+            );
+            let n = backend
+                .repair_minter_sentinel(Some("node-x"))
+                .await
+                .unwrap();
             assert_eq!(n, 4);
             assert_eq!(count(&backend).await, 0);
             assert_eq!(
-                backend.community_dek_current_epoch("legacy-comm", "node-x").await.unwrap(),
+                backend
+                    .community_dek_current_epoch("legacy-comm", "node-x")
+                    .await
+                    .unwrap(),
                 1
             );
             assert_eq!(
@@ -1250,7 +1411,13 @@ mod tests {
                     .expect("I66 (pg): existing content still opens"),
                 b"pre-V145 minutes (pg)"
             );
-            assert_eq!(backend.repair_minter_sentinel(Some("node-x")).await.unwrap(), 0);
+            assert_eq!(
+                backend
+                    .repair_minter_sentinel(Some("node-x"))
+                    .await
+                    .unwrap(),
+                0
+            );
             {
                 let client = backend.get_client().await.unwrap();
                 client
@@ -1356,12 +1523,18 @@ mod tests {
             };
             let run = uuid::Uuid::new_v4().simple().to_string();
             let (alias_a, alias_b) = (format!("eng-a-{run}"), format!("eng-b-{run}"));
-            let engine_a = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_a), "sqlite::memory:")
-                .await
-                .unwrap();
-            let engine_b = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), "sqlite::memory:")
-                .await
-                .unwrap();
+            let engine_a = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_a),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            let engine_b = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_b),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
             for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
                 e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
                     .await
@@ -1371,10 +1544,11 @@ mod tests {
                 engine_a.sqlite_backend().unwrap().clone(),
                 engine_b.sqlite_backend().unwrap().clone(),
             );
-            let kem = |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
-                x25519_base64: id.x25519_pubkey_b64,
-                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
-            };
+            let kem =
+                |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                    x25519_base64: id.x25519_pubkey_b64,
+                    ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+                };
             let a = Node {
                 backend: sa.as_ref(),
                 signer: ts::local_signer(&alias_a),
@@ -1399,16 +1573,26 @@ mod tests {
                 .await
                 .expect("A's scoped put");
             assert_eq!(r.tier, CryptoTier::CommunityDek);
-            assert!(r.key_grant_emission.is_some(), "the first seal minted: a set was reported");
+            assert!(
+                r.key_grant_emission.is_some(),
+                "the first seal minted: a set was reported"
+            );
             let sha = r.at_rest_sha256;
             let emitted: Vec<_> = sa
                 .list_attestations_by(&a.key)
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|x| x.attestation_type == crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE)
+                .filter(|x| {
+                    x.attestation_type
+                        == crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE
+                })
                 .collect();
-            assert_eq!(emitted.len(), 1, "exactly one epoch-axis set emitted by the door");
+            assert_eq!(
+                emitted.len(),
+                1,
+                "exactly one epoch-axis set emitted by the door"
+            );
 
             // B admits through the Engine door, adopts through the Engine door.
             let admission = engine_b
@@ -1437,7 +1621,10 @@ mod tests {
                 .await
                 .expect("B adopts through the Engine door");
             assert_eq!(
-                engine_b.read_blob_as(&sha, &b.key, None).await.expect("B reads through the Engine door"),
+                engine_b
+                    .read_blob_as(&sha, &b.key, None)
+                    .await
+                    .expect("B reads through the Engine door"),
                 b"engine minutes"
             );
             // Re-emission on demand carries the full set again (idempotent).
@@ -1449,13 +1636,19 @@ mod tests {
                 })
                 .await
                 .expect("re-emit");
-            assert!(again.is_some(), "A holds wraps, so a re-emission carries them");
+            assert!(
+                again.is_some(),
+                "A holds wraps, so a re-emission carries them"
+            );
             // A second seal in the same epoch changes no grant: no new set.
             let r2 = engine_a
                 .put_blob_scoped(COMMUNITY, Some(&comm), b"more minutes", None, None)
                 .await
                 .unwrap();
-            assert!(r2.key_grant_emission.is_none(), "an unchanged fan-out emits nothing (§14)");
+            assert!(
+                r2.key_grant_emission.is_none(),
+                "an unchanged fan-out emits nothing (§14)"
+            );
         }
     }
 
