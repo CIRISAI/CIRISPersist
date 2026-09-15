@@ -687,6 +687,15 @@ verbatim (`verify_transport_binding`, transport ≠ signing). The stored row is
 signed-put, so the plane advertises it and the far node admits it through the
 same gate.
 
+**Implementation note (PR #852 review).** The content-only gate binds every
+field the backends read back — `device_class`, `asserted_at` (the
+last-signed-wins and revocation-freshness clock), `valid_until`,
+`hardware_attestation` — at the producer's millisecond precision; a relay
+cannot forward-date a typed row under a valid signature. The self-signed
+form consults the LIVE owner binding on every admission and never the
+occurrence row a prior admission left, so a withdrawn or lapsed binding
+stops vouching the moment it dies (I76, legs 4 and 5).
+
 ### 20.3 The door: a node publishes its own occurrence
 
 `Engine::publish_self_occurrence(identity_key_id, device_class)` /

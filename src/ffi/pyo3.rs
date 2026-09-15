@@ -1297,9 +1297,15 @@ impl PyEngine {
     /// classical by the local key carries its PQC half too and peers admit
     /// it.
     fn select_pqc(&self, attesting_key_id: &str) -> Option<Arc<crate::signing::LocalSigner>> {
+        // A normal Python call attests as the DERIVED federation key id
+        // (`local_derived_key_id`), for which `select_signer` returns the
+        // composed signer — built over this same LocalSigner — so its PQC
+        // half is this one; a keystore-alias caller matches by alias. Either
+        // way the classical and PQC halves come from one identity
+        // (PR #852 review).
         self.local_signer
             .as_ref()
-            .filter(|ls| ls.key_id() == attesting_key_id)
+            .filter(|ls| ls.key_id() == attesting_key_id || ls.derived_key_id() == attesting_key_id)
             .cloned()
     }
 

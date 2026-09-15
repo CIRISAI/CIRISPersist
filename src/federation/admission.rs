@@ -4544,6 +4544,13 @@ pub async fn verify_signed_identity_occurrence(
         return Err(diverges("encryption_pubkeys"));
     }
 
+    // PR #852 review — a producer that stamps `asserted_at` into the
+    // envelope (every persist producer does) binds the typed instant too.
+    if let Some(at) = env.get("asserted_at").and_then(|v| v.as_str()) {
+        if !same_instant_ms(at, row.asserted_at) {
+            return Err(diverges("asserted_at"));
+        }
+    }
     // (3) Verify the hybrid signature against the signer's PINNED federation key.
     let Some(signer_key) = directory
         .lookup_public_key(&signed.attesting_key_id)
@@ -4588,6 +4595,14 @@ pub async fn verify_signed_identity_occurrence(
         None,
     )
     .await
+}
+
+/// PR #852 review — an envelope instant (RFC 3339) equals a typed instant at
+/// millisecond precision, the producer's. Unparseable ⇒ not equal.
+fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(envelope)
+        .map(|e| e.timestamp_millis() == typed.timestamp_millis())
+        .unwrap_or(false)
 }
 
 /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.2) — the content-only signed
@@ -4659,6 +4674,33 @@ async fn verify_content_only_identity_occurrence(
     if row_enc.as_ref() != Some(&env_enc) {
         return Err(diverges("encryption_pubkeys"));
     }
+    // Every persisted field the backends read back — `asserted_at` is the
+    // last-signed-wins / revocation-freshness clock — is bound to the
+    // envelope, or a relay could forward-date a typed row under a valid
+    // signature (PR #852 review). Instants compare at millisecond precision,
+    // the producer's.
+    if str_field("device_class")? != row.device_class {
+        return Err(diverges("device_class"));
+    }
+    if !same_instant_ms(&str_field("asserted_at")?, row.asserted_at) {
+        return Err(diverges("asserted_at"));
+    }
+    match (
+        env.get("valid_until").filter(|v| !v.is_null()),
+        row.valid_until,
+    ) {
+        (None, None) => {}
+        (Some(v), Some(t)) if v.as_str().is_some_and(|v| same_instant_ms(v, t)) => {}
+        _ => return Err(diverges("valid_until")),
+    }
+    match (
+        env.get("hardware_attestation").filter(|v| !v.is_null()),
+        row.hardware_attestation.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(v), Some(h)) if v.as_str() == Some(h) => {}
+        _ => return Err(diverges("hardware_attestation")),
+    }
     // (2) Hybrid signature over JCS(envelope), 1-of-1 against the pinned key.
     let Some(signer_key) = directory
         .lookup_public_key(&signed.attesting_key_id)
@@ -4718,20 +4760,24 @@ async fn check_signer_acts_for(
     if attesting_key_id == identity_key_id {
         return Ok(());
     }
-    let mut acts_for = matches!(
-        directory
-            .lookup_identity_for_occurrence(attesting_key_id)
-            .await?,
-        Some(sig_occ) if sig_occ.identity_key_id == identity_key_id
-    );
     // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — a node may vouch for
-    // ITS OWN occurrence when a live owner binding lifts it to the identity:
+    // ITS OWN occurrence when a LIVE owner binding lifts it to the identity:
     // the owner-signed, replicated `delegates_to(owner → node)` is the
-    // authority (the #765 lift), the node's own signature covers the row. A
-    // node with no such binding, or bound to another identity, stays refused.
-    if !acts_for && own_occurrence_key_id == Some(attesting_key_id) {
-        acts_for = owner_of(directory, attesting_key_id).await?.as_deref() == Some(identity_key_id);
-    }
+    // authority (the #765 lift), the node's own signature covers the row. The
+    // binding is consulted on EVERY such admission — never the occurrence row
+    // a prior admission left behind, or a withdrawn/lapsed binding would
+    // keep vouching (PR #852 review). A node with no live binding, or bound
+    // to another identity, is refused.
+    let acts_for = if own_occurrence_key_id == Some(attesting_key_id) {
+        owner_of(directory, attesting_key_id).await?.as_deref() == Some(identity_key_id)
+    } else {
+        matches!(
+            directory
+                .lookup_identity_for_occurrence(attesting_key_id)
+                .await?,
+            Some(sig_occ) if sig_occ.identity_key_id == identity_key_id
+        )
+    };
     if !acts_for {
         return Err(Error::SignatureInvalid(format!(
             "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \

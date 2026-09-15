@@ -13753,14 +13753,21 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("blob_list_key_grant_dirty: {e}"))
             })?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                r.safe_get_with::<Vec<u8>, _, _, _>(0, crate::federation::BlobError::Backend)
-                    .ok()
-                    .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        // A row that cannot be decoded is an error, never a silently shorter
+        // dirty list — the sweep would report success and the blob's set
+        // would never be carried (PR #852 review).
+        rows.iter()
+            .map(|r| {
+                let v =
+                    r.safe_get_with::<Vec<u8>, _, _, _>(0, crate::federation::BlobError::Backend)?;
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(format!(
+                        "blob_list_key_grant_dirty: sha256 is {} bytes, not 32",
+                        v.len()
+                    ))
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn key_grant_pending_put(

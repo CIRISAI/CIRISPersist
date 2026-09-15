@@ -609,6 +609,8 @@ where
             "ml_kem_768_base64": enc.ml_kem_768_base64,
         },
         "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "valid_until": serde_json::Value::Null,
+        "hardware_attestation": serde_json::Value::Null,
     });
     let (signed_envelope, signature) =
         ciris_verify_core::transport_binding::produce_signed_identity_occurrence(

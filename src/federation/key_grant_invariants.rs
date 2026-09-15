@@ -1396,7 +1396,7 @@ pub mod two_node {
     /// admitted once a live owner binding does; a second row claiming
     /// ANOTHER identity is refused. The admitted row is advertised by the
     /// plane's since-read; a trusted-local row is not (I78).
-    pub async fn exercise_i76_content_only_occurrence<B>(n: &Node<'_, B>, tag: &str)
+    pub async fn exercise_i76_content_only_occurrence<B>(n: &Node<'_, B>, alias: &str, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
@@ -1406,6 +1406,7 @@ pub mod two_node {
         ts::register_identity_key(n.backend, &alice, USER).await;
         ts::register_identity_key(n.backend, &carol, USER).await;
         let content_only = |identity: &str| {
+            let at = chrono::Utc::now();
             let env = serde_json::json!({
                 "attesting_key_id": n.key,
                 "identity_key_id": identity,
@@ -1415,11 +1416,13 @@ pub mod two_node {
                     "x25519_base64": n.kem.x25519_base64,
                     "ml_kem_768_base64": n.kem.ml_kem_768_base64,
                 },
-                "asserted_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "valid_until": serde_json::Value::Null,
+                "hardware_attestation": serde_json::Value::Null,
             });
-            (identity.to_owned(), env)
+            (identity.to_owned(), env, at)
         };
-        let sign = |identity: String, env: serde_json::Value| async move {
+        let sign = |identity: String, env: serde_json::Value, at: chrono::DateTime<chrono::Utc>| async move {
             let (signed_envelope, signature) =
                 ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
                     &crate::signing::LocalSelfSigner::new(n.signer.as_ref()),
@@ -1433,7 +1436,7 @@ pub mod two_node {
                     occurrence_key_id: n.key.clone(),
                     device_class: crate::federation::types::device_class::SERVER.into(),
                     hardware_attestation: None,
-                    asserted_at: chrono::Utc::now(),
+                    asserted_at: at,
                     valid_until: None,
                     encryption_pubkeys: Some(n.kem.clone()),
                     transport_binding: None,
@@ -1445,10 +1448,10 @@ pub mod two_node {
             }
         };
         // (1) Unbound: refused.
-        let (i, e) = content_only(&alice);
+        let (i, e, at) = content_only(&alice);
         let err = n
             .backend
-            .put_identity_occurrence(sign(i, e).await)
+            .put_identity_occurrence(sign(i, e, at).await)
             .await
             .expect_err("{tag} I76: an unbound node cannot vouch for itself");
         assert!(
@@ -1462,9 +1465,10 @@ pub mod two_node {
             })
             .await
             .unwrap();
-        let (i, e) = content_only(&alice);
+        let (i, e, at) = content_only(&alice);
+        let admitted = sign(i, e, at).await;
         n.backend
-            .put_identity_occurrence(sign(i, e).await)
+            .put_identity_occurrence(admitted.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag} I76: the owner binding lifts the node: {e}"));
         let row = n
@@ -1515,12 +1519,54 @@ pub mod two_node {
             "{tag} I78: a trusted-local row is not on the plane"
         );
         // (3) The same node claiming ANOTHER identity: refused.
-        let (i, e) = content_only(&carol);
+        let (i, e, at) = content_only(&carol);
         let err = n
             .backend
-            .put_identity_occurrence(sign(i, e).await)
+            .put_identity_occurrence(sign(i, e, at).await)
             .await
             .expect_err("{tag} I76: a node bound to alice cannot claim carol");
+        assert!(
+            err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
+            "{tag} I76: {err}"
+        );
+        // (4) PR #852 review — a RELAY forwards the admitted row with the
+        // typed `asserted_at` pushed into the future under the valid
+        // signature: every persisted field is bound to the envelope.
+        let mut forward_dated = admitted.clone();
+        forward_dated.identity_occurrence.asserted_at =
+            admitted.identity_occurrence.asserted_at + chrono::Duration::days(365);
+        let err = n
+            .backend
+            .put_identity_occurrence(forward_dated)
+            .await
+            .expect_err("{tag} I76: a typed asserted_at diverging from the envelope is refused");
+        assert!(
+            err.to_string().contains("asserted_at"),
+            "{tag} I76: the refusal names the diverging field: {err}"
+        );
+        // (5) PR #852 review — the occurrence row alone never vouches: on a
+        // backend that holds the admitted row but NO owner binding, the same
+        // node's self-signed re-submission is refused.
+        let other = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        crate::store::Backend::run_migrations(&other).await.unwrap();
+        // The same node (same alias ⇒ same deterministic signer and key),
+        // registered on the fresh backend with its REAL pubkeys.
+        let twin = node_as(&other, alias, crate::federation::types::identity_type::NODE).await;
+        assert_eq!(twin.key, n.key);
+        ts::register_identity_key(&other, &alice, USER).await;
+        other
+            .put_identity_occurrence_local(admitted.identity_occurrence.clone())
+            .await
+            .unwrap();
+        let (i, e, at) = content_only(&alice);
+        let err = other
+            .put_identity_occurrence(sign(i, e, at).await)
+            .await
+            .expect_err(
+                "{tag} I76: the row a prior admission left never vouches without the live binding",
+            );
         assert!(
             err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
             "{tag} I76: {err}"
@@ -2437,7 +2483,7 @@ mod tests {
         async fn i76_content_only_occurrence_sqlite() {
             let bn = fresh().await;
             let n = node_as(&bn, "i76-n", crate::federation::types::identity_type::NODE).await;
-            exercise_i76_content_only_occurrence(&n, "sqlite").await;
+            exercise_i76_content_only_occurrence(&n, "i76-n", "sqlite").await;
         }
 
         #[tokio::test]
@@ -3324,7 +3370,7 @@ mod tests {
                 return;
             };
             let n = node_as(&bn, "i76-n", crate::federation::types::identity_type::NODE).await;
-            exercise_i76_content_only_occurrence(&n, "postgres").await;
+            exercise_i76_content_only_occurrence(&n, "i76-n", "postgres").await;
         }
 
         #[tokio::test]

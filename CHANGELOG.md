@@ -46,6 +46,27 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   through a since-read and the gated door on the other side; B's node is in
   A's set; B admits and opens.
 
+### Review round one (PR #852, Codex) — three P1s, one P2
+- **Every persisted occurrence field is bound to the envelope.** The
+  content-only gate binds `device_class`, `asserted_at`, `valid_until` and
+  `hardware_attestation` (instants at the producer's millisecond precision),
+  not only the ids and KEM pubkeys — a relay could otherwise forward-date a
+  typed row under a valid signature and outlive a revocation. The
+  transport-bound path binds `asserted_at` when its envelope carries it.
+  `publish_self_occurrence` carries the two nullable fields explicitly. I76 (4).
+- **The self-signed form consults the live owner binding on every
+  admission**, never the occurrence row a prior admission left — a
+  withdrawn or lapsed binding no longer keeps vouching. I76 (5): a backend
+  holding the row but no binding refuses the re-submission.
+- **PyEngine's `select_pqc` matches by the derived federation id as well as
+  the alias** — a normal Python call attests as the derived id, for which
+  `select_signer` returns the composed signer over the same LocalSigner; the
+  alias-only match left PyEngine's commons claim classical. The Python test
+  reads the claim back through `list_attestations_by` and asserts the PQC
+  half.
+- **`blob_list_key_grant_dirty` propagates a row decode failure** instead
+  of a silently shorter dirty list (the sweep would have reported success).
+
 ### Fixed
 - **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
   A write door's claim was stored at federation tier with a classical-only
