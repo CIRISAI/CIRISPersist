@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased — #851]
+## [44.4.0] - 2026-09-15
 
 **The occurrence that carries the key.** CIRISEdge's mesh harness ran the
 plane I61 could not: every receiving node refused every `KeyGrant` set
@@ -32,6 +32,9 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   verbatim. I76.
 
 ### Added
+- **I80** — a LocalSigner without a PQC half keeps the classical claim,
+  byte-identical to the pre-#851 claim (a classical-only producer stays
+  classical-only; no new failure).
 - **`Engine::publish_self_occurrence` / `PyEngine.publish_self_occurrence`
   (§20.3)** — a node publishes its own content-only occurrence under its
   owner, signed with its LocalSigner, through the gated door, so it is born
