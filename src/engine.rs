@@ -5379,6 +5379,19 @@ impl Engine {
                     .into(),
             )
         })?;
+        // The occurrence published is THIS NODE's: the LocalSigner must be the
+        // node's identity (an Engine over a shared backend may compose a
+        // different classical signer — PR #852 review, round five).
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("publish_self_occurrence: node key: {e}"))
+        })?;
+        if local.derived_key_id() != me {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "publish_self_occurrence: the LocalSigner ({}) is not this node's identity ({me}); \
+                 a node publishes only its own occurrence (BLOB_REPLICATION.md §20.3)",
+                local.derived_key_id()
+            )));
+        }
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {

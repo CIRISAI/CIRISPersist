@@ -4550,6 +4550,7 @@ pub async fn verify_signed_identity_occurrence(
         if !same_instant_ms(at, row.asserted_at) {
             return Err(diverges("asserted_at"));
         }
+        super::operational::check_skew_bound(row.asserted_at, chrono::Utc::now())?;
     }
     // (3) Verify the hybrid signature against the signer's PINNED federation key.
     let Some(signer_key) = directory
@@ -4592,7 +4593,6 @@ pub async fn verify_signed_identity_occurrence(
         &signed.attesting_key_id,
         &row.identity_key_id,
         "identity_occurrence",
-        None,
     )
     .await
 }
@@ -4697,6 +4697,11 @@ async fn verify_content_only_identity_occurrence(
     if !same_instant_ms(&str_field("asserted_at")?, row.asserted_at) {
         return Err(diverges("asserted_at"));
     }
+    // The signed instant is bounded: a compromised node with a live binding
+    // must not date its occurrence into the future to out-rank authentic
+    // replacements and escape a later revocation (PR #852 review, round
+    // five). The same clock-skew tolerance every stamped write gets.
+    super::operational::check_skew_bound(row.asserted_at, chrono::Utc::now())?;
     match (
         env.get("valid_until").filter(|v| !v.is_null()),
         row.valid_until,
@@ -4750,7 +4755,6 @@ async fn verify_content_only_identity_occurrence(
         &signed.attesting_key_id,
         &row.identity_key_id,
         "identity_occurrence",
-        Some(&row.occurrence_key_id),
     )
     .await
 }
@@ -4767,33 +4771,38 @@ async fn check_signer_acts_for(
     attesting_key_id: &str,
     identity_key_id: &str,
     what: &str,
-    own_occurrence_key_id: Option<&str>,
 ) -> Result<(), Error> {
     if attesting_key_id == identity_key_id {
         return Ok(());
     }
-    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — a node may vouch for
-    // ITS OWN occurrence when a LIVE owner binding lifts it to the identity:
-    // the owner-signed, replicated `delegates_to(owner → node)` is the
-    // authority (the #765 lift), the node's own signature covers the row. The
-    // binding is consulted on EVERY such admission — never the occurrence row
-    // a prior admission left behind, or a withdrawn/lapsed binding would
-    // keep vouching (PR #852 review). A node with no live binding, or bound
-    // to another identity, is refused.
-    let acts_for = if own_occurrence_key_id == Some(attesting_key_id) {
+    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2; PR #852 review, rounds
+    // two–five) — who may vouch for `identity_key_id` besides itself:
+    // - a NODE-role key ONLY through its live owner binding (`owner_of`) —
+    //   for its own occurrence and for any sibling key alike; never through
+    //   an occurrence row a prior admission left, so a withdrawn or lapsed
+    //   binding, or a revoked node, vouches for nothing;
+    // - any other key through the ACTIVE occurrence fold of the identity
+    //   (revocations applied), never a raw historical row.
+    let is_node = directory
+        .lookup_public_key(attesting_key_id)
+        .await?
+        .is_some_and(|k| {
+            k.identity_type == super::types::identity_type::NODE
+                || k.claims_role(super::types::identity_type::NODE)
+        });
+    let acts_for = if is_node {
         owner_of(directory, attesting_key_id).await?.as_deref() == Some(identity_key_id)
     } else {
-        matches!(
-            directory
-                .lookup_identity_for_occurrence(attesting_key_id)
-                .await?,
-            Some(sig_occ) if sig_occ.identity_key_id == identity_key_id
-        )
+        directory
+            .list_identity_occurrences_active(identity_key_id)
+            .await?
+            .iter()
+            .any(|o| o.occurrence_key_id == attesting_key_id)
     };
     if !acts_for {
         return Err(Error::SignatureInvalid(format!(
             "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \
-             nor an active occurrence of it"
+             nor an active occurrence of it, nor a node it owns"
         )));
     }
     Ok(())
@@ -4926,7 +4935,6 @@ pub async fn verify_signed_identity_occurrence_revocation(
         &signed.attesting_key_id,
         &row.identity_key_id,
         "identity_occurrence_revocation",
-        None,
     )
     .await
 }
@@ -5099,7 +5107,6 @@ pub async fn verify_signed_transport_destination(
         &signed.attesting_key_id,
         &row.occurrence_key_id,
         "transport_destination",
-        None,
     )
     .await
 }
@@ -5953,7 +5960,6 @@ pub async fn verify_signed_touch_claim(
                 &claim.attesting_key_id,
                 &claim.target_key_id,
                 "touch_claim",
-                None,
             )
             .await?;
         }

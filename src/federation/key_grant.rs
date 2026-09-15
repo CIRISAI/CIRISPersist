@@ -874,19 +874,6 @@ where
         k.identity_type == crate::federation::types::identity_type::NODE
             || k.claims_role(crate::federation::types::identity_type::NODE)
     });
-    let mut principals: Vec<String> = vec![signer.to_owned()];
-    if is_node {
-        match crate::federation::admission::owner_of(directory, signer).await? {
-            Some(owner) if !revoked_under.contains(&owner) => principals.push(owner),
-            _ => return Ok(false),
-        }
-    } else {
-        for o in &rows {
-            if !revoked_under.contains(&o.identity_key_id) {
-                principals.push(o.identity_key_id.clone());
-            }
-        }
-    }
     let revs = directory
         .list_community_membership_revocations_for(community_key_id)
         .await?;
@@ -895,6 +882,27 @@ where
             .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
         as_of,
     );
+    // A NODE minter has exactly ONE principal — its live owner — and no
+    // fallback: not the key itself, not a stale row under a former owner,
+    // not the member-occurrence walk below (PR #852 review, round five: an
+    // ownership transfer must end the old community's minting authority).
+    if is_node {
+        return Ok(
+            match crate::federation::admission::owner_of(directory, signer).await? {
+                Some(owner) if !revoked_under.contains(&owner) => {
+                    !removed.contains(owner.as_str())
+                        && community.members.iter().any(|m| m.key_id == owner)
+                }
+                _ => false,
+            },
+        );
+    }
+    let mut principals: Vec<String> = vec![signer.to_owned()];
+    for o in &rows {
+        if !revoked_under.contains(&o.identity_key_id) {
+            principals.push(o.identity_key_id.clone());
+        }
+    }
     for member in &community.members {
         if removed.contains(member.key_id.as_str()) {
             continue;

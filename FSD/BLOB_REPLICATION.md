@@ -722,6 +722,16 @@ is revoked, a device key lifts to each identity whose row is unrevoked (I77
 occurrence gates, and the producer truncates (I76 7). A PQC-less LocalSigner
 that is the attester signs the claim classically itself (I81 b).
 
+**Implementation note (PR #852 review, round five).** A NODE minter's only
+principal is its live owner — no fallback to the key itself, to a stale row
+under a former owner, or to the member-occurrence walk (I77 8). Who may
+vouch for an identity besides itself is decided by role and by the active
+fold: a NODE signer only through its live owner binding, for its own
+occurrence and for any sibling key; any other signer only as an active
+occurrence of the identity (I76 9). Signed instants are bounded by the
+write-gate skew tolerance (I76 8). The publish door refuses a LocalSigner
+that is not the node's identity (I82).
+
 ### 20.3 The door: a node publishes its own occurrence
 
 `Engine::publish_self_occurrence(identity_key_id, device_class)` /

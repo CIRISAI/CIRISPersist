@@ -110,6 +110,24 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   revocation. Both gates require it; `publish_self_occurrence` truncates.
   I76 (7).
 
+### Review round five (PR #852, Codex) — three P1s, one P2
+- **A NODE minter has exactly one principal — its live owner — and no
+  fallback**: not the key itself, not a stale row under a former owner, not
+  the member-occurrence walk; an ownership transfer ends the old community's
+  minting authority. I77 (8).
+- **`check_signer_acts_for` resolves by role and by the active fold.** A
+  NODE signer vouches only through its live owner binding — for its own
+  occurrence and for any sibling key alike; any other signer only as an
+  ACTIVE occurrence of the identity (revocations applied), never a raw
+  historical row. I76 (9).
+- **The signed instant is bounded** by the write-gate clock-skew tolerance in
+  both occurrence gates: a compromised node with a live binding cannot date
+  an occurrence into the future to out-rank replacements or escape a later
+  revocation. I76 (8).
+- **`publish_self_occurrence` publishes only this node's key** — a
+  LocalSigner that is not the node's identity (an Engine over a shared
+  backend with a different composed signer) is refused. I82.
+
 ### Fixed
 - **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
   A write door's claim was stored at federation tier with a classical-only

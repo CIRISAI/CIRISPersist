@@ -1734,6 +1734,84 @@ pub mod two_node {
                     panic!("{tag} I77 (7): carol's revocation of HER row must not disable A: {err}")
                 });
         }
+        // (8) PR #852 round five — ownership moved alice → dave: A keeps an
+        // unrevoked occurrence row under alice (the member); the live binding
+        // is dave's, who is NOT on the roster. A NODE minter has exactly one
+        // principal — its live owner — so the set is refused; the stale row
+        // and the member-occurrence walk are not fallbacks.
+        #[cfg(feature = "sqlite")]
+        {
+            let f = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            crate::store::Backend::run_migrations(&f).await.unwrap();
+            let dave = format!("{tag}-dave-{run}");
+            ts::register_hybrid_key_as(
+                &f,
+                &a.key,
+                "i77-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            for ident in [&alice, &bob, &dave] {
+                ts::register_identity_key(&f, ident, USER).await;
+            }
+            ts::register_hybrid_key_as(&f, &comm, &comm, USER).await;
+            f.put_community(ts::sign_community(
+                &comm,
+                crate::federation::types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "Principal Co-op".into(),
+                    members: [&alice, &bob]
+                        .into_iter()
+                        .map(|k| crate::federation::types::CommunityMember {
+                            key_id: k.clone(),
+                            joined_at: chrono::Utc::now(),
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+            f.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: alice.clone(),
+                occurrence_key_id: a.key.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now() - chrono::Duration::seconds(30),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+            f.apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-f-{run}"), &dave, &a.key),
+            })
+            .await
+            .unwrap();
+            let row5 = a
+                .backend
+                .get_attestation(&emitted.attestation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let err = admit_replicated_key_grant(&f, SignedKeyGrantSet { attestation: row5 })
+                .await
+                .expect_err("{tag} I77 (8): a stale row under a former owner is not a principal");
+            assert_eq!(
+                refusal_reason(&err),
+                "signer_not_active_member",
+                "{tag} I77 (8): {err}"
+            );
+        }
     }
 
     /// **I76 (#851 §20.2) — the content-only signed occurrence.** A node
@@ -1806,7 +1884,9 @@ pub mod two_node {
             .await
             .expect_err("{tag} I76: an unbound node cannot vouch for itself");
         assert!(
-            err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
+            err.to_string().contains("neither identity")
+                || err.to_string().contains("acts for")
+                || err.to_string().contains("nor a node it owns"),
             "{tag} I76: the refusal is signer_acts_for: {err}"
         );
         // (2) alice's live owner binding lifts the node: admitted, advertised.
@@ -1877,9 +1957,121 @@ pub mod two_node {
             .await
             .expect_err("{tag} I76: a node bound to alice cannot claim carol");
         assert!(
-            err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
+            err.to_string().contains("neither identity")
+                || err.to_string().contains("acts for")
+                || err.to_string().contains("nor a node it owns"),
             "{tag} I76: {err}"
         );
+        // (8) PR #852 round five — a future-dated content-only occurrence is
+        // refused by the write-gate skew bound, however consistent envelope
+        // and row are: a compromised node with a live binding must not
+        // out-rank authentic replacements or escape a later revocation.
+        {
+            let future = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp_millis(),
+            )
+            .unwrap();
+            let env = serde_json::json!({
+                "attesting_key_id": n.key,
+                "identity_key_id": alice,
+                "occurrence_key_id": n.key,
+                "device_class": crate::federation::types::device_class::SERVER,
+                "encryption_pubkeys": {
+                    "x25519_base64": n.kem.x25519_base64,
+                    "ml_kem_768_base64": n.kem.ml_kem_768_base64,
+                },
+                "asserted_at": future.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "valid_until": serde_json::Value::Null,
+                "hardware_attestation": serde_json::Value::Null,
+            });
+            let err = n
+                .backend
+                .put_identity_occurrence(sign(alice.clone(), env, future).await)
+                .await
+                .expect_err("{tag} I76 (8): a future-dated occurrence is refused");
+            assert!(
+                err.to_string().to_lowercase().contains("skew")
+                    || err.to_string().to_lowercase().contains("future"),
+                "{tag} I76 (8): the refusal is the skew bound: {err}"
+            );
+        }
+        // (9) PR #852 round five — a NODE vouching for a SIBLING key under its
+        // owner: admitted where its owner binding is live; refused on a
+        // backend that holds only its occurrence row (no binding) — the raw
+        // row never vouches, for the node's own key or any other.
+        {
+            let sibling = format!("{tag}-sibling-{run}");
+            ts::register_hybrid_key_as(n.backend, &sibling, &sibling, USER).await;
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+            let env = serde_json::json!({
+                "attesting_key_id": n.key,
+                "identity_key_id": alice,
+                "occurrence_key_id": sibling,
+                "device_class": crate::federation::types::device_class::AGENT,
+                "encryption_pubkeys": {
+                    "x25519_base64": n.kem.x25519_base64,
+                    "ml_kem_768_base64": n.kem.ml_kem_768_base64,
+                },
+                "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "valid_until": serde_json::Value::Null,
+                "hardware_attestation": serde_json::Value::Null,
+            });
+            let (signed_envelope, signature) =
+                ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+                    &crate::signing::LocalSelfSigner::new(n.signer.as_ref()),
+                    env,
+                )
+                .await
+                .unwrap();
+            let sibling_row = crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::types::IdentityOccurrence {
+                    identity_key_id: alice.clone(),
+                    occurrence_key_id: sibling.clone(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: at,
+                    valid_until: None,
+                    encryption_pubkeys: Some(n.kem.clone()),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                },
+                attesting_key_id: n.key.clone(),
+                signed_envelope,
+                signature,
+            };
+            n.backend
+                .put_identity_occurrence(sibling_row.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{tag} I76 (9): a bound node vouches for a sibling: {e}")
+                });
+            #[cfg(feature = "sqlite")]
+            {
+                let o2 = crate::store::sqlite::SqliteBackend::open_in_memory()
+                    .await
+                    .unwrap();
+                crate::store::Backend::run_migrations(&o2).await.unwrap();
+                let _twin =
+                    node_as(&o2, alias, crate::federation::types::identity_type::NODE).await;
+                ts::register_identity_key(&o2, &alice, USER).await;
+                ts::register_hybrid_key_as(&o2, &sibling, &sibling, USER).await;
+                o2.put_identity_occurrence_local(admitted.identity_occurrence.clone())
+                    .await
+                    .unwrap();
+                let err = o2
+                    .put_identity_occurrence(sibling_row)
+                    .await
+                    .expect_err("{tag} I76 (9): the node's raw row never vouches for a sibling");
+                assert!(
+                    err.to_string().contains("nor a node it owns")
+                        || err.to_string().contains("acts for"),
+                    "{tag} I76 (9): {err}"
+                );
+            }
+        }
         // (7) PR #852 round four — the typed instant must be millisecond-exact:
         // a relay that keeps the signed millisecond but adds an unsigned
         // sub-millisecond part (enough to hop a same-millisecond revocation)
@@ -3342,6 +3534,39 @@ mod tests {
                     .await
                     .expect("I75: B's member opens — the mesh's red leg"),
                 b"delivered minutes"
+            );
+        }
+
+        /// **I82 (PR #852 round five) — `publish_self_occurrence` publishes
+        /// only THIS node's key.** An Engine over a shared backend whose
+        /// composed signer is one identity and whose LocalSigner is another
+        /// (`from_shared_with_local`) is refused: the occurrence would name a
+        /// key that is not the node.
+        #[tokio::test]
+        async fn i82_publish_self_occurrence_refuses_a_foreign_local_signer_sqlite() {
+            use crate::federation::tier_ingest::test_support as ts;
+            use std::sync::Arc;
+            let backend = Arc::new(fresh().await);
+            let node_local = ts::local_signer("i82-node");
+            let foreign_local = ts::local_signer("i82-foreign");
+            let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+                crate::signing::LocalSignerHardwareAdapter::new(node_local.clone()),
+            );
+            let engine = crate::Engine::from_shared_with_local(
+                crate::engine::BackendDispatch::Sqlite(backend.clone()),
+                signer,
+                Some(foreign_local),
+            );
+            let err = engine
+                .publish_self_occurrence(
+                    "i82-owner",
+                    crate::federation::types::device_class::SERVER,
+                )
+                .await
+                .expect_err("I82: a LocalSigner that is not the node's identity is refused");
+            assert!(
+                err.to_string().contains("not this node's identity"),
+                "I82: the refusal names the mismatch: {err}"
             );
         }
 
