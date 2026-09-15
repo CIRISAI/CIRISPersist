@@ -698,6 +698,19 @@ Engine has a LocalSigner (the trusted-local write remains for engines that
 cannot sign, and for the app/agent device occurrences, which are a follow-up
 with their own issue).
 
+### 20.5 The claim the plane served and every peer refused
+
+I75's first delivery leg found the next thing I61 never carried: the
+`holds_bytes` claim a write door announces is stored at federation tier but
+signed classical-only (`sign_holds_bytes_claim` signs through the classical
+`HardwareSigner`, which has no hybrid method), the cursor serves it, and the
+federation-tier ingest gate on every peer refuses it (CC 5.3.2.4.3.1 —
+classical-only producers are confined to local tier). The claim is now
+hybrid-signed whenever the Engine or PyEngine has a LocalSigner (the optional
+signer is threaded from the doors through `put_blob_signing_at` and
+`adopt_sealed_blob` to the claim); an engine without one keeps the classical
+claim, which no peer will admit — stated, not silent (I79).
+
 ### 20.4 Invariants — three planes, delivered, never copied
 
 | # | invariant | falsified by | gate |
@@ -706,6 +719,7 @@ with their own issue).
 | I76 | A content-only signed occurrence signed by its own key is admitted iff a live owner binding lifts that key to the identity; unbound, or bound to another identity, refused; a transport-bound occurrence is verified as before. | a peer minting a victim's occurrence | behavioural, both backends |
 | I77 | A `KeyGrant` whose minter is an owned node with no occurrence row on the admitting node is admitted when the owner is an active member, refused when the owner was removed at `asserted_at` or the binding is not live. | membership asked about the instrument | behavioural, two-node |
 | I78 | The occurrence plane's since-read lists the published occurrence (signed-put) and never a trusted-local row (from disk + behavioural). | an occurrence written unadvertised | both |
+| I79 | A `holds_bytes` claim announced by an Engine with a LocalSigner carries a PQC signature and is admitted by a peer through the attestation cursor. | a claim the plane serves and every peer refuses | behavioural, two Engines |
 
 ## 19. What Edge and Server do
 

@@ -77,6 +77,32 @@ pub mod two_node {
     /// pubkeys are the alias's deterministic pair (`ts::hybrid_pubkeys`), so
     /// a signature made on one node verifies on the other against a row the
     /// other node registered itself.
+    /// A [`Node`] whose own key is registered on its backend under `role`
+    /// (`identity_type::NODE` when an owner binding must target it — #851).
+    /// The same construction as [`node`] (via `node_signer`), role aside.
+    pub async fn node_as<'a, B>(backend: &'a B, alias: &str, role: &str) -> Node<'a, B>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        ts::register_hybrid_key_as(backend, alias, alias, role).await;
+        let signer = ts::local_signer(alias);
+        let key = signer.derived_key_id();
+        ts::register_hybrid_key_as(backend, &key, alias, role).await;
+        let id = backend
+            .load_or_init_content_kem_identity()
+            .await
+            .expect("content-KEM identity");
+        Node {
+            backend,
+            signer,
+            key,
+            kem: EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            },
+        }
+    }
+
     /// Register every node's key on every node as a USER (the historical
     /// fixture role). Use [`introduce_as`] with `identity_type::NODE` when an
     /// owner binding must target the key (#851).
@@ -2390,13 +2416,7 @@ mod tests {
         #[tokio::test]
         async fn i76_content_only_occurrence_sqlite() {
             let bn = fresh().await;
-            let n = node(&bn, "i76-n").await;
-            introduce_as(
-                &[&n],
-                &["i76-n"],
-                crate::federation::types::identity_type::NODE,
-            )
-            .await;
+            let n = node_as(&bn, "i76-n", crate::federation::types::identity_type::NODE).await;
             exercise_i76_content_only_occurrence(&n, "sqlite").await;
         }
 
@@ -3283,13 +3303,7 @@ mod tests {
                 eprintln!("no postgres — skipped");
                 return;
             };
-            let n = node(&bn, "i76-n").await;
-            introduce_as(
-                &[&n],
-                &["i76-n"],
-                crate::federation::types::identity_type::NODE,
-            )
-            .await;
+            let n = node_as(&bn, "i76-n", crate::federation::types::identity_type::NODE).await;
             exercise_i76_content_only_occurrence(&n, "postgres").await;
         }
 

@@ -40,6 +40,15 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   through a since-read and the gated door on the other side; B's node is in
   A's set; B admits and opens.
 
+### Fixed
+- **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
+  A write door's claim was stored at federation tier with a classical-only
+  signature, served on the cursor, and refused by every peer
+  (`verify_hybrid_pqc_fields_mismatch`). The optional LocalSigner is threaded
+  from the Engine/PyEngine doors through `put_blob_signing_at` and
+  `adopt_sealed_blob` to `sign_holds_bytes_claim`. An engine without one keeps
+  the classical claim, which peers do not admit. I79.
+
 ## [44.3.0] - 2026-09-15
 
 **The key follows the bytes.** v44.2.0 got a sealed blob's bytes to a
