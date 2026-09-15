@@ -1,7 +1,8 @@
 # FSD: Blob Replication — the holder plane, and the decision to hold
 
-**Status:** Implemented in v44.2.0 (design locked 2026-09-14; the operator's
-party-to correction applied before the build reached §4)
+**Status:** §1–§10 implemented in v44.2.0 (design locked 2026-09-14; the
+operator's party-to correction applied before the build reached §4).
+§11–§18 (key transport, #848) locked 2026-09-15 for v44.3.0.
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
 **Created:** 2026-09-14
 **Repo:** `~/CIRISPersist`
@@ -348,3 +349,176 @@ check is mutated once to prove the witness measures it and not a neighbour.
 content it is not party to — no cohort it belongs to may access the granting
 attestation — on `put_blob_signing` as well as the new doors. Today that
 content is accepted by anyone above a trust threshold that defaults to zero.
+
+---
+
+# Part II — Key transport (#848): the key follows the bytes
+
+## 11. The fork, and the ruling: an epoch belongs to its minter
+
+v44.2.0 gets the bytes to a member's node and not the key. The per-epoch
+wraps and the per-blob grants are written only by the author node's cascade
+into local tables; nothing carries them. Before carrying them, CIRISEdge's
+review of this issue (verified in-tree) showed the epoch itself was not one
+thing: `federation_community_dek` is keyed `(community, epoch)`,
+`ensure_epoch_dek` mints from the **local** self-retention row, and
+`community_dek_bump_epoch` has one production caller (the revoker). Two
+members writing at the same epoch number mint two random DEKs both labelled
+E; the grant table holds one. The Constitution rules this a **fork by
+definition**: a ledger MUST declare its serialization discipline — a write
+lease, or per-delegate sub-ledgers folded deterministically — and
+concurrent unleased writes at one sequence number are a fork (ledger clause
+3; part 3 composition; CC 5.3.3 for streams).
+
+**Ruling: per-minter epochs.** The stream rule (I41) applied to the key
+layer. An epoch belongs to its **minter** M — the occurrence whose cascade
+minted it. Key state, self-retention and grants are keyed
+`(community_key_id, minter_key_id, epoch)`; a blob's key identity is
+`(community, author, epoch)`, and the author is already on the row
+(`author_key_id`, §5). Each minter owns its counter: the local bump on
+admitting a removal is correct by construction, the signer rule falls out
+(M signs M's counter), and nothing consumes "one DEK per community epoch".
+The write-lease shape was rejected: more surface for a property nothing
+reads. In the Constitution's steady state, where the content DEK derives
+from the MLS exporter (CC 5.4), the minter becomes the leaseholder
+committer with no schema change here; the lease lives at the agreement
+layer (CIRISEdge#604), which is where TreeKEM already needs one.
+
+## 12. The carrier is the Constitution's `key_grant`, on a replicated kind
+
+The wire object exists. CC 3 defines **`key_grant`** as a Contribution
+subject_kind — `wrapped_dek` (base64url, under the recipient's encryption
+pubkeys), `wrap_algorithm` (`x25519_mlkem768_aes256_gcm_hkdf_sha256`,
+mandatory), a supersession lineage — and CC 5.1 names its two addressing
+axes: **content-addressed** `(content_sha256, recipient)` and
+**epoch-addressed** `(stream_id, epoch[, recipient])`, "the same
+supersession reused on the new axis". Persist does not invent a dimension;
+it gives that object a replicated kind.
+
+**`EnvelopeKind::KeyGrant`** — the sixteenth kind, appended (the order is
+hashed). One envelope carries one **set**:
+
+| axis | identity | `wraps[]` | who signs |
+|---|---|---|---|
+| epoch (community / affiliations) | `(community_key_id, minter_key_id, epoch)` | every recipient occurrence M could wrap to at emission | M's occurrence key |
+| content (self / family) | `(at_rest_sha256, cohort_scope, owner_or_family_key_id)` | every recipient occurrence of the self-collective / family | the blob's author |
+
+Each `wraps[]` entry is `{ recipient_occurrence_key_id, wrap_algorithm,
+wrapped_dek }`. The envelope is opaque to everyone but each recipient; a
+member is party to the community, so a node stores the whole set (§13) and
+a late device can be served the set by any member.
+
+**Registry-of-Record row** (`policy_for`): signer `RegisteredSigner`,
+binding `SelfOwn` (the minter signs its own counter; the author its own
+blob), `PopOnInsert::NotApplicable`, `WireTier::FederationOnly`,
+projections `[Projection::KeyGrants]`. **Admission** (the E-edges, CC §0):
+the signer is resolved from the admitting node's own directory, never the
+sender; on the epoch axis the signer's identity must be an **active member**
+of the community at `asserted_at` per the replicated roster fold, and must
+equal the envelope's `minter_key_id`; on the content axis the signer must
+equal the blob row's `author_key_id` when the row is present, and the set
+is accepted before the row arrives (the grant is opaque; order
+independence, §13). Any other signer is refused at admission.
+
+**Projection plane.** `projection_for` gains `Plane::KeyGrant { axis }`:
+`SelfOwn` on the content axis (self / family), `Cohort` on the epoch axis
+(community / affiliations), never `Global`. Grants are never retracted —
+forward secrecy is by rotation, and CC 3 says a publisher "retains existing
+key_grants (cannot retroactively un-share)" — so the tombstone ceiling is
+the row max and no withdraw exists for this kind.
+
+`REPLICATION_POLICY_HASH` moves. CIRISServer re-pins; CIRISEdge adds the
+wire kind (its protocol enum mirrors the sixteen names in order).
+
+## 13. `Projection::KeyGrants` — union, idempotent, order-independent
+
+On admission the projection writes, in the admit transaction, every entry of
+the set: epoch axis → `federation_community_dek_member_grants (community,
+minter, epoch, recipient)`; content axis → `federation_blob_key_grants
+(at_rest_sha256, recipient)`. **Union semantics**: a grant, once admitted
+for an epoch or a blob, is never removed by a later set. A later set for the
+same identity adds what it carries. This is what makes partial emission
+safe (§14) and what CC 3's "cannot retroactively un-share" requires. A
+recipient that appears in **no** admitted set is `NotGranted` on that node
+until a set carrying it is admitted. The projection does not consult the
+local keyring: it stores wraps for every recipient, and `read_blob_as`
+finds the viewer's row and unwraps with the viewer's private half exactly
+as today.
+
+## 14. Emission: the full set, every time, supersedable
+
+- **Epoch axis.** When `ensure_epoch_dek` mints (C, M, E), and after every
+  fan-out that granted a new recipient, the minter emits one `KeyGrant`
+  for (C, M, E) carrying **every** grant it holds for that epoch — the full
+  enumeration, not the delta — through the normal attestation store, so it
+  replicates by the Cohort projection like any admitted row. A node that
+  dies mid-fan-out re-emits the full set on its next write. Re-emission is
+  idempotent on every receiver (§13).
+- **Content axis.** After `encrypt_and_cascade` (self / family) the author
+  emits one `KeyGrant` for the blob carrying every occurrence grant.
+
+## 15. Rotation on admitted removal — every minter, its own counter
+
+CIRISEdge's fact 1 is a present-day forward-secrecy hole across nodes: after
+a removal only the revoker's node rotates; every other member's node keeps
+sealing under E, which the removed member can still open. Under per-minter
+epochs the fix is local and needs no coordination: **a minter rotates its
+own counter before its next seal after admitting a removal.**
+`ensure_epoch_dek` compares the replicated roster fold's latest
+`removed_at` for C against the current (C, M, E)'s `minted_at`; if a removal
+is newer, it disables E and mints E+1 before sealing. The revoker's explicit
+bump stays as it is. Coalescing per CC 5.1 is unchanged.
+
+## 16. Schema — V145, and the sentinel only the running node can resolve
+
+Rebuild (the V136 shape, final name) with `minter_key_id`:
+`federation_community_dek_epoch` → PK `(community_key_id, minter_key_id)`;
+`federation_community_dek` → PK `(community_key_id, minter_key_id, epoch)`
+plus `minted_at`; `federation_community_dek_member_grants` → PK
+`(community_key_id, minter_key_id, epoch, member_key_id)`; the V139 key-state
+table gains `minter_key_id`; `federation_community_blob_epoch` gains
+`minter_key_id` (from the blob row's `author_key_id` where present).
+
+The backfill is exact — every existing row on a node was minted by that
+node — but SQL cannot know the node's key. V145 writes the sentinel
+`__this_node__`; a boot-time step beside the #840 and #845 repairs resolves
+the sentinel to the node's own derived key, idempotently, before any read.
+A row still carrying the sentinel after that step aborts the boot.
+
+## 17. Reads
+
+`community_dek_blob_epoch(sha)` returns `(community, minter, epoch)`;
+`has_member_grant(community, minter, epoch, viewer)`. `read_blob_as`,
+`read_blob_range_as` and `read_stream_chunk_as` keep their signatures; the
+tier dispatch (I2) is unchanged; only the binding they consult is wider.
+
+## 18. Invariants — each falsifiable through a consumer-held door, on two nodes
+
+"Two nodes" is two backends, each with its own signer and keyring, connected
+only by taking an envelope from one and handing it to the other's apply
+door. No shared directory.
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I59 | `KeyGrant` is the sixteenth kind with a policy row; `REPLICATION_POLICY_HASH` is re-pinned and the manifest witness holds; the wire table documents it. | a kind without a policy; a moved hash nobody pinned | from-disk + witness |
+| I60 | A `KeyGrant` whose signer is not the envelope's minter, or not an active member of the community at `asserted_at`, is refused at admission; the signer is resolved from the admitting node's directory. | a forged wrap set accepted | behavioural, both backends |
+| I61 | **The end to end.** A seals a community blob under (C, A, E) and emits its set; B admits the set and adopts the bytes; B's member occurrence opens the blob; a non-member on B is `NotGranted`. | a member's node that holds the bytes and not the key | behavioural, two nodes |
+| I62 | The projection is a union and is order-independent: re-applying a set, applying a superset, and applying the set before the bytes arrive all leave every prior grant in place and add the new ones. | a re-emission that un-grants; a grant that arrives before its blob and is lost | behavioural, two nodes |
+| I63 | B admits A's revocation of X; B's next seal is under a new B-epoch; the old B-epoch is `disabled`; X is absent from B's new set. | the cross-node forward-secrecy hole | behavioural, two nodes |
+| I64 | Two minters at the same epoch number coexist: B's viewer opens A's content at (C, A, 3) and C's content at (C, C, 3). | the fork | behavioural, two nodes |
+| I65 | Content axis: the owner's second occurrence on B opens a self blob sealed on A once A's set is admitted on B. | a person's other device that cannot read their own content | behavioural, two nodes |
+| I66 | A pre-V145 database resolves every `__this_node__` sentinel to the node's own key at boot, its existing content still opens, and a sentinel that survives aborts the boot. | a silent minter of nobody | behavioural (sqlite + postgres) |
+| I67 | No production path removes a grant within an epoch; the only forward-secrecy mechanism is rotation (from-disk: no `DELETE` on the grant tables outside the epoch destroy sweep). | an un-share | from-disk |
+
+## 19. What Edge and Server do
+
+- **Edge**: add the wire kind (sixteenth, in order); on admitting a
+  `KeyGrant` call `apply_replicated_key_grant`; nothing else in the
+  pull-on-attestation hook changes — the grants arrive on the same
+  replication path the hook already sits on. Then the #601 ladder rung "B
+  opens A's body across nodes" turns green.
+- **Server**: re-pin `REPLICATION_POLICY_HASH`; N-member rooms need nothing
+  else.
+
+**v44.3.0**, MINOR with the re-pin stated.
+
