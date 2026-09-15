@@ -445,6 +445,32 @@ local keyring: it stores wraps for every recipient, and `read_blob_as`
 finds the viewer's row and unwraps with the viewer's private half exactly
 as today.
 
+**Implementation note (the build, #848).** The carrier row is admitted
+through the attestation plane's own door (`apply_replicated_attestation`:
+the hybrid-Strict ingest gate against the receiver's directory, every
+`put_attestation` gate, the plan/act convergence outcome) and the grant
+rows are then written in ONE transaction of their own
+(`community_dek_put_member_grants` / `put_at_rest_grants`). Two ordered
+transactions, not one: the projection cannot ride inside `put_attestation`
+without either duplicating the minter / member / author rules there or
+projecting a `key_grant:*` row that arrived through the generic attestation
+door unchecked. A crash between the two leaves a stored row and no grants,
+which the next re-emission repairs — the same set re-applied projects on
+`Unchanged` / `AlreadyPresentIdentical` as well as on `Inserted`. A
+`key_grant:*` row that reaches a node through `apply_replicated_attestation`
+instead of `apply_replicated_key_grant` is stored and projects nothing; the
+member's read is `NotGranted` until the right door runs — a visible failure,
+not a bypass.
+
+**Implementation note (§15, the build).** The revocation door bumps every
+counter this node owns when a removal is admitted (materialising a pointer
+for a minter that has minted but never rotated), and `ensure_epoch_dek`
+disables every enabled epoch of the minter that was minted before the latest
+effective removal, so "the old B-epoch is disabled" holds on the door path
+as well. The `removed_at > minted_at` compare on the CURRENT epoch remains as
+the backstop for a removal that reached the roster without that bump; in
+process it is unreachable, and is stated as BELIEVED in the cut's report.
+
 ## 14. Emission: the full set, every time, supersedable
 
 - **Epoch axis.** When `ensure_epoch_dek` mints (C, M, E), and after every

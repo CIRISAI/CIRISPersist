@@ -2230,15 +2230,19 @@ pub mod invariants {
             "{tag} I38: bob is not granted at e1"
         );
         // I17 at the chunk floor: an append that binds at the rotated-past
-        // epoch (still `enabled` — no sweep ran) is refused as a UNIT: no
-        // blob row, no index row, nothing to orphan.
+        // epoch is refused as a UNIT: no blob row, no index row, nothing to
+        // orphan. #848 (§15, I63): the seal at e1 above DISABLED e0 — a
+        // removal was admitted after e0 was minted, and "rotated past" now
+        // means it at the next seal, not at the next sweep. The floor's
+        // refusal below is therefore doubly grounded (pointer AND state);
+        // what it measures is that the append lands as a unit or not at all.
         {
             use crate::federation::at_rest_cascade::{fresh_dek, seal};
             use crate::federation::{EpochBinding, StorageFloor, StreamClaim};
             assert_eq!(
                 backend.community_dek_key_state(&comm, &minter, e0).await.unwrap(),
-                Some(crate::federation::DekKeyState::Enabled),
-                "{tag} I38: precondition — e0 is still enabled"
+                Some(crate::federation::DekKeyState::Disabled),
+                "{tag} I38: precondition — e0 was disabled by the seal that rotated past it (#848 §15)"
             );
             let stale = seal(&fresh_dek().unwrap(), b"stale", None)
                 .unwrap()
