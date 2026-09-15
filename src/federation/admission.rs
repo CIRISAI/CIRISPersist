@@ -4597,12 +4597,18 @@ pub async fn verify_signed_identity_occurrence(
     .await
 }
 
-/// PR #852 review — an envelope instant (RFC 3339) equals a typed instant at
-/// millisecond precision, the producer's. Unparseable ⇒ not equal.
+/// PR #852 review (rounds one and four) — an envelope instant (RFC 3339)
+/// equals a typed instant at millisecond precision, the producer's, AND the
+/// typed instant carries nothing below the millisecond: the signature covers
+/// the millisecond rendering only, and `IdentityOccurrenceRevocation::revokes`
+/// compares the typed instant exactly, so an unsigned sub-millisecond part
+/// would let a relay move an occurrence across a same-millisecond revocation.
+/// Unparseable ⇒ not equal.
 fn same_instant_ms(envelope: &str, typed: chrono::DateTime<chrono::Utc>) -> bool {
-    chrono::DateTime::parse_from_rfc3339(envelope)
-        .map(|e| e.timestamp_millis() == typed.timestamp_millis())
-        .unwrap_or(false)
+    typed.timestamp_subsec_nanos() % 1_000_000 == 0
+        && chrono::DateTime::parse_from_rfc3339(envelope)
+            .map(|e| e.timestamp_millis() == typed.timestamp_millis())
+            .unwrap_or(false)
 }
 
 /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.2) — the content-only signed

@@ -598,7 +598,12 @@ where
         x25519_base64: kem.x25519_pubkey_b64,
         ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
     };
-    let asserted_at = chrono::Utc::now();
+    // Millisecond-exact: the envelope carries the millisecond rendering and
+    // the gate requires the typed instant to carry nothing below it.
+    let asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap_or_else(chrono::Utc::now);
     let envelope = serde_json::json!({
         "attesting_key_id": me,
         "identity_key_id": identity_key_id,
@@ -843,42 +848,45 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(false);
     };
-    // The principal (§20.1, PR #852 review round two):
-    // - a signer with a KNOWN-BUT-REVOKED occurrence at `as_of` is dead,
-    //   whatever its owner binding says — the revocation gate strips a lost
-    //   or compromised device's inherited authority;
-    // - a NODE-role key (the role is on the Key-plane record the mesh already
-    //   carries) lifts ONLY through its live owner binding, never through the
-    //   occurrence row a prior admission left — withdrawing the binding
-    //   removes the node's authority the moment it dies;
-    // - a device occurrence lifts to its identity as before.
-    // EVERY row bound under the signer's key, whatever identity each names
-    // (the table's key is (identity, occurrence); a moved ownership leaves a
-    // stale row): a revocation effective at `as_of` on ANY of them is final
-    // (PR #852 review, round three).
-    for o in directory
+    // The principals (§20.1, PR #852 review rounds two–four):
+    // - every row bound under the signer's key is read (the table's key is
+    //   (identity, occurrence), so one key may be bound under several
+    //   identities); a revocation counts ONLY on the row of the identity the
+    //   lift resolves to — an identity may bind any key as its occurrence and
+    //   revoke it, which must not disable that key for everyone else;
+    // - a NODE-role key (the role on the Key-plane record) lifts only through
+    //   its live owner binding, refused if the owner's own row for the key is
+    //   revoked, never through a row a prior admission left;
+    // - a device key lifts to each identity whose row for it is unrevoked.
+    let rows = directory
         .list_identity_occurrences_by_occurrence_key(signer)
-        .await?
-    {
+        .await?;
+    let mut revoked_under: std::collections::BTreeSet<String> = Default::default();
+    for o in &rows {
         let revs = directory
             .list_identity_occurrence_revocations_for(&o.identity_key_id)
             .await?;
-        if revs.iter().any(|r| r.revokes(&o, as_of)) {
-            return Ok(false);
+        if revs.iter().any(|r| r.revokes(o, as_of)) {
+            revoked_under.insert(o.identity_key_id.clone());
         }
     }
     let is_node = directory.lookup_public_key(signer).await?.is_some_and(|k| {
         k.identity_type == crate::federation::types::identity_type::NODE
             || k.claims_role(crate::federation::types::identity_type::NODE)
     });
-    let principal = if is_node {
+    let mut principals: Vec<String> = vec![signer.to_owned()];
+    if is_node {
         match crate::federation::admission::owner_of(directory, signer).await? {
-            Some(owner) => owner,
-            None => return Ok(false),
+            Some(owner) if !revoked_under.contains(&owner) => principals.push(owner),
+            _ => return Ok(false),
         }
     } else {
-        crate::federation::admission::admission_identity_for_writer(directory, signer).await?
-    };
+        for o in &rows {
+            if !revoked_under.contains(&o.identity_key_id) {
+                principals.push(o.identity_key_id.clone());
+            }
+        }
+    }
     let revs = directory
         .list_community_membership_revocations_for(community_key_id)
         .await?;
@@ -891,7 +899,7 @@ where
         if removed.contains(member.key_id.as_str()) {
             continue;
         }
-        if member.key_id == signer || member.key_id == principal {
+        if principals.contains(&member.key_id) {
             return Ok(true);
         }
         // Folded at `as_of`, not at the wall clock: a set emitted while its

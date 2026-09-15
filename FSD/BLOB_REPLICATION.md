@@ -713,6 +713,15 @@ key (`list_identity_occurrences_by_occurrence_key`), never one row of them
 is the claimed attester; a different local identity falls to the classical
 path under the attester (I81).
 
+**Implementation note (PR #852 review, round four).** A revocation counts
+only on the row of the identity the lift resolves to (an identity may attest
+any key as its occurrence — a revocation of that row must not disable the key
+for everyone else): a NODE minter is refused when its OWNER's row for the key
+is revoked, a device key lifts to each identity whose row is unrevoked (I77
+7). Typed instants are millisecond-exact — the signed precision — in both
+occurrence gates, and the producer truncates (I76 7). A PQC-less LocalSigner
+that is the attester signs the claim classically itself (I81 b).
+
 ### 20.3 The door: a node publishes its own occurrence
 
 `Engine::publish_self_occurrence(identity_key_id, device_class)` /

@@ -93,6 +93,23 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   (`from_shared_with_local`) fell to a row signed by one key and attributed
   to another; now the classical path under the attester. I81.
 
+### Review round four (PR #852, Codex) — one P1, two P2s
+- **A revocation counts only on the row of the identity the lift resolves
+  to.** Round three's "any row" rule was a denial vector: an identity may
+  attest any key as its occurrence, so an attacker could bind a victim's key
+  under itself and revoke it. Now a NODE minter is refused only if its OWNER's
+  row is revoked; a device key lifts to each identity whose row for it is
+  unrevoked. I77 (7): a member binds A's key under herself and revokes that
+  row; A's set is still admitted through alice's live binding.
+- **A PQC-less LocalSigner that is the attester signs the claim itself,
+  classically** — never the composed `signer`, which in the
+  `from_shared_with_local` shape may be another identity. I81 (b).
+- **Typed occurrence instants must be millisecond-exact.** The signature
+  covers the millisecond rendering and `revokes` compares typed instants
+  exactly, so an unsigned sub-millisecond part could hop a same-millisecond
+  revocation. Both gates require it; `publish_self_occurrence` truncates.
+  I76 (7).
+
 ### Fixed
 - **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
   A write door's claim was stored at federation tier with a classical-only

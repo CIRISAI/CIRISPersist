@@ -1608,6 +1608,132 @@ pub mod two_node {
                 "{tag} I77 (6): {err}"
             );
         }
+        // (7) PR #852 round four — a revocation counts only on the row of
+        // the identity the lift resolves to. carol (a member, the attacker)
+        // binds A's key under HERSELF (an identity may attest any key as its
+        // occurrence) and revokes that row; alice's binding is live and
+        // alice's row unrevoked: A's set is still admitted.
+        #[cfg(feature = "sqlite")]
+        {
+            let e = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            crate::store::Backend::run_migrations(&e).await.unwrap();
+            let carol = format!("{tag}-carol-{run}");
+            ts::register_hybrid_key_as(
+                &e,
+                &a.key,
+                "i77-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            for ident in [&alice, &bob, &carol] {
+                ts::register_identity_key(&e, ident, USER).await;
+            }
+            ts::register_hybrid_key_as(&e, &comm, &comm, USER).await;
+            e.put_community(ts::sign_community(
+                &comm,
+                crate::federation::types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "Principal Co-op".into(),
+                    members: [&alice, &bob, &carol]
+                        .into_iter()
+                        .map(|k| crate::federation::types::CommunityMember {
+                            key_id: k.clone(),
+                            joined_at: chrono::Utc::now(),
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+            e.apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-e-{run}"), &alice, &a.key),
+            })
+            .await
+            .unwrap();
+            // carol's identity-signed content-only occurrence binding A's key.
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                chrono::Utc::now().timestamp_millis() - 30_000,
+            )
+            .unwrap();
+            let env = serde_json::json!({
+                "attesting_key_id": carol,
+                "identity_key_id": carol,
+                "occurrence_key_id": a.key,
+                "device_class": crate::federation::types::device_class::SERVER,
+                "encryption_pubkeys": {
+                    "x25519_base64": a.kem.x25519_base64,
+                    "ml_kem_768_base64": a.kem.ml_kem_768_base64,
+                },
+                "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                "valid_until": serde_json::Value::Null,
+                "hardware_attestation": serde_json::Value::Null,
+            });
+            let carol_signer = ts::local_signer(&carol);
+            let (signed_envelope, signature) =
+                ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+                    &crate::signing::LocalSelfSigner::new(carol_signer.as_ref()),
+                    env,
+                )
+                .await
+                .unwrap();
+            e.put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::types::IdentityOccurrence {
+                    identity_key_id: carol.clone(),
+                    occurrence_key_id: a.key.clone(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: at,
+                    valid_until: None,
+                    encryption_pubkeys: Some(a.kem.clone()),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                },
+                attesting_key_id: carol.clone(),
+                signed_envelope,
+                signature,
+            })
+            .await
+            .unwrap_or_else(|err| {
+                panic!("{tag} I77 (7): an identity may bind a key as its occurrence: {err}")
+            });
+            e.put_identity_occurrence_revocation_local(
+                crate::federation::types::IdentityOccurrenceRevocation {
+                    identity_key_id: carol.clone(),
+                    occurrence_key_id: a.key.clone(),
+                    revoked_at: chrono::Utc::now(),
+                    effective_at: chrono::Utc::now(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let latest = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+                .await
+                .unwrap()
+                .expect("A still holds wraps");
+            let row4 = a
+                .backend
+                .get_attestation(&latest.attestation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            admit_replicated_key_grant(&e, SignedKeyGrantSet { attestation: row4 })
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{tag} I77 (7): carol's revocation of HER row must not disable A: {err}")
+                });
+        }
     }
 
     /// **I76 (#851 §20.2) — the content-only signed occurrence.** A node
@@ -1626,7 +1752,10 @@ pub mod two_node {
         ts::register_identity_key(n.backend, &alice, USER).await;
         ts::register_identity_key(n.backend, &carol, USER).await;
         let content_only = |identity: &str| {
-            let at = chrono::Utc::now();
+            let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
             let env = serde_json::json!({
                 "attesting_key_id": n.key,
                 "identity_key_id": identity,
@@ -1749,6 +1878,24 @@ pub mod two_node {
             err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
             "{tag} I76: {err}"
         );
+        // (7) PR #852 round four — the typed instant must be millisecond-exact:
+        // a relay that keeps the signed millisecond but adds an unsigned
+        // sub-millisecond part (enough to hop a same-millisecond revocation)
+        // is refused.
+        {
+            let mut sub_ms = admitted.clone();
+            sub_ms.identity_occurrence.asserted_at =
+                admitted.identity_occurrence.asserted_at + chrono::Duration::microseconds(500);
+            let err = n
+                .backend
+                .put_identity_occurrence(sub_ms)
+                .await
+                .expect_err("{tag} I76 (7): a sub-millisecond typed instant is refused");
+            assert!(
+                err.to_string().contains("asserted_at"),
+                "{tag} I76 (7): {err}"
+            );
+        }
         // (6) PR #852 round two — the envelope's attester must be the
         // wrapper's signer: a valid signature under an envelope that names
         // ANOTHER key as attester is refused.

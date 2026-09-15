@@ -2869,7 +2869,19 @@ pub async fn sign_holds_bytes_claim(
                 Some(B64.encode(&sig.pqc.signature)),
                 local.derived_key_id(),
             )),
-            Err(crate::signing::LocalSignerError::PqcNotConfigured) => None,
+            // A PQC-less LocalSigner that IS the attester still signs the
+            // claim itself, classically — never the unrelated composed
+            // `signer` (PR #852 review, round four): the signature must
+            // verify against the attester's registered key.
+            Err(crate::signing::LocalSignerError::PqcNotConfigured) => {
+                let sig = local
+                    .sign_ed25519_async(&canonical_bytes)
+                    .await
+                    .map_err(|e| {
+                        BlobError::AttestationEmissionFailed(format!("sign_ed25519: {e}"))
+                    })?;
+                Some((B64.encode(sig.as_ref()), None, local.derived_key_id()))
+            }
             Err(e) => {
                 return Err(BlobError::AttestationEmissionFailed(format!(
                     "sign_hybrid: {e}"

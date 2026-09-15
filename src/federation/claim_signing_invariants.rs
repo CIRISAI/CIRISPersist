@@ -215,7 +215,32 @@ mod tests {
             own.scrub_signature_pqc.is_some(),
             "I81: the attester's own key signs hybrid"
         );
-        let _ = LocalSigner::from_parts; // the I80 constructor stays in scope for symmetry
+        // (b) PR #852 round four — a PQC-less LocalSigner that IS the attester
+        // signs the claim itself, classically; the composed `signer` (another
+        // identity here) is never used for it.
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x81u8; 32]);
+        let pqcless = std::sync::Arc::new(LocalSigner::from_parts(
+            ed,
+            "i81b-attester".to_owned(),
+            None,
+            None,
+        ));
+        let key_b = pqcless.derived_key_id();
+        let foreign_adapter = LocalSignerHardwareAdapter::new(other.clone());
+        let claim_b =
+            sign_holds_bytes_claim(&foreign_adapter, Some(&*pqcless), &sha, &key_b, id, now)
+                .await
+                .expect("I81 (b): a PQC-less attester signs classically");
+        assert!(claim_b.scrub_signature_pqc.is_none());
+        assert_eq!(claim_b.scrub_key_id, key_b);
+        let own_adapter = LocalSignerHardwareAdapter::new(pqcless.clone());
+        let reference = sign_holds_bytes_claim(&own_adapter, None, &sha, &key_b, id, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_b.scrub_signature_classical, reference.scrub_signature_classical,
+            "I81 (b): signed by the attester's own key, not the composed signer"
+        );
     }
 
     #[tokio::test]
