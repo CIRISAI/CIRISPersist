@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased — #848]
+## [44.3.0] - 2026-09-15
 
 **The key follows the bytes.** v44.2.0 got a sealed blob's bytes to a
 member's node (`adopt_sealed_blob`) and not the key: the per-epoch wraps and
@@ -120,6 +120,30 @@ invariants I59–I67, each a two-node witness driven on sqlite and postgres.
   database resolving at boot and still opening, a survivor aborting; and the
   from-disk I67: the only `DELETE` on the member-grant table is the epoch
   destroy, at-rest grant deletes ride blob deletion only.
+
+### Consumer-visible (read before adopting)
+- **An encrypted write now needs a node that can EMIT.** `put_blob_encrypted_*`,
+  `put_blob_scoped` at an encrypted tier, `put_blob_chunk_scoped` and
+  `seal_stream_scoped` emit the `KeyGrant` set through the attestation plane
+  after the cascade; an engine whose self-signer cannot produce an admissible
+  federated attestation (classical-only, PQC-mandatory ingest since v9.0.0)
+  gets `BlobError::AttestationEmissionFailed` — the bytes are stored, the
+  write reports the failure, no member can open them until a re-emit
+  (`emit_key_grant`) succeeds. Hosts that construct with
+  `Engine::with_signer` + a hybrid identity are unaffected.
+- **Every constructor resolves V145's sentinel from the node's own key** —
+  `with_signer`, `with_hardware_signer`, `with_hardware_signer_hybrid` (which
+  now also push the derived key to the backend, #607's `set_node_key_id`) and
+  `PyEngine.__init__` (which resolves from the signer directly). A host that
+  constructs a backend without an Ed25519 identity boots a pre-V145 database
+  into I66's abort — fail-secure, by design.
+- **Wire:** consumers mirroring `EnvelopeKind` add `KeyGrant` as the sixteenth
+  name, in order; rows whose `attestation_type` is `key_grant:epoch:v1` /
+  `key_grant:content:v1` route to `apply_replicated_key_grant`, not
+  `apply_replicated_attestation` (the general door admits the carrier but
+  projects no wraps). Both pins move — see **Changed**.
+- `PostgresBackend::get_client` is `pub(crate)` (was private); no public
+  surface widens.
 
 ### Not changed
 - Sealed manifests, chunk AAD, the transfer path (I36) and the read doors'
