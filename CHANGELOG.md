@@ -67,6 +67,20 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
 - **`blob_list_key_grant_dirty` propagates a row decode failure** instead
   of a silently shorter dirty list (the sweep would have reported success).
 
+### Review round two (PR #852, Codex) — two P1s, one P2
+- **A NODE minter lifts only through its live owner binding.** With the
+  node's content-only occurrence stored on the admitting peer,
+  `admission_identity_for_writer` lifted through the row and never consulted
+  the binding, so a withdrawn binding left the node minting. `KeyGrant`
+  admission now reads the minter's role from the Key-plane record: a NODE
+  key's principal is `owner_of` (live binding required); a device occurrence
+  lifts to its identity as before. I77 (4).
+- **A known-but-revoked occurrence refuses outright**, whatever its owner
+  binding says — the revocation gate strips a lost or compromised device's
+  inherited authority. I77 (5).
+- **The content-only gate binds the envelope's `attesting_key_id` to the
+  wrapper's** (the transport-bound path's SubjectMismatch rule). I76 (6).
+
 ### Fixed
 - **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
   A write door's claim was stored at federation tier with a classical-only

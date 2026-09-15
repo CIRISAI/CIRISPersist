@@ -671,6 +671,15 @@ refused `signer_not_active_member`, as today. No wire change: the binding is
 already a replicated attestation.
 
 ### 20.2 The content-only signed occurrence
+**Implementation note (PR #852 review, round two).** The principal is
+resolved by role: a NODE-role minter (the role is on the Key-plane record the
+mesh already carries) lifts ONLY through its live owner binding, never
+through the occurrence row a prior admission left — withdrawing the binding
+removes the node's authority the moment it dies; a device occurrence lifts to
+its identity. A known-but-revoked occurrence at `asserted_at` refuses
+outright, whatever the binding says. The content-only gate binds the
+envelope's `attesting_key_id` to the wrapper's signer (I76 6, I77 4–5).
+
 
 The gated door (`put_identity_occurrence`, HTTP and wire — one gate) admits a
 second form beside #418's transport-bound one: an envelope carrying

@@ -1388,6 +1388,130 @@ pub mod two_node {
             "signer_not_active_member",
             "{tag} I77: {err}"
         );
+        // (4) PR #852 round two — the peer holds the node's occurrence row
+        // (under alice) but NO owner binding: a NODE minter lifts only
+        // through the live binding, never through the row. A fresh
+        // backend, seeded like B was but with A's occurrence and without
+        // alice's binding or removal.
+        #[cfg(feature = "sqlite")]
+        {
+            let c = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            crate::store::Backend::run_migrations(&c).await.unwrap();
+            ts::register_hybrid_key_as(
+                &c,
+                &a.key,
+                "i77-a",
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            ts::register_identity_key(&c, &alice, USER).await;
+            ts::register_identity_key(&c, &bob, USER).await;
+            ts::register_hybrid_key_as(&c, &comm, &comm, USER).await;
+            c.put_community(ts::sign_community(
+                &comm,
+                crate::federation::types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "Principal Co-op".into(),
+                    members: [&alice, &bob]
+                        .into_iter()
+                        .map(|k| crate::federation::types::CommunityMember {
+                            key_id: k.clone(),
+                            joined_at: chrono::Utc::now(),
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+            c.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: alice.clone(),
+                occurrence_key_id: a.key.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+            let row = a
+                .backend
+                .get_attestation(&emitted.attestation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let err = admit_replicated_key_grant(
+                &c,
+                SignedKeyGrantSet {
+                    attestation: row.clone(),
+                },
+            )
+            .await
+            .expect_err("{tag} I77: the occurrence row alone never lifts a NODE minter");
+            assert_eq!(
+                refusal_reason(&err),
+                "signer_not_active_member",
+                "{tag} I77 (4): {err}"
+            );
+            // …and with the binding it is admitted; then (5) the occurrence
+            // REVOKED (effective before the set's asserted_at) with the
+            // binding still live: refused — the revocation gate wins.
+            c.apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-c-{run}"), &alice, &a.key),
+            })
+            .await
+            .unwrap();
+            admit_replicated_key_grant(
+                &c,
+                SignedKeyGrantSet {
+                    attestation: row.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I77 (4): with the live binding: {e}"));
+            c.put_identity_occurrence_revocation_local(
+                crate::federation::types::IdentityOccurrenceRevocation {
+                    identity_key_id: alice.clone(),
+                    occurrence_key_id: a.key.clone(),
+                    revoked_at: chrono::Utc::now(),
+                    effective_at: chrono::Utc::now(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let fresh = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+                .await
+                .unwrap()
+                .expect("A still holds wraps");
+            let row2 = a
+                .backend
+                .get_attestation(&fresh.attestation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let err = admit_replicated_key_grant(&c, SignedKeyGrantSet { attestation: row2 })
+                .await
+                .expect_err("{tag} I77 (5): a revoked occurrence is not lifted by a live binding");
+            assert_eq!(
+                refusal_reason(&err),
+                "signer_not_active_member",
+                "{tag} I77 (5): {err}"
+            );
+        }
     }
 
     /// **I76 (#851 §20.2) — the content-only signed occurrence.** A node
@@ -1529,6 +1653,24 @@ pub mod two_node {
             err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
             "{tag} I76: {err}"
         );
+        // (6) PR #852 round two — the envelope's attester must be the
+        // wrapper's signer: a valid signature under an envelope that names
+        // ANOTHER key as attester is refused.
+        {
+            let (i, mut e, at) = content_only(&alice);
+            e["attesting_key_id"] = serde_json::Value::String(carol.clone());
+            let err = n
+                .backend
+                .put_identity_occurrence(sign(i, e, at).await)
+                .await
+                .expect_err(
+                    "{tag} I76 (6): envelope attester diverging from the wrapper is refused",
+                );
+            assert!(
+                err.to_string().contains("attesting_key_id"),
+                "{tag} I76 (6): the refusal names the field: {err}"
+            );
+        }
         // (4) PR #852 review — a RELAY forwards the admitted row with the
         // typed `asserted_at` pushed into the future under the valid
         // signature: every persisted field is bound to the envelope.

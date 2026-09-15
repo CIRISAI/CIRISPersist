@@ -843,10 +843,36 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(false);
     };
-    // The principal: an owned node lifts to its owner through the live owner
-    // binding that the mesh already carries for every node (§20.1).
-    let principal =
-        crate::federation::admission::admission_identity_for_writer(directory, signer).await?;
+    // The principal (§20.1, PR #852 review round two):
+    // - a signer with a KNOWN-BUT-REVOKED occurrence at `as_of` is dead,
+    //   whatever its owner binding says — the revocation gate strips a lost
+    //   or compromised device's inherited authority;
+    // - a NODE-role key (the role is on the Key-plane record the mesh already
+    //   carries) lifts ONLY through its live owner binding, never through the
+    //   occurrence row a prior admission left — withdrawing the binding
+    //   removes the node's authority the moment it dies;
+    // - a device occurrence lifts to its identity as before.
+    let occurrence = directory.lookup_identity_for_occurrence(signer).await?;
+    if let Some(o) = &occurrence {
+        let revs = directory
+            .list_identity_occurrence_revocations_for(&o.identity_key_id)
+            .await?;
+        if revs.iter().any(|r| r.revokes(o, as_of)) {
+            return Ok(false);
+        }
+    }
+    let is_node = directory.lookup_public_key(signer).await?.is_some_and(|k| {
+        k.identity_type == crate::federation::types::identity_type::NODE
+            || k.claims_role(crate::federation::types::identity_type::NODE)
+    });
+    let principal = if is_node {
+        match crate::federation::admission::owner_of(directory, signer).await? {
+            Some(owner) => owner,
+            None => return Ok(false),
+        }
+    } else {
+        crate::federation::admission::admission_identity_for_writer(directory, signer).await?
+    };
     let revs = directory
         .list_community_membership_revocations_for(community_key_id)
         .await?;

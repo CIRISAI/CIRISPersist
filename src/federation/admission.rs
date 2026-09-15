@@ -4664,6 +4664,12 @@ async fn verify_content_only_identity_occurrence(
     if str_field("occurrence_key_id")? != row.occurrence_key_id {
         return Err(diverges("occurrence_key_id"));
     }
+    // The envelope's attester IS the wrapper's signer (the transport-bound
+    // path's SubjectMismatch rule) — the signed bytes and the persisted
+    // attribution name one principal (PR #852 review round two).
+    if str_field("attesting_key_id")? != signed.attesting_key_id {
+        return Err(diverges("attesting_key_id"));
+    }
     if row.transport_binding.is_some() {
         return Err(diverges("transport_destination"));
     }
