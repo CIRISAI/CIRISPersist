@@ -1746,6 +1746,8 @@ pub mod two_node {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        // `alias` names the node's twin in leg (5), a sqlite-only leg.
+        let _ = alias;
         let run = uuid::Uuid::new_v4().simple().to_string();
         let alice = format!("{tag}-alice-{run}");
         let carol = format!("{tag}-carol-{run}");
