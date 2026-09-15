@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — #851]
+
+**The occurrence that carries the key.** CIRISEdge's mesh harness ran the
+plane I61 could not: every receiving node refused every `KeyGrant` set
+(`signer_not_active_member`) because the minter's node-class occurrence never
+reaches the far node — it is written through the trusted-local door, whose
+rows are never advertised, and the gated door required a transport
+destination and an identity/active-occurrence signer. Admission also asked
+membership about the instrument (the occurrence row) rather than the
+principal (the node's owner) — the #765 shape. And the fan-out has the mirror
+gap: the minter wraps to occurrence rows, so a far member whose occurrence
+never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
+
+### Changed
+- **`KeyGrant` admission asks about the principal (§20.1).** The minter is
+  resolved through `admission_identity_for_writer` — an occurrence lifts to
+  its identity, an owned node to its single live owner — and the principal
+  must be an active member at `asserted_at`. No wire change. I77.
+- **The gated occurrence door admits a content-only signed occurrence
+  (§20.2)** — `encryption_pubkeys` present, no `transport_destination`,
+  verified as the signed revocation is (hybrid signature at 1-of-1 against
+  the pinned key; typed row equals the envelope) — and `signer_acts_for`
+  gains one clause: the occurrence key itself, when a live owner binding
+  lifts it to the identity. Transport-bound occurrences keep #418's rule
+  verbatim. I76.
+
+### Added
+- **`Engine::publish_self_occurrence` / `PyEngine.publish_self_occurrence`
+  (§20.3)** — a node publishes its own content-only occurrence under its
+  owner, signed with its LocalSigner, through the gated door, so it is born
+  replicable. I75, I78.
+- **I75 — the end to end, delivered**: two Engines, every row crossing only
+  through a since-read and the gated door on the other side; B's node is in
+  A's set; B admits and opens.
+
 ## [44.3.0] - 2026-09-15
 
 **The key follows the bytes.** v44.2.0 got a sealed blob's bytes to a

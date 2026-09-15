@@ -4471,12 +4471,16 @@ pub async fn verify_signed_identity_occurrence(
                 ))
             })
     };
-    let td_env = env.get("transport_destination").ok_or_else(|| {
-        Error::InvalidArgument(
-            "signed identity_occurrence must carry a transport_destination (occurrence-KEX #418)"
-                .into(),
-        )
-    })?;
+    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — the CONTENT-ONLY form: no
+    // transport destination (the node's transport identity lives on its own
+    // plane), content-KEM pubkeys REQUIRED, verified as the signed revocation
+    // is (hybrid 1-of-1 over JCS(envelope) against the pinned key), then the
+    // same `signer_acts_for` — with the owner-binding lift for a node signing
+    // its own occurrence. Transport-bound occurrences keep #418's path below.
+    let td_env = match env.get("transport_destination") {
+        Some(v) if !v.is_null() => v,
+        _ => return verify_content_only_identity_occurrence(directory, signed).await,
+    };
     let transport_destination = TransportDestination {
         reticulum_x25519_pubkey_base64: str_field(td_env, "reticulum_x25519_pubkey")?,
         reticulum_ed25519_pubkey_base64: str_field(td_env, "reticulum_ed25519_pubkey")?,
@@ -4581,6 +4585,118 @@ pub async fn verify_signed_identity_occurrence(
         &signed.attesting_key_id,
         &row.identity_key_id,
         "identity_occurrence",
+        None,
+    )
+    .await
+}
+
+/// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.2) — the content-only signed
+/// occurrence gate: the envelope carries `encryption_pubkeys` and no
+/// `transport_destination`. Verified exactly as
+/// [`verify_signed_identity_occurrence_revocation`] verifies its envelope:
+/// 1. the typed projection EQUALS the envelope (ids, KEM pubkeys — both
+///    halves — and `transport_binding: None`);
+/// 2. the hybrid signature over `JCS(signed_envelope)` at threshold 1-of-1
+///    against the PINNED federation pubkeys of `attesting_key_id`;
+/// 3. [`check_signer_acts_for`] with the row's own occurrence key, so a node
+///    may vouch for its own occurrence through a live owner binding.
+async fn verify_content_only_identity_occurrence(
+    directory: &dyn super::FederationDirectory,
+    signed: &crate::federation::types::SignedIdentityOccurrence,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+    let row = &signed.identity_occurrence;
+    let env = &signed.signed_envelope;
+    let str_field = |k: &str| -> Result<String, Error> {
+        env.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed identity_occurrence envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
+        ))
+    };
+    // (1) The envelope must carry the content-KEM pubkeys — a content-only
+    // occurrence with neither transport nor keys binds nothing.
+    let Some(enc) = env.get("encryption_pubkeys").filter(|e| !e.is_null()) else {
+        return Err(Error::InvalidArgument(
+            "signed identity_occurrence must carry a transport_destination (occurrence-KEX \
+             #418) or encryption_pubkeys (content-only, CIRISPersist#851)"
+                .into(),
+        ));
+    };
+    let env_enc = (
+        enc.get("x25519_base64")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| diverges("encryption_pubkeys.x25519_base64"))?,
+        enc.get("ml_kem_768_base64")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| diverges("encryption_pubkeys.ml_kem_768_base64"))?,
+    );
+    if str_field("identity_key_id")? != row.identity_key_id {
+        return Err(diverges("identity_key_id"));
+    }
+    if str_field("occurrence_key_id")? != row.occurrence_key_id {
+        return Err(diverges("occurrence_key_id"));
+    }
+    if row.transport_binding.is_some() {
+        return Err(diverges("transport_destination"));
+    }
+    let row_enc = row
+        .encryption_pubkeys
+        .as_ref()
+        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
+    if row_enc.as_ref() != Some(&env_enc) {
+        return Err(diverges("encryption_pubkeys"));
+    }
+    // (2) Hybrid signature over JCS(envelope), 1-of-1 against the pinned key.
+    let Some(signer_key) = directory
+        .lookup_public_key(&signed.attesting_key_id)
+        .await?
+    else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
+            signed.attesting_key_id
+        )));
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
+        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+    })?;
+    let members = [ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let sigs = [ThresholdSignature {
+        member_id: signed.attesting_key_id.clone(),
+        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
+        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
+    }];
+    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence for {} not authentic (hybrid 1-of-1 over JCS(envelope) \
+             failed against the pinned key of {})",
+            row.occurrence_key_id, signed.attesting_key_id
+        )));
+    }
+    // (3) signer_acts_for, with the owner-binding lift for the row's own key.
+    check_signer_acts_for(
+        directory,
+        &signed.attesting_key_id,
+        &row.identity_key_id,
+        "identity_occurrence",
+        Some(&row.occurrence_key_id),
     )
     .await
 }
@@ -4597,16 +4713,25 @@ async fn check_signer_acts_for(
     attesting_key_id: &str,
     identity_key_id: &str,
     what: &str,
+    own_occurrence_key_id: Option<&str>,
 ) -> Result<(), Error> {
     if attesting_key_id == identity_key_id {
         return Ok(());
     }
-    let acts_for = matches!(
+    let mut acts_for = matches!(
         directory
             .lookup_identity_for_occurrence(attesting_key_id)
             .await?,
         Some(sig_occ) if sig_occ.identity_key_id == identity_key_id
     );
+    // CIRISPersist#851 (BLOB_REPLICATION.md §20.2) — a node may vouch for
+    // ITS OWN occurrence when a live owner binding lifts it to the identity:
+    // the owner-signed, replicated `delegates_to(owner → node)` is the
+    // authority (the #765 lift), the node's own signature covers the row. A
+    // node with no such binding, or bound to another identity, stays refused.
+    if !acts_for && own_occurrence_key_id == Some(attesting_key_id) {
+        acts_for = owner_of(directory, attesting_key_id).await?.as_deref() == Some(identity_key_id);
+    }
     if !acts_for {
         return Err(Error::SignatureInvalid(format!(
             "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \
@@ -4743,6 +4868,7 @@ pub async fn verify_signed_identity_occurrence_revocation(
         &signed.attesting_key_id,
         &row.identity_key_id,
         "identity_occurrence_revocation",
+        None,
     )
     .await
 }
@@ -4915,6 +5041,7 @@ pub async fn verify_signed_transport_destination(
         &signed.attesting_key_id,
         &row.occurrence_key_id,
         "transport_destination",
+        None,
     )
     .await
 }
@@ -5768,6 +5895,7 @@ pub async fn verify_signed_touch_claim(
                 &claim.attesting_key_id,
                 &claim.target_key_id,
                 "touch_claim",
+                None,
             )
             .await?;
         }

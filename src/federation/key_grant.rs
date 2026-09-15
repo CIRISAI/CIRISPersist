@@ -570,6 +570,73 @@ where
     Ok(emitted)
 }
 
+/// #851 (§20.3) — **publish this node's own content-only occurrence under
+/// `identity_key_id`**: the envelope names the node as `attesting_key_id` and
+/// `occurrence_key_id`, carries this node's content-KEM pubkeys and NO
+/// transport destination (the node's transport identity lives on its own
+/// plane), is signed by `signer` (the node's LocalSigner), and is admitted
+/// through the gated door — so the stored row is signed-put and the plane
+/// advertises it. Admission's `signer_acts_for` lifts the node to
+/// `identity_key_id` through its live owner binding (§20.2); a node with no
+/// such binding on this backend is refused here, exactly as a peer would
+/// refuse it.
+pub async fn publish_self_occurrence_with_local_signer<B>(
+    backend: &B,
+    signer: &crate::signing::LocalSigner,
+    identity_key_id: &str,
+    device_class: &str,
+) -> Result<crate::federation::SignedIdentityOccurrence, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let me = signer.derived_key_id();
+    let kem = backend
+        .load_or_init_content_kem_identity()
+        .await
+        .map_err(map_blob_err)?;
+    let enc = crate::federation::EncryptionPubkeys {
+        x25519_base64: kem.x25519_pubkey_b64,
+        ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
+    };
+    let asserted_at = chrono::Utc::now();
+    let envelope = serde_json::json!({
+        "attesting_key_id": me,
+        "identity_key_id": identity_key_id,
+        "occurrence_key_id": me,
+        "device_class": device_class,
+        "encryption_pubkeys": {
+            "x25519_base64": enc.x25519_base64,
+            "ml_kem_768_base64": enc.ml_kem_768_base64,
+        },
+        "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    });
+    let (signed_envelope, signature) =
+        ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+            &crate::signing::LocalSelfSigner::new(signer),
+            envelope,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("publish_self_occurrence: sign: {e}")))?;
+    let signed = crate::federation::SignedIdentityOccurrence {
+        identity_occurrence: crate::federation::IdentityOccurrence {
+            identity_key_id: identity_key_id.to_owned(),
+            occurrence_key_id: me.clone(),
+            device_class: device_class.to_owned(),
+            hardware_attestation: None,
+            asserted_at,
+            valid_until: None,
+            encryption_pubkeys: Some(enc),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        },
+        attesting_key_id: me,
+        signed_envelope,
+        signature,
+    };
+    backend.put_identity_occurrence(signed.clone()).await?;
+    Ok(signed)
+}
+
 /// §14 (V146, PR #850 review) — **the emission ledger: stamp the axis as
 /// emitted** with the database's own clock. Called by every emitter on a
 /// successful (`Some`) emission — the Engine's composed-signer door and the
@@ -751,11 +818,17 @@ where
     Ok(emitted)
 }
 
-/// §12 — is `signer` an ACTIVE member occurrence (or member identity) of
-/// `community_key_id` at `as_of`, per this node's replicated roster fold?
-/// Roster minus effective removals ([`removed_key_ids_at`](crate::federation::removed_key_ids_at)
-/// — the same fold the cascade wraps by), then each remaining identity's
-/// active occurrences. An unknown community admits nobody.
+/// §12 / §20.1 — is `signer` an ACTIVE member of `community_key_id` at
+/// `as_of`, per this node's replicated roster fold — asked about the
+/// PRINCIPAL, not the instrument (CIRISPersist#851, the #765 lift):
+/// `signer` is first resolved through
+/// [`admission_identity_for_writer`](crate::federation::admission::admission_identity_for_writer)
+/// — an occurrence lifts to its identity, an owned node to its single live
+/// owner, anything else stays itself — and the principal must be on the
+/// roster minus effective removals
+/// ([`removed_key_ids_at`](crate::federation::removed_key_ids_at) — the same
+/// fold the cascade wraps by). The occurrence walk remains for a signer that
+/// is a member's occurrence on this node. An unknown community admits nobody.
 async fn is_active_member_at<D>(
     directory: &D,
     community_key_id: &str,
@@ -768,6 +841,10 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(false);
     };
+    // The principal: an owned node lifts to its owner through the live owner
+    // binding that the mesh already carries for every node (§20.1).
+    let principal =
+        crate::federation::admission::admission_identity_for_writer(directory, signer).await?;
     let revs = directory
         .list_community_membership_revocations_for(community_key_id)
         .await?;
@@ -780,7 +857,7 @@ where
         if removed.contains(member.key_id.as_str()) {
             continue;
         }
-        if member.key_id == signer {
+        if member.key_id == signer || member.key_id == principal {
             return Ok(true);
         }
         // Folded at `as_of`, not at the wall clock: a set emitted while its

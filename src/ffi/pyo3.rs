@@ -6448,6 +6448,64 @@ impl PyEngine {
         })
     }
 
+    /// (derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) —
+    /// **publish this node's own content-only occurrence** under
+    /// `identity_key_id` (its owner), signed with the LocalSigner and admitted
+    /// through the gated door so the IdentityOccurrence plane advertises it
+    /// and a far node admits it (the owner binding lifts the node to its
+    /// owner). Returns the signed occurrence as JSON. FFI mirror of
+    /// [`Engine::publish_self_occurrence`](crate::engine::Engine::publish_self_occurrence).
+    fn publish_self_occurrence(
+        &self,
+        py: Python<'_>,
+        identity_key_id: &str,
+        device_class: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let local = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "publish_self_occurrence requires a LocalSigner to hybrid-sign the occurrence \
+                     (§20.3); this engine has none",
+                )
+            })?;
+            let (identity, class) = (identity_key_id.to_owned(), device_class.to_owned());
+            py.detach(|| {
+                let signed = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::publish_self_occurrence_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                                &identity,
+                                &class,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::publish_self_occurrence_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                                &identity,
+                                &class,
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(federation_err_to_py)?;
+                serde_json::to_string(&signed).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? Returns `True` iff its `federation_keys`
     /// row's `identity_type` set contains `canonical`. Because the substrate

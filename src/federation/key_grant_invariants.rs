@@ -77,14 +77,25 @@ pub mod two_node {
     /// pubkeys are the alias's deterministic pair (`ts::hybrid_pubkeys`), so
     /// a signature made on one node verifies on the other against a row the
     /// other node registered itself.
+    /// Register every node's key on every node as a USER (the historical
+    /// fixture role). Use [`introduce_as`] with `identity_type::NODE` when an
+    /// owner binding must target the key (#851).
     pub async fn introduce<B>(nodes: &[&Node<'_, B>], aliases: &[&str])
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        introduce_as(nodes, aliases, USER).await;
+    }
+
+    /// Register every node's key on every node under `role`.
+    pub async fn introduce_as<B>(nodes: &[&Node<'_, B>], aliases: &[&str], role: &str)
     where
         B: FederationDirectory + Sync,
     {
         for (i, n) in nodes.iter().enumerate() {
             for (j, other) in nodes.iter().enumerate() {
                 if i != j {
-                    ts::register_hybrid_key_as(n.backend, &other.key, aliases[j], USER).await;
+                    ts::register_hybrid_key_as(n.backend, &other.key, aliases[j], role).await;
                 }
             }
         }
@@ -1197,6 +1208,298 @@ pub mod two_node {
         );
     }
 
+    /// **I77 (#851 §20.1) — admission asks about the PRINCIPAL.** The
+    /// minter is an owned node with NO occurrence row on the admitting node:
+    /// refused while no live owner binding lifts it; admitted once the
+    /// owner's binding (a replicated attestation) is on B and the owner is an
+    /// active member; refused again once the owner is removed at
+    /// `asserted_at`.
+    pub async fn exercise_i77_owned_node_minter_admitted_by_principal<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        // alice is a deterministic-keyed USER on both nodes (the owner-binding
+        // helper signs as her); bob likewise; the community on both.
+        for n in [a, b] {
+            ts::register_identity_key(n.backend, &alice, USER).await;
+            ts::register_identity_key(n.backend, &bob, USER).await;
+            ts::register_hybrid_key_as(n.backend, &comm, &comm, USER).await;
+            n.backend
+                .put_community(ts::sign_community(
+                    &comm,
+                    crate::federation::types::Community {
+                        community_key_id: comm.clone(),
+                        community_name: "Principal Co-op".into(),
+                        members: [&alice, &bob]
+                            .into_iter()
+                            .map(|k| crate::federation::types::CommunityMember {
+                                key_id: k.clone(),
+                                joined_at: chrono::Utc::now(),
+                                role: None,
+                            })
+                            .collect(),
+                        founded_at: chrono::Utc::now(),
+                        consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                            .to_owned(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I77: seed community: {e}"));
+        }
+        // On A only: A's own occurrence under alice (the local decrypt target,
+        // trusted-local — exactly what does NOT replicate) and B's occurrence
+        // under bob, so A's fan-out has a far recipient.
+        for (ident, o) in [(&alice, a), (&bob, b)] {
+            a.backend
+                .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                    identity_key_id: ident.clone(),
+                    occurrence_key_id: o.key.clone(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys: Some(o.kem.clone()),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        // On B: bob's own occurrence (B's decrypt target), NOTHING for A.
+        b.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: bob.clone(),
+                occurrence_key_id: b.key.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(b.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+        let sealed =
+            encrypt_and_cascade_community(a.backend, &comm, b"principal", None, Some(&a.key))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I77: A seals: {e}"));
+        assert!(
+            sealed.granted.contains(&b.key),
+            "{tag} I77: A wrapped to B's occurrence"
+        );
+        let emitted = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+            .await
+            .unwrap()
+            .expect("A holds wraps");
+        // (1) No occurrence for A on B, no binding: refused — as today.
+        let err = carry_key_grant(a, b, &emitted.attestation_id)
+            .await
+            .expect_err("{tag} I77: an unbound node is nobody's instrument");
+        assert_eq!(
+            refusal_reason(&err),
+            "signer_not_active_member",
+            "{tag} I77: {err}"
+        );
+        // (2) alice's owner binding for A lands on B (a replicated
+        // attestation — what the mesh already carries): admitted.
+        let binding = ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &a.key);
+        b.backend
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I77: B admits alice's owner binding for A: {e}"));
+        let admission = carry_key_grant(a, b, &emitted.attestation_id)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I77: an owned node lifts to its owner: {e}"));
+        assert!(admission.wraps_written >= 1, "{tag} I77: {admission:?}");
+        assert!(
+            b.backend
+                .community_dek_has_member_grant(&comm, &a.key, 0, &b.key)
+                .await
+                .unwrap(),
+            "{tag} I77: B's own wrap projected"
+        );
+        // (3) alice removed, effective before a later set's asserted_at: the
+        // principal is no longer a member — refused.
+        let rev = ts::sign_community_membership_revocation(
+            &comm,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: comm.clone(),
+                removed_identity_key_id: alice.clone(),
+                removed_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        b.backend
+            .put_community_membership_revocation(rev)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let late = emit_epoch_key_grant_with_local_signer(a.backend, &a.signer, &comm, 0)
+            .await
+            .unwrap()
+            .expect("A still holds wraps");
+        let err = carry_key_grant(a, b, &late.attestation_id)
+            .await
+            .expect_err("{tag} I77: the removed owner's instrument is refused");
+        assert_eq!(
+            refusal_reason(&err),
+            "signer_not_active_member",
+            "{tag} I77: {err}"
+        );
+    }
+
+    /// **I76 (#851 §20.2) — the content-only signed occurrence.** A node
+    /// signs its own occurrence (no transport destination, KEM pubkeys
+    /// present): refused while nothing lifts the node to the identity;
+    /// admitted once a live owner binding does; a second row claiming
+    /// ANOTHER identity is refused. The admitted row is advertised by the
+    /// plane's since-read; a trusted-local row is not (I78).
+    pub async fn exercise_i76_content_only_occurrence<B>(n: &Node<'_, B>, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let alice = format!("{tag}-alice-{run}");
+        let carol = format!("{tag}-carol-{run}");
+        ts::register_identity_key(n.backend, &alice, USER).await;
+        ts::register_identity_key(n.backend, &carol, USER).await;
+        let content_only = |identity: &str| {
+            let env = serde_json::json!({
+                "attesting_key_id": n.key,
+                "identity_key_id": identity,
+                "occurrence_key_id": n.key,
+                "device_class": crate::federation::types::device_class::SERVER,
+                "encryption_pubkeys": {
+                    "x25519_base64": n.kem.x25519_base64,
+                    "ml_kem_768_base64": n.kem.ml_kem_768_base64,
+                },
+                "asserted_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            });
+            (identity.to_owned(), env)
+        };
+        let sign = |identity: String, env: serde_json::Value| async move {
+            let (signed_envelope, signature) =
+                ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+                    &crate::signing::LocalSelfSigner::new(n.signer.as_ref()),
+                    env,
+                )
+                .await
+                .unwrap();
+            crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::types::IdentityOccurrence {
+                    identity_key_id: identity,
+                    occurrence_key_id: n.key.clone(),
+                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: chrono::Utc::now(),
+                    valid_until: None,
+                    encryption_pubkeys: Some(n.kem.clone()),
+                    transport_binding: None,
+                    persist_row_hash: String::new(),
+                },
+                attesting_key_id: n.key.clone(),
+                signed_envelope,
+                signature,
+            }
+        };
+        // (1) Unbound: refused.
+        let (i, e) = content_only(&alice);
+        let err = n
+            .backend
+            .put_identity_occurrence(sign(i, e).await)
+            .await
+            .expect_err("{tag} I76: an unbound node cannot vouch for itself");
+        assert!(
+            err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
+            "{tag} I76: the refusal is signer_acts_for: {err}"
+        );
+        // (2) alice's live owner binding lifts the node: admitted, advertised.
+        n.backend
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &n.key),
+            })
+            .await
+            .unwrap();
+        let (i, e) = content_only(&alice);
+        n.backend
+            .put_identity_occurrence(sign(i, e).await)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I76: the owner binding lifts the node: {e}"));
+        let row = n
+            .backend
+            .lookup_identity_for_occurrence(&n.key)
+            .await
+            .unwrap()
+            .expect("the occurrence exists");
+        assert_eq!(row.identity_key_id, alice);
+        assert!(row.encryption_pubkeys.is_some() && row.transport_binding.is_none());
+        let served = n
+            .backend
+            .list_signed_identity_occurrences_since(None, 1_000)
+            .await
+            .unwrap();
+        assert!(
+            served
+                .iter()
+                .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == n.key),
+            "{tag} I78: the published occurrence is advertised by the plane"
+        );
+        // I78: a trusted-local row is never advertised.
+        let local_occ = format!("{tag}-local-{run}");
+        ts::register_hybrid_key_as(n.backend, &local_occ, &local_occ, USER).await;
+        n.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: alice.clone(),
+                occurrence_key_id: local_occ.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(n.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+        let served = n
+            .backend
+            .list_signed_identity_occurrences_since(None, 1_000)
+            .await
+            .unwrap();
+        assert!(
+            !served
+                .iter()
+                .any(|s| s.occurrence.identity_occurrence.occurrence_key_id == local_occ),
+            "{tag} I78: a trusted-local row is not on the plane"
+        );
+        // (3) The same node claiming ANOTHER identity: refused.
+        let (i, e) = content_only(&carol);
+        let err = n
+            .backend
+            .put_identity_occurrence(sign(i, e).await)
+            .await
+            .expect_err("{tag} I76: a node bound to alice cannot claim carol");
+        assert!(
+            err.to_string().contains("neither identity") || err.to_string().contains("acts for"),
+            "{tag} I76: {err}"
+        );
+    }
+
     /// **I60b — a set from a minter occurrence that is no longer active is
     /// refused, even one asserted before the revocation — and by the RIGHT
     /// gate.** The KeyGrant check folds membership at the row's
@@ -2085,6 +2388,19 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn i76_content_only_occurrence_sqlite() {
+            let bn = fresh().await;
+            let n = node(&bn, "i76-n").await;
+            introduce_as(
+                &[&n],
+                &["i76-n"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i76_content_only_occurrence(&n, "sqlite").await;
+        }
+
+        #[tokio::test]
         async fn i60_forged_set_refused_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node(&ba, "i60-a").await;
@@ -2101,6 +2417,20 @@ mod tests {
             introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
             exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "sqlite")
                 .await;
+        }
+
+        #[tokio::test]
+        async fn i77_owned_node_minter_admitted_by_principal_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node(&ba, "i77-a").await;
+            let b = node(&bb, "i77-b").await;
+            introduce_as(
+                &[&a, &b],
+                &["i77-a", "i77-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i77_owned_node_minter_admitted_by_principal(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
@@ -2272,6 +2602,269 @@ mod tests {
                 .unwrap();
             assert!(rk2.changed_blobs.is_empty(), "I68: {rk2:?}");
             assert_eq!(sets_for(sq.clone(), me.clone()).await.len(), 2);
+        }
+
+        /// **I75 (#851 §20.4) — THE END TO END, DELIVERED.** Two Engines. Every
+        /// row crosses only through a since-read and the gated door on the
+        /// other side: keys through the Key plane, owner bindings through the
+        /// attestation cursor, occurrences through
+        /// `list_signed_identity_occurrences_since` → `put_identity_occurrence`,
+        /// the set through the cursor → `apply_replicated_key_grant`. Nothing
+        /// is copied by hand — the plane I61 could not run.
+        #[tokio::test]
+        async fn i75_end_to_end_delivered_by_the_planes_sqlite() {
+            use crate::federation::key_grant::SignedKeyGrantSet;
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+            use crate::federation::types::identity_type::USER;
+            use crate::federation::{
+                AdoptDisposition, BlobBody, BlobProvenance, BlobStorage, FederationDirectory,
+                SignedAttestation, SignedKeyRecord,
+            };
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let (alias_a, alias_b) = (format!("i75-a-{run}"), format!("i75-b-{run}"));
+            let engine_a = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_a),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            let engine_b = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_b),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+                e.register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    alias,
+                    None,
+                    serde_json::json!({}),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            }
+            let (sa, sb) = (
+                engine_a.sqlite_backend().unwrap().clone(),
+                engine_b.sqlite_backend().unwrap().clone(),
+            );
+            let (a_key, b_key) = (
+                engine_a.local_derived_key_id().await.unwrap(),
+                engine_b.local_derived_key_id().await.unwrap(),
+            );
+            // ── the planes ────────────────────────────────────────────
+            async fn deliver_keys(from: &SqliteBackend, to: &SqliteBackend) -> usize {
+                let mut n = 0;
+                for served in from
+                    .list_signed_key_records_since(None, 1_000)
+                    .await
+                    .unwrap()
+                {
+                    if FederationDirectory::lookup_public_key(to, &served.record.key_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                    {
+                        to.put_public_key(SignedKeyRecord {
+                            record: served.record,
+                        })
+                        .await
+                        .unwrap();
+                        n += 1;
+                    }
+                }
+                n
+            }
+            async fn deliver_attestations(
+                from: &SqliteBackend,
+                to: &crate::Engine,
+                to_backend: &SqliteBackend,
+            ) -> usize {
+                let mut n = 0;
+                for served in from.list_attestations_since(None, 1_000).await.unwrap() {
+                    let row = served.attestation;
+                    if to_backend
+                        .get_attestation(&row.attestation_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let kind = format!(
+                        "{} (tier={}, pqc_sig={})",
+                        row.attestation_type,
+                        row.tier,
+                        row.scrub_signature_pqc.is_some()
+                    );
+                    let signer = row.attesting_key_id.clone();
+                    if row.attestation_type.starts_with("key_grant:") {
+                        to.apply_replicated_key_grant(SignedKeyGrantSet { attestation: row })
+                            .await
+                            .unwrap_or_else(|e| panic!("I75: the far node admits the set: {e}"));
+                    } else {
+                        to_backend
+                            .apply_replicated_attestation(SignedAttestation { attestation: row })
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!("I75: the far node admits the row {kind} by {signer}: {e}")
+                            });
+                    }
+                    n += 1;
+                }
+                n
+            }
+            async fn deliver_occurrences(from: &SqliteBackend, to: &SqliteBackend) -> usize {
+                let mut n = 0;
+                for served in from
+                    .list_signed_identity_occurrences_since(None, 1_000)
+                    .await
+                    .unwrap()
+                {
+                    let occ = served.occurrence;
+                    if to
+                        .lookup_identity_for_occurrence(&occ.identity_occurrence.occurrence_key_id)
+                        .await
+                        .unwrap()
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    to.put_identity_occurrence(occ)
+                        .await
+                        .unwrap_or_else(|e| panic!("I75: the far node admits the occurrence: {e}"));
+                    n += 1;
+                }
+                n
+            }
+            // ── identities and the community, each born on ONE node ───
+            let (alice, bob, comm) = (
+                format!("i75-alice-{run}"),
+                format!("i75-bob-{run}"),
+                format!("i75-comm-{run}"),
+            );
+            ts::register_identity_key(sa.as_ref(), &alice, USER).await;
+            ts::register_identity_key(sb.as_ref(), &bob, USER).await;
+            ts::register_hybrid_key_as(sa.as_ref(), &comm, &comm, USER).await;
+            // alice owns A (born on A); bob owns B (born on B) — attestations.
+            sa.apply_replicated_attestation(SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-a-{run}"), &alice, &a_key),
+            })
+            .await
+            .unwrap();
+            sb.apply_replicated_attestation(SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-b-{run}"), &bob, &b_key),
+            })
+            .await
+            .unwrap();
+            // Keys cross (both ways) so each side can verify the other's rows.
+            assert!(deliver_keys(&sa, &sb).await >= 3, "I75: A's keys reach B");
+            assert!(deliver_keys(&sb, &sa).await >= 2, "I75: B's keys reach A");
+            let a_on_b = FederationDirectory::lookup_public_key(sb.as_ref(), &a_key)
+                .await
+                .unwrap()
+                .expect("A's key on B");
+            assert!(
+                a_on_b.pubkey_ml_dsa_65_base64.is_some(),
+                "I75: A's key record on B carries the ML-DSA-65 pubkey (hybrid rows verify)"
+            );
+            // The community row (roster plane: the signed row, both sides).
+            let community = ts::sign_community(
+                &comm,
+                crate::federation::types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "Delivered Co-op".into(),
+                    members: [&alice, &bob]
+                        .into_iter()
+                        .map(|k| crate::federation::types::CommunityMember {
+                            key_id: k.clone(),
+                            joined_at: chrono::Utc::now(),
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            );
+            sa.put_community(community.clone()).await.unwrap();
+            sb.put_community(community).await.unwrap();
+            // Bindings cross.
+            deliver_attestations(&sa, &engine_b, &sb).await;
+            deliver_attestations(&sb, &engine_a, &sa).await;
+            // ── each node publishes its OWN occurrence (§20.3) ────────
+            engine_a
+                .publish_self_occurrence(&alice, crate::federation::types::device_class::SERVER)
+                .await
+                .expect("I75: A publishes its occurrence under alice");
+            engine_b
+                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER)
+                .await
+                .expect("I75: B publishes its occurrence under bob");
+            // Occurrences cross through the plane and the gated door.
+            assert_eq!(
+                deliver_occurrences(&sa, &sb).await,
+                1,
+                "I75: A's occurrence reaches B"
+            );
+            assert_eq!(
+                deliver_occurrences(&sb, &sa).await,
+                1,
+                "I75: B's occurrence reaches A"
+            );
+            // ── A seals; B's node is IN the set ───────────────────────
+            let r = engine_a
+                .put_blob_scoped(COMMUNITY, Some(&comm), b"delivered minutes", None, None)
+                .await
+                .expect("A seals through the door");
+            assert!(
+                r.granted.contains(&b_key),
+                "I75: the far member's node is in A's fan-out: {:?}",
+                r.granted
+            );
+            assert!(r.key_grant_emission.is_some());
+            let sha = r.at_rest_sha256;
+            // The set crosses through the cursor to the Engine door.
+            assert!(
+                deliver_attestations(&sa, &engine_b, &sb).await >= 1,
+                "I75: the set reaches B"
+            );
+            assert!(
+                sb.community_dek_has_member_grant(&comm, &a_key, r.epoch.unwrap_or(0), &b_key)
+                    .await
+                    .unwrap(),
+                "I75: B's own wrap is projected on B"
+            );
+            // The bytes cross (CIRISEdge#601's hook is the fetch; here the adopt).
+            let Some(BlobBody::Inline(bytes)) = sa.get_blob(&sha).await.unwrap() else {
+                panic!("inline")
+            };
+            engine_b
+                .adopt_sealed_blob(
+                    &bytes,
+                    BlobProvenance {
+                        author_key_id: a_key.clone(),
+                        cohort_scope: COMMUNITY.into(),
+                        community_key_id: Some(comm.clone()),
+                        epoch: r.epoch,
+                        tier: CryptoTier::CommunityDek,
+                    },
+                    None,
+                    AdoptDisposition::LocalOnly,
+                )
+                .await
+                .expect("B adopts");
+            assert_eq!(
+                engine_b
+                    .read_blob_as(&sha, &b_key, None)
+                    .await
+                    .expect("I75: B's member opens — the mesh's red leg"),
+                b"delivered minutes"
+            );
         }
 
         /// **I74 — the ledger stamps the WATERMARK, never the clock** (PR
@@ -2685,6 +3278,22 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn i76_content_only_occurrence_postgres() {
+            let Some(bn) = fresh().await else {
+                eprintln!("no postgres — skipped");
+                return;
+            };
+            let n = node(&bn, "i76-n").await;
+            introduce_as(
+                &[&n],
+                &["i76-n"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i76_content_only_occurrence(&n, "postgres").await;
+        }
+
+        #[tokio::test]
         async fn i60_forged_set_refused_postgres() {
             let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
                 eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -2707,6 +3316,23 @@ mod tests {
             introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
             exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "postgres")
                 .await;
+        }
+
+        #[tokio::test]
+        async fn i77_owned_node_minter_admitted_by_principal_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node(&ba, "i77-a").await;
+            let b = node(&bb, "i77-b").await;
+            introduce_as(
+                &[&a, &b],
+                &["i77-a", "i77-b"],
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            exercise_i77_owned_node_minter_admitted_by_principal(&a, &b, "postgres").await;
         }
 
         #[tokio::test]

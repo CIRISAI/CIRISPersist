@@ -5323,6 +5323,52 @@ impl Engine {
         Ok(emitted)
     }
 
+    /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.3) — **publish this
+    /// node's own content-only occurrence under `identity_key_id`**, signed
+    /// with this Engine's LocalSigner and admitted through the gated door, so
+    /// it is born replicable: the IdentityOccurrence plane advertises it and
+    /// a far node admits it through the same gate, lifting this node to its
+    /// owner through the live owner binding (§20.2). What a node runs once
+    /// its owner binding exists — the node-class occurrence CIRISEdge's
+    /// `provision_engine_occurrence` used to write through the trusted-local
+    /// door, where nothing could carry it. Requires a LocalSigner.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn publish_self_occurrence(
+        &self,
+        identity_key_id: &str,
+        device_class: &str,
+    ) -> Result<crate::federation::SignedIdentityOccurrence, crate::federation::Error> {
+        let local = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(
+                "publish_self_occurrence requires a LocalSigner to hybrid-sign the occurrence \
+                 (BLOB_REPLICATION.md §20.3); this engine has none"
+                    .into(),
+            )
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::key_grant::publish_self_occurrence_with_local_signer(
+                    b.as_ref(),
+                    local,
+                    identity_key_id,
+                    device_class,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::key_grant::publish_self_occurrence_with_local_signer(
+                    b.as_ref(),
+                    local,
+                    identity_key_id,
+                    device_class,
+                )
+                .await
+            }
+        }
+    }
+
     /// #848 §14 (V146, PR #850 review) — **emit every `KeyGrant` set this
     /// node owes and has not yet carried**: each epoch this node minted whose
     /// set is dirty (a grant newer than the last emission, or never emitted —

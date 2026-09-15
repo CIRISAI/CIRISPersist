@@ -632,6 +632,81 @@ door. No shared directory.
 | I66 (extended) | A pre-V145 binding authored by an old signer stays the old occurrence's and refuses under the new key; a NULL-author row resolves to the node; an adopted binding keeps its author. | a new occurrence opening an old one's epoch; silent stranding | behavioural, sqlite file |
 | I65 (5) | A retroactive ADD on the adopting node skips the peer-authored blob and grants the new device nothing there. | a rekey aborting on adopted content | behavioural, two-node |
 
+## 20. The occurrence that carries the key (#851)
+
+CIRISEdge's mesh harness ran the plane I61 could not: I61 copies each node's
+occurrence between two backends by hand, and every receiving node on the mesh
+refused every set — `signer_not_active_member`. Three facts, each verified in
+the tree at 713dd42:
+
+1. **Admission asked membership about the instrument.** §12's check looked
+   for the minter's *occurrence row* on the admitting node. That is the #765
+   shape exactly: the roster's members are persons; a node is its owner's
+   instrument, and its authority to speak lives on the live
+   `delegates_to(owner → node)` owner binding — an owner-signed attestation
+   the mesh already carries for every node.
+2. **A node-class occurrence could not replicate.** It is written through the
+   trusted-local door (`self_at_login`, Edge's `provision_engine_occurrence`,
+   I61's fixture), whose rows are never advertised
+   (`list_signed_identity_occurrences_since` lists signed-put rows only); the
+   gated door requires a `transport_destination` in the envelope and a signer
+   that is the identity or an already-active occurrence of it — a node cannot
+   sign its own first occurrence, and its transport identity already lives on
+   its own plane (`SignedTransportDestination`).
+3. **The fan-out has the mirror gap.** The minter wraps to
+   `active_member_occurrences` — occurrence rows with `encryption_pubkeys` —
+   so a far member whose node-class occurrence never arrives is never in the
+   set at all. Fixing admission alone would admit sets that omit every far
+   member.
+
+### 20.1 Admission asks about the principal
+
+`admit_replicated_key_grant` (epoch axis) resolves the minter through
+`admission_identity_for_writer`: an occurrence lifts to its identity, an owned
+node lifts to its single live owner (`owner_of`, the #578/#584 liveness fold),
+anything else stays itself. The **principal** must be an active member of the
+community at `asserted_at` per the replicated roster fold. A minter with
+neither an occurrence row nor a live owner binding on the admitting node is
+refused `signer_not_active_member`, as today. No wire change: the binding is
+already a replicated attestation.
+
+### 20.2 The content-only signed occurrence
+
+The gated door (`put_identity_occurrence`, HTTP and wire — one gate) admits a
+second form beside #418's transport-bound one: an envelope carrying
+`encryption_pubkeys` and **no** `transport_destination`. Verified exactly as
+the signed revocation is: the typed projection must equal the envelope; the
+hybrid signature over `JCS(envelope)` verifies at 1-of-1 against the PINNED
+federation keys of `attesting_key_id`; and `signer_acts_for` — extended by
+one clause: the signer may be **the occurrence key itself when a live owner
+binding lifts it to `identity_key_id`** (`owner_of(occurrence) == identity`).
+Authority comes from the owner-signed, replicated binding; the KEM pubkeys are
+covered by the node's own signature; a consented peer holds neither key, so
+#418's content-MITM stays closed. Transport-bound occurrences keep #418's rule
+verbatim (`verify_transport_binding`, transport ≠ signing). The stored row is
+signed-put, so the plane advertises it and the far node admits it through the
+same gate.
+
+### 20.3 The door: a node publishes its own occurrence
+
+`Engine::publish_self_occurrence(identity_key_id, device_class)` /
+`PyEngine.publish_self_occurrence` builds the content-only envelope with this
+node's content-KEM identity, signs it with the composed hybrid signer, and
+admits it through the gated door — so a node's occurrence is born replicable.
+`self_at_login` publishes the node-class occurrence this way whenever the
+Engine has a LocalSigner (the trusted-local write remains for engines that
+cannot sign, and for the app/agent device occurrences, which are a follow-up
+with their own issue).
+
+### 20.4 Invariants — three planes, delivered, never copied
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I75 | **The end to end, delivered.** Two Engines; alice owns A, bob owns B (owner bindings as attestations); A and B each publish their own content-only occurrence; every row crosses only through a since-read and the gated door on the other side — bindings via the attestation cursor, occurrences via `list_signed_identity_occurrences_since` → `put_identity_occurrence`, the set via the cursor → `apply_replicated_key_grant`; B's node is IN A's set; B admits and opens. | the mesh's refusal (#851); a set that omits the far member | behavioural, two Engines, both backends |
+| I76 | A content-only signed occurrence signed by its own key is admitted iff a live owner binding lifts that key to the identity; unbound, or bound to another identity, refused; a transport-bound occurrence is verified as before. | a peer minting a victim's occurrence | behavioural, both backends |
+| I77 | A `KeyGrant` whose minter is an owned node with no occurrence row on the admitting node is admitted when the owner is an active member, refused when the owner was removed at `asserted_at` or the binding is not live. | membership asked about the instrument | behavioural, two-node |
+| I78 | The occurrence plane's since-read lists the published occurrence (signed-put) and never a trusted-local row (from disk + behavioural). | an occurrence written unadvertised | both |
+
 ## 19. What Edge and Server do
 
 - **Edge**: add the wire kind (sixteenth, in order); on admitting a
