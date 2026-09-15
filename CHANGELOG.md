@@ -35,7 +35,10 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
 - **`Engine::publish_self_occurrence` / `PyEngine.publish_self_occurrence`
   (§20.3)** — a node publishes its own content-only occurrence under its
   owner, signed with its LocalSigner, through the gated door, so it is born
-  replicable. I75, I78.
+  replicable — what CIRISEdge's `provision_engine_occurrence` calls in place
+  of the trusted-local write. Device occurrences (`self_at_login`'s app and
+  agent) stay trusted-local; their replicable form is the identity-signed
+  content-only occurrence, which the door now admits. I75, I78.
 - **I75 — the end to end, delivered**: two Engines, every row crossing only
   through a since-read and the gated door on the other side; B's node is in
   A's set; B admits and opens.

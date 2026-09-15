@@ -693,10 +693,13 @@ same gate.
 `PyEngine.publish_self_occurrence` builds the content-only envelope with this
 node's content-KEM identity, signs it with the composed hybrid signer, and
 admits it through the gated door — so a node's occurrence is born replicable.
-`self_at_login` publishes the node-class occurrence this way whenever the
-Engine has a LocalSigner (the trusted-local write remains for engines that
-cannot sign, and for the app/agent device occurrences, which are a follow-up
-with their own issue).
+This is what CIRISEdge's `provision_engine_occurrence` calls in place of the
+trusted-local write, once the node's owner binding exists. `self_at_login`
+writes only the app and agent DEVICE occurrences and keeps the trusted-local
+door for them; their replicable form is the same content-only occurrence
+signed by the identity itself (§20.2 admits it — the identity is the
+signer; no lift needed), which Edge can produce with the identity seed it
+already holds. No further persist change.
 
 ### 20.5 The claim the plane served and every peer refused
 

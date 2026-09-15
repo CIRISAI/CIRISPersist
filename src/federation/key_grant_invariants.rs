@@ -1795,6 +1795,25 @@ mod tests {
         }
     }
 
+    /// **I78 (from disk, #851) — the occurrence plane advertises signed-put
+    /// rows only**: both dialects' `list_signed_identity_occurrences_since`
+    /// keep the `attesting_key_id IS NOT NULL` filter, so a trusted-local
+    /// row can never be listed (the behavioural half is in I76).
+    #[test]
+    fn i78_occurrence_plane_lists_signed_put_rows_only() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            let prod = production_only(&text);
+            let body = method_body(&prod, "list_signed_identity_occurrences_since");
+            assert!(
+                body.contains("federation_identity_occurrences")
+                    && body.contains("attesting_key_id IS NOT NULL"),
+                "I78: {file}: list_signed_identity_occurrences_since must list signed-put rows only"
+            );
+        }
+    }
+
     /// **I66e (from disk) — every DEK-plane door of the Engine resolves the
     /// sentinel first**, so an `Engine` built by `from_shared*` (which cannot
     /// repair synchronously) is repaired at its first such door. And **I68's
