@@ -746,18 +746,37 @@ signed by the identity itself (§20.2 admits it — the identity is the
 signer; no lift needed), which Edge can produce with the identity seed it
 already holds. No further persist change.
 
-### 20.5 The claim the plane served and every peer refused
+### 20.5 The claim the plane served and every peer refused — hybrid-only
 
 I75's first delivery leg found the next thing I61 never carried: the
-`holds_bytes` claim a write door announces is stored at federation tier but
-signed classical-only (`sign_holds_bytes_claim` signs through the classical
-`HardwareSigner`, which has no hybrid method), the cursor serves it, and the
-federation-tier ingest gate on every peer refuses it (CC 5.3.2.4.3.1 —
-classical-only producers are confined to local tier). The claim is now
-hybrid-signed whenever the Engine or PyEngine has a LocalSigner (the optional
-signer is threaded from the doors through `put_blob_signing_at` and
-`adopt_sealed_blob` to the claim); an engine without one keeps the classical
-claim, which no peer will admit — stated, not silent (I79).
+`holds_bytes` claim a write door announces was stored at federation tier but
+signed classical-only (`sign_holds_bytes_claim` signed through the classical
+`HardwareSigner`, which has no hybrid method), the cursor served it, and the
+federation-tier ingest gate on every peer refused it (CC 5.3.2.4.3.1 —
+classical-only producers are confined to local tier).
+
+**Ruling (operator): hybrid/PQC only, no legacy fallback.** The classical
+claim path is gone. A `holds_bytes` claim is signed only by the node's PQC
+LocalSigner, whose derived id must be the claimed attester; an engine with no
+LocalSigner, or one whose LocalSigner has no ML-DSA-65 half, cannot announce
+a federation-tier claim and its write door refuses (`AttestationEmissionFailed`,
+"hybrid-only") before anything announced is stored — the same rule #848
+applies to `KeyGrant` emission and v9.0.0 applies to ingest. The trait
+defaults `put_blob_signing` / `put_blob_signing_scoped` (the classical path)
+are removed; every announcing door is `put_blob_signing_at` with the
+LocalSigner. The content-only occurrence gate likewise refuses a signature
+without its ML-DSA-65 half before verifying anything. Consumer-visible:
+CIRISEdge constructs through `from_shared_hybrid` / `from_shared_with_local`
+(it does); a bare `from_shared` engine holds and reads but does not announce
+(I79, I80, I81, I83).
+
+**The author is not the attester (§20.5).** The commons door's key parameter
+says *whose content this is* — the #149 proxy decision, recorded on the row —
+and the holder claim is always this node's, signed by this node (I23). The
+federation-tier ingest gate verifies a `holds_bytes` row against its own
+`attesting_key_id`, so binding an author into the claim produced a row the
+cursor served and every peer refused: the classical claim's sibling defect,
+found by the same directive.
 
 ### 20.4 Invariants — three planes, delivered, never copied
 

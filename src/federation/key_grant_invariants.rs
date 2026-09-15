@@ -230,11 +230,9 @@ pub mod two_node {
             panic!("the sealed blob is inline on the author");
         };
         let ctx = hold_ctx(false, &to.key, family);
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(to.signer.clone());
         let out = adopt_sealed_blob(
             to.backend,
-            &adapter,
-            None,
+            &to.signer,
             &ctx,
             &bytes,
             &BlobProvenance {
@@ -1962,6 +1960,22 @@ pub mod two_node {
                 || err.to_string().contains("nor a node it owns"),
             "{tag} I76: {err}"
         );
+        // (10) Hybrid-only (operator directive) — a content-only occurrence
+        // whose signature carries no ML-DSA-65 half is refused before any
+        // verification, however valid the Ed25519 half.
+        {
+            let mut classical_only = admitted.clone();
+            classical_only.signature.mldsa65_signature_base64 = None;
+            let err = n
+                .backend
+                .put_identity_occurrence(classical_only)
+                .await
+                .expect_err("{tag} I76 (10): a classical-only occurrence signature is refused");
+            assert!(
+                err.to_string().contains("ML-DSA-65") && err.to_string().contains("hybrid-only"),
+                "{tag} I76 (10): the refusal names the missing half: {err}"
+            );
+        }
         // (8) PR #852 round five — a future-dated content-only occurrence is
         // refused by the write-gate skew bound, however consistent envelope
         // and row are: a compromised node with a live binding must not

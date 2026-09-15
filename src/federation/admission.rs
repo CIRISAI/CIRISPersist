@@ -4719,6 +4719,16 @@ async fn verify_content_only_identity_occurrence(
         _ => return Err(diverges("hardware_attestation")),
     }
     // (2) Hybrid signature over JCS(envelope), 1-of-1 against the pinned key.
+    // Hybrid-ONLY (operator directive; CC 5.3.2.4.3.1): a signature without
+    // its ML-DSA-65 half is refused before any verification is attempted —
+    // never verified classically.
+    if signed.signature.mldsa65_signature_base64.is_none() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence for {} carries no ML-DSA-65 signature; the plane is \
+             hybrid-only (CC 5.3.2.4.3.1)",
+            row.occurrence_key_id
+        )));
+    }
     let Some(signer_key) = directory
         .lookup_public_key(&signed.attesting_key_id)
         .await?
@@ -7666,6 +7676,24 @@ pub async fn check_withdraws_admission(
         // Target not locally present — defer authority to read side.
         return Ok(None);
     };
+    // CC 3 (CIRISPersist#851 / the CC 2.3 audit) — a `withdraws` naming a
+    // `key_grant:*` row is REFUSED, not admitted inert. The Constitution is
+    // explicit that a shared key cannot be retroactively un-shared, so
+    // persist cannot honour the claim; admitting it would leave a row that
+    // every reader ignores — a revocation the emitter believes took effect
+    // and that nothing enforces (the fail-silent class). The honest verdict
+    // is at the gate. Forward secrecy on this axis is ROTATION (§15): bump
+    // the epoch, and the next seal is unreadable to the removed party.
+    if target
+        .attestation_type
+        .starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "withdraws names a key_grant row ({}) — a shared key cannot be retroactively \
+             un-shared (CC 3); rotate the epoch instead (BLOB_REPLICATION.md §15)",
+            target.attestation_type
+        )));
+    }
     // Scope discriminator: a `holds_bytes:sha256:*` target is a
     // content-location directory entry whose `withdraws` is emitted by a
     // separately-authorized moderation / host self-attestation path

@@ -4785,15 +4785,22 @@ impl Engine {
     /// See the trait method's doc-comment for the full rationale —
     /// the JCS-vs-Python silent-correctness trap this method closes.
     ///
-    /// CIRISPersist#851 §20.5: a classical-only claim is confined to local
-    /// tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is hybrid-signed
-    /// so peers admit it — this door reaches the commons floor with it.
+    /// CIRISPersist#851 §20.5 — hybrid/PQC only: the holder claim is signed
+    /// by this node's PQC LocalSigner, or the write refuses (CC 5.3.2.4.3.1).
     ///
     /// #846 (`BLOB_REPLICATION.md` §4) — runs [`would_hold`](Self::would_hold)
     /// first: the commons is everyone's, so this is the #149 rule — a proxy
     /// write (an author neither local nor family) is refused at the stop
-    /// tier; local + family never. The author is `attesting_key_id`, recorded
-    /// on the row.
+    /// tier; local + family never.
+    ///
+    /// `author_key_id` is WHOSE CONTENT this is — the proxy decision — and is
+    /// recorded on the row. It is NOT who claims to hold the bytes: the
+    /// holder claim is always THIS NODE's (I23), signed by this node, because
+    /// the federation-tier ingest gate verifies a `holds_bytes` row against
+    /// its own `attesting_key_id`. Before §20.5 this door bound the author
+    /// into the claim, so a proxy write announced a row no peer could verify
+    /// — served by the cursor and refused by every one of them (the classical
+    /// claim's sibling defect).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_signing(
@@ -4801,7 +4808,7 @@ impl Engine {
         sha256: &[u8; 32],
         body: crate::federation::BlobBody,
         media_type: Option<&str>,
-        attesting_key_id: &str,
+        author_key_id: &str,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
     ) -> Result<(), crate::federation::BlobError> {
@@ -4814,7 +4821,7 @@ impl Engine {
         // stop tier, local + family writes are NEVER refused. The cached
         // snapshot, no statvfs per write.
         self.would_hold(&crate::federation::BlobProvenance {
-            author_key_id: attesting_key_id.to_owned(),
+            author_key_id: author_key_id.to_owned(),
             cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
             community_key_id: None,
             epoch: None,
@@ -4822,6 +4829,8 @@ impl Engine {
         })
         .await?;
 
+        // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
+        let local = self.announcing_signer()?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -4837,9 +4846,8 @@ impl Engine {
                     sha256,
                     body,
                     media_type,
-                    attesting_key_id,
-                    &**self.signer(),
-                    self.local_signer.as_deref(),
+                    &local.derived_key_id(),
+                    local,
                     now,
                     attestation_id,
                 )
@@ -4859,9 +4867,8 @@ impl Engine {
                     sha256,
                     body,
                     media_type,
-                    attesting_key_id,
-                    &**self.signer(),
-                    self.local_signer.as_deref(),
+                    &local.derived_key_id(),
+                    local,
                     now,
                     attestation_id,
                 )
@@ -5010,6 +5017,8 @@ impl Engine {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
+        // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
+        let local = self.announcing_signer()?;
         use crate::federation::adopt_cascade::adopt_sealed_blob;
         let (our_key, fam) = self.local_or_family_parts().await?;
         let ctx = crate::federation::HoldContext {
@@ -5022,8 +5031,7 @@ impl Engine {
             BackendDispatch::Postgres(arc) => {
                 adopt_sealed_blob(
                     arc.as_ref(),
-                    &**self.signer(),
-                    self.local_signer.as_deref(),
+                    local,
                     &ctx,
                     envelope,
                     &provenance,
@@ -5036,8 +5044,7 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 adopt_sealed_blob(
                     arc.as_ref(),
-                    &**self.signer(),
-                    self.local_signer.as_deref(),
+                    local,
                     &ctx,
                     envelope,
                     &provenance,
@@ -5242,14 +5249,15 @@ impl Engine {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
+        // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
+        let local = self.announcing_signer()?;
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 put_blob_scoped(
                     arc.as_ref(),
-                    &*self.signer,
-                    self.local_signer.as_deref(),
+                    local,
                     cohort_scope,
                     community_key_id,
                     plaintext,
@@ -5262,8 +5270,7 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 put_blob_scoped(
                     arc.as_ref(),
-                    &*self.signer,
-                    self.local_signer.as_deref(),
+                    local,
                     cohort_scope,
                     community_key_id,
                     plaintext,
@@ -5355,6 +5362,28 @@ impl Engine {
             .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
         }
         Ok(emitted)
+    }
+
+    /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
+    /// hybrid/PQC only, no legacy fallback.** Every door that emits a
+    /// federation-tier `holds_bytes` claim signs with this node's PQC
+    /// `LocalSigner`; an Engine without one (a classical `with_hardware_signer`
+    /// build, or `from_shared` with no local key) holds and reads but does not
+    /// announce, and says so here rather than storing bytes under a claim no
+    /// peer will admit (CC 5.3.2.4.3.1).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn announcing_signer(
+        &self,
+    ) -> Result<&crate::signing::LocalSigner, crate::federation::BlobError> {
+        self.local_signer.as_deref().ok_or_else(|| {
+            crate::federation::BlobError::AttestationEmissionFailed(
+                "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
+                 federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1); \
+                 construct with `with_signer` / `with_hardware_signer_hybrid` / \
+                 `from_shared_with_local` to announce"
+                    .into(),
+            )
+        })
     }
 
     /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.3) — **publish this
@@ -6028,14 +6057,15 @@ impl Engine {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
+        // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
+        let local = self.announcing_signer()?;
         use crate::federation::chunk_dag_cascade::orchestrate::seal_stream_scoped;
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 seal_stream_scoped(
                     arc.as_ref(),
-                    &*self.signer,
-                    self.local_signer.as_deref(),
+                    local,
                     cohort_scope,
                     community_key_id,
                     stream_id,
@@ -6048,8 +6078,7 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 seal_stream_scoped(
                     arc.as_ref(),
-                    &*self.signer,
-                    self.local_signer.as_deref(),
+                    local,
                     cohort_scope,
                     community_key_id,
                     stream_id,

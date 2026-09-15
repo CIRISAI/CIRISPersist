@@ -118,8 +118,7 @@ fn resolve_adopt(
 #[allow(clippy::too_many_arguments)]
 pub async fn adopt_sealed_blob<B, F>(
     backend: &B,
-    signer: &dyn ciris_keyring::HardwareSigner,
-    pqc: Option<&crate::signing::LocalSigner>,
+    local: &crate::signing::LocalSigner,
     ctx: &HoldContext<'_, F>,
     envelope: &[u8],
     provenance: &BlobProvenance,
@@ -149,8 +148,7 @@ where
         // derived key, never the author's.
         Some(
             crate::federation::blobs::sign_holds_bytes_claim(
-                signer,
-                pqc,
+                local,
                 &sha256,
                 ctx.our_key_id,
                 uuid::Uuid::new_v4(),

@@ -170,116 +170,219 @@ mod tests {
         );
     }
 
-    /// **I80 — a classical-only `LocalSigner` keeps the classical claim.**
-    /// A `LocalSigner` built without a PQC signer (`from_parts(.., None,
-    /// None)`) is a classical-only producer: `sign_holds_bytes_claim` falls
-    /// back to the classical path — no error, no PQC half, and the SAME
-    /// classical signature the signer-only path produces (Ed25519 is
-    /// deterministic), so the fallback IS the pre-#851 claim.
-    /// **I81 (PR #852 review, round three) — the LocalSigner signs a claim
-    /// only when it IS the claimed attester.** An Engine whose composed
-    /// `signer` and `local_signer` are different identities must not announce
-    /// a row signed by one key and attributed to another (every peer would
-    /// refuse it): the claim falls to the classical path under the attester.
+    /// **I80 — a `LocalSigner` with no ML-DSA-65 half cannot sign a claim.**
+    /// Hybrid/PQC only, no legacy fallback (operator ruling, §20.5): a
+    /// classical-only producer does not announce — it REFUSES, rather than
+    /// minting a federation-tier claim every peer's ingest gate discards.
     #[tokio::test]
-    async fn i81_a_local_signer_that_is_not_the_attester_does_not_sign_the_claim() {
+    async fn i80_a_pqc_less_local_signer_cannot_sign_a_claim() {
         use crate::federation::blobs::sign_holds_bytes_claim;
-        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
-        let attester = crate::federation::tier_ingest::test_support::local_signer("i81-attester");
-        let other = crate::federation::tier_ingest::test_support::local_signer("i81-other");
-        assert_ne!(attester.derived_key_id(), other.derived_key_id());
-        let adapter = LocalSignerHardwareAdapter::new(attester.clone());
-        let key = attester.derived_key_id();
-        let sha = [0x81u8; 32];
-        let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
-        let claim = sign_holds_bytes_claim(&adapter, Some(&*other), &sha, &key, id, now)
-            .await
-            .expect("I81: a foreign LocalSigner is ignored, never used");
-        assert!(
-            claim.scrub_signature_pqc.is_none(),
-            "I81: no PQC half from a key that is not the attester"
-        );
-        assert_eq!(claim.scrub_key_id, key, "I81: attributed to the attester");
-        let classical = sign_holds_bytes_claim(&adapter, None, &sha, &key, id, now)
-            .await
-            .unwrap();
-        assert_eq!(
-            claim.scrub_signature_classical, classical.scrub_signature_classical,
-            "I81: the classical path under the attester, byte-identical"
-        );
-        // And the attester's own LocalSigner does sign hybrid.
-        let own = sign_holds_bytes_claim(&adapter, Some(&*attester), &sha, &key, id, now)
-            .await
-            .unwrap();
-        assert!(
-            own.scrub_signature_pqc.is_some(),
-            "I81: the attester's own key signs hybrid"
-        );
-        // (b) PR #852 round four — a PQC-less LocalSigner that IS the attester
-        // signs the claim itself, classically; the composed `signer` (another
-        // identity here) is never used for it.
-        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x81u8; 32]);
-        let pqcless = std::sync::Arc::new(LocalSigner::from_parts(
-            ed,
-            "i81b-attester".to_owned(),
-            None,
-            None,
-        ));
-        let key_b = pqcless.derived_key_id();
-        let foreign_adapter = LocalSignerHardwareAdapter::new(other.clone());
-        let claim_b =
-            sign_holds_bytes_claim(&foreign_adapter, Some(&*pqcless), &sha, &key_b, id, now)
-                .await
-                .expect("I81 (b): a PQC-less attester signs classically");
-        assert!(claim_b.scrub_signature_pqc.is_none());
-        assert_eq!(claim_b.scrub_key_id, key_b);
-        let own_adapter = LocalSignerHardwareAdapter::new(pqcless.clone());
-        let reference = sign_holds_bytes_claim(&own_adapter, None, &sha, &key_b, id, now)
-            .await
-            .unwrap();
-        assert_eq!(
-            claim_b.scrub_signature_classical, reference.scrub_signature_classical,
-            "I81 (b): signed by the attester's own key, not the composed signer"
-        );
-    }
-
-    #[tokio::test]
-    async fn i80_a_pqc_less_local_signer_keeps_the_classical_claim() {
-        use crate::federation::blobs::sign_holds_bytes_claim;
-        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
+        use crate::signing::LocalSigner;
         let ed = ed25519_dalek::SigningKey::from_bytes(&[0x51u8; 32]);
-        let local = std::sync::Arc::new(LocalSigner::from_parts(
-            ed,
-            "i80-classical-only".to_owned(),
-            None,
-            None,
-        ));
+        let local = LocalSigner::from_parts(ed, "i80-classical-only".to_owned(), None, None);
         assert!(
             local.pqc_signer().is_none(),
             "I80: precondition — no PQC signer"
         );
-        let adapter = LocalSignerHardwareAdapter::new(local.clone());
         let key = local.derived_key_id();
-        let sha = [0x80u8; 32];
-        let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
-        let with = sign_holds_bytes_claim(&adapter, Some(&*local), &sha, &key, id, now)
-            .await
-            .expect("I80: a PQC-less LocalSigner is a classical-only producer, not an error");
+        let err = sign_holds_bytes_claim(
+            &local,
+            &[0x80u8; 32],
+            &key,
+            uuid::Uuid::new_v4(),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("I80: a classical-only producer must not announce");
+        let msg = err.to_string();
         assert!(
-            with.scrub_signature_pqc.is_none(),
-            "I80: no PQC signer, no PQC half"
+            msg.contains("hybrid-only") && msg.contains("ML-DSA-65"),
+            "I80: the refusal names the rule: {msg}"
         );
-        assert_eq!(with.scrub_key_id, key, "I80: the derived key id, as before");
-        let without = sign_holds_bytes_claim(&adapter, None, &sha, &key, id, now)
+    }
+
+    /// **I81 — the signer of a claim IS its claimed attester.** A LocalSigner
+    /// belonging to another identity never signs (an Engine whose composed
+    /// signer and LocalSigner differ, `from_shared_with_local`): the claim
+    /// would be attributed to one key and signed by another, which every peer
+    /// refuses. There is no classical fallback to drop to — it REFUSES.
+    #[tokio::test]
+    async fn i81_a_local_signer_that_is_not_the_attester_refuses() {
+        use crate::federation::blobs::sign_holds_bytes_claim;
+        let attester = crate::federation::tier_ingest::test_support::local_signer("i81-attester");
+        let other = crate::federation::tier_ingest::test_support::local_signer("i81-other");
+        assert_ne!(attester.derived_key_id(), other.derived_key_id());
+        let key = attester.derived_key_id();
+        let sha = [0x81u8; 32];
+        let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
+        let err = sign_holds_bytes_claim(&other, &sha, &key, id, now)
+            .await
+            .expect_err("I81: a foreign LocalSigner must not sign this attester's claim");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hybrid-only") && msg.contains("not the claimed attester"),
+            "I81: the refusal names the mismatch: {msg}"
+        );
+        // The attester's own LocalSigner signs, hybrid, attributed to itself.
+        let own = sign_holds_bytes_claim(&attester, &sha, &key, id, now)
+            .await
+            .expect("I81: the attester signs its own claim");
+        assert!(own.scrub_signature_pqc.is_some(), "I81: hybrid");
+        assert_eq!(own.scrub_key_id, key);
+    }
+
+    /// **I83 — an Engine with no PQC LocalSigner cannot announce, and stores
+    /// nothing under a claim it cannot make.** The commons door refuses
+    /// before the row exists; nothing is left for a peer to refuse later.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i83_an_engine_without_a_local_signer_cannot_announce_sqlite() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::{BlobBody, BlobStorage};
+        use crate::store::Backend as _;
+        use std::sync::Arc;
+        let backend = Arc::new(
+            crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap(),
+        );
+        backend.run_migrations().await.unwrap();
+        let local = ts::local_signer("i83-node");
+        let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+        );
+        // `from_shared` — a node with no LocalSigner at all.
+        let engine = crate::Engine::from_shared(
+            crate::engine::BackendDispatch::Sqlite(backend.clone()),
+            signer,
+        );
+        let body = b"i83 commons bytes".to_vec();
+        let sha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&body).into()
+        };
+        let err = engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(body),
+                None,
+                &local.derived_key_id(),
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect_err("I83: no LocalSigner, no announcement");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hybrid-only") && msg.contains("cannot announce"),
+            "I83: the refusal names the rule: {msg}"
+        );
+        assert!(
+            backend.get_blob(&sha).await.unwrap().is_none(),
+            "I83: the refused write stored no bytes"
+        );
+    }
+
+    /// **I84 (CC 2.3.2.1, the CC 2.3 audit) — a malformed subject is REFUSED
+    /// at the gate, never normalized into acceptance.** The consequence of
+    /// admitting one is silent and permanent: a subject nobody can match under
+    /// withdraws rules 2/3 is a row nobody can ever revoke, with no error
+    /// raised anywhere.
+    #[test]
+    fn i84_malformed_subject_key_ids_are_refused_at_the_gate() {
+        let ok = |v: &str| {
+            crate::federation::validate_subject_key_ids(&[v.to_owned()])
+                .unwrap_or_else(|e| panic!("I84: {v:?} is well-formed: {e}"));
+        };
+        let refused = |v: &str, why: &str| {
+            let err = crate::federation::validate_subject_key_ids(&[v.to_owned()])
+                .expect_err(&format!("I84: {v:?} must be refused ({why})"));
+            assert!(
+                err.to_string().contains("CC 2.3.2.1"),
+                "I84: the refusal cites the clause: {err}"
+            );
+        };
+        // Well-formed: a derived key id, and a full canonical digest.
+        ok("actor-a-rssebwawts");
+        ok(&format!("canonical:sha256:{}", "a".repeat(64)));
+        // The reject vectors.
+        refused("", "empty");
+        refused("Actor-A", "uppercase");
+        refused("actor-a ", "trailing space");
+        refused(" actor-a", "leading space");
+        refused("actor a", "internal space");
+        refused(
+            &format!("canonical:md5:{}", "a".repeat(32)),
+            "wrong hash family",
+        );
+        refused(
+            &format!("canonical:sha256:{}", "a".repeat(63)),
+            "short digest",
+        );
+        refused(
+            &format!("canonical:sha256:{}", "z".repeat(64)),
+            "non-hex digest",
+        );
+    }
+
+    /// **I85 (CC 3, the CC 2.3 audit) — a `withdraws` naming a `key_grant`
+    /// row is refused, not admitted inert.** A shared key cannot be
+    /// retroactively un-shared; admitting the row would leave a revocation
+    /// the emitter believes took effect and nothing enforces. Forward secrecy
+    /// on this axis is rotation (§15).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i85_a_withdraws_naming_a_key_grant_row_is_refused_sqlite() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::USER;
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
             .await
             .unwrap();
-        assert_eq!(
-            with.scrub_signature_classical, without.scrub_signature_classical,
-            "I80: the fallback is the classical path — byte-identical signature"
+        backend.run_migrations().await.unwrap();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let minter = format!("i85-minter-{run}");
+        ts::register_identity_key(&backend, &minter, USER).await;
+        // A stored key_grant carrier row, and a withdraws naming it.
+        // A stored key_grant carrier, sealed the way every admissible row is
+        // (instants + the #643 mirror), then a withdraws naming it.
+        let target_id = format!("kg-{run}");
+        let mut carrier = ts::bare_attestation(
+            &target_id,
+            &minter,
+            &minter,
+            &serde_json::json!({ "id": target_id, "kind": "key_grant" }),
         );
-        assert_eq!(
-            with.original_content_hash_hex,
-            without.original_content_hash_hex
+        carrier.attestation_type =
+            crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE.to_owned();
+        let carrier = ts::seal_row(&minter, carrier);
+        backend
+            .apply_replicated_attestation(crate::federation::SignedAttestation {
+                attestation: carrier,
+            })
+            .await
+            .expect("I85: the carrier row stores");
+        let w_id = format!("w-{run}");
+        let mut w = ts::bare_attestation(
+            &w_id,
+            &minter,
+            &minter,
+            &serde_json::json!({
+                "id": w_id,
+                "kind": "withdraws",
+                "references_attestation_id": target_id,
+            }),
+        );
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+        let w = ts::seal_row(&minter, w);
+        let err = crate::federation::admission::check_withdraws_admission(&backend, &w)
+            .await
+            .expect_err("I85: a withdraws on a key_grant row must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be retroactively un-shared") && msg.contains("rotate"),
+            "I85: the refusal says why and names the remedy: {msg}"
         );
     }
 }

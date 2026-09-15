@@ -1291,22 +1291,24 @@ impl PyEngine {
         }
     }
 
-    /// CIRISPersist#851 §20.5 — the hybrid half of
-    /// [`select_signer`](Self::select_signer): the LocalSigner exactly when
-    /// it is the one `select_signer` chose, so a holder claim signed
-    /// classical by the local key carries its PQC half too and peers admit
-    /// it.
-    fn select_pqc(&self, attesting_key_id: &str) -> Option<Arc<crate::signing::LocalSigner>> {
-        // A normal Python call attests as the DERIVED federation key id
-        // (`local_derived_key_id`), for which `select_signer` returns the
-        // composed signer — built over this same LocalSigner — so its PQC
-        // half is this one; a keystore-alias caller matches by alias. Either
-        // way the classical and PQC halves come from one identity
-        // (PR #852 review).
-        self.local_signer
-            .as_ref()
-            .filter(|ls| ls.key_id() == attesting_key_id || ls.derived_key_id() == attesting_key_id)
-            .cloned()
+    /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
+    /// hybrid/PQC only, no legacy fallback.** A federation-tier `holds_bytes`
+    /// claim is signed by the LocalSigner whose derived id IS the claimed
+    /// attester (a normal Python call attests as the derived id; a
+    /// keystore-alias caller matches by alias). No LocalSigner, or one that
+    /// is not this attester, and the door REFUSES — never a classical claim
+    /// no peer will admit (CC 5.3.2.4.3.1).
+    /// §20.5 — the announcing signer with no attester to match: the doors
+    /// whose parameter names the AUTHOR (the commons form) announce as this
+    /// node. No PQC LocalSigner ⇒ no announcement.
+    fn announcing_signer_any(&self) -> PyResult<Arc<crate::signing::LocalSigner>> {
+        self.local_signer.clone().ok_or_else(|| {
+            blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
+                 federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+                    .into(),
+            ))
+        })
     }
 
     /// #846 (§5 / I23) — this node's DERIVED federation key id, for the
@@ -13137,20 +13139,16 @@ impl PyEngine {
             let scope = cohort_scope.to_owned();
             let comm = community_key_id.map(str::to_owned);
             let media = media_type.map(str::to_owned);
-            // CIRISPersist#851 §20.5: a classical-only claim is confined to local
-            // tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is hybrid-signed
-            // so peers admit it — passed as `pqc` from `self`, so the Python
-            // signature is unchanged.
-            // §11.2 (6) / I23 — announce under the identity the sweep retracts
-            // under: the LOCAL signer when one is configured (what
-            // `sweep_community_epochs` uses), else the composed signer. The
-            // key id is derived from whichever signs; no alias is passed.
-            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            // CIRISPersist#851 §20.5 — hybrid/PQC only, no legacy fallback: the
+            // door announces with this node's PQC LocalSigner or refuses; the
+            // composed classical signer can never sign a federation-tier claim.
+            let local = self.local_signer.clone().ok_or_else(|| {
+                blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                    "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
+                     federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+                        .into(),
+                ))
+            })?;
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -13159,8 +13157,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_scoped(
                                 backend.as_ref(),
-                                &*signer,
-                                self.local_signer.as_deref(),
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -13176,8 +13173,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_scoped(
                                 backend.as_ref(),
-                                &*signer,
-                                self.local_signer.as_deref(),
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -13821,19 +13817,16 @@ impl PyEngine {
             let comm = community_key_id.map(str::to_owned);
             let stream = stream_id.to_owned();
             let media = media_type.map(str::to_owned);
-            // CIRISPersist#851 §20.5: a classical-only claim is confined to local
-            // tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is hybrid-signed
-            // so peers admit it — passed as `pqc` from `self`, so the Python
-            // signature is unchanged.
-            // §11.2 (6) / I23 — announce under the identity the sweep retracts
-            // under: the LOCAL signer when one is configured, else the
-            // composed signer; the key id is derived from whichever signs.
-            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            // CIRISPersist#851 §20.5 — hybrid/PQC only, no legacy fallback: the
+            // door announces with this node's PQC LocalSigner or refuses; the
+            // composed classical signer can never sign a federation-tier claim.
+            let local = self.local_signer.clone().ok_or_else(|| {
+                blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                    "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
+                     federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+                        .into(),
+                ))
+            })?;
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -13842,8 +13835,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             seal_stream_scoped(
                                 backend.as_ref(),
-                                &*signer,
-                                self.local_signer.as_deref(),
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -13859,8 +13851,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             seal_stream_scoped(
                                 backend.as_ref(),
-                                &*signer,
-                                self.local_signer.as_deref(),
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -14317,8 +14308,12 @@ impl PyEngine {
                 })?;
             }
 
-            let signer = self.select_signer(&attesting_key_id_owned);
-            let pqc = self.select_pqc(&attesting_key_id_owned);
+            // §20.5 parity with `Engine::put_blob_signing`: the parameter is the
+            // AUTHOR (the #149 proxy decision, recorded on the row); the holder
+            // claim is this node's own, signed by this node (I23), because the
+            // ingest gate verifies the row against its own attesting_key_id.
+            let local = self.announcing_signer_any()?;
+            let holder = local.derived_key_id();
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {
@@ -14339,9 +14334,8 @@ impl PyEngine {
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
-                                &attesting_key_id_owned,
-                                &*signer,
-                                pqc.as_deref(),
+                                &holder,
+                                &local,
                                 now,
                                 attestation_id,
                             )
@@ -14366,9 +14360,8 @@ impl PyEngine {
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
-                                &attesting_key_id_owned,
-                                &*signer,
-                                pqc.as_deref(),
+                                &holder,
+                                &local,
                                 now,
                                 attestation_id,
                             )

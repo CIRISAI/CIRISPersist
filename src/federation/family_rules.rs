@@ -523,6 +523,15 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "canonical:",
+        "a KEY-ID ENCODING prefix (`canonical:sha256:<64 hex>`), not a dimension \
+         family: it names how an identifier was derived, never what a row is \
+         about. Persist rules on its SHAPE at the subject gate \
+         (`validate_subject_key_ids`, CC 2.3.2.1 — a malformed subject is \
+         refused, never normalized) because a subject nobody can match is a \
+         row nobody can revoke; that is an identifier check, not a family rule.",
+    ),
+    (
         "file:",
         "a SQLite URI-filename SCHEME, not a dimension family. CIRISPersist#829: \
          `SqliteBackend::open_with_readers` inspects the path it was handed for \

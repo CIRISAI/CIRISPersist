@@ -128,14 +128,52 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   LocalSigner that is not the node's identity (an Engine over a shared
   backend with a different composed signer) is refused. I82.
 
-### Fixed
-- **`holds_bytes` claims are hybrid-signed when a LocalSigner exists (§20.5).**
-  A write door's claim was stored at federation tier with a classical-only
-  signature, served on the cursor, and refused by every peer
-  (`verify_hybrid_pqc_fields_mismatch`). The optional LocalSigner is threaded
-  from the Engine/PyEngine doors through `put_blob_signing_at` and
-  `adopt_sealed_blob` to `sign_holds_bytes_claim`. An engine without one keeps
-  the classical claim, which peers do not admit. I79.
+### Removed — hybrid/PQC only, no legacy fallback (operator directive)
+- **The classical `holds_bytes` claim path is gone.** `sign_holds_bytes_claim`
+  takes the node's PQC `LocalSigner` — not a `HardwareSigner` — and signs the
+  claim hybrid or REFUSES: `PqcNotConfigured`, a LocalSigner that is not the
+  claimed attester, and an engine with no LocalSigner each yield
+  `AttestationEmissionFailed` ("hybrid-only") *before* anything announced is
+  stored. No classical claim is produced anywhere. The trait wrappers
+  `put_blob_signing` / `put_blob_signing_scoped` and the `_at` floor all take
+  the LocalSigner; `adopt_sealed_blob` and the cascades do too.
+- **The commons door separates AUTHOR from ATTESTER.** `Engine::put_blob_signing`
+  and `PyEngine.put_blob_signing` take the key as *whose content this is* — the
+  #149 proxy decision, recorded on the row — and announce the holder claim as
+  THIS NODE (I23), signed by this node. Before, a proxy write bound the
+  author into the claim; the federation-tier ingest gate verifies a
+  `holds_bytes` row against its own `attesting_key_id`, so such a row was
+  served by the cursor and refused by every peer — the classical claim's
+  sibling defect. **The holder recorded for a proxy write is now the node**,
+  not the author (`list_holders` / `list_held_by` / `evict_actor` take the
+  node's derived key id).
+- **A content-only signed occurrence without its ML-DSA-65 half is refused**
+  before verification (I76).
+- Witnesses: I80 and I81 are now refusals; I83 — a `from_shared` engine
+  cannot announce and stores nothing announced. Six mutations red.
+- Consumer-visible: CIRISEdge's `from_shared_hybrid` / `from_shared_with_local`
+  are the announcing constructors (already so); a hardware-only classical
+  engine (`with_hardware_signer`) holds and reads but does not announce —
+  `with_hardware_signer_hybrid` does.
+
+### CC 2.3 audit (operator) — two gates closed
+- **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids`): a
+  subject that is empty, uppercase, carries any whitespace, or is a
+  `canonical:` id that is not exactly `canonical:sha256:<64 lowercase hex>` is
+  REFUSED at the gate, never normalized into acceptance. The cost of admitting
+  one was silent and permanent — a subject nobody can match under withdraws
+  rules 2/3 is a row nobody can ever revoke. I84.
+- **A `withdraws` naming a `key_grant:*` row is refused**, not admitted inert:
+  CC 3 says a shared key cannot be retroactively un-shared, so persist cannot
+  honour the claim, and a row every reader ignores is a revocation the emitter
+  believes took effect. The refusal names the remedy — rotation (§15). I85.
+- Not in this cut, filed separately: the read/serve doors do not consult the
+  referencing row's tombstone, so a subject's `withdraws` tombstones the row
+  while the bytes stay readable on every holder. CC 2.3 therefore holds at the
+  row plane and not yet at the bytes plane; the hook needs Edge's half
+  (evict-on-withdraws) and must recompute the withdraws rule when it acts,
+  because `check_withdraws_admission` admits a non-local target with
+  `rule = None`.
 
 ## [44.3.0] - 2026-09-15
 

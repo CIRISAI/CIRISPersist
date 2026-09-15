@@ -560,11 +560,38 @@ fn assert_change_envelope_matches(
 /// because a leg that cannot compile is a leg that proves nothing.
 pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
     for sid in subject_key_ids {
-        if sid.is_empty() || sid.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err(Error::InvalidArgument(format!(
+        // CC 2.3.2.1 (the CC 2.3 audit) — each malformed subject "MUST be
+        // refused at the gate, never normalized into acceptance". The
+        // consequence of admitting one is silent and permanent: a subject
+        // nobody can ever match under withdraws rules 2/3, so the row is
+        // unrevocable and no error is raised anywhere — the fail-silent
+        // class. Refused here: empty, uppercase, ANY whitespace (leading,
+        // trailing or internal), and a `canonical:` id that is not exactly
+        // `canonical:sha256:<64 lowercase hex>` (a wrong hash family or a
+        // short digest can never be produced by the canonicalizer, so it can
+        // never be matched either).
+        let malformed = |why: &str| {
+            Err(Error::InvalidArgument(format!(
                 "subject_key_ids element must be a canonical lowercase key_id \
-                 (CC 2.6.3 / §0.6); got {sid:?}"
-            )));
+                 (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
+            )))
+        };
+        if sid.is_empty() {
+            return malformed("empty");
+        }
+        if sid.bytes().any(|b| b.is_ascii_uppercase()) {
+            return malformed("uppercase");
+        }
+        if sid.chars().any(char::is_whitespace) {
+            return malformed("whitespace");
+        }
+        if let Some(rest) = sid.strip_prefix("canonical:") {
+            let Some(digest) = rest.strip_prefix("sha256:") else {
+                return malformed("canonical id is not sha256");
+            };
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return malformed("canonical sha256 digest is not 64 lowercase hex");
+            }
         }
     }
     Ok(())

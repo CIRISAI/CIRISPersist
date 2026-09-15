@@ -2056,8 +2056,7 @@ pub mod orchestrate {
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_scoped<B>(
         backend: &B,
-        signer: &dyn ciris_keyring::HardwareSigner,
-        pqc: Option<&crate::signing::LocalSigner>,
+        local: &crate::signing::LocalSigner,
         cohort_scope: &str,
         community_key_id: Option<&str>,
         plaintext: &[u8],
@@ -2075,9 +2074,9 @@ pub mod orchestrate {
         let now = chrono::Utc::now();
         // §11.2 (6) / I23 — the attesting key id has exactly one correct
         // value per signer; derive it, never accept it.
-        let signer_key_id = crate::signing::federation_key_id_of(signer)
-            .await
-            .map_err(|e| BlobError::Backend(format!("put_blob_scoped: signer key id: {e}")))?;
+        // §11.2 (6) / I23 / §20.5 — the announcing identity IS the PQC
+        // LocalSigner's derived id; hybrid-only, so there is no other.
+        let signer_key_id = local.derived_key_id();
         let signer_key_id = signer_key_id.as_str();
         let tier = super::resolve_write_tier(backend, cohort_scope, community_key_id).await?;
         match tier {
@@ -2100,8 +2099,7 @@ pub mod orchestrate {
                         BlobBody::Inline(plaintext.to_vec()),
                         media_type,
                         signer_key_id,
-                        signer,
-                        pqc,
+                        local,
                         now,
                         uuid::Uuid::new_v4(),
                     )
@@ -2186,8 +2184,7 @@ pub mod orchestrate {
                         BlobBody::Inline(sealed),
                         media_type,
                         signer_key_id,
-                        signer,
-                        pqc,
+                        local,
                         now,
                         uuid::Uuid::new_v4(),
                     )
@@ -2793,7 +2790,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
         // A public document that begins with the magic bytes by coincidence.
         let mut body = AT_REST_ENVELOPE_MAGIC.to_vec();
@@ -2804,8 +2800,8 @@ pub mod blob_invariants {
                 &id,
                 BlobBody::Inline(body.clone()),
                 None,
-                &node,
-                &adapter,
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -2840,7 +2836,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
         // A real, non-infra community so the refusal is "encrypted tier",
         // not "unknown community".
@@ -2865,8 +2860,8 @@ pub mod blob_invariants {
                     &id,
                     BlobBody::Inline(spoofed.clone()),
                     None,
-                    &node,
-                    &adapter,
+                    &signer.derived_key_id(),
+                    &signer,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -3141,7 +3136,6 @@ pub mod blob_invariants {
         .await;
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
         let sealed = encrypt_and_cascade_community(backend, &comm, b"old", None, Some(&minter))
             .await
@@ -3166,9 +3160,8 @@ pub mod blob_invariants {
                 &sealed.at_rest_sha256,
                 BlobBody::Inline(bytes),
                 None,
-                &node_derived,
-                &adapter,
-                None,
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3235,7 +3228,6 @@ pub mod blob_invariants {
         )
         .await;
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
         let body = b"canonical governance root, plaintext by constitution".to_vec();
         let id = sha(&body);
@@ -3246,8 +3238,8 @@ pub mod blob_invariants {
                 &id,
                 BlobBody::Inline(body.clone()),
                 None,
-                &node,
-                &adapter,
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3259,7 +3251,11 @@ pub mod blob_invariants {
                 )
             });
         assert!(
-            backend.list_holders(&id).await.unwrap().contains(&node),
+            backend
+                .list_holders(&id)
+                .await
+                .unwrap()
+                .contains(&signer.derived_key_id()),
             "{tag} I10: commons-tier infra content announces holds_bytes"
         );
     }
@@ -3294,13 +3290,11 @@ pub mod blob_invariants {
         )
         .await;
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
         let body = b"governance root: plaintext by constitution, readable by anyone".to_vec();
         let res = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             &body,
@@ -3463,7 +3457,6 @@ pub mod blob_invariants {
         .await;
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let node_derived = signer.derived_key_id();
         let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
         async fn withdraws_by<D: FederationDirectory + Sync>(backend: &D, node: &str) -> usize {
@@ -3495,9 +3488,8 @@ pub mod blob_invariants {
                 &sealed.at_rest_sha256,
                 BlobBody::Inline(bytes),
                 None,
-                &node_derived,
-                &adapter,
-                None,
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3571,9 +3563,8 @@ pub mod blob_invariants {
                 &sealed2.at_rest_sha256,
                 BlobBody::Inline(bytes2),
                 None,
-                &node_derived,
-                &adapter,
-                None,
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3784,14 +3775,12 @@ pub mod blob_invariants {
         )
         .await;
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
 
         let plaintext = format!("{tag} an image the matcher must see AS IS {run}").into_bytes();
         matcher.seen.lock().unwrap().clear();
         put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             &plaintext,
@@ -3812,8 +3801,7 @@ pub mod blob_invariants {
         matcher.seen.lock().unwrap().clear();
         put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             crate::federation::types::cohort_scope::FEDERATION,
             None,
             &plaintext,
@@ -3855,7 +3843,6 @@ pub mod blob_invariants {
         .await;
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         assert!(matcher.refuse, "{tag} I21b: fixture — a refusing matcher");
         let epoch = backend
             .community_dek_current_epoch(&comm, &minter)
@@ -3863,8 +3850,7 @@ pub mod blob_invariants {
             .unwrap();
         let res = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             b"known-bad",
@@ -3901,7 +3887,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let derived = signer.derived_key_id();
         assert_ne!(
             derived, node,
@@ -3911,8 +3896,7 @@ pub mod blob_invariants {
         let body = format!("{tag} commons {run}").into_bytes();
         let res = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             crate::federation::types::cohort_scope::FEDERATION,
             None,
             &body,
@@ -3951,11 +3935,9 @@ pub mod blob_invariants {
         )
         .await;
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let res = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             AFFILIATIONS,
             Some(&comm),
             b"affil",
@@ -4039,7 +4021,6 @@ pub mod blob_invariants {
         .await;
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let node_derived = signer.derived_key_id();
 
         // The cascade half of the door: sealed, stored, bound.
@@ -4081,9 +4062,8 @@ pub mod blob_invariants {
                 &sealed.at_rest_sha256,
                 BlobBody::Inline(bytes),
                 None,
-                &node_derived,
-                &adapter,
-                None,
+                &signer.derived_key_id(),
+                &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -4412,18 +4392,9 @@ pub mod blob_invariants {
             ),
         ] {
             let body = format!("message body sealed at {scope}").into_bytes();
-            let put = put_blob_scoped(
-                backend,
-                &adapter,
-                None,
-                scope,
-                Some(key),
-                &body,
-                None,
-                Some(a),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I40: seal at {scope} with associated data: {e}"));
+            let put = put_blob_scoped(backend, &signer, scope, Some(key), &body, None, Some(a))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I40: seal at {scope} with associated data: {e}"));
             assert_eq!(
                 put.tier, tier,
                 "{tag} I40: precondition — {scope} resolved sealed"
@@ -4495,18 +4466,10 @@ pub mod blob_invariants {
             // A seal WITHOUT data at the same tier is the v43 row: it opens
             // without data, and presenting data against it is refused — the
             // two entry points do not open each other's ciphertext.
-            let unbound = put_blob_scoped(
-                backend,
-                &adapter,
-                None,
-                scope,
-                Some(key),
-                b"unbound",
-                None,
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I40: an AAD-less seal at {scope}: {e}"));
+            let unbound =
+                put_blob_scoped(backend, &signer, scope, Some(key), b"unbound", None, None)
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag} I40: an AAD-less seal at {scope}: {e}"));
             assert_eq!(
                 read_any_for_viewer(backend, &unbound.at_rest_sha256, viewer, None)
                     .await
@@ -4528,17 +4491,7 @@ pub mod blob_invariants {
         // nothing stored.
         let body = b"public doc with a binding nobody could hold".to_vec();
         let id = sha(&body);
-        let res = put_blob_scoped(
-            backend,
-            &adapter,
-            None,
-            FEDERATION,
-            None,
-            &body,
-            None,
-            Some(a),
-        )
-        .await;
+        let res = put_blob_scoped(backend, &signer, FEDERATION, None, &body, None, Some(a)).await;
         assert!(
             matches!(res, Err(BlobError::InvalidArgument(_))),
             "{tag} I40: associated data at a PLAINTEXT tier must be refused, not silently \
@@ -4548,7 +4501,7 @@ pub mod blob_invariants {
             !backend.has_blob(&id).await.unwrap(),
             "{tag} I40: the refused commons write stored the row anyway"
         );
-        put_blob_scoped(backend, &adapter, None, FEDERATION, None, &body, None, None)
+        put_blob_scoped(backend, &signer, FEDERATION, None, &body, None, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I40: the commons write without data: {e}"));
         let res = read_any_for_viewer(backend, &id, &stranger, Some(a)).await;
@@ -4593,26 +4546,15 @@ pub mod blob_invariants {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I40: commons chunk without data: {e}"));
-        let res = seal_stream_scoped(
-            backend,
-            &adapter,
-            None,
-            FEDERATION,
-            None,
-            &stream,
-            None,
-            Some(a),
-        )
-        .await;
+        let res =
+            seal_stream_scoped(backend, &signer, FEDERATION, None, &stream, None, Some(a)).await;
         assert!(
             matches!(res, Err(BlobError::InvalidArgument(_))),
             "{tag} I40: a commons STREAM seal accepted associated data it cannot bind: {res:?}"
         );
-        let sealed = seal_stream_scoped(
-            backend, &adapter, None, FEDERATION, None, &stream, None, None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I40: commons seal without data: {e}"));
+        let sealed = seal_stream_scoped(backend, &signer, FEDERATION, None, &stream, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I40: commons seal without data: {e}"));
         let res =
             read_any_range_for_viewer(backend, &sealed.manifest_sha256, &stranger, 0, 2, Some(a))
                 .await;
@@ -4664,7 +4606,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let none: Vec<String> = Vec::new();
         let no_grants: Vec<MemberGrant> = Vec::new();
 
@@ -4682,8 +4623,7 @@ pub mod blob_invariants {
         .await;
         let res = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             COMMUNITY,
             Some(&comm),
             b"minutes",
@@ -4723,8 +4663,7 @@ pub mod blob_invariants {
         seed_community_shaped(backend, &comm2, &[(&lone, &[])]).await;
         let res2 = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             COMMUNITY,
             Some(&comm2),
             b"lone",
@@ -4769,8 +4708,7 @@ pub mod blob_invariants {
         revoke_member(backend, &comm3, &erin).await;
         let res3 = put_blob_scoped(
             backend,
-            &adapter,
-            None,
+            &signer,
             COMMUNITY,
             Some(&comm3),
             b"mixed",
@@ -4840,18 +4778,9 @@ pub mod blob_invariants {
             &[(&fay, &[]), (&gus, &[(&gus_phone, false)])],
         )
         .await;
-        let res4 = put_blob_scoped(
-            backend,
-            &adapter,
-            None,
-            FAMILY,
-            Some(&fam),
-            b"list",
-            None,
-            None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I54/4: family write: {e}"));
+        let res4 = put_blob_scoped(backend, &signer, FAMILY, Some(&fam), b"list", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I54/4: family write: {e}"));
         assert_eq!(res4.granted, none, "{tag} I54/4");
         assert_eq!(res4.excluded, vec![gus_phone.clone()], "{tag} I54/4");
         assert_eq!(
@@ -4871,18 +4800,9 @@ pub mod blob_invariants {
 
         let owner = format!("{tag}-owner-{run}");
         seed_member_shaped(backend, &owner, &[]).await;
-        let res5 = put_blob_scoped(
-            backend,
-            &adapter,
-            None,
-            SELF,
-            Some(&owner),
-            b"note",
-            None,
-            None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I54/4: self write: {e}"));
+        let res5 = put_blob_scoped(backend, &signer, SELF, Some(&owner), b"note", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I54/4: self write: {e}"));
         assert_eq!(
             res5.roster.absent,
             vec![owner.clone()],
@@ -4894,11 +4814,9 @@ pub mod blob_invariants {
         );
 
         // 5. A commons write is readable by everyone.
-        let res6 = put_blob_scoped(
-            backend, &adapter, None, FEDERATION, None, b"public", None, None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I54/5: commons write: {e}"));
+        let res6 = put_blob_scoped(backend, &signer, FEDERATION, None, b"public", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I54/5: commons write: {e}"));
         assert_eq!(
             res6.roster,
             RosterPartition::default(),
@@ -5064,7 +4982,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let our = signer.derived_key_id();
         let family = vec![format!("{tag}-fam-{run}")];
         let peer = format!("{tag}-peer-{run}");
@@ -5091,8 +5008,7 @@ pub mod blob_invariants {
         let prov = community_provenance(&peer, &comm, epoch);
         let err = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &stop,
             &env_peer,
             &prov,
@@ -5123,8 +5039,7 @@ pub mod blob_invariants {
             let prov = community_provenance(author, &comm, epoch);
             let out = adopt_sealed_blob(
                 backend,
-                &adapter,
-                None,
+                &signer,
                 &stop,
                 env,
                 &prov,
@@ -5166,8 +5081,7 @@ pub mod blob_invariants {
             };
             adopt_sealed_blob(
                 backend,
-                &adapter,
-                None,
+                &signer,
                 &stop,
                 &env,
                 &prov,
@@ -5183,8 +5097,7 @@ pub mod blob_invariants {
         let normal = hold_ctx(false, &our, &family);
         adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &normal,
             &env_peer,
             &prov,
@@ -5214,7 +5127,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let our = signer.derived_key_id();
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
@@ -5249,8 +5161,7 @@ pub mod blob_invariants {
         let prov = community_provenance(&peer, &theirs, ep_theirs);
         let err = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env_theirs,
             &prov,
@@ -5297,8 +5208,7 @@ pub mod blob_invariants {
             };
             let err = adopt_sealed_blob(
                 backend,
-                &adapter,
-                None,
+                &signer,
                 &ctx,
                 &env,
                 &prov,
@@ -5318,8 +5228,7 @@ pub mod blob_invariants {
         let prov_ours = community_provenance(&peer, &comm, ep_ours);
         adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env_ours,
             &prov_ours,
@@ -5345,8 +5254,7 @@ pub mod blob_invariants {
         let server_ctx = hold_ctx(false, &server, &family);
         let err = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &server_ctx,
             &env_theirs,
             &prov,
@@ -5384,7 +5292,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let our = signer.derived_key_id();
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
@@ -5415,8 +5322,7 @@ pub mod blob_invariants {
         let ctx = hold_ctx(false, &our, &family);
         adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env,
             &community_provenance(&peer, &comm, epoch),
@@ -5598,7 +5504,6 @@ pub mod blob_invariants {
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let our = signer.derived_key_id();
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
@@ -5628,8 +5533,7 @@ pub mod blob_invariants {
         backend.delete_blob(&sha_a).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env_a,
             &community_provenance(&peer, &ghost, 7),
@@ -5684,8 +5588,7 @@ pub mod blob_invariants {
         );
         let out = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env_b,
             &community_provenance(&peer, &ghost, old_epoch),
@@ -5736,7 +5639,6 @@ pub mod blob_invariants {
         let run = uuid::Uuid::new_v4().simple().to_string();
         let node = format!("{tag}-node-{run}");
         let signer = node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let our = signer.derived_key_id();
         let peer = format!("{tag}-peer-{run}");
         let family: Vec<String> = Vec::new();
@@ -5752,8 +5654,7 @@ pub mod blob_invariants {
         backend.delete_blob(&sha1).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env1,
             &community_provenance(&peer, &comm, epoch),
@@ -5780,8 +5681,7 @@ pub mod blob_invariants {
         backend.delete_blob(&sha2).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
-            &adapter,
-            None,
+            &signer,
             &ctx,
             &env2,
             &community_provenance(&peer, &comm, epoch),
@@ -5806,8 +5706,7 @@ pub mod blob_invariants {
             };
             let err = adopt_sealed_blob(
                 backend,
-                &adapter,
-                None,
+                &signer,
                 &ctx,
                 &env2,
                 &prov,
