@@ -392,6 +392,29 @@ pub mod two_node {
             .unwrap_or_else(|e| panic!("{tag} I61: A emits: {e}"))
             .expect("A holds wraps to emit");
 
+        // The set is what a PEER pulls: it rides the federation-tier
+        // attestation cursor (§14 — "listable by the replication reader"),
+        // under the epoch-axis row type, signed by the minter.
+        let served = a
+            .backend
+            .list_attestations_since(None, 1_000)
+            .await
+            .expect("the attestation cursor");
+        let row = served
+            .iter()
+            .find(|x| x.attestation.attestation_id == emitted.attestation_id)
+            .unwrap_or_else(|| {
+                panic!("{tag} I61: the emitted set is not on A's replication cursor")
+            });
+        assert_eq!(
+            row.attestation.attestation_type,
+            crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE
+        );
+        assert_eq!(
+            row.attestation.attesting_key_id, a.key,
+            "{tag} I61: signed by the minter"
+        );
+
         // The wire: the set, then the bytes.
         let admission = carry_key_grant(a, b, &emitted.attestation_id)
             .await
