@@ -1604,6 +1604,7 @@ pub trait BlobStorage: Send + Sync {
             media_type,
             attesting_key_id,
             signer,
+            None,
             now,
             attestation_id,
         )
@@ -1692,6 +1693,10 @@ pub trait BlobStorage: Send + Sync {
     /// commons wrapper and by the plaintext arm of
     /// [`put_blob_signing_scoped`](Self::put_blob_signing_scoped); there is no
     /// path through here for an encrypted tier.
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
     #[allow(clippy::too_many_arguments)]
     fn put_blob_signing_at<'s>(
         &'s self,
@@ -1702,6 +1707,7 @@ pub trait BlobStorage: Send + Sync {
         media_type: Option<&'s str>,
         attesting_key_id: &'s str,
         signer: &'s dyn ciris_keyring::HardwareSigner,
+        pqc: Option<&'s crate::signing::LocalSigner>,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
@@ -1721,8 +1727,9 @@ pub trait BlobStorage: Send + Sync {
             }
             // #846 — the claim is signed by the one helper the adopt door
             // also uses, so what a holder claim IS has one spelling.
-            let att = sign_holds_bytes_claim(signer, sha256, attesting_key_id, attestation_id, now)
-                .await?;
+            let att =
+                sign_holds_bytes_claim(signer, pqc, sha256, attesting_key_id, attestation_id, now)
+                    .await?;
             self.put_blob_with_scope(sha256, body, media_type, att, cohort_scope, floor)
                 .await
         }
@@ -1795,6 +1802,7 @@ pub trait BlobStorage: Send + Sync {
                         media_type,
                         attesting_key_id,
                         signer,
+                        None,
                         now,
                         attestation_id,
                     )
@@ -2795,8 +2803,13 @@ pub struct BlobProvenanceRow {
 /// does: the v31-shaped envelope, the produce-side canonicalizer, the
 /// signer's DERIVED key id as `scrub_key_id` (I23). One function, so the
 /// signing door and the adopt door cannot drift on what a holder claim is.
+///
+/// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+/// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+/// hybrid-signed so peers admit it.
 pub async fn sign_holds_bytes_claim(
     signer: &dyn ciris_keyring::HardwareSigner,
+    pqc: Option<&crate::signing::LocalSigner>,
     sha256: &[u8; 32],
     attesting_key_id: &str,
     attestation_id: uuid::Uuid,
@@ -2832,30 +2845,52 @@ pub async fn sign_holds_bytes_claim(
         })?;
     let original_content_hash_hex = hex::encode(Sha256::digest(&canonical_bytes));
 
-    let sig_bytes = signer
-        .sign(&canonical_bytes)
-        .await
-        .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
-    let scrub_signature_classical = B64.encode(&sig_bytes);
-    // v9.3.0 (#247) — the holds_bytes `scrub_key_id` FKs to
-    // `federation_keys(key_id)`, which is the DERIVED wire key_id
-    // (`<label>-<fp>`), NOT the keystore alias `current_alias()`.
-    // Using the alias FK-violated on every node whose alias ≠
-    // derived id (the same class as `attestation_promote` #247).
-    let signer_pubkey = signer.public_key().await.map_err(|e| {
-        BlobError::AttestationEmissionFailed(format!(
-            "holds_bytes derive scrub_key_id (signer public_key): {e}"
-        ))
-    })?;
-    let scrub_key_id =
-        ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &signer_pubkey);
+    // CIRISPersist#851 §20.5 — the claim is FEDERATION-tier: the cursor
+    // serves it and every peer's ingest gate demands the hybrid form
+    // (CC 5.3.2.4.3.1). With a `LocalSigner` in hand, sign both halves the
+    // way `attestation_emit::assemble` does — the classical half is the
+    // hybrid's classical half, the PQC half rides `scrub_signature_pqc`,
+    // and `scrub_key_id` is the signer's derived id. Without one, the
+    // classical-only claim stays confined to local tier.
+    let (scrub_signature_classical, scrub_signature_pqc, scrub_key_id) = match pqc {
+        Some(local) => {
+            let sig = local
+                .sign_hybrid(&canonical_bytes)
+                .await
+                .map_err(|e| BlobError::AttestationEmissionFailed(format!("sign_hybrid: {e}")))?;
+            (
+                B64.encode(&sig.classical.signature),
+                Some(B64.encode(&sig.pqc.signature)),
+                local.derived_key_id(),
+            )
+        }
+        None => {
+            let sig_bytes = signer
+                .sign(&canonical_bytes)
+                .await
+                .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
+            // v9.3.0 (#247) — the holds_bytes `scrub_key_id` FKs to
+            // `federation_keys(key_id)`, which is the DERIVED wire key_id
+            // (`<label>-<fp>`), NOT the keystore alias `current_alias()`.
+            // Using the alias FK-violated on every node whose alias ≠
+            // derived id (the same class as `attestation_promote` #247).
+            let signer_pubkey = signer.public_key().await.map_err(|e| {
+                BlobError::AttestationEmissionFailed(format!(
+                    "holds_bytes derive scrub_key_id (signer public_key): {e}"
+                ))
+            })?;
+            let scrub_key_id =
+                ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &signer_pubkey);
+            (B64.encode(&sig_bytes), None, scrub_key_id)
+        }
+    };
 
     Ok(PutBlobAttestation {
         attesting_key_id: attesting_key_id.to_string(),
         attestation_id: attestation_id.to_string(),
         original_content_hash_hex,
         scrub_signature_classical,
-        scrub_signature_pqc: None,
+        scrub_signature_pqc,
         scrub_key_id,
         scrub_timestamp: now,
         asserted_at: now,

@@ -2049,10 +2049,15 @@ pub mod orchestrate {
     /// row does not open there. `Some(aad)` at a plaintext tier is refused
     /// (`InvalidArgument`): nothing to bind it to, and dropping it would leave
     /// the caller believing in a binding that does not exist.
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_blob_scoped<B>(
         backend: &B,
         signer: &dyn ciris_keyring::HardwareSigner,
+        pqc: Option<&crate::signing::LocalSigner>,
         cohort_scope: &str,
         community_key_id: Option<&str>,
         plaintext: &[u8],
@@ -2096,6 +2101,7 @@ pub mod orchestrate {
                         media_type,
                         signer_key_id,
                         signer,
+                        pqc,
                         now,
                         uuid::Uuid::new_v4(),
                     )
@@ -2181,6 +2187,7 @@ pub mod orchestrate {
                         media_type,
                         signer_key_id,
                         signer,
+                        pqc,
                         now,
                         uuid::Uuid::new_v4(),
                     )
@@ -3161,6 +3168,7 @@ pub mod blob_invariants {
                 None,
                 &node_derived,
                 &adapter,
+                None,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3292,6 +3300,7 @@ pub mod blob_invariants {
         let res = put_blob_scoped(
             backend,
             &adapter,
+            None,
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             &body,
@@ -3488,6 +3497,7 @@ pub mod blob_invariants {
                 None,
                 &node_derived,
                 &adapter,
+                None,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3563,6 +3573,7 @@ pub mod blob_invariants {
                 None,
                 &node_derived,
                 &adapter,
+                None,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -3780,6 +3791,7 @@ pub mod blob_invariants {
         put_blob_scoped(
             backend,
             &adapter,
+            None,
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             &plaintext,
@@ -3801,6 +3813,7 @@ pub mod blob_invariants {
         put_blob_scoped(
             backend,
             &adapter,
+            None,
             crate::federation::types::cohort_scope::FEDERATION,
             None,
             &plaintext,
@@ -3851,6 +3864,7 @@ pub mod blob_invariants {
         let res = put_blob_scoped(
             backend,
             &adapter,
+            None,
             crate::federation::types::cohort_scope::COMMUNITY,
             Some(&comm),
             b"known-bad",
@@ -3898,6 +3912,7 @@ pub mod blob_invariants {
         let res = put_blob_scoped(
             backend,
             &adapter,
+            None,
             crate::federation::types::cohort_scope::FEDERATION,
             None,
             &body,
@@ -3940,6 +3955,7 @@ pub mod blob_invariants {
         let res = put_blob_scoped(
             backend,
             &adapter,
+            None,
             AFFILIATIONS,
             Some(&comm),
             b"affil",
@@ -4067,6 +4083,7 @@ pub mod blob_invariants {
                 None,
                 &node_derived,
                 &adapter,
+                None,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -4395,9 +4412,18 @@ pub mod blob_invariants {
             ),
         ] {
             let body = format!("message body sealed at {scope}").into_bytes();
-            let put = put_blob_scoped(backend, &adapter, scope, Some(key), &body, None, Some(a))
-                .await
-                .unwrap_or_else(|e| panic!("{tag} I40: seal at {scope} with associated data: {e}"));
+            let put = put_blob_scoped(
+                backend,
+                &adapter,
+                None,
+                scope,
+                Some(key),
+                &body,
+                None,
+                Some(a),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I40: seal at {scope} with associated data: {e}"));
             assert_eq!(
                 put.tier, tier,
                 "{tag} I40: precondition — {scope} resolved sealed"
@@ -4469,10 +4495,18 @@ pub mod blob_invariants {
             // A seal WITHOUT data at the same tier is the v43 row: it opens
             // without data, and presenting data against it is refused — the
             // two entry points do not open each other's ciphertext.
-            let unbound =
-                put_blob_scoped(backend, &adapter, scope, Some(key), b"unbound", None, None)
-                    .await
-                    .unwrap_or_else(|e| panic!("{tag} I40: an AAD-less seal at {scope}: {e}"));
+            let unbound = put_blob_scoped(
+                backend,
+                &adapter,
+                None,
+                scope,
+                Some(key),
+                b"unbound",
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I40: an AAD-less seal at {scope}: {e}"));
             assert_eq!(
                 read_any_for_viewer(backend, &unbound.at_rest_sha256, viewer, None)
                     .await
@@ -4494,7 +4528,17 @@ pub mod blob_invariants {
         // nothing stored.
         let body = b"public doc with a binding nobody could hold".to_vec();
         let id = sha(&body);
-        let res = put_blob_scoped(backend, &adapter, FEDERATION, None, &body, None, Some(a)).await;
+        let res = put_blob_scoped(
+            backend,
+            &adapter,
+            None,
+            FEDERATION,
+            None,
+            &body,
+            None,
+            Some(a),
+        )
+        .await;
         assert!(
             matches!(res, Err(BlobError::InvalidArgument(_))),
             "{tag} I40: associated data at a PLAINTEXT tier must be refused, not silently \
@@ -4504,7 +4548,7 @@ pub mod blob_invariants {
             !backend.has_blob(&id).await.unwrap(),
             "{tag} I40: the refused commons write stored the row anyway"
         );
-        put_blob_scoped(backend, &adapter, FEDERATION, None, &body, None, None)
+        put_blob_scoped(backend, &adapter, None, FEDERATION, None, &body, None, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I40: the commons write without data: {e}"));
         let res = read_any_for_viewer(backend, &id, &stranger, Some(a)).await;
@@ -4549,15 +4593,26 @@ pub mod blob_invariants {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I40: commons chunk without data: {e}"));
-        let res =
-            seal_stream_scoped(backend, &adapter, FEDERATION, None, &stream, None, Some(a)).await;
+        let res = seal_stream_scoped(
+            backend,
+            &adapter,
+            None,
+            FEDERATION,
+            None,
+            &stream,
+            None,
+            Some(a),
+        )
+        .await;
         assert!(
             matches!(res, Err(BlobError::InvalidArgument(_))),
             "{tag} I40: a commons STREAM seal accepted associated data it cannot bind: {res:?}"
         );
-        let sealed = seal_stream_scoped(backend, &adapter, FEDERATION, None, &stream, None, None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I40: commons seal without data: {e}"));
+        let sealed = seal_stream_scoped(
+            backend, &adapter, None, FEDERATION, None, &stream, None, None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I40: commons seal without data: {e}"));
         let res =
             read_any_range_for_viewer(backend, &sealed.manifest_sha256, &stranger, 0, 2, Some(a))
                 .await;
@@ -4628,6 +4683,7 @@ pub mod blob_invariants {
         let res = put_blob_scoped(
             backend,
             &adapter,
+            None,
             COMMUNITY,
             Some(&comm),
             b"minutes",
@@ -4668,6 +4724,7 @@ pub mod blob_invariants {
         let res2 = put_blob_scoped(
             backend,
             &adapter,
+            None,
             COMMUNITY,
             Some(&comm2),
             b"lone",
@@ -4713,6 +4770,7 @@ pub mod blob_invariants {
         let res3 = put_blob_scoped(
             backend,
             &adapter,
+            None,
             COMMUNITY,
             Some(&comm3),
             b"mixed",
@@ -4782,9 +4840,18 @@ pub mod blob_invariants {
             &[(&fay, &[]), (&gus, &[(&gus_phone, false)])],
         )
         .await;
-        let res4 = put_blob_scoped(backend, &adapter, FAMILY, Some(&fam), b"list", None, None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I54/4: family write: {e}"));
+        let res4 = put_blob_scoped(
+            backend,
+            &adapter,
+            None,
+            FAMILY,
+            Some(&fam),
+            b"list",
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I54/4: family write: {e}"));
         assert_eq!(res4.granted, none, "{tag} I54/4");
         assert_eq!(res4.excluded, vec![gus_phone.clone()], "{tag} I54/4");
         assert_eq!(
@@ -4804,9 +4871,18 @@ pub mod blob_invariants {
 
         let owner = format!("{tag}-owner-{run}");
         seed_member_shaped(backend, &owner, &[]).await;
-        let res5 = put_blob_scoped(backend, &adapter, SELF, Some(&owner), b"note", None, None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I54/4: self write: {e}"));
+        let res5 = put_blob_scoped(
+            backend,
+            &adapter,
+            None,
+            SELF,
+            Some(&owner),
+            b"note",
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I54/4: self write: {e}"));
         assert_eq!(
             res5.roster.absent,
             vec![owner.clone()],
@@ -4818,9 +4894,11 @@ pub mod blob_invariants {
         );
 
         // 5. A commons write is readable by everyone.
-        let res6 = put_blob_scoped(backend, &adapter, FEDERATION, None, b"public", None, None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I54/5: commons write: {e}"));
+        let res6 = put_blob_scoped(
+            backend, &adapter, None, FEDERATION, None, b"public", None, None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I54/5: commons write: {e}"));
         assert_eq!(
             res6.roster,
             RosterPartition::default(),
@@ -5014,6 +5092,7 @@ pub mod blob_invariants {
         let err = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &stop,
             &env_peer,
             &prov,
@@ -5045,6 +5124,7 @@ pub mod blob_invariants {
             let out = adopt_sealed_blob(
                 backend,
                 &adapter,
+                None,
                 &stop,
                 env,
                 &prov,
@@ -5087,6 +5167,7 @@ pub mod blob_invariants {
             adopt_sealed_blob(
                 backend,
                 &adapter,
+                None,
                 &stop,
                 &env,
                 &prov,
@@ -5103,6 +5184,7 @@ pub mod blob_invariants {
         adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &normal,
             &env_peer,
             &prov,
@@ -5168,6 +5250,7 @@ pub mod blob_invariants {
         let err = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env_theirs,
             &prov,
@@ -5215,6 +5298,7 @@ pub mod blob_invariants {
             let err = adopt_sealed_blob(
                 backend,
                 &adapter,
+                None,
                 &ctx,
                 &env,
                 &prov,
@@ -5235,6 +5319,7 @@ pub mod blob_invariants {
         adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env_ours,
             &prov_ours,
@@ -5261,6 +5346,7 @@ pub mod blob_invariants {
         let err = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &server_ctx,
             &env_theirs,
             &prov,
@@ -5330,6 +5416,7 @@ pub mod blob_invariants {
         adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env,
             &community_provenance(&peer, &comm, epoch),
@@ -5542,6 +5629,7 @@ pub mod blob_invariants {
         let out = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env_a,
             &community_provenance(&peer, &ghost, 7),
@@ -5597,6 +5685,7 @@ pub mod blob_invariants {
         let out = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env_b,
             &community_provenance(&peer, &ghost, old_epoch),
@@ -5664,6 +5753,7 @@ pub mod blob_invariants {
         let out = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env1,
             &community_provenance(&peer, &comm, epoch),
@@ -5691,6 +5781,7 @@ pub mod blob_invariants {
         let out = adopt_sealed_blob(
             backend,
             &adapter,
+            None,
             &ctx,
             &env2,
             &community_provenance(&peer, &comm, epoch),
@@ -5716,6 +5807,7 @@ pub mod blob_invariants {
             let err = adopt_sealed_blob(
                 backend,
                 &adapter,
+                None,
                 &ctx,
                 &env2,
                 &prov,

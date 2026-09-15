@@ -208,6 +208,7 @@ pub mod two_node {
         let out = adopt_sealed_blob(
             to.backend,
             &adapter,
+            None,
             &ctx,
             &bytes,
             &BlobProvenance {

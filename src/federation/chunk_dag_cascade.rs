@@ -372,9 +372,15 @@ pub mod orchestrate {
     /// `put_blob_scoped` does. `InvisibleEncrypted` announces nothing.
     ///
     /// `aad` is the #831 hook for the manifest's seal.
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn seal_stream_scoped<B>(
         backend: &B,
         signer: &dyn ciris_keyring::HardwareSigner,
+        pqc: Option<&crate::signing::LocalSigner>,
         cohort_scope: &str,
         community_key_id: Option<&str>,
         stream_id: &str,
@@ -451,6 +457,7 @@ pub mod orchestrate {
                         media_type,
                         &signer_key_id,
                         signer,
+                        pqc,
                         now,
                         uuid::Uuid::new_v4(),
                     )
@@ -561,6 +568,7 @@ pub mod orchestrate {
                                     media_type,
                                     &signer_key_id,
                                     signer,
+                                    pqc,
                                     now,
                                     uuid::Uuid::new_v4(),
                                 )
@@ -1362,10 +1370,18 @@ pub mod invariants {
             shas.push(r.chunk_sha256);
             plain.extend_from_slice(seg);
         }
-        let sealed =
-            seal_stream_scoped(backend, adapter, COMMUNITY, Some(comm), stream, None, None)
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: a community stream must seal: {e}"));
+        let sealed = seal_stream_scoped(
+            backend,
+            adapter,
+            None,
+            COMMUNITY,
+            Some(comm),
+            stream,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: a community stream must seal: {e}"));
         assert_eq!(sealed.chunk_count, segments.len() as u64);
         assert_eq!(sealed.total_size, plain.len() as u64);
         (sealed.manifest_sha256, shas, plain)
@@ -1494,6 +1510,7 @@ pub mod invariants {
             let res = seal_stream_scoped(
                 backend,
                 &adapter,
+                None,
                 COMMUNITY,
                 Some(&comm),
                 &same_cohort,
@@ -1522,6 +1539,7 @@ pub mod invariants {
         let res = seal_stream_scoped(
             backend,
             &adapter,
+            None,
             COMMUNITY,
             Some(&comm),
             &commons,
@@ -1830,9 +1848,18 @@ pub mod invariants {
             chunk_shas.push(r.chunk_sha256);
             plain.extend_from_slice(seg);
         }
-        let sealed = seal_stream_scoped(backend, &adapter, SELF, Some(&owner), &stream, None, None)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I34b: seal: {e}"));
+        let sealed = seal_stream_scoped(
+            backend,
+            &adapter,
+            None,
+            SELF,
+            Some(&owner),
+            &stream,
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I34b: seal: {e}"));
         let manifest = sealed.manifest_sha256;
         for s in chunk_shas.iter().chain(std::iter::once(&manifest)) {
             assert!(
@@ -1920,10 +1947,18 @@ pub mod invariants {
             .unwrap();
             let later_occ = format!("{tag}-owner-later-occ-{run}");
             seed_occurrence(backend, &owner, &later_occ).await;
-            let sealed2 =
-                seal_stream_scoped(backend, &adapter, SELF, Some(&owner), &stream2, None, None)
-                    .await
-                    .unwrap();
+            let sealed2 = seal_stream_scoped(
+                backend,
+                &adapter,
+                None,
+                SELF,
+                Some(&owner),
+                &stream2,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 sealed2.granted.contains(&later_occ),
                 "{tag} I34b: the later occurrence is granted on the manifest"
@@ -2294,6 +2329,7 @@ pub mod invariants {
         let sealed = seal_stream_scoped(
             backend,
             &adapter,
+            None,
             COMMUNITY,
             Some(&comm),
             &stream,
@@ -2565,6 +2601,7 @@ pub mod invariants {
         let res = seal_stream_scoped(
             backend,
             &writer_b,
+            None,
             COMMUNITY,
             Some(&comm),
             &stream,
@@ -2584,6 +2621,7 @@ pub mod invariants {
         let res = seal_stream_scoped(
             backend,
             &writer_a,
+            None,
             COMMUNITY,
             Some(&other),
             &stream,
@@ -2602,6 +2640,7 @@ pub mod invariants {
         let sealed = seal_stream_scoped(
             backend,
             &writer_a,
+            None,
             COMMUNITY,
             Some(&comm),
             &stream,
@@ -2649,6 +2688,7 @@ pub mod invariants {
         match seal_stream_scoped(
             backend,
             &writer_a,
+            None,
             COMMUNITY,
             Some(&comm),
             &mixed,
@@ -2937,6 +2977,7 @@ pub mod invariants {
         let sealed2 = seal_stream_scoped(
             backend,
             &writer,
+            None,
             COMMUNITY,
             Some(&comm),
             &stream2,
@@ -3049,6 +3090,7 @@ pub mod invariants {
         let sealed_sparse = seal_stream_scoped(
             backend,
             &writer,
+            None,
             COMMUNITY,
             Some(&comm),
             &sparse,

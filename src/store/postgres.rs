@@ -548,7 +548,10 @@ impl PostgresBackend {
                 sqlstate: None,
                 detail: format!("postgres minter-sentinel resolution (#848): count: {e}"),
             })?;
-        let remaining: i64 = row.get("n");
+        let remaining: i64 = row.safe_get_with("n", |detail| Error::Migration {
+            sqlstate: None,
+            detail,
+        })?;
         if remaining != 0 {
             let _ = tx.rollback().await;
             return Err(Error::Migration {
@@ -13550,7 +13553,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("community_dek_key_grant_dirty: {e}"))
             })?;
-        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+        Ok(match row {
+            Some(r) => r.safe_get_with(0, crate::federation::BlobError::Backend)?,
+            None => false,
+        })
     }
 
     async fn community_dek_key_grant_watermark(
@@ -13576,7 +13582,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     "community_dek_key_grant_watermark: {e}"
                 ))
             })?;
-        Ok(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0))
+        row.safe_get_with(0, crate::federation::BlobError::Backend)
     }
 
     async fn community_dek_mark_key_grant_emitted(
@@ -13636,10 +13642,14 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     "community_dek_list_key_grant_dirty: {e}"
                 ))
             })?;
-        Ok(rows
-            .iter()
-            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1) as u64))
-            .collect())
+        rows.iter()
+            .map(|r| {
+                let community: String =
+                    r.safe_get_with(0, crate::federation::BlobError::Backend)?;
+                let epoch: i64 = r.safe_get_with(1, crate::federation::BlobError::Backend)?;
+                Ok((community, epoch as u64))
+            })
+            .collect()
     }
 
     async fn blob_key_grant_dirty(
@@ -13667,7 +13677,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("blob_key_grant_dirty: {e}"))
             })?;
-        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+        Ok(match row {
+            Some(r) => r.safe_get_with(0, crate::federation::BlobError::Backend)?,
+            None => false,
+        })
     }
 
     async fn blob_key_grant_watermark(
@@ -13690,7 +13703,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("blob_key_grant_watermark: {e}"))
             })?;
-        Ok(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0))
+        row.safe_get_with(0, crate::federation::BlobError::Backend)
     }
 
     async fn blob_mark_key_grant_emitted(
@@ -13742,7 +13755,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
             })?;
         Ok(rows
             .iter()
-            .filter_map(|r| <[u8; 32]>::try_from(r.get::<_, Vec<u8>>(0).as_slice()).ok())
+            .filter_map(|r| {
+                r.safe_get_with::<Vec<u8>, _, _, _>(0, crate::federation::BlobError::Backend)
+                    .ok()
+                    .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            })
             .collect())
     }
 
@@ -26490,6 +26507,7 @@ mod tests {
                             None,
                             &key,
                             &ad,
+                            None,
                             chrono::Utc::now(),
                             uuid::Uuid::new_v4(),
                         )

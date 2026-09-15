@@ -2029,6 +2029,7 @@ pub mod lifecycle_harness {
                 None,
                 &sweeper_id,
                 &crate::signing::LocalSignerHardwareAdapter::new(sweeper.clone()),
+                None,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )

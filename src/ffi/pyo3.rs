@@ -13119,6 +13119,10 @@ impl PyEngine {
             let scope = cohort_scope.to_owned();
             let comm = community_key_id.map(str::to_owned);
             let media = media_type.map(str::to_owned);
+            // CIRISPersist#851 §20.5: a classical-only claim is confined to local
+            // tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is hybrid-signed
+            // so peers admit it — passed as `pqc` from `self`, so the Python
+            // signature is unchanged.
             // §11.2 (6) / I23 — announce under the identity the sweep retracts
             // under: the LOCAL signer when one is configured (what
             // `sweep_community_epochs` uses), else the composed signer. The
@@ -13138,6 +13142,7 @@ impl PyEngine {
                             put_blob_scoped(
                                 backend.as_ref(),
                                 &*signer,
+                                self.local_signer.as_deref(),
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -13154,6 +13159,7 @@ impl PyEngine {
                             put_blob_scoped(
                                 backend.as_ref(),
                                 &*signer,
+                                self.local_signer.as_deref(),
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -13797,6 +13803,10 @@ impl PyEngine {
             let comm = community_key_id.map(str::to_owned);
             let stream = stream_id.to_owned();
             let media = media_type.map(str::to_owned);
+            // CIRISPersist#851 §20.5: a classical-only claim is confined to local
+            // tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is hybrid-signed
+            // so peers admit it — passed as `pqc` from `self`, so the Python
+            // signature is unchanged.
             // §11.2 (6) / I23 — announce under the identity the sweep retracts
             // under: the LOCAL signer when one is configured, else the
             // composed signer; the key id is derived from whichever signs.
@@ -13815,6 +13825,7 @@ impl PyEngine {
                             seal_stream_scoped(
                                 backend.as_ref(),
                                 &*signer,
+                                self.local_signer.as_deref(),
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -13831,6 +13842,7 @@ impl PyEngine {
                             seal_stream_scoped(
                                 backend.as_ref(),
                                 &*signer,
+                                self.local_signer.as_deref(),
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
