@@ -2175,33 +2175,33 @@ impl PyEngine {
         // signer's public key may be a device round trip: `py.detach`.
         {
             let signer_for_key = signer.clone();
-            let key = py.detach(|| {
-                runtime.block_on(crate::signing::federation_key_id_of(&*signer_for_key))
-            });
-            if let Ok(key) = key {
-                match &backend {
-                    #[cfg(feature = "postgres")]
-                    BackendDispatch::Postgres(pg) => {
-                        let pg = pg.clone();
-                        let k = key.clone();
-                        py.detach(|| runtime.block_on(pg.repair_minter_sentinel(&k)))
-                            .map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "V145 minter sentinel resolution (#848): {e}"
-                                ))
-                            })?;
-                    }
-                    #[cfg(feature = "sqlite")]
-                    BackendDispatch::Sqlite(sq) => {
-                        let sq = sq.clone();
-                        let k = key.clone();
-                        py.detach(|| runtime.block_on(sq.repair_minter_sentinel(&k)))
-                            .map_err(|e| {
-                                PyRuntimeError::new_err(format!(
-                                    "V145 minter sentinel resolution (#848): {e}"
-                                ))
-                            })?;
-                    }
+            // A signer that cannot name itself resolves nothing — and a
+            // sentinel that exists still aborts (fail-secure).
+            let key: Option<String> = py
+                .detach(|| runtime.block_on(crate::signing::federation_key_id_of(&*signer_for_key)))
+                .ok();
+            match &backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let pg = pg.clone();
+                    let k = key.clone();
+                    py.detach(|| runtime.block_on(pg.repair_minter_sentinel(k.as_deref())))
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "V145 minter sentinel resolution (#848): {e}"
+                            ))
+                        })?;
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let sq = sq.clone();
+                    let k = key.clone();
+                    py.detach(|| runtime.block_on(sq.repair_minter_sentinel(k.as_deref())))
+                        .map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "V145 minter sentinel resolution (#848): {e}"
+                            ))
+                        })?;
                 }
             }
         }

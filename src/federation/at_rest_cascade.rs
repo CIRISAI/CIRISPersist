@@ -4056,7 +4056,6 @@ pub mod blob_invariants {
             encrypt_and_cascade_community, read_for_community_viewer, sweep_rotated_epochs,
         };
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -4065,6 +4064,9 @@ pub mod blob_invariants {
         let stranger = format!("{tag}-stranger-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ), (&bob, &bob_occ)]).await;
         let sweeper = node_signer(backend, &format!("{tag}-sweeper-{run}")).await;
+        // #848 — the sweep runs over the signer's own counter: the sweeper
+        // is the minter of everything sealed below.
+        let minter = sweeper.derived_key_id();
 
         let sealed = encrypt_and_cascade_community(backend, &comm, b"minutes", None, Some(&minter))
             .await

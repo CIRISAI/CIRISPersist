@@ -493,7 +493,13 @@ impl PostgresBackend {
     /// sentinel to this node's own key. Postgres twin of the sqlite repair;
     /// see it for the reasoning. One transaction; a surviving sentinel aborts
     /// the boot. Returns the rows resolved.
-    pub(crate) async fn repair_minter_sentinel(&self, node_key_id: &str) -> Result<usize, Error> {
+    ///
+    /// `node_key_id = None` — nothing is resolved, a surviving sentinel still
+    /// aborts (see the sqlite twin).
+    pub(crate) async fn repair_minter_sentinel(
+        &self,
+        node_key_id: Option<&str>,
+    ) -> Result<usize, Error> {
         let mut client = self
             .pool
             .get()
@@ -505,22 +511,26 @@ impl PostgresBackend {
         })?;
         let sentinel = crate::federation::key_grant::MINTER_SENTINEL;
         let mut n = 0usize;
-        for table in [
-            "cirislens.federation_community_dek_epoch",
-            "cirislens.federation_community_dek",
-            "cirislens.federation_community_dek_member_grants",
-            "cirislens.federation_community_blob_epoch",
-        ] {
-            n += tx
-                .execute(
-                    &format!("UPDATE {table} SET minter_key_id = $1 WHERE minter_key_id = $2"),
-                    &[&node_key_id, &sentinel],
-                )
-                .await
-                .map_err(|e| Error::Migration {
-                    sqlstate: None,
-                    detail: format!("postgres minter-sentinel resolution (#848): {table}: {e}"),
-                })? as usize;
+        if let Some(node) = node_key_id {
+            for table in [
+                "cirislens.federation_community_dek_epoch",
+                "cirislens.federation_community_dek",
+                "cirislens.federation_community_dek_member_grants",
+                "cirislens.federation_community_blob_epoch",
+            ] {
+                n += tx
+                    .execute(
+                        &format!("UPDATE {table} SET minter_key_id = $1 WHERE minter_key_id = $2"),
+                        &[&node, &sentinel],
+                    )
+                    .await
+                    .map_err(|e| Error::Migration {
+                        sqlstate: None,
+                        detail: format!(
+                            "postgres minter-sentinel resolution (#848): {table}: {e}"
+                        ),
+                    })? as usize;
+            }
         }
         let row = tx
             .query_one(
@@ -8467,13 +8477,30 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // remaining members. Forward-only — blobs already sealed under the
         // old epoch keep their grants. A spurious extra bump only skips an
         // epoch number (the DEK is minted lazily on next emission).
-        // #848 (§15) — PER MINTER: every pointer row on this node is a
-        // counter THIS node owns (a peer's counter never has a pointer here),
-        // so all of them advance; and this node's own counter advances even
-        // when it has no row yet, when the node key is known. A node that
-        // seals later without a pointer row is covered by
-        // `ensure_epoch_dek`'s removal-vs-mint compare (§15).
+        // #848 (§15) — PER MINTER: every counter on this node is one THIS
+        // node owns (a peer's epoch never has a self-retention row or a
+        // pointer here), so all of them advance. A minter that has minted (a
+        // self-retention row) but never rotated has no pointer row yet —
+        // epoch 0 is implicit — so its pointer is materialised at 0 first and
+        // then advanced with the rest; and this node's own counter advances
+        // even before it has minted, when the node key is known.
+        // `ensure_epoch_dek`'s removal-vs-mint compare (§15) is the backstop
+        // for a removal admitted where none of this ran.
         let node_key: Option<String> = self.node_key_id.read().expect("node_key_id lock").clone();
+        tx.execute(
+            "INSERT INTO cirislens.federation_community_dek_epoch \
+                (community_key_id, minter_key_id, epoch, rotated_at) \
+             SELECT DISTINCT community_key_id, minter_key_id, 0, NOW() \
+               FROM cirislens.federation_community_dek WHERE community_key_id = $1 \
+             ON CONFLICT (community_key_id, minter_key_id) DO NOTHING",
+            &[&row.community_key_id],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "community DEK rotation-on-removal (pointer): {e}"
+            ))
+        })?;
         if let Some(node) = &node_key {
             tx.execute(
                 "INSERT INTO cirislens.federation_community_dek_epoch \

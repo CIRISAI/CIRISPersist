@@ -503,6 +503,37 @@ pub mod orchestrate {
                 epoch = next;
             }
         }
+        // §15, the other half — an epoch the pointer has ALREADY moved past
+        // (the revocation door bumped this minter's counter when the removal
+        // was admitted) but that is still `enabled` and was minted before
+        // that removal: it must stop accepting seals now, not at the next
+        // sweep. A removed member holds a wrap on it; "rotated past" has to
+        // mean it. Only this minter's own epochs, only ones older than the
+        // latest effective removal.
+        if let Some(removed_at) = latest_removed_at {
+            for (past, state) in backend
+                .community_dek_epochs(community_key_id, minter_key_id)
+                .await?
+            {
+                if past >= epoch || state != DekKeyState::Enabled {
+                    continue;
+                }
+                let minted_before = backend
+                    .community_dek_minted_at(community_key_id, minter_key_id, past)
+                    .await?
+                    .is_some_and(|m| m < removed_at);
+                if minted_before {
+                    set_key_state(
+                        backend,
+                        community_key_id,
+                        minter_key_id,
+                        past,
+                        DekKeyState::Disabled,
+                    )
+                    .await?;
+                }
+            }
+        }
 
         // v43.0.0 (§10.5) — NEVER SEAL UNDER A NON-ENABLED EPOCH.
         //

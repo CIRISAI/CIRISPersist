@@ -1072,6 +1072,10 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
+        // v44.3.0 (CIRISPersist#848, I66) — see `with_signer`. The I66 boot
+        // witness found this constructor without the hook: a pre-genesis
+        // node with V145 sentinels would have served a minter of nobody.
+        engine.resolve_minter_sentinels_at_boot().await?;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -5296,27 +5300,30 @@ impl Engine {
     /// reason. Runs before any read; a sentinel that survives aborts the
     /// boot. Idempotent: a no-op on every boot but the first after V145.
     async fn resolve_minter_sentinels_at_boot(&self) -> Result<(), EngineError> {
-        let key = match self.local_derived_key_id().await {
-            Ok(k) => k,
-            // No Ed25519 federation identity: this node mints nothing and
-            // holds no key state to resolve. A sentinel on such a node would
-            // be found by the first Engine that CAN name itself.
-            Err(_) => return Ok(()),
-        };
+        // No Ed25519 federation identity ⇒ nothing to resolve TO — but a
+        // sentinel that exists is still a minter of nobody, and the boot must
+        // not proceed on it (fail-secure: the backend counts and refuses).
+        let key = self.local_derived_key_id().await.ok();
         #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
         let _ = key;
         #[cfg(feature = "sqlite")]
         if let Some(b) = self.sqlite_backend() {
-            let n = b.repair_minter_sentinel(&key).await.map_err(EngineError::Store)?;
+            let n = b
+                .repair_minter_sentinel(key.as_deref())
+                .await
+                .map_err(EngineError::Store)?;
             if n > 0 {
-                tracing::info!(rows = n, node = %key, "V145 minter sentinel resolved (#848)");
+                tracing::info!(rows = n, node = ?key, "V145 minter sentinel resolved (#848)");
             }
         }
         #[cfg(feature = "postgres")]
         if let Some(b) = self.postgres_backend() {
-            let n = b.repair_minter_sentinel(&key).await.map_err(EngineError::Store)?;
+            let n = b
+                .repair_minter_sentinel(key.as_deref())
+                .await
+                .map_err(EngineError::Store)?;
             if n > 0 {
-                tracing::info!(rows = n, node = %key, "V145 minter sentinel resolved (#848)");
+                tracing::info!(rows = n, node = ?key, "V145 minter sentinel resolved (#848)");
             }
         }
         Ok(())
@@ -19195,7 +19202,21 @@ mod tests {
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
-        self_login_seed_key(&engine, &steward_derived, identity_type::STEWARD).await;
+        // #848 — the engine's own key is registered with its REAL hybrid
+        // pubkeys: a self write now emits a federation-tier `KeyGrant` set
+        // (the content axis, §14), which the ingest gate verifies against
+        // this row. The fake `'AAAA'` row the other self-login tests seed
+        // can verify nothing.
+        engine
+            .register_self_federation_key(
+                identity_type::STEWARD,
+                &steward_derived,
+                None,
+                serde_json::json!({}),
+                vec![],
+            )
+            .await
+            .expect("register the engine's own key");
 
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let (identity_key, _identity_signer) =

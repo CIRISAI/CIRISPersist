@@ -84,6 +84,10 @@ pub mod identity_aggregate;
 // v44.3.0 (CIRISPersist#848, BLOB_REPLICATION.md Part II) — key transport:
 // the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
 pub mod key_grant;
+// #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
+// consumers can drive them against their own backends.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod key_grant_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed

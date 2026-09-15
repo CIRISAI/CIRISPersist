@@ -2777,7 +2777,6 @@ pub mod invariants {
         use crate::federation::community_dek::orchestrate::ensure_epoch_dek;
         use crate::federation::{StorageFloor, StreamClaim};
         let run = uuid::Uuid::new_v4().simple().to_string();
-        let minter = format!("{tag}-minter-{run}");
         let comm = format!("{tag}-comm-{run}");
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
@@ -2791,6 +2790,9 @@ pub mod invariants {
             .await,
         );
         let owner = crate::signing::federation_key_id_of(&writer).await.unwrap();
+        // #848 — the writer IS the minter (I23): the floor is driven below
+        // under the epoch the door minted for this key.
+        let minter = owner.clone();
         let stream = format!("{tag}-stream-{run}");
         let segs = [segment(31, 100), segment(32, 200)];
         let (manifest, shas, plain) =

@@ -427,23 +427,32 @@ impl SqliteBackend {
     /// minter of nobody is a key nobody can be asked for, and a read that
     /// dispatched on it would name an epoch that belongs to no one. Returns
     /// the rows resolved.
-    pub(crate) async fn repair_minter_sentinel(&self, node_key_id: &str) -> Result<usize, Error> {
-        let node = node_key_id.to_owned();
+    ///
+    /// `node_key_id = None` — the Engine could not derive a key (no Ed25519
+    /// identity): nothing is resolved, but a sentinel that exists still
+    /// aborts. Fail-secure both ways.
+    pub(crate) async fn repair_minter_sentinel(
+        &self,
+        node_key_id: Option<&str>,
+    ) -> Result<usize, Error> {
+        let node = node_key_id.map(str::to_owned);
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
             let tx = conn.transaction()?;
             let mut n = 0usize;
-            for table in [
-                "federation_community_dek_epoch",
-                "federation_community_dek",
-                "federation_community_dek_member_grants",
-                "federation_community_blob_epoch",
-            ] {
-                n += tx.execute(
-                    &format!(
-                        "UPDATE {table} SET minter_key_id = ?1 WHERE minter_key_id = ?2"
-                    ),
-                    rusqlite::params![node, crate::federation::key_grant::MINTER_SENTINEL],
-                )?;
+            if let Some(node) = &node {
+                for table in [
+                    "federation_community_dek_epoch",
+                    "federation_community_dek",
+                    "federation_community_dek_member_grants",
+                    "federation_community_blob_epoch",
+                ] {
+                    n += tx.execute(
+                        &format!(
+                            "UPDATE {table} SET minter_key_id = ?1 WHERE minter_key_id = ?2"
+                        ),
+                        rusqlite::params![node, crate::federation::key_grant::MINTER_SENTINEL],
+                    )?;
+                }
             }
             let remaining: i64 = tx.query_row(
                 "SELECT (SELECT COUNT(*) FROM federation_community_dek_epoch WHERE minter_key_id = ?1) \
@@ -457,7 +466,8 @@ impl SqliteBackend {
                 return Err(rusqlite::Error::ToSqlConversionFailure(
                     format!(
                         "{remaining} community-DEK row(s) still carry the V145 minter sentinel \
-                         after resolution to {node:?}; a minter of nobody cannot be served \
+                         after resolution to {node:?} (None = no Ed25519 identity to resolve \
+                         to); a minter of nobody cannot be served \
                          (CIRISPersist#848, BLOB_REPLICATION.md §16)"
                     )
                     .into(),
@@ -7910,12 +7920,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // grants. A spurious extra bump only skips an epoch number, which
             // is harmless (the DEK is minted lazily on next emission).
             //
-            // #848 (§15) — PER MINTER: every pointer row on this node is a
-            // counter THIS node owns (a peer's counter never has a pointer
-            // here), so all of them advance; and this node's own counter
-            // advances even when it has no row yet, when the node key is
-            // known. A node that seals later without a pointer row is covered
-            // by `ensure_epoch_dek`'s removal-vs-mint compare (§15).
+            // #848 (§15) — PER MINTER: every counter on this node is one
+            // THIS node owns (a peer's epoch never has a self-retention row
+            // or a pointer here), so all of them advance. A minter that has
+            // minted (a self-retention row) but never rotated has no pointer
+            // row yet — epoch 0 is implicit — so its pointer is materialised
+            // at 0 first and then advanced with the rest; and this node's own
+            // counter advances even before it has minted, when the node key
+            // is known. `ensure_epoch_dek`'s removal-vs-mint compare (§15) is
+            // the backstop for a removal admitted where none of this ran.
+            tx.execute(
+                "INSERT INTO federation_community_dek_epoch \
+                    (community_key_id, minter_key_id, epoch, rotated_at) \
+                 SELECT DISTINCT community_key_id, minter_key_id, 0, \
+                        strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                   FROM federation_community_dek WHERE community_key_id = ?1 \
+                 ON CONFLICT (community_key_id, minter_key_id) DO NOTHING",
+                rusqlite::params![row.community_key_id],
+            )?;
             if let Some(node) = &node_key {
                 tx.execute(
                     "INSERT INTO federation_community_dek_epoch \
@@ -30366,15 +30388,19 @@ mod tests {
         use crate::federation::{BlobStorage, DekKeyState};
 
         let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // #848 — the sweep runs over the SIGNER's own counter, so the node
+        // that mints here is the sweeper.
+        let sweeper = test_signer_for("sweeper");
+        let minter = sweeper.derived_key_id();
+        backend.set_node_key_id(&minter);
         let old = encrypt_and_cascade_community(&backend, "comm", b"old minutes", None, None)
             .await
             .unwrap();
-        backend.community_dek_bump_epoch("comm", "comm-node").await.unwrap();
+        backend.community_dek_bump_epoch("comm", &minter).await.unwrap();
         encrypt_and_cascade_community(&backend, "comm", b"new minutes", None, None)
             .await
             .unwrap();
 
-        let sweeper = test_signer_for("sweeper");
         let report = sweep_rotated_epochs(&backend, "comm", &sweeper, chrono::Utc::now())
             .await
             .unwrap();
@@ -30399,7 +30425,7 @@ mod tests {
         // still readable. That is the whole difference.
         assert_eq!(
             backend
-                .community_dek_key_state("comm", "comm-node", old.epoch)
+                .community_dek_key_state("comm", &minter, old.epoch)
                 .await
                 .unwrap(),
             Some(DekKeyState::Disabled)
@@ -30425,10 +30451,15 @@ mod tests {
         use crate::federation::{BlobStorage, DekKeyState};
 
         let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // #848 — the sweep runs over the SIGNER's own counter, so the node
+        // that mints here is the sweeper.
+        let sweeper = test_signer_for("sweeper");
+        let minter = sweeper.derived_key_id();
+        backend.set_node_key_id(&minter);
         let old = encrypt_and_cascade_community(&backend, "comm", b"old minutes", None, None)
             .await
             .unwrap();
-        backend.community_dek_bump_epoch("comm", "comm-node").await.unwrap();
+        backend.community_dek_bump_epoch("comm", &minter).await.unwrap();
         let new = encrypt_and_cascade_community(&backend, "comm", b"new minutes", None, None)
             .await
             .unwrap();
@@ -30445,7 +30476,6 @@ mod tests {
             .unwrap();
         }
 
-        let sweeper = test_signer_for("sweeper");
         let report = sweep_rotated_epochs(&backend, "comm", &sweeper, chrono::Utc::now())
             .await
             .unwrap();
@@ -30458,7 +30488,7 @@ mod tests {
 
         assert_eq!(
             backend
-                .community_dek_key_state("comm", "comm-node", old.epoch)
+                .community_dek_key_state("comm", &minter, old.epoch)
                 .await
                 .unwrap(),
             Some(DekKeyState::Destroyed)

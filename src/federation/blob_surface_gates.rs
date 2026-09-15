@@ -96,6 +96,12 @@ mod tests {
             ("adopt_sealed_blob(", "adopt_sealed_blob"),
             ("would_hold(", "would_hold"),
             ("hold_breadth(", "hold_breadth"),
+            // #848 (BLOB_REPLICATION.md §12–§14) — the key follows the bytes:
+            // the admit door a replication bridge routes a `KeyGrant` to, and
+            // the re-emission door. A member's node that can adopt bytes but
+            // cannot admit the key is the state #848 was opened on.
+            ("apply_replicated_key_grant(", "apply_replicated_key_grant"),
+            ("emit_key_grant(", "emit_key_grant"),
         ];
         let mut missing = Vec::new();
         for (sym, _) in ops {

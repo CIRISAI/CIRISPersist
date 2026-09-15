@@ -82,6 +82,54 @@ revisited, its allocation lands in a stable place.
 
 ---
 
+## Replicated `EnvelopeKind`s — the sixteenth kind, `KeyGrant` (v44.3.0, #848)
+
+Distinct from the Tier-2 `kind: u32` range above: the **replicated wire
+kinds** are the closed `EnvelopeKind` set persist owns as the APPLY authority
+(`src/federation/replication_policy.rs`, pinned by `REPLICATION_POLICY_HASH`;
+CIRISEdge's `replication::protocol::EnvelopeKind` mirrors the names in order,
+CIRISServer pins the hash). Fifteen kinds shipped through v44.2.1; v44.3.0
+**appends** the sixteenth — never inserts, the order is hashed:
+
+| # | `EnvelopeKind` | carries | signer | binding | projections |
+|---|---|---|---|---|---|
+| 16 | `KeyGrant` | one CC 3 `key_grant` **set**: every recipient wrap for one identity | `RegisteredSigner` | `SelfOwn` | `[KeyGrants]` |
+
+- **Wire shape.** A `SignedKeyGrantSet` is an attestation row whose
+  `attestation_type` is `key_grant:epoch:v1` (epoch axis: identity
+  `(community_key_id, minter_key_id, epoch)`, signed by the MINTER's
+  occurrence key) or `key_grant:content:v1` (content axis: identity
+  `(at_rest_sha256, cohort_scope, owner_key_id)`, signed by the blob's
+  AUTHOR), and whose envelope carries `{"kind":"key_grant", "axis", …identity…,
+  "wraps":[{"recipient_occurrence_key_id","wrap_algorithm","wrapped_dek"}]}`
+  — CC 3's vocabulary, canonicalised and hybrid-signed like every other
+  attestation. It rides the attestation cursor (`list_attestations_since`);
+  a receiver routes it by `attestation_type` to `apply_replicated_key_grant`.
+- **Admission** (`key_grant::admit_replicated_key_grant`): the signer is
+  resolved from the admitting node's own directory; epoch axis — the signer
+  is the set's `minter_key_id` AND an active member of the community at
+  `asserted_at` per the replicated roster fold; content axis — the signer is
+  the blob row's `author_key_id` when the row is present (accepted before the
+  row arrives: order independence); every wrap is v2. Anything else is a
+  typed `federation_key_grant_refused`.
+- **Projection** `KeyGrants`: every wrap, in one transaction, as a UNION
+  (`ON CONFLICT DO NOTHING`). Grants are never retracted (CC 3: "cannot
+  retroactively un-share"); forward secrecy is by rotation. There is no
+  withdraw for this kind.
+- **Plane.** `Plane::KeyGrant { axis }` projects `SelfOwn` at self / family
+  (the content axis) and `Cohort` everywhere else (the epoch axis); never
+  `Global`. Tombstone ceiling: the row max, `Cohort` — unreachable, since the
+  kind has no withdraw.
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `3af30bcc…23bbef` → `c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d`;
+  `CONSENT_GRAMMAR_HASH` (its `kind_transferability` covers the kind list;
+  `KeyGrant` is `StructuralPlane`)
+  `b66870da…290d69f` → `79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac`.
+
+`FSD/BLOB_REPLICATION.md` Part II (§11–§19) is the design.
+
+---
+
 ## Why persist exposes no `send_trace_batch` wrapper
 
 §3.3's worked example — `CIRISAgent::send_inline_text(text)` wrapping
