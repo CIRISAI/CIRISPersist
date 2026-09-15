@@ -12322,6 +12322,19 @@ fn scope_blob_symbol_from_sqlite_row(
     })
 }
 
+/// #848 §14 (V146) — the ledger's TEXT instant, byte-compatible with the
+/// grant tables' `created_at` default (`strftime('%Y-%m-%d %H:%M:%f','now')`,
+/// millisecond precision) so `<=` in SQL compares what the watermark read.
+fn format_ledger_instant(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+fn parse_ledger_instant(t: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
 impl crate::federation::BlobStorage for SqliteBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -12878,15 +12891,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
             epoch as i64,
         );
         self.read(move |conn| -> Result<bool, rusqlite::Error> {
-            // Dirty: a grant exists AND (never emitted OR the newest grant is
-            // not older than the emission). `<=` on purpose — a grant landing
-            // in the emission's own millisecond re-emits once, never misses.
+            // Dirty: a grant exists AND (never emitted OR a grant is NEWER than
+            // the stamped watermark). The stamp IS the snapshot's newest
+            // `created_at`, so equality means "carried"; a grant landing in
+            // that same millisecond after the snapshot is the one window the
+            // ledger cannot see — its own door emits (PR #850, round three).
             conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM federation_community_dek_member_grants g \
                                WHERE g.community_key_id = d.community_key_id \
                                  AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
                         AND (d.key_grant_emitted_at IS NULL \
-                             OR d.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                             OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                                  FROM federation_community_dek_member_grants g \
                                 WHERE g.community_key_id = d.community_key_id \
                                   AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
@@ -12904,23 +12919,52 @@ impl crate::federation::BlobStorage for SqliteBackend {
         })
     }
 
+    async fn community_dek_key_grant_watermark(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT MAX(created_at) FROM federation_community_dek_member_grants \
+                  WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                rusqlite::params![c, m, e],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_key_grant_watermark: {e}"))
+        })
+        .map(|t| t.and_then(|t| parse_ledger_instant(&t)))
+    }
+
     async fn community_dek_mark_key_grant_emitted(
         &self,
         community_key_id: &str,
         minter_key_id: &str,
         epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::BlobError> {
         let (c, m, e) = (
             community_key_id.to_owned(),
             minter_key_id.to_owned(),
             epoch as i64,
         );
+        let w = format_ledger_instant(watermark);
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "UPDATE federation_community_dek \
-                    SET key_grant_emitted_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
-                  WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
-                rusqlite::params![c, m, e],
+                    SET key_grant_emitted_at = ?4 \
+                  WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < ?4)",
+                rusqlite::params![c, m, e, w],
             )?;
             Ok(())
         })
@@ -12945,7 +12989,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                                 WHERE g.community_key_id = d.community_key_id \
                                   AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
                     AND (d.key_grant_emitted_at IS NULL \
-                         OR d.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                         OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                              FROM federation_community_dek_member_grants g \
                             WHERE g.community_key_id = d.community_key_id \
                               AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
@@ -12975,7 +13019,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 "SELECT EXISTS(SELECT 1 FROM federation_blob_key_grants g \
                                WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2) \
                         AND (b.key_grant_emitted_at IS NULL \
-                             OR b.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                             OR b.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                                  FROM federation_blob_key_grants g \
                                 WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2)) \
                    FROM federation_blobs b WHERE b.sha256 = ?1",
@@ -12989,17 +13033,41 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("blob_key_grant_dirty: {e}")))
     }
 
+    async fn blob_key_grant_watermark(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT MAX(created_at) FROM federation_blob_key_grants \
+                  WHERE at_rest_sha256 = ?1 AND recipient_key_id != ?2",
+                rusqlite::params![sha_vec, sentinel],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("blob_key_grant_watermark: {e}"))
+        })
+        .map(|t| t.and_then(|t| parse_ledger_instant(&t)))
+    }
+
     async fn blob_mark_key_grant_emitted(
         &self,
         at_rest_sha256: &[u8; 32],
+        watermark: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::BlobError> {
         let sha_vec = at_rest_sha256.to_vec();
+        let w = format_ledger_instant(watermark);
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             conn.execute(
                 "UPDATE federation_blobs \
-                    SET key_grant_emitted_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
-                  WHERE sha256 = ?1",
-                rusqlite::params![sha_vec],
+                    SET key_grant_emitted_at = ?2 \
+                  WHERE sha256 = ?1 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < ?2)",
+                rusqlite::params![sha_vec, w],
             )?;
             Ok(())
         })
@@ -13022,7 +13090,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     AND EXISTS(SELECT 1 FROM federation_blob_key_grants g \
                                 WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2) \
                     AND (b.key_grant_emitted_at IS NULL \
-                         OR b.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                         OR b.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                              FROM federation_blob_key_grants g \
                             WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2)) \
                   ORDER BY b.sha256",
@@ -13073,34 +13141,47 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_put: {e}")))
     }
 
-    async fn key_grant_pending_take(
+    async fn key_grant_pending_list(
         &self,
         at_rest_sha256: &[u8; 32],
         cohort_scope: &str,
     ) -> Result<Vec<(String, String)>, crate::federation::BlobError> {
         let sha_vec = at_rest_sha256.to_vec();
         let scope = cohort_scope.to_owned();
-        self.write(move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
-            let tx = conn.transaction()?;
-            let rows: Vec<(String, String)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT attestation_id, signer_key_id FROM federation_key_grant_pending \
-                      WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2 ORDER BY created_at, attestation_id",
-                )?;
-                let it = stmt.query_map(rusqlite::params![sha_vec, scope], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?;
-                it.collect::<Result<_, _>>()?
-            };
-            tx.execute(
-                "DELETE FROM federation_key_grant_pending WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2",
-                rusqlite::params![sha_vec, scope],
+        self.read(move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, signer_key_id FROM federation_key_grant_pending \
+                  WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2 ORDER BY created_at, attestation_id",
             )?;
-            tx.commit()?;
-            Ok(rows)
+            let it = stmt.query_map(rusqlite::params![sha_vec, scope], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            it.collect()
         })
         .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_take: {e}")))
+        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_list: {e}")))
+    }
+
+    async fn key_grant_pending_delete(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let (scope, id) = (cohort_scope.to_owned(), attestation_id.to_owned());
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "DELETE FROM federation_key_grant_pending \
+                  WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2 AND attestation_id = ?3",
+                rusqlite::params![sha_vec, scope, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("key_grant_pending_delete: {e}"))
+        })
     }
 
     async fn list_at_rest_grants(
@@ -14197,9 +14278,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     })
                     .collect();
                 let sql = format!(
-                    "SELECT DISTINCT at_rest_sha256 FROM federation_blob_key_grants \
-                 WHERE cohort_scope = ?1 AND recipient_key_id IN ({}) \
-                 ORDER BY at_rest_sha256",
+                    "SELECT DISTINCT g.at_rest_sha256 FROM federation_blob_key_grants g \
+                 WHERE g.cohort_scope = ?1 AND g.recipient_key_id IN ({}) \
+                   AND EXISTS (SELECT 1 FROM federation_blob_key_grants s \
+                                WHERE s.at_rest_sha256 = g.at_rest_sha256 \
+                                  AND s.recipient_key_id = '__persist_self__') \
+                 ORDER BY g.at_rest_sha256",
                     placeholders.join(", ")
                 );
                 let mut stmt = conn.prepare(&sql)?;

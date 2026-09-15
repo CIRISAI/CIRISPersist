@@ -60,11 +60,18 @@ ALTER TABLE cirislens.federation_community_blob_epoch
     ADD COLUMN minter_key_id TEXT NOT NULL DEFAULT '__this_node__';
 ALTER TABLE cirislens.federation_community_blob_epoch
     ALTER COLUMN minter_key_id DROP DEFAULT;
+-- A binding whose (community, epoch) has a local DEK row was minted here and
+-- keeps the sentinel with its DEK rows (a rotated signer must not strand old
+-- content); only a binding with NO local DEK row — an adopted blob — names its
+-- author, who is the minter. See the sqlite dialect's WHY (PR #850, round three).
 UPDATE cirislens.federation_community_blob_epoch e
    SET minter_key_id = b.author_key_id
   FROM cirislens.federation_blobs b
  WHERE b.sha256 = e.at_rest_sha256
-   AND b.author_key_id IS NOT NULL;
+   AND b.author_key_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM cirislens.federation_community_dek d
+                    WHERE d.community_key_id = e.community_key_id
+                      AND d.epoch = e.epoch);
 
 -- V138's reverse seek, re-keyed on the full epoch identity.
 DROP INDEX IF EXISTS cirislens.federation_community_blob_epoch_by_community_epoch;

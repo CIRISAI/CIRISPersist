@@ -506,6 +506,12 @@ where
     B: BlobStorage + FederationDirectory + Sync,
 {
     let minter = signer.derived_key_id();
+    let wm_axis = KeyGrantAxis::Epoch {
+        community_key_id: community_key_id.to_owned(),
+        minter_key_id: minter.clone(),
+        epoch,
+    };
+    let watermark = watermark_for_axis(backend, &wm_axis).await?;
     let Some(set) = build_epoch_set(backend, community_key_id, &minter, epoch)
         .await
         .map_err(map_blob_err)?
@@ -520,8 +526,8 @@ where
         )
         .await,
     )?;
-    if emitted.is_some() {
-        mark_emitted(backend, &set.axis).await?;
+    if let (Some(_), Some(watermark)) = (&emitted, watermark) {
+        mark_emitted(backend, &set.axis, watermark).await?;
     }
     Ok(emitted)
 }
@@ -538,6 +544,12 @@ pub async fn emit_content_key_grant_with_local_signer<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    let wm_axis = KeyGrantAxis::Content {
+        at_rest_sha256: hex::encode(at_rest_sha256),
+        cohort_scope: scope.to_owned(),
+        owner_key_id: owner_key_id.to_owned(),
+    };
+    let watermark = watermark_for_axis(backend, &wm_axis).await?;
     let Some(set) = build_content_set(backend, at_rest_sha256, scope, owner_key_id)
         .await
         .map_err(map_blob_err)?
@@ -552,8 +564,8 @@ where
         )
         .await,
     )?;
-    if emitted.is_some() {
-        mark_emitted(backend, &set.axis).await?;
+    if let (Some(_), Some(watermark)) = (&emitted, watermark) {
+        mark_emitted(backend, &set.axis, watermark).await?;
     }
     Ok(emitted)
 }
@@ -563,7 +575,11 @@ where
 /// successful (`Some`) emission — the Engine's composed-signer door and the
 /// local-signer emitters alike — so the ledger never depends on which door
 /// carried the set.
-pub async fn mark_emitted<B>(backend: &B, axis: &KeyGrantAxis) -> Result<(), Error>
+pub async fn mark_emitted<B>(
+    backend: &B,
+    axis: &KeyGrantAxis,
+    watermark: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
 where
     B: BlobStorage + Sync,
 {
@@ -573,7 +589,12 @@ where
             minter_key_id,
             epoch,
         } => backend
-            .community_dek_mark_key_grant_emitted(community_key_id, minter_key_id, *epoch)
+            .community_dek_mark_key_grant_emitted(
+                community_key_id,
+                minter_key_id,
+                *epoch,
+                watermark,
+            )
             .await
             .map_err(map_blob_err),
         KeyGrantAxis::Content { at_rest_sha256, .. } => {
@@ -582,7 +603,41 @@ where
                 .and_then(|v| v.try_into().ok())
                 .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
             backend
-                .blob_mark_key_grant_emitted(&sha)
+                .blob_mark_key_grant_emitted(&sha, watermark)
+                .await
+                .map_err(map_blob_err)
+        }
+    }
+}
+
+/// §14 (V146) — **the grant watermark for an axis, read BEFORE the set is
+/// built**: the newest grant's `created_at` under it. The set built next
+/// carries every grant at or before it; a grant that lands after it — a
+/// concurrent rekey, say — is newer than the mark and keeps the axis dirty
+/// (PR #850 review, round three). `None` when no grant exists yet.
+pub async fn watermark_for_axis<B>(
+    backend: &B,
+    axis: &KeyGrantAxis,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+where
+    B: BlobStorage + Sync,
+{
+    match axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            epoch,
+        } => backend
+            .community_dek_key_grant_watermark(community_key_id, minter_key_id, *epoch)
+            .await
+            .map_err(map_blob_err),
+        KeyGrantAxis::Content { at_rest_sha256, .. } => {
+            let sha: [u8; 32] = hex::decode(at_rest_sha256)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
+            backend
+                .blob_key_grant_watermark(&sha)
                 .await
                 .map_err(map_blob_err)
         }
@@ -674,6 +729,8 @@ pub async fn emit_key_grant_axis_with_local_signer<B>(
 where
     B: BlobStorage + FederationDirectory + Sync,
 {
+    let wm_axis = axis.clone();
+    let watermark = watermark_for_axis(backend, &wm_axis).await?;
     let Some(set) = build_set_for_axis(backend, axis)
         .await
         .map_err(map_blob_err)?
@@ -688,8 +745,8 @@ where
         )
         .await,
     )?;
-    if emitted.is_some() {
-        mark_emitted(backend, &set.axis).await?;
+    if let (Some(_), Some(watermark)) = (&emitted, watermark) {
+        mark_emitted(backend, &set.axis, watermark).await?;
     }
     Ok(emitted)
 }
@@ -943,10 +1000,10 @@ where
             }
             Some(author) if author != signer => {
                 // The author is known now and it is not the signer: the
-                // carrier stays a stored attestation, the index row is
+                // carrier stays a stored attestation, its index row is
                 // dropped, nothing projects.
-                let _ = backend
-                    .key_grant_pending_take(&sha, cohort_scope)
+                backend
+                    .key_grant_pending_delete(&sha, cohort_scope, &row_id)
                     .await
                     .map_err(map_blob_err)?;
                 return Err(refuse(
@@ -958,10 +1015,10 @@ where
             }
             Some(_) => {
                 // The bytes arrived meanwhile: project directly (below) and
-                // retire the index row — the adopt may also have taken it;
-                // both paths are unions.
-                let _ = backend
-                    .key_grant_pending_take(&sha, cohort_scope)
+                // retire this set's index row — the adopt may also project
+                // it; both paths are unions.
+                backend
+                    .key_grant_pending_delete(&sha, cohort_scope, &row_id)
                     .await
                     .map_err(map_blob_err)?;
             }
@@ -1003,9 +1060,9 @@ where
 
 /// §13 — **project the content-axis sets that were admitted before their
 /// bytes.** Called by the adopt path the moment a blob row exists with its
-/// author known: the pending index rows for `(sha, scope)` are TAKEN (read
-/// and deleted, V146 — an adopt reads its own rows, never an author's
-/// attestations), and each stored `key_grant:content:v1` row among them
+/// author known: the pending index rows for `(sha, scope)` are listed (V146
+/// — an adopt reads its own rows, never an author's attestations), each is
+/// retired only once its verdict is final, and each stored `key_grant:content:v1` row among them
 /// *signed by `author_key_id`* is projected as a union; a row signed by
 /// anyone else grants nothing (the same `SignerNotAuthor` verdict
 /// [`admit_replicated_key_grant`] gives when the row is present).
@@ -1024,44 +1081,41 @@ where
     let want = hex::encode(sha256);
     let mut written = 0usize;
     for (attestation_id, signer) in backend
-        .key_grant_pending_take(sha256, cohort_scope)
+        .key_grant_pending_list(sha256, cohort_scope)
         .await
         .map_err(map_blob_err)?
     {
+        // A definitive non-author verdict retires the row; anything that
+        // fails or is not yet resolvable leaves it pending for the next
+        // adopt (PR #850 review, round three).
         if signer != author_key_id {
+            backend
+                .key_grant_pending_delete(sha256, cohort_scope, &attestation_id)
+                .await
+                .map_err(map_blob_err)?;
             continue;
         }
         let Some(row) = backend.get_attestation(&attestation_id).await? else {
             continue;
         };
-        if row.attestation_type != KEY_GRANT_CONTENT_ATTESTATION_TYPE
-            || row.scrub_key_id != author_key_id
-        {
-            continue;
+        let projectable = row.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
+            && row.scrub_key_id == author_key_id
+            && KeyGrantSet::from_attestation(&row).ok().is_some_and(|parsed| {
+                matches!(&parsed.axis, KeyGrantAxis::Content { at_rest_sha256, cohort_scope: set_scope, .. }
+                    if *at_rest_sha256 == want && set_scope == cohort_scope)
+                    && parsed.wraps.iter().all(|w| w.wrap_algorithm == WRAP_ALGORITHM_V2)
+            });
+        if projectable {
+            let parsed = KeyGrantSet::from_attestation(&row)?;
+            written += backend
+                .put_at_rest_grants(sha256, cohort_scope, &parsed.wraps)
+                .await
+                .map_err(map_blob_err)?;
         }
-        let Ok(parsed) = KeyGrantSet::from_attestation(&row) else {
-            continue;
-        };
-        let KeyGrantAxis::Content {
-            at_rest_sha256,
-            cohort_scope: set_scope,
-            ..
-        } = &parsed.axis
-        else {
-            continue;
-        };
-        if *at_rest_sha256 != want || set_scope != cohort_scope {
-            continue;
-        }
-        if parsed
-            .wraps
-            .iter()
-            .any(|w| w.wrap_algorithm != WRAP_ALGORITHM_V2)
-        {
-            continue;
-        }
-        written += backend
-            .put_at_rest_grants(sha256, cohort_scope, &parsed.wraps)
+        // Projected, or a row that can never project (malformed / wrong
+        // axis / non-v2): either way the verdict is final.
+        backend
+            .key_grant_pending_delete(sha256, cohort_scope, &attestation_id)
             .await
             .map_err(map_blob_err)?;
     }

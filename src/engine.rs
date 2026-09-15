@@ -5268,12 +5268,27 @@ impl Engine {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
-        use crate::federation::key_grant::build_set_for_axis;
-        let set = match &self.backend {
+        use crate::federation::key_grant::{build_set_for_axis, watermark_for_axis};
+        // §14 (V146) — the watermark FIRST, then the set: the mark below
+        // stamps this instant, so a grant landing after it stays dirty.
+        let ledger = |e: crate::federation::Error| {
+            crate::federation::BlobError::Backend(format!("key_grant ledger: {e}"))
+        };
+        let (watermark, set) = match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => build_set_for_axis(arc.as_ref(), axis).await?,
+            BackendDispatch::Postgres(arc) => (
+                watermark_for_axis(arc.as_ref(), axis)
+                    .await
+                    .map_err(ledger)?,
+                build_set_for_axis(arc.as_ref(), axis).await?,
+            ),
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => build_set_for_axis(arc.as_ref(), axis).await?,
+            BackendDispatch::Sqlite(arc) => (
+                watermark_for_axis(arc.as_ref(), axis)
+                    .await
+                    .map_err(ledger)?,
+                build_set_for_axis(arc.as_ref(), axis).await?,
+            ),
         };
         let Some(set) = set else {
             return Ok(None);
@@ -5292,15 +5307,15 @@ impl Engine {
         // §14 (V146) — the emission ledger: the axis is clean from this
         // instant until a newer grant lands under it. A skipped emission
         // (`None`) leaves it dirty, so the next door or the boot sweep retries.
-        if emitted.is_some() {
+        if let (Some(_), Some(watermark)) = (&emitted, watermark) {
             match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => {
-                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis).await
+                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis, watermark).await
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(b) => {
-                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis).await
+                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis, watermark).await
                 }
             }
             .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;

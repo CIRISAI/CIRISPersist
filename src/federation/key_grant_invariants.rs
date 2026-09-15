@@ -1004,11 +1004,11 @@ pub mod two_node {
         // The pending index (V146) was TAKEN by the adopt: nothing left.
         assert!(
             a2.backend
-                .key_grant_pending_take(&sha, SELF)
+                .key_grant_pending_list(&sha, SELF)
                 .await
                 .unwrap()
                 .is_empty(),
-            "{tag} I65: the adopt took every pending row for the blob"
+            "{tag} I65: the adopt retired every pending row for the blob"
         );
         // (4) A re-delivered author set after the bytes projects directly —
         // the row is present, the author is checked, every wrap already held.
@@ -1047,6 +1047,46 @@ pub mod two_node {
         assert!(
             matches!(err, BlobError::NotGranted { .. }),
             "{tag} I65: the outsider the forged set named stays refused: {err:?}"
+        );
+        // (5) A retroactive ADD on the ADOPTING node (PR #850, round three):
+        // the owner admits a third device on a2. The peer-authored blob is
+        // not this node's to re-wrap (no self-retention here) — the walk
+        // skips it rather than aborting, and grants it nothing.
+        let dev3 = format!("{tag}-dev3-{run}");
+        ts::register_hybrid_key_as(a2.backend, &dev3, &dev3, USER).await;
+        a2.backend
+            .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: owner.clone(),
+                occurrence_key_id: dev3.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(a.kem.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+        let rk = crate::federation::at_rest_cascade::orchestrate::rekey_self_occurrence_add(
+            a2.backend,
+            &owner,
+            std::slice::from_ref(&dev3),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I65: a rekey on the adopting node must not abort: {e}"));
+        assert!(
+            !rk.changed_blobs.contains(&sha),
+            "{tag} I65: the peer-authored blob is not re-wrapped here"
+        );
+        assert!(
+            a2.backend
+                .get_at_rest_grant(&sha, &dev3)
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I65: only the author's node can grant the third device"
         );
     }
 
@@ -1405,6 +1445,27 @@ mod tests {
         }
     }
 
+    /// **I72 (from disk) — both adopt doors reconcile pending content sets**
+    /// (PR #850, round three): a self/family chunk has its own DEK and its
+    /// own set, so `adopt_sealed_chunk` projects exactly as `adopt_sealed_blob`.
+    #[test]
+    fn i72_both_adopt_doors_project_pending_content_grants() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("src/federation/adopt_cascade.rs")).unwrap();
+        let prod = production_only(&text);
+        for door in ["adopt_sealed_blob", "adopt_sealed_chunk"] {
+            let start = prod.find(&format!("pub async fn {door}<")).unwrap();
+            let end = prod[start + 1..]
+                .find("\npub async fn ")
+                .map(|i| start + 1 + i)
+                .unwrap_or(prod.len());
+            assert!(
+                prod[start..end].contains("project_pending_content_grants("),
+                "I72: {door} must project the pending content sets once the row names its author"
+            );
+        }
+    }
+
     /// **I66e (from disk) — every DEK-plane door of the Engine resolves the
     /// sentinel first**, so an `Engine` built by `from_shared*` (which cannot
     /// repair synchronously) is repaired at its first such door. And **I68's
@@ -1538,7 +1599,69 @@ mod tests {
                 rusqlite::params![sha.to_vec()],
             )
             .unwrap();
+            // PR #850 round three — a second blob under the SAME local epoch
+            // whose row names an OLD signer as author (the node's signer
+            // rotated after the write), and an ADOPTED blob (#846) under an
+            // epoch this node holds no DEK for.
+            let old_signer_blob = seal(&dek, b"written under the old signer", None)
+                .unwrap()
+                .to_bytes();
+            let old_sha: [u8; 32] = sha2::Sha256::digest(&old_signer_blob).into();
+            conn.execute(
+                "INSERT INTO federation_blobs (sha256, storage_kind, bytes_inline, size_bytes, \
+                    cohort_scope, crypto_tier, author_key_id) \
+                 VALUES (?1, 'inline', ?2, ?3, 'community', 'community_dek', 'old-signer-A')",
+                rusqlite::params![
+                    old_sha.to_vec(),
+                    old_signer_blob,
+                    old_signer_blob.len() as i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
+                 VALUES (?1, 'legacy-comm', 1)",
+                rusqlite::params![old_sha.to_vec()],
+            )
+            .unwrap();
+            let adopted = seal(&fresh_dek().unwrap(), b"adopted from a peer", None)
+                .unwrap()
+                .to_bytes();
+            let adopted_sha: [u8; 32] = sha2::Sha256::digest(&adopted).into();
+            conn.execute(
+                "INSERT INTO federation_blobs (sha256, storage_kind, bytes_inline, size_bytes, \
+                    cohort_scope, crypto_tier, author_key_id) \
+                 VALUES (?1, 'inline', ?2, ?3, 'community', 'community_dek', 'peer-P')",
+                rusqlite::params![adopted_sha.to_vec(), adopted, adopted.len() as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO federation_community_blob_epoch (at_rest_sha256, community_key_id, epoch) \
+                 VALUES (?1, 'legacy-comm', 7)",
+                rusqlite::params![adopted_sha.to_vec()],
+            )
+            .unwrap();
             sha
+        }
+
+        /// The minter V145 + the boot gave each pre-V145 binding under
+        /// `legacy-comm` at `epoch`, keyed by the row's author.
+        fn binding_minters(backend: &SqliteBackend, epoch: i64) -> Vec<(String, String)> {
+            let conn = backend.conn_handle();
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT COALESCE(b.author_key_id, ''), e.minter_key_id \
+                       FROM federation_community_blob_epoch e \
+                       JOIN federation_blobs b ON b.sha256 = e.at_rest_sha256 \
+                      WHERE e.community_key_id = 'legacy-comm' AND e.epoch = ?1 \
+                      ORDER BY 1",
+                )
+                .unwrap();
+            stmt.query_map([epoch], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
         }
 
         fn sentinel_rows(backend: &SqliteBackend) -> i64 {
@@ -1563,14 +1686,14 @@ mod tests {
             backend.run_migrations().await.unwrap();
             assert_eq!(
                 sentinel_rows(&backend),
-                4,
+                5,
                 "I66: V145 wrote the sentinel on every re-keyed row (SQL cannot know the node)"
             );
             let n = backend
                 .repair_minter_sentinel(Some("node-x"))
                 .await
                 .unwrap();
-            assert_eq!(n, 4, "I66: every sentinel resolved");
+            assert_eq!(n, 5, "I66: every sentinel resolved");
             assert_eq!(sentinel_rows(&backend), 0);
             assert_eq!(
                 backend
@@ -1665,6 +1788,22 @@ mod tests {
             .expect("I66: the boot resolves the sentinel and succeeds");
             let sq = engine.sqlite_backend().unwrap();
             assert_eq!(sentinel_rows(sq), 0, "I66: no sentinel survives the boot");
+            // PR #850 round three — bindings follow the DEK they were sealed
+            // under: both local rows (NULL author, and the OLD signer's)
+            // resolve to this node; the adopted row keeps its author.
+            assert_eq!(
+                binding_minters(sq, 1),
+                vec![
+                    (String::new(), key.clone()),
+                    ("old-signer-A".to_owned(), key.clone())
+                ],
+                "I66: pre-V145 local bindings resolve to the node whatever author the row names"
+            );
+            assert_eq!(
+                binding_minters(sq, 7),
+                vec![("peer-P".to_owned(), "peer-P".to_owned())],
+                "I66: an adopted binding (no local DEK) keeps its author as minter"
+            );
             assert_eq!(
                 sq.community_dek_current_epoch("legacy-comm", &key)
                     .await
@@ -1699,7 +1838,7 @@ mod tests {
                     .await
                     .unwrap();
                 backend.run_migrations().await.unwrap();
-                assert_eq!(sentinel_rows(&backend), 4, "I66d: V145 wrote the sentinel");
+                assert_eq!(sentinel_rows(&backend), 5, "I66d: V145 wrote the sentinel");
                 let local = crate::federation::tier_ingest::test_support::local_signer(&format!(
                     "i66d-{survivor}"
                 ));
@@ -1728,7 +1867,7 @@ mod tests {
                 );
                 assert_eq!(
                     sentinel_rows(&backend),
-                    4,
+                    5,
                     "I66d: a synchronous constructor resolves nothing"
                 );
                 let read = engine
@@ -2107,6 +2246,65 @@ mod tests {
                 .unwrap();
             assert!(rk2.changed_blobs.is_empty(), "I68: {rk2:?}");
             assert_eq!(sets_for(sq.clone(), me.clone()).await.len(), 2);
+        }
+
+        /// **I74 — the ledger stamps the WATERMARK, never the clock** (PR
+        /// #850, round three). A grant that lands after the emitted set was
+        /// built is newer than the mark and keeps the axis dirty; a mark at
+        /// the newest grant cleans it; the mark never moves backwards.
+        #[tokio::test]
+        async fn i74_ledger_mark_is_the_snapshot_watermark_sqlite() {
+            use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
+            use crate::federation::{BlobStorage, GrantWrap};
+            let sq = fresh().await;
+            let (comm, me) = ("i74-comm", "i74-me");
+            sq.community_dek_put_self_retention(comm, me, 0, "{}")
+                .await
+                .unwrap();
+            let wrap = |r: &str| GrantWrap {
+                recipient_key_id: r.into(),
+                wrap_algorithm: WRAP_ALGORITHM_V2.into(),
+                wrapped_dek: "{}".into(),
+            };
+            sq.community_dek_put_member_grants(comm, me, 0, &[wrap("r1")])
+                .await
+                .unwrap();
+            let w1 = sq
+                .community_dek_key_grant_watermark(comm, me, 0)
+                .await
+                .unwrap()
+                .expect("a grant exists");
+            assert!(sq.community_dek_key_grant_dirty(comm, me, 0).await.unwrap());
+            // The concurrent grant: lands AFTER the snapshot's watermark.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            sq.community_dek_put_member_grants(comm, me, 0, &[wrap("r2")])
+                .await
+                .unwrap();
+            // Mark at the SNAPSHOT's watermark (what the emitter read): still
+            // dirty — r2 was not in the emitted set.
+            sq.community_dek_mark_key_grant_emitted(comm, me, 0, w1)
+                .await
+                .unwrap();
+            assert!(
+                sq.community_dek_key_grant_dirty(comm, me, 0).await.unwrap(),
+                "I74: a grant newer than the emitted snapshot keeps the axis dirty"
+            );
+            // Mark at the NEW watermark (a later emission that carried r2): clean.
+            let w2 = sq
+                .community_dek_key_grant_watermark(comm, me, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(w2 > w1);
+            sq.community_dek_mark_key_grant_emitted(comm, me, 0, w2)
+                .await
+                .unwrap();
+            assert!(!sq.community_dek_key_grant_dirty(comm, me, 0).await.unwrap());
+            // Never backwards: an older mark does not re-dirty.
+            sq.community_dek_mark_key_grant_emitted(comm, me, 0, w1)
+                .await
+                .unwrap();
+            assert!(!sq.community_dek_key_grant_dirty(comm, me, 0).await.unwrap());
         }
 
         /// **I70 — the emission ledger (V146): a door that died between its

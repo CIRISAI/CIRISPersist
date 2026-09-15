@@ -472,13 +472,16 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // #848 §13–§14 (V146, PR #850 review) — the emission ledger and the
     // pending-content index.
     ("community_dek_key_grant_dirty", ConnClass::Read),
+    ("community_dek_key_grant_watermark", ConnClass::Read),
     ("community_dek_mark_key_grant_emitted", ConnClass::Write),
     ("community_dek_list_key_grant_dirty", ConnClass::Read),
     ("blob_key_grant_dirty", ConnClass::Read),
+    ("blob_key_grant_watermark", ConnClass::Read),
     ("blob_mark_key_grant_emitted", ConnClass::Write),
     ("blob_list_key_grant_dirty", ConnClass::Read),
     ("key_grant_pending_put", ConnClass::Write),
-    ("key_grant_pending_take", ConnClass::Write),
+    ("key_grant_pending_list", ConnClass::Read),
+    ("key_grant_pending_delete", ConnClass::Write),
     ("put_attestation_with_origin", ConnClass::Write),
     // #846 — the chunk floor's ONE body; `put_blob_chunk_with_scope` and
     // `adopt_sealed_chunk_at` delegate to it and touch no connection.

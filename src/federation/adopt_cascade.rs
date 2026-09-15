@@ -208,7 +208,7 @@ where
 {
     let (floor, binding) = resolve_adopt(envelope, provenance)?;
     would_hold(backend, ctx, provenance).await?;
-    backend
+    let sha256 = backend
         .adopt_sealed_chunk_at(
             stream_id,
             seq,
@@ -220,5 +220,17 @@ where
             floor,
             binding,
         )
-        .await
+        .await?;
+    // #848 §13 (PR #850 review, round three) — a self/family chunk has its
+    // own DEK and its own content-axis set; the set that arrived before the
+    // chunk projects here, exactly as for a blob.
+    crate::federation::key_grant::project_pending_content_grants(
+        backend,
+        &sha256,
+        &provenance.cohort_scope,
+        &provenance.author_key_id,
+    )
+    .await
+    .map_err(|e| BlobError::Backend(format!("pending key_grant projection: {e}")))?;
+    Ok(sha256)
 }

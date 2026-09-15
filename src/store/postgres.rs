@@ -13529,16 +13529,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let epoch = epoch as i64;
-        // Dirty: a grant exists AND (never emitted OR the newest grant is not
-        // older than the emission) — `<=` so a same-instant grant re-emits
-        // once rather than being missed.
+        // Dirty: a grant exists AND (never emitted OR a grant is NEWER than the
+        // stamped watermark — the snapshot's newest `created_at`, so equality
+        // means "carried"; PR #850, round three).
         let row = client
             .query_opt(
                 "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_dek_member_grants g \
                                WHERE g.community_key_id = d.community_key_id \
                                  AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
                         AND (d.key_grant_emitted_at IS NULL \
-                             OR d.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                             OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                                  FROM cirislens.federation_community_dek_member_grants g \
                                 WHERE g.community_key_id = d.community_key_id \
                                   AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
@@ -13553,11 +13553,38 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
     }
 
+    async fn community_dek_key_grant_watermark(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let epoch = epoch as i64;
+        let row = client
+            .query_one(
+                "SELECT MAX(created_at) FROM cirislens.federation_community_dek_member_grants \
+                  WHERE community_key_id = $1 AND minter_key_id = $2 AND epoch = $3",
+                &[&community_key_id, &minter_key_id, &epoch],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_key_grant_watermark: {e}"
+                ))
+            })?;
+        Ok(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0))
+    }
+
     async fn community_dek_mark_key_grant_emitted(
         &self,
         community_key_id: &str,
         minter_key_id: &str,
         epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::BlobError> {
         let client = self
             .get_client()
@@ -13566,9 +13593,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let epoch = epoch as i64;
         client
             .execute(
-                "UPDATE cirislens.federation_community_dek SET key_grant_emitted_at = NOW() \
-                  WHERE community_key_id = $1 AND minter_key_id = $2 AND epoch = $3",
-                &[&community_key_id, &minter_key_id, &epoch],
+                "UPDATE cirislens.federation_community_dek SET key_grant_emitted_at = $4 \
+                  WHERE community_key_id = $1 AND minter_key_id = $2 AND epoch = $3 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < $4)",
+                &[&community_key_id, &minter_key_id, &epoch, &watermark],
             )
             .await
             .map_err(|e| {
@@ -13595,7 +13623,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                                 WHERE g.community_key_id = d.community_key_id \
                                   AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
                     AND (d.key_grant_emitted_at IS NULL \
-                         OR d.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                         OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                              FROM cirislens.federation_community_dek_member_grants g \
                             WHERE g.community_key_id = d.community_key_id \
                               AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
@@ -13629,7 +13657,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 "SELECT EXISTS(SELECT 1 FROM cirislens.federation_blob_key_grants g \
                                WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != $2) \
                         AND (b.key_grant_emitted_at IS NULL \
-                             OR b.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                             OR b.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                                  FROM cirislens.federation_blob_key_grants g \
                                 WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != $2)) \
                    FROM cirislens.federation_blobs b WHERE b.sha256 = $1",
@@ -13642,9 +13670,33 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
     }
 
+    async fn blob_key_grant_watermark(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT;
+        let row = client
+            .query_one(
+                "SELECT MAX(created_at) FROM cirislens.federation_blob_key_grants \
+                  WHERE at_rest_sha256 = $1 AND recipient_key_id != $2",
+                &[&sha_vec, &sentinel],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("blob_key_grant_watermark: {e}"))
+            })?;
+        Ok(row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0))
+    }
+
     async fn blob_mark_key_grant_emitted(
         &self,
         at_rest_sha256: &[u8; 32],
+        watermark: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), crate::federation::BlobError> {
         let client = self
             .get_client()
@@ -13653,8 +13705,9 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let sha_vec = at_rest_sha256.to_vec();
         client
             .execute(
-                "UPDATE cirislens.federation_blobs SET key_grant_emitted_at = NOW() WHERE sha256 = $1",
-                &[&sha_vec],
+                "UPDATE cirislens.federation_blobs SET key_grant_emitted_at = $2 \
+                  WHERE sha256 = $1 AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < $2)",
+                &[&sha_vec, &watermark],
             )
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("blob_mark_key_grant_emitted: {e}")))?;
@@ -13677,7 +13730,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     AND EXISTS(SELECT 1 FROM cirislens.federation_blob_key_grants g \
                                 WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != $2) \
                     AND (b.key_grant_emitted_at IS NULL \
-                         OR b.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                         OR b.key_grant_emitted_at < (SELECT MAX(g.created_at) \
                              FROM cirislens.federation_blob_key_grants g \
                             WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != $2)) \
                   ORDER BY b.sha256",
@@ -13720,39 +13773,52 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
-    async fn key_grant_pending_take(
+    async fn key_grant_pending_list(
         &self,
         at_rest_sha256: &[u8; 32],
         cohort_scope: &str,
     ) -> Result<Vec<(String, String)>, crate::federation::BlobError> {
-        let mut client = self
+        let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let sha_vec = at_rest_sha256.to_vec();
-        let tx = client.transaction().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("key_grant_pending_take tx: {e}"))
-        })?;
-        let rows = tx
+        let rows = client
             .query(
-                "DELETE FROM cirislens.federation_key_grant_pending \
+                "SELECT attestation_id, signer_key_id FROM cirislens.federation_key_grant_pending \
                   WHERE at_rest_sha256 = $1 AND cohort_scope = $2 \
-                  RETURNING attestation_id, signer_key_id, created_at",
+                  ORDER BY created_at, attestation_id",
                 &[&sha_vec, &cohort_scope],
             )
             .await
             .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("key_grant_pending_take: {e}"))
+                crate::federation::BlobError::Backend(format!("key_grant_pending_list: {e}"))
             })?;
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("key_grant_pending_take commit: {e}"))
-        })?;
-        let mut out: Vec<(chrono::DateTime<chrono::Utc>, String, String)> = rows
-            .iter()
-            .map(|r| (r.get(2), r.get(0), r.get(1)))
-            .collect();
-        out.sort();
-        Ok(out.into_iter().map(|(_, id, s)| (id, s)).collect())
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    async fn key_grant_pending_delete(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        client
+            .execute(
+                "DELETE FROM cirislens.federation_key_grant_pending \
+                  WHERE at_rest_sha256 = $1 AND cohort_scope = $2 AND attestation_id = $3",
+                &[&sha_vec, &cohort_scope, &attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("key_grant_pending_delete: {e}"))
+            })?;
+        Ok(())
     }
 
     async fn list_at_rest_grants(
@@ -14912,9 +14978,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let recipients: Vec<String> = recipient_key_ids.to_vec();
         let rows = client
             .query(
-                "SELECT DISTINCT at_rest_sha256 FROM cirislens.federation_blob_key_grants \
-                 WHERE cohort_scope = $1 AND recipient_key_id = ANY($2) \
-                 ORDER BY at_rest_sha256",
+                "SELECT DISTINCT g.at_rest_sha256 FROM cirislens.federation_blob_key_grants g \
+                 WHERE g.cohort_scope = $1 AND g.recipient_key_id = ANY($2) \
+                   AND EXISTS (SELECT 1 FROM cirislens.federation_blob_key_grants s \
+                                WHERE s.at_rest_sha256 = g.at_rest_sha256 \
+                                  AND s.recipient_key_id = '__persist_self__') \
+                 ORDER BY g.at_rest_sha256",
                 &[&cohort_scope, &recipients],
             )
             .await

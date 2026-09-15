@@ -528,6 +528,19 @@ marks on success; a skipped emission stays dirty. `Engine::emit_pending_key_gran
 sweeps at every constructor after the sentinel resolves (best effort, logged)
 and on demand (I70).
 
+**Implementation note (PR #850 review, round three) — the ledger's stamp is
+the snapshot's watermark.** The emitter reads the newest grant's
+`created_at` under the axis before building the set and stamps that value on
+success (never the clock, never backwards); the dirty predicate is strict
+(`stamp < newest grant`), so equality means "carried". The one window the
+ledger cannot see — a grant landing in the same millisecond as the snapshot's
+newest, after the read — is closed by that grant's own door emitting (I74).
+A pending row (§13) is retired only after its projection succeeds or its
+verdict is final; a failed projection leaves it for the next adopt. Both
+adopt doors reconcile (I72). The retroactive-ADD walk sees only blobs this
+node self-retains — a peer-authored blob adopted here is skipped, never an
+abort (I65).
+
 ## 15. Rotation on admitted removal — every minter, its own counter
 
 CIRISEdge's fact 1 is a present-day forward-secrecy hole across nodes: after
@@ -571,6 +584,13 @@ community-DEK plane checks it first — an atomic load thereafter, the same
 resolver otherwise; a survivor fails that door with the sentinel named,
 never a silently unreadable binding (I66d, I66e).
 
+**Implementation note (PR #850 review, round three) — V145's binding
+rule.** A pre-V145 binding whose `(community, epoch)` has a local DEK row was
+minted here and takes the sentinel with its DEK rows, whatever author the row
+names (a rotated signer must not strand old content); only a binding with no
+local DEK row — an adopted blob — names its author as minter. V145 was
+unreleased; its manifest rows are re-pinned.
+
 ## 17. Reads
 
 `community_dek_blob_epoch(sha)` returns `(community, minter, epoch)`;
@@ -603,6 +623,10 @@ door. No shared directory.
 | I69 | Every Python write door — the two specialized ones included — calls the one emission helper (from disk). | bytes stored through Python with no set on the cursor | from-disk |
 | I70 | A cascade that ran with no emission (the crash shape) leaves the epoch DIRTY; the next door emits though the fan-out is unchanged; a clean epoch emits nothing more; `emit_pending_key_grants` emits a dirty community once and then nothing. | ciphertext announced, key never carried | behavioural, Engine door + sweep |
 | I71 | A removal with a future `effective_at`, a bump-and-seal in between (minted after `removed_at`, before `effective_at`, X still granted), then after `effective_at` the next seal rotates that epoch, disables it, excludes X. | an epoch minted in the skew window kept forever | behavioural, two-node |
+| I72 | Both adopt doors project the pending content sets once the row names its author (from disk). | a chunk's set that arrived first, never projected | from-disk |
+| I74 | The ledger's stamp is the snapshot watermark: a grant newer than the emitted snapshot keeps the axis dirty; a stamp at the newest grant cleans it; an older stamp never re-dirties. | a concurrent grant hidden behind a wall-clock stamp | behavioural, floor, both dialects' predicate |
+| I66 (extended) | A pre-V145 local binding authored by an old signer resolves to the node; an adopted binding keeps its author. | a rotated signer stranding old content | behavioural, sqlite file |
+| I65 (5) | A retroactive ADD on the adopting node skips the peer-authored blob and grants the new device nothing there. | a rekey aborting on adopted content | behavioural, two-node |
 
 ## 19. What Edge and Server do
 

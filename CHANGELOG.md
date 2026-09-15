@@ -179,6 +179,34 @@ invariants I59–I67, each a two-node witness driven on sqlite and postgres.
 - **V146** (both dialects): two nullable columns, one table; additive, no
   rebuild. Manifest rows appended.
 
+### Review round three (PR #850, Codex) — five P1s
+- **The ledger stamps the snapshot's watermark, never the clock.** The
+  emitter reads the newest grant's `created_at` under the axis BEFORE it
+  builds the set and stamps that on success; a grant that lands after the
+  snapshot is newer than the stamp and keeps the axis dirty. The stamp never
+  moves backwards. One window remains by construction — a grant landing in
+  the same millisecond as the snapshot's newest, after the read — and its own
+  door emits it. I74.
+- **A pending row is retired only once its verdict is final.** The adopt
+  lists its pending rows, projects the author-signed ones, and deletes each
+  after its projection succeeds (or on a definitive non-author / never-
+  projectable verdict); a failed `get_attestation` or projection leaves the
+  row for the next adopt.
+- **`adopt_sealed_chunk` reconciles pending content sets** exactly as
+  `adopt_sealed_blob` (a self/family chunk has its own DEK and set). I72.
+- **A retroactive ADD sees only self-retained blobs.**
+  `list_at_rest_blobs_for_recipients` is restricted to blobs with a
+  `__persist_self__` wrap: a peer-authored blob adopted here carries only
+  recipient wraps and the walk can neither recover its DEK nor emit its
+  author-signed set — it is skipped, never an abort (`self_at_login`
+  included). I65 (5).
+- **V145's binding rule (unreleased, re-pinned).** A pre-V145 binding whose
+  `(community, epoch)` has a local DEK row was minted HERE and takes the
+  sentinel with its DEK rows — whatever author the row names, so a node whose
+  signer rotated since the write keeps its content; only a binding with no
+  local DEK row (an adopted blob) names its author as minter. I66 seeds an
+  old-signer row and an adopted row.
+
 ### Consumer-visible (read before adopting)
 - **An encrypted write now needs a node that can EMIT.** `put_blob_encrypted_*`,
   `put_blob_scoped` at an encrypted tier, `put_blob_chunk_scoped` and

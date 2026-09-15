@@ -1887,14 +1887,28 @@ pub trait BlobStorage: Send + Sync {
         epoch: u64,
     ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
+    /// #848 §14 (V146) — the epoch's grant WATERMARK: the newest member
+    /// grant's `created_at` under `(community, minter, epoch)`, `None` when
+    /// there is none. Read BEFORE a set is built, so every grant the set
+    /// carries is at or before it and every grant it missed is after it.
+    fn community_dek_key_grant_watermark(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<chrono::DateTime<chrono::Utc>>, BlobError>> + Send;
+
     /// #848 §14 (V146) — stamp `key_grant_emitted_at` on the epoch's
-    /// self-retention row with the database's own clock (the same clock the
-    /// grants' `created_at` came from).
+    /// self-retention row with the WATERMARK the emitted set was built at —
+    /// never the wall clock, so a grant that landed between the snapshot and
+    /// the mark keeps the axis dirty (PR #850 review, round three). Never
+    /// moves the stamp backwards.
     fn community_dek_mark_key_grant_emitted(
         &self,
         community_key_id: &str,
         minter_key_id: &str,
         epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// #848 §14 (V146) — every dirty epoch `minter_key_id` minted, as
@@ -1912,10 +1926,19 @@ pub trait BlobStorage: Send + Sync {
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
-    /// #848 §14 (V146) — stamp the blob row's `key_grant_emitted_at`.
+    /// #848 §14 (V146) — the blob's grant watermark: the newest non-self
+    /// at-rest grant's `created_at`, `None` when there is none.
+    fn blob_key_grant_watermark(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<chrono::DateTime<chrono::Utc>>, BlobError>> + Send;
+
+    /// #848 §14 (V146) — stamp the blob row's `key_grant_emitted_at` with the
+    /// watermark the emitted set was built at (see the epoch twin).
     fn blob_mark_key_grant_emitted(
         &self,
         at_rest_sha256: &[u8; 32],
+        watermark: chrono::DateTime<chrono::Utc>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// #848 §14 (V146) — every dirty `invisible_encrypted` blob
@@ -1937,13 +1960,25 @@ pub trait BlobStorage: Send + Sync {
         signer_key_id: &str,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
-    /// #848 §13 (V146) — take (read and delete, one transaction) every
-    /// pending row for `(sha, scope)` as `(attestation_id, signer_key_id)`.
-    fn key_grant_pending_take(
+    /// #848 §13 (V146) — every pending row for `(sha, scope)` as
+    /// `(attestation_id, signer_key_id)`, oldest first. Read only: a row is
+    /// deleted by [`Self::key_grant_pending_delete`] after its projection
+    /// succeeds (or after a definitive non-author verdict), so a failed
+    /// projection leaves the work pending for the next adopt (PR #850
+    /// review, round three).
+    fn key_grant_pending_list(
         &self,
         at_rest_sha256: &[u8; 32],
         cohort_scope: &str,
     ) -> impl Future<Output = Result<Vec<(String, String)>, BlobError>> + Send;
+
+    /// #848 §13 (V146) — retire one pending row. Idempotent.
+    fn key_grant_pending_delete(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
     /// v4.14.0 (CIRISPersist#152) — fetch the at-rest grant for
     /// `(at_rest_sha256, recipient_key_id)`, returning
@@ -1966,6 +2001,11 @@ pub trait BlobStorage: Send + Sync {
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
 
+    /// PR #850 review (round three) — restricted to blobs THIS node
+    /// self-retains (`__persist_self__` wrap present): a peer-authored blob
+    /// adopted here carries only recipient wraps, and the retroactive-ADD
+    /// walk can neither recover its DEK nor emit its author-signed set — the
+    /// author's node does that for the newcomer.
     /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
     /// **retroactive-ADD** enumeration: distinct `at_rest_sha256` of every
     /// blob in `cohort_scope` that **any** of `recipient_key_ids` already
