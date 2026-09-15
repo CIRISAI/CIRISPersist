@@ -1874,6 +1874,77 @@ pub trait BlobStorage: Send + Sync {
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<GrantWrap>, BlobError>> + Send;
 
+    /// #848 §14 (V146, PR #850 review) — **is the epoch's `KeyGrant` set
+    /// DIRTY?** True when at least one member grant exists under
+    /// `(community, minter, epoch)` and the epoch's `key_grant_emitted_at`
+    /// is NULL or not later than the newest grant's `created_at`. A door that
+    /// died between its cascade and its emission leaves the axis dirty; the
+    /// next door — or the boot sweep — emits.
+    fn community_dek_key_grant_dirty(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
+    /// #848 §14 (V146) — stamp `key_grant_emitted_at` on the epoch's
+    /// self-retention row with the database's own clock (the same clock the
+    /// grants' `created_at` came from).
+    fn community_dek_mark_key_grant_emitted(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #848 §14 (V146) — every dirty epoch `minter_key_id` minted, as
+    /// `(community_key_id, epoch)`; what the boot sweep emits.
+    fn community_dek_list_key_grant_dirty(
+        &self,
+        minter_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<(String, u64)>, BlobError>> + Send;
+
+    /// #848 §14 (V146) — content axis: is the blob's set dirty? True when at
+    /// least one non-self at-rest grant exists and the blob row's
+    /// `key_grant_emitted_at` is NULL or not later than the newest grant.
+    fn blob_key_grant_dirty(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
+    /// #848 §14 (V146) — stamp the blob row's `key_grant_emitted_at`.
+    fn blob_mark_key_grant_emitted(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #848 §14 (V146) — every dirty `invisible_encrypted` blob
+    /// `author_key_id` authored; what the boot sweep emits on the content
+    /// axis.
+    fn blob_list_key_grant_dirty(
+        &self,
+        author_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
+
+    /// #848 §13 (V146) — record a content-axis set admitted before its bytes
+    /// (`federation_key_grant_pending`): the adopt takes it by `(sha, scope)`.
+    /// Idempotent on the attestation id.
+    fn key_grant_pending_put(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+        signer_key_id: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// #848 §13 (V146) — take (read and delete, one transaction) every
+    /// pending row for `(sha, scope)` as `(attestation_id, signer_key_id)`.
+    fn key_grant_pending_take(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+    ) -> impl Future<Output = Result<Vec<(String, String)>, BlobError>> + Send;
+
     /// v4.14.0 (CIRISPersist#152) — fetch the at-rest grant for
     /// `(at_rest_sha256, recipient_key_id)`, returning
     /// `(wrap_algorithm, wrapped_dek)` or `None` if no grant exists (the

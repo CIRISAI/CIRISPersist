@@ -486,6 +486,16 @@ plane's cohort gate asks about the signer *now* and must stay there —
 `asserted_at` is signer-chosen, and a revoked occurrence must not regain
 admission by back-dating (I60b).
 
+**Implementation note (PR #850 review, round two).** The pending index
+(`federation_key_grant_pending`, V146) is keyed `(at_rest_sha256,
+cohort_scope)`: admission records a pending set there and the adopt takes
+its own rows, never scanning an author's attestations. Admission re-reads
+the blob's provenance *after* the carrier row lands: an adopt that stored
+the row and took the index between admission's first look and the carrier's
+insert would otherwise leave the set unprojected — with the re-read, every
+interleaving projects (the adopt's take sees the index row written before the
+re-read, or the re-read sees the adopt's row).
+
 ## 14. Emission: the full set, every time, supersedable
 
 - **Epoch axis.** When `ensure_epoch_dek` mints (C, M, E), and after every
@@ -506,6 +516,18 @@ existing self/family ciphertext; it reports each changed blob
 content-axis set (I68). Every Python write door — the two specialized doors
 included — emits through one helper (I69).
 
+**Implementation note (PR #850 review, round two) — the emission ledger.**
+A door that dies between its cascade's commit and its emission leaves a
+durable DEK and wraps and no set on the cursor, and the next write finds the
+fan-out unchanged. The ledger is `key_grant_emitted_at` on the epoch's
+self-retention row and on the blob row (V146): an axis is DIRTY when never
+emitted or when a grant under it is newer than the last emission (the grant
+tables' `created_at`, the database's own clock on both sides). `ensure_epoch_dek`
+reports `changed` when dirty, so every consumer emits; `emit_key_grant`
+marks on success; a skipped emission stays dirty. `Engine::emit_pending_key_grants`
+sweeps at every constructor after the sentinel resolves (best effort, logged)
+and on demand (I70).
+
 ## 15. Rotation on admitted removal — every minter, its own counter
 
 CIRISEdge's fact 1 is a present-day forward-secrecy hole across nodes: after
@@ -517,6 +539,13 @@ own counter before its next seal after admitting a removal.**
 `removed_at` for C against the current (C, M, E)'s `minted_at`; if a removal
 is newer, it disables E and mints E+1 before sealing. The revoker's explicit
 bump stays as it is. Coalescing per CC 5.1 is unchanged.
+
+**Implementation note (PR #850 review, round two).** The comparison is
+against the removal's *effective* instant: a removal admitted with a
+skew-window future `effective_at`, and a bump-and-seal in between, mint an
+epoch newer than `removed_at` that still grants the member (correctly — the
+removal is not yet in effect); at the first seal after `effective_at` that
+epoch rotates too (I71).
 
 ## 16. Schema — V145, and the sentinel only the running node can resolve
 
@@ -572,6 +601,8 @@ door. No shared directory.
 | I66e | Every Engine door that touches the community-DEK plane calls the resolver first (from disk, sixteen doors). | a door added without the check | from-disk |
 | I68 | `rekey_self_occurrence_add` names each changed blob and emits its full content set; a second walk changes and emits nothing. | a newcomer device with local grants and no key on its remote node | behavioural, Engine door |
 | I69 | Every Python write door — the two specialized ones included — calls the one emission helper (from disk). | bytes stored through Python with no set on the cursor | from-disk |
+| I70 | A cascade that ran with no emission (the crash shape) leaves the epoch DIRTY; the next door emits though the fan-out is unchanged; a clean epoch emits nothing more; `emit_pending_key_grants` emits a dirty community once and then nothing. | ciphertext announced, key never carried | behavioural, Engine door + sweep |
+| I71 | A removal with a future `effective_at`, a bump-and-seal in between (minted after `removed_at`, before `effective_at`, X still granted), then after `effective_at` the next seal rotates that epoch, disables it, excludes X. | an epoch minted in the skew window kept forever | behavioural, two-node |
 
 ## 19. What Edge and Server do
 

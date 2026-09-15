@@ -295,6 +295,7 @@ Engine	duty_holders_for_content_json	empirical
 Engine	emit_attestation	deontic	
 Engine	emit_attestation_self	deontic	
 Engine	emit_key_grant	deontic
+Engine	emit_pending_key_grants	deontic
 Engine	engine_handle	structural	
 Engine	enqueue_outbound	procedural	
 Engine	enter_mesh	deontic	

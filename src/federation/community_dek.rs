@@ -252,7 +252,7 @@ pub mod orchestrate {
     /// active occurrences. This is the same shape the self/family
     /// `resolve_recipients` family arm uses, keyed on the community.
     ///
-    /// #848 (§15) — also returns the latest `removed_at` among the
+    /// #848 (§15) — also returns the latest `effective_at` among the
     /// EFFECTIVE removals, so `ensure_epoch_dek` can compare it with the
     /// current epoch's mint instant from the same fold it wrapped by.
     async fn resolve_community_members<B>(
@@ -315,7 +315,7 @@ pub mod orchestrate {
     /// disclosure predicate ([`may_learn_epoch_fate`], #833) so "who is a
     /// member" has one answer.
     ///
-    /// #848 (§15) — the second value is the latest `removed_at` among the
+    /// #848 (§15) — the second value is the latest `effective_at` among the
     /// removals that are effective now: the instant a minter's current epoch
     /// must be newer than, or rotate.
     async fn active_member_occurrences<B>(
@@ -341,10 +341,15 @@ pub mod orchestrate {
                 .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
             now,
         );
+        // The removal's EFFECTIVE instant, not the instant it was recorded:
+        // a removal admitted with a (skew-window) future `effective_at` lets
+        // a seal in between mint an epoch newer than `removed_at` that still
+        // grants the member; comparing against `effective_at` rotates that
+        // epoch at the first seal after the removal takes effect (PR #850).
         let latest_removed_at = revs
             .iter()
             .filter(|r| r.effective_at <= now)
-            .map(|r| r.removed_at)
+            .map(|r| r.effective_at)
             .max();
 
         let mut out = Vec::new();
@@ -427,6 +432,8 @@ pub mod orchestrate {
         /// The per-occurrence split and roster partition (#843).
         pub report: GrantReport,
         /// A DEK was minted, or a recipient granted, in this call (§14).
+        /// Also true when the epoch's `KeyGrant` set is DIRTY per the V146
+        /// ledger (never emitted, or a grant newer than the last emission).
         pub changed: bool,
     }
 
@@ -451,8 +458,8 @@ pub mod orchestrate {
     ///
     /// Before this, only the REVOKER's node rotated after a removal; every
     /// other member's node kept sealing under an epoch the removed member
-    /// could still open. Here, if the roster fold's latest effective
-    /// `removed_at` is NEWER than `(community, minter, epoch)`'s `minted_at`,
+    /// could still open. Here, if the roster fold's latest effective removal's
+    /// `effective_at` is NEWER than `(community, minter, epoch)`'s `minted_at`,
     /// the minter's counter is advanced and `epoch` is disabled BEFORE any
     /// seal — the returned [`EnsuredEpoch::epoch`] is the new one, and the
     /// caller binds to that. Local, coordination-free: the counter is the
@@ -629,7 +636,13 @@ pub mod orchestrate {
             epoch,
             dek,
             report,
-            changed,
+            // §14 (V146, PR #850 review) — the emission ledger: an epoch whose
+            // set was never carried (a door that died between its cascade and
+            // its emission) reports `changed` so every consumer emits now.
+            changed: changed
+                || backend
+                    .community_dek_key_grant_dirty(community_key_id, minter_key_id, epoch)
+                    .await?,
         })
     }
 

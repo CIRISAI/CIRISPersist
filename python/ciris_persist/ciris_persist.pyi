@@ -761,6 +761,10 @@ class Engine:
     def emit_key_grant(self, axis_json: str) -> str | None:
         """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14) — emit the KeyGrant set for an axis on demand. FFI mirror of [Engine::emit_key_grant](crate::engine::Eng..."""
 
+    def emit_pending_key_grants(self) -> int:
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every KeyGrant set this node owes and has not yet carried: each epoch it minted whose set is dirty per the emission ledger and each self/family blob it authored likewise. Runs at __init__ after the sentinel resolves; reachable on demand. Returns how many sets were emitted. FFI mirror of [Engine::emit_pending_key_grants]."""
+        ...
+
     def enter_mesh(self, attestation_id: str, contextual_integrity: str) -> dict[str, Any]:
         """(derived) deontic — v39.0.0 — enter the mesh: flip a local-tier row to the federation tier over the SAME bytes (CC 5.3.2.4.2). Replaces attestation_promote, which re-s..."""
 

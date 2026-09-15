@@ -1001,6 +1001,15 @@ pub mod two_node {
                 .is_none(),
             "{tag} I65: a set the author did not sign never projects"
         );
+        // The pending index (V146) was TAKEN by the adopt: nothing left.
+        assert!(
+            a2.backend
+                .key_grant_pending_take(&sha, SELF)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I65: the adopt took every pending row for the blob"
+        );
         // (4) A re-delivered author set after the bytes projects directly —
         // the row is present, the author is checked, every wrap already held.
         let again = carry_key_grant(a, a2, &emitted.attestation_id)
@@ -1038,6 +1047,113 @@ pub mod two_node {
         assert!(
             matches!(err, BlobError::NotGranted { .. }),
             "{tag} I65: the outsider the forged set named stays refused: {err:?}"
+        );
+    }
+
+    /// **I71 — rotation is keyed on the removal's EFFECTIVE instant** (PR
+    /// #850 review). A removal admitted with a future `effective_at` (inside
+    /// the skew window) and a bump-and-seal in between mint an epoch NEWER
+    /// than `removed_at` that still grants the member. Once the removal takes
+    /// effect, the next seal must rotate that epoch too: compared against
+    /// `removed_at` it never would.
+    pub async fn exercise_i71_rotation_keys_on_effective_at<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let comm = format!("{tag}-comm-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        let xavier = format!("{tag}-xavier-{run}");
+        seed_community_everywhere(
+            &[a, b],
+            &comm,
+            &[(&alice, Some(a)), (&bob, Some(b)), (&xavier, None)],
+        )
+        .await;
+        let x_occ = format!("{tag}-x-occ-{run}");
+        for n in [a, b] {
+            ts::register_hybrid_key_as(n.backend, &x_occ, &x_occ, USER).await;
+            crate::federation::at_rest_cascade::blob_invariants::join_as_occurrence(
+                n.backend, &xavier, &x_occ,
+            )
+            .await;
+        }
+        let first = encrypt_and_cascade_community(a.backend, &comm, b"e0", None, Some(&a.key))
+            .await
+            .unwrap();
+        assert!(first.granted.contains(&x_occ), "{tag} I71: X granted at e0");
+        // The removal is RECORDED now and takes EFFECT shortly (skew window).
+        let removed_at = chrono::Utc::now();
+        let effective_at = removed_at + chrono::Duration::milliseconds(400);
+        let rev = ts::sign_community_membership_revocation(
+            &comm,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: comm.clone(),
+                removed_identity_key_id: xavier.clone(),
+                removed_at,
+                effective_at,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        a.backend
+            .put_community_membership_revocation(rev)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I71: a future-effective removal is admitted: {e}"));
+        // Between admission and effect: the revoker's bump, then a seal —
+        // an epoch minted AFTER `removed_at` that still grants X.
+        a.backend
+            .community_dek_bump_epoch(&comm, &a.key)
+            .await
+            .unwrap();
+        let between =
+            encrypt_and_cascade_community(a.backend, &comm, b"between", None, Some(&a.key))
+                .await
+                .unwrap();
+        assert!(
+            between.epoch > first.epoch,
+            "{tag} I71: the bump minted a new epoch"
+        );
+        assert!(
+            between.granted.contains(&x_occ),
+            "{tag} I71: before the removal takes effect X is still granted (by design)"
+        );
+        let between_minted = a
+            .backend
+            .community_dek_minted_at(&comm, &a.key, between.epoch)
+            .await
+            .unwrap()
+            .expect("minted_at");
+        assert!(between_minted > removed_at && between_minted < effective_at);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The removal is in effect: the next seal must rotate the in-between
+        // epoch (its mint predates `effective_at`), disable it, and exclude X.
+        let after = encrypt_and_cascade_community(a.backend, &comm, b"after", None, Some(&a.key))
+            .await
+            .unwrap();
+        assert!(
+            after.epoch > between.epoch,
+            "{tag} I71: the epoch minted before the removal took EFFECT rotates ({} -> {})",
+            between.epoch,
+            after.epoch
+        );
+        assert_eq!(
+            a.backend
+                .community_dek_key_state(&comm, &a.key, between.epoch)
+                .await
+                .unwrap(),
+            Some(crate::federation::DekKeyState::Disabled),
+            "{tag} I71: the in-between epoch is disabled"
+        );
+        assert!(
+            !after.granted.contains(&x_occ),
+            "{tag} I71: X is absent after the removal takes effect: {:?}",
+            after.granted
         );
     }
 
@@ -1823,6 +1939,15 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn i71_rotation_keys_on_effective_at_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node(&ba, "i71-a").await;
+            let b = node(&bb, "i71-b").await;
+            introduce(&[&a, &b], &["i71-a", "i71-b"]).await;
+            exercise_i71_rotation_keys_on_effective_at(&a, &b, "sqlite").await;
+        }
+
+        #[tokio::test]
         async fn i61_end_to_end_sqlite() {
             let (ba, bb) = (fresh().await, fresh().await);
             let a = node(&ba, "i61-a").await;
@@ -1982,6 +2107,185 @@ mod tests {
                 .unwrap();
             assert!(rk2.changed_blobs.is_empty(), "I68: {rk2:?}");
             assert_eq!(sets_for(sq.clone(), me.clone()).await.len(), 2);
+        }
+
+        /// **I70 — the emission ledger (V146): a door that died between its
+        /// cascade and its emission is repaired by the next door, and by the
+        /// boot sweep** (PR #850 review). The cascade is driven directly on the
+        /// engine's backend — the exact state a crash leaves: DEK and wraps
+        /// durable, no set on the cursor.
+        #[tokio::test]
+        async fn i70_emission_ledger_repairs_a_missed_emission_sqlite() {
+            use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+            use crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE;
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::cohort_scope::COMMUNITY;
+            use crate::federation::types::identity_type::USER;
+            use crate::federation::{BlobStorage, EncryptionPubkeys, FederationDirectory};
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("i70-node-{run}");
+            let engine =
+                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+                    .await
+                    .unwrap();
+            engine
+                .register_self_federation_key(USER, &alias, None, serde_json::json!({}), vec![])
+                .await
+                .unwrap();
+            let sq = engine.sqlite_backend().unwrap().clone();
+            let me = engine.local_derived_key_id().await.unwrap();
+            let kem =
+                |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                    x25519_base64: id.x25519_pubkey_b64,
+                    ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+                };
+            // A community of me (occurrence: this node) and a member whose
+            // occurrence lives elsewhere (a second in-memory identity).
+            let other = fresh().await;
+            let member_occ = format!("i70-member-occ-{run}");
+            ts::register_hybrid_key_as(sq.as_ref(), &member_occ, &member_occ, USER).await;
+            let node = Node {
+                backend: sq.as_ref(),
+                signer: ts::local_signer(&alias),
+                key: me.clone(),
+                kem: kem(sq.load_or_init_content_kem_identity().await.unwrap()),
+            };
+            let comm = format!("i70-comm-{run}");
+            let (alice, bob) = (format!("i70-alice-{run}"), format!("i70-bob-{run}"));
+            seed_community_everywhere(&[&node], &comm, &[(&alice, Some(&node)), (&bob, None)])
+                .await;
+            sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: bob.clone(),
+                occurrence_key_id: member_occ.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(kem(other
+                    .load_or_init_content_kem_identity()
+                    .await
+                    .unwrap())),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+            let epoch_sets = |sq: std::sync::Arc<SqliteBackend>, me: String| async move {
+                sq.list_attestations_by(&me)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|r| r.attestation_type == KEY_GRANT_EPOCH_ATTESTATION_TYPE)
+                    .count()
+            };
+            // (1) The crash shape: the cascade ran, no door emitted.
+            let sealed =
+                encrypt_and_cascade_community(sq.as_ref(), &comm, b"minutes", None, Some(&me))
+                    .await
+                    .unwrap();
+            assert!(sealed.granted.contains(&member_occ));
+            assert_eq!(
+                epoch_sets(sq.clone(), me.clone()).await,
+                0,
+                "I70: nothing carried"
+            );
+            assert!(
+                sq.community_dek_key_grant_dirty(&comm, &me, sealed.epoch)
+                    .await
+                    .unwrap(),
+                "I70: the epoch's set is DIRTY"
+            );
+            // (2) The next door — fan-out unchanged — emits anyway.
+            let r = engine
+                .put_blob_scoped(COMMUNITY, Some(&comm), b"next", None, None)
+                .await
+                .unwrap();
+            assert!(
+                r.key_grant_emission.is_some(),
+                "I70: the dirty epoch reports an emission"
+            );
+            assert_eq!(
+                epoch_sets(sq.clone(), me.clone()).await,
+                1,
+                "I70: the set is on the cursor"
+            );
+            assert!(!sq
+                .community_dek_key_grant_dirty(&comm, &me, sealed.epoch)
+                .await
+                .unwrap());
+            // (3) Clean: a further unchanged write emits nothing more.
+            let r2 = engine
+                .put_blob_scoped(COMMUNITY, Some(&comm), b"again", None, None)
+                .await
+                .unwrap();
+            assert!(
+                r2.key_grant_emission.is_none(),
+                "I70: clean epoch, no emission"
+            );
+            assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 1);
+            // (4) The boot sweep on a fresh community left dirty by a "crash".
+            let comm2 = format!("i70-comm2-{run}");
+            // Seeded by hand: alice (this node's identity) is already
+            // registered — one occurrence, one identity — and joins a second
+            // community with bob2.
+            let bob2 = format!("i70-bob2-{run}");
+            let member_occ2 = format!("i70-member-occ2-{run}");
+            for k in [&comm2, &bob2, &member_occ2] {
+                ts::register_hybrid_key_as(sq.as_ref(), k, k, USER).await;
+            }
+            sq.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                identity_key_id: bob2.clone(),
+                occurrence_key_id: member_occ2.clone(),
+                device_class: crate::federation::types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(kem(other
+                    .load_or_init_content_kem_identity()
+                    .await
+                    .unwrap())),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+            let roster = [&alice, &bob2]
+                .into_iter()
+                .map(|k| crate::federation::types::CommunityMember {
+                    key_id: k.clone(),
+                    joined_at: chrono::Utc::now(),
+                    role: None,
+                })
+                .collect();
+            sq.put_community(ts::sign_community(
+                &comm2,
+                crate::federation::types::Community {
+                    community_key_id: comm2.clone(),
+                    community_name: "Second Co-op".into(),
+                    members: roster,
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                        .to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap();
+            encrypt_and_cascade_community(sq.as_ref(), &comm2, b"crashed", None, Some(&me))
+                .await
+                .unwrap();
+            assert_eq!(
+                engine.emit_pending_key_grants().await.unwrap(),
+                1,
+                "I70: the sweep emits the dirty epoch"
+            );
+            assert_eq!(epoch_sets(sq.clone(), me.clone()).await, 2);
+            assert_eq!(
+                engine.emit_pending_key_grants().await.unwrap(),
+                0,
+                "I70: nothing left to emit"
+            );
         }
 
         /// I61 through the CONSUMER-HELD doors: two `Engine`s, each its own
@@ -2179,6 +2483,18 @@ mod tests {
             introduce(&[&a, &b], &["i60b-a", "i60b-b"]).await;
             exercise_i60b_delayed_set_survives_a_later_occurrence_revocation(&a, &b, "postgres")
                 .await;
+        }
+
+        #[tokio::test]
+        async fn i71_rotation_keys_on_effective_at_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node(&ba, "i71-a").await;
+            let b = node(&bb, "i71-b").await;
+            introduce(&[&a, &b], &["i71-a", "i71-b"]).await;
+            exercise_i71_rotation_keys_on_effective_at(&a, &b, "postgres").await;
         }
 
         #[tokio::test]

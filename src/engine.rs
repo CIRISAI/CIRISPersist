@@ -992,6 +992,7 @@ impl Engine {
         // CIRISPersist#848 (I66) — the V145 minter sentinel resolves
         // to this node's key HERE, before any read; a survivor is boot-fatal.
         engine.resolve_minter_sentinels_at_boot().await?;
+        engine.sweep_pending_key_grants_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1076,6 +1077,7 @@ impl Engine {
         // witness found this constructor without the hook: a pre-genesis
         // node with V145 sentinels would have served a minter of nobody.
         engine.resolve_minter_sentinels_at_boot().await?;
+        engine.sweep_pending_key_grants_at_boot().await;
         // v31.0.0 (CIRISPersist#650) — same hook as `with_signer`. A
         // pre-genesis node usually has nothing to migrate (no identity ⇒ no
         // authorship), and the routine returns early in that case; but a node
@@ -1144,6 +1146,7 @@ impl Engine {
             engine.set_backend_node_key_id(&id);
         }
         engine.resolve_minter_sentinels_at_boot().await?;
+        engine.sweep_pending_key_grants_at_boot().await;
         Ok(engine)
     }
 
@@ -1215,6 +1218,7 @@ impl Engine {
             engine.set_backend_node_key_id(&id);
         }
         engine.resolve_minter_sentinels_at_boot().await?;
+        engine.sweep_pending_key_grants_at_boot().await;
         Ok(engine)
     }
 
@@ -5276,7 +5280,7 @@ impl Engine {
         };
         // A community with no live moderator may not federate at all
         // (`key_grant::emission_outcome`): nothing to carry, the write stands.
-        crate::federation::key_grant::emission_outcome(
+        let emitted = crate::federation::key_grant::emission_outcome(
             self.emit_attestation_self(set.emit_input()).await,
         )
         .map_err(|e| {
@@ -5284,7 +5288,60 @@ impl Engine {
                 "key_grant set for {axis:?} could not be emitted — the bytes are stored, the \
                  key cannot follow them until this succeeds ({e})"
             ))
-        })
+        })?;
+        // §14 (V146) — the emission ledger: the axis is clean from this
+        // instant until a newer grant lands under it. A skipped emission
+        // (`None`) leaves it dirty, so the next door or the boot sweep retries.
+        if emitted.is_some() {
+            match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis).await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    crate::federation::key_grant::mark_emitted(b.as_ref(), axis).await
+                }
+            }
+            .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
+        }
+        Ok(emitted)
+    }
+
+    /// #848 §14 (V146, PR #850 review) — **emit every `KeyGrant` set this
+    /// node owes and has not yet carried**: each epoch this node minted whose
+    /// set is dirty (a grant newer than the last emission, or never emitted —
+    /// the shape a crash between a cascade and its emission leaves), and each
+    /// self/family blob this node authored likewise. Called at every
+    /// constructor after the sentinel resolves (a failure is logged, never a
+    /// boot abort — the doors retry on their own writes), and reachable on
+    /// demand. Returns how many sets were emitted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn emit_pending_key_grants(&self) -> Result<usize, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("emit_pending_key_grants: {e}"))
+        })?;
+        let axes = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::key_grant::dirty_axes(b.as_ref(), &me).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::key_grant::dirty_axes(b.as_ref(), &me).await
+            }
+        }
+        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
+        let mut emitted = 0usize;
+        for axis in &axes {
+            if self.emit_key_grant(axis).await?.is_some() {
+                emitted += 1;
+            }
+        }
+        Ok(emitted)
     }
 
     /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
@@ -5340,6 +5397,22 @@ impl Engine {
             return Ok(());
         }
         self.resolve_minter_sentinels_at_boot().await
+    }
+
+    /// #848 §14 (V146) — the boot leg of [`emit_pending_key_grants`]
+    /// (Self::emit_pending_key_grants): best effort, logged, never an abort —
+    /// a node that cannot emit right now must still boot, and every write
+    /// door retries the dirty axis on its own path.
+    async fn sweep_pending_key_grants_at_boot(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        match self.emit_pending_key_grants().await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(sets = n, "pending KeyGrant sets emitted at boot (#848 §14)"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "pending KeyGrant sets could not be emitted at boot; the write doors retry (#848 §14)"
+            ),
+        }
     }
 
     async fn resolve_minter_sentinels_at_boot(&self) -> Result<(), EngineError> {
@@ -5600,6 +5673,9 @@ impl Engine {
             }
         }?;
         // #848 (§14) — the set follows the bytes when the fan-out changed.
+        // §14 (V146) — `fanout_changed` is also true when the epoch's set is
+        // DIRTY per the emission ledger (`ensure_epoch_dek`), so a door that
+        // died before emitting is repaired by the next one (PR #850 review).
         if r.fanout_changed {
             self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Epoch {
                 community_key_id: community_key_id.to_owned(),

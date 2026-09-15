@@ -12866,6 +12866,243 @@ impl crate::federation::BlobStorage for SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("put_at_rest_grants: {e}")))
     }
 
+    async fn community_dek_key_grant_dirty(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        self.read(move |conn| -> Result<bool, rusqlite::Error> {
+            // Dirty: a grant exists AND (never emitted OR the newest grant is
+            // not older than the emission). `<=` on purpose — a grant landing
+            // in the emission's own millisecond re-emits once, never misses.
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federation_community_dek_member_grants g \
+                               WHERE g.community_key_id = d.community_key_id \
+                                 AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
+                        AND (d.key_grant_emitted_at IS NULL \
+                             OR d.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                                 FROM federation_community_dek_member_grants g \
+                                WHERE g.community_key_id = d.community_key_id \
+                                  AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
+                   FROM federation_community_dek d \
+                  WHERE d.community_key_id = ?1 AND d.minter_key_id = ?2 AND d.epoch = ?3",
+                rusqlite::params![c, m, e],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(false))
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_key_grant_dirty: {e}"))
+        })
+    }
+
+    async fn community_dek_mark_key_grant_emitted(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<(), crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_community_dek \
+                    SET key_grant_emitted_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                  WHERE community_key_id = ?1 AND minter_key_id = ?2 AND epoch = ?3",
+                rusqlite::params![c, m, e],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_mark_key_grant_emitted: {e}"
+            ))
+        })
+    }
+
+    async fn community_dek_list_key_grant_dirty(
+        &self,
+        minter_key_id: &str,
+    ) -> Result<Vec<(String, u64)>, crate::federation::BlobError> {
+        let m = minter_key_id.to_owned();
+        self.read(move |conn| -> Result<Vec<(String, u64)>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT d.community_key_id, d.epoch FROM federation_community_dek d \
+                  WHERE d.minter_key_id = ?1 \
+                    AND EXISTS(SELECT 1 FROM federation_community_dek_member_grants g \
+                                WHERE g.community_key_id = d.community_key_id \
+                                  AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch) \
+                    AND (d.key_grant_emitted_at IS NULL \
+                         OR d.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                             FROM federation_community_dek_member_grants g \
+                            WHERE g.community_key_id = d.community_key_id \
+                              AND g.minter_key_id = d.minter_key_id AND g.epoch = d.epoch)) \
+                  ORDER BY d.community_key_id, d.epoch",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![m], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_list_key_grant_dirty: {e}"
+            ))
+        })
+    }
+
+    async fn blob_key_grant_dirty(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<bool, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(move |conn| -> Result<bool, rusqlite::Error> {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM federation_blob_key_grants g \
+                               WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2) \
+                        AND (b.key_grant_emitted_at IS NULL \
+                             OR b.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                                 FROM federation_blob_key_grants g \
+                                WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2)) \
+                   FROM federation_blobs b WHERE b.sha256 = ?1",
+                rusqlite::params![sha_vec, sentinel],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or(false))
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("blob_key_grant_dirty: {e}")))
+    }
+
+    async fn blob_mark_key_grant_emitted(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_blobs \
+                    SET key_grant_emitted_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                  WHERE sha256 = ?1",
+                rusqlite::params![sha_vec],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("blob_mark_key_grant_emitted: {e}"))
+        })
+    }
+
+    async fn blob_list_key_grant_dirty(
+        &self,
+        author_key_id: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        let author = author_key_id.to_owned();
+        let sentinel = crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT.to_owned();
+        self.read(move |conn| -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT b.sha256 FROM federation_blobs b \
+                  WHERE b.author_key_id = ?1 AND b.crypto_tier = 'invisible_encrypted' \
+                    AND EXISTS(SELECT 1 FROM federation_blob_key_grants g \
+                                WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2) \
+                    AND (b.key_grant_emitted_at IS NULL \
+                         OR b.key_grant_emitted_at <= (SELECT MAX(g.created_at) \
+                             FROM federation_blob_key_grants g \
+                            WHERE g.at_rest_sha256 = b.sha256 AND g.recipient_key_id != ?2)) \
+                  ORDER BY b.sha256",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![author, sentinel], |r| {
+                let v: Vec<u8> = r.get(0)?;
+                Ok(v)
+            })?;
+            let mut out = Vec::new();
+            for v in rows {
+                let v = v?;
+                if let Ok(a) = <[u8; 32]>::try_from(v.as_slice()) {
+                    out.push(a);
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("blob_list_key_grant_dirty: {e}"))
+        })
+    }
+
+    async fn key_grant_pending_put(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+        attestation_id: &str,
+        signer_key_id: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let (scope, id, signer) = (
+            cohort_scope.to_owned(),
+            attestation_id.to_owned(),
+            signer_key_id.to_owned(),
+        );
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "INSERT INTO federation_key_grant_pending \
+                    (at_rest_sha256, cohort_scope, attestation_id, signer_key_id) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (at_rest_sha256, cohort_scope, attestation_id) DO NOTHING",
+                rusqlite::params![sha_vec, scope, id, signer],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_put: {e}")))
+    }
+
+    async fn key_grant_pending_take(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        cohort_scope: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let scope = cohort_scope.to_owned();
+        self.write(move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+            let tx = conn.transaction()?;
+            let rows: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT attestation_id, signer_key_id FROM federation_key_grant_pending \
+                      WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2 ORDER BY created_at, attestation_id",
+                )?;
+                let it = stmt.query_map(rusqlite::params![sha_vec, scope], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                it.collect::<Result<_, _>>()?
+            };
+            tx.execute(
+                "DELETE FROM federation_key_grant_pending WHERE at_rest_sha256 = ?1 AND cohort_scope = ?2",
+                rusqlite::params![sha_vec, scope],
+            )?;
+            tx.commit()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant_pending_take: {e}")))
+    }
+
     async fn list_at_rest_grants(
         &self,
         at_rest_sha256: &[u8; 32],

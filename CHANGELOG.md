@@ -153,6 +153,32 @@ invariants I59–I67, each a two-node witness driven on sqlite and postgres.
   resolver otherwise, and a survivor fails THAT door with the sentinel named
   rather than leaving bindings silently unreadable. I66d, I66e (from disk).
 
+### Review round two (PR #850, Codex) — three P1s, one P2; V146
+- **The emission ledger (§14, V146).** A door that died between its cascade
+  and its emission left a durable DEK and wraps and no set on the cursor, and
+  the next write saw the fan-out unchanged. `key_grant_emitted_at` on the
+  epoch's self-retention row and on the blob row is the ledger: an axis is
+  DIRTY when never emitted or when a grant is newer than the last emission
+  (the grant tables' `created_at`). `ensure_epoch_dek` reports `changed` when
+  dirty, so every consumer — the Engine doors, the chunk cascade, the Python
+  doors — emits; `emit_key_grant` marks on success; a skipped emission (no
+  moderator) stays dirty. **`Engine::emit_pending_key_grants` /
+  `PyEngine.emit_pending_key_grants`** sweep every dirty epoch this node
+  minted and every dirty self/family blob it authored; every constructor
+  runs it after the sentinel resolves (logged, never a boot abort). I70.
+- **The pending index (§13, V146).** `federation_key_grant_pending` keyed
+  `(at_rest_sha256, cohort_scope)`: a content set admitted before its bytes
+  is recorded there and the adopt TAKES its own rows — no scan of an author's
+  attestations (the P2). Admission re-reads provenance after the carrier
+  lands (the race with a concurrent adopt: every interleaving projects).
+- **Rotation keys on the removal's `effective_at`**, not the instant it was
+  recorded: a removal admitted with a skew-window future `effective_at` and
+  a bump-and-seal in between mint an epoch newer than `removed_at` that still
+  grants the member; it now rotates at the first seal after the removal takes
+  effect. I71.
+- **V146** (both dialects): two nullable columns, one table; additive, no
+  rebuild. Manifest rows appended.
+
 ### Consumer-visible (read before adopting)
 - **An encrypted write now needs a node that can EMIT.** `put_blob_encrypted_*`,
   `put_blob_scoped` at an encrypted tier, `put_blob_chunk_scoped` and

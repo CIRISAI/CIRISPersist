@@ -512,14 +512,18 @@ where
     else {
         return Ok(None);
     };
-    emission_outcome(
+    let emitted = emission_outcome(
         crate::federation::attestation_emit::emit_with_local_signer(
             backend,
             signer,
             set.emit_input(),
         )
         .await,
-    )
+    )?;
+    if emitted.is_some() {
+        mark_emitted(backend, &set.axis).await?;
+    }
+    Ok(emitted)
 }
 
 /// §14 — emit the full content-axis set for one self/family blob authored
@@ -540,14 +544,88 @@ where
     else {
         return Ok(None);
     };
-    emission_outcome(
+    let emitted = emission_outcome(
         crate::federation::attestation_emit::emit_with_local_signer(
             backend,
             signer,
             set.emit_input(),
         )
         .await,
-    )
+    )?;
+    if emitted.is_some() {
+        mark_emitted(backend, &set.axis).await?;
+    }
+    Ok(emitted)
+}
+
+/// §14 (V146, PR #850 review) — **the emission ledger: stamp the axis as
+/// emitted** with the database's own clock. Called by every emitter on a
+/// successful (`Some`) emission — the Engine's composed-signer door and the
+/// local-signer emitters alike — so the ledger never depends on which door
+/// carried the set.
+pub async fn mark_emitted<B>(backend: &B, axis: &KeyGrantAxis) -> Result<(), Error>
+where
+    B: BlobStorage + Sync,
+{
+    match axis {
+        KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id,
+            epoch,
+        } => backend
+            .community_dek_mark_key_grant_emitted(community_key_id, minter_key_id, *epoch)
+            .await
+            .map_err(map_blob_err),
+        KeyGrantAxis::Content { at_rest_sha256, .. } => {
+            let sha: [u8; 32] = hex::decode(at_rest_sha256)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
+            backend
+                .blob_mark_key_grant_emitted(&sha)
+                .await
+                .map_err(map_blob_err)
+        }
+    }
+}
+
+/// §14 (V146) — **every axis this node owes an emission on**: each epoch
+/// `me` minted whose set is dirty, then each `invisible_encrypted` blob `me`
+/// authored whose set is dirty (its owner is the blob row's
+/// `community_key_id` — the self identity or the family — or `me` when the
+/// row carries none). What the boot sweep and `emit_pending_key_grants`
+/// iterate.
+pub async fn dirty_axes<B>(backend: &B, me: &str) -> Result<Vec<KeyGrantAxis>, Error>
+where
+    B: BlobStorage + Sync,
+{
+    let mut out = Vec::new();
+    for (community_key_id, epoch) in backend
+        .community_dek_list_key_grant_dirty(me)
+        .await
+        .map_err(map_blob_err)?
+    {
+        out.push(KeyGrantAxis::Epoch {
+            community_key_id,
+            minter_key_id: me.to_owned(),
+            epoch,
+        });
+    }
+    for sha in backend
+        .blob_list_key_grant_dirty(me)
+        .await
+        .map_err(map_blob_err)?
+    {
+        let Some(prov) = backend.blob_provenance(&sha).await.map_err(map_blob_err)? else {
+            continue;
+        };
+        out.push(KeyGrantAxis::Content {
+            at_rest_sha256: hex::encode(sha),
+            cohort_scope: prov.cohort_scope,
+            owner_key_id: prov.community_key_id.unwrap_or_else(|| me.to_owned()),
+        });
+    }
+    Ok(out)
 }
 
 /// §14 — the full set for an emission axis a write door reported
@@ -602,14 +680,18 @@ where
     else {
         return Ok(None);
     };
-    emission_outcome(
+    let emitted = emission_outcome(
         crate::federation::attestation_emit::emit_with_local_signer(
             backend,
             signer,
             set.emit_input(),
         )
         .await,
-    )
+    )?;
+    if emitted.is_some() {
+        mark_emitted(backend, &set.axis).await?;
+    }
+    Ok(emitted)
 }
 
 /// §12 — is `signer` an ACTIVE member occurrence (or member identity) of
@@ -796,6 +878,9 @@ where
     }
 
     // The carrier row, through the attestation plane's own admission.
+    let row_id = set.attestation.attestation_id.clone();
+    let signer = signer.to_owned();
+    let signer = signer.as_str();
     let outcome = backend
         .apply_replicated_attestation(SignedAttestation {
             attestation: set.attestation,
@@ -817,13 +902,70 @@ where
     }
 
     if pending {
-        return Ok(KeyGrantAdmission {
-            wraps_offered: parsed.wraps.len(),
-            axis: parsed.axis,
-            attestation: outcome,
-            wraps_written: 0,
-            pending: true,
-        });
+        let KeyGrantAxis::Content {
+            at_rest_sha256,
+            cohort_scope,
+            ..
+        } = &parsed.axis
+        else {
+            unreachable!("pending is a content-axis verdict");
+        };
+        let sha: [u8; 32] = hex::decode(at_rest_sha256)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
+        // V146 — the pending index the adopt takes by (sha, scope).
+        backend
+            .key_grant_pending_put(&sha, cohort_scope, &row_id, signer)
+            .await
+            .map_err(map_blob_err)?;
+        // The race double-check (PR #850 review): an adopt that stored the
+        // row and took the pending index between our first look and the
+        // carrier's insert would otherwise leave this set unprojected
+        // forever. Re-read now that the carrier is stored — every
+        // interleaving is covered: if the adopt's row landed before this
+        // read we project here; if after, the adopt's take sees our index
+        // row (written before this read).
+        match backend
+            .blob_provenance(&sha)
+            .await
+            .map_err(map_blob_err)?
+            .and_then(|p| p.author_key_id)
+        {
+            None => {
+                return Ok(KeyGrantAdmission {
+                    wraps_offered: parsed.wraps.len(),
+                    axis: parsed.axis,
+                    attestation: outcome,
+                    wraps_written: 0,
+                    pending: true,
+                });
+            }
+            Some(author) if author != signer => {
+                // The author is known now and it is not the signer: the
+                // carrier stays a stored attestation, the index row is
+                // dropped, nothing projects.
+                let _ = backend
+                    .key_grant_pending_take(&sha, cohort_scope)
+                    .await
+                    .map_err(map_blob_err)?;
+                return Err(refuse(
+                    KeyGrantRefusalReason::SignerNotAuthor,
+                    format!(
+                        "signer {signer:?} is not the author {author:?} of blob {at_rest_sha256}"
+                    ),
+                ));
+            }
+            Some(_) => {
+                // The bytes arrived meanwhile: project directly (below) and
+                // retire the index row — the adopt may also have taken it;
+                // both paths are unions.
+                let _ = backend
+                    .key_grant_pending_take(&sha, cohort_scope)
+                    .await
+                    .map_err(map_blob_err)?;
+            }
+        }
     }
     // The projection: every wrap, a union.
     let wraps_written = match &parsed.axis {
@@ -861,12 +1003,14 @@ where
 
 /// §13 — **project the content-axis sets that were admitted before their
 /// bytes.** Called by the adopt path the moment a blob row exists with its
-/// author known: every stored `key_grant:content:v1` row for `sha256`
+/// author known: the pending index rows for `(sha, scope)` are TAKEN (read
+/// and deleted, V146 — an adopt reads its own rows, never an author's
+/// attestations), and each stored `key_grant:content:v1` row among them
 /// *signed by `author_key_id`* is projected as a union; a row signed by
-/// anyone else stays a stored attestation and grants nothing (the same
-/// `SignerNotAuthor` verdict [`admit_replicated_key_grant`] gives when the
-/// row is present). Idempotent — `ON CONFLICT DO NOTHING` under it, like
-/// every projection. Returns the number of wraps written.
+/// anyone else grants nothing (the same `SignerNotAuthor` verdict
+/// [`admit_replicated_key_grant`] gives when the row is present).
+/// Idempotent — `ON CONFLICT DO NOTHING` under it. Returns the wraps
+/// written.
 pub async fn project_pending_content_grants<B>(
     backend: &B,
     sha256: &[u8; 32],
@@ -879,7 +1023,17 @@ where
     use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
     let want = hex::encode(sha256);
     let mut written = 0usize;
-    for row in backend.list_attestations_by(author_key_id).await? {
+    for (attestation_id, signer) in backend
+        .key_grant_pending_take(sha256, cohort_scope)
+        .await
+        .map_err(map_blob_err)?
+    {
+        if signer != author_key_id {
+            continue;
+        }
+        let Some(row) = backend.get_attestation(&attestation_id).await? else {
+            continue;
+        };
         if row.attestation_type != KEY_GRANT_CONTENT_ATTESTATION_TYPE
             || row.scrub_key_id != author_key_id
         {

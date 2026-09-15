@@ -2250,6 +2250,69 @@ impl PyEngine {
             }
         }
 
+        // CIRISPersist#848 §14 (V146) — the boot leg of the KeyGrant
+        // emission ledger: emit every set this node owes and never carried
+        // (a crash between a cascade and its emission). Best effort — a node
+        // that cannot emit right now must still boot; the write doors retry.
+        if let Some(local) = local_signer.as_ref() {
+            let local = local.clone();
+            let sweep: Result<usize, crate::federation::Error> = py.detach(|| {
+                runtime.block_on(async {
+                    let me = crate::signing::federation_key_id_of(&*signer)
+                        .await
+                        .map_err(|e| crate::federation::Error::Backend(format!("node key: {e}")))?;
+                    let mut emitted = 0usize;
+                    match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            for axis in
+                                crate::federation::key_grant::dirty_axes(pg.as_ref(), &me).await?
+                            {
+                                if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    pg.as_ref(),
+                                    &local,
+                                    &axis,
+                                )
+                                .await?
+                                .is_some()
+                                {
+                                    emitted += 1;
+                                }
+                            }
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            for axis in
+                                crate::federation::key_grant::dirty_axes(sq.as_ref(), &me).await?
+                            {
+                                if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    sq.as_ref(),
+                                    &local,
+                                    &axis,
+                                )
+                                .await?
+                                .is_some()
+                                {
+                                    emitted += 1;
+                                }
+                            }
+                        }
+                    }
+                    Ok(emitted)
+                })
+            });
+            match sweep {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(sets = n, "pending KeyGrant sets emitted at init (#848 §14)")
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "pending KeyGrant sets could not be emitted at init; the write doors retry (#848 §14)"
+                ),
+            }
+        }
+
         // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
         // PQC key is configured. Drains hybrid-pending rows authored
         // before the per-write cold-path was wired (or rows where the
@@ -6303,6 +6366,84 @@ impl PyEngine {
                 }
                 .map_err(federation_err_to_py)?;
                 Ok(emitted.map(|e| e.attestation_id))
+            })
+        })
+    }
+
+    /// (derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
+    /// **emit every KeyGrant set this node owes and has not yet carried**: each
+    /// epoch it minted whose set is dirty per the emission ledger (never
+    /// emitted, or a grant newer than the last emission — the shape a crash
+    /// between a cascade and its emission leaves) and each self/family blob it
+    /// authored likewise. Runs at `__init__` after the sentinel resolves (best
+    /// effort, logged); reachable on demand. Returns how many sets were
+    /// emitted. FFI mirror of [`Engine::emit_pending_key_grants`](crate::engine::Engine::emit_pending_key_grants).
+    fn emit_pending_key_grants(&self, py: Python<'_>) -> PyResult<usize> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let local = self.local_signer.clone().ok_or_else(|| {
+                blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                    "emit_pending_key_grants requires a LocalSigner to hybrid-sign the sets \
+                     (§14); this engine has none"
+                        .into(),
+                ))
+            })?;
+            py.detach(|| {
+                let me = runtime.block_on(self.local_derived_key_id_async())?;
+                let axes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::dirty_axes(backend.as_ref(), &me).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::dirty_axes(backend.as_ref(), &me).await
+                        })
+                    }
+                }
+                .map_err(federation_err_to_py)?;
+                let mut emitted = 0usize;
+                for axis in &axes {
+                    let done = match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            let backend = pg.clone();
+                            let local = local.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            let backend = sq.clone();
+                            let local = local.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                    .map_err(federation_err_to_py)?;
+                    if done.is_some() {
+                        emitted += 1;
+                    }
+                }
+                Ok(emitted)
             })
         })
     }
