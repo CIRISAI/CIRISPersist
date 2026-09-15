@@ -179,10 +179,14 @@ database by I55/I55b on every test run and on a real 3.40.1 by the bookworm
 witness on every CI run.
 
 **Required versus normalisation.** The repair first asks the library whether
-`datetime('now', 'subsec')` is NULL. Where it is (< 3.42), a refused repair
-is fatal, stated once and loudly, because the node could not write anyway.
-Where it is not, a refused repair is a warning and writes proceed on the
-shipped text.
+`datetime('now', 'subsec')` is NULL. A *refusal* — the connection will not
+accept schema writes, told by reading `PRAGMA writable_schema` back after
+setting it — is the one outcome that depends on the answer: fatal where the
+modifier is NULL (< 3.42), because the node could not write anyway; a
+warning where it evaluates, with writes proceeding on the shipped text.
+Every other failure — an I/O error, a failed commit, a non-`ok`
+`integrity_check` — propagates on every library, because a boot must not
+proceed on a half-known schema.
 
 It lives beside the #840 repair (`repair_v070_checksum`) and for the same
 reason: a shipped migration is immutable, so what a shipped migration got
@@ -196,7 +200,8 @@ crate, not in the ledger.
 | I55 | After `run_migrations` on sqlite, no `CREATE TABLE` text in `sqlite_master` contains `subsec`; an `INSERT` omitting a defaulted timestamp column succeeds and stores the 23-character form; a second run rewrites nothing. | a bookworm host that cannot write; a repair that changes the stored format | behavioural (sqlite), and the bookworm witness |
 | I55b | The repair succeeds on a connection with `SQLITE_DBCONFIG_DEFENSIVE` on, and defensive mode is restored afterwards. | an Apple node whose boot aborts on a refused rewrite; a repair that leaves defensive mode off | behavioural (sqlite) |
 | I55c | The rewrite succeeds with double-quoted strings disabled (`SQLITE_DQS=0` / `SQLITE_DBCONFIG_DQS_*` off): both literals are bound parameters and the statement spells no `"`. | a build that parses `"…"` as an identifier and fails `no such column` | behavioural (sqlite) |
-| I55d | A failed rewrite leaves `writable_schema` OFF and the shipped text untouched; a real repair then succeeds. | a declined repair that leaves the live writer editable for the process | behavioural (sqlite) |
+| I55d | A failed rewrite leaves `writable_schema` OFF and the shipped text untouched, and the failure **propagates on every library** — an I/O error, a failed commit or a non-`ok` `integrity_check` is never downgraded. | a declined repair that leaves the live writer editable; a boot that proceeds on a half-known schema | behavioural (sqlite) |
+| I55f | A **refusal** — the connection will not accept schema writes, detected by reading `PRAGMA writable_schema` back after setting it, never by matching an error message — is the one outcome downgraded to a warning where the modifier evaluates, and is fatal where it is NULL. | a refusal mistaken for an error, or an error mistaken for a refusal | behavioural (sqlite) |
 | I55e | A foreign table whose DDL merely contains the substring `subsec` neither counts nor fails the post-condition: the exact obsolete expression is what is matched. | a consumer column named `subsec_note` aborting every boot on a pre-3.42 host | behavioural (sqlite) |
 | I56 | No migration file after V144, in either dialect, contains `subsec`; the shipped set's count is pinned (44 in sqlite, 0 in postgres). | a new migration that reintroduces the modifier | from-disk |
 | I57 | The shell witness `scripts/sqlite_portability_witness.sh` and the Rust repair carry the same two literals, so what CI proves on 3.40.1 is what the crate does. | a witness that tests a different rewrite | from-disk |

@@ -51,7 +51,13 @@ image. `FSD/MIGRATION_IMMUTABILITY.md` §6, invariants I55–I58.
   left the live writer editable for the process — I55d); and the count and
   post-condition match the **exact obsolete expression**, never the
   substring (a consumer table with a `subsec_note` column would otherwise
-  have aborted every boot on a pre-3.42 host — I55e).
+  have aborted every boot on a pre-3.42 host — I55e). And a P1: the
+  "modifier evaluates here" arm had swallowed **every** error from the
+  rewrite, not only a refusal. A refusal is now a typed outcome detected by
+  reading `writable_schema` back after setting it — never by matching an
+  error message — and it alone is downgraded where the modifier evaluates
+  (I55f); an I/O error, a failed commit or a non-`ok` `integrity_check`
+  propagates on every library (I55d).
 - **Nine runtime statements** — the community-DEK epoch rotation
   (`rotated_at`), maintenance locks, incidents, telemetry — now use the
   portable form. On 3.40.1 they wrote NULL into nullable columns silently or

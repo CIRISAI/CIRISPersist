@@ -157,14 +157,30 @@ pub struct SqliteBackend {
     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
 }
 
-/// #845 (I55d) — where a test asks the portable-default rewrite to fail, so
-/// the cleanup that follows a failure can be witnessed. Production passes
+/// #845 (I55d/I55f) — where a test asks the portable-default rewrite to fail,
+/// so the paths that follow a failure can be witnessed. Production passes
 /// `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepairFault {
-    /// Fail between `writable_schema = ON` and `= OFF` — the point a
-    /// DQS-refused UPDATE fails at.
+    /// Fail between `writable_schema = ON` and `= OFF` with a real error.
     AfterWritableSchemaOn,
+    /// Do not issue `writable_schema = ON`, so the read-back reports 0 —
+    /// the shape a connection that refuses schema writes presents.
+    SkipWritableSchemaOn,
+}
+
+/// #845 — what the rewrite did. A refusal is a fact about the CONNECTION
+/// (it will not accept schema writes), told apart from every other failure
+/// by reading `PRAGMA writable_schema` back after setting it — never by
+/// matching an error message. Only a refusal may be downgraded; an I/O
+/// error, a failed commit or a non-`ok` `integrity_check` propagates on
+/// every library (Codex, #849).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RewriteOutcome {
+    /// The rewrite committed; this many tables changed.
+    Rewritten(usize),
+    /// The connection refuses schema writes; nothing was changed.
+    Refused,
 }
 
 /// The nine steps of SQLite's documented "simpler procedure" for changing
@@ -172,23 +188,35 @@ pub(crate) enum RepairFault {
 /// Schema Changes"), in its order: transaction, read schema_version,
 /// writable_schema ON, UPDATE sqlite_schema, schema_version = X+1,
 /// writable_schema OFF, integrity_check, commit. One transaction, so a
-/// refusal at any step leaves the shipped text exactly as it was. Both
-/// literals are BOUND (`SQLITE_DQS=0` parses a double-quoted string as an
-/// identifier), and the post-condition counts the exact obsolete
-/// expression, never the substring.
+/// refusal or failure at any step leaves the shipped text exactly as it
+/// was. Both literals are BOUND (`SQLITE_DQS=0` parses a double-quoted
+/// string as an identifier), and the post-condition counts the exact
+/// obsolete expression, never the substring. Free fn handed the writer's
+/// connection from inside `repair_portable_defaults_with`
+/// (`ConnClass::HelperWrite`).
 fn rewrite_portable_defaults_in_tx(
     conn: &mut Connection,
     obsolete: &str,
     portable: &str,
     fault: Option<RepairFault>,
-) -> Result<usize, rusqlite::Error> {
+) -> Result<RewriteOutcome, rusqlite::Error> {
     use crate::store::migration_immutability as mi;
     let tx = conn.transaction()?;
     let version: i64 = tx.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
-    tx.execute_batch("PRAGMA writable_schema = ON")?;
+    if fault != Some(RepairFault::SkipWritableSchemaOn) {
+        tx.execute_batch("PRAGMA writable_schema = ON")?;
+    }
+    // The refusal probe: a connection that will not accept schema writes
+    // (defensive mode with the toggle unhonoured, or a build that locks it)
+    // leaves the pragma reading 0 after ON. That is the ONE outcome the
+    // caller may downgrade.
+    let writable: i64 = tx.query_row("PRAGMA writable_schema", [], |r| r.get(0))?;
+    if writable == 0 {
+        tx.rollback()?;
+        return Ok(RewriteOutcome::Refused);
+    }
     if fault == Some(RepairFault::AfterWritableSchemaOn) {
-        // I55d — the failure Codex named: an error between `ON` and `OFF`
-        // (a DQS-refused UPDATE is the real one). The transaction rolls
+        // I55d — a real error between `ON` and `OFF`. The transaction rolls
         // back; the connection flag does not.
         return Err(rusqlite::Error::ToSqlConversionFailure(
             "injected fault after writable_schema = ON".into(),
@@ -217,7 +245,7 @@ fn rewrite_portable_defaults_in_tx(
         ));
     }
     tx.commit()?;
-    Ok(rewritten)
+    Ok(RewriteOutcome::Rewritten(rewritten))
 }
 
 impl SqliteBackend {
@@ -331,26 +359,33 @@ impl SqliteBackend {
                 let _ = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true);
             }
             match outcome {
-                Ok(n) => Ok(n),
-                Err(e) if !required => {
+                Ok(RewriteOutcome::Rewritten(n)) => Ok(n),
+                // The ONE downgradeable outcome: this connection refuses
+                // schema writes. Survivable where the modifier evaluates;
+                // fatal where it is NULL, because the node could not write.
+                Ok(RewriteOutcome::Refused) if !required => {
                     tracing::warn!(
-                        error = %e,
                         remaining = before,
-                        "portable-default repair declined by this SQLite; the modifier evaluates \
-                         here (>= 3.42) so writes proceed — schema text left as shipped (#845)"
+                        "portable-default repair refused by this SQLite connection; the modifier \
+                         evaluates here (>= 3.42) so writes proceed — schema text left as shipped \
+                         (#845)"
                     );
                     Ok(0)
                 }
-                Err(e) => Err(rusqlite::Error::ToSqlConversionFailure(
+                Ok(RewriteOutcome::Refused) => Err(rusqlite::Error::ToSqlConversionFailure(
                     format!(
-                        "this SQLite ({}) evaluates the subsec modifier to NULL and the schema \
-                         repair was refused: {e}. Every insert relying on a defaulted timestamp \
-                         column would fail NOT NULL. Upgrade libsqlite3 to >= 3.42 or allow \
-                         writable_schema (#845)",
+                        "this SQLite ({}) evaluates the subsec modifier to NULL and the connection \
+                         refuses schema writes (writable_schema stays 0). Every insert relying on a \
+                         defaulted timestamp column would fail NOT NULL. Upgrade libsqlite3 to \
+                         >= 3.42 or allow writable_schema (#845)",
                         rusqlite::version()
                     )
                     .into(),
                 )),
+                // Every other failure — I/O, a failed commit, a non-ok
+                // integrity_check — propagates on every library: the schema
+                // may be half-known and the boot must not proceed on it.
+                Err(e) => Err(e),
             }
         })
         .await
@@ -23130,8 +23165,8 @@ mod accord_tests {
             "writable_schema must be OFF after a failure between ON and OFF"
         );
         assert!(
-            outcome.is_ok(),
-            "on a >= 3.42 library a declined repair is a warning: {outcome:?}"
+            outcome.is_err(),
+            "a real error between ON and OFF must PROPAGATE on every library: {outcome:?}"
         );
         // (b) A failure at integrity_check: the text must be untouched.
         let outcome = backend
@@ -23160,15 +23195,71 @@ mod accord_tests {
             obsolete_left, 1,
             "the shipped text must be untouched after a failed rewrite"
         );
-        // On this host the modifier evaluates, so the failure is a warning,
-        // not a refusal; on a pre-3.42 host it would be fatal. Either way
-        // the connection is usable and a real repair then succeeds.
+        // The connection is still usable and a real repair then succeeds.
         assert!(
-            outcome.is_ok(),
-            "on a >= 3.42 library a declined repair is a warning: {outcome:?}"
+            outcome.is_err(),
+            "a non-ok integrity_check must PROPAGATE, whatever the library: {outcome:?}"
         );
         let n = backend.repair_portable_defaults().await.unwrap();
         assert_eq!(n, 1, "the real repair must rewrite the one restored table");
+    }
+
+    /// **I55f (#845, Codex P1) — a REFUSAL is the one downgradeable outcome,
+    /// and it is detected by reading `writable_schema` back, not by matching
+    /// an error.** With the ON skipped, the read-back reports 0 — the shape a
+    /// connection that refuses schema writes presents. On this host the
+    /// modifier evaluates, so the outcome is a warning and `Ok(0)`, the flag
+    /// reads 0, the text is untouched, and a real repair then succeeds.
+    #[tokio::test]
+    async fn i55f_a_refusal_is_the_one_downgradeable_outcome() {
+        use crate::store::migration_immutability as mi;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations_through(143).await.unwrap();
+        backend
+            .write(|conn| {
+                let v: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
+                conn.execute_batch("PRAGMA writable_schema = ON").unwrap();
+                conn.execute(
+                    "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2) WHERE name = 'federation_content_master'",
+                    rusqlite::params![mi::SQLITE_PORTABLE_DEFAULT, mi::SQLITE_SUBSEC_DEFAULT],
+                )
+                .unwrap();
+                conn.execute_batch(&format!("PRAGMA schema_version = {}", v + 1)).unwrap();
+                conn.execute_batch("PRAGMA writable_schema = OFF").unwrap();
+            })
+            .await;
+        let outcome = backend
+            .repair_portable_defaults_with(
+                mi::SQLITE_PORTABLE_DEFAULT,
+                Some(RepairFault::SkipWritableSchemaOn),
+            )
+            .await;
+        assert_eq!(
+            outcome.unwrap(),
+            0,
+            "a refusal on a >= 3.42 library is a warning, not a failure"
+        );
+        let (writable, obsolete_left): (i64, i64) = backend
+            .write(|conn| {
+                let w = conn
+                    .query_row("PRAGMA writable_schema", [], |r| r.get(0))
+                    .unwrap();
+                let n = conn
+                    .query_row(
+                        mi::SQLITE_OBSOLETE_DEFAULT_COUNT,
+                        [mi::SQLITE_SUBSEC_DEFAULT],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                (w, n)
+            })
+            .await;
+        assert_eq!(writable, 0);
+        assert_eq!(
+            obsolete_left, 1,
+            "a refused rewrite must leave the text untouched"
+        );
+        assert_eq!(backend.repair_portable_defaults().await.unwrap(), 1);
     }
 
     /// **I55e (#845, Codex) — a foreign table whose DDL merely contains the
