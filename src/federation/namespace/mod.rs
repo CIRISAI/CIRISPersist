@@ -87,7 +87,7 @@ pub enum Plane<'a> {
         /// dimension resolves the conservative default row.
         dimension: &'a str,
     },
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12) — the
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12) — the
     /// `KeyGrant` kind: the CC 3 `key_grant` set, value-keyed by its
     /// addressing AXIS (`"epoch"` for community / affiliations, `"content"`
     /// for self / family). On the load-bearing axis it is an attestation
@@ -499,7 +499,7 @@ pub fn projection_for(
             }
             _ => Projection::Cohort,
         },
-        // KeyGrant (v44.3.0, #848 §12) — `SelfOwn` at the identity tier,
+        // KeyGrant (#848 §12) — `SelfOwn` at the identity tier,
         // where the content axis is emitted (a self / family blob's wraps
         // reach the owner's / family's own occurrences); `Cohort` everywhere
         // else, where the epoch axis is emitted (a community epoch's wraps

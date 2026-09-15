@@ -1,4 +1,4 @@
-//! v44.3.0 (CIRISPersist#848, `FSD/BLOB_REPLICATION.md` §18) — **the
+//! CIRISPersist#848 (`FSD/BLOB_REPLICATION.md` §18) — **the
 //! two-node witnesses, I59–I67.**
 //!
 //! "Two nodes" is two backends, each with its own signer and its own
@@ -1153,6 +1153,21 @@ mod tests {
         use crate::store::Backend as _;
         use sha2::Digest as _;
 
+        async fn count(b: &PostgresBackend) -> i64 {
+            let client = b.get_client().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT ((SELECT COUNT(*) FROM cirislens.federation_community_dek_epoch WHERE minter_key_id = '__this_node__') \
+                           + (SELECT COUNT(*) FROM cirislens.federation_community_dek WHERE minter_key_id = '__this_node__') \
+                           + (SELECT COUNT(*) FROM cirislens.federation_community_dek_member_grants WHERE minter_key_id = '__this_node__') \
+                           + (SELECT COUNT(*) FROM cirislens.federation_community_blob_epoch WHERE minter_key_id = '__this_node__'))::bigint AS n",
+                    &[],
+                )
+                .await
+                .unwrap();
+            row.get::<_, i64>("n")
+        }
+
         #[tokio::test]
         async fn i66_pre_v145_rows_resolve_to_the_node_and_still_open_postgres() {
             let Some(dsn) = crate::test_pg::empty_dsn() else {
@@ -1173,7 +1188,11 @@ mod tests {
                         "INSERT INTO cirislens.federation_blobs (sha256, storage_kind, bytes_inline, \
                             size_bytes, cohort_scope, crypto_tier) \
                          VALUES ($1, 'inline', $2, $3, 'community', 'community_dek')",
-                        &[&sha.to_vec(), &envelope, &(envelope.len() as i64)],
+                        &[
+                            &sha.to_vec() as &(dyn tokio_postgres::types::ToSql + Sync),
+                            &envelope,
+                            &(envelope.len() as i64),
+                        ],
                     )
                     .await
                     .unwrap();
@@ -1213,20 +1232,6 @@ mod tests {
                     .unwrap();
             }
             backend.run_migrations().await.unwrap();
-            let count = |b: &PostgresBackend| async move {
-                let client = b.get_client().await.unwrap();
-                let row = client
-                    .query_one(
-                        "SELECT ((SELECT COUNT(*) FROM cirislens.federation_community_dek_epoch WHERE minter_key_id = '__this_node__') \
-                               + (SELECT COUNT(*) FROM cirislens.federation_community_dek WHERE minter_key_id = '__this_node__') \
-                               + (SELECT COUNT(*) FROM cirislens.federation_community_dek_member_grants WHERE minter_key_id = '__this_node__') \
-                               + (SELECT COUNT(*) FROM cirislens.federation_community_blob_epoch WHERE minter_key_id = '__this_node__'))::bigint AS n",
-                        &[],
-                    )
-                    .await
-                    .unwrap();
-                row.get::<_, i64>("n")
-            };
             assert_eq!(count(&backend).await, 4, "I66 (pg): the sentinel on every re-keyed row");
             let n = backend.repair_minter_sentinel(Some("node-x")).await.unwrap();
             assert_eq!(n, 4);
@@ -1331,6 +1336,126 @@ mod tests {
             let a2 = node(&bb, "i65-a2").await;
             introduce(&[&a, &a2], &["i65-a", "i65-a2"]).await;
             exercise_i65_content_axis_second_device(&a, &a2, "sqlite").await;
+        }
+
+        /// I61 through the CONSUMER-HELD doors: two `Engine`s, each its own
+        /// in-memory sqlite. `put_blob_scoped` on A emits the set through
+        /// `emit_attestation_self`; B admits it through
+        /// `Engine::apply_replicated_key_grant`, adopts the bytes through
+        /// `Engine::adopt_sealed_blob`, and opens them through
+        /// `Engine::read_blob_as`. `Engine::emit_key_grant` re-emits on demand.
+        #[tokio::test]
+        async fn i61_end_to_end_through_the_engine_doors_sqlite() {
+            use crate::federation::key_grant::{KeyGrantAxis, SignedKeyGrantSet};
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+            use crate::federation::types::identity_type::USER;
+            use crate::federation::{
+                AdoptDisposition, BlobBody, BlobProvenance, BlobStorage, EncryptionPubkeys,
+                FederationDirectory,
+            };
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let (alias_a, alias_b) = (format!("eng-a-{run}"), format!("eng-b-{run}"));
+            let engine_a = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_a), "sqlite::memory:")
+                .await
+                .unwrap();
+            let engine_b = crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias_b), "sqlite::memory:")
+                .await
+                .unwrap();
+            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+                e.register_self_federation_key(USER, alias, None, serde_json::json!({}), vec![])
+                    .await
+                    .expect("register the engine's own key");
+            }
+            let (sa, sb) = (
+                engine_a.sqlite_backend().unwrap().clone(),
+                engine_b.sqlite_backend().unwrap().clone(),
+            );
+            let kem = |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            };
+            let a = Node {
+                backend: sa.as_ref(),
+                signer: ts::local_signer(&alias_a),
+                key: engine_a.local_derived_key_id().await.unwrap(),
+                kem: kem(sa.load_or_init_content_kem_identity().await.unwrap()),
+            };
+            let b = Node {
+                backend: sb.as_ref(),
+                signer: ts::local_signer(&alias_b),
+                key: engine_b.local_derived_key_id().await.unwrap(),
+                kem: kem(sb.load_or_init_content_kem_identity().await.unwrap()),
+            };
+            introduce(&[&a, &b], &[&alias_a, &alias_b]).await;
+            let comm = format!("eng-comm-{run}");
+            let (alice, bob) = (format!("eng-alice-{run}"), format!("eng-bob-{run}"));
+            seed_community_everywhere(&[&a, &b], &comm, &[(&alice, Some(&a)), (&bob, Some(&b))])
+                .await;
+
+            // A writes through THE door; the set is emitted by the door.
+            let r = engine_a
+                .put_blob_scoped(COMMUNITY, Some(&comm), b"engine minutes", None, None)
+                .await
+                .expect("A's scoped put");
+            assert_eq!(r.tier, CryptoTier::CommunityDek);
+            assert!(r.key_grant_emission.is_some(), "the first seal minted: a set was reported");
+            let sha = r.at_rest_sha256;
+            let emitted: Vec<_> = sa
+                .list_attestations_by(&a.key)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.attestation_type == crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE)
+                .collect();
+            assert_eq!(emitted.len(), 1, "exactly one epoch-axis set emitted by the door");
+
+            // B admits through the Engine door, adopts through the Engine door.
+            let admission = engine_b
+                .apply_replicated_key_grant(SignedKeyGrantSet {
+                    attestation: emitted[0].clone(),
+                })
+                .await
+                .expect("B admits A's set through the Engine door");
+            assert!(admission.wraps_written >= 1);
+            let Some(BlobBody::Inline(bytes)) = sa.get_blob(&sha).await.unwrap() else {
+                panic!("inline")
+            };
+            engine_b
+                .adopt_sealed_blob(
+                    &bytes,
+                    BlobProvenance {
+                        author_key_id: a.key.clone(),
+                        cohort_scope: COMMUNITY.into(),
+                        community_key_id: Some(comm.clone()),
+                        epoch: Some(0),
+                        tier: CryptoTier::CommunityDek,
+                    },
+                    None,
+                    AdoptDisposition::LocalOnly,
+                )
+                .await
+                .expect("B adopts through the Engine door");
+            assert_eq!(
+                engine_b.read_blob_as(&sha, &b.key, None).await.expect("B reads through the Engine door"),
+                b"engine minutes"
+            );
+            // Re-emission on demand carries the full set again (idempotent).
+            let again = engine_a
+                .emit_key_grant(&KeyGrantAxis::Epoch {
+                    community_key_id: comm.clone(),
+                    minter_key_id: a.key.clone(),
+                    epoch: 0,
+                })
+                .await
+                .expect("re-emit");
+            assert!(again.is_some(), "A holds wraps, so a re-emission carries them");
+            // A second seal in the same epoch changes no grant: no new set.
+            let r2 = engine_a
+                .put_blob_scoped(COMMUNITY, Some(&comm), b"more minutes", None, None)
+                .await
+                .unwrap();
+            assert!(r2.key_grant_emission.is_none(), "an unchanged fan-out emits nothing (§14)");
         }
     }
 

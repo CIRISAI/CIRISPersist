@@ -81,7 +81,7 @@ pub mod genesis;
 pub mod goal;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
-// v44.3.0 (CIRISPersist#848, BLOB_REPLICATION.md Part II) — key transport:
+// CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
 // the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
 pub mod key_grant;
 // #848 §18 — the two-node witnesses I59–I67; `pub` under `test-anchor` so
@@ -7808,7 +7808,7 @@ pub enum Error {
         reason: String,
     },
 
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12) — a replicated
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12) — a replicated
     /// `KeyGrant` set was refused at admission: the signer is not the set's
     /// minter / the blob's author, not an active member of the community at
     /// `asserted_at`, a wrap is not v2, the envelope is malformed, or the

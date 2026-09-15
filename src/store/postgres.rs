@@ -964,7 +964,7 @@ impl PostgresBackend {
     /// that had no reproducible failing test). The happy path takes one
     /// iteration (no added cost); a hard-down DB still surfaces the real error
     /// after a short, bounded backoff (50 + 100 + 150 ms).
-    async fn get_client(&self) -> Result<deadpool_postgres::Object, Error> {
+    pub(crate) async fn get_client(&self) -> Result<deadpool_postgres::Object, Error> {
         const MAX_ATTEMPTS: u32 = 4;
         let mut last_err = None;
         for attempt in 1..=MAX_ATTEMPTS {

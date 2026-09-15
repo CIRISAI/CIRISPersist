@@ -989,7 +989,7 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
-        // v44.3.0 (CIRISPersist#848, I66) — the V145 minter sentinel resolves
+        // CIRISPersist#848 (I66) — the V145 minter sentinel resolves
         // to this node's key HERE, before any read; a survivor is boot-fatal.
         engine.resolve_minter_sentinels_at_boot().await?;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
@@ -1072,7 +1072,7 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
-        // v44.3.0 (CIRISPersist#848, I66) — see `with_signer`. The I66 boot
+        // CIRISPersist#848 (I66) — see `with_signer`. The I66 boot
         // witness found this constructor without the hook: a pre-genesis
         // node with V145 sentinels would have served a minter of nobody.
         engine.resolve_minter_sentinels_at_boot().await?;
@@ -1139,7 +1139,7 @@ impl Engine {
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
-        // v44.3.0 (CIRISPersist#848, I66) — see `with_signer`.
+        // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
@@ -1210,7 +1210,7 @@ impl Engine {
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         };
-        // v44.3.0 (CIRISPersist#848, I66) — see `with_signer`.
+        // CIRISPersist#848 (I66) — see `with_signer`.
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
@@ -5231,7 +5231,7 @@ impl Engine {
         Ok(r)
     }
 
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §14) — **emit the
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14) — **emit the
     /// `KeyGrant` set for an axis**: the FULL set this node holds for
     /// `(community, minter, epoch)` or for one self/family blob, signed by
     /// this Engine's composed hybrid signer and stored through
@@ -5269,7 +5269,7 @@ impl Engine {
             })
     }
 
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12–§13) — **admit a
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
     /// replicated `KeyGrant` set and project every wrap.** The apply a
     /// replication bridge routes a `key_grant:*` attestation to instead of
     /// `apply_replicated_attestation`: the signer is resolved from THIS
@@ -5293,7 +5293,7 @@ impl Engine {
         }
     }
 
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §16, I66) — **resolve
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §16, I66) — **resolve
     /// the V145 minter sentinel to this node's own key**, at construction,
     /// the first moment the backend and the signer exist together — beside
     /// `run_v31_migration_at_boot`, which needs the signer for the same

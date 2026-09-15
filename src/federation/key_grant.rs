@@ -1,4 +1,4 @@
-//! v44.3.0 (CIRISPersist#848, `FSD/BLOB_REPLICATION.md` Part II) — **key
+//! CIRISPersist#848 (`FSD/BLOB_REPLICATION.md` Part II) — **key
 //! transport: the key follows the bytes.**
 //!
 //! v44.2.0 got a sealed blob's BYTES to a member's node (`adopt_sealed_blob`,

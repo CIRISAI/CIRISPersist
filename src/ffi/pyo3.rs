@@ -2168,7 +2168,7 @@ impl PyEngine {
             _ => signer,
         };
 
-        // v44.3.0 (CIRISPersist#848, I66) — resolve the V145 minter sentinel
+        // CIRISPersist#848 (I66) — resolve the V145 minter sentinel
         // to this node's own key, exactly as `Engine::with_signer` does: the
         // first moment the backend and the signer exist together, before any
         // read. A survivor aborts the boot. CIRISPersist#580 clause 1 — the
@@ -6143,7 +6143,7 @@ impl PyEngine {
         })
     }
 
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12–§13) — **admit a
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §12–§13) — **admit a
     /// replicated `KeyGrant` set and project every wrap.** FFI mirror of
     /// [`Engine::apply_replicated_key_grant`](crate::engine::Engine::apply_replicated_key_grant):
     /// the apply a replication bridge routes a `key_grant:*` attestation to
@@ -6204,7 +6204,7 @@ impl PyEngine {
         })
     }
 
-    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §14) — **emit the
+    /// CIRISPersist#848 (`BLOB_REPLICATION.md` §14) — **emit the
     /// `KeyGrant` set for an axis on demand.** FFI mirror of
     /// [`Engine::emit_key_grant`](crate::engine::Engine::emit_key_grant).
     /// Every write door emits after a fan-out that changed; this is the
@@ -32048,7 +32048,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::WideningReAuthors { member, .. } => PyValueError::new_err(
             format!("{kind}: `{member}` — a widening reuses the prior's body"),
         ),
-        // v44.3.0 (CIRISPersist#848) — a refused `KeyGrant` set is
+        // CIRISPersist#848 — a refused `KeyGrant` set is
         // caller-fault content (the wrong signer, a non-v2 wrap, a malformed
         // envelope, or a carrier row the plane refused): ValueError carrying
         // the stable reason token, so a bridge can count refusals by cause

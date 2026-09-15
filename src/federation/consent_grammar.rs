@@ -188,7 +188,7 @@ pub fn consent_transferability(
         // narrow (or purport to widen) the carriage of the quorum that
         // governs the whole mesh.
         | K::AccordQuorumEvidence
-        // v44.3.0 (CIRISPersist#848) — a `KeyGrant` set is key material
+        // CIRISPersist#848 — a `KeyGrant` set is key material
         // addressed to its recipients, opaque to everyone else, and its
         // audience is the AXIS's (SelfOwn / Cohort), never a consent grant's:
         // an end-user grant could neither widen a wrap set (nobody outside
@@ -520,7 +520,7 @@ pub fn consent_grammar_sha256() -> String {
 /// principles, restriction ops, audiences — is unchanged; what changed is the
 /// closed set of kinds a grant may name. Previous value:
 /// `2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05`.
-/// v44.3.0 (CIRISPersist#848) — re-pinned for the same reason: the 16th kind
+/// CIRISPersist#848 — re-pinned for the same reason: the 16th kind
 /// ([`KeyGrant`](super::replication_policy::EnvelopeKind::KeyGrant),
 /// classified `StructuralPlane`) joins `kind_transferability`. The grammar is
 /// unchanged. Previous value:

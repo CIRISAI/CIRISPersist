@@ -600,6 +600,9 @@ class Engine:
     def apply_replicated_attestation(self, signed_attestation_json: str) -> str:
         """(derived) deontic — v36.0.0 (CIRISPersist#624) — typed, pre-write replicated Attestation-plane apply. FFI mirror of [Engine::apply_replicated_attestation](crate::engin..."""
 
+    def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
+        """(derived) deontic — v44.3.0 (CIRISPersist#848, BLOB_REPLICATION.md §12–§13) — admit a replicated KeyGrant set and project every wrap. FFI mirror of [Engine::apply_repl..."""
+
     def apply_replicated_key_record(
         self,
         signed_key_record_json: str,
@@ -754,6 +757,9 @@ class Engine:
 
     def emit_attestation_self(self, input_json: str) -> str:
         """(derived) deontic — v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN composed signer (the common case: a node emitting a federation-tier row about itse..."""
+
+    def emit_key_grant(self, axis_json: str) -> str | None:
+        """(derived) deontic — v44.3.0 (CIRISPersist#848, BLOB_REPLICATION.md §14) — emit the KeyGrant set for an axis on demand. FFI mirror of [Engine::emit_key_grant](crate::en..."""
 
     def enter_mesh(self, attestation_id: str, contextual_integrity: str) -> dict[str, Any]:
         """(derived) deontic — v39.0.0 — enter the mesh: flip a local-tier row to the federation tier over the SAME bytes (CC 5.3.2.4.2). Replaces attestation_promote, which re-s..."""

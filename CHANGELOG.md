@@ -5,6 +5,124 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased — #848]
+
+**The key follows the bytes.** v44.2.0 got a sealed blob's bytes to a
+member's node (`adopt_sealed_blob`) and not the key: the per-epoch wraps and
+the per-blob grants were written only by the author node's cascade into local
+tables, and nothing carried them, so on every non-author member
+`read_blob_as` was `NotGranted` — the state CIRISEdge#601 observed. Before
+carrying them, the review found the epoch itself was not one thing:
+`federation_community_dek` was keyed `(community, epoch)`, `ensure_epoch_dek`
+minted from the local self-retention row, and the bump was local to the
+revoking node, so two members writing at one epoch number minted two DEKs
+both labelled E — a fork by the Constitution's own definition (ledger clause
+3; CC 5.3.3). `FSD/BLOB_REPLICATION.md` Part II (§11–§19) is the design;
+invariants I59–I67, each a two-node witness driven on sqlite and postgres.
+
+### Changed
+- **An epoch belongs to its MINTER (§11).** Key state, self-retention,
+  member grants and the blob binding are keyed
+  `(community_key_id, minter_key_id, epoch)`; a blob's key identity is
+  `(community, author, epoch)` — the author was already on the row (V144).
+  Every `community_dek_*` floor takes the minter; `community_dek_blob_epoch`
+  returns `(community, minter, epoch)`; `EpochBinding` / `BlobEpochBinding`
+  carry `minter_key_id`; `CommunityCascadeResult` reports `minter_key_id`
+  and `fanout_changed`. The read doors keep their signatures and dispatch on
+  the wider binding. `adopt_sealed_*` bind the provenance's `author_key_id`
+  as the minter — `BlobProvenance` needs no new field, because the author IS
+  the minter.
+- **V145** (both dialects): the four community-DEK tables re-keyed on
+  `minter_key_id`, `federation_community_dek.minted_at` added, the reverse
+  seek re-keyed on the full epoch identity. The migration writes the
+  sentinel `__this_node__` (SQL cannot know the node's key; the blob
+  binding takes the row's author where non-NULL), and every `Engine`
+  constructor — and `PyEngine.__init__` — resolves it to the node's derived
+  key before any read (`repair_minter_sentinel`, beside the #840/#845
+  repairs). A sentinel that survives, or a node with no Ed25519 identity to
+  resolve to over a sentinel, **aborts the boot** (I66).
+- **Rotation on admitted removal (§15, I63).** A minter rotates its own
+  counter before its next seal after admitting a removal newer than the
+  epoch's `minted_at`, and every enabled epoch of its own that was minted
+  before that removal is disabled at that seal — the cross-node
+  forward-secrecy hole CIRISEdge's review named is closed without
+  coordination. The revocation-door bump now advances every counter this
+  node owns, materialising a pointer for a minter that has minted but never
+  rotated; the revoker's explicit bump is unchanged.
+- **`REPLICATION_POLICY_HASH` moved:**
+  `3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef` →
+  `c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d`.
+  CIRISServer re-pins; CIRISEdge adds the wire kind (its protocol enum
+  mirrors the sixteen names in order). **`CONSENT_GRAMMAR_HASH` moved** for
+  the same reason (its `kind_transferability` covers the kind list;
+  `KeyGrant` is `StructuralPlane`):
+  `b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f` →
+  `79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac`.
+
+### Added
+- **`EnvelopeKind::KeyGrant` — the sixteenth kind (§12), appended.** The
+  Constitution's own `key_grant` (CC 3, CC 5.1's two axes) on a replicated
+  kind: one set per identity — epoch-addressed `(community, minter, epoch)`
+  signed by the minter, content-addressed `(at_rest_sha256, cohort_scope,
+  owner)` signed by the author — carrying every recipient's
+  `{recipient_occurrence_key_id, wrap_algorithm, wrapped_dek}`. Policy row:
+  `RegisteredSigner` / `SelfOwn` / `NotApplicable` / `FederationOnly` /
+  `[Projection::KeyGrants]`. The set rides the attestation store as a
+  `key_grant:epoch:v1` / `key_grant:content:v1` row (`SignedKeyGrantSet`),
+  so it is served by the cursor peers already pull. `Plane::KeyGrant { axis }`
+  projects `SelfOwn` at self / family, `Cohort` everywhere else, never
+  `Global`; there is no withdraw for the kind (CC 3: "cannot retroactively
+  un-share"). Documented in `WIRE_VOCABULARY_KINDS.md`.
+- **`Engine::apply_replicated_key_grant` / `PyEngine.apply_replicated_key_grant`
+  (§12–§13).** Admission: the signer is resolved from the admitting node's
+  own directory; epoch axis — the signer is the set's minter AND an active
+  member of the community at `asserted_at` per the replicated roster fold;
+  content axis — the signer is the blob row's author when the row is present
+  (a set is accepted before its bytes arrive). Every wrap must be v2. Then the
+  carrier row is admitted through the attestation plane and every wrap is
+  projected as a **union** (`ON CONFLICT DO NOTHING`): a grant once admitted
+  is never removed by a later set, a re-applied set is a no-op, a subset
+  removes nothing (I62). Refusals are typed
+  `Error::KeyGrantRefused { reason, .. }` (`federation_key_grant_refused`;
+  reasons `signer_not_minter`, `signer_not_active_member`,
+  `signer_not_author`, `wrap_algorithm_not_v2`, `malformed`,
+  `attestation_refused`). I60.
+- **Emission (§14).** Every write door — `put_blob_scoped`,
+  `put_blob_encrypted_community`, `put_blob_encrypted_self_family`,
+  `put_blob_chunk_scoped`, `seal_stream_scoped`, and their PyO3 twins — emits
+  the FULL set after a cascade that minted or granted anew (the result's
+  `key_grant_emission` names it); `Engine::emit_key_grant` /
+  `PyEngine.emit_key_grant` re-emit on demand. A node that cannot sign the
+  set says so (`AttestationEmissionFailed`) rather than leaving members with
+  bytes and no key.
+- **The recipient-decrypt path V073 stored the sealed privates for.** A
+  member's node opens a peer-minted epoch — and the owner's second device its
+  own self content (I65) — from the wrap addressed to its occurrence, with
+  the content-KEM private halves this node keeps
+  (`BlobStorage::load_content_kem_private_halves`,
+  `at_rest_cascade::unwrap_dek_v2_json`). Persist's self-retention row is
+  used where this node minted; the viewer's wrap where a peer did.
+- Floors: `community_dek_put_member_grants` / `put_at_rest_grants` (the
+  projection, one transaction, a union), `community_dek_member_grants_for_epoch`
+  / `list_at_rest_grants` (the full set an emission carries),
+  `community_dek_member_grant_wrap`, `community_dek_minted_at`.
+- Witnesses I59–I67 (`federation::key_grant_invariants`): the sixteenth
+  kind's row and pins; a forged / non-member / non-v2 / unknown-community set
+  refused with nothing projected; **the end to end** — A seals, emits, B
+  admits and adopts, B's member opens, a stranger is `NotGranted`, on two
+  sqlite and two postgres backends and through the `Engine` doors; union and
+  order independence; rotation on an admitted removal; two minters at epoch
+  3 both opening on B; the content axis on a second device; a pre-V145
+  database resolving at boot and still opening, a survivor aborting; and the
+  from-disk I67: the only `DELETE` on the member-grant table is the epoch
+  destroy, at-rest grant deletes ride blob deletion only.
+
+### Not changed
+- Sealed manifests, chunk AAD, the transfer path (I36) and the read doors'
+  contracts. `REPLICATION_POLICY_HASH`'s consumers re-pin; nothing else on
+  the wire moves. The money ledger, the roster fold and the tombstone planes
+  are untouched.
+
 ## [44.2.1] - 2026-09-14
 
 **Every encrypted-at-rest write failed on Debian stable, and now does not.**
