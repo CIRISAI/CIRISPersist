@@ -649,6 +649,13 @@ pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
          `scores` family",
     ),
     (
+        "key_grant:",
+        "an `attestation_type` prefix for the CC 3 `key_grant` carrier on the sixteenth \
+         replicated kind (`key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX`, CIRISPersist#848) — \
+         a structural primitive like `holds_bytes:`, admitted by `apply_replicated_key_grant`'s \
+         signer rules rather than by a dimension family",
+    ),
+    (
         "identity:",
         "`identity:canonical_binding:{H}` is consumed as an authority-WIDENING input on the \
          withdraws path, not gated at emit; CC Part 3 catalogues no `identity:` family",

@@ -87,6 +87,17 @@ pub enum Plane<'a> {
         /// dimension resolves the conservative default row.
         dimension: &'a str,
     },
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12) — the
+    /// `KeyGrant` kind: the CC 3 `key_grant` set, value-keyed by its
+    /// addressing AXIS (`"epoch"` for community / affiliations, `"content"`
+    /// for self / family). On the load-bearing axis it is an attestation
+    /// row ([`Self::class`] says so); on the projection axis it is its own
+    /// plane, because its audience is decided by the axis, not by a
+    /// dimension family.
+    KeyGrant {
+        /// `"epoch"` or `"content"` — `key_grant::KeyGrantAxis::token`.
+        axis: &'a str,
+    },
 }
 
 impl Plane<'_> {
@@ -101,6 +112,9 @@ impl Plane<'_> {
             Plane::FountainContent => ObjectClass::FountainContent,
             Plane::HardCaseEvent => ObjectClass::HardCaseEvent,
             Plane::Attestation { .. } => ObjectClass::Attestation,
+            // #848 — a `KeyGrant` set is STORED as an attestation row
+            // (`key_grant:*`), so on the reference-counting axis it is one.
+            Plane::KeyGrant { .. } => ObjectClass::Attestation,
         }
     }
 }
@@ -483,6 +497,22 @@ pub fn projection_for(
             cohort_scope::SPECIES | cohort_scope::BIOSPHERE | cohort_scope::FEDERATION => {
                 Projection::Cohort
             }
+            _ => Projection::Cohort,
+        },
+        // KeyGrant (v44.3.0, #848 §12) — `SelfOwn` at the identity tier,
+        // where the content axis is emitted (a self / family blob's wraps
+        // reach the owner's / family's own occurrences); `Cohort` everywhere
+        // else, where the epoch axis is emitted (a community epoch's wraps
+        // reach the members); NEVER Global: a wrap set is opaque to everyone
+        // but its recipients, and a party outside the cohort has no
+        // recipient in it. The row is total over scopes for the same reason
+        // every row is (a future or stray scope resolves the bounded
+        // community-tier cell), but each axis is emitted at exactly the
+        // scopes its cell was decided for: content at self / family, epoch
+        // at the community scope. The axis token is carried so the plane
+        // names WHICH set it projects; it does not widen a cell.
+        Plane::KeyGrant { .. } => match cohort_scope {
+            cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
             _ => Projection::Cohort,
         },
         // Attestation — per dimension FAMILY (v36.0.0, #713 second half).
@@ -1133,6 +1163,13 @@ pub fn tombstone_ceiling(plane: Plane<'_>, authority: AuthorityClass) -> Project
                 Projection::Cohort
             }
         }
+        // KeyGrant (#848 §12) — the row max (Cohort), and there is NO
+        // withdraw for this kind: CC 3 says a publisher "retains existing
+        // key_grants (cannot retroactively un-share)", so forward secrecy is
+        // by rotation (I67) and a tombstone never exists to project. The
+        // ceiling is stated so the row-max witness holds over every plane;
+        // nothing reaches it in production.
+        Plane::KeyGrant { .. } => Projection::Cohort,
         // Per dimension FAMILY (v36.0.0) — consent is the decided
         // above-row-max exception; every other family takes its row-max.
         Plane::Attestation { dimension } => match attestation_family(dimension) {
@@ -1795,10 +1832,18 @@ mod tests {
         Plane::HardCaseEvent,
     ];
 
+    /// #848 — the KeyGrant plane's two axes, for the same sweeps.
+    const KEY_GRANT_PLANES: [Plane<'static>; 2] = [
+        Plane::KeyGrant { axis: "epoch" },
+        Plane::KeyGrant { axis: "content" },
+    ];
+
     /// Every plane, with the Attestation plane fanned across [`FAMILY_DIMS`]
-    /// — the projection registry's full extent, for property sweeps.
+    /// and the KeyGrant plane across its two axes — the projection
+    /// registry's full extent, for property sweeps.
     fn all_planes() -> Vec<Plane<'static>> {
         let mut v = DIMLESS_PLANES.to_vec();
+        v.extend(KEY_GRANT_PLANES);
         v.extend(
             FAMILY_DIMS
                 .iter()

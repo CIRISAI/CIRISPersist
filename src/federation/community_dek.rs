@@ -150,8 +150,9 @@ pub mod orchestrate {
         partition_roster, GrantReport, MemberOccurrences,
     };
     use crate::federation::at_rest_cascade::{
-        fresh_dek, open, seal, unwrap_dek_for_persist, wrap_dek_for_persist, wrap_dek_v2,
-        AtRestEnvelope, AtRestError, DEK_LEN, WRAP_ALGORITHM_V2,
+        fresh_dek, open, seal, unwrap_dek_for_persist, unwrap_dek_v2_json,
+        wrap_dek_for_persist, wrap_dek_v2, AtRestEnvelope, AtRestError, DEK_LEN,
+        WRAP_ALGORITHM_V2,
     };
     use crate::federation::blobs::{
         BlobBody, BlobError, BlobStorage, DekKeyState, RosterPartition,
@@ -169,7 +170,11 @@ pub mod orchestrate {
         /// envelope) — the handle a later
         /// [`read_for_community_viewer`] read targets.
         pub at_rest_sha256: [u8; 32],
-        /// The `(community, epoch)` the blob was sealed under.
+        /// #848 (§11) — the minter of the epoch the blob was sealed under:
+        /// this node's own key (the author). The blob's key identity is
+        /// `(community, minter, epoch)`.
+        pub minter_key_id: String,
+        /// The `(community, minter, epoch)` the blob was sealed under.
         pub epoch: u64,
         /// Member occurrence key_ids that hold a v2 grant on this epoch's
         /// DEK (granted at epoch creation; reused across emissions).
@@ -185,6 +190,11 @@ pub mod orchestrate {
         /// member with no active occurrence — the author of the write
         /// CIRISPersist#843 was opened on.
         pub roster: RosterPartition,
+        /// #848 (§14) — did this cascade MINT the epoch or grant a NEW
+        /// recipient? When true the caller emits the full `KeyGrant` set for
+        /// `(community, minter, epoch)`; when false the set already
+        /// replicated and nothing changed.
+        pub fanout_changed: bool,
     }
 
     impl CommunityCascadeResult {
@@ -204,6 +214,34 @@ pub mod orchestrate {
         BlobError::Backend(format!("community DEK cascade crypto: {e}"))
     }
 
+    /// #848 (§11) — **the minter of a local seal.** The author IS the
+    /// minter: the row's `author_key_id` (I23 — derived from the signer)
+    /// names the occurrence whose cascade mints. A door that could not name
+    /// an author falls back to the node's own key, which the Engine tells
+    /// the backend at boot; a backend with neither refuses to mint, because
+    /// an epoch with no minter is the fork §11 rules out.
+    pub(crate) fn resolve_minter<B>(
+        backend: &B,
+        author_key_id: Option<&str>,
+    ) -> Result<String, BlobError>
+    where
+        B: FederationDirectory,
+    {
+        if let Some(a) = author_key_id {
+            if !a.is_empty() {
+                return Ok(a.to_owned());
+            }
+        }
+        backend.node_key_id().ok_or_else(|| {
+            BlobError::InvalidArgument(
+                "community DEK cascade: no minter — the write named no author and the backend \
+                 knows no node key. An epoch belongs to its minter (BLOB_REPLICATION.md §11); \
+                 pass the author's derived key id"
+                    .into(),
+            )
+        })
+    }
+
     /// Resolve the **current** members of a community, each with its
     /// occurrence wrap targets as `(occurrence_key_id, encryption_pubkeys?)`
     /// pairs (#843: by MEMBER, so a member with none is still listed).
@@ -214,10 +252,20 @@ pub mod orchestrate {
     /// active-membership read), then each remaining member identity's
     /// active occurrences. This is the same shape the self/family
     /// `resolve_recipients` family arm uses, keyed on the community.
+    ///
+    /// #848 (§15) — also returns the latest `removed_at` among the
+    /// EFFECTIVE removals, so `ensure_epoch_dek` can compare it with the
+    /// current epoch's mint instant from the same fold it wrapped by.
     async fn resolve_community_members<B>(
         backend: &B,
         community_key_id: &str,
-    ) -> Result<Vec<MemberOccurrences>, BlobError>
+    ) -> Result<
+        (
+            Vec<MemberOccurrences>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+        BlobError,
+    >
     where
         B: FederationDirectory + Sync,
     {
@@ -267,13 +315,24 @@ pub mod orchestrate {
     /// wrap fan-out ([`resolve_community_members`]) and the eviction
     /// disclosure predicate ([`may_learn_epoch_fate`], #833) so "who is a
     /// member" has one answer.
+    ///
+    /// #848 (§15) — the second value is the latest `removed_at` among the
+    /// removals that are effective now: the instant a minter's current epoch
+    /// must be newer than, or rotate.
     async fn active_member_occurrences<B>(
         backend: &B,
         community: &crate::federation::types::Community,
-    ) -> Result<Vec<MemberOccurrences>, BlobError>
+    ) -> Result<
+        (
+            Vec<MemberOccurrences>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+        BlobError,
+    >
     where
         B: FederationDirectory + Sync,
     {
+        let now = chrono::Utc::now();
         let revs = backend
             .list_community_membership_revocations_for(&community.community_key_id)
             .await
@@ -281,8 +340,13 @@ pub mod orchestrate {
         let removed = crate::federation::removed_key_ids_at(
             revs.iter()
                 .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
-            chrono::Utc::now(),
+            now,
         );
+        let latest_removed_at = revs
+            .iter()
+            .filter(|r| r.effective_at <= now)
+            .map(|r| r.removed_at)
+            .max();
 
         let mut out = Vec::new();
         for member in &community.members {
@@ -300,11 +364,12 @@ pub mod orchestrate {
                     .collect(),
             ));
         }
-        Ok(out)
+        Ok((out, latest_removed_at))
     }
 
     /// #833 (`BLOB_ENCRYPTION_AT_REST.md` §11.5, I31) — may `viewer_key_id`
-    /// be told what became of content sealed under `(community, epoch)`?
+    /// be told what became of content sealed under `(community, minter,
+    /// epoch)`?
     ///
     /// Two legs, either suffices:
     /// 1. the viewer holds a member grant on that epoch — the same predicate
@@ -325,6 +390,7 @@ pub mod orchestrate {
     pub async fn may_learn_epoch_fate<B>(
         backend: &B,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         viewer_key_id: &str,
     ) -> Result<bool, BlobError>
@@ -332,7 +398,7 @@ pub mod orchestrate {
         B: BlobStorage + FederationDirectory + Sync,
     {
         if backend
-            .community_dek_has_member_grant(community_key_id, epoch, viewer_key_id)
+            .community_dek_has_member_grant(community_key_id, minter_key_id, epoch, viewer_key_id)
             .await?
         {
             return Ok(true);
@@ -346,13 +412,28 @@ pub mod orchestrate {
         };
         Ok(active_member_occurrences(backend, &community)
             .await?
+            .0
             .iter()
             .any(|(_, occurrences)| occurrences.iter().any(|(occ, _)| occ == viewer_key_id)))
     }
 
-    /// Mint (or read) the shared DEK for `(community, epoch)` and ensure it
-    /// is wrapped to every current member occurrence + persist's own
-    /// self-retention.
+    /// #848 — what [`ensure_epoch_dek`] settled on: the epoch actually in
+    /// force for the minter (it may be one past the caller's, §15), the DEK,
+    /// the fan-out report, and whether the fan-out changed anything.
+    pub(crate) struct EnsuredEpoch {
+        /// The minter's epoch the DEK belongs to.
+        pub epoch: u64,
+        /// The epoch DEK.
+        pub dek: [u8; DEK_LEN],
+        /// The per-occurrence split and roster partition (#843).
+        pub report: GrantReport,
+        /// A DEK was minted, or a recipient granted, in this call (§14).
+        pub changed: bool,
+    }
+
+    /// Mint (or read) the shared DEK for `(community, minter, epoch)` and
+    /// ensure it is wrapped to every current member occurrence + persist's
+    /// own self-retention.
     ///
     /// On the FIRST emission in an epoch (no self-retention row yet) this
     /// mints a fresh DEK, records persist's content-master self-retention
@@ -360,22 +441,68 @@ pub mod orchestrate {
     /// keyless). On a LATER emission in the same epoch it recovers the
     /// already-minted DEK via the self-retention row and only fills in any
     /// member who joined since (idempotent — already-granted members are
-    /// skipped). Returns `(dek, report)` — the per-occurrence split and the
-    /// roster partition (#843) from one enumeration.
+    /// skipped).
     ///
     /// #832 (§12.3) — crate-private rather than private: the chunk cascade
     /// seals each segment under the same epoch DEK the whole-blob cascade
     /// uses, through this one function, so there is exactly one place that
     /// mints, recovers and fans out a community DEK.
+    ///
+    /// # #848 (§15) — rotation on admitted removal, every minter its own counter
+    ///
+    /// Before this, only the REVOKER's node rotated after a removal; every
+    /// other member's node kept sealing under an epoch the removed member
+    /// could still open. Here, if the roster fold's latest effective
+    /// `removed_at` is NEWER than `(community, minter, epoch)`'s `minted_at`,
+    /// the minter's counter is advanced and `epoch` is disabled BEFORE any
+    /// seal — the returned [`EnsuredEpoch::epoch`] is the new one, and the
+    /// caller binds to that. Local, coordination-free: the counter is the
+    /// minter's own. The revoker's explicit bump is unchanged.
     pub(crate) async fn ensure_epoch_dek<B>(
         backend: &B,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
-    ) -> Result<([u8; DEK_LEN], GrantReport), BlobError>
+    ) -> Result<EnsuredEpoch, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let members = resolve_community_members(backend, community_key_id).await?;
+        let (members, latest_removed_at) =
+            resolve_community_members(backend, community_key_id).await?;
+
+        // §15 — a removal admitted after this epoch was minted rotates it.
+        let mut epoch = epoch;
+        if let (Some(removed_at), Some(minted_at)) = (
+            latest_removed_at,
+            backend
+                .community_dek_minted_at(community_key_id, minter_key_id, epoch)
+                .await?,
+        ) {
+            if removed_at > minted_at {
+                let next = backend
+                    .community_dek_bump_epoch(community_key_id, minter_key_id)
+                    .await?;
+                // The door refuses to disable the CURRENT epoch, which is why
+                // the bump comes first: after it, `epoch` is rotated-past.
+                set_key_state(
+                    backend,
+                    community_key_id,
+                    minter_key_id,
+                    epoch,
+                    DekKeyState::Disabled,
+                )
+                .await?;
+                tracing::info!(
+                    community = %community_key_id,
+                    minter = %minter_key_id,
+                    from = epoch,
+                    to = next,
+                    "community DEK: a removal admitted after this epoch was minted; rotated the \
+                     minter's own counter before sealing (BLOB_REPLICATION.md §15)"
+                );
+                epoch = next;
+            }
+        }
 
         // v43.0.0 (§10.5) — NEVER SEAL UNDER A NON-ENABLED EPOCH.
         //
@@ -387,14 +514,14 @@ pub mod orchestrate {
         // Without this the state column would be decoration: rotation would
         // bump the pointer and sealing would carry on regardless.
         if let Some(state) = backend
-            .community_dek_key_state(community_key_id, epoch)
+            .community_dek_key_state(community_key_id, minter_key_id, epoch)
             .await?
         {
             if state != DekKeyState::Enabled {
                 return Err(BlobError::InvalidArgument(format!(
-                    "community {community_key_id:?} epoch {epoch} is {} — refusing to seal \
-                     new content under it. A rotated epoch still DECRYPTS what it sealed; \
-                     it does not accept more (BLOB_ENCRYPTION_AT_REST.md §10.5)",
+                    "community {community_key_id:?} epoch {epoch} (minter {minter_key_id:?}) is {} — \
+                     refusing to seal new content under it. A rotated epoch still DECRYPTS what \
+                     it sealed; it does not accept more (BLOB_ENCRYPTION_AT_REST.md §10.5)",
                     state.as_str()
                 )));
             }
@@ -402,8 +529,9 @@ pub mod orchestrate {
         let content_master = backend.load_or_init_content_master().await?;
 
         // Recover-or-mint the epoch DEK.
+        let mut changed = false;
         let dek = match backend
-            .community_dek_get_self_retention(community_key_id, epoch)
+            .community_dek_get_self_retention(community_key_id, minter_key_id, epoch)
             .await?
         {
             Some(wrapped) => {
@@ -417,17 +545,24 @@ pub mod orchestrate {
                 // raced us. Re-read after the idempotent put to converge on
                 // the persisted DEK rather than using our discarded one.
                 backend
-                    .community_dek_put_self_retention(community_key_id, epoch, &self_wrap)
+                    .community_dek_put_self_retention(
+                        community_key_id,
+                        minter_key_id,
+                        epoch,
+                        &self_wrap,
+                    )
                     .await?;
                 let persisted = backend
-                    .community_dek_get_self_retention(community_key_id, epoch)
+                    .community_dek_get_self_retention(community_key_id, minter_key_id, epoch)
                     .await?
                     .ok_or_else(|| {
                         BlobError::Backend(format!(
                             "community DEK self-retention vanished after put for \
-                             {community_key_id:?} epoch {epoch} (corrupt cascade state)"
+                             {community_key_id:?} minter {minter_key_id:?} epoch {epoch} \
+                             (corrupt cascade state)"
                         ))
                     })?;
+                changed = true;
                 unwrap_dek_for_persist(&content_master, &persisted).map_err(map_at_rest_err)?
             }
         };
@@ -438,7 +573,7 @@ pub mod orchestrate {
         // partition is decided by roster MEMBER in `partition_roster`,
         // once, for every cascade — a member with no occurrence is `absent`.
         let already: std::collections::HashSet<String> = backend
-            .community_dek_member_grant_recipients(community_key_id, epoch)
+            .community_dek_member_grant_recipients(community_key_id, minter_key_id, epoch)
             .await?
             .into_iter()
             .collect();
@@ -450,27 +585,39 @@ pub mod orchestrate {
                 backend
                     .community_dek_put_member_grant(
                         community_key_id,
+                        minter_key_id,
                         epoch,
                         &occ_key_id,
                         WRAP_ALGORITHM_V2,
                         &wrapped,
                     )
                     .await?;
+                changed = true;
             }
         }
-        Ok((dek, report))
+        Ok(EnsuredEpoch {
+            epoch,
+            dek,
+            report,
+            changed,
+        })
     }
 
     /// Encrypt `plaintext` under the community's CURRENT-epoch shared DEK,
-    /// store the ciphertext envelope, bind it to `(community, epoch)`, and
-    /// (on first emission in the epoch) wrap the DEK to every current
-    /// member — fail-secure excluding members without valid
+    /// store the ciphertext envelope, bind it to `(community, minter,
+    /// epoch)`, and (on first emission in the epoch) wrap the DEK to every
+    /// current member — fail-secure excluding members without valid
     /// `encryption_pubkeys`.
     ///
     /// Returns the [`CommunityCascadeResult`]. Unlike the self/family
     /// cascade this does NOT suppress `holds_bytes`: community content
     /// federates with cleartext provenance (the caller emits the
     /// `holds_bytes:*` row; this owns only the at-rest crypto + grants).
+    /// #848 (§14) — the caller also emits the `KeyGrant` set when
+    /// [`CommunityCascadeResult::fanout_changed`] says the fan-out changed.
+    ///
+    /// `author_key_id` is the MINTER (§11): the node's derived key on every
+    /// production call ([`resolve_minter`]).
     ///
     /// Precondition: the community is NOT `cohort_subkind: infrastructure`
     /// (asserted in [`resolve_community_members`] — an infra community is
@@ -530,6 +677,7 @@ pub mod orchestrate {
             CryptoTier::CommunityDek
         ));
 
+        let minter = resolve_minter(backend, author_key_id)?;
         // §11.4 / I17 — read the epoch, seal, store, BIND-IF-STILL-CURRENT. A
         // rotation that lands between the read and the bind refuses the
         // bind; the attempt cleans up its own ciphertext row and this loop
@@ -539,12 +687,13 @@ pub mod orchestrate {
         let mut last_epoch = 0;
         for _ in 0..ATTEMPTS {
             let epoch = backend
-                .community_dek_current_epoch(community_key_id)
+                .community_dek_current_epoch(community_key_id, &minter)
                 .await?;
             match seal_store_bind_at(
                 backend,
                 cohort_scope,
                 community_key_id,
+                &minter,
                 epoch,
                 plaintext,
                 media_type,
@@ -594,11 +743,15 @@ pub mod orchestrate {
     /// a public blob). [`encrypt_and_cascade_community`] is the door and
     /// loops over this; it is crate-private so no consumer can seal at an
     /// epoch of its choosing.
+    ///
+    /// #848 (§15) — `ensure_epoch_dek` may rotate past `epoch`; the seal and
+    /// the bind use the epoch it settled on.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn seal_store_bind_at<B>(
         backend: &B,
         cohort_scope: &str,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         plaintext: &[u8],
         media_type: Option<&str>,
@@ -608,12 +761,13 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let (dek, report) = ensure_epoch_dek(backend, community_key_id, epoch).await?;
+        let ensured = ensure_epoch_dek(backend, community_key_id, minter_key_id, epoch).await?;
+        let epoch = ensured.epoch;
 
         // Seal the body under the shared epoch DEK into the self-describing
         // CRBLOB envelope (same format as self/family). `aad` (#831) is bound
         // into the tag and never stored.
-        let envelope = seal(&dek, plaintext, aad).map_err(map_at_rest_err)?;
+        let envelope = seal(&ensured.dek, plaintext, aad).map_err(map_at_rest_err)?;
         let envelope_bytes = envelope.to_bytes();
         let at_rest_sha256: [u8; 32] = Sha256::digest(&envelope_bytes).into();
 
@@ -630,15 +784,17 @@ pub mod orchestrate {
             )
             .await?;
         match backend
-            .community_dek_bind_blob_epoch(&at_rest_sha256, community_key_id, epoch)
+            .community_dek_bind_blob_epoch(&at_rest_sha256, community_key_id, minter_key_id, epoch)
             .await
         {
             Ok(()) => Ok(SealOutcome::Bound(CommunityCascadeResult {
                 at_rest_sha256,
+                minter_key_id: minter_key_id.to_owned(),
                 epoch,
-                granted: report.granted,
-                excluded: report.excluded,
-                roster: report.roster,
+                granted: ensured.report.granted,
+                excluded: ensured.report.excluded,
+                roster: ensured.report.roster,
+                fanout_changed: ensured.changed,
             })),
             Err(BlobError::EpochNotCurrent { .. }) => {
                 backend.delete_blob(&at_rest_sha256).await?;
@@ -655,7 +811,10 @@ pub mod orchestrate {
     /// community DEK epoch's key state, refusing an unsafe DESTROY.**
     ///
     /// This is the door. [`BlobStorage::community_dek_set_key_state`] is the
-    /// raw setter and enforces nothing; callers use this.
+    /// raw setter and enforces nothing; callers use this. #848 — key state
+    /// is per `(community, minter, epoch)`; `minter_key_id` is this node's
+    /// own key on every production call (only its own epochs have key
+    /// state here).
     ///
     /// # The DESTROY precondition
     ///
@@ -690,6 +849,7 @@ pub mod orchestrate {
     pub async fn set_key_state<B>(
         backend: &B,
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
         to: DekKeyState,
     ) -> Result<(), BlobError>
@@ -699,11 +859,12 @@ pub mod orchestrate {
         // The epoch must exist. Setting state on a DEK that was never minted
         // would otherwise succeed-by-doing-nothing on some backends.
         let current = backend
-            .community_dek_key_state(community_key_id, epoch)
+            .community_dek_key_state(community_key_id, minter_key_id, epoch)
             .await?
             .ok_or_else(|| {
                 BlobError::InvalidArgument(format!(
-                    "community {community_key_id:?} has no DEK at epoch {epoch}"
+                    "community {community_key_id:?} has no DEK at epoch {epoch} \
+                     (minter {minter_key_id:?})"
                 ))
             })?;
 
@@ -724,7 +885,7 @@ pub mod orchestrate {
         // conditional UPDATE refuses this too; here it gets a reason.
         if to != DekKeyState::Enabled {
             let current_epoch = backend
-                .community_dek_current_epoch(community_key_id)
+                .community_dek_current_epoch(community_key_id, minter_key_id)
                 .await?;
             if epoch == current_epoch {
                 return Err(BlobError::InvalidArgument(format!(
@@ -740,7 +901,7 @@ pub mod orchestrate {
         // early check only produces a friendlier message.
         if to == DekKeyState::Destroyed {
             let remaining = backend
-                .community_dek_epoch_object_count(community_key_id, epoch)
+                .community_dek_epoch_object_count(community_key_id, minter_key_id, epoch)
                 .await?;
             if remaining > 0 {
                 return Err(BlobError::InvalidArgument(format!(
@@ -753,7 +914,7 @@ pub mod orchestrate {
         }
 
         backend
-            .community_dek_set_key_state(community_key_id, epoch, to)
+            .community_dek_set_key_state(community_key_id, minter_key_id, epoch, to)
             .await
     }
 
@@ -789,6 +950,11 @@ pub mod orchestrate {
     /// change would stall a community rotation on its own corpus. Callers
     /// that want it now call it directly; the scheduled path calls the same
     /// function.
+    ///
+    /// #848 — sweeps THIS node's own counter: the minter is `signer`'s
+    /// derived key. A peer's epochs have no key state here to sweep; their
+    /// content on this node is retained under the binding's `(community,
+    /// minter, epoch)` until the peer's grants say otherwise.
     ///
     /// # What it does, per epoch below the current one
     ///
@@ -826,15 +992,19 @@ pub mod orchestrate {
     where
         B: BlobStorage + Sync,
     {
+        let minter = signer.derived_key_id();
         let current = backend
-            .community_dek_current_epoch(community_key_id)
+            .community_dek_current_epoch(community_key_id, &minter)
             .await?;
         let retain = backend
-            .community_dek_retain_past_epochs(community_key_id)
+            .community_dek_retain_past_epochs(community_key_id, &minter)
             .await?;
         let mut report = SweepReport::default();
 
-        for (epoch, state) in backend.community_dek_epochs(community_key_id).await? {
+        for (epoch, state) in backend
+            .community_dek_epochs(community_key_id, &minter)
+            .await?
+        {
             // The current epoch is the primary. Never touched.
             if epoch >= current || state == DekKeyState::Destroyed {
                 continue;
@@ -842,7 +1012,12 @@ pub mod orchestrate {
 
             if state == DekKeyState::Enabled {
                 backend
-                    .community_dek_set_key_state(community_key_id, epoch, DekKeyState::Disabled)
+                    .community_dek_set_key_state(
+                        community_key_id,
+                        &minter,
+                        epoch,
+                        DekKeyState::Disabled,
+                    )
                     .await?;
                 report.disabled.push(epoch);
             }
@@ -859,7 +1034,13 @@ pub mod orchestrate {
                 // failed retraction leaves the bytes in place (I18); this
                 // epoch is reported and the sweep moves on.
                 match backend
-                    .community_dek_evict_epoch_objects(community_key_id, epoch, signer, now)
+                    .community_dek_evict_epoch_objects(
+                        community_key_id,
+                        &minter,
+                        epoch,
+                        signer,
+                        now,
+                    )
                     .await
                 {
                     Ok(n) => report.evicted_objects += n,
@@ -871,13 +1052,20 @@ pub mod orchestrate {
             }
 
             let remaining = backend
-                .community_dek_epoch_object_count(community_key_id, epoch)
+                .community_dek_epoch_object_count(community_key_id, &minter, epoch)
                 .await?;
             if remaining == 0 {
                 // Goes through `set_key_state`, not the raw setter, so the
                 // DESTROY precondition is re-checked at the door rather than
                 // trusted from the count we just read.
-                set_key_state(backend, community_key_id, epoch, DekKeyState::Destroyed).await?;
+                set_key_state(
+                    backend,
+                    community_key_id,
+                    &minter,
+                    epoch,
+                    DekKeyState::Destroyed,
+                )
+                .await?;
                 report.destroyed.push(epoch);
             } else {
                 report.blocked.push((epoch, remaining));
@@ -886,17 +1074,85 @@ pub mod orchestrate {
         Ok(report)
     }
 
+    /// #848 (§13, §17) — **recover the DEK of `(community, minter, epoch)`
+    /// for `viewer_key_id`**, on whichever node this is.
+    ///
+    /// Two ways, tried in order:
+    /// 1. **This node minted it** — the self-retention row exists; unwrap
+    ///    under the content master (the V070 read discipline, unchanged).
+    /// 2. **A peer minted it** — no self-retention here. The viewer's OWN
+    ///    grant row holds the DEK wrapped to the viewer occurrence's
+    ///    `encryption_pubkeys`; when those are THIS node's content-KEM
+    ///    identity, the private halves V073 sealed for exactly this path
+    ///    open it. This is what makes a member's node open bytes it adopted
+    ///    (I61) and the owner's second device open its own content (I65).
+    ///
+    /// Authorization is the CALLER's (the grant check runs before this);
+    /// this only recovers material. A viewer whose grant is addressed to
+    /// pubkeys this node does not hold the private half for cannot be served
+    /// here — that wrap belongs to another device — and the refusal says so.
+    pub(crate) async fn recover_epoch_dek_for_viewer<B>(
+        backend: &B,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<[u8; DEK_LEN], BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        if let Some(wrapped) = backend
+            .community_dek_get_self_retention(community_key_id, minter_key_id, epoch)
+            .await?
+        {
+            let content_master = backend.load_or_init_content_master().await?;
+            return unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err);
+        }
+        // No self-retention: either a peer's epoch, or ours and destroyed.
+        // A destroyed epoch of OUR OWN still has its state row (NULL
+        // material, V139's CHECK); a peer's epoch has no state row at all.
+        if backend
+            .community_dek_key_state(community_key_id, minter_key_id, epoch)
+            .await?
+            .is_some()
+        {
+            return Err(BlobError::InvalidArgument(format!(
+                "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
+                 is gone and this blob is permanently unreadable \
+                 (BLOB_ENCRYPTION_AT_REST.md §11.4)"
+            )));
+        }
+        let Some((_alg, wrapped)) = backend
+            .community_dek_member_grant_wrap(community_key_id, minter_key_id, epoch, viewer_key_id)
+            .await?
+        else {
+            return Err(BlobError::NotGranted {
+                sha256_hex: String::new(),
+                viewer_key_id: viewer_key_id.to_owned(),
+            });
+        };
+        let private = backend.load_content_kem_private_halves().await?;
+        unwrap_dek_v2_json(&private, &wrapped).map_err(|e| {
+            BlobError::Backend(format!(
+                "community {community_key_id:?} epoch {epoch} (minter {minter_key_id:?}): the wrap \
+                 addressed to {viewer_key_id:?} does not open with this node's content-KEM \
+                 identity — that occurrence's private half lives on another device ({e})"
+            ))
+        })
+    }
+
     /// Recover the plaintext community-content body for a member viewer.
     ///
     /// Authorization predicate: the viewer must hold a v2 grant on the
-    /// blob's `(community, epoch)`
+    /// blob's `(community, minter, epoch)`
     /// ([`community_dek_has_member_grant`](BlobStorage::community_dek_has_member_grant)).
     /// A removed member who was a grantee on a PRE-rotation epoch still
     /// passes for those blobs (Option-A forward-only: they keep what they
     /// could already read); a member who only ever held grants on a
     /// later-rotated epoch cannot read a blob sealed under an epoch they
-    /// were never granted on. Persist recovers the actual DEK via its
-    /// per-epoch self-retention row (the V070 read discipline).
+    /// were never granted on. The DEK is recovered by
+    /// [`recover_epoch_dek_for_viewer`]: persist's self-retention row where
+    /// this node minted the epoch, the viewer's own wrap where a peer did.
     ///
     /// - [`BlobError::NotHeld`] if the ciphertext is absent.
     /// - [`BlobError::NotGranted`] if the viewer holds no grant on the
@@ -923,7 +1179,8 @@ pub mod orchestrate {
                     hex::encode(at_rest_sha256)
                 ))
             })?;
-        let (community_key_id, epoch) = (binding.community_key_id, binding.epoch);
+        let (community_key_id, minter_key_id, epoch) =
+            (binding.community_key_id, binding.minter_key_id, binding.epoch);
         // #833 (§11.5, I31) — the sweep kept the binding as an eviction
         // record. This door is a production surface
         // (`Engine::read_blob_for_community_viewer`, PyO3), so it gives the
@@ -932,7 +1189,15 @@ pub mod orchestrate {
         // predicate is the two-leg one — and it runs BEFORE the fact is
         // named.
         if let Some(evicted_at) = binding.evicted_at {
-            if !may_learn_epoch_fate(backend, &community_key_id, epoch, viewer_key_id).await? {
+            if !may_learn_epoch_fate(
+                backend,
+                &community_key_id,
+                &minter_key_id,
+                epoch,
+                viewer_key_id,
+            )
+            .await?
+            {
                 return Err(BlobError::NotGranted {
                     sha256_hex: hex::encode(at_rest_sha256),
                     viewer_key_id: viewer_key_id.to_owned(),
@@ -948,7 +1213,7 @@ pub mod orchestrate {
         // v43.0.0 (§11.3) — AUTHORIZE FIRST. The destroyed-epoch refusal
         // below names the community; a non-grantee must never reach it.
         if !backend
-            .community_dek_has_member_grant(&community_key_id, epoch, viewer_key_id)
+            .community_dek_has_member_grant(&community_key_id, &minter_key_id, epoch, viewer_key_id)
             .await?
         {
             return Err(BlobError::NotGranted {
@@ -991,7 +1256,7 @@ pub mod orchestrate {
     where
         B: BlobStorage + Sync,
     {
-        let (community_key_id, epoch) = backend
+        let (community_key_id, minter_key_id, epoch) = backend
             .community_dek_blob_epoch(at_rest_sha256)
             .await?
             .ok_or_else(|| {
@@ -1003,7 +1268,7 @@ pub mod orchestrate {
         // Defense in depth: the §11.3 door authorized already; a direct
         // caller of this function is re-checked rather than trusted.
         if !backend
-            .community_dek_has_member_grant(&community_key_id, epoch, viewer_key_id)
+            .community_dek_has_member_grant(&community_key_id, &minter_key_id, epoch, viewer_key_id)
             .await?
         {
             return Err(BlobError::NotGranted {
@@ -1011,53 +1276,61 @@ pub mod orchestrate {
                 viewer_key_id: viewer_key_id.to_owned(),
             });
         }
-        let wrapped = backend
-            .community_dek_get_self_retention(&community_key_id, epoch)
-            .await?
-            .ok_or_else(|| {
-                // NULL self-retention ⇔ destroyed (V139's CHECK): the key
-                // material is gone. Said to a GRANTEE, after authorization.
-                BlobError::InvalidArgument(format!(
-                    "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
-                     is gone and this blob is permanently unreadable \
-                     (BLOB_ENCRYPTION_AT_REST.md §11.4)"
-                ))
-            })?;
-        let content_master = backend.load_or_init_content_master().await?;
-        let dek = unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err)?;
+        let dek = recover_epoch_dek_for_viewer(
+            backend,
+            &community_key_id,
+            &minter_key_id,
+            epoch,
+            viewer_key_id,
+        )
+        .await
+        .map_err(|e| match e {
+            BlobError::NotGranted { viewer_key_id, .. } => BlobError::NotGranted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                viewer_key_id,
+            },
+            other => other,
+        })?;
         open(&dek, envelope, aad).map_err(map_at_rest_err)
     }
 
     /// #832 (§12.4) — recover the epoch DEK a COMMUNITY row was sealed under
-    /// and open it, for a caller that has ALREADY authorized the viewer on
-    /// that row's epoch. The DEK comes from the row's own binding, never from
-    /// the community's current epoch — a chunk sealed before a rotation opens
-    /// under the epoch it was sealed at (I38). Destroyed ⇒ the same
-    /// post-authorization refusal `read_for_community_viewer_sealed` gives.
-    pub(crate) async fn open_community_row_as_persist<B>(
+    /// and open it, for a caller that has ALREADY authorized `viewer_key_id`
+    /// on that row's epoch. The DEK comes from the row's own binding, never
+    /// from the community's current epoch — a chunk sealed before a rotation
+    /// opens under the epoch it was sealed at (I38). #848 — recovered by
+    /// [`recover_epoch_dek_for_viewer`], so a peer-minted chunk opens with
+    /// the viewer's own wrap. Destroyed ⇒ the same post-authorization
+    /// refusal `read_for_community_viewer_sealed` gives.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_community_row_for_viewer<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         community_key_id: &str,
+        minter_key_id: &str,
         epoch: u64,
+        viewer_key_id: &str,
         envelope: &AtRestEnvelope,
         aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + Sync,
     {
-        let wrapped = backend
-            .community_dek_get_self_retention(community_key_id, epoch)
-            .await?
-            .ok_or_else(|| {
-                BlobError::InvalidArgument(format!(
-                    "community {community_key_id:?} epoch {epoch} is destroyed — the key material \
-                     is gone and blob {} is permanently unreadable \
-                     (BLOB_ENCRYPTION_AT_REST.md §11.4)",
-                    hex::encode(at_rest_sha256)
-                ))
-            })?;
-        let content_master = backend.load_or_init_content_master().await?;
-        let dek = unwrap_dek_for_persist(&content_master, &wrapped).map_err(map_at_rest_err)?;
+        let dek = recover_epoch_dek_for_viewer(
+            backend,
+            community_key_id,
+            minter_key_id,
+            epoch,
+            viewer_key_id,
+        )
+        .await
+        .map_err(|e| match e {
+            BlobError::NotGranted { viewer_key_id, .. } => BlobError::NotGranted {
+                sha256_hex: hex::encode(at_rest_sha256),
+                viewer_key_id,
+            },
+            other => other,
+        })?;
         open(&dek, envelope, aad).map_err(map_at_rest_err)
     }
 
@@ -1491,6 +1764,16 @@ pub mod lifecycle_harness {
         let alice_occ = format!("{tag}-alice-occ-{run}");
         let bob = format!("{tag}-bob-{run}");
         let bob_occ = format!("{tag}-bob-occ-{run}");
+        // #848 (§11) — THIS node is the minter: the sweeper's derived key.
+        // The sweep runs over the signer's own counter, so the cascades
+        // below mint under the same key the sweep will find.
+        let sweeper = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend,
+            &format!("{tag}-sweeper-{run}"),
+        )
+        .await;
+        let sweeper_id = sweeper.derived_key_id();
+        let minter = sweeper_id.clone();
 
         // ── 1. CREATE ────────────────────────────────────────────────────
         super::lifecycle_support::seed_community(
@@ -1502,7 +1785,7 @@ pub mod lifecycle_harness {
 
         // ── 2. ENCRYPT (epoch 0) ─────────────────────────────────────────
         let before =
-            encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None, None)
+            encrypt_and_cascade_community(backend, &comm, b"pre-rotation minutes", None, Some(&minter))
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: seal at epoch 0: {e}"));
         assert_eq!(
@@ -1531,7 +1814,7 @@ pub mod lifecycle_harness {
 
         // ── 5. ENCRYPT AGAIN — lands on the NEW epoch ────────────────────
         let after =
-            encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None, None)
+            encrypt_and_cascade_community(backend, &comm, b"post-rotation minutes", None, Some(&minter))
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
         assert!(
@@ -1574,7 +1857,7 @@ pub mod lifecycle_harness {
         assert_eq!(got, b"pre-rotation minutes");
 
         // ── 8. KEY STATE on the rotated-past epoch ───────────────────────
-        set_key_state(backend, &comm, before.epoch, DekKeyState::Disabled)
+        set_key_state(backend, &comm, &minter, before.epoch, DekKeyState::Disabled)
             .await
             .unwrap_or_else(|e| panic!("{tag}: disable epoch 0: {e}"));
 
@@ -1586,7 +1869,7 @@ pub mod lifecycle_harness {
 
         // And it cannot be destroyed while its content is live: destroying
         // would ORPHAN the blob, not erase it.
-        let err = set_key_state(backend, &comm, before.epoch, DekKeyState::Destroyed)
+        let err = set_key_state(backend, &comm, &minter, before.epoch, DekKeyState::Destroyed)
             .await
             .expect_err("destroying an epoch with live content must be refused");
         assert!(
@@ -1663,12 +1946,6 @@ pub mod lifecycle_harness {
         // the announcement (withdraws), delete the bytes, destroy the key.
         // The first implementation's sweep had zero postgres coverage; this
         // step runs on every backend that runs the harness.
-        let sweeper = crate::federation::at_rest_cascade::blob_invariants::node_signer(
-            backend,
-            &format!("{tag}-sweeper-{run}"),
-        )
-        .await;
-        let sweeper_id = sweeper.derived_key_id();
         // Announce epoch 0's sealed bytes as this sweeper node, so there is
         // an announcement to retract.
         let crate::federation::BlobBody::Inline(sealed0) = backend
@@ -1704,7 +1981,7 @@ pub mod lifecycle_harness {
             "{tag}: precondition — the sweeper is a listed holder"
         );
         backend
-            .community_dek_set_retain_past_epochs(&comm, Some(0))
+            .community_dek_set_retain_past_epochs(&comm, &minter, Some(0))
             .await
             .unwrap();
         let report = crate::federation::community_dek::orchestrate::sweep_rotated_epochs(
@@ -1738,12 +2015,12 @@ pub mod lifecycle_harness {
         );
         assert!(
             backend
-                .community_dek_get_self_retention(&comm, before.epoch)
+                .community_dek_get_self_retention(&comm, &minter, before.epoch)
                 .await
                 .unwrap()
                 .is_none()
                 && backend
-                    .community_dek_member_grant_recipients(&comm, before.epoch)
+                    .community_dek_member_grant_recipients(&comm, &minter, before.epoch)
                     .await
                     .unwrap()
                     .is_empty(),

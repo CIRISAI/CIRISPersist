@@ -989,6 +989,9 @@ impl Engine {
         if let Ok(id) = engine.local_derived_key_id().await {
             engine.set_backend_node_key_id(&id);
         }
+        // v44.3.0 (CIRISPersist#848, I66) — the V145 minter sentinel resolves
+        // to this node's key HERE, before any read; a survivor is boot-fatal.
+        engine.resolve_minter_sentinels_at_boot().await?;
         // v31.0.0 (CIRISPersist#650) — the in-place v31 migration. Here rather
         // than in `Backend::run_migrations` because a re-stamp is a re-SIGN and
         // `Backend` has no signer; this is the first point at which the backend
@@ -1122,7 +1125,7 @@ impl Engine {
         dsn: &str,
     ) -> Result<Self, EngineError> {
         let backend = build_backend(dsn, true).await?;
-        Ok(Engine {
+        let engine = Engine {
             backend,
             signer,
             local_signer: None,
@@ -1131,7 +1134,13 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
-        })
+        };
+        // v44.3.0 (CIRISPersist#848, I66) — see `with_signer`.
+        if let Ok(id) = engine.local_derived_key_id().await {
+            engine.set_backend_node_key_id(&id);
+        }
+        engine.resolve_minter_sentinels_at_boot().await?;
+        Ok(engine)
     }
 
     /// v7.1.0 (CIRISPersist#224) — construct a fresh Engine (connect + run
@@ -1183,7 +1192,7 @@ impl Engine {
             .await?,
         );
         let backend = build_backend(dsn, true).await?;
-        Ok(Engine {
+        let engine = Engine {
             backend,
             // `signer` is the hardware classical itself — same shape as
             // the other ctors (the classical-signing federation identity).
@@ -1196,7 +1205,13 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
-        })
+        };
+        // v44.3.0 (CIRISPersist#848, I66) — see `with_signer`.
+        if let Ok(id) = engine.local_derived_key_id().await {
+            engine.set_backend_node_key_id(&id);
+        }
+        engine.resolve_minter_sentinels_at_boot().await?;
+        Ok(engine)
     }
 
     /// Borrow the public [`BackendDispatch`] enum the Engine
@@ -5098,7 +5113,7 @@ impl Engine {
         let author = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
         })?;
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 encrypt_and_cascade(
@@ -5125,7 +5140,15 @@ impl Engine {
                 )
                 .await
             }
-        }
+        }?;
+        // #848 (§14, content axis) — a fresh per-write DEK is a new set.
+        self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Content {
+            at_rest_sha256: hex::encode(r.at_rest_sha256),
+            cohort_scope: cohort_scope.to_owned(),
+            owner_key_id: owner_or_family_key_id.to_owned(),
+        })
+        .await?;
+        Ok(r)
     }
 
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §11.2) — **THE write door.**
@@ -5168,7 +5191,7 @@ impl Engine {
         aad: Option<&[u8]>,
     ) -> Result<crate::federation::PutBlobScopedResult, crate::federation::BlobError> {
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 put_blob_scoped(
@@ -5195,7 +5218,108 @@ impl Engine {
                 )
                 .await
             }
+        }?;
+        // #848 (§14) — the key follows the bytes: the set the cascade
+        // reported is emitted through the attestation store so it replicates.
+        if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
         }
+        Ok(r)
+    }
+
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §14) — **emit the
+    /// `KeyGrant` set for an axis**: the FULL set this node holds for
+    /// `(community, minter, epoch)` or for one self/family blob, signed by
+    /// this Engine's composed hybrid signer and stored through
+    /// [`emit_attestation_self`](Self::emit_attestation_self), so it rides the
+    /// attestation cursor peers already pull and projects by the KeyGrant
+    /// plane (`Cohort` / `SelfOwn`). Re-emission carries the full set and is
+    /// idempotent on every receiver (§13). `Ok(None)` when this node holds
+    /// no wrap for the axis (nothing to carry).
+    ///
+    /// Called by every write door after a cascade that minted or granted
+    /// anew; reachable directly so a node that died mid-fan-out, or an
+    /// operator re-seeding a late device, can re-emit on demand.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn emit_key_grant(
+        &self,
+        axis: &crate::federation::key_grant::KeyGrantAxis,
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        use crate::federation::key_grant::build_set_for_axis;
+        let set = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => build_set_for_axis(arc.as_ref(), axis).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => build_set_for_axis(arc.as_ref(), axis).await?,
+        };
+        let Some(set) = set else {
+            return Ok(None);
+        };
+        self.emit_attestation_self(set.emit_input())
+            .await
+            .map(Some)
+            .map_err(|e| {
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "key_grant set for {axis:?} could not be emitted — the bytes are stored, the                      key cannot follow them until this succeeds ({e})"
+                ))
+            })
+    }
+
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12–§13) — **admit a
+    /// replicated `KeyGrant` set and project every wrap.** The apply a
+    /// replication bridge routes a `key_grant:*` attestation to instead of
+    /// `apply_replicated_attestation`: the signer is resolved from THIS
+    /// node's directory, must be the set's minter (epoch axis; and an active
+    /// member at `asserted_at`) or the blob's author (content axis; when the
+    /// row is present), every wrap must be v2, and then the carrier row is
+    /// admitted through the attestation plane and every wrap written as a
+    /// UNION. Refusals are typed
+    /// ([`Error::KeyGrantRefused`](crate::federation::Error::KeyGrantRefused)).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_key_grant(
+        &self,
+        set: crate::federation::key_grant::SignedKeyGrantSet,
+    ) -> Result<crate::federation::key_grant::KeyGrantAdmission, crate::federation::Error> {
+        use crate::federation::key_grant::admit_replicated_key_grant;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => admit_replicated_key_grant(arc.as_ref(), set).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => admit_replicated_key_grant(arc.as_ref(), set).await,
+        }
+    }
+
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §16, I66) — **resolve
+    /// the V145 minter sentinel to this node's own key**, at construction,
+    /// the first moment the backend and the signer exist together — beside
+    /// `run_v31_migration_at_boot`, which needs the signer for the same
+    /// reason. Runs before any read; a sentinel that survives aborts the
+    /// boot. Idempotent: a no-op on every boot but the first after V145.
+    async fn resolve_minter_sentinels_at_boot(&self) -> Result<(), EngineError> {
+        let key = match self.local_derived_key_id().await {
+            Ok(k) => k,
+            // No Ed25519 federation identity: this node mints nothing and
+            // holds no key state to resolve. A sentinel on such a node would
+            // be found by the first Engine that CAN name itself.
+            Err(_) => return Ok(()),
+        };
+        #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
+        let _ = key;
+        #[cfg(feature = "sqlite")]
+        if let Some(b) = self.sqlite_backend() {
+            let n = b.repair_minter_sentinel(&key).await.map_err(EngineError::Store)?;
+            if n > 0 {
+                tracing::info!(rows = n, node = %key, "V145 minter sentinel resolved (#848)");
+            }
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(b) = self.postgres_backend() {
+            let n = b.repair_minter_sentinel(&key).await.map_err(EngineError::Store)?;
+            if n > 0 {
+                tracing::info!(rows = n, node = %key, "V145 minter sentinel resolved (#848)");
+            }
+        }
+        Ok(())
     }
 
     /// v43.0.0 (§11.6) — transition a community DEK epoch's key state.
@@ -5203,6 +5327,10 @@ impl Engine {
     /// precondition at the door; the backend's conditional UPDATE enforces
     /// it again by statement.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// #848 (§11) — key state is per `(community, minter, epoch)`, and the
+    /// only epochs with key state on this node are the ones THIS node
+    /// minted, so the minter is this node's derived key.
     pub async fn community_dek_set_key_state(
         &self,
         community_key_id: &str,
@@ -5210,14 +5338,17 @@ impl Engine {
         state: crate::federation::DekKeyState,
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::community_dek::orchestrate::set_key_state;
+        let minter = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                set_key_state(arc.as_ref(), community_key_id, epoch, state).await
+                set_key_state(arc.as_ref(), community_key_id, &minter, epoch, state).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                set_key_state(arc.as_ref(), community_key_id, epoch, state).await
+                set_key_state(arc.as_ref(), community_key_id, &minter, epoch, state).await
             }
         }
     }
@@ -5234,16 +5365,28 @@ impl Engine {
         retain_past_epochs: Option<u64>,
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::BlobStorage as _;
+        // #848 — the policy rides this node's own pointer row.
+        let minter = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                arc.community_dek_set_retain_past_epochs(community_key_id, retain_past_epochs)
-                    .await
+                arc.community_dek_set_retain_past_epochs(
+                    community_key_id,
+                    &minter,
+                    retain_past_epochs,
+                )
+                .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                arc.community_dek_set_retain_past_epochs(community_key_id, retain_past_epochs)
-                    .await
+                arc.community_dek_set_retain_past_epochs(
+                    community_key_id,
+                    &minter,
+                    retain_past_epochs,
+                )
+                .await
             }
         }
     }
@@ -5373,7 +5516,7 @@ impl Engine {
         let author = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
         })?;
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 encrypt_and_cascade_community(
@@ -5396,7 +5539,17 @@ impl Engine {
                 )
                 .await
             }
+        }?;
+        // #848 (§14) — the set follows the bytes when the fan-out changed.
+        if r.fanout_changed {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Epoch {
+                community_key_id: community_key_id.to_owned(),
+                minter_key_id: r.minter_key_id.clone(),
+                epoch: r.epoch,
+            })
+            .await?;
         }
+        Ok(r)
     }
 
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10) — **read any blob as a
@@ -5527,7 +5680,7 @@ impl Engine {
         // #837 — the WRITER is this Engine's signer, the same one
         // `seal_stream_scoped` seals under, so the stream's owner and its
         // sealer are one key.
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 put_blob_chunk_scoped(
@@ -5558,7 +5711,12 @@ impl Engine {
                 )
                 .await
             }
+        }?;
+        // #848 (§14) — the key follows the chunk.
+        if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
         }
+        Ok(r)
     }
 
     /// #838 (§12.10) — **read one chunk of a stream by POSITION, as
@@ -5609,7 +5767,7 @@ impl Engine {
         crate::federation::BlobError,
     > {
         use crate::federation::chunk_dag_cascade::orchestrate::seal_stream_scoped;
-        match &self.backend {
+        let r = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 seal_stream_scoped(
@@ -5636,7 +5794,12 @@ impl Engine {
                 )
                 .await
             }
+        }?;
+        // #848 (§14) — the key follows the manifest.
+        if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
         }
+        Ok(r)
     }
 
     /// #832 (§12.5, I37) — **the live-stream handle**: the chunks of
@@ -5785,12 +5948,18 @@ impl Engine {
     ) -> Result<u64, crate::federation::BlobError> {
         use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke;
         let now = chrono::Utc::now();
+        // #848 (§15) — the revoker's explicit bump is of THIS node's own
+        // counter.
+        let minter = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("local derived key id: {e}"))
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
                 rekey_community_member_revoke(
                     arc.as_ref(),
                     community_key_id,
+                    &minter,
                     removed_identity_key_id,
                     now,
                     authority_key_id,
@@ -5804,6 +5973,7 @@ impl Engine {
                 rekey_community_member_revoke(
                     arc.as_ref(),
                     community_key_id,
+                    &minter,
                     removed_identity_key_id,
                     now,
                     authority_key_id,
@@ -17365,6 +17535,8 @@ mod tests {
         // ── §7 community rekey-on-revoke (epoch bump) ──
         let comm = format!("g4-comm-{s}");
         let cm: Vec<String> = (0..3).map(|i| format!("g4-cm{i}-{s}")).collect();
+        // #848 — the revoker bumps ITS OWN counter.
+        let minter = format!("g4-node-{s}");
         d.put_public_key(sweeper_test_key(&comm))
             .await
             .expect("seed");
@@ -17396,7 +17568,7 @@ mod tests {
         .expect("put_community");
 
         let e1 = d
-            .community_dek_bump_epoch(&comm)
+            .community_dek_bump_epoch(&comm, &minter)
             .await
             .expect("genesis epoch");
         // #502 E4 — sign the removal with `comm` (registered above with real
@@ -17419,6 +17591,7 @@ mod tests {
         let e2 = at_rest_cascade::orchestrate::rekey_community_member_revoke(
             d,
             &comm,
+            &minter,
             &cm[0],
             revoke_at,
             &comm,

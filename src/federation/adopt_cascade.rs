@@ -83,6 +83,11 @@ fn resolve_adopt(
             };
             Some(EpochBinding {
                 community_key_id: community.to_owned(),
+                // #848 (§11) — the AUTHOR is the minter; `BlobProvenance`
+                // needs no new field: its `author_key_id` IS the epoch's
+                // minter, because the author's cascade minted the epoch the
+                // blob is sealed under.
+                minter_key_id: provenance.author_key_id.clone(),
                 epoch,
             })
         }

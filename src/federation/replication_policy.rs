@@ -107,11 +107,26 @@ pub enum EnvelopeKind {
     /// V104/V095 projection ([`Projection::RoleWithdrawals`]), which is what
     /// makes carrying the evidence safe.
     AccordQuorumEvidence,
+    /// v44.3.0 (CIRISPersist#848, `FSD/BLOB_REPLICATION.md` §12) — **the
+    /// sixteenth kind**: the Constitution's `key_grant` (CC 3, CC 5.1) on a
+    /// replicated kind. One envelope carries one SET of recipient wraps for
+    /// one identity — epoch-addressed `(community, minter, epoch)` for
+    /// community / affiliations, content-addressed `(at_rest_sha256,
+    /// cohort_scope, owner)` for self / family. Rides the attestation store
+    /// as a `key_grant:*` row (`key_grant::SignedKeyGrantSet`), so peers pull
+    /// it through the cursor they already have; a receiver routes it to
+    /// `apply_replicated_key_grant`, which resolves the signer from its OWN
+    /// directory (never the sender), requires the minter (epoch axis) or the
+    /// author (content axis) to have signed, and projects every wrap as a
+    /// UNION ([`Projection::KeyGrants`]). Grants are never retracted —
+    /// forward secrecy is by rotation — so this kind has no withdraw.
+    KeyGrant,
 }
 
 impl EnvelopeKind {
-    /// Every kind, in the canonical (manifest-hashed) order.
-    pub const ALL: [EnvelopeKind; 15] = [
+    /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
+    /// inserted — the order is hashed.
+    pub const ALL: [EnvelopeKind; 16] = [
         EnvelopeKind::Key,
         EnvelopeKind::Attestation,
         EnvelopeKind::Revocation,
@@ -127,6 +142,7 @@ impl EnvelopeKind {
         EnvelopeKind::PartnerRecord,
         EnvelopeKind::TransportDestination,
         EnvelopeKind::AccordQuorumEvidence,
+        EnvelopeKind::KeyGrant,
     ];
 
     /// The stable wire token (must match edge's `as_str`; pinned by hash).
@@ -148,6 +164,7 @@ impl EnvelopeKind {
             EnvelopeKind::PartnerRecord => "PartnerRecord",
             EnvelopeKind::TransportDestination => "TransportDestination",
             EnvelopeKind::AccordQuorumEvidence => "AccordQuorumEvidence",
+            EnvelopeKind::KeyGrant => "KeyGrant",
         }
     }
 }
@@ -228,6 +245,16 @@ pub enum Projection {
     /// a tombstone exists on a node only because that node re-tallied the
     /// quorum itself.
     RoleWithdrawals,
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §13) — the grant
+    /// tables, from an admitted `KeyGrant` set: every wrap of the set into
+    /// `federation_community_dek_member_grants` (epoch axis) or
+    /// `federation_blob_key_grants` (content axis), `ON CONFLICT DO NOTHING`.
+    /// A UNION: a grant once admitted is never removed by a later set, a
+    /// re-applied set is a no-op, and a set admitted before its bytes arrive
+    /// is stored and read when they do. The projection consults no keyring —
+    /// every recipient's wrap is stored, and the read door finds the
+    /// viewer's row.
+    KeyGrants,
 }
 
 /// The admission policy for one [`EnvelopeKind`] — persist's half of the
@@ -327,6 +354,16 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
             PopOnInsert::NotApplicable,
             &[P::RoleWithdrawals],
         ),
+        // v44.3.0 (#848, §12): the minter signs its own counter; the author
+        // its own blob. The signer is the record's attester, resolved from
+        // OUR directory through the attestation plane's ingest gate; the
+        // minter / author / active-member rules are the admission door's.
+        K::KeyGrant => (
+            S::RegisteredSigner,
+            B::SelfOwn,
+            PopOnInsert::NotApplicable,
+            &[P::KeyGrants],
+        ),
     };
     KindPolicy {
         kind,
@@ -371,8 +408,14 @@ pub fn replication_policy_sha256() -> String {
 /// [`Projection::RoleWithdrawals`] fan-out it declares. Previous value:
 /// `351912ead0aab4847f40d2b54a7a326546c37d43507deb38ea24d6094d29d63b`
 /// (v21.0.0 – v31.0.0, the 14-kind era).
+/// v44.3.0 (CIRISPersist#848) — re-pinned for the 16th kind
+/// ([`EnvelopeKind::KeyGrant`]) and the [`Projection::KeyGrants`] fan-out it
+/// declares. Previous value:
+/// `3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef`
+/// (v31.1.0 – v44.2.1, the 15-kind era). CIRISServer re-pins; CIRISEdge adds
+/// the wire kind (its protocol enum mirrors the sixteen names in order).
 pub const REPLICATION_POLICY_HASH: &str =
-    "3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef";
+    "c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d";
 
 #[cfg(test)]
 mod tests {
@@ -399,6 +442,6 @@ mod tests {
             // E5: NO wire kind may admit at local tier.
             assert_eq!(p.tier, WireTier::FederationOnly);
         }
-        assert_eq!(EnvelopeKind::ALL.len(), 15, "the wire-kind count is pinned");
+        assert_eq!(EnvelopeKind::ALL.len(), 16, "the wire-kind count is pinned");
     }
 }

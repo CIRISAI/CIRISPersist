@@ -81,6 +81,9 @@ pub mod genesis;
 pub mod goal;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
+// v44.3.0 (CIRISPersist#848, BLOB_REPLICATION.md Part II) — key transport:
+// the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
+pub mod key_grant;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
@@ -308,7 +311,7 @@ pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
     BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow, BlobRange, BlobStorage,
     ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport, ExternalRef,
-    GroupDekRef, ManifestRowSpec, MemberGrant, PreparedHoldsBytes, PutBlobAttestation,
+    GrantWrap, GroupDekRef, ManifestRowSpec, MemberGrant, PreparedHoldsBytes, PutBlobAttestation,
     PutBlobScopedResult, RosterPartition, ScopeBlobSymbol, StorageFloor, StreamChunkRef,
     StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
     DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
@@ -7801,6 +7804,20 @@ pub enum Error {
         reason: String,
     },
 
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12) — a replicated
+    /// `KeyGrant` set was refused at admission: the signer is not the set's
+    /// minter / the blob's author, not an active member of the community at
+    /// `asserted_at`, a wrap is not v2, the envelope is malformed, or the
+    /// attestation plane refused the carrier row. `reason` is a stable
+    /// [`KeyGrantRefusalReason`](key_grant::KeyGrantRefusalReason) token.
+    #[error("key_grant refused ({reason}): {detail}")]
+    KeyGrantRefused {
+        /// The stable refusal token.
+        reason: &'static str,
+        /// What was refused, in words.
+        detail: String,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -7972,6 +7989,7 @@ impl Error {
             Error::AudienceNotWider { .. } => "federation_audience_not_wider",
             Error::WideningReAuthors { .. } => "federation_widening_re_authors",
             Error::WideningMalformed { .. } => "federation_widening_malformed",
+            Error::KeyGrantRefused { .. } => "federation_key_grant_refused",
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

@@ -2168,6 +2168,44 @@ impl PyEngine {
             _ => signer,
         };
 
+        // v44.3.0 (CIRISPersist#848, I66) — resolve the V145 minter sentinel
+        // to this node's own key, exactly as `Engine::with_signer` does: the
+        // first moment the backend and the signer exist together, before any
+        // read. A survivor aborts the boot. CIRISPersist#580 clause 1 — the
+        // signer's public key may be a device round trip: `py.detach`.
+        {
+            let signer_for_key = signer.clone();
+            let key = py.detach(|| {
+                runtime.block_on(crate::signing::federation_key_id_of(&*signer_for_key))
+            });
+            if let Ok(key) = key {
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let pg = pg.clone();
+                        let k = key.clone();
+                        py.detach(|| runtime.block_on(pg.repair_minter_sentinel(&k)))
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "V145 minter sentinel resolution (#848): {e}"
+                                ))
+                            })?;
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let sq = sq.clone();
+                        let k = key.clone();
+                        py.detach(|| runtime.block_on(sq.repair_minter_sentinel(&k)))
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "V145 minter sentinel resolution (#848): {e}"
+                                ))
+                            })?;
+                    }
+                }
+            }
+        }
+
         // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
         // PQC key is configured. Drains hybrid-pending rows authored
         // before the per-write cold-path was wired (or rows where the
@@ -6101,6 +6139,124 @@ impl PyEngine {
                 PyValueError::new_err(format!(
                     "apply_replicated_attestation outcome serialize: {e}"
                 ))
+            })
+        })
+    }
+
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §12–§13) — **admit a
+    /// replicated `KeyGrant` set and project every wrap.** FFI mirror of
+    /// [`Engine::apply_replicated_key_grant`](crate::engine::Engine::apply_replicated_key_grant):
+    /// the apply a replication bridge routes a `key_grant:*` attestation to
+    /// (CIRISEdge#601's pull-on-attestation hook) instead of
+    /// `apply_replicated_attestation`.
+    ///
+    /// `signed_key_grant_json` is the `SignedKeyGrantSet` — the same shape as
+    /// a `SignedAttestation` whose `attestation_type` is `key_grant:epoch:v1`
+    /// or `key_grant:content:v1`. The signer is resolved from THIS node's
+    /// directory; it must be the set's minter (epoch axis, and an active
+    /// member at `asserted_at`) or the blob's author (content axis, when the
+    /// row is present); every wrap must be v2. Returns the
+    /// `KeyGrantAdmission` as JSON: `axis`, the attestation plane's
+    /// `attestation` outcome, `wraps_offered`, `wraps_written` (a union: a
+    /// re-applied set writes 0 and is still admitted). A refusal is a
+    /// `federation_key_grant_refused` error naming its reason.
+    fn apply_replicated_key_grant(
+        &self,
+        py: Python<'_>,
+        signed_key_grant_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let set: crate::federation::key_grant::SignedKeyGrantSet =
+                serde_json::from_str(signed_key_grant_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyGrantSet JSON decode: {e}"))
+                })?;
+            let outcome = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::key_grant::admit_replicated_key_grant(
+                            backend.as_ref(),
+                            set,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::key_grant::admit_replicated_key_grant(
+                            backend.as_ref(),
+                            set,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&outcome).map_err(|e| {
+                PyValueError::new_err(format!("apply_replicated_key_grant outcome serialize: {e}"))
+            })
+        })
+    }
+
+    /// v44.3.0 (CIRISPersist#848, `BLOB_REPLICATION.md` §14) — **emit the
+    /// `KeyGrant` set for an axis on demand.** FFI mirror of
+    /// [`Engine::emit_key_grant`](crate::engine::Engine::emit_key_grant).
+    /// Every write door emits after a fan-out that changed; this is the
+    /// re-emission door — a node that died mid-fan-out, or an operator
+    /// re-seeding a late device, carries the FULL set again (idempotent on
+    /// every receiver, §13). `axis_json` is a `KeyGrantAxis`:
+    /// `{"axis":"epoch","community_key_id":…,"minter_key_id":…,"epoch":N}` or
+    /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`.
+    /// Returns the emitted row's `attestation_id`, or `null` when this node
+    /// holds no wrap for the axis. Needs the LocalSigner (hybrid).
+    fn emit_key_grant(&self, py: Python<'_>, axis_json: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let axis: crate::federation::key_grant::KeyGrantAxis = serde_json::from_str(axis_json)
+                .map_err(|e| PyValueError::new_err(format!("KeyGrantAxis JSON decode: {e}")))?;
+            let local = self.local_signer.clone().ok_or_else(|| {
+                blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                    "emit_key_grant requires a LocalSigner to hybrid-sign the set (§14); this \
+                     engine has none"
+                        .into(),
+                ))
+            })?;
+            py.detach(|| {
+                let emitted = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                                &axis,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                                &axis,
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(federation_err_to_py)?;
+                Ok(emitted.map(|e| e.attestation_id))
             })
         })
     }
@@ -12752,6 +12908,48 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                // #848 (§14) — the key follows the bytes: the set the cascade
+                // reported is emitted through the attestation store, signed by
+                // the LocalSigner (the hybrid signer this engine has), so it
+                // replicates. An engine that cannot sign it says so rather than
+                // leaving members with bytes and no key.
+                if let Some(axis) = r.key_grant_emission.as_ref() {
+                    let local = self.local_signer.clone().ok_or_else(|| {
+                        blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                            "the key_grant set for this write cannot be emitted: this engine has \
+                             no LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the \
+                             bytes are stored and the key cannot follow them"
+                                .into(),
+                        ))
+                    })?;
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            let backend = pg.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            let backend = sq.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                    .map_err(federation_err_to_py)?;
+                }
                 let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "at_rest_sha256": hex::encode(r.at_rest_sha256),
@@ -12783,20 +12981,30 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let st = crate::federation::DekKeyState::parse_str(state).map_err(blob_err_to_py)?;
             let comm = community_key_id.to_owned();
+            let signer = self.signer.clone();
             py.detach(move || {
+                // #848 — key state is per minter; only this node's own epochs
+                // have key state here, so the minter is this node's key.
+                let minter = runtime
+                    .block_on(crate::signing::federation_key_id_of(&*signer))
+                    .map_err(|e| {
+                        blob_err_to_py(crate::federation::BlobError::Backend(format!(
+                            "local derived key id: {e}"
+                        )))
+                    })?;
                 match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            set_key_state(backend.as_ref(), &comm, epoch, st).await
+                            set_key_state(backend.as_ref(), &comm, &minter, epoch, st).await
                         })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            set_key_state(backend.as_ref(), &comm, epoch, st).await
+                            set_key_state(backend.as_ref(), &comm, &minter, epoch, st).await
                         })
                     }
                 }
@@ -12822,14 +13030,27 @@ impl PyEngine {
             use crate::federation::BlobStorage as _;
             let runtime = self.runtime.clone();
             let comm = community_key_id.to_owned();
+            let signer = self.signer.clone();
             py.detach(move || {
+                // #848 — the policy rides this node's own pointer row.
+                let minter = runtime
+                    .block_on(crate::signing::federation_key_id_of(&*signer))
+                    .map_err(|e| {
+                        blob_err_to_py(crate::federation::BlobError::Backend(format!(
+                            "local derived key id: {e}"
+                        )))
+                    })?;
                 match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
                             backend
-                                .community_dek_set_retain_past_epochs(&comm, retain_past_epochs)
+                                .community_dek_set_retain_past_epochs(
+                                    &comm,
+                                    &minter,
+                                    retain_past_epochs,
+                                )
                                 .await
                         })
                     }
@@ -12838,7 +13059,11 @@ impl PyEngine {
                         let backend = sq.clone();
                         runtime.block_on(async move {
                             backend
-                                .community_dek_set_retain_past_epochs(&comm, retain_past_epochs)
+                                .community_dek_set_retain_past_epochs(
+                                    &comm,
+                                    &minter,
+                                    retain_past_epochs,
+                                )
                                 .await
                         })
                     }
@@ -13292,6 +13517,48 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                // #848 (§14) — the key follows the bytes: the set the cascade
+                // reported is emitted through the attestation store, signed by
+                // the LocalSigner (the hybrid signer this engine has), so it
+                // replicates. An engine that cannot sign it says so rather than
+                // leaving members with bytes and no key.
+                if let Some(axis) = r.key_grant_emission.as_ref() {
+                    let local = self.local_signer.clone().ok_or_else(|| {
+                        blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                            "the key_grant set for this write cannot be emitted: this engine has \
+                             no LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the \
+                             bytes are stored and the key cannot follow them"
+                                .into(),
+                        ))
+                    })?;
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            let backend = pg.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            let backend = sq.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                    .map_err(federation_err_to_py)?;
+                }
                 let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "chunk_sha256": hex::encode(r.chunk_sha256),
@@ -13382,6 +13649,48 @@ impl PyEngine {
                     }
                 }
                 .map_err(blob_err_to_py)?;
+                // #848 (§14) — the key follows the bytes: the set the cascade
+                // reported is emitted through the attestation store, signed by
+                // the LocalSigner (the hybrid signer this engine has), so it
+                // replicates. An engine that cannot sign it says so rather than
+                // leaving members with bytes and no key.
+                if let Some(axis) = r.key_grant_emission.as_ref() {
+                    let local = self.local_signer.clone().ok_or_else(|| {
+                        blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                            "the key_grant set for this write cannot be emitted: this engine has \
+                             no LocalSigner to hybrid-sign it (BLOB_REPLICATION.md §14); the \
+                             bytes are stored and the key cannot follow them"
+                                .into(),
+                        ))
+                    })?;
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            let backend = pg.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            let backend = sq.clone();
+                            runtime.block_on(async move {
+                                crate::federation::key_grant::emit_key_grant_axis_with_local_signer(
+                                    backend.as_ref(),
+                                    &local,
+                                    axis,
+                                )
+                                .await
+                            })
+                        }
+                    }
+                    .map_err(federation_err_to_py)?;
+                }
                 let readable_by_nobody = r.readable_by_nobody();
                 Ok(serde_json::json!({
                     "manifest_sha256": hex::encode(r.manifest_sha256),
@@ -31739,6 +32048,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::WideningReAuthors { member, .. } => PyValueError::new_err(
             format!("{kind}: `{member}` — a widening reuses the prior's body"),
         ),
+        // v44.3.0 (CIRISPersist#848) — a refused `KeyGrant` set is
+        // caller-fault content (the wrong signer, a non-v2 wrap, a malformed
+        // envelope, or a carrier row the plane refused): ValueError carrying
+        // the stable reason token, so a bridge can count refusals by cause
+        // without a second copy of the taxonomy.
+        crate::federation::Error::KeyGrantRefused { reason, detail } => {
+            PyValueError::new_err(format!("{kind}: {reason}: {detail}"))
+        }
         crate::federation::Error::WideningMalformed { reason, .. } => {
             PyValueError::new_err(format!("{kind}: {reason}"))
         }
