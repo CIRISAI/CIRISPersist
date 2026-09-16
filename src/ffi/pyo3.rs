@@ -1301,7 +1301,20 @@ impl PyEngine {
     /// §20.5 — the announcing signer with no attester to match: the doors
     /// whose parameter names the AUTHOR (the commons form) announce as this
     /// node. No PQC LocalSigner ⇒ no announcement.
-    fn announcing_signer_any(&self) -> PyResult<Arc<crate::signing::LocalSigner>> {
+    ///
+    /// Review round eight — takes the node identity because EXISTENCE and a
+    /// PQC half are not the whole question. The parameter of the doors that
+    /// reach this helper names the AUTHOR, so the holder claim is signed as
+    /// this LocalSigner's OWN derived id; a hardware-signer engine carrying a
+    /// distinct legacy local key would therefore attribute and sign the claim
+    /// as that unrelated key. Normally only the composed node key is
+    /// registered, so the attestation FK rejects the write; where the local
+    /// key was separately registered, peers record the WRONG node as holder.
+    /// `Engine::announcing_signer` refuses that mismatch and so does this.
+    fn announcing_signer_any(
+        &self,
+        node_key_id: &str,
+    ) -> PyResult<Arc<crate::signing::LocalSigner>> {
         let local = self.local_signer.clone().ok_or_else(|| {
             blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
@@ -1314,17 +1327,9 @@ impl PyEngine {
         // EXISTS, so the check above passes, the cascade persists ciphertext and
         // grants, and `sign_hybrid` fails afterwards, orphaning a blob whose key
         // was never federated. Refuse before any cascade writes.
-        if local.pqc_signer().is_none() {
-            return Err(blob_err_to_py(
-                crate::federation::BlobError::AttestationEmissionFailed(format!(
-                    "hybrid-only: this engine's LocalSigner ({}) has no ML-DSA-65 key, so \
-                     nothing it announces would be admitted at federation tier \
-                     (CC 5.3.2.4.3.1); refused BEFORE any cascade writes, so no blob is \
-                     stored whose key cannot follow it (CIRISPersist#851 §20.5)",
-                    local.derived_key_id()
-                )),
-            ));
-        }
+        // §20.5 — the SAME predicate `Engine::announcing_signer` asks.
+        crate::federation::blobs::check_announcing_signer(&local, node_key_id)
+            .map_err(blob_err_to_py)?;
         Ok(local)
     }
 
@@ -14329,7 +14334,11 @@ impl PyEngine {
             // AUTHOR (the #149 proxy decision, recorded on the row); the holder
             // claim is this node's own, signed by this node (I23), because the
             // ingest gate verifies the row against its own attesting_key_id.
-            let local = self.announcing_signer_any()?;
+            // Review round eight — the node identity comes from the COMPOSED
+            // signer, so the helper can refuse a LocalSigner that is not it.
+            let node_key_id =
+                py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+            let local = self.announcing_signer_any(&node_key_id)?;
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {

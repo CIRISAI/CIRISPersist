@@ -420,6 +420,116 @@ mod tests {
         }
     }
 
+    /// **I89 (review round eight) — ONE predicate, asked by every announcing
+    /// door.** Round six added the identity check to `Engine::announcing_signer`
+    /// and round seven added the PQC check there and in the PyO3 door; the PyO3
+    /// door still had no identity check, so a hardware-signer engine carrying a
+    /// distinct legacy local key would attribute and sign the holder claim as
+    /// that unrelated key, recording the wrong node as holder. The mismatch
+    /// needs real hardware to reproduce through the Python surface, so the
+    /// predicate is extracted and witnessed HERE, where both doors call it.
+    #[test]
+    fn i89_the_announcing_predicate_refuses_a_foreign_or_pqc_less_signer() {
+        use crate::federation::blobs::check_announcing_signer;
+        use crate::signing::LocalSigner;
+
+        let node = crate::federation::tier_ingest::test_support::local_signer("i89-node");
+        let node_key = node.derived_key_id();
+        assert!(
+            node.pqc_signer().is_some(),
+            "I89: precondition — the node signer is hybrid"
+        );
+
+        // The engine's own hybrid signer is admitted.
+        check_announcing_signer(&node, &node_key)
+            .expect("I89: this node's own hybrid LocalSigner announces");
+
+        // A FOREIGN hybrid signer is refused — the round-eight hole. It has a
+        // PQC half, so only the identity clause can reject it.
+        let foreign = crate::federation::tier_ingest::test_support::local_signer("i89-foreign");
+        assert_ne!(
+            foreign.derived_key_id(),
+            node_key,
+            "I89: precondition — the foreign signer is a different identity"
+        );
+        let err = check_announcing_signer(&foreign, &node_key)
+            .expect_err("I89: a LocalSigner that is not this node must not announce");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("is not its node identity") && msg.contains("wrong node as holder"),
+            "I89: the refusal names WHY it matters: {msg}"
+        );
+
+        // A PQC-less signer that IS this node is refused on the other clause,
+        // and the message says the refusal precedes any write.
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x89u8; 32]);
+        let classical = LocalSigner::from_parts(ed, "i89-classical".to_owned(), None, None);
+        let classical_key = classical.derived_key_id();
+        let err = check_announcing_signer(&classical, &classical_key)
+            .expect_err("I89: a PQC-less LocalSigner must not announce");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ML-DSA-65") && msg.contains("BEFORE any cascade writes"),
+            "I89: the refusal names the rule and WHEN it fires: {msg}"
+        );
+
+        // Both clauses at once still refuses, and identity is reported first —
+        // it is the one that would record the wrong node.
+        let err = check_announcing_signer(&classical, &node_key)
+            .expect_err("I89: foreign AND PQC-less refuses");
+        assert!(
+            err.to_string().contains("is not its node identity"),
+            "I89: identity is the clause reported when both fail: {err}"
+        );
+    }
+
+    /// **I89 (b) — every announcing accessor ROUTES to the shared predicate.**
+    /// I89 proves the predicate is right; this proves both doors ask it, which
+    /// is the part that actually failed. `include_str!` rather than a runtime
+    /// read, so the assertion is fixed at compile time against THIS tree and
+    /// cannot drift with the working directory
+    /// (`feedback_from_disk_gates_are_not_hermetic`).
+    #[test]
+    fn i89b_both_announcing_doors_route_to_the_shared_predicate() {
+        const ENGINE_RS: &str = include_str!("../engine.rs");
+        const PYO3_RS: &str = include_str!("../ffi/pyo3.rs");
+
+        // The Rust door.
+        let engine_fn = ENGINE_RS
+            .split("async fn announcing_signer(")
+            .nth(1)
+            .expect("I89 (b): Engine::announcing_signer exists");
+        let engine_body = &engine_fn[..engine_fn.find("\n    }").expect("fn end")];
+        assert!(
+            engine_body.contains("check_announcing_signer("),
+            "I89 (b): Engine::announcing_signer must ask the shared predicate, not its own copy"
+        );
+
+        // The PyO3 door.
+        let py_fn = PYO3_RS
+            .split("fn announcing_signer_any(")
+            .nth(1)
+            .expect("I89 (b): PyEngine::announcing_signer_any exists");
+        let py_body = &py_fn[..py_fn.find("\n    }").expect("fn end")];
+        assert!(
+            py_body.contains("check_announcing_signer("),
+            "I89 (b): the PyO3 door must ask the SAME predicate — it announced through a \
+             foreign key for a whole review round because it had its own checks"
+        );
+
+        // And neither door re-spells a clause locally, which is how they drifted.
+        for (name, body) in [("Engine", engine_body), ("PyEngine", py_body)] {
+            assert!(
+                !body.contains("pqc_signer().is_none()"),
+                "I89 (b): {name}'s door re-spells the PQC clause instead of delegating"
+            );
+            assert!(
+                !body.contains("is not its node identity"),
+                "I89 (b): {name}'s door re-spells the identity clause instead of delegating"
+            );
+        }
+    }
+
     /// **I84 (CC 2.3.2.1, the CC 2.3 audit) — a malformed subject is REFUSED
     /// at the gate, never normalized into acceptance.** The consequence of
     /// admitting one is silent and permanent: a subject nobody can match under

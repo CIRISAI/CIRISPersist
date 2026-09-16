@@ -2816,6 +2816,56 @@ pub struct BlobProvenanceRow {
     pub community_key_id: Option<String>,
 }
 
+/// CIRISPersist#851 §20.5 — **the one predicate every announcing door asks.**
+///
+/// An engine announces with ONE key. Two facts have to hold before any door
+/// stores something it intends to announce, and both were learned the hard way
+/// on PR #852:
+///
+/// 1. **The LocalSigner IS this node.** The doors that reach here take the
+///    AUTHOR as their key parameter (the #149 proxy decision, recorded on the
+///    row); the holder claim is signed as the LocalSigner's own derived id
+///    (I23). So a `from_shared_with_local` engine, or a hardware-signer engine
+///    carrying a distinct legacy local key, would attribute and sign the claim
+///    as an unrelated key — peers record the wrong node as holder, the cascades
+///    record the node as author/minter/stream-owner while the grant set is
+///    signed by the other key so every peer rejects the set, and
+///    `check_stream_head_matches` rejects every seal.
+/// 2. **It has an ML-DSA-65 half.** Existence and identity both admit an
+///    Ed25519-only signer, and the cascade doors mint the epoch DEK, seal and
+///    mint grants BEFORE the claim is signed — so without this the engine
+///    stranded key material and ciphertext for a blob whose grant set could
+///    never be emitted, and only then returned an error.
+///
+/// It lives here, as one function, because the divergence is the recurring
+/// defect: the check was added to `Engine::announcing_signer` in one review
+/// round and the PyO3 door kept announcing through a foreign key until the
+/// next. Two doors asking one question must not be two implementations.
+pub fn check_announcing_signer(
+    local: &crate::signing::LocalSigner,
+    node_key_id: &str,
+) -> Result<(), BlobError> {
+    let derived = local.derived_key_id();
+    if derived != node_key_id {
+        return Err(BlobError::AttestationEmissionFailed(format!(
+            "hybrid-only: this engine's LocalSigner ({derived}) is not its node identity \
+             ({node_key_id}); the holder claim is signed as the LocalSigner's OWN derived id, \
+             so announcing through a foreign key would record the wrong node as holder. An \
+             announcing engine signs its claims, its key grants and its cascades with ONE key \
+             (CIRISPersist#851 §20.5)"
+        )));
+    }
+    if local.pqc_signer().is_none() {
+        return Err(BlobError::AttestationEmissionFailed(format!(
+            "hybrid-only: this engine's LocalSigner ({derived}) has no ML-DSA-65 key, so \
+             nothing it announces would be admitted at federation tier (CC 5.3.2.4.3.1); \
+             refused BEFORE any cascade writes, so no blob is stored whose key cannot follow \
+             it (CIRISPersist#851 §20.5)"
+        )));
+    }
+    Ok(())
+}
+
 /// #846 (`BLOB_REPLICATION.md` §6.1) — sign the `holds_bytes` claim for
 /// `sha256`, exactly as [`BlobStorage::put_blob_signing_at`] does: the
 /// v31-shaped envelope, the produce-side canonicalizer, the signer's DERIVED

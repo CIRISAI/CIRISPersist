@@ -5399,35 +5399,11 @@ impl Engine {
         let node = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("announcing signer: node key: {e}"))
         })?;
-        if local.derived_key_id() != node {
-            return Err(crate::federation::BlobError::AttestationEmissionFailed(
-                format!(
-                "hybrid-only: this engine's LocalSigner ({}) is not its node identity ({node}); \
-                 an announcing engine signs its claims, its key grants and its cascades with ONE \
-                 key (CIRISPersist#851 §20.5)",
-                local.derived_key_id()
-            ),
-            ));
-        }
-        // PR #852 review round seven — the preflight must ask the question the
-        // cascade will ask LATER. Existence and identity are not enough: an
-        // Ed25519-only LocalSigner passes both, `put_blob_scoped` then persists
-        // ciphertext and mints grants, and `sign_hybrid` fails afterwards inside
-        // the announcement or the KeyGrant emission — leaving an orphaned blob
-        // whose key was never federated, which is the exact state §20.5 exists to
-        // prevent. `sign_hybrid` returns `PqcNotConfigured` iff `pqc_signer` is
-        // absent, so this is the same predicate, asked before anything is stored.
-        if local.pqc_signer().is_none() {
-            return Err(crate::federation::BlobError::AttestationEmissionFailed(
-                format!(
-                    "hybrid-only: this engine's LocalSigner ({}) has no ML-DSA-65 key, so nothing \
-                 it announces would be admitted at federation tier (CC 5.3.2.4.3.1); refused \
-                 BEFORE any cascade writes, so no blob is stored whose key cannot follow it \
-                 (CIRISPersist#851 §20.5)",
-                    local.derived_key_id()
-                ),
-            ));
-        }
+        // §20.5 — ONE predicate, asked by every announcing door (Rust and
+        // PyO3 alike). It lives in `federation::blobs` because keeping it here
+        // is what let the PyO3 door keep announcing through a foreign key for
+        // a whole review round after this one was fixed.
+        crate::federation::blobs::check_announcing_signer(local, &node)?;
         Ok(local)
     }
 
