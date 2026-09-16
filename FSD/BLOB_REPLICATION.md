@@ -803,6 +803,17 @@ its signer through one accessor that refuses the mismatch before storing
 anything. A `LocalOnly` adopt announces nothing and needs no such signer
 (I81, I83, I87).
 
+**The preflight asks what the cascade will ask.** Existence and identity are
+not the whole question. An Ed25519-only `LocalSigner` satisfies both, and the
+cascade doors mint the epoch DEK, seal the bytes and mint grants BEFORE the
+claim is signed — so the engine stranded key material and ciphertext for a
+blob whose grant set could never be emitted, and only then returned an error.
+`sign_hybrid` fails iff the ML-DSA-65 half is absent, so the accessor asks
+that same question first. Note the witness shape this forced: a deeper gate
+(`sign_holds_bytes_claim`) also refuses a PQC-less signer, so the ERROR alone
+cannot distinguish a preflight from a late failure — only the absence of the
+minted DEK can, and that is what I88 asserts.
+
 ### 20.4 Invariants — three planes, delivered, never copied
 
 | # | invariant | falsified by | gate |
@@ -820,3 +831,4 @@ anything. A `LocalOnly` adopt announces nothing and needs no such signer
 | I85 | A `withdraws` naming a `key_grant:*` row is refused, not admitted inert — (b) including the deferred branch, where the target has not arrived and the row declares `references_attestation_type: key_grant:*`. | a revocation every reader ignores and its emitter believes took effect | behavioural, both backends |
 | I86 | A proxy write records the peer as the row's `author_key_id` while the node announces the holder claim as itself, so `serve_blob_to_peer` still classifies proxy content and the stop-tier proxy-serve refusal still applies. | the caller-supplied author lost to the attester, proxy content served as locally authored | behavioural, both backends |
 | I87 | `AdoptDisposition::LocalOnly` adopts without a LocalSigner; only `Announce` requires one. | a hardware or classical engine unable to hold received bytes it never announces | behavioural, both backends |
+| I88 | The announcing preflight refuses a LocalSigner with no ML-DSA-65 half BEFORE the cascade writes: after the refusal the epoch DEK the cascade mints first is absent. | an orphaned blob whose key was never federated — the cascade sealed and minted, then `sign_hybrid` failed | behavioural, both backends |

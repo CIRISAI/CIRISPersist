@@ -180,6 +180,31 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
 - Four more mutations red (author untied, LocalOnly re-gated, deferred
   refusal removed, ingest gate removed).
 
+### Review round seven — the preflight, and the digest alphabet
+- **The announcing preflight now asks what the cascade will ask.** Checking
+  that a `LocalSigner` exists and is this node's identity admits an
+  Ed25519-only signer. `put_blob_scoped` then minted the epoch DEK, sealed the
+  bytes and minted grants, and only then failed inside `sign_hybrid` — an
+  orphaned blob whose key was never federated, the exact state §20.5 exists to
+  prevent. `sign_hybrid` fails iff the ML-DSA-65 half is absent, so the
+  preflight asks that same question before anything is stored. The Python door
+  had the identical hole and gets the identical check. I88 witnesses the
+  ORPHAN, not just the error: with the check removed the epoch DEK is present
+  after the refusal, so the witness distinguishes a preflight from a late
+  failure — which the error message alone cannot, because a deeper gate also
+  refuses a PQC-less signer.
+- **A `canonical:` digest is lowercase on BOTH gates.** `is_ascii_hexdigit()`
+  accepts `A`–`F`, and `SubjectGate::Ingest` deliberately skips the general
+  uppercase clause for the cirisnode corpus, so a peer could persist
+  `canonical:sha256:<UPPERCASE>` while the branch's own message promised
+  lowercase. Canonical binding and withdrawal authority compare by exact
+  string equality, so that spelling never matches the lowercase binding and
+  the subject is unrevocable by its canonical identity — CC 2.3.2.1's named
+  harm, arriving through the ingest door this cut had just opened. The digest
+  alphabet is spelled out in the digest clause itself rather than borrowed
+  from the general clause. The legacy exception covers non-canonical subjects,
+  none of which carry this prefix. I84 (c).
+
 ### CC 2.3 audit (operator) — two gates closed
 - **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
   a subject that is empty, carries any whitespace, or is a `canonical:` id
