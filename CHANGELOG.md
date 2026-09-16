@@ -243,6 +243,27 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   hash-family clause was a surviving mutant. An operator reading a rejected
   subject needs to be told which part of the spelling is wrong.
 
+### Review round ten — the accessor was shared; the doors still were not
+- **Two PyO3 doors skipped the preflight entirely.** `put_blob_scoped` and
+  `seal_stream_scoped` each took the LocalSigner with their own existence-only
+  check — copied from the accessor, message and all. With an Ed25519-only
+  signer the cascade minted the epoch DEK, sealed the bytes and minted grants,
+  and only then failed in `sign_hybrid`, so Python received an error after
+  storage had already been mutated. Both now take the accessor.
+- **The sweep found four more.** `emit_key_grant` and `emit_pending_key_grants`
+  sign a set peers accept only when signer == minter; `publish_self_occurrence`
+  never carried I82's rule on the Python side at all, so it could publish an
+  occurrence for a key this engine is not; and the internal
+  `emit_key_grant_axis_async` helper asked existence only. All six sites ask
+  the one predicate now.
+- **I89 (c) is the gate that would have caught this.** I89 (b) asserted the two
+  ACCESSORS delegate, which was true and insufficient — a door can skip the
+  accessor. I89 (c) asserts coverage instead: every occurrence of the
+  take-the-LocalSigner idiom in the PyO3 surface must have the preflight within
+  the window that follows it, before anything can be stored. It also asserts
+  the idiom is still FOUND at all, so a rename cannot silently stop the gate
+  looking.
+
 ### CC 2.3 audit (operator) — two gates closed
 - **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
   a subject that is empty, carries any whitespace, or is a `canonical:` id

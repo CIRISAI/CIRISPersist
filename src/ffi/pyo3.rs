@@ -1358,6 +1358,13 @@ impl PyEngine {
                     .into(),
             ))
         })?;
+        // Review round ten — the doors that call this now preflight, so a bad
+        // signer cannot reach here; asking anyway costs nothing and keeps the
+        // helper honest on its own, which is what the coverage gate checks.
+        // Already async, so the node key is awaited rather than detached.
+        let node_key_id = self.local_derived_key_id_async().await?;
+        crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+            .map_err(blob_err_to_py)?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(pg) => {
@@ -6379,6 +6386,14 @@ impl PyEngine {
                         .into(),
                 ))
             })?;
+            // Review round ten — peers enforce signer == minter, so a set signed
+            // by a foreign or PQC-less key is one every peer rejects.
+            {
+                let node_key_id =
+                    py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+                crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+                    .map_err(blob_err_to_py)?;
+            }
             py.detach(|| {
                 let emitted = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -6431,6 +6446,13 @@ impl PyEngine {
                         .into(),
                 ))
             })?;
+            // Review round ten — same predicate: peers enforce signer == minter.
+            {
+                let node_key_id =
+                    py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+                crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+                    .map_err(blob_err_to_py)?;
+            }
             py.detach(|| {
                 let me = runtime.block_on(self.local_derived_key_id_async())?;
                 let axes = match &self.backend {
@@ -6512,6 +6534,17 @@ impl PyEngine {
                      (§20.3); this engine has none",
                 )
             })?;
+            // Review round ten — I82's rule, which this door never carried: a
+            // node publishes ITS OWN occurrence. A foreign LocalSigner would
+            // publish an occurrence for a key this engine is not, and a
+            // PQC-less one an occurrence the gate refuses for its missing
+            // ML-DSA-65 half.
+            {
+                let node_key_id =
+                    py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+                crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+                    .map_err(blob_err_to_py)?;
+            }
             let (identity, class) = (identity_key_id.to_owned(), device_class.to_owned());
             py.detach(|| {
                 let signed = match &self.backend {
@@ -13164,13 +13197,14 @@ impl PyEngine {
             // CIRISPersist#851 §20.5 — hybrid/PQC only, no legacy fallback: the
             // door announces with this node's PQC LocalSigner or refuses; the
             // composed classical signer can never sign a federation-tier claim.
-            let local = self.local_signer.clone().ok_or_else(|| {
-                blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                    "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
-                     federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
-                        .into(),
-                ))
-            })?;
+            // Review round ten — this door ANNOUNCES, so it takes the one
+            // preflight, not a copy of the absence check. Existence alone let an
+            // Ed25519-only signer through: the cascade minted the epoch DEK,
+            // sealed and minted grants, and only then failed in `sign_hybrid`,
+            // leaving Python an error after storage had already been mutated.
+            let node_key_id =
+                py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+            let local = self.announcing_signer_any(&node_key_id)?;
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -13842,13 +13876,14 @@ impl PyEngine {
             // CIRISPersist#851 §20.5 — hybrid/PQC only, no legacy fallback: the
             // door announces with this node's PQC LocalSigner or refuses; the
             // composed classical signer can never sign a federation-tier claim.
-            let local = self.local_signer.clone().ok_or_else(|| {
-                blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
-                    "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
-                     federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
-                        .into(),
-                ))
-            })?;
+            // Review round ten — this door ANNOUNCES, so it takes the one
+            // preflight, not a copy of the absence check. Existence alone let an
+            // Ed25519-only signer through: the cascade minted the epoch DEK,
+            // sealed and minted grants, and only then failed in `sign_hybrid`,
+            // leaving Python an error after storage had already been mutated.
+            let node_key_id =
+                py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+            let local = self.announcing_signer_any(&node_key_id)?;
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]

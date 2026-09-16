@@ -528,6 +528,39 @@ mod tests {
                 "I89 (b): {name}'s door re-spells the identity clause instead of delegating"
             );
         }
+
+        // I89 (c), review round ten — the accessors delegating is NOT enough,
+        // because a door can skip the accessor entirely. `put_blob_scoped` and
+        // `seal_stream_scoped` on the PyO3 surface each took the LocalSigner
+        // with their own existence-only check — copied, message and all, from
+        // the accessor — so an Ed25519-only signer reached the cascade, which
+        // minted the epoch DEK and sealed before `sign_hybrid` failed.
+        //
+        // Every site that reaches for `self.local_signer` in order to SIGN must
+        // be covered by the preflight. Asserted structurally: each occurrence
+        // of the take-the-signer idiom must have the preflight within the
+        // window that follows it, before anything can be stored.
+        const IDIOM: &str = "let local = self.local_signer.clone().ok_or_else(";
+        let mut sites = 0usize;
+        for (off, _) in PYO3_RS.match_indices(IDIOM) {
+            sites += 1;
+            let window_end = (off + 2600).min(PYO3_RS.len());
+            let window = &PYO3_RS[off..window_end];
+            assert!(
+                window.contains("check_announcing_signer(")
+                    || window.contains("announcing_signer_any("),
+                "I89 (c): a PyO3 door takes the LocalSigner to sign without the shared \
+                 preflight, near byte {off}. Existence is not the question — identity and \
+                 the ML-DSA-65 half are, and asking them AFTER the cascade writes is how a \
+                 blob is stranded without its key."
+            );
+        }
+        assert!(
+            sites >= 4,
+            "I89 (c): expected several take-the-signer sites in the PyO3 surface, found \
+             {sites} — if the idiom was renamed this gate stopped looking, which is worse \
+             than a failure"
+        );
     }
 
     /// **I84 (CC 2.3.2.1, the CC 2.3 audit) — a malformed subject is REFUSED
