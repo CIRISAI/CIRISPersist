@@ -4808,6 +4808,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // traffic writable simply by claiming a genesis id on a row this gate is
         // about to refuse. See the memory backend for the full rationale;
         // backend-symmetric across memory / sqlite / postgres.
+        // CC 2.3.2.1 (PR #852 review) — the subject gate runs on EVERY ingest,
+        // not only the local producer: a remote signer can hybrid-sign a row
+        // carrying a malformed subject, and replication would store the same
+        // unmatchable revocation authority the emit path refuses.
+        crate::federation::validate_subject_key_ids_at(
+            &row.subject_key_ids,
+            crate::federation::SubjectGate::Ingest,
+        )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
         if !row.attesting_key_id.is_empty() {
             // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
@@ -12957,6 +12965,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         attestation: crate::federation::PutBlobAttestation,
     ) -> Result<(), crate::federation::BlobError> {
         self.put_blob_with_scope(
+            None,
             sha256,
             body,
             media_type,
@@ -12971,6 +12980,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
 
     async fn put_blob_with_scope(
         &self,
+        author_key_id: Option<&str>,
         sha256: &[u8; 32],
         body: crate::federation::BlobBody,
         media_type: Option<&str>,
@@ -13089,6 +13099,12 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        // §20.5 (PR #852 review) — the ROW's author is the supplied one (a
+        // proxy write's peer); absent that, the claim's attester. The claim
+        // itself is always the holder's (this node, I23).
+        let row_author = author_key_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| attestation.attesting_key_id.clone());
         let tx = client
             .transaction()
             .await
@@ -13114,7 +13130,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     &media_type,
                     &scope,
                     &tier,
-                    &attestation.attesting_key_id,
+                    &row_author,
                 ],
             )
             .await
@@ -13172,7 +13188,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             tx.execute(
                 "UPDATE cirislens.federation_blobs SET author_key_id = $2 \
                   WHERE sha256 = $1 AND author_key_id IS NULL",
-                &[&sha_vec, &attestation.attesting_key_id],
+                &[&sha_vec, &row_author],
             )
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("announce author: {e}")))?;
@@ -36901,7 +36917,10 @@ mod tests {
 
         let k = format!("pg-cb-K-{}", uuid_like());
         let prod = format!("pg-cb-prod-{}", uuid_like());
-        let canon = format!("canonical:sha256:{}-{}", "c".repeat(32), uuid_like());
+        let canon = format!(
+            "canonical:sha256:{:0<64}",
+            format!("c{}", uuid_like().replace('-', ""))
+        );
         for key in [&k, &prod] {
             backend
                 .put_public_key(crate::federation::SignedKeyRecord {

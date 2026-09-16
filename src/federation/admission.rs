@@ -7673,7 +7673,28 @@ pub async fn check_withdraws_admission(
         return Ok(None);
     };
     let Some(target) = directory.get_attestation(target_id).await? else {
-        // Target not locally present — defer authority to read side.
+        // Target not locally present — defer authority to read side. Except
+        // for the one verdict that does not depend on the target's contents
+        // (PR #852 review): a withdraws whose OWN envelope declares a
+        // `key_grant:*` target is refused now, because out-of-order delivery
+        // would otherwise leave it admitted-and-inert forever — nothing
+        // rechecks a deferred row when its target lands. An emitter that
+        // omits `references_attestation_type` still defers; persist's own
+        // emitter always states it.
+        if row
+            .attestation_envelope
+            .get("references_attestation_type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| {
+                t.starts_with(crate::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+            })
+        {
+            return Err(Error::InvalidArgument(
+                "withdraws declares a key_grant target — a shared key cannot be retroactively \
+                 un-shared (CC 3); rotate the epoch instead (BLOB_REPLICATION.md §15)"
+                    .into(),
+            ));
+        }
         return Ok(None);
     };
     // CC 3 (CIRISPersist#851 / the CC 2.3 audit) — a `withdraws` naming a

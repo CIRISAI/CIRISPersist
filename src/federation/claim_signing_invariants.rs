@@ -384,5 +384,235 @@ mod tests {
             msg.contains("cannot be retroactively un-shared") && msg.contains("rotate"),
             "I85: the refusal says why and names the remedy: {msg}"
         );
+        // (b) PR #852 review — the DEFERRED case: the same withdraws arriving
+        // BEFORE its target. Nothing rechecks a deferred row when its target
+        // lands, so the verdict that needs no target — the declared type —
+        // is given now.
+        let absent = format!("kg-absent-{run}");
+        let mut deferred = ts::bare_attestation(
+            &format!("w2-{run}"),
+            &minter,
+            &minter,
+            &serde_json::json!({
+                "id": format!("w2-{run}"),
+                "kind": "withdraws",
+                "references_attestation_id": absent,
+                "references_attestation_type":
+                    crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE,
+            }),
+        );
+        deferred.attestation_type =
+            crate::federation::types::attestation_type::WITHDRAWS.to_owned();
+        let deferred = ts::seal_row(&minter, deferred);
+        let err = crate::federation::admission::check_withdraws_admission(&backend, &deferred)
+            .await
+            .expect_err("I85 (b): a deferred withdraws declaring a key_grant target is refused");
+        assert!(
+            err.to_string()
+                .contains("cannot be retroactively un-shared"),
+            "I85 (b): {err}"
+        );
+    }
+
+    /// **I86 (PR #852 review) — the row records the AUTHOR, the claim the
+    /// HOLDER.** A proxy write (bytes whose author is a peer) stores the peer
+    /// as `author_key_id` and announces under this node; losing the author
+    /// made proxy content look locally authored and slipped the stop-tier
+    /// proxy-serve refusal.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i86_a_proxy_write_records_the_peer_author_and_announces_as_the_node_sqlite() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::USER;
+        use crate::federation::{BlobBody, BlobStorage};
+        use crate::store::Backend as _;
+        use std::sync::Arc;
+        let backend = Arc::new(
+            crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap(),
+        );
+        backend.run_migrations().await.unwrap();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let local = ts::local_signer(&format!("i86-node-{run}"));
+        let node = local.derived_key_id();
+        let peer = format!("i86-peer-{run}");
+        for k in [&node, &peer] {
+            ts::register_hybrid_key_as(backend.as_ref(), k, k, USER).await;
+        }
+        let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+        );
+        let engine = crate::Engine::from_shared_with_local(
+            crate::engine::BackendDispatch::Sqlite(backend.clone()),
+            signer,
+            Some(local.clone()),
+        );
+        let body = b"i86 proxy bytes".to_vec();
+        let sha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&body).into()
+        };
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(body),
+                None,
+                &peer,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("I86: a proxy write below the stop tier succeeds");
+        // The ROW's author is the peer — what `serve_blob_to_peer` reads to
+        // decide proxy-ness.
+        let prov = backend
+            .blob_provenance(&sha)
+            .await
+            .unwrap()
+            .expect("I86: the row exists");
+        assert_eq!(
+            prov.author_key_id.as_deref(),
+            Some(peer.as_str()),
+            "I86: the row records the peer as author"
+        );
+        // The CLAIM is this node's, and it is hybrid.
+        assert_eq!(
+            backend.list_holders(&sha).await.unwrap(),
+            vec![node.clone()],
+            "I86: the holder claim is this node's (I23)"
+        );
+        let claim = backend
+            .list_attestations_by(&node)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| {
+                a.attestation_type
+                    .starts_with(crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+            })
+            .expect("I86: the claim is stored under the node");
+        assert!(claim.scrub_signature_pqc.is_some(), "I86: hybrid claim");
+    }
+
+    /// **I87 (PR #852 review) — a LocalOnly adopt needs no announcing signer.**
+    /// A hardware/classical engine may hold received bytes; only `Announce`
+    /// requires the PQC LocalSigner.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i87_local_only_adoption_works_without_a_local_signer_sqlite() {
+        use crate::federation::at_rest_cascade::{fresh_dek, seal};
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::{AdoptDisposition, BlobProvenance, BlobStorage};
+        use crate::store::Backend as _;
+        use std::sync::Arc;
+        let backend = Arc::new(
+            crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap(),
+        );
+        backend.run_migrations().await.unwrap();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        // The node, its community and the peer author — seeded by the same
+        // two-node helpers every §20 witness uses, so the node is a member
+        // (the operator rule: a node holds only what it is party to, #846).
+        use crate::federation::key_grant_invariants::two_node::{
+            node_as, seed_community_everywhere,
+        };
+        let n = node_as(
+            backend.as_ref(),
+            &format!("i87-node-{run}"),
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let node = n.key.clone();
+        let author = format!("i87-author-{run}");
+        let comm = format!("i87-comm-{run}");
+        seed_community_everywhere(&[&n], &comm, &[(&author, Some(&n))]).await;
+        let local = ts::local_signer(&format!("i87-node-{run}"));
+        assert_eq!(local.derived_key_id(), node);
+        let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+        );
+        // No LocalSigner at all — the documented hardware/classical shape.
+        let engine = crate::Engine::from_shared(
+            crate::engine::BackendDispatch::Sqlite(backend.clone()),
+            signer,
+        );
+        let envelope = seal(&fresh_dek().unwrap(), b"i87 received bytes", None)
+            .unwrap()
+            .to_bytes();
+        let sha = engine
+            .adopt_sealed_blob(
+                &envelope,
+                BlobProvenance {
+                    author_key_id: author.clone(),
+                    cohort_scope: COMMUNITY.into(),
+                    community_key_id: Some(comm.clone()),
+                    epoch: Some(0),
+                    tier: CryptoTier::CommunityDek,
+                },
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I87: LocalOnly adoption emits no claim and needs no LocalSigner");
+        assert!(backend.get_blob(&sha.sha256).await.unwrap().is_some());
+        assert!(
+            backend.list_holders(&sha.sha256).await.unwrap().is_empty(),
+            "I87: LocalOnly announces nothing"
+        );
+    }
+
+    /// **I84 (b) — the subject gate runs on INGEST, not only on emit.** A
+    /// remote signer can hybrid-sign a row carrying a malformed subject; the
+    /// backend's own admission must refuse it, or replication stores the same
+    /// unmatchable revocation authority the emit path rejects.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i84b_a_replicated_row_with_a_malformed_subject_is_refused_sqlite() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type::USER;
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let backend = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let signer = format!("i84b-signer-{run}");
+        ts::register_identity_key(&backend, &signer, USER).await;
+        let id = format!("i84b-{run}");
+        let mut row = ts::bare_attestation(
+            &id,
+            &signer,
+            &signer,
+            &serde_json::json!({ "id": id, "kind": "scores" }),
+        );
+        row.attestation_type = crate::federation::types::attestation_type::SCORES.to_owned();
+        // The malformed subject a remote signer can perfectly well sign.
+        row.subject_key_ids = vec![format!("canonical:sha256:{}", "a".repeat(63))];
+        let row = ts::seal_row(&signer, row);
+        let err = backend
+            .apply_replicated_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect_err("I84 (b): the ingest gate refuses a malformed subject");
+        assert!(
+            err.to_string().contains("CC 2.3.2.1"),
+            "I84 (b): the refusal cites the clause: {err}"
+        );
+        // …and the ONE clause ingest does not carry, named rather than
+        // silent: a raw base64 pubkey subject (uppercase) still admits,
+        // because cirisnode's moderation corpus predates the rule. The emit
+        // gate refuses it, so no NEW row can carry one.
+        let b64_subject = "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU=".to_owned();
+        crate::federation::validate_subject_key_ids_at(
+            std::slice::from_ref(&b64_subject),
+            crate::federation::SubjectGate::Ingest,
+        )
+        .expect("I84 (b): ingest admits the pre-existing uppercase corpus");
+        crate::federation::validate_subject_key_ids(std::slice::from_ref(&b64_subject))
+            .expect_err("I84 (b): emit refuses it, so no new row carries one");
     }
 }

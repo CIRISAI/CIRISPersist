@@ -558,18 +558,37 @@ fn assert_change_envelope_matches(
 /// caller being gated to match. Found while verifying CIRISServer#356 against
 /// the feature matrix; unrelated to that work, and fixed rather than deferred
 /// because a leg that cannot compile is a leg that proves nothing.
-pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
+pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
+    validate_subject_key_ids_at(subject_key_ids, SubjectGate::Emit)
+}
+
+/// CC 2.3.2.1 (PR #852 review) — which subject vectors a gate refuses.
+///
+/// `Emit` is the full rule, applied to rows THIS node produces. `Ingest` is
+/// applied to replicated rows and drops one clause — uppercase — because a
+/// live corpus predates the rule: `cirisnode`'s moderation and takedown
+/// contributions carry the subject's raw base64 Ed25519 pubkey (uppercase by
+/// construction) and reach the store through `put_contribution`, which never
+/// ran this validator. Refusing those at ingest would break a child-safety
+/// surface on a patch release, so the deferral is NAMED here rather than
+/// silently normalized, and every other vector — empty, whitespace, a
+/// malformed `canonical:` id — is refused on both paths. Closing the gap
+/// means giving cirisnode's subjects a canonical id; that is a data change,
+/// filed separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectGate {
+    /// Rows this node produces: the full CC 2.3.2.1 rule.
+    Emit,
+    /// Replicated rows: every vector except the pre-existing uppercase corpus.
+    Ingest,
+}
+
+/// CC 2.3.2.1 — the subject gate at `gate`. See [`SubjectGate`].
+pub fn validate_subject_key_ids_at(
+    subject_key_ids: &[String],
+    gate: SubjectGate,
+) -> Result<(), Error> {
     for sid in subject_key_ids {
-        // CC 2.3.2.1 (the CC 2.3 audit) — each malformed subject "MUST be
-        // refused at the gate, never normalized into acceptance". The
-        // consequence of admitting one is silent and permanent: a subject
-        // nobody can ever match under withdraws rules 2/3, so the row is
-        // unrevocable and no error is raised anywhere — the fail-silent
-        // class. Refused here: empty, uppercase, ANY whitespace (leading,
-        // trailing or internal), and a `canonical:` id that is not exactly
-        // `canonical:sha256:<64 lowercase hex>` (a wrong hash family or a
-        // short digest can never be produced by the canonicalizer, so it can
-        // never be matched either).
         let malformed = |why: &str| {
             Err(Error::InvalidArgument(format!(
                 "subject_key_ids element must be a canonical lowercase key_id \
@@ -579,7 +598,7 @@ pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(),
         if sid.is_empty() {
             return malformed("empty");
         }
-        if sid.bytes().any(|b| b.is_ascii_uppercase()) {
+        if gate == SubjectGate::Emit && sid.bytes().any(|b| b.is_ascii_uppercase()) {
             return malformed("uppercase");
         }
         if sid.chars().any(char::is_whitespace) {

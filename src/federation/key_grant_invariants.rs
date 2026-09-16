@@ -232,7 +232,7 @@ pub mod two_node {
         let ctx = hold_ctx(false, &to.key, family);
         let out = adopt_sealed_blob(
             to.backend,
-            &to.signer,
+            Some(&*to.signer),
             &ctx,
             &bytes,
             &BlobProvenance {

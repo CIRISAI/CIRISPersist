@@ -14313,7 +14313,6 @@ impl PyEngine {
             // claim is this node's own, signed by this node (I23), because the
             // ingest gate verifies the row against its own attesting_key_id.
             let local = self.announcing_signer_any()?;
-            let holder = local.derived_key_id();
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {
@@ -14334,7 +14333,7 @@ impl PyEngine {
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
-                                &holder,
+                                &attesting_key_id_owned,
                                 &local,
                                 now,
                                 attestation_id,
@@ -14360,7 +14359,7 @@ impl PyEngine {
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
-                                &holder,
+                                &attesting_key_id_owned,
                                 &local,
                                 now,
                                 attestation_id,

@@ -1151,8 +1151,10 @@ pub trait BlobStorage: Send + Sync {
     /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
     /// with the row's `cohort_scope` and resolved `crypto_tier` recorded.
     /// `put_blob` itself is the commons form (`federation`, plaintext).
+    #[allow(clippy::too_many_arguments)]
     fn put_blob_with_scope(
         &self,
+        author_key_id: Option<&str>,
         sha256: &[u8; 32],
         body: BlobBody,
         media_type: Option<&str>,
@@ -1708,7 +1710,7 @@ pub trait BlobStorage: Send + Sync {
         sha256: &'s [u8; 32],
         body: BlobBody,
         media_type: Option<&'s str>,
-        attesting_key_id: &'s str,
+        author_key_id: &'s str,
         local: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
@@ -1729,10 +1731,26 @@ pub trait BlobStorage: Send + Sync {
             }
             // #846 — the claim is signed by the one helper the adopt door
             // also uses, so what a holder claim IS has one spelling.
-            let att = sign_holds_bytes_claim(local, sha256, attesting_key_id, attestation_id, now)
-                .await?;
-            self.put_blob_with_scope(sha256, body, media_type, att, cohort_scope, floor)
-                .await
+            //
+            // §20.5 (PR #852 review) — the claim is the HOLDER's: this node,
+            // signed by this node (I23), because the ingest gate verifies the
+            // row against its own `attesting_key_id`. The ROW separately
+            // records the AUTHOR, which for a proxy write is the peer —
+            // losing it made proxy content look locally authored and slipped
+            // the stop-tier proxy-serve refusal.
+            let att =
+                sign_holds_bytes_claim(local, sha256, &local.derived_key_id(), attestation_id, now)
+                    .await?;
+            self.put_blob_with_scope(
+                Some(author_key_id),
+                sha256,
+                body,
+                media_type,
+                att,
+                cohort_scope,
+                floor,
+            )
+            .await
         }
     }
 

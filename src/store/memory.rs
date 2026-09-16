@@ -2799,6 +2799,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // means only a seated accord holder's row ever reaches that budget.
         //
         // Backend-symmetric across memory / sqlite / postgres.
+        // CC 2.3.2.1 (PR #852 review) — the subject gate runs on EVERY ingest,
+        // not only the local producer: a remote signer can hybrid-sign a row
+        // carrying a malformed subject, and replication would store the same
+        // unmatchable revocation authority the emit path refuses.
+        crate::federation::validate_subject_key_ids_at(
+            &row.subject_key_ids,
+            crate::federation::SubjectGate::Ingest,
+        )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
 
         if !row.attesting_key_id.is_empty() {
@@ -18088,7 +18096,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let canonical_h = "canonical:sha256:deadbeefcafe";
+        let canonical_h =
+            "canonical:sha256:deadbeefcafe0000000000000000000000000000000000000000000000000000";
 
         // Target T: a producer `scores` naming the canonical hash H as a
         // consent subject. (subject_key_ids takes canonical-hash entries —

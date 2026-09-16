@@ -4223,6 +4223,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // traffic writable simply by claiming a genesis id on a row this gate is
         // about to refuse. See the memory backend for the full rationale;
         // backend-symmetric across memory / sqlite / postgres.
+        // CC 2.3.2.1 (PR #852 review) — the subject gate runs on EVERY ingest,
+        // not only the local producer: a remote signer can hybrid-sign a row
+        // carrying a malformed subject, and replication would store the same
+        // unmatchable revocation authority the emit path refuses.
+        crate::federation::validate_subject_key_ids_at(
+            &row.subject_key_ids,
+            crate::federation::SubjectGate::Ingest,
+        )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
         if !row.attesting_key_id.is_empty() {
             // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
@@ -12383,6 +12391,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
     ) -> Result<(), crate::federation::BlobError> {
         // The commons form (§11.1): records `federation`.
         self.put_blob_with_scope(
+            None,
             sha256,
             body,
             media_type,
@@ -12397,6 +12406,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
 
     async fn put_blob_with_scope(
         &self,
+        author_key_id: Option<&str>,
         sha256: &[u8; 32],
         body: crate::federation::BlobBody,
         media_type: Option<&str>,
@@ -12520,6 +12530,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let cohort_scope_owned = attestation_row.cohort_scope.clone();
         let attestation_id_owned = attestation.attestation_id.clone();
         let attesting_key_id_owned = attestation.attesting_key_id.clone();
+        // §20.5 (PR #852 review) — the ROW's author is the supplied one (a
+        // proxy write's peer); absent that, the claim's attester, which for a
+        // local write is this node. The claim is always the holder's.
+        let row_author = author_key_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| attestation.attesting_key_id.clone());
         let scrub_signature_classical_owned = attestation.scrub_signature_classical.clone();
         let scrub_signature_pqc_owned = attestation.scrub_signature_pqc.clone();
         let scrub_key_id_owned = attestation.scrub_key_id.clone();
@@ -12562,7 +12578,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 tx.execute(
                     "UPDATE federation_blobs SET author_key_id = ?2 \
                       WHERE sha256 = ?1 AND author_key_id IS NULL",
-                    rusqlite::params![sha_vec, attesting_key_id_owned],
+                    rusqlite::params![sha_vec, row_author],
                 )?;
             } else {
                 // #846 (§5) — the row records its AUTHOR: the attesting key of
@@ -12584,7 +12600,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                         now_iso,
                         scope,
                         tier,
-                        attesting_key_id_owned,
+                        row_author,
                     ],
                 )?;
             }
@@ -27112,7 +27128,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let k = format!("K-{}", uuid::Uuid::new_v4());
         let prod = format!("prod-{}", uuid::Uuid::new_v4());
-        let canon = format!("canonical:sha256:{}", "b".repeat(48));
+        let canon = format!("canonical:sha256:{}", "b".repeat(64));
         ensure_key(&backend, &k).await;
         let tid = format!("t-{}", uuid::Uuid::new_v4());
         // Target T names the canonical hash H in subject_key_ids (no FK).

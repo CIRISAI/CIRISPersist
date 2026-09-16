@@ -5008,7 +5008,7 @@ pub mod blob_invariants {
         let prov = community_provenance(&peer, &comm, epoch);
         let err = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &stop,
             &env_peer,
             &prov,
@@ -5039,7 +5039,7 @@ pub mod blob_invariants {
             let prov = community_provenance(author, &comm, epoch);
             let out = adopt_sealed_blob(
                 backend,
-                &signer,
+                Some(&signer),
                 &stop,
                 env,
                 &prov,
@@ -5081,7 +5081,7 @@ pub mod blob_invariants {
             };
             adopt_sealed_blob(
                 backend,
-                &signer,
+                Some(&signer),
                 &stop,
                 &env,
                 &prov,
@@ -5097,7 +5097,7 @@ pub mod blob_invariants {
         let normal = hold_ctx(false, &our, &family);
         adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &normal,
             &env_peer,
             &prov,
@@ -5161,7 +5161,7 @@ pub mod blob_invariants {
         let prov = community_provenance(&peer, &theirs, ep_theirs);
         let err = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env_theirs,
             &prov,
@@ -5208,7 +5208,7 @@ pub mod blob_invariants {
             };
             let err = adopt_sealed_blob(
                 backend,
-                &signer,
+                Some(&signer),
                 &ctx,
                 &env,
                 &prov,
@@ -5228,7 +5228,7 @@ pub mod blob_invariants {
         let prov_ours = community_provenance(&peer, &comm, ep_ours);
         adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env_ours,
             &prov_ours,
@@ -5254,7 +5254,7 @@ pub mod blob_invariants {
         let server_ctx = hold_ctx(false, &server, &family);
         let err = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &server_ctx,
             &env_theirs,
             &prov,
@@ -5322,7 +5322,7 @@ pub mod blob_invariants {
         let ctx = hold_ctx(false, &our, &family);
         adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env,
             &community_provenance(&peer, &comm, epoch),
@@ -5533,7 +5533,7 @@ pub mod blob_invariants {
         backend.delete_blob(&sha_a).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env_a,
             &community_provenance(&peer, &ghost, 7),
@@ -5588,7 +5588,7 @@ pub mod blob_invariants {
         );
         let out = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env_b,
             &community_provenance(&peer, &ghost, old_epoch),
@@ -5654,7 +5654,7 @@ pub mod blob_invariants {
         backend.delete_blob(&sha1).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env1,
             &community_provenance(&peer, &comm, epoch),
@@ -5681,7 +5681,7 @@ pub mod blob_invariants {
         backend.delete_blob(&sha2).await.unwrap();
         let out = adopt_sealed_blob(
             backend,
-            &signer,
+            Some(&signer),
             &ctx,
             &env2,
             &community_provenance(&peer, &comm, epoch),
@@ -5706,7 +5706,7 @@ pub mod blob_invariants {
             };
             let err = adopt_sealed_blob(
                 backend,
-                &signer,
+                Some(&signer),
                 &ctx,
                 &env2,
                 &prov,

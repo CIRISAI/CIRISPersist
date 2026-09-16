@@ -118,7 +118,7 @@ fn resolve_adopt(
 #[allow(clippy::too_many_arguments)]
 pub async fn adopt_sealed_blob<B, F>(
     backend: &B,
-    local: &crate::signing::LocalSigner,
+    local: Option<&crate::signing::LocalSigner>,
     ctx: &HoldContext<'_, F>,
     envelope: &[u8],
     provenance: &BlobProvenance,
@@ -146,6 +146,13 @@ where
         let sha256: [u8; 32] = sha2::Sha256::digest(envelope).into();
         // The HOLDER claims (I23): attested and signed by this node's
         // derived key, never the author's.
+        let local = local.ok_or_else(|| {
+            BlobError::AttestationEmissionFailed(
+                "hybrid-only: announcing an adopted blob needs this node's PQC LocalSigner \
+                 (CIRISPersist#851 §20.5); adopt it LocalOnly to hold without announcing"
+                    .into(),
+            )
+        })?;
         Some(
             crate::federation::blobs::sign_holds_bytes_claim(
                 local,

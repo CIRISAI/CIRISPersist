@@ -4830,7 +4830,7 @@ impl Engine {
         .await?;
 
         // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
-        let local = self.announcing_signer()?;
+        let local = self.announcing_signer().await?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -4846,7 +4846,7 @@ impl Engine {
                     sha256,
                     body,
                     media_type,
-                    &local.derived_key_id(),
+                    author_key_id,
                     local,
                     now,
                     attestation_id,
@@ -4867,7 +4867,7 @@ impl Engine {
                     sha256,
                     body,
                     media_type,
-                    &local.derived_key_id(),
+                    author_key_id,
                     local,
                     now,
                     attestation_id,
@@ -5017,8 +5017,13 @@ impl Engine {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
-        // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
-        let local = self.announcing_signer()?;
+        // §20.5 — the signer is needed only to ANNOUNCE: a LocalOnly adopt
+        // emits no federation-tier claim, so a hardware/classical engine may
+        // hold received bytes (PR #852 review).
+        let local = match disposition {
+            crate::federation::AdoptDisposition::Announce => Some(self.announcing_signer().await?),
+            _ => self.local_signer.as_deref(),
+        };
         use crate::federation::adopt_cascade::adopt_sealed_blob;
         let (our_key, fam) = self.local_or_family_parts().await?;
         let ctx = crate::federation::HoldContext {
@@ -5250,7 +5255,7 @@ impl Engine {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
         // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
-        let local = self.announcing_signer()?;
+        let local = self.announcing_signer().await?;
         use crate::federation::at_rest_cascade::orchestrate::put_blob_scoped;
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5372,10 +5377,17 @@ impl Engine {
     /// announce, and says so here rather than storing bytes under a claim no
     /// peer will admit (CC 5.3.2.4.3.1).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    fn announcing_signer(
+    async fn announcing_signer(
         &self,
     ) -> Result<&crate::signing::LocalSigner, crate::federation::BlobError> {
-        self.local_signer.as_deref().ok_or_else(|| {
+        // PR #852 review — ONE identity per announcing engine. In the
+        // `from_shared_with_local` shape the composed signer and the LocalSigner
+        // may be different keys; the cascades record the node (composed) as
+        // author / minter / stream-owner while claims and KeyGrant sets are
+        // signed by the LocalSigner, so peers reject every set and
+        // `check_stream_head_matches` rejects every seal. Refuse here rather
+        // than store content whose key can never follow it.
+        let local = self.local_signer.as_deref().ok_or_else(|| {
             crate::federation::BlobError::AttestationEmissionFailed(
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
                  federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1); \
@@ -5383,7 +5395,21 @@ impl Engine {
                  `from_shared_with_local` to announce"
                     .into(),
             )
-        })
+        })?;
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("announcing signer: node key: {e}"))
+        })?;
+        if local.derived_key_id() != node {
+            return Err(crate::federation::BlobError::AttestationEmissionFailed(
+                format!(
+                "hybrid-only: this engine's LocalSigner ({}) is not its node identity ({node}); \
+                 an announcing engine signs its claims, its key grants and its cascades with ONE \
+                 key (CIRISPersist#851 §20.5)",
+                local.derived_key_id()
+            ),
+            ));
+        }
+        Ok(local)
     }
 
     /// CIRISPersist#851 (`BLOB_REPLICATION.md` §20.3) — **publish this
@@ -6058,7 +6084,7 @@ impl Engine {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
         // §20.5 — hybrid-only: no PQC LocalSigner, no announcement.
-        let local = self.announcing_signer()?;
+        let local = self.announcing_signer().await?;
         use crate::federation::chunk_dag_cascade::orchestrate::seal_stream_scoped;
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
@@ -12269,11 +12295,18 @@ mod tests {
         let seed = [0xCDu8; 32];
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
         let key_id = format!("put-blob-signing-pg-{}", uuid::Uuid::new_v4());
+        // §20.5 hybrid-only: an announcing engine carries a real ML-DSA-65
+        // half, or the door refuses (that refusal is I80's subject, not this
+        // test's).
+        let pqc = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x42; 32], &key_id)
+                .expect("mldsa seed length"),
+        );
         let signer = Arc::new(LocalSigner::from_parts(
             signing_key,
             key_id.clone(),
-            None,
-            None,
+            Some(pqc),
+            Some(key_id.clone()),
         ));
         // v9.3.0 (#247) — the holds_bytes scrub_key_id is the signer's
         // DERIVED federation key_id; register + attest under it.

@@ -156,13 +156,46 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   engine (`with_hardware_signer`) holds and reads but does not announce —
   `with_hardware_signer_hybrid` does.
 
+### Review round six (PR #852, Codex) — six findings, all built
+- **The row records the AUTHOR, the claim the HOLDER.** Threading the holder
+  into the claim (above) had also overwritten the row's `author_key_id`, so a
+  proxy write looked locally authored and slipped the stop-tier proxy-serve
+  refusal. `put_blob_with_scope` takes the author explicitly; the claim stays
+  this node's. I86.
+- **A LocalOnly adopt needs no announcing signer.** `adopt_sealed_blob` takes
+  `Option<&LocalSigner>` and requires it only in the `Announce` branch, so a
+  hardware/classical engine can still hold received bytes. I87.
+- **One identity per announcing engine.** In the `from_shared_with_local`
+  shape the composed signer and the LocalSigner may differ; the cascades
+  recorded the node while claims and KeyGrant sets were signed by the
+  LocalSigner, so peers would reject every set and `check_stream_head_matches`
+  every seal. The announcing accessor refuses that configuration by name.
+- **The subject gate runs on every ingest**, not only the local producer —
+  sqlite, postgres and memory, in the same position (the parity gate found the
+  third). A remote signer can hybrid-sign a malformed subject. I84 (b).
+- **A deferred `withdraws` declaring a `key_grant` target is refused now**,
+  because nothing rechecks a deferred row when its target lands; the verdict
+  that needs no target is given at admission. An emitter omitting
+  `references_attestation_type` still defers — stated, not silent. I85 (b).
+- Four more mutations red (author untied, LocalOnly re-gated, deferred
+  refusal removed, ingest gate removed).
+
 ### CC 2.3 audit (operator) — two gates closed
-- **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids`): a
-  subject that is empty, uppercase, carries any whitespace, or is a
-  `canonical:` id that is not exactly `canonical:sha256:<64 lowercase hex>` is
-  REFUSED at the gate, never normalized into acceptance. The cost of admitting
-  one was silent and permanent — a subject nobody can match under withdraws
-  rules 2/3 is a row nobody can ever revoke. I84.
+- **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
+  a subject that is empty, carries any whitespace, or is a `canonical:` id
+  that is not exactly `canonical:sha256:<64 lowercase hex>` is REFUSED — on
+  the emit path AND on every backend's ingest — never normalized into
+  acceptance. Admitting one is silent and permanent: a subject nobody can
+  match under withdraws rules 2/3 is a row nobody can ever revoke. I84.
+- **One clause is deferred at ingest, and named**: `uppercase`. `cirisnode`'s
+  moderation and takedown contributions carry the subject's raw base64
+  Ed25519 pubkey and reach the store through `put_contribution`, which never
+  ran this validator, so the corpus predates the rule. Refusing it at ingest
+  would break a child-safety surface in a patch release. The emit gate refuses
+  it, so no NEW row can carry one; `SubjectGate::{Emit, Ingest}` states which
+  path carries which clause, and I84 (b) witnesses both halves. Closing it
+  means giving cirisnode's subjects a canonical id — a data change, filed
+  separately.
 - **A `withdraws` naming a `key_grant:*` row is refused**, not admitted inert:
   CC 3 says a shared key cannot be retroactively un-shared, so persist cannot
   honour the claim, and a row every reader ignores is a revocation the emitter
