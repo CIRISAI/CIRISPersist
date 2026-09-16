@@ -88,6 +88,10 @@ pub mod key_grant;
 // consumers can drive them against their own backends.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod key_grant_invariants;
+// CIRISPersist#851 §20.5 — I79: the holder claim is hybrid-signed when a
+// LocalSigner exists, so peers admit it at the federation-tier gate.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod claim_signing_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
@@ -554,13 +558,96 @@ fn assert_change_envelope_matches(
 /// caller being gated to match. Found while verifying CIRISServer#356 against
 /// the feature matrix; unrelated to that work, and fixed rather than deferred
 /// because a leg that cannot compile is a leg that proves nothing.
-pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
+pub fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
+    validate_subject_key_ids_at(subject_key_ids, SubjectGate::Emit)
+}
+
+/// CC 2.3.2.1 (PR #852 review) — which subject vectors a gate refuses.
+///
+/// `Emit` is the full rule, applied to rows THIS node produces. `Ingest` is
+/// applied to replicated rows and drops one clause — uppercase — because a
+/// live corpus predates the rule: `cirisnode`'s moderation and takedown
+/// contributions carry the subject's raw base64 Ed25519 pubkey (uppercase by
+/// construction) and reach the store through `put_contribution`, which never
+/// ran this validator. Refusing those at ingest would break a child-safety
+/// surface on a patch release, so the deferral is NAMED here rather than
+/// silently normalized, and every other vector — empty, whitespace, a
+/// malformed `canonical:` id — is refused on both paths. Closing the gap
+/// means giving cirisnode's subjects a canonical id; that is a data change,
+/// filed separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectGate {
+    /// Rows this node produces: the full CC 2.3.2.1 rule.
+    Emit,
+    /// Replicated rows: every vector except the pre-existing uppercase corpus.
+    Ingest,
+}
+
+/// CC 2.3.2.1 — the subject gate at `gate`. See [`SubjectGate`].
+pub fn validate_subject_key_ids_at(
+    subject_key_ids: &[String],
+    gate: SubjectGate,
+) -> Result<(), Error> {
     for sid in subject_key_ids {
-        if sid.is_empty() || sid.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err(Error::InvalidArgument(format!(
+        let malformed = |why: &str| {
+            Err(Error::InvalidArgument(format!(
                 "subject_key_ids element must be a canonical lowercase key_id \
-                 (CC 2.6.3 / §0.6); got {sid:?}"
-            )));
+                 (CC 2.3.2.1 / CC 2.6.3 / §0.6): {why}; got {sid:?}"
+            )))
+        };
+        if sid.is_empty() {
+            return malformed("empty");
+        }
+        if gate == SubjectGate::Emit && sid.bytes().any(|b| b.is_ascii_uppercase()) {
+            return malformed("uppercase");
+        }
+        if sid.chars().any(char::is_whitespace) {
+            return malformed("whitespace");
+        }
+        // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so
+        // `Canonical:sha256:<lowercase hex>` never entered the branch below at
+        // all: it fell through as an ordinary subject, and `SubjectGate::Ingest`
+        // skips the general uppercase clause, so a peer could persist it. That
+        // is the uppercase-digest defect again by another spelling — an id that
+        // LOOKS canonical, that exact-match canonical binding and withdrawal
+        // authority never recognize, leaving the subject unrevocable by its
+        // canonical identity. Anything whose first ten bytes are `canonical:`
+        // in ANY case must be exactly the canonical form or be refused; that
+        // also catches `canonical:SHA256:…`. Compared as BYTES so a multi-byte
+        // character cannot panic a slice, and the cirisnode legacy corpus is
+        // untouched because base64 subjects contain no `:`.
+        let looks_canonical =
+            sid.len() >= 10 && sid.as_bytes()[..10].eq_ignore_ascii_case(b"canonical:");
+        if looks_canonical && !sid.starts_with("canonical:") {
+            return malformed("canonical prefix is not lowercase");
+        }
+        if let Some(rest) = sid.strip_prefix("canonical:") {
+            // Round nine — the hash family is part of the canonical spelling:
+            // `canonical:SHA256:…` is the same alternate-spelling defect.
+            let Some(digest) = rest.strip_prefix("sha256:") else {
+                if rest.len() >= 7 && rest.as_bytes()[..7].eq_ignore_ascii_case(b"sha256:") {
+                    return malformed("canonical hash family is not lowercase");
+                }
+                return malformed("canonical id is not sha256");
+            };
+            // PR #852 review round seven — `is_ascii_hexdigit()` accepts `A`-`F`,
+            // and `SubjectGate::Ingest` deliberately skips the general uppercase
+            // clause above (the cirisnode legacy corpus), so a peer could persist
+            // `canonical:sha256:<UPPERCASE>` while this branch's own message
+            // promised lowercase. Canonical binding and withdrawal authority
+            // compare by exact string equality, so the alternate spelling never
+            // matches the lowercase binding and the subject becomes unrevocable
+            // by its canonical identity — the precise harm CC 2.3.2.1 names.
+            // The digest is spelled out here rather than deferred to the general
+            // clause, so it holds on BOTH gates; the legacy exception covers
+            // non-canonical subjects only, and none of those carry this prefix.
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return malformed("canonical sha256 digest is not 64 lowercase hex");
+            }
         }
     }
     Ok(())
@@ -2095,6 +2182,18 @@ pub trait FederationDirectory: Send + Sync {
             "list_signed_identity_occurrences_for not implemented for this backend".into(),
         ))
     }
+
+    /// CIRISPersist#851 (PR #852 review, round three) — EVERY occurrence row
+    /// bound under `occurrence_key_id`, whatever identity each names. The
+    /// table's key is `(identity_key_id, occurrence_key_id)`, so one key may
+    /// be bound under several identities (ownership moved, a stale row left);
+    /// [`Self::lookup_identity_for_occurrence`] returns one of them, and a
+    /// revocation check that read only that one would miss the other's
+    /// revocation. Empty when the key is bound nowhere.
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error>;
 
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns `None` if the key is

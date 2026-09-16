@@ -190,6 +190,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_family_charter_admission", Class::Gate),
     ("check_federation", Class::Gate),
     ("check_genesis_attestation_reserved", Class::Gate),
+    ("validate_subject_key_ids_at", Class::Gate),
     ("check_genesis_rebake_purge_admission_under", Class::Gate),
     ("check_geographic_community_admission", Class::Gate),
     ("check_infra_attest_role_admission", Class::Gate),

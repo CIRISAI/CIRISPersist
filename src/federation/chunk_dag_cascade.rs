@@ -372,9 +372,14 @@ pub mod orchestrate {
     /// `put_blob_scoped` does. `InvisibleEncrypted` announces nothing.
     ///
     /// `aad` is the #831 hook for the manifest's seal.
+    ///
+    /// `pqc` — CIRISPersist#851 §20.5: a classical-only claim is confined to
+    /// local tier (CC 5.3.2.4.3.1); with a LocalSigner the claim is
+    /// hybrid-signed so peers admit it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn seal_stream_scoped<B>(
         backend: &B,
-        signer: &dyn ciris_keyring::HardwareSigner,
+        local: &crate::signing::LocalSigner,
         cohort_scope: &str,
         community_key_id: Option<&str>,
         stream_id: &str,
@@ -391,9 +396,9 @@ pub mod orchestrate {
                 "stream {stream_id} has no chunks"
             )));
         }
-        let signer_key_id = crate::signing::federation_key_id_of(signer)
-            .await
-            .map_err(|e| BlobError::Backend(format!("seal_stream_scoped: signer key id: {e}")))?;
+        // §11.2 (6) / I23 / §20.5 — the announcing identity IS the PQC
+        // LocalSigner's derived id; hybrid-only, so there is no other.
+        let signer_key_id = local.derived_key_id();
         // #837 (§12.9 / I41) — the stream's ROW first: a seal by a signer
         // that is not the owner, or at a cohort / community that is not
         // the stream's, is refused before any chunk row is looked at.
@@ -450,7 +455,7 @@ pub mod orchestrate {
                         BlobBody::Inline(jcs),
                         media_type,
                         &signer_key_id,
-                        signer,
+                        local,
                         now,
                         uuid::Uuid::new_v4(),
                     )
@@ -560,7 +565,7 @@ pub mod orchestrate {
                                     BlobBody::Inline(body),
                                     media_type,
                                     &signer_key_id,
-                                    signer,
+                                    local,
                                     now,
                                     uuid::Uuid::new_v4(),
                                 )
@@ -1325,15 +1330,14 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
-        sealed_community_stream_as(backend, &adapter, tag, comm, stream, segments).await
+        sealed_community_stream_as(backend, &signer, tag, comm, stream, segments).await
     }
 
     /// [`sealed_community_stream`] with the WRITER given: every chunk and
     /// the seal are signed by `adapter`, so the stream belongs to it (#837).
     async fn sealed_community_stream_as<B>(
         backend: &B,
-        adapter: &dyn ciris_keyring::HardwareSigner,
+        local: &std::sync::Arc<crate::signing::LocalSigner>,
         tag: &str,
         comm: &str,
         stream: &str,
@@ -1345,9 +1349,10 @@ pub mod invariants {
         let mut shas = Vec::new();
         let mut plain = Vec::new();
         for (i, seg) in segments.iter().enumerate() {
+            let chunk_writer = crate::signing::LocalSignerHardwareAdapter::new(local.clone());
             let r = put_blob_chunk_scoped(
                 backend,
-                adapter,
+                &chunk_writer,
                 COMMUNITY,
                 Some(comm),
                 stream,
@@ -1362,10 +1367,9 @@ pub mod invariants {
             shas.push(r.chunk_sha256);
             plain.extend_from_slice(seg);
         }
-        let sealed =
-            seal_stream_scoped(backend, adapter, COMMUNITY, Some(comm), stream, None, None)
-                .await
-                .unwrap_or_else(|e| panic!("{tag}: a community stream must seal: {e}"));
+        let sealed = seal_stream_scoped(backend, local, COMMUNITY, Some(comm), stream, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: a community stream must seal: {e}"));
         assert_eq!(sealed.chunk_count, segments.len() as u64);
         assert_eq!(sealed.total_size, plain.len() as u64);
         (sealed.manifest_sha256, shas, plain)
@@ -1444,12 +1448,10 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
 
-        let owner = crate::signing::federation_key_id_of(&adapter)
-            .await
-            .unwrap();
+        let owner = signer.derived_key_id();
         // (Before #837 this witness also staged a mixed stream through the
         // commons door; the chunk floor now refuses that append — I41.)
 
@@ -1493,7 +1495,7 @@ pub mod invariants {
                 .unwrap();
             let res = seal_stream_scoped(
                 backend,
-                &adapter,
+                &signer,
                 COMMUNITY,
                 Some(&comm),
                 &same_cohort,
@@ -1521,7 +1523,7 @@ pub mod invariants {
             .unwrap();
         let res = seal_stream_scoped(
             backend,
-            &adapter,
+            &signer,
             COMMUNITY,
             Some(&comm),
             &commons,
@@ -1802,7 +1804,7 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let stream = format!("{tag}-stream-{run}");
         let segs = [segment(3, 2000), segment(4, 1000)];
         let mut plain = Vec::new();
@@ -1830,7 +1832,7 @@ pub mod invariants {
             chunk_shas.push(r.chunk_sha256);
             plain.extend_from_slice(seg);
         }
-        let sealed = seal_stream_scoped(backend, &adapter, SELF, Some(&owner), &stream, None, None)
+        let sealed = seal_stream_scoped(backend, &signer, SELF, Some(&owner), &stream, None, None)
             .await
             .unwrap_or_else(|e| panic!("{tag} I34b: seal: {e}"));
         let manifest = sealed.manifest_sha256;
@@ -1921,7 +1923,7 @@ pub mod invariants {
             let later_occ = format!("{tag}-owner-later-occ-{run}");
             seed_occurrence(backend, &owner, &later_occ).await;
             let sealed2 =
-                seal_stream_scoped(backend, &adapter, SELF, Some(&owner), &stream2, None, None)
+                seal_stream_scoped(backend, &signer, SELF, Some(&owner), &stream2, None, None)
                     .await
                     .unwrap();
             assert!(
@@ -2077,13 +2079,12 @@ pub mod invariants {
         let alice = format!("{tag}-alice-{run}");
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
-        let writer = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                backend,
-                &format!("{tag}-writer-{run}"),
-            )
-            .await,
-        );
+        let writer_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend,
+            &format!("{tag}-writer-{run}"),
+        )
+        .await;
+        let writer = crate::signing::LocalSignerHardwareAdapter::new(writer_local.clone());
         let stream = format!("{tag}-stream-{run}");
         assert_eq!(
             backend.stream_chunks(&stream).await.unwrap(),
@@ -2190,15 +2191,13 @@ pub mod invariants {
         let node = format!("{tag}-node-{run}");
         let signer =
             crate::federation::at_rest_cascade::blob_invariants::node_signer(backend, &node).await;
+        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer.clone());
         let minter = signer.derived_key_id();
-        let adapter = crate::signing::LocalSignerHardwareAdapter::new(signer);
         let stream = format!("{tag}-stream-{run}");
         let seg0 = segment(21, 900);
         let seg1 = segment(22, 600);
 
-        let owner = crate::signing::federation_key_id_of(&adapter)
-            .await
-            .unwrap();
+        let owner = signer.derived_key_id();
         let c0 = put_blob_chunk_scoped(
             backend,
             &adapter,
@@ -2293,7 +2292,7 @@ pub mod invariants {
         }
         let sealed = seal_stream_scoped(
             backend,
-            &adapter,
+            &signer,
             COMMUNITY,
             Some(&comm),
             &stream,
@@ -2406,20 +2405,18 @@ pub mod invariants {
         let bob_occ = format!("{tag}-bob-occ-{run}");
         seed_community(backend, &other, &[(&bob, &bob_occ)]).await;
         // Two writers, each a registered node key.
-        let writer_a = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                backend,
-                &format!("{tag}-writer-a-{run}"),
-            )
-            .await,
-        );
-        let writer_b = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                backend,
-                &format!("{tag}-writer-b-{run}"),
-            )
-            .await,
-        );
+        let writer_a_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend,
+            &format!("{tag}-writer-a-{run}"),
+        )
+        .await;
+        let writer_a = crate::signing::LocalSignerHardwareAdapter::new(writer_a_local.clone());
+        let writer_b_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend,
+            &format!("{tag}-writer-b-{run}"),
+        )
+        .await;
+        let writer_b = crate::signing::LocalSignerHardwareAdapter::new(writer_b_local.clone());
         let key_a = crate::signing::federation_key_id_of(&writer_a)
             .await
             .unwrap();
@@ -2564,7 +2561,7 @@ pub mod invariants {
         // seal is not.
         let res = seal_stream_scoped(
             backend,
-            &writer_b,
+            &writer_b_local,
             COMMUNITY,
             Some(&comm),
             &stream,
@@ -2583,7 +2580,7 @@ pub mod invariants {
         // the stream's.
         let res = seal_stream_scoped(
             backend,
-            &writer_a,
+            &writer_a_local,
             COMMUNITY,
             Some(&other),
             &stream,
@@ -2601,7 +2598,7 @@ pub mod invariants {
         }
         let sealed = seal_stream_scoped(
             backend,
-            &writer_a,
+            &writer_a_local,
             COMMUNITY,
             Some(&comm),
             &stream,
@@ -2648,7 +2645,7 @@ pub mod invariants {
             .unwrap_or_else(|e| panic!("{tag} I41: the owner's claim passes the floor: {e}"));
         match seal_stream_scoped(
             backend,
-            &writer_a,
+            &writer_a_local,
             COMMUNITY,
             Some(&comm),
             &mixed,
@@ -2795,13 +2792,12 @@ pub mod invariants {
         let alice_occ = format!("{tag}-alice-occ-{run}");
         seed_community(backend, &comm, &[(&alice, &alice_occ)]).await;
         let stranger = format!("{tag}-stranger-{run}");
-        let writer = crate::signing::LocalSignerHardwareAdapter::new(
-            crate::federation::at_rest_cascade::blob_invariants::node_signer(
-                backend,
-                &format!("{tag}-writer-{run}"),
-            )
-            .await,
-        );
+        let writer_local = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            backend,
+            &format!("{tag}-writer-{run}"),
+        )
+        .await;
+        let writer = crate::signing::LocalSignerHardwareAdapter::new(writer_local.clone());
         let owner = crate::signing::federation_key_id_of(&writer).await.unwrap();
         // #848 — the writer IS the minter (I23): the floor is driven below
         // under the epoch the door minted for this key.
@@ -2809,7 +2805,7 @@ pub mod invariants {
         let stream = format!("{tag}-stream-{run}");
         let segs = [segment(31, 100), segment(32, 200)];
         let (manifest, shas, plain) =
-            sealed_community_stream_as(backend, &writer, tag, &comm, &stream, &segs).await;
+            sealed_community_stream_as(backend, &writer_local, tag, &comm, &stream, &segs).await;
 
         // The honest read, across the boundary and whole.
         assert_eq!(
@@ -2936,7 +2932,7 @@ pub mod invariants {
             .unwrap_or_else(|e| panic!("{tag} I42: lift through the floor: {e}"));
         let sealed2 = seal_stream_scoped(
             backend,
-            &writer,
+            &writer_local,
             COMMUNITY,
             Some(&comm),
             &stream2,
@@ -3048,7 +3044,7 @@ pub mod invariants {
         }
         let sealed_sparse = seal_stream_scoped(
             backend,
-            &writer,
+            &writer_local,
             COMMUNITY,
             Some(&comm),
             &sparse,

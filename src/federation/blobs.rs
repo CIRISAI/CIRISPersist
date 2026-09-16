@@ -1151,8 +1151,10 @@ pub trait BlobStorage: Send + Sync {
     /// v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.1) — [`put_blob`](Self::put_blob)
     /// with the row's `cohort_scope` and resolved `crypto_tier` recorded.
     /// `put_blob` itself is the commons form (`federation`, plaintext).
+    #[allow(clippy::too_many_arguments)]
     fn put_blob_with_scope(
         &self,
+        author_key_id: Option<&str>,
         sha256: &[u8; 32],
         body: BlobBody,
         media_type: Option<&str>,
@@ -1588,7 +1590,7 @@ pub trait BlobStorage: Send + Sync {
         body: BlobBody,
         media_type: Option<&'s str>,
         attesting_key_id: &'s str,
-        signer: &'s dyn ciris_keyring::HardwareSigner,
+        local: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
@@ -1596,6 +1598,7 @@ pub trait BlobStorage: Send + Sync {
         Self: Sync,
     {
         // The commons form: records `federation` / plaintext on the row (§11.1).
+        // Hybrid-only like every announcing door (§20.5).
         self.put_blob_signing_at(
             crate::federation::types::cohort_scope::FEDERATION,
             StorageFloor::resolved(crate::federation::types::cohort_scope::CryptoTier::Plaintext),
@@ -1603,7 +1606,7 @@ pub trait BlobStorage: Send + Sync {
             body,
             media_type,
             attesting_key_id,
-            signer,
+            local,
             now,
             attestation_id,
         )
@@ -1692,6 +1695,13 @@ pub trait BlobStorage: Send + Sync {
     /// commons wrapper and by the plaintext arm of
     /// [`put_blob_signing_scoped`](Self::put_blob_signing_scoped); there is no
     /// path through here for an encrypted tier.
+    ///
+    /// `local` — CIRISPersist#851 §20.5, HYBRID/PQC ONLY: the holder claim is
+    /// federation-tier, so it is signed by this node's PQC `LocalSigner` and
+    /// by nothing else. No LocalSigner, no ML-DSA-65 half, or a LocalSigner
+    /// that is not `attesting_key_id` ⇒ the write REFUSES
+    /// ([`BlobError::AttestationEmissionFailed`]) rather than storing bytes
+    /// under a claim no peer will admit.
     #[allow(clippy::too_many_arguments)]
     fn put_blob_signing_at<'s>(
         &'s self,
@@ -1700,8 +1710,8 @@ pub trait BlobStorage: Send + Sync {
         sha256: &'s [u8; 32],
         body: BlobBody,
         media_type: Option<&'s str>,
-        attesting_key_id: &'s str,
-        signer: &'s dyn ciris_keyring::HardwareSigner,
+        author_key_id: &'s str,
+        local: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
@@ -1721,10 +1731,26 @@ pub trait BlobStorage: Send + Sync {
             }
             // #846 — the claim is signed by the one helper the adopt door
             // also uses, so what a holder claim IS has one spelling.
-            let att = sign_holds_bytes_claim(signer, sha256, attesting_key_id, attestation_id, now)
-                .await?;
-            self.put_blob_with_scope(sha256, body, media_type, att, cohort_scope, floor)
-                .await
+            //
+            // §20.5 (PR #852 review) — the claim is the HOLDER's: this node,
+            // signed by this node (I23), because the ingest gate verifies the
+            // row against its own `attesting_key_id`. The ROW separately
+            // records the AUTHOR, which for a proxy write is the peer —
+            // losing it made proxy content look locally authored and slipped
+            // the stop-tier proxy-serve refusal.
+            let att =
+                sign_holds_bytes_claim(local, sha256, &local.derived_key_id(), attestation_id, now)
+                    .await?;
+            self.put_blob_with_scope(
+                Some(author_key_id),
+                sha256,
+                body,
+                media_type,
+                att,
+                cohort_scope,
+                floor,
+            )
+            .await
         }
     }
 
@@ -1764,7 +1790,7 @@ pub trait BlobStorage: Send + Sync {
         body: BlobBody,
         media_type: Option<&'s str>,
         attesting_key_id: &'s str,
-        signer: &'s dyn ciris_keyring::HardwareSigner,
+        local: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
         attestation_id: uuid::Uuid,
     ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
@@ -1794,7 +1820,7 @@ pub trait BlobStorage: Send + Sync {
                         body,
                         media_type,
                         attesting_key_id,
-                        signer,
+                        local,
                         now,
                         attestation_id,
                     )
@@ -2790,13 +2816,71 @@ pub struct BlobProvenanceRow {
     pub community_key_id: Option<String>,
 }
 
+/// CIRISPersist#851 §20.5 — **the one predicate every announcing door asks.**
+///
+/// An engine announces with ONE key. Two facts have to hold before any door
+/// stores something it intends to announce, and both were learned the hard way
+/// on PR #852:
+///
+/// 1. **The LocalSigner IS this node.** The doors that reach here take the
+///    AUTHOR as their key parameter (the #149 proxy decision, recorded on the
+///    row); the holder claim is signed as the LocalSigner's own derived id
+///    (I23). So a `from_shared_with_local` engine, or a hardware-signer engine
+///    carrying a distinct legacy local key, would attribute and sign the claim
+///    as an unrelated key — peers record the wrong node as holder, the cascades
+///    record the node as author/minter/stream-owner while the grant set is
+///    signed by the other key so every peer rejects the set, and
+///    `check_stream_head_matches` rejects every seal.
+/// 2. **It has an ML-DSA-65 half.** Existence and identity both admit an
+///    Ed25519-only signer, and the cascade doors mint the epoch DEK, seal and
+///    mint grants BEFORE the claim is signed — so without this the engine
+///    stranded key material and ciphertext for a blob whose grant set could
+///    never be emitted, and only then returned an error.
+///
+/// It lives here, as one function, because the divergence is the recurring
+/// defect: the check was added to `Engine::announcing_signer` in one review
+/// round and the PyO3 door kept announcing through a foreign key until the
+/// next. Two doors asking one question must not be two implementations.
+pub fn check_announcing_signer(
+    local: &crate::signing::LocalSigner,
+    node_key_id: &str,
+) -> Result<(), BlobError> {
+    let derived = local.derived_key_id();
+    if derived != node_key_id {
+        return Err(BlobError::AttestationEmissionFailed(format!(
+            "hybrid-only: this engine's LocalSigner ({derived}) is not its node identity \
+             ({node_key_id}); the holder claim is signed as the LocalSigner's OWN derived id, \
+             so announcing through a foreign key would record the wrong node as holder. An \
+             announcing engine signs its claims, its key grants and its cascades with ONE key \
+             (CIRISPersist#851 §20.5)"
+        )));
+    }
+    if local.pqc_signer().is_none() {
+        return Err(BlobError::AttestationEmissionFailed(format!(
+            "hybrid-only: this engine's LocalSigner ({derived}) has no ML-DSA-65 key, so \
+             nothing it announces would be admitted at federation tier (CC 5.3.2.4.3.1); \
+             refused BEFORE any cascade writes, so no blob is stored whose key cannot follow \
+             it (CIRISPersist#851 §20.5)"
+        )));
+    }
+    Ok(())
+}
+
 /// #846 (`BLOB_REPLICATION.md` §6.1) — sign the `holds_bytes` claim for
-/// `sha256` under `signer`, exactly as [`BlobStorage::put_blob_signing_at`]
-/// does: the v31-shaped envelope, the produce-side canonicalizer, the
-/// signer's DERIVED key id as `scrub_key_id` (I23). One function, so the
-/// signing door and the adopt door cannot drift on what a holder claim is.
+/// `sha256`, exactly as [`BlobStorage::put_blob_signing_at`] does: the
+/// v31-shaped envelope, the produce-side canonicalizer, the signer's DERIVED
+/// key id as `scrub_key_id` (I23). One function, so the signing door and the
+/// adopt door cannot drift on what a holder claim is.
+///
+/// **HYBRID/PQC ONLY — no legacy fallback** (operator ruling, #851 §20.5).
+/// The claim is FEDERATION-tier: the cursor serves it and every peer's ingest
+/// gate demands the hybrid form (CC 5.3.2.4.3.1), so it is signed by `local`
+/// — this node's PQC `LocalSigner` — and by nothing else. There is no
+/// classical path: a `LocalSigner` that is not the claimed attester, or that
+/// has no ML-DSA-65 half, REFUSES here rather than producing a claim no peer
+/// will admit.
 pub async fn sign_holds_bytes_claim(
-    signer: &dyn ciris_keyring::HardwareSigner,
+    local: &crate::signing::LocalSigner,
     sha256: &[u8; 32],
     attesting_key_id: &str,
     attestation_id: uuid::Uuid,
@@ -2810,6 +2894,18 @@ pub async fn sign_holds_bytes_claim(
         return Err(BlobError::InvalidArgument(
             "attesting_key_id is empty".into(),
         ));
+    }
+    // The signer IS the claimed attester: an Engine whose composed `signer`
+    // and `local_signer` are different identities (`from_shared_with_local`)
+    // must not announce a row signed by one key and attributed to another —
+    // every peer verifies the signature against `attesting_key_id`.
+    let derived = local.derived_key_id();
+    if derived != attesting_key_id {
+        return Err(BlobError::AttestationEmissionFailed(format!(
+            "hybrid-only: the LocalSigner ({derived}) is not the claimed attester \
+             ({attesting_key_id}); a holds_bytes claim is signed by the attester itself \
+             (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+        )));
     }
     // v31.0.0 (CIRISPersist#652) — the v31-SHAPED envelope: the #598
     // instants and the #643 mirror ride the bytes this signer is about
@@ -2832,31 +2928,28 @@ pub async fn sign_holds_bytes_claim(
         })?;
     let original_content_hash_hex = hex::encode(Sha256::digest(&canonical_bytes));
 
-    let sig_bytes = signer
-        .sign(&canonical_bytes)
-        .await
-        .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
-    let scrub_signature_classical = B64.encode(&sig_bytes);
-    // v9.3.0 (#247) — the holds_bytes `scrub_key_id` FKs to
-    // `federation_keys(key_id)`, which is the DERIVED wire key_id
-    // (`<label>-<fp>`), NOT the keystore alias `current_alias()`.
-    // Using the alias FK-violated on every node whose alias ≠
-    // derived id (the same class as `attestation_promote` #247).
-    let signer_pubkey = signer.public_key().await.map_err(|e| {
-        BlobError::AttestationEmissionFailed(format!(
-            "holds_bytes derive scrub_key_id (signer public_key): {e}"
-        ))
+    // Both halves, the way `attestation_emit::assemble` does it: the classical
+    // half is the hybrid's classical half, the PQC half rides
+    // `scrub_signature_pqc`, and `scrub_key_id` is the derived id (#247 — the
+    // FK target is the wire key_id, never the keystore alias).
+    let sig = local.sign_hybrid(&canonical_bytes).await.map_err(|e| {
+        BlobError::AttestationEmissionFailed(match e {
+            crate::signing::LocalSignerError::PqcNotConfigured => format!(
+                "hybrid-only: {attesting_key_id} has no ML-DSA-65 key, so it cannot sign a \
+                 federation-tier holds_bytes claim; a classical-only producer does not \
+                 announce (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+            ),
+            other => format!("sign_hybrid: {other}"),
+        })
     })?;
-    let scrub_key_id =
-        ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &signer_pubkey);
 
     Ok(PutBlobAttestation {
         attesting_key_id: attesting_key_id.to_string(),
         attestation_id: attestation_id.to_string(),
         original_content_hash_hex,
-        scrub_signature_classical,
-        scrub_signature_pqc: None,
-        scrub_key_id,
+        scrub_signature_classical: B64.encode(&sig.classical.signature),
+        scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+        scrub_key_id: derived,
         scrub_timestamp: now,
         asserted_at: now,
     })
@@ -5236,7 +5329,7 @@ mod tests {
     async fn seed_signer_for(
         backend: &crate::store::sqlite::SqliteBackend,
         key_id: &str,
-    ) -> crate::signing::LocalSignerHardwareAdapter {
+    ) -> std::sync::Arc<crate::signing::LocalSigner> {
         use crate::federation::FederationDirectory;
         use ed25519_dalek::SigningKey;
         let signing_key = SigningKey::from_bytes(&[0x77; 32]);
@@ -5290,13 +5383,19 @@ mod tests {
             })
             .await
             .unwrap();
-        let local = std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+        // §20.5 hybrid-only: an announcing fixture carries a real ML-DSA-65
+        // half, or the door refuses it (which is I80's job, not this test's).
+        let pqc = std::sync::Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], key_id)
+                .expect("mldsa seed length"),
+        );
+
+        std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
             signing_key,
             key_id.into(),
-            None,
-            None,
-        ));
-        crate::signing::LocalSignerHardwareAdapter::new(local)
+            Some(pqc),
+            Some(key_id.to_owned()),
+        ))
     }
 
     #[cfg(feature = "sqlite")]
@@ -5322,7 +5421,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(body),
                 None,
-                "test-key",
+                &signer.derived_key_id(),
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
@@ -5362,7 +5461,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(body),
                 None,
-                "test-key",
+                &signer.derived_key_id(),
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
@@ -5396,7 +5495,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext),
                 None,
-                "test-key",
+                &signer.derived_key_id(),
                 &signer,
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),

@@ -775,6 +775,14 @@ pub struct PyEngine {
     /// / `put_attestation` / `put_revocation` can clone and own its
     /// own reference for the duration of the cold-path sign.
     local_signer: Option<Arc<crate::signing::LocalSigner>>,
+    /// PR #852 review round ten — memoized node identity.
+    /// `local_derived_key_id_async` reads `self.signer.public_key()`, which on
+    /// a real hardware signer is an IPC round trip — the ~80ms dbus cost
+    /// CIRISConformance surfaced in #137 and `select_signer` exists to avoid.
+    /// The composed signer is fixed for the life of the Engine, so its derived
+    /// id is too. Routing every announcing door through the signer preflight
+    /// would otherwise have added two of those reads per write.
+    derived_key_id_memo: Arc<std::sync::OnceLock<String>>,
     /// v1.5.0 Phase H — persisted [`SqliteAuditBackend`] wrapping the
     /// same connection handle as the SQLite [`BackendDispatch::Sqlite`]
     /// arm. Held on the Engine (instead of constructed fresh per call
@@ -970,6 +978,7 @@ impl PyEngine {
             signer: cell.signer.clone(),
             signer_key_id: cell.signer_key_id.clone(),
             local_signer: cell.local_signer.clone(),
+            derived_key_id_memo: Arc::new(std::sync::OnceLock::new()),
             #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
             sqlite_audit: cell.sqlite_audit.clone(),
             closed: cell.closed.clone(),
@@ -1291,6 +1300,48 @@ impl PyEngine {
         }
     }
 
+    /// CIRISPersist#851 §20.5 (operator ruling) — **the announcing signer:
+    /// hybrid/PQC only, no legacy fallback.** A federation-tier `holds_bytes`
+    /// claim is signed by the LocalSigner whose derived id IS the claimed
+    /// attester (a normal Python call attests as the derived id; a
+    /// keystore-alias caller matches by alias). No LocalSigner, or one that
+    /// is not this attester, and the door REFUSES — never a classical claim
+    /// no peer will admit (CC 5.3.2.4.3.1).
+    /// §20.5 — the announcing signer with no attester to match: the doors
+    /// whose parameter names the AUTHOR (the commons form) announce as this
+    /// node. No PQC LocalSigner ⇒ no announcement.
+    ///
+    /// Review round eight — takes the node identity because EXISTENCE and a
+    /// PQC half are not the whole question. The parameter of the doors that
+    /// reach this helper names the AUTHOR, so the holder claim is signed as
+    /// this LocalSigner's OWN derived id; a hardware-signer engine carrying a
+    /// distinct legacy local key would therefore attribute and sign the claim
+    /// as that unrelated key. Normally only the composed node key is
+    /// registered, so the attestation FK rejects the write; where the local
+    /// key was separately registered, peers record the WRONG node as holder.
+    /// `Engine::announcing_signer` refuses that mismatch and so does this.
+    fn announcing_signer_any(
+        &self,
+        node_key_id: &str,
+    ) -> PyResult<Arc<crate::signing::LocalSigner>> {
+        let local = self.local_signer.clone().ok_or_else(|| {
+            blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
+                "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
+                 federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
+                    .into(),
+            ))
+        })?;
+        // PR #852 review round seven — the Python preflight asks the same
+        // question as `Engine::announcing_signer`: an Ed25519-only LocalSigner
+        // EXISTS, so the check above passes, the cascade persists ciphertext and
+        // grants, and `sign_hybrid` fails afterwards, orphaning a blob whose key
+        // was never federated. Refuse before any cascade writes.
+        // §20.5 — the SAME predicate `Engine::announcing_signer` asks.
+        crate::federation::blobs::check_announcing_signer(&local, node_key_id)
+            .map_err(blob_err_to_py)?;
+        Ok(local)
+    }
+
     /// #846 (§5 / I23) — this node's DERIVED federation key id, for the
     /// bindings that must record an author on a row. The same derivation
     /// `Engine::local_derived_key_id` runs; `ValueError` on a non-Ed25519
@@ -1316,6 +1367,13 @@ impl PyEngine {
                     .into(),
             ))
         })?;
+        // Review round ten — the doors that call this now preflight, so a bad
+        // signer cannot reach here; asking anyway costs nothing and keeps the
+        // helper honest on its own, which is what the coverage gate checks.
+        // Already async, so the node key is awaited rather than detached.
+        let node_key_id = self.local_derived_key_id_async().await?;
+        crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+            .map_err(blob_err_to_py)?;
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(pg) => {
@@ -1345,9 +1403,23 @@ impl PyEngine {
     /// helper that blocked here would be correct at every call site today and
     /// invisible to the gate that keeps it so.
     async fn local_derived_key_id_async(&self) -> PyResult<String> {
-        crate::signing::federation_key_id_of(&*self.signer)
+        // Round ten — memoized. `federation_key_id_of` reads
+        // `signer.public_key()`, an IPC round trip on a real hardware signer
+        // (the ~80ms dbus cost behind #137). The composed signer is fixed for
+        // the life of the Engine, so its derived id is computed once. Routing
+        // every announcing door through the signer preflight would otherwise
+        // have added two of those reads to every write.
+        if let Some(cached) = self.derived_key_id_memo.get() {
+            return Ok(cached.clone());
+        }
+        let derived = crate::signing::federation_key_id_of(&*self.signer)
             .await
-            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))
+            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))?;
+        // A racing caller may have filled it; either value is the same bytes.
+        Ok(self
+            .derived_key_id_memo
+            .get_or_init(|| derived.clone())
+            .clone())
     }
 
     /// #846 (BLOB_REPLICATION.md §4, I46) — an [`Engine`](crate::Engine) view
@@ -4071,6 +4143,8 @@ impl PyEngine {
             signer: self.signer.clone(),
             signer_key_id: self.signer_key_id.clone(),
             local_signer: self.local_signer.clone(),
+            // Shared, not re-derived: a handle has the SAME composed signer.
+            derived_key_id_memo: self.derived_key_id_memo.clone(),
             #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
             sqlite_audit: self.sqlite_audit.clone(),
             closed: self.closed.clone(),
@@ -6337,6 +6411,14 @@ impl PyEngine {
                         .into(),
                 ))
             })?;
+            // Review round ten — peers enforce signer == minter, so a set signed
+            // by a foreign or PQC-less key is one every peer rejects.
+            {
+                let node_key_id =
+                    py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+                crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+                    .map_err(blob_err_to_py)?;
+            }
             py.detach(|| {
                 let emitted = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -6389,6 +6471,13 @@ impl PyEngine {
                         .into(),
                 ))
             })?;
+            // Review round ten — same predicate: peers enforce signer == minter.
+            {
+                let node_key_id =
+                    py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+                crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+                    .map_err(blob_err_to_py)?;
+            }
             py.detach(|| {
                 let me = runtime.block_on(self.local_derived_key_id_async())?;
                 let axes = match &self.backend {
@@ -6444,6 +6533,75 @@ impl PyEngine {
                     }
                 }
                 Ok(emitted)
+            })
+        })
+    }
+
+    /// (derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) —
+    /// **publish this node's own content-only occurrence** under
+    /// `identity_key_id` (its owner), signed with the LocalSigner and admitted
+    /// through the gated door so the IdentityOccurrence plane advertises it
+    /// and a far node admits it (the owner binding lifts the node to its
+    /// owner). Returns the signed occurrence as JSON. FFI mirror of
+    /// [`Engine::publish_self_occurrence`](crate::engine::Engine::publish_self_occurrence).
+    fn publish_self_occurrence(
+        &self,
+        py: Python<'_>,
+        identity_key_id: &str,
+        device_class: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let local = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "publish_self_occurrence requires a LocalSigner to hybrid-sign the occurrence \
+                     (§20.3); this engine has none",
+                )
+            })?;
+            // Review round ten — I82's rule, which this door never carried: a
+            // node publishes ITS OWN occurrence. A foreign LocalSigner would
+            // publish an occurrence for a key this engine is not, and a
+            // PQC-less one an occurrence the gate refuses for its missing
+            // ML-DSA-65 half.
+            {
+                let node_key_id =
+                    py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+                crate::federation::blobs::check_announcing_signer(&local, &node_key_id)
+                    .map_err(blob_err_to_py)?;
+            }
+            let (identity, class) = (identity_key_id.to_owned(), device_class.to_owned());
+            py.detach(|| {
+                let signed = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::publish_self_occurrence_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                                &identity,
+                                &class,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::key_grant::publish_self_occurrence_with_local_signer(
+                                backend.as_ref(),
+                                &local,
+                                &identity,
+                                &class,
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(federation_err_to_py)?;
+                serde_json::to_string(&signed).map_err(|e| PyValueError::new_err(e.to_string()))
             })
         })
     }
@@ -13061,16 +13219,17 @@ impl PyEngine {
             let scope = cohort_scope.to_owned();
             let comm = community_key_id.map(str::to_owned);
             let media = media_type.map(str::to_owned);
-            // §11.2 (6) / I23 — announce under the identity the sweep retracts
-            // under: the LOCAL signer when one is configured (what
-            // `sweep_community_epochs` uses), else the composed signer. The
-            // key id is derived from whichever signs; no alias is passed.
-            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            // CIRISPersist#851 §20.5 — hybrid/PQC only, no legacy fallback: the
+            // door announces with this node's PQC LocalSigner or refuses; the
+            // composed classical signer can never sign a federation-tier claim.
+            // Review round ten — this door ANNOUNCES, so it takes the one
+            // preflight, not a copy of the absence check. Existence alone let an
+            // Ed25519-only signer through: the cascade minted the epoch DEK,
+            // sealed and minted grants, and only then failed in `sign_hybrid`,
+            // leaving Python an error after storage had already been mutated.
+            let node_key_id =
+                py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+            let local = self.announcing_signer_any(&node_key_id)?;
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -13079,7 +13238,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_scoped(
                                 backend.as_ref(),
-                                &*signer,
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -13095,7 +13254,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             put_blob_scoped(
                                 backend.as_ref(),
-                                &*signer,
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &plaintext,
@@ -13739,15 +13898,17 @@ impl PyEngine {
             let comm = community_key_id.map(str::to_owned);
             let stream = stream_id.to_owned();
             let media = media_type.map(str::to_owned);
-            // §11.2 (6) / I23 — announce under the identity the sweep retracts
-            // under: the LOCAL signer when one is configured, else the
-            // composed signer; the key id is derived from whichever signs.
-            let signer: Arc<dyn ciris_keyring::HardwareSigner> = match &self.local_signer {
-                Some(local) => Arc::new(crate::signing::LocalSignerHardwareAdapter::new(
-                    local.clone(),
-                )),
-                None => self.signer.clone(),
-            };
+            // CIRISPersist#851 §20.5 — hybrid/PQC only, no legacy fallback: the
+            // door announces with this node's PQC LocalSigner or refuses; the
+            // composed classical signer can never sign a federation-tier claim.
+            // Review round ten — this door ANNOUNCES, so it takes the one
+            // preflight, not a copy of the absence check. Existence alone let an
+            // Ed25519-only signer through: the cascade minted the epoch DEK,
+            // sealed and minted grants, and only then failed in `sign_hybrid`,
+            // leaving Python an error after storage had already been mutated.
+            let node_key_id =
+                py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+            let local = self.announcing_signer_any(&node_key_id)?;
             py.detach(move || {
                 let r = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -13756,7 +13917,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             seal_stream_scoped(
                                 backend.as_ref(),
-                                &*signer,
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -13772,7 +13933,7 @@ impl PyEngine {
                         runtime.block_on(async move {
                             seal_stream_scoped(
                                 backend.as_ref(),
-                                &*signer,
+                                &local,
                                 &scope,
                                 comm.as_deref(),
                                 &stream,
@@ -14229,7 +14390,15 @@ impl PyEngine {
                 })?;
             }
 
-            let signer = self.select_signer(&attesting_key_id_owned);
+            // §20.5 parity with `Engine::put_blob_signing`: the parameter is the
+            // AUTHOR (the #149 proxy decision, recorded on the row); the holder
+            // claim is this node's own, signed by this node (I23), because the
+            // ingest gate verifies the row against its own attesting_key_id.
+            // Review round eight — the node identity comes from the COMPOSED
+            // signer, so the helper can refuse a LocalSigner that is not it.
+            let node_key_id =
+                py.detach(|| self.runtime.block_on(self.local_derived_key_id_async()))?;
+            let local = self.announcing_signer_any(&node_key_id)?;
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {
@@ -14238,13 +14407,20 @@ impl PyEngine {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // CIRISPersist#851 §20.5 — the commons floor with the
+                        // LocalSigner (when it is the attesting key), so the
+                        // claim is hybrid-signed and peers admit it.
                         backend
-                            .put_blob_signing(
+                            .put_blob_signing_at(
+                                crate::federation::types::cohort_scope::FEDERATION,
+                                crate::federation::StorageFloor::resolved(
+                                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                                ),
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
                                 &attesting_key_id_owned,
-                                &*signer,
+                                &local,
                                 now,
                                 attestation_id,
                             )
@@ -14257,13 +14433,20 @@ impl PyEngine {
                     let backend = sq.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
+                        // CIRISPersist#851 §20.5 — the commons floor with the
+                        // LocalSigner (when it is the attesting key), so the
+                        // claim is hybrid-signed and peers admit it.
                         backend
-                            .put_blob_signing(
+                            .put_blob_signing_at(
+                                crate::federation::types::cohort_scope::FEDERATION,
+                                crate::federation::StorageFloor::resolved(
+                                    crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+                                ),
                                 &sha,
                                 body,
                                 media_type_owned.as_deref(),
                                 &attesting_key_id_owned,
-                                &*signer,
+                                &local,
                                 now,
                                 attestation_id,
                             )

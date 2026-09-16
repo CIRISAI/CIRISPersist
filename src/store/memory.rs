@@ -2799,6 +2799,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // means only a seated accord holder's row ever reaches that budget.
         //
         // Backend-symmetric across memory / sqlite / postgres.
+        // CC 2.3.2.1 (PR #852 review) — the subject gate runs on EVERY ingest,
+        // not only the local producer: a remote signer can hybrid-sign a row
+        // carrying a malformed subject, and replication would store the same
+        // unmatchable revocation authority the emit path refuses.
+        crate::federation::validate_subject_key_ids_at(
+            &row.subject_key_ids,
+            crate::federation::SubjectGate::Ingest,
+        )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
 
         if !row.attesting_key_id.is_empty() {
@@ -5089,6 +5097,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .occurrence_key_id
                 .cmp(&b.identity_occurrence.occurrence_key_id)
         });
+        Ok(rows)
+    }
+
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_identity_occurrences
+            .values()
+            .filter(|o| o.occurrence_key_id == occurrence_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.identity_key_id.cmp(&b.identity_key_id));
         Ok(rows)
     }
 
@@ -18073,7 +18096,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let canonical_h = "canonical:sha256:deadbeefcafe";
+        let canonical_h =
+            "canonical:sha256:deadbeefcafe0000000000000000000000000000000000000000000000000000";
 
         // Target T: a producer `scores` naming the canonical hash H as a
         // consent subject. (subject_key_ids takes canonical-hash entries —

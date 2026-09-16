@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 87 delegations, generated. Every one: fault first, then delegate.
+// 88 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -520,6 +520,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_identity_occurrence_revocations_for(identity_key_id)
+            .await
+    }
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        if let Some(e) = self.faulted("list_identity_occurrences_by_occurrence_key") {
+            return Err(e);
+        }
+        self.inner
+            .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
             .await
     }
     async fn list_identity_occurrences_for(

@@ -2994,6 +2994,18 @@ impl FederationDirectory for OpsDirectory {
             method: "list_identity_occurrences_for",
         })
     }
+    // CIRISPersist#851 (PR #852 round three) — not routed over the capsule
+    // (KeyGrant admission runs on the Engine's own backend, never here);
+    // `Unsupported` is an error, never an empty list — fail-closed.
+    async fn list_identity_occurrences_by_occurrence_key(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        let _ = occurrence_key_id;
+        Err(Error::Unsupported {
+            method: "list_identity_occurrences_by_occurrence_key",
+        })
+    }
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,

@@ -5,6 +5,304 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.4.0] - 2026-09-15
+
+**The occurrence that carries the key.** CIRISEdge's mesh harness ran the
+plane I61 could not: every receiving node refused every `KeyGrant` set
+(`signer_not_active_member`) because the minter's node-class occurrence never
+reaches the far node — it is written through the trusted-local door, whose
+rows are never advertised, and the gated door required a transport
+destination and an identity/active-occurrence signer. Admission also asked
+membership about the instrument (the occurrence row) rather than the
+principal (the node's owner) — the #765 shape. And the fan-out has the mirror
+gap: the minter wraps to occurrence rows, so a far member whose occurrence
+never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
+
+### Changed
+- **`KeyGrant` admission asks about the principal (§20.1).** The minter is
+  resolved through `admission_identity_for_writer` — an occurrence lifts to
+  its identity, an owned node to its single live owner — and the principal
+  must be an active member at `asserted_at`. No wire change. I77.
+- **The gated occurrence door admits a content-only signed occurrence
+  (§20.2)** — `encryption_pubkeys` present, no `transport_destination`,
+  verified as the signed revocation is (hybrid signature at 1-of-1 against
+  the pinned key; typed row equals the envelope) — and `signer_acts_for`
+  gains one clause: the occurrence key itself, when a live owner binding
+  lifts it to the identity. Transport-bound occurrences keep #418's rule
+  verbatim. I76.
+
+### Added
+- **I80** — a LocalSigner without a PQC half keeps the classical claim,
+  byte-identical to the pre-#851 claim (a classical-only producer stays
+  classical-only; no new failure).
+- **`Engine::publish_self_occurrence` / `PyEngine.publish_self_occurrence`
+  (§20.3)** — a node publishes its own content-only occurrence under its
+  owner, signed with its LocalSigner, through the gated door, so it is born
+  replicable — what CIRISEdge's `provision_engine_occurrence` calls in place
+  of the trusted-local write. Device occurrences (`self_at_login`'s app and
+  agent) stay trusted-local; their replicable form is the identity-signed
+  content-only occurrence, which the door now admits. I75, I78.
+- **I75 — the end to end, delivered**: two Engines, every row crossing only
+  through a since-read and the gated door on the other side; B's node is in
+  A's set; B admits and opens.
+
+### Review round one (PR #852, Codex) — three P1s, one P2
+- **Every persisted occurrence field is bound to the envelope.** The
+  content-only gate binds `device_class`, `asserted_at`, `valid_until` and
+  `hardware_attestation` (instants at the producer's millisecond precision),
+  not only the ids and KEM pubkeys — a relay could otherwise forward-date a
+  typed row under a valid signature and outlive a revocation. The
+  transport-bound path binds `asserted_at` when its envelope carries it.
+  `publish_self_occurrence` carries the two nullable fields explicitly. I76 (4).
+- **The self-signed form consults the live owner binding on every
+  admission**, never the occurrence row a prior admission left — a
+  withdrawn or lapsed binding no longer keeps vouching. I76 (5): a backend
+  holding the row but no binding refuses the re-submission.
+- **PyEngine's `select_pqc` matches by the derived federation id as well as
+  the alias** — a normal Python call attests as the derived id, for which
+  `select_signer` returns the composed signer over the same LocalSigner; the
+  alias-only match left PyEngine's commons claim classical. The Python test
+  reads the claim back through `list_attestations_by` and asserts the PQC
+  half.
+- **`blob_list_key_grant_dirty` propagates a row decode failure** instead
+  of a silently shorter dirty list (the sweep would have reported success).
+
+### Review round two (PR #852, Codex) — two P1s, one P2
+- **A NODE minter lifts only through its live owner binding.** With the
+  node's content-only occurrence stored on the admitting peer,
+  `admission_identity_for_writer` lifted through the row and never consulted
+  the binding, so a withdrawn binding left the node minting. `KeyGrant`
+  admission now reads the minter's role from the Key-plane record: a NODE
+  key's principal is `owner_of` (live binding required); a device occurrence
+  lifts to its identity as before. I77 (4).
+- **A known-but-revoked occurrence refuses outright**, whatever its owner
+  binding says — the revocation gate strips a lost or compromised device's
+  inherited authority. I77 (5).
+- **The content-only gate binds the envelope's `attesting_key_id` to the
+  wrapper's** (the transport-bound path's SubjectMismatch rule). I76 (6).
+
+### Review round three (PR #852, Codex) — two P1s
+- **A revocation on ANY row bound under the minter's key is final.** The
+  occurrence table is keyed `(identity, occurrence)`, so one key may be bound
+  under several identities (ownership moved, a stale row left) and
+  `lookup_identity_for_occurrence` returns one of them. New floor
+  `list_identity_occurrences_by_occurrence_key` (all four directories);
+  KeyGrant admission checks every row's revocations before the lift. I77 (6).
+- **The LocalSigner signs a claim only when it is the claimed attester.** An
+  Engine whose composed `signer` and `local_signer` are different identities
+  (`from_shared_with_local`) fell to a row signed by one key and attributed
+  to another; now the classical path under the attester. I81.
+
+### Review round four (PR #852, Codex) — one P1, two P2s
+- **A revocation counts only on the row of the identity the lift resolves
+  to.** Round three's "any row" rule was a denial vector: an identity may
+  attest any key as its occurrence, so an attacker could bind a victim's key
+  under itself and revoke it. Now a NODE minter is refused only if its OWNER's
+  row is revoked; a device key lifts to each identity whose row for it is
+  unrevoked. I77 (7): a member binds A's key under herself and revokes that
+  row; A's set is still admitted through alice's live binding.
+- **A PQC-less LocalSigner that is the attester signs the claim itself,
+  classically** — never the composed `signer`, which in the
+  `from_shared_with_local` shape may be another identity. I81 (b).
+- **Typed occurrence instants must be millisecond-exact.** The signature
+  covers the millisecond rendering and `revokes` compares typed instants
+  exactly, so an unsigned sub-millisecond part could hop a same-millisecond
+  revocation. Both gates require it; `publish_self_occurrence` truncates.
+  I76 (7).
+
+### Review round five (PR #852, Codex) — three P1s, one P2
+- **A NODE minter has exactly one principal — its live owner — and no
+  fallback**: not the key itself, not a stale row under a former owner, not
+  the member-occurrence walk; an ownership transfer ends the old community's
+  minting authority. I77 (8).
+- **`check_signer_acts_for` resolves by role and by the active fold.** A
+  NODE signer vouches only through its live owner binding — for its own
+  occurrence and for any sibling key alike; any other signer only as an
+  ACTIVE occurrence of the identity (revocations applied), never a raw
+  historical row. I76 (9).
+- **The signed instant is bounded** by the write-gate clock-skew tolerance in
+  both occurrence gates: a compromised node with a live binding cannot date
+  an occurrence into the future to out-rank replacements or escape a later
+  revocation. I76 (8).
+- **`publish_self_occurrence` publishes only this node's key** — a
+  LocalSigner that is not the node's identity (an Engine over a shared
+  backend with a different composed signer) is refused. I82.
+
+### Removed — hybrid/PQC only, no legacy fallback (operator directive)
+- **The classical `holds_bytes` claim path is gone.** `sign_holds_bytes_claim`
+  takes the node's PQC `LocalSigner` — not a `HardwareSigner` — and signs the
+  claim hybrid or REFUSES: `PqcNotConfigured`, a LocalSigner that is not the
+  claimed attester, and an engine with no LocalSigner each yield
+  `AttestationEmissionFailed` ("hybrid-only") *before* anything announced is
+  stored. No classical claim is produced anywhere. The trait wrappers
+  `put_blob_signing` / `put_blob_signing_scoped` and the `_at` floor all take
+  the LocalSigner; `adopt_sealed_blob` and the cascades do too.
+- **The commons door separates AUTHOR from ATTESTER.** `Engine::put_blob_signing`
+  and `PyEngine.put_blob_signing` take the key as *whose content this is* — the
+  #149 proxy decision, recorded on the row — and announce the holder claim as
+  THIS NODE (I23), signed by this node. Before, a proxy write bound the
+  author into the claim; the federation-tier ingest gate verifies a
+  `holds_bytes` row against its own `attesting_key_id`, so such a row was
+  served by the cursor and refused by every peer — the classical claim's
+  sibling defect. **The holder recorded for a proxy write is now the node**,
+  not the author (`list_holders` / `list_held_by` / `evict_actor` take the
+  node's derived key id).
+- **A content-only signed occurrence without its ML-DSA-65 half is refused**
+  before verification (I76).
+- Witnesses: I80 and I81 are now refusals; I83 — a `from_shared` engine
+  cannot announce and stores nothing announced. Six mutations red.
+- Consumer-visible: CIRISEdge's `from_shared_hybrid` / `from_shared_with_local`
+  are the announcing constructors (already so); a hardware-only classical
+  engine (`with_hardware_signer`) holds and reads but does not announce —
+  `with_hardware_signer_hybrid` does.
+
+### Review round six (PR #852, Codex) — six findings, all built
+- **The row records the AUTHOR, the claim the HOLDER.** Threading the holder
+  into the claim (above) had also overwritten the row's `author_key_id`, so a
+  proxy write looked locally authored and slipped the stop-tier proxy-serve
+  refusal. `put_blob_with_scope` takes the author explicitly; the claim stays
+  this node's. I86.
+- **A LocalOnly adopt needs no announcing signer.** `adopt_sealed_blob` takes
+  `Option<&LocalSigner>` and requires it only in the `Announce` branch, so a
+  hardware/classical engine can still hold received bytes. I87.
+- **One identity per announcing engine.** In the `from_shared_with_local`
+  shape the composed signer and the LocalSigner may differ; the cascades
+  recorded the node while claims and KeyGrant sets were signed by the
+  LocalSigner, so peers would reject every set and `check_stream_head_matches`
+  every seal. The announcing accessor refuses that configuration by name.
+- **The subject gate runs on every ingest**, not only the local producer —
+  sqlite, postgres and memory, in the same position (the parity gate found the
+  third). A remote signer can hybrid-sign a malformed subject. I84 (b).
+- **A deferred `withdraws` declaring a `key_grant` target is refused now**,
+  because nothing rechecks a deferred row when its target lands; the verdict
+  that needs no target is given at admission. An emitter omitting
+  `references_attestation_type` still defers — stated, not silent. I85 (b).
+- Four more mutations red (author untied, LocalOnly re-gated, deferred
+  refusal removed, ingest gate removed).
+
+### Review round seven — the preflight, and the digest alphabet
+- **The announcing preflight now asks what the cascade will ask.** Checking
+  that a `LocalSigner` exists and is this node's identity admits an
+  Ed25519-only signer. `put_blob_scoped` then minted the epoch DEK, sealed the
+  bytes and minted grants, and only then failed inside `sign_hybrid` — an
+  orphaned blob whose key was never federated, the exact state §20.5 exists to
+  prevent. `sign_hybrid` fails iff the ML-DSA-65 half is absent, so the
+  preflight asks that same question before anything is stored. The Python door
+  had the identical hole and gets the identical check. I88 witnesses the
+  ORPHAN, not just the error: with the check removed the epoch DEK is present
+  after the refusal, so the witness distinguishes a preflight from a late
+  failure — which the error message alone cannot, because a deeper gate also
+  refuses a PQC-less signer.
+- **A `canonical:` digest is lowercase on BOTH gates.** `is_ascii_hexdigit()`
+  accepts `A`–`F`, and `SubjectGate::Ingest` deliberately skips the general
+  uppercase clause for the cirisnode corpus, so a peer could persist
+  `canonical:sha256:<UPPERCASE>` while the branch's own message promised
+  lowercase. Canonical binding and withdrawal authority compare by exact
+  string equality, so that spelling never matches the lowercase binding and
+  the subject is unrevocable by its canonical identity — CC 2.3.2.1's named
+  harm, arriving through the ingest door this cut had just opened. The digest
+  alphabet is spelled out in the digest clause itself rather than borrowed
+  from the general clause. The legacy exception covers non-canonical subjects,
+  none of which carry this prefix. I84 (c).
+
+### Review round eight — one announcing predicate, asked by both doors
+- **The PyO3 door was announcing through a foreign key.** Round six added the
+  identity check to `Engine::announcing_signer`; round seven added the PQC
+  check there and to `announcing_signer_any`, but not the identity check. A
+  hardware-signer engine carrying a distinct legacy local key would therefore
+  sign and attribute the holder claim as that unrelated key: usually the
+  attestation FK rejects the write because only the composed node key is
+  registered, but where the local key was separately registered, peers record
+  the WRONG node as holder.
+- **The shape is the lesson.** Two doors asking one question had become two
+  implementations, drifting by one clause per review round.
+  `check_announcing_signer` is now that one question, in `federation::blobs`
+  beside the claim signer it protects, and both doors delegate to it. I89
+  witnesses the predicate; **I89 (b) witnesses the ROUTING**, which is the part
+  that actually failed — `include_str!` asserts both accessors call it and that
+  neither re-spells a clause locally.
+- The Python commons-door test still tolerated a classical claim behind an
+  `if has_pqc_key` guard that the hybrid-only ruling removed. The assertion is
+  unconditional now.
+
+### Review round nine — the canonical PREFIX is part of the spelling
+- `strip_prefix` is case-sensitive, so `Canonical:sha256:<lowercase hex>` never
+  entered the canonical branch at all: it fell through as an ordinary subject,
+  and `SubjectGate::Ingest` skips the general uppercase clause, so a peer could
+  persist it. That is the uppercase-digest defect again by another spelling —
+  an id that LOOKS canonical, that exact-match canonical binding and withdrawal
+  authority never recognize, leaving the subject unrevocable by its canonical
+  identity. Anything whose first ten bytes are `canonical:` in ANY case must
+  now be exactly the canonical form or be refused, and `canonical:SHA256:` is
+  refused for the same reason. Compared as BYTES, so a multi-byte character
+  cannot panic a slice. The cirisnode legacy corpus is untouched: base64
+  subjects contain no `:`.
+- I84 (d) carries the vectors and asserts the DIAGNOSIS on ingest, not just the
+  refusal. That is not decoration: the generic "is not sha256" branch already
+  refuses `canonical:SHA256:…`, so without asserting which clause spoke, the
+  hash-family clause was a surviving mutant. An operator reading a rejected
+  subject needs to be told which part of the spelling is wrong.
+
+### Review round ten — the accessor was shared; the doors still were not
+- **Two PyO3 doors skipped the preflight entirely.** `put_blob_scoped` and
+  `seal_stream_scoped` each took the LocalSigner with their own existence-only
+  check — copied from the accessor, message and all. With an Ed25519-only
+  signer the cascade minted the epoch DEK, sealed the bytes and minted grants,
+  and only then failed in `sign_hybrid`, so Python received an error after
+  storage had already been mutated. Both now take the accessor.
+- **The sweep found four more.** `emit_key_grant` and `emit_pending_key_grants`
+  sign a set peers accept only when signer == minter; `publish_self_occurrence`
+  never carried I82's rule on the Python side at all, so it could publish an
+  occurrence for a key this engine is not; and the internal
+  `emit_key_grant_axis_async` helper asked existence only. All six sites ask
+  the one predicate now.
+- **I89 (c) is the gate that would have caught this.** I89 (b) asserted the two
+  ACCESSORS delegate, which was true and insufficient — a door can skip the
+  accessor. I89 (c) asserts coverage instead: every occurrence of the
+  take-the-LocalSigner idiom in the PyO3 surface must have the preflight within
+  the window that follows it, before anything can be stored. It also asserts
+  the idiom is still FOUND at all, so a rename cannot silently stop the gate
+  looking.
+
+### Round ten, second half — the preflight must not cost an IPC round trip
+- Routing every PyO3 announcing door through the signer preflight means asking
+  for the node identity on every write, and `local_derived_key_id_async` reads
+  `signer.public_key()` — an IPC round trip on a real hardware signer, the
+  ~80ms dbus cost CIRISConformance surfaced in #137 and `select_signer` exists
+  to avoid. The naive fix would have added two of those per write.
+- The composed signer is fixed for the life of an Engine, so its derived id is
+  too. It is memoized now, shared across handles from `engine_handle` because a
+  handle carries the same signer. I89 (d) asserts the memo is still there:
+  losing it is a silent performance regression no correctness test would catch.
+
+### CC 2.3 audit (operator) — two gates closed
+- **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
+  a subject that is empty, carries any whitespace, or is a `canonical:` id
+  that is not exactly `canonical:sha256:<64 lowercase hex>` is REFUSED — on
+  the emit path AND on every backend's ingest — never normalized into
+  acceptance. Admitting one is silent and permanent: a subject nobody can
+  match under withdraws rules 2/3 is a row nobody can ever revoke. I84.
+- **One clause is deferred at ingest, and named**: `uppercase`. `cirisnode`'s
+  moderation and takedown contributions carry the subject's raw base64
+  Ed25519 pubkey and reach the store through `put_contribution`, which never
+  ran this validator, so the corpus predates the rule. Refusing it at ingest
+  would break a child-safety surface in a patch release. The emit gate refuses
+  it, so no NEW row can carry one; `SubjectGate::{Emit, Ingest}` states which
+  path carries which clause, and I84 (b) witnesses both halves. Closing it
+  means giving cirisnode's subjects a canonical id — a data change, filed
+  separately.
+- **A `withdraws` naming a `key_grant:*` row is refused**, not admitted inert:
+  CC 3 says a shared key cannot be retroactively un-shared, so persist cannot
+  honour the claim, and a row every reader ignores is a revocation the emitter
+  believes took effect. The refusal names the remedy — rotation (§15). I85.
+- Not in this cut, filed separately: the read/serve doors do not consult the
+  referencing row's tombstone, so a subject's `withdraws` tombstones the row
+  while the bytes stay readable on every holder. CC 2.3 therefore holds at the
+  row plane and not yet at the bytes plane; the hook needs Edge's half
+  (evict-on-withdraws) and must recompute the withdraws rule when it acts,
+  because `check_withdraws_admission` admits a non-local target with
+  `rule = None`.
+
 ## [44.3.0] - 2026-09-15
 
 **The key follows the bytes.** v44.2.0 got a sealed blob's bytes to a
