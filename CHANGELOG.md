@@ -264,6 +264,17 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   the idiom is still FOUND at all, so a rename cannot silently stop the gate
   looking.
 
+### Round ten, second half — the preflight must not cost an IPC round trip
+- Routing every PyO3 announcing door through the signer preflight means asking
+  for the node identity on every write, and `local_derived_key_id_async` reads
+  `signer.public_key()` — an IPC round trip on a real hardware signer, the
+  ~80ms dbus cost CIRISConformance surfaced in #137 and `select_signer` exists
+  to avoid. The naive fix would have added two of those per write.
+- The composed signer is fixed for the life of an Engine, so its derived id is
+  too. It is memoized now, shared across handles from `engine_handle` because a
+  handle carries the same signer. I89 (d) asserts the memo is still there:
+  losing it is a silent performance regression no correctness test would catch.
+
 ### CC 2.3 audit (operator) — two gates closed
 - **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
   a subject that is empty, carries any whitespace, or is a `canonical:` id

@@ -775,6 +775,14 @@ pub struct PyEngine {
     /// / `put_attestation` / `put_revocation` can clone and own its
     /// own reference for the duration of the cold-path sign.
     local_signer: Option<Arc<crate::signing::LocalSigner>>,
+    /// PR #852 review round ten — memoized node identity.
+    /// `local_derived_key_id_async` reads `self.signer.public_key()`, which on
+    /// a real hardware signer is an IPC round trip — the ~80ms dbus cost
+    /// CIRISConformance surfaced in #137 and `select_signer` exists to avoid.
+    /// The composed signer is fixed for the life of the Engine, so its derived
+    /// id is too. Routing every announcing door through the signer preflight
+    /// would otherwise have added two of those reads per write.
+    derived_key_id_memo: Arc<std::sync::OnceLock<String>>,
     /// v1.5.0 Phase H — persisted [`SqliteAuditBackend`] wrapping the
     /// same connection handle as the SQLite [`BackendDispatch::Sqlite`]
     /// arm. Held on the Engine (instead of constructed fresh per call
@@ -970,6 +978,7 @@ impl PyEngine {
             signer: cell.signer.clone(),
             signer_key_id: cell.signer_key_id.clone(),
             local_signer: cell.local_signer.clone(),
+            derived_key_id_memo: Arc::new(std::sync::OnceLock::new()),
             #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
             sqlite_audit: cell.sqlite_audit.clone(),
             closed: cell.closed.clone(),
@@ -1394,9 +1403,23 @@ impl PyEngine {
     /// helper that blocked here would be correct at every call site today and
     /// invisible to the gate that keeps it so.
     async fn local_derived_key_id_async(&self) -> PyResult<String> {
-        crate::signing::federation_key_id_of(&*self.signer)
+        // Round ten — memoized. `federation_key_id_of` reads
+        // `signer.public_key()`, an IPC round trip on a real hardware signer
+        // (the ~80ms dbus cost behind #137). The composed signer is fixed for
+        // the life of the Engine, so its derived id is computed once. Routing
+        // every announcing door through the signer preflight would otherwise
+        // have added two of those reads to every write.
+        if let Some(cached) = self.derived_key_id_memo.get() {
+            return Ok(cached.clone());
+        }
+        let derived = crate::signing::federation_key_id_of(&*self.signer)
             .await
-            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))
+            .map_err(|e| PyValueError::new_err(format!("local derived key id: {e}")))?;
+        // A racing caller may have filled it; either value is the same bytes.
+        Ok(self
+            .derived_key_id_memo
+            .get_or_init(|| derived.clone())
+            .clone())
     }
 
     /// #846 (BLOB_REPLICATION.md §4, I46) — an [`Engine`](crate::Engine) view
@@ -4120,6 +4143,8 @@ impl PyEngine {
             signer: self.signer.clone(),
             signer_key_id: self.signer_key_id.clone(),
             local_signer: self.local_signer.clone(),
+            // Shared, not re-derived: a handle has the SAME composed signer.
+            derived_key_id_memo: self.derived_key_id_memo.clone(),
             #[cfg(all(feature = "sqlite", feature = "cirisaudit"))]
             sqlite_audit: self.sqlite_audit.clone(),
             closed: self.closed.clone(),

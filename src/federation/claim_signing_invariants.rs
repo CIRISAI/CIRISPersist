@@ -555,6 +555,24 @@ mod tests {
                  blob is stranded without its key."
             );
         }
+        // I89 (d), round ten — the preflight must not cost an IPC round trip per
+        // write. `local_derived_key_id_async` reads `signer.public_key()`, which
+        // on a real hardware signer is the ~80ms dbus call #137 exists to avoid,
+        // and routing every door through the preflight calls it on every write.
+        // The composed signer is fixed for the Engine's life, so the id is
+        // memoized; assert that, because losing it is a silent regression no
+        // test would otherwise fail on.
+        let derive_fn = PYO3_RS
+            .split("async fn local_derived_key_id_async(")
+            .nth(1)
+            .expect("I89 (d): the derivation helper exists");
+        let derive_body = &derive_fn[..derive_fn.find("\n    }").expect("fn end")];
+        assert!(
+            derive_body.contains("derived_key_id_memo"),
+            "I89 (d): the node-identity derivation must be memoized — every announcing door \
+             now asks for it, and on a hardware signer each read is an IPC round trip"
+        );
+
         assert!(
             sites >= 4,
             "I89 (c): expected several take-the-signer sites in the PyO3 surface, found \
