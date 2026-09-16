@@ -632,6 +632,18 @@ door. No shared directory.
 | I66 (extended) | A pre-V145 binding authored by an old signer stays the old occurrence's and refuses under the new key; a NULL-author row resolves to the node; an adopted binding keeps its author. | a new occurrence opening an old one's epoch; silent stranding | behavioural, sqlite file |
 | I65 (5) | A retroactive ADD on the adopting node skips the peer-authored blob and grants the new device nothing there. | a rekey aborting on adopted content | behavioural, two-node |
 
+## 19. What Edge and Server do
+
+- **Edge**: add the wire kind (sixteenth, in order); on admitting a
+  `KeyGrant` call `apply_replicated_key_grant`; nothing else in the
+  pull-on-attestation hook changes — the grants arrive on the same
+  replication path the hook already sits on. Then the #601 ladder rung "B
+  opens A's body across nodes" turns green.
+- **Server**: re-pin `REPLICATION_POLICY_HASH`; N-member rooms need nothing
+  else.
+
+**v44.3.0**, MINOR with the re-pin stated.
+
 ## 20. The occurrence that carries the key (#851)
 
 CIRISEdge's mesh harness ran the plane I61 could not: I61 copies each node's
@@ -778,6 +790,19 @@ federation-tier ingest gate verifies a `holds_bytes` row against its own
 cursor served and every peer refused: the classical claim's sibling defect,
 found by the same directive.
 
+**One identity per announcing engine.** In the `from_shared_with_local` shape
+the composed signer and the LocalSigner may be different keys. The cascades
+record the node (the composed signer) as author, epoch minter and stream
+owner, while the holder claim and the `KeyGrant` set are signed by the
+LocalSigner — so peers, which enforce signer == blob author / minter, reject
+every set, and `check_stream_head_matches` rejects every seal before the
+manifest is created. Content would be stored whose key can never follow it.
+Every announcing door (`put_blob_signing`, `put_blob_scoped`,
+`seal_stream_scoped`, and the `Announce` branch of `adopt_sealed_blob`) takes
+its signer through one accessor that refuses the mismatch before storing
+anything. A `LocalOnly` adopt announces nothing and needs no such signer
+(I81, I83, I87).
+
 ### 20.4 Invariants — three planes, delivered, never copied
 
 | # | invariant | falsified by | gate |
@@ -787,16 +812,11 @@ found by the same directive.
 | I77 | A `KeyGrant` whose minter is an owned node with no occurrence row on the admitting node is admitted when the owner is an active member, refused when the owner was removed at `asserted_at` or the binding is not live. | membership asked about the instrument | behavioural, two-node |
 | I78 | The occurrence plane's since-read lists the published occurrence (signed-put) and never a trusted-local row (from disk + behavioural). | an occurrence written unadvertised | both |
 | I79 | A `holds_bytes` claim announced by an Engine with a LocalSigner carries a PQC signature and is admitted by a peer through the attestation cursor. | a claim the plane serves and every peer refuses | behavioural, two Engines |
-
-## 19. What Edge and Server do
-
-- **Edge**: add the wire kind (sixteenth, in order); on admitting a
-  `KeyGrant` call `apply_replicated_key_grant`; nothing else in the
-  pull-on-attestation hook changes — the grants arrive on the same
-  replication path the hook already sits on. Then the #601 ladder rung "B
-  opens A's body across nodes" turns green.
-- **Server**: re-pin `REPLICATION_POLICY_HASH`; N-member rooms need nothing
-  else.
-
-**v44.3.0**, MINOR with the re-pin stated.
-
+| I80 | A LocalSigner with no ML-DSA-65 half refuses to sign a claim; the door names `PqcNotConfigured` and stores nothing announced. | a classical fallback re-entering by omission | behavioural |
+| I81 | A LocalSigner whose derived id is not the claimed attester refuses. | one engine announcing another node's holding | behavioural |
+| I82 | `publish_self_occurrence` refuses a LocalSigner that is not this node's identity. | a node publishing an occurrence it does not hold the key for | behavioural, both backends |
+| I83 | A `from_shared` Engine (no LocalSigner) cannot announce, and the refusal happens before anything is stored. | a refusal that leaves a half-written row | behavioural, both backends |
+| I84 | A `subject_key_ids` entry that is empty, carries whitespace, or is a malformed `canonical:` id is refused — on emit (`SubjectGate::Emit`) and on every backend's ingest (`SubjectGate::Ingest`). (b) a replicated row carrying one is refused at the store floor, and the `uppercase` clause is deferred at ingest by name, not by silence. | a subject nobody can match under withdraws rules 2/3 — a row nobody can ever revoke | from disk (parity) + behavioural, three backends |
+| I85 | A `withdraws` naming a `key_grant:*` row is refused, not admitted inert — (b) including the deferred branch, where the target has not arrived and the row declares `references_attestation_type: key_grant:*`. | a revocation every reader ignores and its emitter believes took effect | behavioural, both backends |
+| I86 | A proxy write records the peer as the row's `author_key_id` while the node announces the holder claim as itself, so `serve_blob_to_peer` still classifies proxy content and the stop-tier proxy-serve refusal still applies. | the caller-supplied author lost to the attester, proxy content served as locally authored | behavioural, both backends |
+| I87 | `AdoptDisposition::LocalOnly` adopts without a LocalSigner; only `Announce` requires one. | a hardware or classical engine unable to hold received bytes it never announces | behavioural, both backends |
