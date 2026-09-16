@@ -225,6 +225,24 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   `if has_pqc_key` guard that the hybrid-only ruling removed. The assertion is
   unconditional now.
 
+### Review round nine — the canonical PREFIX is part of the spelling
+- `strip_prefix` is case-sensitive, so `Canonical:sha256:<lowercase hex>` never
+  entered the canonical branch at all: it fell through as an ordinary subject,
+  and `SubjectGate::Ingest` skips the general uppercase clause, so a peer could
+  persist it. That is the uppercase-digest defect again by another spelling —
+  an id that LOOKS canonical, that exact-match canonical binding and withdrawal
+  authority never recognize, leaving the subject unrevocable by its canonical
+  identity. Anything whose first ten bytes are `canonical:` in ANY case must
+  now be exactly the canonical form or be refused, and `canonical:SHA256:` is
+  refused for the same reason. Compared as BYTES, so a multi-byte character
+  cannot panic a slice. The cirisnode legacy corpus is untouched: base64
+  subjects contain no `:`.
+- I84 (d) carries the vectors and asserts the DIAGNOSIS on ingest, not just the
+  refusal. That is not decoration: the generic "is not sha256" branch already
+  refuses `canonical:SHA256:…`, so without asserting which clause spoke, the
+  hash-family clause was a surviving mutant. An operator reading a rejected
+  subject needs to be told which part of the spelling is wrong.
+
 ### CC 2.3 audit (operator) — two gates closed
 - **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
   a subject that is empty, carries any whitespace, or is a `canonical:` id

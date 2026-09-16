@@ -604,8 +604,30 @@ pub fn validate_subject_key_ids_at(
         if sid.chars().any(char::is_whitespace) {
             return malformed("whitespace");
         }
+        // PR #852 review round nine — `strip_prefix` is CASE-SENSITIVE, so
+        // `Canonical:sha256:<lowercase hex>` never entered the branch below at
+        // all: it fell through as an ordinary subject, and `SubjectGate::Ingest`
+        // skips the general uppercase clause, so a peer could persist it. That
+        // is the uppercase-digest defect again by another spelling — an id that
+        // LOOKS canonical, that exact-match canonical binding and withdrawal
+        // authority never recognize, leaving the subject unrevocable by its
+        // canonical identity. Anything whose first ten bytes are `canonical:`
+        // in ANY case must be exactly the canonical form or be refused; that
+        // also catches `canonical:SHA256:…`. Compared as BYTES so a multi-byte
+        // character cannot panic a slice, and the cirisnode legacy corpus is
+        // untouched because base64 subjects contain no `:`.
+        let looks_canonical =
+            sid.len() >= 10 && sid.as_bytes()[..10].eq_ignore_ascii_case(b"canonical:");
+        if looks_canonical && !sid.starts_with("canonical:") {
+            return malformed("canonical prefix is not lowercase");
+        }
         if let Some(rest) = sid.strip_prefix("canonical:") {
+            // Round nine — the hash family is part of the canonical spelling:
+            // `canonical:SHA256:…` is the same alternate-spelling defect.
             let Some(digest) = rest.strip_prefix("sha256:") else {
+                if rest.len() >= 7 && rest.as_bytes()[..7].eq_ignore_ascii_case(b"sha256:") {
+                    return malformed("canonical hash family is not lowercase");
+                }
                 return malformed("canonical id is not sha256");
             };
             // PR #852 review round seven — `is_ascii_hexdigit()` accepts `A`-`F`,
