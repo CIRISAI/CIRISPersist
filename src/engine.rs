@@ -5409,6 +5409,25 @@ impl Engine {
             ),
             ));
         }
+        // PR #852 review round seven — the preflight must ask the question the
+        // cascade will ask LATER. Existence and identity are not enough: an
+        // Ed25519-only LocalSigner passes both, `put_blob_scoped` then persists
+        // ciphertext and mints grants, and `sign_hybrid` fails afterwards inside
+        // the announcement or the KeyGrant emission — leaving an orphaned blob
+        // whose key was never federated, which is the exact state §20.5 exists to
+        // prevent. `sign_hybrid` returns `PqcNotConfigured` iff `pqc_signer` is
+        // absent, so this is the same predicate, asked before anything is stored.
+        if local.pqc_signer().is_none() {
+            return Err(crate::federation::BlobError::AttestationEmissionFailed(
+                format!(
+                    "hybrid-only: this engine's LocalSigner ({}) has no ML-DSA-65 key, so nothing \
+                 it announces would be admitted at federation tier (CC 5.3.2.4.3.1); refused \
+                 BEFORE any cascade writes, so no blob is stored whose key cannot follow it \
+                 (CIRISPersist#851 §20.5)",
+                    local.derived_key_id()
+                ),
+            ));
+        }
         Ok(local)
     }
 

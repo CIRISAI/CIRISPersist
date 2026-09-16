@@ -1302,13 +1302,30 @@ impl PyEngine {
     /// whose parameter names the AUTHOR (the commons form) announce as this
     /// node. No PQC LocalSigner ⇒ no announcement.
     fn announcing_signer_any(&self) -> PyResult<Arc<crate::signing::LocalSigner>> {
-        self.local_signer.clone().ok_or_else(|| {
+        let local = self.local_signer.clone().ok_or_else(|| {
             blob_err_to_py(crate::federation::BlobError::AttestationEmissionFailed(
                 "hybrid-only: this engine has no PQC LocalSigner and cannot announce a \
                  federation-tier holds_bytes claim (CIRISPersist#851 §20.5 / CC 5.3.2.4.3.1)"
                     .into(),
             ))
-        })
+        })?;
+        // PR #852 review round seven — the Python preflight asks the same
+        // question as `Engine::announcing_signer`: an Ed25519-only LocalSigner
+        // EXISTS, so the check above passes, the cascade persists ciphertext and
+        // grants, and `sign_hybrid` fails afterwards, orphaning a blob whose key
+        // was never federated. Refuse before any cascade writes.
+        if local.pqc_signer().is_none() {
+            return Err(blob_err_to_py(
+                crate::federation::BlobError::AttestationEmissionFailed(format!(
+                    "hybrid-only: this engine's LocalSigner ({}) has no ML-DSA-65 key, so \
+                     nothing it announces would be admitted at federation tier \
+                     (CC 5.3.2.4.3.1); refused BEFORE any cascade writes, so no blob is \
+                     stored whose key cannot follow it (CIRISPersist#851 §20.5)",
+                    local.derived_key_id()
+                )),
+            ));
+        }
+        Ok(local)
     }
 
     /// #846 (§5 / I23) — this node's DERIVED federation key id, for the

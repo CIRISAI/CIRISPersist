@@ -283,6 +283,143 @@ mod tests {
         );
     }
 
+    /// **I88 (review round seven) — the announcing preflight asks the question
+    /// the CASCADE will ask later.** An Ed25519-only `LocalSigner` that IS this
+    /// node's identity passes both earlier clauses (it exists; it matches), so
+    /// before this the commons door persisted ciphertext and minted grants and
+    /// only THEN failed inside `sign_hybrid` — leaving an orphaned blob whose
+    /// key was never federated, the exact state §20.5 exists to prevent. The
+    /// refusal must happen before the cascade mutates storage.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i88_a_pqc_less_announcing_engine_refuses_before_the_cascade_writes_sqlite() {
+        use crate::federation::BlobStorage;
+        use crate::signing::LocalSigner;
+        use crate::store::Backend as _;
+        use std::sync::Arc;
+        let backend = Arc::new(
+            crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap(),
+        );
+        backend.run_migrations().await.unwrap();
+
+        // The engine's ONE identity is classical-only: the composed signer and
+        // the LocalSigner are the same key, so the identity clause passes and
+        // only the PQC clause can refuse.
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x88u8; 32]);
+        let local = Arc::new(LocalSigner::from_parts(
+            ed,
+            "i88-classical-only".to_owned(),
+            None,
+            None,
+        ));
+        assert!(
+            local.pqc_signer().is_none(),
+            "I88: precondition — the LocalSigner has no ML-DSA-65 half"
+        );
+        let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
+        );
+        let engine = crate::Engine::from_shared_with_local(
+            crate::engine::BackendDispatch::Sqlite(backend.clone()),
+            signer,
+            Some(local.clone()),
+        );
+
+        let node_key = local.derived_key_id();
+
+        // The commons door: the blob is addressed by a sha the CALLER knows, so
+        // "was anything stored?" is directly observable — no guessing at a
+        // ciphertext address.
+        let body = b"i88 commons bytes that must never be stored".to_vec();
+        let sha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&body).into()
+        };
+        assert!(
+            backend.get_blob(&sha).await.unwrap().is_none(),
+            "I88: precondition — nothing stored at this address yet"
+        );
+
+        let err = engine
+            .put_blob_signing(
+                &sha,
+                crate::federation::BlobBody::Inline(body),
+                None,
+                &node_key,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect_err("I88: a PQC-less announcing engine must refuse the commons door");
+        // The orphan check FIRST — it is the claim. A deeper gate
+        // (`sign_holds_bytes_claim`) also refuses a PQC-less signer, so the
+        // ERROR alone cannot tell a preflight from a late failure; only the
+        // absence of stored bytes can.
+        assert!(
+            backend.get_blob(&sha).await.unwrap().is_none(),
+            "I88: the refused door stored NO bytes — it refused BEFORE writing, \
+             not after"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hybrid-only") && msg.contains("ML-DSA-65"),
+            "I88: the refusal names the rule: {msg}"
+        );
+        assert!(
+            msg.contains("BEFORE any cascade writes"),
+            "I88: the refusal is the PREFLIGHT, not the late signing failure: {msg}"
+        );
+
+        // Leg 2 — the CASCADE door, which is where the orphan actually lives.
+        // The commons door signs before it stores, so nothing is left behind
+        // there; `put_blob_scoped` mints the epoch DEK and seals FIRST and only
+        // then signs, so without the preflight it strands key material and
+        // ciphertext for a blob whose grant set can never be emitted.
+        let comm = "community-i88";
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            backend.as_ref(),
+            comm,
+            &[("i88-alice", "i88-alice-occ")],
+        )
+        .await;
+        for epoch in 0..2u64 {
+            assert!(
+                backend
+                    .community_dek_get_self_retention(comm, &node_key, epoch)
+                    .await
+                    .expect("I88: baseline DEK read")
+                    .is_none(),
+                "I88: precondition — no epoch {epoch} DEK before the scoped write"
+            );
+        }
+        let err = engine
+            .put_blob_scoped(
+                crate::federation::types::cohort_scope::COMMUNITY,
+                Some(comm),
+                b"i88 community bytes that must never be sealed",
+                None,
+                None,
+            )
+            .await
+            .expect_err("I88: a PQC-less announcing engine must refuse the cascade door");
+        assert!(
+            err.to_string().contains("BEFORE any cascade writes"),
+            "I88: the cascade door refuses at the preflight: {err}"
+        );
+        for epoch in 0..2u64 {
+            assert!(
+                backend
+                    .community_dek_get_self_retention(comm, &node_key, epoch)
+                    .await
+                    .expect("I88: DEK read after the refusal")
+                    .is_none(),
+                "I88: the refused cascade minted NO epoch {epoch} DEK — it never ran"
+            );
+        }
+    }
+
     /// **I84 (CC 2.3.2.1, the CC 2.3 audit) — a malformed subject is REFUSED
     /// at the gate, never normalized into acceptance.** The consequence of
     /// admitting one is silent and permanent: a subject nobody can match under
@@ -323,6 +460,34 @@ mod tests {
             &format!("canonical:sha256:{}", "z".repeat(64)),
             "non-hex digest",
         );
+
+        // I84 (c), review round seven — the digest clause is spelled out, NOT
+        // borrowed from the general uppercase check, so it holds on the gate
+        // where that check is deliberately skipped. `is_ascii_hexdigit()`
+        // accepts `A`-`F`; an uppercase digest admitted at ingest never matches
+        // the lowercase canonical binding under withdraws rules 2/3, so the
+        // subject is unrevocable by its canonical identity.
+        use crate::federation::SubjectGate;
+        for gate in [SubjectGate::Emit, SubjectGate::Ingest] {
+            let upper = format!("canonical:sha256:{}", "A".repeat(64));
+            let err =
+                crate::federation::validate_subject_key_ids_at(std::slice::from_ref(&upper), gate)
+                    .expect_err("I84 (c): an UPPERCASE canonical digest is refused on BOTH gates");
+            assert!(
+                err.to_string().contains("CC 2.3.2.1"),
+                "I84 (c): the refusal cites the clause on {gate:?}: {err}"
+            );
+            // Mixed case is the same defect, and the likelier spelling.
+            let mixed = format!("canonical:sha256:{}{}", "A".repeat(32), "b".repeat(32));
+            crate::federation::validate_subject_key_ids_at(&[mixed], gate)
+                .expect_err("I84 (c): a MIXED-case canonical digest is refused on BOTH gates");
+            // The lowercase form still passes on both gates — the clause
+            // narrows the alphabet, it does not close the canonical door.
+            let lower = format!("canonical:sha256:{}", "9f".repeat(32));
+            crate::federation::validate_subject_key_ids_at(&[lower], gate).unwrap_or_else(|e| {
+                panic!("I84 (c): lowercase hex stays admissible on {gate:?}: {e}")
+            });
+        }
     }
 
     /// **I85 (CC 3, the CC 2.3 audit) — a `withdraws` naming a `key_grant`

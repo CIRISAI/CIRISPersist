@@ -608,7 +608,22 @@ pub fn validate_subject_key_ids_at(
             let Some(digest) = rest.strip_prefix("sha256:") else {
                 return malformed("canonical id is not sha256");
             };
-            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            // PR #852 review round seven — `is_ascii_hexdigit()` accepts `A`-`F`,
+            // and `SubjectGate::Ingest` deliberately skips the general uppercase
+            // clause above (the cirisnode legacy corpus), so a peer could persist
+            // `canonical:sha256:<UPPERCASE>` while this branch's own message
+            // promised lowercase. Canonical binding and withdrawal authority
+            // compare by exact string equality, so the alternate spelling never
+            // matches the lowercase binding and the subject becomes unrevocable
+            // by its canonical identity — the precise harm CC 2.3.2.1 names.
+            // The digest is spelled out here rather than deferred to the general
+            // clause, so it holds on BOTH gates; the legacy exception covers
+            // non-canonical subjects only, and none of those carry this prefix.
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
                 return malformed("canonical sha256 digest is not 64 lowercase hex");
             }
         }
