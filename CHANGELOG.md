@@ -205,6 +205,26 @@ never arrived was never in the set. `FSD/BLOB_REPLICATION.md` §20.
   from the general clause. The legacy exception covers non-canonical subjects,
   none of which carry this prefix. I84 (c).
 
+### Review round eight — one announcing predicate, asked by both doors
+- **The PyO3 door was announcing through a foreign key.** Round six added the
+  identity check to `Engine::announcing_signer`; round seven added the PQC
+  check there and to `announcing_signer_any`, but not the identity check. A
+  hardware-signer engine carrying a distinct legacy local key would therefore
+  sign and attribute the holder claim as that unrelated key: usually the
+  attestation FK rejects the write because only the composed node key is
+  registered, but where the local key was separately registered, peers record
+  the WRONG node as holder.
+- **The shape is the lesson.** Two doors asking one question had become two
+  implementations, drifting by one clause per review round.
+  `check_announcing_signer` is now that one question, in `federation::blobs`
+  beside the claim signer it protects, and both doors delegate to it. I89
+  witnesses the predicate; **I89 (b) witnesses the ROUTING**, which is the part
+  that actually failed — `include_str!` asserts both accessors call it and that
+  neither re-spells a clause locally.
+- The Python commons-door test still tolerated a classical claim behind an
+  `if has_pqc_key` guard that the hybrid-only ruling removed. The assertion is
+  unconditional now.
+
 ### CC 2.3 audit (operator) — two gates closed
 - **CC 2.3.2.1 reject vectors are enforced** (`validate_subject_key_ids_at`):
   a subject that is empty, carries any whitespace, or is a `canonical:` id
