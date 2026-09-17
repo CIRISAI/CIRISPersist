@@ -5,7 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [44.5.0] - UNRELEASED
+## [44.5.0] - 2026-09-17
+
+### Added — what the v44.4.0 adopters asked for (`BLOB_REPLICATION.md` §21)
+- **`Engine::serve_blob_range_to_peer`** (CIRISPersist#821 Q1, §21.1) — the
+  ranged serve: the same two gates as `serve_blob_to_peer`, a different body.
+  CIRISEdge's swarm answers one chunk at a time, and a chunk responder wired
+  to `get_blob_range` directly bypassed BOTH serve gates — the stop-tier
+  proxy-serve refusal and the quarantine consult — while the whole-blob path
+  still honoured them, so enforcement looked intact and a pressured node kept
+  relaying, or a quarantined blob leaked one chunk at a time with every read
+  green. Both gates are whole-blob decisions keyed only on `sha256`, so the
+  ranged door is the identical decision: extracted into ONE internal
+  `check_serve_disposition` both doors ask before reading a body. Range
+  semantics are the storage trait's (RFC 9110 §14.4, inclusive end, clamped;
+  a start past the size is `RangeNotSatisfiable`), returning `BlobRange`
+  exactly as `get_blob_range` does; refusals are the existing typed arms, so
+  a peer's `PolicyDenied` mapping needs no new case. Ruled on the #821 thread
+  2026-09-09; as of 2026-09-16 it gates files. I90 (pressure + quarantine
+  legs, each with the whole-blob refusal as a precondition so the ranged
+  assertion cannot pass vacuously); I90 (b) from disk: every serve door routes
+  through the disposition, reads the body only AFTER it, and re-spells
+  neither gate — the PR #852 lesson, gated over the doors rather than the
+  extraction. I49 now inspects the disposition, where the decision moved.
+- **`valid_until` on `publish_self_occurrence`** (CIRISPersist#855, §21.2) —
+  one more bound member. The door built its envelope with `valid_until:
+  null`, and `put_identity_occurrence` is a last-signed-wins upsert whose
+  `DO UPDATE` carries the column, so a republish silently replaced a stored
+  expiry with none; Edge's heal for a node whose occurrence predates the plane
+  therefore refused any row carrying an expiry and left it invisible. `Engine`
+  and `publish_self_occurrence_with_local_signer` take
+  `valid_until: Option<DateTime<Utc>>`, truncated to the millisecond BEFORE
+  signing (the gate compares the typed instant to the envelope's millisecond
+  rendering; a finer instant would sign one thing and store another);
+  `PyEngine.publish_self_occurrence` gains a trailing `valid_until_iso`
+  keyword. Nothing else moves: not the drift rule, not the upsert. I91.
+- **`self_at_login` publishes the device occurrences** (CIRISPersist#856,
+  §21.3) — the producer that FSD §20.3 said existed did not: "Edge produces
+  it with the identity seed", and Edge holds no identity seed, while
+  CIRISServer, the caller with the app+agent shape, wrote through
+  `put_identity_occurrence_local` — signature columns NULL, never served. It
+  matters the moment a device occurrence must be a wrap target on a FAR node
+  (a member's phone reading a room whose seals are minted elsewhere), because
+  the minter's cascade folds occurrences on the minter's node and a local-door
+  row from another node is not there — the #851 shape one class down. With
+  `identity_signer` (already on the input, already required to BE the
+  identity), each occurrence carrying `encryption_pubkeys` is built as the
+  §20.2 content-only envelope, signed by the identity, and admitted through
+  the gated door — following the pattern the delegation in the same call
+  already had. Without the signer, today's trusted-local write, unchanged. An
+  occurrence with no `encryption_pubkeys` has no replicable form (they ARE
+  the content) and stays trusted-local even with a signer, reported in the
+  new `occurrences_local_only` alongside `occurrences_published`; not a
+  signing fallback — no claim is emitted classically, the row is simply not
+  put on the key plane. ONE envelope producer
+  (`publish_signed_content_only_occurrence`) now serves both the node's own
+  occurrence and the device one, so the two cannot drift by a bound field.
+  The signer-is-the-identity check moved ahead of step 1, because step 1 now
+  signs with it (I93: a foreign signer refuses before any occurrence is
+  written). No new failure mode for the only production caller — CIRISServer
+  passes `identity_signer: None`. I92 (two nodes: the plane advertises both
+  device rows and the far node admits them through the same gate), I92 (b),
+  I93.
+
+### Changed — breaking for Rust callers, flagged
+- **`Engine::publish_self_occurrence` and
+  `publish_self_occurrence_with_local_signer` take a third parameter**,
+  `valid_until: Option<DateTime<Utc>>` (#855). Rust callers pass `None` to
+  keep today's behaviour, or the expiry a row already carries when healing it
+  onto the plane — CIRISEdge's `provision_engine_occurrence` is the one
+  caller. Python is unchanged for existing callers: `valid_until_iso` is a
+  trailing keyword defaulting to `None`. A clean break rather than an
+  `_at` twin, per the rename rule: one door, one signature.
+- **`SelfAtLoginOutcome` gains `occurrences_published` and
+  `occurrences_local_only`** (#856). Additive for readers; a consumer that
+  constructs the struct by hand would need the two fields.
+- **`quarantine` markers and the serve path**: no behavioural change, but the
+  I90 quarantine leg is the first witness of the serve door's quarantine arm
+  driven through a backend. It found that `list_attestations_for` reads
+  federation-tier rows only, so a local-tier marker withholds nothing — which
+  is correct, and now stated.
 
 ### Changed
 - **CIRISVerify re-pin v15.1.0 → v15.2.0** (CIRISVerify#281 / PR #282): all
