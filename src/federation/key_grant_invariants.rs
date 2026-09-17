@@ -3482,11 +3482,15 @@ mod tests {
             deliver_attestations(&sb, &engine_a, &sa).await;
             // ── each node publishes its OWN occurrence (§20.3) ────────
             engine_a
-                .publish_self_occurrence(&alice, crate::federation::types::device_class::SERVER)
+                .publish_self_occurrence(
+                    &alice,
+                    crate::federation::types::device_class::SERVER,
+                    None,
+                )
                 .await
                 .expect("I75: A publishes its occurrence under alice");
             engine_b
-                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER)
+                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER, None)
                 .await
                 .expect("I75: B publishes its occurrence under bob");
             // Occurrences cross through the plane and the gated door.
@@ -3575,12 +3579,491 @@ mod tests {
                 .publish_self_occurrence(
                     "i82-owner",
                     crate::federation::types::device_class::SERVER,
+                    None,
                 )
                 .await
                 .expect_err("I82: a LocalSigner that is not the node's identity is refused");
             assert!(
                 err.to_string().contains("not this node's identity"),
                 "I82: the refusal names the mismatch: {err}"
+            );
+        }
+
+        /// **I91 (§21.2, #855) — `valid_until` is one more bound member.**
+        /// Stored at millisecond precision, carried in the envelope, admitted
+        /// by the gate; `None` stores NULL; and a republish carrying the expiry
+        /// KEEPS it — the republish that dropped an operator's expiry is the
+        /// defect.
+        #[tokio::test]
+        async fn i91_publish_self_occurrence_carries_valid_until_sqlite() {
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::identity_type::USER;
+            use crate::federation::{FederationDirectory, SignedAttestation};
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("i91-node-{run}");
+            let engine =
+                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+                    .await
+                    .unwrap();
+            engine
+                .register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    &alias,
+                    None,
+                    serde_json::json!({}),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let s = engine.sqlite_backend().unwrap().clone();
+            let me = engine.local_derived_key_id().await.unwrap();
+            let alice = format!("i91-alice-{run}");
+            ts::register_identity_key(s.as_ref(), &alice, USER).await;
+            // alice owns this node — the binding the lift resolves through.
+            s.apply_replicated_attestation(SignedAttestation {
+                attestation: ts::owner_binding_attestation(&format!("ob-{run}"), &alice, &me),
+            })
+            .await
+            .unwrap();
+
+            // A sub-millisecond instant: the door must truncate BEFORE signing,
+            // or it signs one rendering and stores another.
+            let until = chrono::DateTime::parse_from_rfc3339("2031-06-01T12:00:00.123456Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let until_ms =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(until.timestamp_millis())
+                    .unwrap();
+            let server = crate::federation::types::device_class::SERVER;
+
+            let signed = engine
+                .publish_self_occurrence(&alice, server, Some(until))
+                .await
+                .expect("I91: publish with an expiry");
+            assert_eq!(
+                signed.identity_occurrence.valid_until,
+                Some(until_ms),
+                "I91: the typed row carries the expiry at ms precision"
+            );
+            assert_eq!(
+                signed
+                    .signed_envelope
+                    .get("valid_until")
+                    .and_then(|v| v.as_str()),
+                Some(
+                    until_ms
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                        .as_str()
+                ),
+                "I91: the envelope carries the SAME instant"
+            );
+            let stored = |s: &std::sync::Arc<SqliteBackend>| {
+                let s = s.clone();
+                let alice = alice.clone();
+                let me = me.clone();
+                async move {
+                    FederationDirectory::list_identity_occurrences_for(s.as_ref(), &alice)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .find(|o| o.occurrence_key_id == me)
+                        .expect("I91: the node's occurrence is stored")
+                        .valid_until
+                }
+            };
+            assert_eq!(
+                stored(&s).await,
+                Some(until_ms),
+                "I91: stored, not just returned"
+            );
+            // It is on the plane — the gate admitted the bound member.
+            assert!(
+                s.list_signed_identity_occurrences_since(None, 1_000)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|x| x.occurrence.identity_occurrence.valid_until == Some(until_ms)),
+                "I91: the plane serves the row with its expiry"
+            );
+
+            // Republish WITH the expiry: it stays. This is the heal Edge needs.
+            engine
+                .publish_self_occurrence(&alice, server, Some(until_ms))
+                .await
+                .expect("I91: republish with the same expiry");
+            assert_eq!(
+                stored(&s).await,
+                Some(until_ms),
+                "I91: a republish keeps the expiry"
+            );
+
+            // And `None` stores NULL — the door does not invent an expiry.
+            engine
+                .publish_self_occurrence(&alice, server, None)
+                .await
+                .expect("I91: publish without an expiry");
+            assert_eq!(stored(&s).await, None, "I91: None stores NULL");
+        }
+
+        /// **I92 (§21.3, #856) — the device occurrence's producer is
+        /// `self_at_login`, and what it produces crosses the plane.** With
+        /// the identity's signer, each pubkey-bearing occurrence is admitted
+        /// through the GATED door: the stored row is signed-put, the plane
+        /// advertises it, and a second node admits it through the same gate.
+        /// Without the signer the rows are trusted-local and the plane does
+        /// not list them — today's behaviour, unchanged.
+        #[tokio::test]
+        async fn i92_self_at_login_publishes_device_occurrences_through_the_gated_door_sqlite() {
+            use crate::engine::{SelfAtLoginInput, SelfAtLoginOccurrence};
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::identity_type::{AGENT, USER};
+            use crate::federation::FederationDirectory;
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let (alias_a, alias_b) = (format!("i92-a-{run}"), format!("i92-b-{run}"));
+            let engine_a = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_a),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            let engine_b = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&alias_b),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            for (e, alias) in [(&engine_a, &alias_a), (&engine_b, &alias_b)] {
+                e.register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    alias,
+                    None,
+                    serde_json::json!({}),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            }
+            let (sa, sb) = (
+                engine_a.sqlite_backend().unwrap().clone(),
+                engine_b.sqlite_backend().unwrap().clone(),
+            );
+            // The identity: registered on BOTH nodes under its DERIVED id with
+            // the label's real pubkeys, because the far node verifies the
+            // identity's signature over the occurrence.
+            let identity_label = format!("i92-alice-{run}");
+            let identity_signer = ts::local_signer(&identity_label);
+            let identity = identity_signer.derived_key_id();
+            for s in [&sa, &sb] {
+                ts::register_hybrid_key_as(s.as_ref(), &identity, &identity_label, USER).await;
+            }
+            // The device keys, on both nodes (the occurrence names them).
+            let (app_key, agent_key) = (format!("i92-app-{run}"), format!("i92-agent-{run}"));
+            for s in [&sa, &sb] {
+                ts::register_hybrid_key_as(s.as_ref(), &app_key, &app_key, USER).await;
+                ts::register_hybrid_key_as(s.as_ref(), &agent_key, &agent_key, AGENT).await;
+            }
+            let mk_keys = || {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                let (_xp, x_pub, _mp, ml_pub) =
+                    crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+                crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(ml_pub),
+                }
+            };
+            let input =
+                |signer: Option<std::sync::Arc<crate::signing::LocalSigner>>| SelfAtLoginInput {
+                    identity_key_id: identity.clone(),
+                    identity_signer: signer,
+                    app: SelfAtLoginOccurrence {
+                        occurrence_key_id: app_key.clone(),
+                        device_class: crate::federation::types::device_class::PHONE.to_owned(),
+                        // The producer's Some(..) path: a bound member the
+                        // node's own occurrence never exercises.
+                        hardware_attestation: Some("hw-attest-i92".to_owned()),
+                        encryption_pubkeys: Some(mk_keys()),
+                        transport_destinations: vec![],
+                    },
+                    agent: SelfAtLoginOccurrence {
+                        occurrence_key_id: agent_key.clone(),
+                        device_class: crate::federation::types::device_class::AGENT.to_owned(),
+                        hardware_attestation: None,
+                        encryption_pubkeys: Some(mk_keys()),
+                        transport_destinations: vec![],
+                    },
+                    bilateral_pair_id: uuid::Uuid::new_v4().to_string(),
+                    delegation_scope: None,
+                };
+
+            // ── leg 1: with the signer, the rows are ON THE PLANE ─────────
+            let outcome = engine_a
+                .self_at_login(input(Some(identity_signer.clone())))
+                .await
+                .expect("I92: self_at_login with the identity's signer");
+            assert_eq!(
+                outcome.occurrences_published.len(),
+                2,
+                "I92: both pubkey-bearing occurrences were published: {outcome:?}"
+            );
+            assert!(outcome.occurrences_local_only.is_empty(), "{outcome:?}");
+            let on_plane: Vec<String> = sa
+                .list_signed_identity_occurrences_since(None, 1_000)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|s| s.occurrence.identity_occurrence.occurrence_key_id)
+                .collect();
+            assert!(
+                on_plane.contains(&app_key) && on_plane.contains(&agent_key),
+                "I92: the plane advertises BOTH device occurrences: {on_plane:?}"
+            );
+            // The far node admits them through the SAME gate — the identity's
+            // signature verifies against the identity's key, no lift needed.
+            let mut delivered = 0;
+            for served in sa
+                .list_signed_identity_occurrences_since(None, 1_000)
+                .await
+                .unwrap()
+            {
+                let occ = served.occurrence;
+                let k = occ.identity_occurrence.occurrence_key_id.clone();
+                if k != app_key && k != agent_key {
+                    continue;
+                }
+                sb.put_identity_occurrence(occ)
+                    .await
+                    .unwrap_or_else(|e| panic!("I92: B admits {k} through the gated door: {e}"));
+                delivered += 1;
+            }
+            assert_eq!(delivered, 2, "I92: both crossed");
+            let far: Vec<String> =
+                FederationDirectory::list_identity_occurrences_for(sb.as_ref(), &identity)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|o| o.occurrence_key_id)
+                    .collect();
+            assert!(
+                far.contains(&app_key) && far.contains(&agent_key),
+                "I92: on B: {far:?}"
+            );
+            // The hardware attestation crossed as a BOUND member: the far row
+            // carries the string the producer rendered into the envelope.
+            let far_app =
+                FederationDirectory::list_identity_occurrences_for(sb.as_ref(), &identity)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|o| o.occurrence_key_id == app_key)
+                    .expect("I92: the app row on B");
+            assert_eq!(
+                far_app.hardware_attestation.as_deref(),
+                Some("hw-attest-i92"),
+                "I92: hardware_attestation is bound into the envelope and crosses intact"
+            );
+
+            // ── leg 2: WITHOUT the signer, trusted-local, not on the plane ──
+            let engine_c = crate::Engine::with_signer_pre_genesis(
+                ts::local_signer(&format!("i92-c-{run}")),
+                "sqlite::memory:",
+            )
+            .await
+            .unwrap();
+            engine_c
+                .register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    &format!("i92-c-{run}"),
+                    None,
+                    serde_json::json!({}),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let sc = engine_c.sqlite_backend().unwrap().clone();
+            ts::register_hybrid_key_as(sc.as_ref(), &identity, &identity_label, USER).await;
+            ts::register_hybrid_key_as(sc.as_ref(), &app_key, &app_key, USER).await;
+            ts::register_hybrid_key_as(sc.as_ref(), &agent_key, &agent_key, AGENT).await;
+            let outcome_c = engine_c
+                .self_at_login(input(None))
+                .await
+                .expect("I92: self_at_login without a signer still lands (local)");
+            assert!(outcome_c.occurrences_published.is_empty(), "{outcome_c:?}");
+            assert_eq!(outcome_c.occurrences_local_only.len(), 2, "{outcome_c:?}");
+            let plane_c: Vec<String> = sc
+                .list_signed_identity_occurrences_since(None, 1_000)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|s| s.occurrence.identity_occurrence.occurrence_key_id)
+                .collect();
+            assert!(
+                !plane_c.contains(&app_key) && !plane_c.contains(&agent_key),
+                "I92: a trusted-local row is never on the plane: {plane_c:?}"
+            );
+            // But they ARE stored locally, so the node's own cascade sees them.
+            let local_c =
+                FederationDirectory::list_identity_occurrences_for(sc.as_ref(), &identity)
+                    .await
+                    .unwrap();
+            assert_eq!(local_c.len(), 2, "I92: stored locally");
+        }
+
+        /// **I92 (b) — an occurrence with no `encryption_pubkeys` has no
+        /// replicable form.** It is written trusted-local even when the signer
+        /// is present, login does NOT fail for it, and the outcome names it.
+        #[tokio::test]
+        async fn i92b_a_pubkey_less_occurrence_stays_local_and_is_named_sqlite() {
+            use crate::engine::{SelfAtLoginInput, SelfAtLoginOccurrence};
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::identity_type::{AGENT, USER};
+            use crate::federation::FederationDirectory;
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("i92b-{run}");
+            let engine =
+                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+                    .await
+                    .unwrap();
+            engine
+                .register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    &alias,
+                    None,
+                    serde_json::json!({}),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let s = engine.sqlite_backend().unwrap().clone();
+            let identity_label = format!("i92b-alice-{run}");
+            let identity_signer = ts::local_signer(&identity_label);
+            let identity = identity_signer.derived_key_id();
+            ts::register_hybrid_key_as(s.as_ref(), &identity, &identity_label, USER).await;
+            let (app_key, agent_key) = (format!("i92b-app-{run}"), format!("i92b-agent-{run}"));
+            ts::register_hybrid_key_as(s.as_ref(), &app_key, &app_key, USER).await;
+            ts::register_hybrid_key_as(s.as_ref(), &agent_key, &agent_key, AGENT).await;
+            let keys = {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                let (_xp, x_pub, _mp, ml_pub) =
+                    crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+                crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(ml_pub),
+                }
+            };
+            let outcome = engine
+                .self_at_login(SelfAtLoginInput {
+                    identity_key_id: identity.clone(),
+                    identity_signer: Some(identity_signer),
+                    app: SelfAtLoginOccurrence {
+                        occurrence_key_id: app_key.clone(),
+                        device_class: crate::federation::types::device_class::PHONE.to_owned(),
+                        hardware_attestation: None,
+                        encryption_pubkeys: Some(keys),
+                        transport_destinations: vec![],
+                    },
+                    agent: SelfAtLoginOccurrence {
+                        occurrence_key_id: agent_key.clone(),
+                        device_class: crate::federation::types::device_class::AGENT.to_owned(),
+                        hardware_attestation: None,
+                        encryption_pubkeys: None, // ← no replicable form
+                        transport_destinations: vec![],
+                    },
+                    bilateral_pair_id: uuid::Uuid::new_v4().to_string(),
+                    delegation_scope: None,
+                })
+                .await
+                .expect("I92 (b): login does not fail for a row that cannot replicate");
+            assert_eq!(
+                outcome.occurrences_published,
+                vec![app_key.clone()],
+                "{outcome:?}"
+            );
+            assert_eq!(
+                outcome.occurrences_local_only,
+                vec![agent_key.clone()],
+                "{outcome:?}"
+            );
+            let plane: Vec<String> = s
+                .list_signed_identity_occurrences_since(None, 1_000)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|x| x.occurrence.identity_occurrence.occurrence_key_id)
+                .collect();
+            assert!(plane.contains(&app_key), "I92 (b): the app is on the plane");
+            assert!(
+                !plane.contains(&agent_key),
+                "I92 (b): the pubkey-less agent is NOT"
+            );
+        }
+
+        /// **I93 — a signer that is not the identity refuses BEFORE any
+        /// occurrence is written.** The check existed (step 5); step 1 now
+        /// signs with the signer, so the check moves ahead of it.
+        #[tokio::test]
+        async fn i93_a_foreign_identity_signer_refuses_before_any_occurrence_is_written_sqlite() {
+            use crate::engine::{SelfAtLoginInput, SelfAtLoginOccurrence};
+            use crate::federation::tier_ingest::test_support as ts;
+            use crate::federation::types::identity_type::{AGENT, USER};
+            use crate::federation::FederationDirectory;
+            let run = uuid::Uuid::new_v4().simple().to_string();
+            let alias = format!("i93-{run}");
+            let engine =
+                crate::Engine::with_signer_pre_genesis(ts::local_signer(&alias), "sqlite::memory:")
+                    .await
+                    .unwrap();
+            engine
+                .register_self_federation_key(
+                    crate::federation::types::identity_type::NODE,
+                    &alias,
+                    None,
+                    serde_json::json!({}),
+                    vec![],
+                )
+                .await
+                .unwrap();
+            let s = engine.sqlite_backend().unwrap().clone();
+            let identity_label = format!("i93-alice-{run}");
+            let identity = ts::local_signer(&identity_label).derived_key_id();
+            ts::register_hybrid_key_as(s.as_ref(), &identity, &identity_label, USER).await;
+            let (app_key, agent_key) = (format!("i93-app-{run}"), format!("i93-agent-{run}"));
+            ts::register_hybrid_key_as(s.as_ref(), &app_key, &app_key, USER).await;
+            ts::register_hybrid_key_as(s.as_ref(), &agent_key, &agent_key, AGENT).await;
+            let foreign = ts::local_signer(&format!("i93-mallory-{run}"));
+            let err = engine
+                .self_at_login(SelfAtLoginInput {
+                    identity_key_id: identity.clone(),
+                    identity_signer: Some(foreign),
+                    app: SelfAtLoginOccurrence {
+                        occurrence_key_id: app_key.clone(),
+                        device_class: crate::federation::types::device_class::PHONE.to_owned(),
+                        hardware_attestation: None,
+                        encryption_pubkeys: None,
+                        transport_destinations: vec![],
+                    },
+                    agent: SelfAtLoginOccurrence {
+                        occurrence_key_id: agent_key.clone(),
+                        device_class: crate::federation::types::device_class::AGENT.to_owned(),
+                        hardware_attestation: None,
+                        encryption_pubkeys: None,
+                        transport_destinations: vec![],
+                    },
+                    bilateral_pair_id: uuid::Uuid::new_v4().to_string(),
+                    delegation_scope: None,
+                })
+                .await
+                .expect_err("I93: a foreign signer is refused");
+            assert!(
+                matches!(err, crate::federation::Error::CustodyIsNotTheActor { .. }),
+                "I93: the existing refusal, now first: {err:?}"
+            );
+            // NOTHING was written — the refusal precedes step 1.
+            let rows = FederationDirectory::list_identity_occurrences_for(s.as_ref(), &identity)
+                .await
+                .unwrap();
+            assert!(
+                rows.is_empty(),
+                "I93: no occurrence written before the refusal: {rows:?}"
             );
         }
 

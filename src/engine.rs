@@ -828,6 +828,19 @@ pub struct SelfAtLoginOutcome {
     /// Count of `transport_destination` rows registered across both
     /// occurrences.
     pub transport_destinations_registered: usize,
+    /// v44.5.0 (CIRISPersist#856, §21.3) — occurrence keys published through
+    /// the GATED door as identity-signed content-only occurrences, so they
+    /// are on the plane and a far node's cascade can wrap to them. Non-empty
+    /// only when `identity_signer` was supplied.
+    pub occurrences_published: Vec<String>,
+    /// v44.5.0 (#856) — occurrence keys written trusted-local instead: every
+    /// key when no `identity_signer` was supplied, and with one, any
+    /// occurrence that registered no `encryption_pubkeys` — a row that can
+    /// be a wrap target nowhere has no replicable form. Not a signing
+    /// fallback: no claim is emitted classically; the row is simply not put
+    /// on the key plane. Reported so the caller can see it, as
+    /// `self_dek_excluded` reports the same rows for the same reason.
+    pub occurrences_local_only: Vec<String>,
 }
 
 /// A LIVE egress grant that survived the fail-closed parse + the
@@ -5416,11 +5429,19 @@ impl Engine {
     /// its owner binding exists — the node-class occurrence CIRISEdge's
     /// `provision_engine_occurrence` used to write through the trusted-local
     /// door, where nothing could carry it. Requires a LocalSigner.
+    ///
+    /// `valid_until` — v44.5.0 (CIRISPersist#855, §21.2): carried into the
+    /// signed envelope and the typed row, truncated to the millisecond before
+    /// signing. `put_identity_occurrence` is a last-signed-wins upsert whose
+    /// `DO UPDATE` carries `valid_until`, so a republish with `None` REPLACES
+    /// a stored expiry with none; a caller healing a row onto the plane passes
+    /// the expiry the row already carries.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn publish_self_occurrence(
         &self,
         identity_key_id: &str,
         device_class: &str,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<crate::federation::SignedIdentityOccurrence, crate::federation::Error> {
         let local = self.local_signer.as_ref().ok_or_else(|| {
             crate::federation::Error::InvalidArgument(
@@ -5450,6 +5471,7 @@ impl Engine {
                     local,
                     identity_key_id,
                     device_class,
+                    valid_until,
                 )
                 .await
             }
@@ -5460,6 +5482,7 @@ impl Engine {
                     local,
                     identity_key_id,
                     device_class,
+                    valid_until,
                 )
                 .await
             }
@@ -6428,24 +6451,93 @@ impl Engine {
         let now = chrono::Utc::now();
         let directory = self.federation_directory();
 
-        // (1) Co-admit both occurrences under the one identity key. These are
-        // engine-internal, content-only (DEK-cascade KEX target, no reticulum
-        // transport) writes on behalf of the LOCAL user — not peer-received, so
-        // they take the trusted-local path (#418 ask 4 grandfather-local), NOT
-        // the signature gate (which requires a transport binding they lack).
+        // v44.5.0 (§21.3, I93) — the signer-is-the-identity check used to sit
+        // at step 5, where the delegation is signed. Step 1 now signs with the
+        // same signer, so the check moves ahead of it: a foreign signer
+        // refuses BEFORE any occurrence is written, not after two are.
+        if let Some(signer) = &input.identity_signer {
+            if signer.derived_key_id() != input.identity_key_id {
+                return Err(crate::federation::Error::CustodyIsNotTheActor {
+                    attestation_id: String::new(),
+                    attesting_key_id: input.identity_key_id.clone(),
+                    scrub_key_id: signer.derived_key_id(),
+                });
+            }
+        }
+
+        // (1) Co-admit both occurrences under the one identity key.
+        //
+        // v44.5.0 (CIRISPersist#856, §21.3) — THE PRODUCER of the replicable
+        // device occurrence is this door. With `identity_signer`, each
+        // occurrence that carries `encryption_pubkeys` is built as the §20.2
+        // content-only envelope, signed by the identity, and admitted through
+        // the GATED door — born on the plane, so a far node's cascade can wrap
+        // to it (the #851 shape one class down: a member's phone reading a
+        // room whose seals are minted elsewhere). The identity signing its own
+        // occurrence needs no lift. This follows the pattern the delegation in
+        // step 5 already had: present, the identity signs and the row is born
+        // replicable; absent, the row is staged local and waits.
+        //
+        // Without the signer — or for an occurrence with no `encryption_pubkeys`,
+        // which the content-only gate requires because they ARE the content and
+        // a row without them can be a wrap target nowhere — the write is the
+        // trusted-local one it always was (#418 ask 4 grandfather-local). That
+        // is not a signing fallback: no claim is emitted classically; a row that
+        // cannot carry a key is simply not put on the key plane, and the outcome
+        // names it.
+        let mut occurrences_published = Vec::new();
+        let mut occurrences_local_only = Vec::new();
         for occ in [&input.app, &input.agent] {
-            let row = IdentityOccurrence {
-                identity_key_id: input.identity_key_id.clone(),
-                occurrence_key_id: occ.occurrence_key_id.clone(),
-                device_class: occ.device_class.clone(),
-                hardware_attestation: occ.hardware_attestation.clone(),
-                asserted_at: now,
-                valid_until: None,
-                encryption_pubkeys: occ.encryption_pubkeys.clone(),
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            };
-            directory.put_identity_occurrence_local(row).await?;
+            match (&input.identity_signer, &occ.encryption_pubkeys) {
+                (Some(signer), Some(enc)) => {
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            crate::federation::key_grant::publish_signed_content_only_occurrence(
+                                b.as_ref(),
+                                signer,
+                                &input.identity_key_id,
+                                &occ.occurrence_key_id,
+                                &occ.device_class,
+                                occ.hardware_attestation.as_deref(),
+                                enc.clone(),
+                                None,
+                            )
+                            .await?
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            crate::federation::key_grant::publish_signed_content_only_occurrence(
+                                b.as_ref(),
+                                signer,
+                                &input.identity_key_id,
+                                &occ.occurrence_key_id,
+                                &occ.device_class,
+                                occ.hardware_attestation.as_deref(),
+                                enc.clone(),
+                                None,
+                            )
+                            .await?
+                        }
+                    };
+                    occurrences_published.push(occ.occurrence_key_id.clone());
+                }
+                _ => {
+                    let row = IdentityOccurrence {
+                        identity_key_id: input.identity_key_id.clone(),
+                        occurrence_key_id: occ.occurrence_key_id.clone(),
+                        device_class: occ.device_class.clone(),
+                        hardware_attestation: occ.hardware_attestation.clone(),
+                        asserted_at: now,
+                        valid_until: None,
+                        encryption_pubkeys: occ.encryption_pubkeys.clone(),
+                        transport_binding: None,
+                        persist_row_hash: String::new(),
+                    };
+                    directory.put_identity_occurrence_local(row).await?;
+                    occurrences_local_only.push(occ.occurrence_key_id.clone());
+                }
+            }
         }
 
         // (2) Self-DEK cascade to both newcomers (§8.1.12.4). Composes
@@ -6546,11 +6638,13 @@ impl Engine {
                 (self.emit_attestation(signer, delegation_input).await?, true)
             }
             Some(signer) => {
+                // Unreachable since v44.5.0 moved the check ahead of step 1
+                // (I93); kept as the defensive arm so this match stays total.
                 return Err(crate::federation::Error::CustodyIsNotTheActor {
                     attestation_id: String::new(),
                     attesting_key_id: input.identity_key_id.clone(),
                     scrub_key_id: signer.derived_key_id(),
-                })
+                });
             }
             None if node_key.as_deref() == Some(input.identity_key_id.as_str()) => {
                 (self.emit_attestation_self(delegation_input).await?, true)
@@ -6623,6 +6717,8 @@ impl Engine {
             self_dek_granted: rekey.granted.len(),
             self_dek_excluded: rekey.excluded,
             transport_destinations_registered: transport_rows,
+            occurrences_published,
+            occurrences_local_only,
         })
     }
 
@@ -6688,14 +6784,101 @@ impl Engine {
         _requesting_peer_key_id: &str,
     ) -> Result<crate::federation::BlobBody, crate::federation::BlobError> {
         use crate::federation::BlobStorage;
+        // §21.1 — ONE disposition, asked by every serve door.
+        self.check_serve_disposition(sha256).await?;
+        let body = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.get_blob(sha256).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.get_blob(sha256).await?,
+        };
+        body.ok_or_else(|| crate::federation::BlobError::NotHeld {
+            sha256_hex: hex::encode(sha256),
+        })
+    }
 
+    /// v44.5.0 (CIRISPersist#821 Q1, `BLOB_REPLICATION.md` §21.1) — **the
+    /// ranged serve: the same two gates as [`serve_blob_to_peer`], a
+    /// different body.** CIRISEdge's swarm answers one chunk at a time, and a
+    /// consumer that wired its chunk responder to `get_blob_range` directly
+    /// bypassed BOTH serve gates — the stop-tier proxy-serve refusal and the
+    /// quarantine consult — while the whole-blob path still honoured them, so
+    /// enforcement looked intact and a pressured node kept relaying (or a
+    /// quarantined blob leaked one chunk at a time, every read green).
+    ///
+    /// Both gates are whole-blob decisions keyed only on `sha256`; a range
+    /// changes nothing about either input, so this door is the identical
+    /// decision through [`check_serve_disposition`](Self::check_serve_disposition)
+    /// and then the storage trait's
+    /// [`get_blob_range`](crate::federation::BlobStorage::get_blob_range) —
+    /// RFC 9110 §14.4 semantics, `range_end_inclusive` clamped to size-1, a
+    /// start at or past the size is
+    /// [`BlobError::RangeNotSatisfiable`](crate::federation::BlobError::RangeNotSatisfiable).
+    /// Returns [`BlobRange::Inline`](crate::federation::BlobRange::Inline)
+    /// sliced server-side, or [`BlobRange::External`](crate::federation::BlobRange::External)
+    /// with the ref and clamped range for the caller to fetch (persist never
+    /// dereferences). Refusals are the existing typed arms, so a peer's
+    /// `PolicyDenied` mapping needs no new case.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn serve_blob_range_to_peer(
+        &self,
+        sha256: &[u8; 32],
+        range_start: u64,
+        range_end_inclusive: u64,
+        _requesting_peer_key_id: &str,
+    ) -> Result<crate::federation::BlobRange, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        // §21.1 — ONE disposition, asked by every serve door.
+        self.check_serve_disposition(sha256).await?;
+        let range = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.get_blob_range(sha256, range_start, range_end_inclusive)
+                    .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.get_blob_range(sha256, range_start, range_end_inclusive)
+                    .await?
+            }
+        };
+        range.ok_or_else(|| crate::federation::BlobError::NotHeld {
+            sha256_hex: hex::encode(sha256),
+        })
+    }
+
+    /// §21.1 — **the serve disposition: the decision every serve door asks,
+    /// and reads no body.** Extracted from `serve_blob_to_peer` so the ranged
+    /// door is the same decision rather than a copy of it; PR #852 rounds
+    /// eight and ten showed what a copy does — two doors asking one question
+    /// drift by a clause a review round. I90 (b) asserts every serve door
+    /// routes through here and re-spells neither gate.
+    ///
+    /// Two gates, in this order:
+    /// 1. **pressure / proxy shedding** (v6.8.0, #149; #846 §5, I49) — the
+    ///    ROW's `author_key_id` against local-or-family through
+    ///    [`is_proxy_content`](crate::federation::is_proxy_content); under
+    ///    `refuses_proxy_serves` a proxy blob is
+    ///    [`DiskPressureProxyRefused`](crate::federation::BlobError::DiskPressureProxyRefused)
+    ///    `{ operation: "serve" }` — permanent: fetch from another holder.
+    /// 2. **quarantine** (v25.1.0, #570 ask 5) — for each local holder,
+    ///    [`quarantine::is_withheld`](crate::federation::quarantine::is_withheld);
+    ///    ANY withheld ⇒ [`QuarantineWithheld`](crate::federation::BlobError::QuarantineWithheld).
+    ///    ANY rather than ALL, deliberately: withholding is the restrictive
+    ///    direction, and a graded response that fails open under ambiguity is
+    ///    not a response. The bytes stay on disk — this refuses to SERVE.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn check_serve_disposition(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<(), crate::federation::BlobError> {
         let pressure = self.current_disk_pressure();
         let local_holders = self.list_local_holders(sha256).await?;
         if pressure.refuses_proxy_serves {
             // #846 (§5, I49) — ONE classification: the ROW's author against
             // local-or-family, through `is_proxy_content`. A row with no
             // author (pre-V144) is unknown ⇒ proxy; an absent row is proxy
-            // too, and the NotHeld below answers for it.
+            // too, and the NotHeld the caller raises answers for it.
             let (our_key, fam) = self.local_or_family_parts().await?;
             let local_or_family = local_or_family_predicate(our_key, fam);
             let author = self
@@ -6709,20 +6892,6 @@ impl Engine {
                 });
             }
         }
-
-        // v25.1.0 (CIRISPersist#570 ask 5) — THE QUARANTINE CONSULT on the
-        // blob half of the serve path. If ANY local holder of these bytes is
-        // withheld, we do not hand them to a peer.
-        //
-        // ANY rather than ALL, deliberately: withholding is the restrictive
-        // direction, and a graded response that fails open under ambiguity is
-        // not a response. The bytes stay on disk — this refuses to SERVE, it
-        // never deletes, and lifting the marker restores serving with no
-        // reconstruction.
-        //
-        // Distinct from the pressure gate above in kind, not just in reason:
-        // pressure says "not now, ask another holder", quarantine says "not
-        // from us". Both are permanent-for-this-node signals to the peer.
         let directory = self.federation_directory();
         let now = chrono::Utc::now();
         for holder in &local_holders {
@@ -6741,16 +6910,7 @@ impl Engine {
                 });
             }
         }
-
-        let body = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => arc.get_blob(sha256).await?,
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => arc.get_blob(sha256).await?,
-        };
-        body.ok_or_else(|| crate::federation::BlobError::NotHeld {
-            sha256_hex: hex::encode(sha256),
-        })
+        Ok(())
     }
 
     /// v6.8.0 (CIRISPersist#149) — local-truth holder query for a SHA
@@ -19929,6 +20089,185 @@ mod tests {
             identity_type::parse_set("user,wise_authority"),
             vec!["user", "wise_authority"]
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // v44.5.0 — BLOB_REPLICATION.md §21: what the v44.4.0 adopters asked
+    // for. I90–I93. Each witness was RED before its door existed.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// **I90 (§21.1, #821 Q1) — the ranged serve refuses exactly where the
+    /// whole-blob serve refuses, and returns no byte when it refuses.** The
+    /// silent failure this closes: a chunk responder wired to
+    /// `get_blob_range` directly bypasses BOTH serve gates while the
+    /// whole-blob path still honours them, so enforcement looks intact and a
+    /// pressured node keeps relaying.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i90_ranged_serve_refuses_where_the_whole_blob_serve_refuses_sqlite() {
+        use crate::federation::{BlobError, BlobRange};
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 1).await;
+        let local_sha = local_shas[0];
+        let proxy_sha = seed_proxy_blobs(&engine, "peer-relay-key-i90", 1).await[0];
+        let (engine, stub, monitor) = attach_disk_pressure(engine, TWO_GIB);
+
+        // Below stop: the ranged serve returns the slice, and it is the SAME
+        // slice `get_blob_range` returns — the door adds policy, not bytes.
+        let whole = engine
+            .serve_blob_to_peer(&proxy_sha, "some-peer")
+            .await
+            .expect("I90: whole-blob serve below stop");
+        let whole_bytes = match whole {
+            crate::federation::BlobBody::Inline(b) => b,
+            other => panic!("I90: fixture blobs are inline, got {other:?}"),
+        };
+        let ranged = engine
+            .serve_blob_range_to_peer(&proxy_sha, 1, 3, "some-peer")
+            .await
+            .expect("I90: ranged serve below stop");
+        match ranged {
+            BlobRange::Inline(b) => assert_eq!(b, whole_bytes[1..=3].to_vec(), "I90: the slice"),
+            other => panic!("I90: inline blob must slice inline, got {other:?}"),
+        }
+        // A start past the size is the storage trait's RangeNotSatisfiable,
+        // surfaced unchanged — the door does not invent a second arm.
+        let err = engine
+            .serve_blob_range_to_peer(&proxy_sha, 1 << 40, 1 << 41, "some-peer")
+            .await
+            .expect_err("I90: a start past the size is unsatisfiable");
+        assert!(
+            matches!(err, BlobError::RangeNotSatisfiable { .. }),
+            "I90: expected RangeNotSatisfiable, got {err:?}"
+        );
+
+        // STOP tier: the whole-blob door refuses the proxy blob — precondition,
+        // so the ranged assertion below cannot pass vacuously.
+        stub.set(FOUR_HUNDRED_MIB);
+        monitor.poll_once();
+        assert!(engine.current_disk_pressure().refuses_proxy_serves);
+        let whole_err = engine
+            .serve_blob_to_peer(&proxy_sha, "some-peer")
+            .await
+            .expect_err("I90 precondition: whole-blob proxy serve refused at stop");
+        assert!(matches!(
+            whole_err,
+            BlobError::DiskPressureProxyRefused {
+                operation: "serve",
+                ..
+            }
+        ));
+        // The ranged door refuses the SAME way — same arm, same operation
+        // label — and hands back no byte.
+        let ranged_err = engine
+            .serve_blob_range_to_peer(&proxy_sha, 0, 0, "some-peer")
+            .await
+            .expect_err("I90: the ranged proxy serve is refused at stop too");
+        match ranged_err {
+            BlobError::DiskPressureProxyRefused { operation, tier } => {
+                assert_eq!(operation, "serve", "I90: the peer maps on `operation`");
+                assert_eq!(tier, "stop");
+            }
+            other => panic!("I90: expected DiskPressureProxyRefused, got {other:?}"),
+        }
+        // And the LOCAL blob still serves by range at stop, exactly as it
+        // does whole — the gate is proxy-vs-local, not ranged-vs-whole.
+        engine
+            .serve_blob_range_to_peer(&local_sha, 0, 0, "some-peer")
+            .await
+            .expect("I90: a local blob serves by range at stop");
+    }
+
+    /// **I90, quarantine leg — a withheld local holder refuses the ranged
+    /// serve as it refuses the whole one.** This is the leak the #821 thread
+    /// named as worse than the pressure miss: a hoisted pressure-only
+    /// predicate would let a quarantined blob out one chunk at a time with
+    /// every read green.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i90_ranged_serve_honours_quarantine_sqlite() {
+        use crate::federation::BlobError;
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 1).await;
+        let sha = local_shas[0];
+        let dir = engine.federation_directory();
+        let holders = engine.list_local_holders(&sha).await.expect("holders");
+        let holder = holders
+            .first()
+            .cloned()
+            .expect("I90: the fixture blob has a holder");
+
+        // Serves before the marker — both doors.
+        engine
+            .serve_blob_to_peer(&sha, "some-peer")
+            .await
+            .expect("I90: serves before withholding");
+        engine
+            .serve_blob_range_to_peer(&sha, 0, 0, "some-peer")
+            .await
+            .expect("I90: serves by range before withholding");
+
+        // Withhold the holder: a FEDERATION-tier marker on the quarantine
+        // dimension, filed against the subject, which is what `is_withheld`
+        // folds (`list_attestations_for` reads `tier = 'federation'` only —
+        // a local-tier marker withholds nothing, by design). Seeded as a
+        // stored row, the way the login tests seed keys: I90 asks whether the
+        // ranged door CONSULTS the fold as the whole door does; how a marker
+        // is admitted (slash authority via a named moderator's delegation) is
+        // the quarantine gate's own witness, not this one's.
+        {
+            let sq = engine.sqlite_backend().expect("sqlite");
+            let conn = sq.conn_handle();
+            let envelope = crate::federation::quarantine::withhold_envelope(
+                &holder,
+                "comm-i90",
+                "att-deleg-i90",
+                "spam",
+            )
+            .to_string();
+            let holder = holder.clone();
+            (move || {
+                let conn = conn.lock();
+                conn.execute(
+                    "INSERT INTO federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, tier, \
+                        cohort_scope, admitted_at\
+                     ) VALUES ('i90-withhold', ?1, ?1, 'scores', NULL, '2026-01-01T00:00:00Z', \
+                        NULL, ?2, x'00', 'c2ln', NULL, ?1, '2026-01-01T00:00:00Z', NULL, '0', \
+                        'federation', 'federation', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![holder, envelope],
+                )
+                .expect("I90: the marker row is stored");
+            })();
+        }
+        assert!(
+            crate::federation::quarantine::is_withheld(dir.as_ref(), &holder, chrono::Utc::now())
+                .await
+                .expect("fold"),
+            "I90 precondition: the holder IS withheld after the marker"
+        );
+
+        // Whole-blob refuses — precondition, again so the next line is not vacuous.
+        let whole = engine
+            .serve_blob_to_peer(&sha, "some-peer")
+            .await
+            .expect_err("I90 precondition: whole-blob serve refused while withheld");
+        assert!(
+            matches!(whole, BlobError::QuarantineWithheld { .. }),
+            "{whole:?}"
+        );
+        // Ranged refuses the SAME way.
+        let ranged = engine
+            .serve_blob_range_to_peer(&sha, 0, 0, "some-peer")
+            .await
+            .expect_err("I90: the ranged serve is refused while withheld");
+        match ranged {
+            BlobError::QuarantineWithheld { key_id } => assert_eq!(key_id, holder),
+            other => panic!("I90: expected QuarantineWithheld, got {other:?}"),
+        }
     }
 }
 

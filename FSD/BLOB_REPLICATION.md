@@ -752,11 +752,15 @@ node's content-KEM identity, signs it with the composed hybrid signer, and
 admits it through the gated door — so a node's occurrence is born replicable.
 This is what CIRISEdge's `provision_engine_occurrence` calls in place of the
 trusted-local write, once the node's owner binding exists. `self_at_login`
-writes only the app and agent DEVICE occurrences and keeps the trusted-local
-door for them; their replicable form is the same content-only occurrence
-signed by the identity itself (§20.2 admits it — the identity is the
-signer; no lift needed), which Edge can produce with the identity seed it
-already holds. No further persist change.
+writes the app and agent DEVICE occurrences; their replicable form is the
+same content-only occurrence signed by the identity itself (§20.2 admits
+it — the identity is the signer; no lift needed). **The producer is
+`self_at_login` (§21.3)**: an earlier draft of this sentence said "Edge
+produces it with the identity seed", and CIRISPersist#856 found that no such
+producer exists in any repo — Edge holds no identity seed, and CIRISServer,
+the caller with the app+agent shape, writes through the trusted-local door.
+When the caller passes `identity_signer`, `self_at_login` publishes both
+occurrences through the gated door; absent, the trusted-local write stands.
 
 ### 20.5 The claim the plane served and every peer refused — hybrid-only
 
@@ -833,3 +837,135 @@ minted DEK can, and that is what I88 asserts.
 | I87 | `AdoptDisposition::LocalOnly` adopts without a LocalSigner; only `Announce` requires one. | a hardware or classical engine unable to hold received bytes it never announces | behavioural, both backends |
 | I88 | The announcing preflight refuses a LocalSigner with no ML-DSA-65 half BEFORE the cascade writes: after the refusal the epoch DEK the cascade mints first is absent. | an orphaned blob whose key was never federated — the cascade sealed and minted, then `sign_hybrid` failed | behavioural, both backends |
 | I89 | `check_announcing_signer` is ONE predicate: this node's own hybrid signer announces; a foreign signer and a PQC-less signer each refuse, identity reported first. (b) both the Rust and PyO3 accessors ROUTE to it, and neither re-spells a clause. | the two doors drifting by one clause per review round — the PyO3 door announced through a foreign key (c) EVERY PyO3 door that takes the LocalSigner to sign is covered by the preflight, not just the accessors — two announcing doors had copied the accessor's existence-only check and reached the cascade with an Ed25519-only signer. | a door that skips the accessor; a clause that drifts between two copies | unit + from disk (`include_str!`) |
+
+## 21. What the v44.4.0 adopters asked for (#821 Q1, #855, #856)
+
+Three asks, each from a consumer adopting v44.4.0, each answered by the
+door that already exists plus one thing it was missing. None moves a pin.
+
+### 21.1 The ranged serve — the same two gates, a different body (#821 Q1)
+
+`serve_blob_to_peer` is whole-blob. CIRISEdge's swarm answers one chunk at a
+time, and a consumer that wires the chunk responder to `get_blob_range`
+directly has BYPASSED both serve gates: the stop-tier proxy-serve refusal and
+the quarantine consult. The failure is silent — every chunk read succeeds,
+nothing is red, and the whole-blob path still honours both gates, so the
+enforcement *looks* intact while a pressured node keeps relaying and a
+quarantined blob leaks one chunk at a time. Ruled on the #821 thread on
+2026-09-09; as of 2026-09-16 it gates files (the chunk-DAG attachments shape).
+
+Both serve gates are **whole-blob decisions keyed only on `sha256`**. Neither
+reads a byte of the body:
+
+- **pressure / proxy shedding** — the row's `author_key_id` against
+  local-or-family through `is_proxy_content` (§5, I49); under
+  `refuses_proxy_serves`, a proxy blob is `DiskPressureProxyRefused
+  { operation: "serve" }`.
+- **quarantine** — for each local holder, `quarantine::is_withheld`; ANY
+  withheld ⇒ `QuarantineWithheld`.
+
+A range changes nothing about either input. So the ranged door is the
+**identical decision with a different body**, and the decision is extracted
+into one internal function both doors call:
+
+```rust
+async fn check_serve_disposition(&self, sha256: &[u8; 32]) -> Result<(), BlobError>;
+
+pub async fn serve_blob_to_peer(&self, sha256, requesting_peer_key_id)
+    -> Result<BlobBody, BlobError>;                       // unchanged surface
+pub async fn serve_blob_range_to_peer(&self, sha256, range_start: u64,
+    range_end_inclusive: u64, requesting_peer_key_id)
+    -> Result<BlobRange, BlobError>;                      // NEW
+```
+
+The range convention is the storage trait's (RFC 9110 §14.4, inclusive end,
+clamped; a start at or past the size is `RangeNotSatisfiable`), not the
+`(offset, len)` sketch on the thread, so the ranged door returns exactly what
+`get_blob_range` returns — `BlobRange::Inline` sliced server-side, or
+`BlobRange::External` with the ref and clamped range for the caller to fetch.
+Refusals are the existing typed arms; Edge's `PolicyDenied` mapping needs no
+new case. `requesting_peer_key_id` stays on the signature for the same reason
+it is on the whole-blob door: it is the future per-peer axis, not read today.
+
+**Why extraction rather than a copy.** PR #852 rounds eight and ten: two doors
+asking one question became two implementations and drifted by a clause a
+round. The gate here asserts the PROPERTY — every serve door reaches
+`get_blob` / `get_blob_range` only through the shared disposition — not that
+the two functions happen to match today.
+
+### 21.2 `valid_until` on the publish door — one more bound member (#855)
+
+`publish_self_occurrence` built its envelope with `valid_until: null`, and
+`put_identity_occurrence` is a last-signed-wins upsert whose `DO UPDATE`
+carries `valid_until = excluded.valid_until`. So a republish was never a
+no-op: it replaced whatever expiry the stored row carried with none. Edge's
+one republish case — healing a node whose occurrence was written through the
+trusted-local door on an older release, so every peer refuses its `key_grant`
+sets — therefore refused any row that carried an expiry, rather than silently
+extend a membership an operator had chosen to end. Correct with the door as
+it was, and it left such a node invisible to the plane until someone re-issued
+the row by hand.
+
+`publish_self_occurrence` and `publish_self_occurrence_with_local_signer` take
+`valid_until: Option<DateTime<Utc>>`, carried into the signed envelope (as the
+millisecond rendering, or `null`) and the typed row — exactly as `asserted_at`
+is. The gate already binds `valid_until` to the envelope (§20, PR #852 round
+one) and requires millisecond-exact typed instants, so the door truncates the
+caller's instant to milliseconds before signing, the same way it does its own
+`asserted_at`; a caller-supplied instant with sub-millisecond precision would
+otherwise sign one thing and store another. Nothing else changes: not the
+drift rule, not the upsert. `PyEngine.publish_self_occurrence` gains a
+trailing `valid_until_iso: Option<&str>` keyword.
+
+### 21.3 The device occurrence's producer is `self_at_login` (#856)
+
+§20.3 said Edge produces the identity-signed device occurrence with the
+identity seed. No such producer exists: Edge holds no identity seed (the
+identity signer is the person's, not the node's), and CIRISServer — the
+caller with the app+agent shape — writes through `put_identity_occurrence_local`,
+signature columns NULL, never served. The sentence described nothing.
+
+It matters the moment a device occurrence must be a wrap target on a FAR
+node — a member's phone reading a room whose seals are minted elsewhere —
+because the minter's cascade folds `list_identity_occurrences_active` on the
+minter's node, and a local-door row from another node is not there. That is
+the #851 shape one class down.
+
+**Decision: `self_at_login` publishes** (the issue's option 1). It already
+takes `identity_signer: Option<Arc<LocalSigner>>` and already follows this
+exact pattern for the delegation it emits in the same call — present, the
+identity signs and the row is born on the plane; absent, the row is staged
+local and waits. The occurrences now follow the delegation:
+
+- `identity_signer: Some(s)` (already required to BE `identity_key_id`, else
+  `CustodyIsNotTheActor`) — each occurrence that carries `encryption_pubkeys`
+  is built as the §20.2 content-only envelope, signed by the identity, and
+  admitted through the gated door, so it is born replicable. The identity
+  signing its own occurrence needs no lift.
+- `identity_signer: None` — today's trusted-local write, unchanged.
+- An occurrence with **no `encryption_pubkeys`** has no replicable form: the
+  content-only gate requires the KEM pubkeys because they are the whole
+  content, and a row without them can be a wrap target nowhere. It keeps the
+  trusted-local write and is reported in the outcome
+  (`occurrences_local_only`), alongside the DEK-cascade exclusion that already
+  reports the same rows for the same reason. This is not a signing fallback:
+  no claim is emitted classically; a row that cannot carry a key is simply
+  not put on the key plane.
+
+No new failure mode for the only production caller: CIRISServer passes
+`identity_signer: None` today. A caller that passes a signer already
+hybrid-signs the delegation with it in the same call, so any signer that can
+emit the delegation can sign the occurrence. Option 2 (a separate
+`publish_device_occurrence` door) was rejected as one more thing every
+consumer must remember, for rows that already pass through this door.
+
+### 21.4 Invariants
+
+| # | invariant | falsified by | gate |
+|---|---|---|---|
+| I90 | `serve_blob_range_to_peer` refuses exactly where `serve_blob_to_peer` refuses: a proxy blob under `refuses_proxy_serves` is `DiskPressureProxyRefused`, a blob with a withheld local holder is `QuarantineWithheld`, and in both cases no byte is returned; on the happy path it returns `get_blob_range`'s slice, and a start past the size is `RangeNotSatisfiable`. | a chunk served that the whole blob would not be — the swarm leaking a quarantined blob a chunk at a time | behavioural, both backends |
+| I90 (b) | Every serve door reaches `get_blob` / `get_blob_range` only through `check_serve_disposition`; no serve door re-spells either gate. | the two doors drifting by a clause, as the announcing doors did | from disk |
+| I91 | `publish_self_occurrence(.., valid_until: Some(t))` stores `valid_until == t` at millisecond precision, the envelope carries the same instant, and the gate admits it; `None` stores `NULL`. A republish with `Some(t)` over a row carrying `t` leaves `t` in place. | a republish that silently drops an operator's expiry | behavioural, both backends |
+| I92 | `self_at_login` with `identity_signer: Some(identity)` admits each pubkey-bearing occurrence through the GATED door — the stored row is signed-put, `list_signed_identity_occurrences_since` advertises it, and a second node admits it through the same gate. A `hardware_attestation` on the input crosses as a bound member and is present on the far row. With `identity_signer: None` the rows are trusted-local and the plane does not list them. | the device occurrence with no replicable form — the #851 shape one class down | behavioural, two nodes, both backends |
+| I92 (b) | An occurrence with no `encryption_pubkeys` is written trusted-local even when a signer is present, and is named in `occurrences_local_only`. | a refusal that breaks login for a row that could never replicate anyway; or a silent local write the outcome does not report | behavioural |
+| I93 | `self_at_login` with a signer that is not `identity_key_id` refuses (`CustodyIsNotTheActor`) BEFORE any occurrence is written — the existing check, moved ahead of step 1, because step 1 now signs with it. | two occurrences written under an identity the signer cannot vouch for, then a refusal | behavioural |

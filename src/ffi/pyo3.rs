@@ -6452,7 +6452,7 @@ impl PyEngine {
         })
     }
 
-    /// (derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
+    /// CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
     /// **emit every KeyGrant set this node owes and has not yet carried**: each
     /// epoch it minted whose set is dirty per the emission ledger (never
     /// emitted, or a grant newer than the last emission — the shape a crash
@@ -6537,18 +6537,24 @@ impl PyEngine {
         })
     }
 
-    /// (derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) —
+    /// CIRISPersist#851 (BLOB_REPLICATION.md §20.3) —
     /// **publish this node's own content-only occurrence** under
     /// `identity_key_id` (its owner), signed with the LocalSigner and admitted
     /// through the gated door so the IdentityOccurrence plane advertises it
     /// and a far node admits it (the owner binding lifts the node to its
     /// owner). Returns the signed occurrence as JSON. FFI mirror of
     /// [`Engine::publish_self_occurrence`](crate::engine::Engine::publish_self_occurrence).
+    ///
+    /// `valid_until_iso` — v44.5.0 (CIRISPersist#855, §21.2): RFC 3339,
+    /// carried as one more bound member (millisecond precision); `None`
+    /// stores NULL, and a republish with `None` replaces a stored expiry.
+    #[pyo3(signature = (identity_key_id, device_class, valid_until_iso = None))]
     fn publish_self_occurrence(
         &self,
         py: Python<'_>,
         identity_key_id: &str,
         device_class: &str,
+        valid_until_iso: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -6571,6 +6577,17 @@ impl PyEngine {
                     .map_err(blob_err_to_py)?;
             }
             let (identity, class) = (identity_key_id.to_owned(), device_class.to_owned());
+            let valid_until = valid_until_iso
+                .map(|v| {
+                    chrono::DateTime::parse_from_rfc3339(v)
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                        .map_err(|e| {
+                            PyValueError::new_err(format!(
+                                "publish_self_occurrence valid_until_iso parse: {e}"
+                            ))
+                        })
+                })
+                .transpose()?;
             py.detach(|| {
                 let signed = match &self.backend {
                     #[cfg(feature = "postgres")]
@@ -6582,6 +6599,7 @@ impl PyEngine {
                                 &local,
                                 &identity,
                                 &class,
+                                valid_until,
                             )
                             .await
                         })
@@ -6595,6 +6613,7 @@ impl PyEngine {
                                 &local,
                                 &identity,
                                 &class,
+                                valid_until,
                             )
                             .await
                         })
