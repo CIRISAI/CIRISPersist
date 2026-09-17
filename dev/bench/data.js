@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789668395575,
+  "lastUpdate": 1789674662154,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -89651,6 +89651,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 192,
             "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bb084188330e8f55181a0ae0470089996d5fa4ef",
+          "message": "merge(#859): v44.6.0 — consent is by humans, for THIS machine: the principal walk in the consent doors; the steward fold made deterministic\n\nCloses CIRISPersist#857 (CIRISServer#599, CIRISEdge#609). consent_peers_by_principals / resolve_scoped_consent_by_principals over {k} ∪ stewards_of(k) on rows that name k (for_key_id; CONSENT_GRAMMAR_HASH re-pinned 79c74e4d→ed2b0f2c); V147 consent_peer_set_for; a machine author may name only itself; the steward fold occurrence half reads every row and keeps only active user identities. No owner-binding door for agents (CC 3.2). Certified green on b6670aac; CI green. No external review: Codex had no budget for this PR.",
+          "timestamp": "2026-09-17T14:23:00-05:00",
+          "tree_id": "afc4876e1f45cad572726f7d49f59bb5c4bc161d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/bb084188330e8f55181a0ae0470089996d5fa4ef"
+        },
+        "date": 1789674659917,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 30630443,
+            "range": "± 1616570",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1263571,
+            "range": "± 102266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9267,
+            "range": "± 123",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 14912,
+            "range": "± 278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 25702,
+            "range": "± 665",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 75647,
+            "range": "± 820",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 22,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 133,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 441,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 497,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1599,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 78,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 243,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1104,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 44854,
+            "range": "± 30798",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 81720,
+            "range": "± 14400",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 238083,
+            "range": "± 32180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 10675,
+            "range": "± 5356",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 16699,
+            "range": "± 4589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 29038,
+            "range": "± 9243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 37839,
+            "range": "± 8549",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 6931743,
+            "range": "± 122935",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 7409570,
+            "range": "± 318735",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 456408,
+            "range": "± 35240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1911818,
+            "range": "± 90474",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 74056728,
+            "range": "± 9293359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2824252,
+            "range": "± 395977",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 13162244,
+            "range": "± 2352171",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 185878290,
+            "range": "± 4388819",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 8583846,
+            "range": "± 1282982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 37958401,
+            "range": "± 2148755",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 5173,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 158823,
+            "range": "± 6657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 180921,
+            "range": "± 11760",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 11786,
+            "range": "± 1333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 186187,
+            "range": "± 8690",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 302386,
+            "range": "± 10680",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 42840,
+            "range": "± 2999",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 265267,
+            "range": "± 8805",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 681240,
+            "range": "± 22574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 59077,
+            "range": "± 6234",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 252461,
+            "range": "± 8943",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1465398,
+            "range": "± 36834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1737091,
+            "range": "± 35295",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 57,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 53,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 204297,
+            "range": "± 36580",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 187783,
+            "range": "± 20172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 8300,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 56053,
+            "range": "± 3600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 514003,
+            "range": "± 11397",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 583,
+            "range": "± 85",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 80,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 177,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 106,
+            "range": "± 4",
             "unit": "ns/iter"
           },
           {
