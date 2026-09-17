@@ -4716,6 +4716,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // gate and BEFORE persist_row_hash + INSERT — a rejected emission
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
+        // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
+        crate::federation::admission::check_consent_for_key_admission(self, &row).await?;
 
         // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
         // on-node-key gate (parity with the postgres + memory backends). A
@@ -5093,6 +5095,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
     /// deduped. The fold already happened at write time (see
     /// `sqlite_project_consent_peer_set`), so this is a plain SELECT.
+    /// v44.6.0 (CIRISPersist#857, V147) — the `consent_peer_set_for`
+    /// projection read: every `(author, peer)` from a live grant whose
+    /// `payload.for_key_id` names `for_key_id`. Folded at write time like
+    /// `consent_peer_set`; a plain SELECT.
+    async fn list_consent_peers_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let for_key = for_key_id.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT author_key_id, peer_key_id FROM consent_peer_set_for \
+                 WHERE for_key_id = ?1 ORDER BY author_key_id ASC, peer_key_id ASC",
+                )?;
+                let rows = stmt.query_map([&for_key], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers_for: {e}")))
+    }
+
     async fn list_consent_peers(
         &self,
         node_key_id: &str,
@@ -18614,11 +18641,17 @@ fn sqlite_project_consent_peer_set(
             "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
             rusqlite::params![target_id],
         )?;
+        // v44.6.0 (#857) — the V147 twin is folded by the same composer.
+        conn.execute(
+            "DELETE FROM consent_peer_set_for WHERE source_attestation_id = ?1",
+            rusqlite::params![target_id],
+        )?;
         return Ok(());
     }
     if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
         return Ok(());
     }
+    let for_key = crate::federation::consent_by_humans::for_key_id_of(&row.attestation_envelope);
     for peer in &row.subject_key_ids {
         conn.execute(
             "INSERT OR REPLACE INTO consent_peer_set \
@@ -18631,6 +18664,21 @@ fn sqlite_project_consent_peer_set(
                 row.asserted_at.to_rfc3339(),
             ],
         )?;
+        // v44.6.0 (#857, V147) — a grant that names the machine it is FOR.
+        if let Some(for_key) = for_key {
+            conn.execute(
+                "INSERT OR REPLACE INTO consent_peer_set_for \
+                    (author_key_id, for_key_id, peer_key_id, source_attestation_id, asserted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    row.attesting_key_id,
+                    for_key,
+                    peer,
+                    row.attestation_id,
+                    row.asserted_at.to_rfc3339(),
+                ],
+            )?;
+        }
     }
     Ok(())
 }

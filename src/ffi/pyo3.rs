@@ -23799,6 +23799,77 @@ impl PyEngine {
         })
     }
 
+    /// v44.6.0 (#857 §4) — `list_consent_peers` keyed by ANY key that stands
+    /// for the machine (the union over its human principals and itself). JSON
+    /// array of strings. FFI mirror of
+    /// [`FederationDirectory::consent_peers_by_principals`](crate::federation::FederationDirectory::consent_peers_by_principals).
+    fn consent_peers_by_principals(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let key_id = key_id.to_owned();
+            let engine = self.engine_view();
+            py.detach(move || {
+                let peers = self
+                    .runtime
+                    .block_on(engine.consent_peers_by_principals(&key_id))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&peers)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Vec<String> JSON encode: {e}")))
+            })
+        })
+    }
+
+    /// v44.6.0 (#857 §4) — `resolve_scoped_consent` keyed by ANY key that
+    /// stands for the subject; the per-principal fold combined as a reverse
+    /// quorum on the stop. Returns the stance name. FFI mirror of
+    /// [`FederationDirectory::resolve_scoped_consent_by_principals`](crate::federation::FederationDirectory::resolve_scoped_consent_by_principals).
+    #[pyo3(signature = (target_key_id, subject_key_id, scope, qualifier = None, now_iso = None))]
+    fn resolve_scoped_consent_by_principals(
+        &self,
+        py: Python<'_>,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let (t, sub, sc, q) = (
+                target_key_id.to_owned(),
+                subject_key_id.to_owned(),
+                scope.to_owned(),
+                qualifier.map(str::to_owned),
+            );
+            let engine = self.engine_view();
+            py.detach(move || {
+                let stance = self
+                    .runtime
+                    .block_on(engine.resolve_scoped_consent_by_principals(
+                        &t,
+                        &sub,
+                        &sc,
+                        q.as_deref(),
+                        now,
+                    ))
+                    .map_err(federation_err_to_py)?;
+                Ok(match stance {
+                    crate::federation::hard_case::ConsentState::Granted => "granted",
+                    crate::federation::hard_case::ConsentState::Revoked => "revoked",
+                    crate::federation::hard_case::ConsentState::Expired => "expired",
+                    crate::federation::hard_case::ConsentState::Unspecified => "unspecified",
+                }
+                .to_owned())
+            })
+        })
+    }
+
     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **single
     /// responsible owner** of `key_id`, purpose-filtered to the owner-binding
     /// sub-relation → **at most one**. Returns a JSON string: the owner's

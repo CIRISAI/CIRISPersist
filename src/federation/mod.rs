@@ -63,6 +63,11 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+// CIRISPersist#857 (`FSD/CONSENT_BY_HUMANS.md`) — consent is by humans: the
+// principal walk in the consent doors, one combine rule.
+pub mod consent_by_humans;
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod consent_by_humans_invariants;
 pub mod crossing;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
@@ -1301,6 +1306,23 @@ pub trait FederationDirectory: Send + Sync {
         let _ = node_key_id;
         Err(Error::Unsupported {
             method: "list_consent_peers",
+        })
+    }
+    /// v44.6.0 (CIRISPersist#857, V147) — the `consent_peer_set_for`
+    /// projection: every `(author_key_id, peer_key_id)` from a LIVE
+    /// `consent:replication:v1` grant whose `payload.for_key_id` names
+    /// `for_key_id`, sorted + deduped. Revocation-folded like
+    /// [`Self::list_consent_peers`]. Whether the author stands behind the
+    /// named machine is the caller's question (`consent_peers_by_principals`
+    /// filters to live stewards). Default `Unsupported`; sqlite/postgres/
+    /// memory override.
+    async fn list_consent_peers_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let _ = for_key_id;
+        Err(Error::Unsupported {
+            method: "list_consent_peers_for",
         })
     }
 

@@ -279,3 +279,5 @@ sqlite	145	per_minter_dek_epochs	2052565029181169971
 postgres	145	per_minter_dek_epochs	5338137089296522457
 sqlite	146	key_grant_emission_ledger	8838517352252356577
 postgres	146	key_grant_emission_ledger	16998603888556472534
+sqlite	147	consent_peer_set_for	8332404306030852117
+postgres	147	consent_peer_set_for	4079803879488622867

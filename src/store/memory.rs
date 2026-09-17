@@ -378,6 +378,9 @@ struct State {
     /// (grant upsert / withdraws-revocation fold), same as the SQL backends'
     /// `consent_peer_set` table. See `crate::federation::consent_peer_set`.
     consent_peer_set: Vec<ConsentPeerRow>,
+    /// v44.6.0 (#857) — the V147 `consent_peer_set_for` mirror: a grant that
+    /// names the machine it is FOR, keyed `(author, for_key, peer)`.
+    consent_peer_set_for: Vec<ConsentPeerForRow>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — the authority
     /// signature `put_family` verified at admission, keyed by
     /// `family_key_id`. Absent for `put_family_local` genesis-bake rows
@@ -417,6 +420,14 @@ struct State {
 
 /// v21.0.0 (CIRISPersist#502 E7) — one row of the in-memory
 /// `consent_peer_set` mirror. Mirrors the V109 table shape exactly.
+#[derive(Clone)]
+struct ConsentPeerForRow {
+    author_key_id: String,
+    for_key_id: String,
+    peer_key_id: String,
+    source_attestation_id: String,
+}
+
 #[derive(Clone)]
 struct ConsentPeerRow {
     node_key_id: String,
@@ -772,6 +783,7 @@ impl Default for MemoryBackend {
                 canonical_withdrawals: HashMap::new(),
                 role_withdrawals: HashMap::new(),
                 consent_peer_set: Vec::new(),
+                consent_peer_set_for: Vec::new(),
                 federation_family_authority_sigs: HashMap::new(),
                 federation_community_authority_sigs: HashMap::new(),
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
@@ -3229,6 +3241,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // moderators) or is reached by an steward-bound duty-holder via a live
         // scoped delegates_to chain. Absence ⇒ REJECT.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
+        // v44.6.0 (#857) — a machine author may name only itself in for_key_id.
+        crate::federation::admission::check_consent_for_key_admission(self, &row).await?;
 
         // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — reject-agency-
         // on-node-key gate. A no-op for non-`delegates_to` rows; for a
@@ -3452,8 +3466,27 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 state
                     .consent_peer_set
                     .retain(|r| r.source_attestation_id != target_id);
+                state
+                    .consent_peer_set_for
+                    .retain(|r| r.source_attestation_id != target_id);
             } else if crate::federation::consent_peer_set::is_consent_replication_grant(&row) {
+                let for_key =
+                    crate::federation::consent_by_humans::for_key_id_of(&row.attestation_envelope)
+                        .map(str::to_owned);
                 for peer in &row.subject_key_ids {
+                    if let Some(for_key) = &for_key {
+                        state.consent_peer_set_for.retain(|r| {
+                            !(r.author_key_id == row.attesting_key_id
+                                && r.for_key_id == *for_key
+                                && r.peer_key_id == *peer)
+                        });
+                        state.consent_peer_set_for.push(ConsentPeerForRow {
+                            author_key_id: row.attesting_key_id.clone(),
+                            for_key_id: for_key.clone(),
+                            peer_key_id: peer.clone(),
+                            source_attestation_id: row.attestation_id.clone(),
+                        });
+                    }
                     state.consent_peer_set.retain(|r| {
                         !(r.node_key_id == row.attesting_key_id && r.peer_key_id == *peer)
                     });
@@ -3871,6 +3904,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
     /// deduped. The fold already happened at write time (see
     /// `put_attestation`'s `consent_peer_set` mirror maintenance).
+    async fn list_consent_peers_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<(String, String)>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<(String, String)> = state
+            .consent_peer_set_for
+            .iter()
+            .filter(|r| r.for_key_id == for_key_id)
+            .map(|r| (r.author_key_id.clone(), r.peer_key_id.clone()))
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     async fn list_consent_peers(
         &self,
         node_key_id: &str,
