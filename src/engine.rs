@@ -19930,6 +19930,175 @@ mod tests {
             vec!["user", "wise_authority"]
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // v44.5.0 — BLOB_REPLICATION.md §21: what the v44.4.0 adopters asked
+    // for. I90–I93. Each witness was RED before its door existed.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// **I90 (§21.1, #821 Q1) — the ranged serve refuses exactly where the
+    /// whole-blob serve refuses, and returns no byte when it refuses.** The
+    /// silent failure this closes: a chunk responder wired to
+    /// `get_blob_range` directly bypasses BOTH serve gates while the
+    /// whole-blob path still honours them, so enforcement looks intact and a
+    /// pressured node keeps relaying.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i90_ranged_serve_refuses_where_the_whole_blob_serve_refuses_sqlite() {
+        use crate::federation::{BlobError, BlobRange};
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 1).await;
+        let local_sha = local_shas[0];
+        let proxy_sha = seed_proxy_blobs(&engine, "peer-relay-key-i90", 1).await[0];
+        let (engine, stub, monitor) = attach_disk_pressure(engine, TWO_GIB);
+
+        // Below stop: the ranged serve returns the slice, and it is the SAME
+        // slice `get_blob_range` returns — the door adds policy, not bytes.
+        let whole = engine
+            .serve_blob_to_peer(&proxy_sha, "some-peer")
+            .await
+            .expect("I90: whole-blob serve below stop");
+        let whole_bytes = match whole {
+            crate::federation::BlobBody::Inline(b) => b,
+            other => panic!("I90: fixture blobs are inline, got {other:?}"),
+        };
+        let ranged = engine
+            .serve_blob_range_to_peer(&proxy_sha, 1, 3, "some-peer")
+            .await
+            .expect("I90: ranged serve below stop");
+        match ranged {
+            BlobRange::Inline(b) => assert_eq!(b, whole_bytes[1..=3].to_vec(), "I90: the slice"),
+            other => panic!("I90: inline blob must slice inline, got {other:?}"),
+        }
+        // A start past the size is the storage trait's RangeNotSatisfiable,
+        // surfaced unchanged — the door does not invent a second arm.
+        let err = engine
+            .serve_blob_range_to_peer(&proxy_sha, 1 << 40, 1 << 41, "some-peer")
+            .await
+            .expect_err("I90: a start past the size is unsatisfiable");
+        assert!(
+            matches!(err, BlobError::RangeNotSatisfiable { .. }),
+            "I90: expected RangeNotSatisfiable, got {err:?}"
+        );
+
+        // STOP tier: the whole-blob door refuses the proxy blob — precondition,
+        // so the ranged assertion below cannot pass vacuously.
+        stub.set(FOUR_HUNDRED_MIB);
+        monitor.poll_once();
+        assert!(engine.current_disk_pressure().refuses_proxy_serves);
+        let whole_err = engine
+            .serve_blob_to_peer(&proxy_sha, "some-peer")
+            .await
+            .expect_err("I90 precondition: whole-blob proxy serve refused at stop");
+        assert!(matches!(
+            whole_err,
+            BlobError::DiskPressureProxyRefused {
+                operation: "serve",
+                ..
+            }
+        ));
+        // The ranged door refuses the SAME way — same arm, same operation
+        // label — and hands back no byte.
+        let ranged_err = engine
+            .serve_blob_range_to_peer(&proxy_sha, 0, 0, "some-peer")
+            .await
+            .expect_err("I90: the ranged proxy serve is refused at stop too");
+        match ranged_err {
+            BlobError::DiskPressureProxyRefused { operation, tier } => {
+                assert_eq!(operation, "serve", "I90: the peer maps on `operation`");
+                assert_eq!(tier, "stop");
+            }
+            other => panic!("I90: expected DiskPressureProxyRefused, got {other:?}"),
+        }
+        // And the LOCAL blob still serves by range at stop, exactly as it
+        // does whole — the gate is proxy-vs-local, not ranged-vs-whole.
+        engine
+            .serve_blob_range_to_peer(&local_sha, 0, 0, "some-peer")
+            .await
+            .expect("I90: a local blob serves by range at stop");
+    }
+
+    /// **I90, quarantine leg — a withheld local holder refuses the ranged
+    /// serve as it refuses the whole one.** This is the leak the #821 thread
+    /// named as worse than the pressure miss: a hoisted pressure-only
+    /// predicate would let a quarantined blob out one chunk at a time with
+    /// every read green.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i90_ranged_serve_honours_quarantine_sqlite() {
+        use crate::federation::types::{attestation_type, cohort_scope, LocalAttestationInput};
+        use crate::federation::BlobError;
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 1).await;
+        let sha = local_shas[0];
+        let dir = engine.federation_directory();
+        let holders = engine.list_local_holders(&sha).await.expect("holders");
+        let holder = holders
+            .first()
+            .cloned()
+            .expect("I90: the fixture blob has a holder");
+
+        // Serves before the marker — both doors.
+        engine
+            .serve_blob_to_peer(&sha, "some-peer")
+            .await
+            .expect("I90: serves before withholding");
+        engine
+            .serve_blob_range_to_peer(&sha, 0, 0, "some-peer")
+            .await
+            .expect("I90: serves by range before withholding");
+
+        // Withhold the holder: a marker on the quarantine dimension, filed
+        // against the subject, which is what `is_withheld` folds.
+        dir.attestation_upsert_local(LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: holder.clone(),
+            attested_key_id: Some(holder.clone()),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                crate::federation::quarantine::withhold_envelope(
+                    &holder,
+                    "comm-i90",
+                    "att-deleg-i90",
+                    "spam",
+                ),
+            )
+            .expect("I90: the marker envelope is a valid core"),
+            subject_key_ids: Vec::new(),
+            cohort_scope: cohort_scope::FEDERATION.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        })
+        .await
+        .expect("I90: the marker lands");
+        assert!(
+            crate::federation::quarantine::is_withheld(dir.as_ref(), &holder, chrono::Utc::now())
+                .await
+                .expect("fold"),
+            "I90 precondition: the holder IS withheld after the marker"
+        );
+
+        // Whole-blob refuses — precondition, again so the next line is not vacuous.
+        let whole = engine
+            .serve_blob_to_peer(&sha, "some-peer")
+            .await
+            .expect_err("I90 precondition: whole-blob serve refused while withheld");
+        assert!(
+            matches!(whole, BlobError::QuarantineWithheld { .. }),
+            "{whole:?}"
+        );
+        // Ranged refuses the SAME way.
+        let ranged = engine
+            .serve_blob_range_to_peer(&sha, 0, 0, "some-peer")
+            .await
+            .expect_err("I90: the ranged serve is refused while withheld");
+        match ranged {
+            BlobError::QuarantineWithheld { key_id } => assert_eq!(key_id, holder),
+            other => panic!("I90: expected QuarantineWithheld, got {other:?}"),
+        }
+    }
 }
 
 // ─── the #714 / #716 / #735 canonicalization-parity class, instance FOUR ────

@@ -839,6 +839,75 @@ mod tests {
         );
     }
 
+    /// **I90 (b) (§21.1) — every serve door reaches the body only through
+    /// `check_serve_disposition`, and no serve door re-spells either gate.**
+    /// PR #852 rounds eight and ten: two doors asking one question became
+    /// two implementations and drifted by a clause a round. This asserts
+    /// the PROPERTY over the doors, not that the two happen to match.
+    #[test]
+    fn i90b_every_serve_door_routes_through_the_one_disposition() {
+        let engine = production_only(&src("src/engine.rs"));
+        let body = |sig: &str| -> String {
+            let at = engine
+                .find(sig)
+                .unwrap_or_else(|| panic!("I90 (b): `{sig}` not found"));
+            let stop = engine[at..]
+                .find("\n    }\n")
+                .map(|e| at + e)
+                .unwrap_or(engine.len());
+            engine[at..stop].to_owned()
+        };
+        let doors = [
+            (
+                "serve_blob_to_peer",
+                body("pub async fn serve_blob_to_peer("),
+            ),
+            (
+                "serve_blob_range_to_peer",
+                body("pub async fn serve_blob_range_to_peer("),
+            ),
+        ];
+        for (name, b) in &doors {
+            assert!(
+                b.contains("check_serve_disposition("),
+                "I90 (b): {name} must ask the one disposition before reading a body"
+            );
+            // The body read comes AFTER the disposition, or the gate is decoration.
+            let disp = b.find("check_serve_disposition(").unwrap();
+            let read = b
+                .find(".get_blob(")
+                .or_else(|| b.find(".get_blob_range("))
+                .unwrap_or_else(|| panic!("I90 (b): {name} reads no body?"));
+            assert!(
+                disp < read,
+                "I90 (b): {name} reads the body BEFORE asking the disposition"
+            );
+            // Neither door re-spells a gate.
+            for clause in ["is_proxy_content(", "is_withheld(", "refuses_proxy_serves"] {
+                assert!(
+                    !b.contains(clause),
+                    "I90 (b): {name} re-spells `{clause}` instead of delegating — this is \
+                     how two doors drift"
+                );
+            }
+        }
+        // The disposition itself carries BOTH gates — and the I49 rule still
+        // sees `is_proxy_content` through it (that gate reads the same body).
+        let disp = body("async fn check_serve_disposition(");
+        assert!(
+            disp.contains("is_proxy_content("),
+            "I90 (b): the pressure gate lives here"
+        );
+        assert!(
+            disp.contains("is_withheld("),
+            "I90 (b): the quarantine gate lives here"
+        );
+        assert!(
+            !disp.contains(".get_blob(") && !disp.contains(".get_blob_range("),
+            "I90 (b): the disposition reads no body — it is the decision, not the serve"
+        );
+    }
+
     // ── I53 ──────────────────────────────────────────────────────────────
     /// `BLOB_REPLICATION.md` §2 / CC 1.13.3 — **persist claims exactly two
     /// privacy properties** — content-holding confidentiality and
