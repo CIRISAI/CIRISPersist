@@ -784,8 +784,10 @@ mod tests {
                 body(&engine, "async fn sweep_evictions_once_inner(", "\n    }\n"),
             ),
             (
-                "Engine::serve_blob_to_peer",
-                body(&engine, "pub async fn serve_blob_to_peer(", "\n    }\n"),
+                // §21.1 — the serve decision lives in the one disposition both
+                // serve doors ask (I90 (b) holds the doors to it).
+                "Engine::check_serve_disposition",
+                body(&engine, "async fn check_serve_disposition(", "\n    }\n"),
             ),
             (
                 "hold::would_hold",

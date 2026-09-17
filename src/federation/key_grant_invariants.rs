@@ -3482,11 +3482,15 @@ mod tests {
             deliver_attestations(&sb, &engine_a, &sa).await;
             // ── each node publishes its OWN occurrence (§20.3) ────────
             engine_a
-                .publish_self_occurrence(&alice, crate::federation::types::device_class::SERVER)
+                .publish_self_occurrence(
+                    &alice,
+                    crate::federation::types::device_class::SERVER,
+                    None,
+                )
                 .await
                 .expect("I75: A publishes its occurrence under alice");
             engine_b
-                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER)
+                .publish_self_occurrence(&bob, crate::federation::types::device_class::SERVER, None)
                 .await
                 .expect("I75: B publishes its occurrence under bob");
             // Occurrences cross through the plane and the gated door.
@@ -3575,6 +3579,7 @@ mod tests {
                 .publish_self_occurrence(
                     "i82-owner",
                     crate::federation::types::device_class::SERVER,
+                    None,
                 )
                 .await
                 .expect_err("I82: a LocalSigner that is not the node's identity is refused");

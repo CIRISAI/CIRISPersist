@@ -585,6 +585,7 @@ pub async fn publish_self_occurrence_with_local_signer<B>(
     signer: &crate::signing::LocalSigner,
     identity_key_id: &str,
     device_class: &str,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<crate::federation::SignedIdentityOccurrence, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
@@ -598,24 +599,73 @@ where
         x25519_base64: kem.x25519_pubkey_b64,
         ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
     };
+    publish_signed_content_only_occurrence(
+        backend,
+        signer,
+        identity_key_id,
+        &me,
+        device_class,
+        None,
+        enc,
+        valid_until,
+    )
+    .await
+}
+
+/// v44.5.0 (§21.3, CIRISPersist#856) — **the one producer of the content-only
+/// signed occurrence** (§20.2's second form). Two doors call it: a node
+/// publishing its OWN occurrence (`occurrence_key_id == signer`, the owner
+/// binding lifts it) and `self_at_login` publishing a DEVICE occurrence under
+/// the identity that signs it (`attesting_key_id == identity_key_id`, no lift
+/// needed). One envelope builder, so the two cannot drift by a field — the
+/// gate binds every persisted field to the envelope (PR #852 round one), and
+/// a second builder that carried one field differently would produce rows
+/// the gate refuses.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_signed_content_only_occurrence<B>(
+    backend: &B,
+    signer: &crate::signing::LocalSigner,
+    identity_key_id: &str,
+    occurrence_key_id: &str,
+    device_class: &str,
+    hardware_attestation: Option<&str>,
+    enc: crate::federation::EncryptionPubkeys,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<crate::federation::SignedIdentityOccurrence, Error>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+{
+    let me = signer.derived_key_id();
     // Millisecond-exact: the envelope carries the millisecond rendering and
     // the gate requires the typed instant to carry nothing below it.
     let asserted_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
         chrono::Utc::now().timestamp_millis(),
     )
     .unwrap_or_else(chrono::Utc::now);
+    // v44.5.0 (#855, §21.2) — `valid_until` is one more bound member, carried
+    // exactly as `asserted_at` is: truncated to the millisecond BEFORE
+    // signing, because the gate compares the typed instant to the envelope's
+    // millisecond rendering and a caller-supplied instant with finer
+    // precision would sign one thing and store another.
+    let valid_until = valid_until.map(|t| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).unwrap_or(t)
+    });
+    let valid_until_json = valid_until.map_or(serde_json::Value::Null, |t| {
+        serde_json::Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    });
     let envelope = serde_json::json!({
         "attesting_key_id": me,
         "identity_key_id": identity_key_id,
-        "occurrence_key_id": me,
+        "occurrence_key_id": occurrence_key_id,
         "device_class": device_class,
         "encryption_pubkeys": {
             "x25519_base64": enc.x25519_base64,
             "ml_kem_768_base64": enc.ml_kem_768_base64,
         },
         "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "valid_until": serde_json::Value::Null,
-        "hardware_attestation": serde_json::Value::Null,
+        "valid_until": valid_until_json,
+        "hardware_attestation": hardware_attestation
+            .map_or(serde_json::Value::Null, |h| serde_json::Value::String(h.to_owned())),
     });
     let (signed_envelope, signature) =
         ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
@@ -627,11 +677,11 @@ where
     let signed = crate::federation::SignedIdentityOccurrence {
         identity_occurrence: crate::federation::IdentityOccurrence {
             identity_key_id: identity_key_id.to_owned(),
-            occurrence_key_id: me.clone(),
+            occurrence_key_id: occurrence_key_id.to_owned(),
             device_class: device_class.to_owned(),
-            hardware_attestation: None,
+            hardware_attestation: hardware_attestation.map(str::to_owned),
             asserted_at,
-            valid_until: None,
+            valid_until,
             encryption_pubkeys: Some(enc),
             transport_binding: None,
             persist_row_hash: String::new(),
