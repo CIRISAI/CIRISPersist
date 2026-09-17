@@ -362,6 +362,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_communities_for_member", ConnClass::Read),
     ("list_community_membership_revocations_for", ConnClass::Read),
     ("list_consent_peers", ConnClass::Read),
+    // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
+    ("list_consent_peers_for", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),

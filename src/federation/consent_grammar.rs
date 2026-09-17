@@ -262,6 +262,16 @@ pub struct ConsentTransferPolicy {
     /// [`RestrictionOp`].
     #[serde(default)]
     pub restrictions: Vec<RestrictionOp>,
+    /// v44.6.0 (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md` §4) — **the
+    /// machine this grant is FOR.** A human's consent to ship traces is for
+    /// THIS agent, never for every machine the human stewards (operator,
+    /// 2026-09-17). A steward's grant counts for machine `k` only when this
+    /// names `k`; a grant naming another key, or none, is nothing for `k`.
+    /// There is no blanket form. A MACHINE author may name only itself
+    /// (`check_consent_for_key_admission`); a machine-authored grant with no
+    /// member is about its author by construction.
+    #[serde(default)]
+    pub for_key_id: Option<String>,
 }
 
 /// The ONE strict parser for a `consent:replication:v1` grant's
@@ -487,6 +497,9 @@ pub fn consent_grammar_manifest() -> serde_json::Value {
         ],
         "kind_transferability": kind_transferability,
         "legacy_compat": {"replication": "transfer"},
+        // v44.6.0 (#857) — the optional payload members beyond the defaults
+        // block, so a member added to the closed grammar moves the hash.
+        "optional_members": ["purpose", "valid_until", "for_key_id"],
         "defaults": {
             "direction": "egress",
             "kinds": ["Attestation"],
@@ -526,8 +539,14 @@ pub fn consent_grammar_sha256() -> String {
 /// unchanged. Previous value:
 /// `b66870da9639c8560538a26c566168fea9759139eaa67ad4116ff8a5f290d69f`
 /// (v31.1.0 – v44.2.1).
+/// CIRISPersist#857 (v44.6.0) — re-pinned because the GRAMMAR changed: the
+/// payload gains the optional member `for_key_id` (the machine a human's
+/// grant is FOR), and the manifest now lists the optional payload members so
+/// a member added to the closed grammar moves this hash. Previous value:
+/// `79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac`
+/// (v44.3.0 – v44.5.0).
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac";
+    "ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

@@ -7414,6 +7414,42 @@ impl Engine {
             .await
     }
 
+    /// v44.6.0 (#857 §4) — see
+    /// [`consent_by_humans::consent_peers_by_principals`](crate::federation::consent_by_humans::consent_peers_by_principals).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn consent_peers_by_principals(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        crate::federation::consent_by_humans::consent_peers_by_principals(
+            self.federation_directory().as_ref(),
+            key_id,
+        )
+        .await
+    }
+
+    /// v44.6.0 (#857 §4) — see
+    /// [`consent_by_humans::resolve_scoped_consent_by_principals`](crate::federation::consent_by_humans::resolve_scoped_consent_by_principals).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn resolve_scoped_consent_by_principals(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::hard_case::ConsentState, crate::federation::Error> {
+        crate::federation::consent_by_humans::resolve_scoped_consent_by_principals(
+            self.federation_directory().as_ref(),
+            target_key_id,
+            subject_key_id,
+            scope,
+            qualifier,
+            now,
+        )
+        .await
+    }
+
     /// #249 Cut B — inbound `delegates_to` edges naming `key_id` as
     /// recipient. See
     /// [`FederationDirectory::delegations_to`](crate::federation::FederationDirectory::delegations_to).

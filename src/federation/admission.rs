@@ -8540,6 +8540,55 @@ async fn steward_edge_filter(
     })
 }
 
+/// v44.6.0 (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md` §3) — **the
+/// occurrence half of the steward fold, spelled once**: the `user`-role
+/// identities `k` is an ACTIVE occurrence of.
+///
+/// Clause (2) of `is_steward_bound` / `steward_bindings_of` /
+/// `steward_binding_chain` resolved the occurrence half through
+/// `lookup_identity_for_occurrence` — `WHERE occurrence_key_id = ? LIMIT 1`
+/// with no order on sqlite and postgres, `.values().find(..)` on memory. One
+/// occurrence key may be bound under several identities (the table's key is
+/// `(identity, occurrence)`), and on a split-key home it is: the engine's
+/// transport self-occurrence (identity = itself, CIRISServer#454) beside the
+/// row that binds the agent as an occurrence of its HUMAN (the §8.1.12.7
+/// login). Which row won was arbitrary, so the human anchored the agent on
+/// some backends and in some runs and not others.
+///
+/// Every row for the key is read; `user`-role identities are kept; and only
+/// those under which `k` is ACTIVE count — a revoked device is not co-self
+/// with its former identity (v38.2.0, `active_identity_for_occurrence`).
+async fn user_identity_anchors_of(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let mut out = std::collections::BTreeSet::new();
+    for occ in directory
+        .list_identity_occurrences_by_occurrence_key(k)
+        .await?
+    {
+        let identity = occ.identity_key_id;
+        if identity == k {
+            // The transport self-occurrence: a key is not an occurrence of
+            // itself for stewardship — clause (1) answers for a user key.
+            continue;
+        }
+        let Some(id_rec) = directory.lookup_public_key(&identity).await? else {
+            continue;
+        };
+        if !identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+            continue;
+        }
+        let active = directory
+            .list_identity_occurrences_active(&identity)
+            .await?;
+        if active.iter().any(|o| o.occurrence_key_id == k) {
+            out.insert(identity);
+        }
+    }
+    Ok(out)
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §5.6.8.10) — is key `k`
 /// **steward-bound**? A moderation chain ROOT must terminate in a real human
 /// (a `user`-role identity), never a free-floating agent/service key — the
@@ -8590,12 +8639,9 @@ pub async fn is_steward_bound(
         }
         // (2) k is an occurrence of a human identity — resolve the identity
         //     key and check ITS identity_type set for `user`.
-        if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
-            if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
-                if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
-                    return Ok(true);
-                }
-            }
+        // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once.
+        if !user_identity_anchors_of(directory, k).await?.is_empty() {
+            return Ok(true);
         }
     }
     // (3) a LIVE `delegates_to(U → k)` with U user-role — resolved by the ONE
@@ -8655,13 +8701,8 @@ pub async fn steward_bindings_of(
             }
         }
         // (2) k is an occurrence of a user-role identity.
-        if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
-            if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
-                if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
-                    out.insert(occ.identity_key_id);
-                }
-            }
-        }
+        // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once.
+        out.extend(user_identity_anchors_of(directory, k).await?);
     }
     // (3) each user-role granter U of a LIVE delegates_to(U → k) — with the
     // filter chosen by **whether `k` has agency**.
@@ -11676,12 +11717,14 @@ pub async fn steward_binding_chain(
             }
         }
         // (2) k is an occurrence of a user-role identity — identity → k.
-        if let Some(occ) = directory.lookup_identity_for_occurrence(key_id).await? {
-            if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
-                if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
-                    return Ok(vec![occ.identity_key_id, key_id.to_owned()]);
-                }
-            }
+        // v44.6.0 (#857) — every row for the key, ACTIVE only, spelled once;
+        // the lowest anchor first, for the deterministic path clause (3) keeps.
+        if let Some(identity) = user_identity_anchors_of(directory, key_id)
+            .await?
+            .into_iter()
+            .next()
+        {
+            return Ok(vec![identity, key_id.to_owned()]);
         }
     }
     // (3) a LIVE delegates_to(U → k) with U user-role — U → k. Lowest
@@ -12702,6 +12745,46 @@ async fn named_moderator_holders(
         }
     }
     Ok(holders)
+}
+
+/// v44.6.0 (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md` §4) — **a machine
+/// author may name only itself in `for_key_id`.** Infrastructure cannot
+/// consent on another machine's behalf (consent is by humans); a human
+/// author may name any key, and whether that human stands behind the named
+/// machine is decided at READ time by the steward fold, never by admission
+/// (a grant for a machine the author does not yet steward is stored and
+/// counts the moment the anchor lands). Runs on every backend's
+/// `put_attestation`, after the attesting key's role is known.
+pub async fn check_consent_for_key_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let env = &row.attestation_envelope;
+    let is_consent = envelope_dimension(env).is_some_and(|d| {
+        d == super::consent_grammar::GRANT_DIMENSION
+            || d.starts_with(super::consent::consent_dimension::STATE_PREFIX)
+    });
+    if !is_consent {
+        return Ok(());
+    }
+    let Some(for_key) = super::consent_by_humans::for_key_id_of(env) else {
+        return Ok(());
+    };
+    if for_key == row.attesting_key_id {
+        return Ok(());
+    }
+    let Some(rec) = directory.lookup_public_key(&row.attesting_key_id).await? else {
+        return Ok(()); // the FK / tier-2 gate answers for an unknown attester
+    };
+    if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "consent row by {} names for_key_id {for_key}: a machine author may name only itself — \
+         consent is by humans, and infrastructure cannot consent on another machine's behalf \
+         (CIRISPersist#857, FSD/CONSENT_BY_HUMANS.md §4)",
+        row.attesting_key_id
+    )))
 }
 
 /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25 §11.10) — `put_attestation`
