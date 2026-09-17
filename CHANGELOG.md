@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.5.0] - UNRELEASED
+
+### Changed
+- **CIRISVerify re-pin v15.1.0 → v15.2.0** (CIRISVerify#281 / PR #282): all
+  seven `Cargo.toml` tag pins (`ciris-keyring` ×4 feature variants,
+  `ciris-verify-core` ×2, `ciris-crypto` ×1) flip together, per the
+  crate-coherence rule. Additive MINOR on the verify side, and the whole change
+  is on a PRODUCER persist does not call: `sign_build_manifest_contribution`
+  now emits `evidence_refs: [build.manifest_hash]`, so the manifest
+  Contribution references its own blob. That is the reference shape persist's
+  `envelope_binds_content` / `attestations_binding_content` already resolve
+  through, and the one every blob consumer runs on (a `holds_bytes` row is
+  possession, not meaning — CIRISEdge `PossessionIsNotMeaning`). So with this
+  pin a manifest Contribution ingested by persist binds to the manifest bytes
+  and CIRISEdge#601's pull-on-attestation can fire for it; before it, the same
+  row was `DoesNotReference`. Nothing in persist's ingest keys on the field —
+  the `provenance:build_manifest` projection rules key on family and
+  `cohort_scope` — and verify keeps pre-#281 rows verifying, so no stored row
+  changes disposition. The wheel's `Requires-Dist: ciris-verify>=15.0.0,<16`
+  already admits 15.2.0. No pin hash moves.
+
 ## [44.4.0] - 2026-09-15
 
 **The occurrence that carries the key.** CIRISEdge's mesh harness ran the
