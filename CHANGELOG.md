@@ -68,6 +68,16 @@ threat-model citations because this crate's audit story is the point.
   device rows and the far node admits them through the same gate), I92 (b),
   I93.
 
+### Release mechanics
+- **The annotated tag keeps its markdown headings from this release on.**
+  `git tag -a -F` strips every `#`-leading line as a comment, so every prior
+  CIRISPersist tag (v44.4.0 included: 19504 bytes in, 18616 stored) lost all
+  of its section headers and the prose ran together. The ship chain now tags
+  with `--cleanup=verbatim` and asserts bytes-in equals bytes-stored. A
+  convention change, stated here so the different shape of this tag's message
+  reads as deliberate. The GitHub Release body was always set separately and
+  is unaffected.
+
 ### Changed — breaking for Rust callers, flagged
 - **`Engine::publish_self_occurrence` and
   `publish_self_occurrence_with_local_signer` take a third parameter**,
