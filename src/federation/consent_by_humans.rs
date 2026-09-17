@@ -75,11 +75,11 @@ pub async fn consent_principals_of(
 /// asymmetry are untouched — this composes stances, it does not derive them.
 #[must_use]
 pub fn combine_principal_stances(stances: &[ConsentState]) -> ConsentState {
-    if stances.iter().any(|s| *s == ConsentState::Revoked) {
+    if stances.contains(&ConsentState::Revoked) {
         ConsentState::Revoked
-    } else if stances.iter().any(|s| *s == ConsentState::Granted) {
+    } else if stances.contains(&ConsentState::Granted) {
         ConsentState::Granted
-    } else if stances.iter().any(|s| *s == ConsentState::Expired) {
+    } else if stances.contains(&ConsentState::Expired) {
         ConsentState::Expired
     } else {
         ConsentState::Unspecified
@@ -96,7 +96,7 @@ pub async fn consent_peers_by_principals(
     let stewards = super::admission::steward_bindings_of(directory, k).await?;
     let mut out = directory.list_consent_peers(k).await?;
     for (author, peer) in directory.list_consent_peers_for(k).await? {
-        if stewards.iter().any(|s| *s == author) {
+        if stewards.contains(&author) {
             out.push(peer);
         }
     }

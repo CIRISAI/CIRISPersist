@@ -3971,6 +3971,18 @@ class Engine:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
 
 
+    # ==============================================================
+    # CONTINGENT  (descriptive)
+    # Varying one of these out of scope by construction — see `report` for why this is empty.
+    # ==============================================================
+
+    def consent_peers_by_principals(self, key_id: str) -> str:
+        """(derived) contingent — v44.6.0 (#857 §4) — list_consent_peers keyed by ANY key that stands for the machine (the union over its human principals and itself). JSON array of..."""
+
+    def resolve_scoped_consent_by_principals(self, target_key_id: str, subject_key_id: str, scope: str, qualifier: str | None = None, now_iso: str | None = None) -> str:
+        """(derived) contingent — v44.6.0 (#857 §4) — resolve_scoped_consent keyed by ANY key that stands for the subject; the per-principal fold combined as a reverse quorum on the..."""
+
+
 class ScoringFactorStream:
 
     # ==============================================================

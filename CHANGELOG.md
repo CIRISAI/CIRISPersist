@@ -5,6 +5,68 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.6.0] - 2026-09-17
+
+### Added — consent is by humans, for THIS machine (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md`)
+- **The consent doors take any key and walk to the humans, on rows that name
+  the machine.** The consent that governs a HUMAN's data — ship traces,
+  replicate, analyze — is the human's; an agent still consents for itself
+  within its own agency (partnership acceptance, a shutdown request), and
+  that is untouched. Every consumer used to perform that walk for itself, and
+  Server's write side keyed by the node while its read side keyed by the
+  engine for six releases: zero traces from every split-key home, every test
+  green because the test asked with the writer's key. Two trait defaults,
+  inherited by all three backends from one body:
+  `consent_peers_by_principals(k)` and
+  `resolve_scoped_consent_by_principals(target, k, …)`. A human key is the
+  identity case, so a caller keyed on either axis gets one answer.
+- **The operator's constraint: a human's consent is for THIS agent, never for
+  every machine the human stewards.** The member is `for_key_id` — a payload
+  member of the closed `consent:replication:v1` grammar, so
+  **`CONSENT_GRAMMAR_HASH` re-pins** `79c74e4d…` → `ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482`; an
+  envelope member on `consent:state:*` rows. A steward's row counts for
+  machine `k` only when it names `k`; one naming another agent, or none, is
+  `Unspecified` for `k`; there is no blanket form. Machine-authored rows are
+  about their author by construction and keep counting until superseded; a
+  machine naming another key is refused at admission. V147 adds the
+  `consent_peer_set_for` projection (`author, for_key_id, peer`), maintained
+  and revocation-folded beside V109's, so the widened read stays a projection
+  read. V109 is untouched.
+- **One combine rule, `combine_principal_stances`**: any `Revoked` →
+  `Revoked`; else any `Granted` → `Granted`; else any `Expired`; else
+  `Unspecified`. A reverse quorum on the stop: any one human behind a machine
+  can withdraw its consent for it; no grant overrides another human's
+  revocation. Silence is not refusal; expiry is lapse, not withdrawal.
+- **The walk is `steward_bindings_of`, and its occurrence half was
+  non-deterministic.** Clause (2) of the steward fold — spelled in
+  `is_steward_bound`, `steward_bindings_of` and `steward_binding_chain` —
+  resolved "which identity is `k` an occurrence of" through
+  `lookup_identity_for_occurrence`: `LIMIT 1` with no order on sqlite and
+  postgres, `.values().find(..)` on memory. One occurrence key may be bound
+  under several identities, and on a split-key home it is: Server compose's
+  transport self-occurrence (identity = the engine's own key) beside the row
+  that binds the agent as an occurrence of its human. Which row won was
+  arbitrary. One helper, `user_identity_anchors_of`, reads every row for the
+  key, keeps `user` identities, and keeps only those under which `k` is
+  ACTIVE (v38.2.0: a revoked device is not co-self with its former identity).
+  All three sites call it; I94 (b) holds them to it from disk.
+
+### Not added, and why
+- **No owner-binding door for agents.** An earlier draft framed the human's
+  relation to an agent as ownership. CC 3.2's structural no-slavery
+  guarantee: *"Steward-binding is responsibility, not property … you never
+  steward a node, an agent, or a person as a possession."* A human OWNS a
+  node (the responsible party for a device; persist's purpose string is
+  `responsible_for`) and STEWARDS an agent. CC 3.4.7.3 Clause C forbids any
+  stored agent↔node edge, and Clause D's cardinality text names the agent's
+  base anchor as being an **occurrence of the human's identity** — the
+  §8.1.12.7 login ceremony, `self_at_login`, which v44.5.0 (#856) publishes
+  through the gated door. The split home's fix is that ceremony, signed by
+  the same human who signed the node's owner-binding, not a second binding.
+
+### Mutations
+M61 (the anchors helper drops the ACTIVE filter) reds I94; M62 (the scoped door drops the `for_key_id` filter) reds I95; M63 (the peers door drops the steward filter) reds I96; M64 (the admission gate always admits) reds I96 (b); M65 (a grant beats a revoke) reds the combine-rule unit test and I95. Each restored from a scratch copy.
+
 ## [44.5.0] - 2026-09-17
 
 ### Added — what the v44.4.0 adopters asked for (`BLOB_REPLICATION.md` §21)

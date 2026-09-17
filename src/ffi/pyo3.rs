@@ -23807,7 +23807,7 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let key_id = key_id.to_owned();
-            let engine = self.engine_view();
+            let engine = self.hold_engine_view();
             py.detach(move || {
                 let peers = self
                     .runtime
@@ -23847,7 +23847,7 @@ impl PyEngine {
                 scope.to_owned(),
                 qualifier.map(str::to_owned),
             );
-            let engine = self.engine_view();
+            let engine = self.hold_engine_view();
             py.detach(move || {
                 let stance = self
                     .runtime

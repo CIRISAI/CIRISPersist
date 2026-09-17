@@ -698,3 +698,5 @@ ScoringFactorStream	__iter__	structural
 ScoringFactorStream	__len__	structural	
 ScoringFactorStream	__next__	structural	
 ScoringFactorStream	summary	epistemic	
+Engine	consent_peers_by_principals	deontic	
+Engine	resolve_scoped_consent_by_principals	deontic	
