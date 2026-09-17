@@ -762,12 +762,7 @@ class Engine:
         """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14) — emit the KeyGrant set for an axis on demand. FFI mirror of [Engine::emit_key_grant](crate::engine::Eng..."""
 
     def emit_pending_key_grants(self) -> int:
-        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every KeyGrant set this node owes and has not yet carried: each epoch it minted whose set is dirty per the emission ledger and each self/family blob it authored likewise. Runs at __init__ after the sentinel resolves; reachable on demand. Returns how many sets were emitted. FFI mirror of [Engine::emit_pending_key_grants]."""
-        ...
-
-    def publish_self_occurrence(self, identity_key_id: str, device_class: str) -> str:
-        """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the LocalSigner and admitted through the gated door so the IdentityOccurrence plane advertises it and a far node admits it. Returns the signed occurrence as JSON. FFI mirror of [Engine::publish_self_occurrence]."""
-        ...
+        """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) — emit every KeyGrant set this node owes and has not yet carried: each epoch it minted whose set i..."""
 
     def enter_mesh(self, attestation_id: str, contextual_integrity: str) -> dict[str, Any]:
         """(derived) deontic — v39.0.0 — enter the mesh: flip a local-tier row to the federation tier over the SAME bytes (CC 5.3.2.4.2). Replaces attestation_promote, which re-s..."""
@@ -909,6 +904,9 @@ class Engine:
 
         Read-only -- it releases, evicts and mutates nothing.
         """
+
+    def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
+        """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
     def put_accord_decision_json(self, payload_json: str) -> None:
         """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision>, "steward_signatures": <obj|null> }. Immutable (M2)."""

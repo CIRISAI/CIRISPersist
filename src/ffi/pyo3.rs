@@ -6452,7 +6452,7 @@ impl PyEngine {
         })
     }
 
-    /// (derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
+    /// CIRISPersist#848 (BLOB_REPLICATION.md §14, V146) —
     /// **emit every KeyGrant set this node owes and has not yet carried**: each
     /// epoch it minted whose set is dirty per the emission ledger (never
     /// emitted, or a grant newer than the last emission — the shape a crash
@@ -6537,7 +6537,7 @@ impl PyEngine {
         })
     }
 
-    /// (derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) —
+    /// CIRISPersist#851 (BLOB_REPLICATION.md §20.3) —
     /// **publish this node's own content-only occurrence** under
     /// `identity_key_id` (its owner), signed with the LocalSigner and admitted
     /// through the gated door so the IdentityOccurrence plane advertises it
