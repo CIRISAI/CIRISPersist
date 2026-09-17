@@ -183,6 +183,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
+    // v44.6.0 (#857) — a machine author may name only itself in for_key_id;
+    // refuses on the caller's input.
+    ("check_consent_for_key_admission", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
     ("check_encryption_pubkeys", Class::Gate),
