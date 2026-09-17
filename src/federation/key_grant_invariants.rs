@@ -3778,7 +3778,9 @@ mod tests {
                     app: SelfAtLoginOccurrence {
                         occurrence_key_id: app_key.clone(),
                         device_class: crate::federation::types::device_class::PHONE.to_owned(),
-                        hardware_attestation: None,
+                        // The producer's Some(..) path: a bound member the
+                        // node's own occurrence never exercises.
+                        hardware_attestation: Some("hw-attest-i92".to_owned()),
                         encryption_pubkeys: Some(mk_keys()),
                         transport_destinations: vec![],
                     },
@@ -3844,6 +3846,20 @@ mod tests {
             assert!(
                 far.contains(&app_key) && far.contains(&agent_key),
                 "I92: on B: {far:?}"
+            );
+            // The hardware attestation crossed as a BOUND member: the far row
+            // carries the string the producer rendered into the envelope.
+            let far_app =
+                FederationDirectory::list_identity_occurrences_for(sb.as_ref(), &identity)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|o| o.occurrence_key_id == app_key)
+                    .expect("I92: the app row on B");
+            assert_eq!(
+                far_app.hardware_attestation.as_deref(),
+                Some("hw-attest-i92"),
+                "I92: hardware_attestation is bound into the envelope and crosses intact"
             );
 
             // ── leg 2: WITHOUT the signer, trusted-local, not on the plane ──
