@@ -815,6 +815,52 @@ impl Default for MemoryBackend {
 }
 
 impl MemoryBackend {
+    /// v44.7.0 (CIRISPersist#864) — the trait default is first-seen-wins with
+    /// no plan (it cannot run one over an unsized `Self`). This backend runs
+    /// the ONE key plan first, exactly as the sqlite/postgres applies do, and
+    /// dispatches its `Rebind` arm to the store step; `Insert` goes through
+    /// `put_public_key` behind the same fail-closed PoP gate; `Unchanged` and
+    /// every typed refusal are reported as the plan produced them. The memory
+    /// backend has no upgrade/supersede doors, so those arms are the store
+    /// conflict they always were here — not a pretence of having run them.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{
+            KeyRefusalReason, ReplicatedKeyOutcome, ReplicatedKeyPlan,
+        };
+        use crate::federation::Error;
+        const RACED: ReplicatedKeyOutcome = ReplicatedKeyOutcome::Refused {
+            reason: KeyRefusalReason::StoreConflict,
+        };
+        match crate::federation::register::plan_replicated_key_apply(self, &record.record).await? {
+            ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
+            ReplicatedKeyPlan::Insert => {
+                if !crate::federation::register::record_is_role_gated(&record.record) {
+                    crate::federation::verify_key_registration(self, &record.record).await?;
+                }
+                match crate::federation::FederationDirectory::put_public_key(self, record).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
+                    Err(Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
+            ReplicatedKeyPlan::Rebind => {
+                match crate::federation::FederationDirectory::store_rebound_key_record(self, record)
+                    .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
+            ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => Ok(RACED),
+        }
+    }
+
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
@@ -2524,46 +2570,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
-    /// v44.7.0 (CIRISPersist#864) — the trait default is first-seen-wins with
-    /// no plan (it cannot run one over an unsized `Self`). This backend runs
-    /// the ONE key plan first, exactly as the sqlite/postgres applies do, and
-    /// dispatches its `Rebind` arm to the store step; `Insert` goes through
-    /// `put_public_key` behind the same fail-closed PoP gate; `Unchanged` and
-    /// every typed refusal are reported as the plan produced them. The memory
-    /// backend has no upgrade/supersede doors, so those arms are the store
-    /// conflict they always were here — not a pretence of having run them.
+    /// v44.7.0 (CIRISPersist#864) — delegates to the inherent method, the
+    /// sqlite/postgres shape.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn apply_replicated_key_record(
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
-        use crate::federation::register::{
-            KeyRefusalReason, ReplicatedKeyOutcome, ReplicatedKeyPlan,
-        };
-        use crate::federation::Error;
-        const RACED: ReplicatedKeyOutcome = ReplicatedKeyOutcome::Refused {
-            reason: KeyRefusalReason::StoreConflict,
-        };
-        match crate::federation::register::plan_replicated_key_apply(self, &record.record).await? {
-            ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
-            ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
-            ReplicatedKeyPlan::Insert => {
-                if !crate::federation::register::record_is_role_gated(&record.record) {
-                    crate::federation::verify_key_registration(self, &record.record).await?;
-                }
-                match self.put_public_key(record).await {
-                    Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
-                    Err(Error::Conflict(_)) => Ok(RACED),
-                    Err(e) => Err(e),
-                }
-            }
-            ReplicatedKeyPlan::Rebind => match self.store_rebound_key_record(record).await {
-                Ok(outcome) => Ok(outcome),
-                Err(Error::Conflict(_)) => Ok(RACED),
-                Err(e) => Err(e),
-            },
-            ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => Ok(RACED),
-        }
+        MemoryBackend::apply_replicated_key_record(self, record).await
     }
 
     #[cfg(any(feature = "postgres", feature = "sqlite"))]

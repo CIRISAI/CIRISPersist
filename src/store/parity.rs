@@ -465,6 +465,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // components (runs `check_put_blob_admission`): it refuses caller input.
     ("prepare_holds_bytes_row", Class::Gate),
     ("prepare_proposal", Class::Gate),
+    // v44.7.0 (#864) — the rebind store steps' shared pre-check: same pubkeys,
+    // self-signed, claim byte-equal; refuses the write with `Conflict`.
+    ("prepare_rebind", Class::Gate),
     ("prepare_sealed_manifest_row", Class::Plumbing),
     ("prepare_stream_chunk_row", Class::Plumbing),
     ("project_route", Class::Plumbing),

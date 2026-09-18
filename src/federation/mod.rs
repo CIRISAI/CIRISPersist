@@ -98,7 +98,12 @@ pub mod key_grant_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod claim_signing_invariants;
 // CIRISPersist#864 (`FSD/KEY_RECORD_REBIND.md`) — I99–I103: the same-key rebind.
-#[cfg(any(test, feature = "test-anchor"))]
+// v44.7.0 (#864) — the witnesses drive the key plan, which exists only with a
+// backend feature; a no-backend axis has nothing to witness here.
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
 pub mod key_rebind_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
