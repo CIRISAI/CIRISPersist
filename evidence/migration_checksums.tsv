@@ -281,3 +281,5 @@ sqlite	146	key_grant_emission_ledger	8838517352252356577
 postgres	146	key_grant_emission_ledger	16998603888556472534
 sqlite	147	consent_peer_set_for	8332404306030852117
 postgres	147	consent_peer_set_for	4079803879488622867
+sqlite	148	key_registration_history	17394385412746748785
+postgres	148	key_registration_history	4164581860194465064

@@ -6258,6 +6258,120 @@ impl PyEngine {
         })
     }
 
+    /// v44.7.0 (CIRISPersist#864) — the local REBIND door, see
+    /// `Engine::rebind_key_record`. `signed_key_record_json` is the holder's
+    /// self-signed re-signing of a registration this node already holds.
+    /// Returns the canonical JSON of `RebindOutcome`: `{"outcome":"rebound"}`,
+    /// `{"outcome":"unchanged"}`, or `{"outcome":"refused","reason":…}` with
+    /// the plan's typed reason (`not_self_signed`, `record_absent`,
+    /// `rebind_changes_record`, `pubkey_swap`, `unverifiable_signature`,
+    /// `conflicting_version`, `downgrade`, `store_conflict`, …). Refusals are
+    /// outcomes, not exceptions.
+    fn rebind_key_record(&self, py: Python<'_>, signed_key_record_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            let outcome = py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .rebind_key_record(record)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            serde_json::to_string(&outcome).map_err(|e| {
+                PyValueError::new_err(format!("rebind_key_record outcome encode: {e}"))
+            })
+        })
+    }
+
+    /// v44.7.0 (CIRISPersist#864) — the SELF-HEAL door, see
+    /// `Engine::rebind_self_federation_key`: rebind THIS engine's own
+    /// registration (the row `register_self_federation_key` minted) so its
+    /// envelope binds its subject (#659), the claim copied from the stored
+    /// row. `identity_type` names the row the caller believes it holds; a
+    /// mismatch is `rebind_changes_record`. Returns `RebindOutcome` JSON.
+    fn rebind_self_federation_key(&self, py: Python<'_>, identity_type: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            let identity_type = identity_type.to_owned();
+            let outcome = py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .rebind_self_federation_key(&identity_type)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })?;
+            serde_json::to_string(&outcome).map_err(|e| {
+                PyValueError::new_err(format!("rebind_self_federation_key outcome encode: {e}"))
+            })
+        })
+    }
+
+    /// v44.7.0 (CIRISPersist#864) — the registration claims `key_id` has
+    /// REPLACED through a rebind, oldest first, as a JSON array of
+    /// `KeyRegistrationHistoryRow`. Empty for a key never rebound.
+    fn list_key_registration_history(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let rows = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::list_key_registration_history(
+                            backend.as_ref(),
+                            &key_id,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::list_key_registration_history(
+                            backend.as_ref(),
+                            &key_id,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&rows).map_err(|e| {
+                PyValueError::new_err(format!("list_key_registration_history encode: {e}"))
+            })
+        })
+    }
+
     /// v36.0.0 (CIRISPersist#624) — **typed, pre-write replicated
     /// Attestation-plane apply**. FFI mirror of
     /// [`Engine::apply_replicated_attestation`](crate::engine::Engine::apply_replicated_attestation)

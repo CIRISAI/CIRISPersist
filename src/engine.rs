@@ -3069,6 +3069,170 @@ impl Engine {
         Ok(key_id)
     }
 
+    /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §4) — the local
+    /// REBIND door. The record is a self-signed re-signing of a registration
+    /// this node already holds: same `key_id`, same pubkeys, same claim, the
+    /// envelope now binding its subject (#659). It runs the ONE key plan
+    /// (`plan_replicated_key_apply`) and proceeds only on its `Rebind` arm —
+    /// every other arm is returned as the typed refusal it is, never coerced.
+    /// Not self-signed ⇒ `NotSelfSigned`; no row ⇒ `RecordAbsent`; the plan's
+    /// own refusals pass through. The store step's lost race is
+    /// `StoreConflict`, re-offerable.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rebind_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::RebindOutcome, crate::federation::Error> {
+        use crate::federation::register::{
+            plan_replicated_key_apply, KeyRefusalReason, RebindOutcome, ReplicatedKeyOutcome,
+            ReplicatedKeyPlan,
+        };
+        if record.record.scrub_key_id != record.record.key_id {
+            return Ok(RebindOutcome::Refused {
+                reason: KeyRefusalReason::NotSelfSigned,
+            });
+        }
+        let directory = self.federation_directory();
+        match plan_replicated_key_apply(directory.as_ref(), &record.record).await? {
+            ReplicatedKeyPlan::Rebind => match directory.store_rebound_key_record(record).await {
+                Ok(ReplicatedKeyOutcome::Rebound) => Ok(RebindOutcome::Rebound),
+                Ok(ReplicatedKeyOutcome::Unchanged) => Ok(RebindOutcome::Unchanged),
+                Ok(ReplicatedKeyOutcome::Refused { reason }) => {
+                    Ok(RebindOutcome::Refused { reason })
+                }
+                Ok(other) => Err(crate::federation::Error::Backend(format!(
+                    "rebind_key_record: store step returned {other:?}"
+                ))),
+                Err(crate::federation::Error::Conflict(_)) => Ok(RebindOutcome::Refused {
+                    reason: KeyRefusalReason::StoreConflict,
+                }),
+                Err(e) => Err(e),
+            },
+            ReplicatedKeyPlan::Unchanged => Ok(RebindOutcome::Unchanged),
+            ReplicatedKeyPlan::Insert => Ok(RebindOutcome::Refused {
+                reason: KeyRefusalReason::RecordAbsent,
+            }),
+            ReplicatedKeyPlan::Refused { reason } => Ok(RebindOutcome::Refused { reason }),
+            ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => {
+                Err(crate::federation::Error::InvalidArgument(
+                    "rebind_key_record: a self-signed record planned an anchor-scrub transition"
+                        .into(),
+                ))
+            }
+        }
+    }
+
+    /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §4) — the
+    /// SELF-HEAL door: rebind THIS engine's own registration (the key
+    /// `register_self_federation_key` minted) without re-registering. The
+    /// claim is copied from the STORED row — `identity_ref`, `valid_from`,
+    /// `valid_until`, roles, evidence — so nothing but the envelope binding
+    /// and the signatures can move; `identity_type` is taken as an argument
+    /// only so a caller states which row it believes it holds, and a
+    /// mismatch is `RebindChangesRecord` before anything is signed. A row
+    /// that already binds its subject is `Unchanged`; a row not under this
+    /// engine's keys is `PubkeySwap`; no row is `RecordAbsent`. Otherwise the
+    /// envelope is bound (`bind_subject_into_envelope`), hashed and signed
+    /// exactly as `register_self_federation_key` does, and offered to
+    /// [`rebind_key_record`](Self::rebind_key_record) — one rule, one door.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rebind_self_federation_key(
+        &self,
+        identity_type: &str,
+    ) -> Result<crate::federation::register::RebindOutcome, crate::federation::Error> {
+        use crate::federation::register::{KeyRefusalReason, RebindOutcome};
+        use crate::verify::canonical::ceg_produce_canonicalize;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("rebind_self derive key_id: {e}"))
+        })?;
+        let directory = self.federation_directory();
+        let Some(existing) = directory.lookup_public_key(&key_id).await? else {
+            return Ok(RebindOutcome::Refused {
+                reason: KeyRefusalReason::RecordAbsent,
+            });
+        };
+        if existing.identity_type != identity_type {
+            return Ok(RebindOutcome::Refused {
+                reason: KeyRefusalReason::RebindChangesRecord,
+            });
+        }
+        if crate::federation::admission::verify_envelope_binds_subject(&existing).is_ok() {
+            return Ok(RebindOutcome::Unchanged);
+        }
+        let pubkey = self.signer.public_key().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("rebind_self signer public_key: {e}"))
+        })?;
+        let pubkey_ed25519_base64 = B64.encode(&pubkey);
+        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
+            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("rebind_self pqc public_key: {e}"))
+            })?,
+            None => None,
+        };
+        if existing.pubkey_ed25519_base64 != pubkey_ed25519_base64
+            || existing.pubkey_ml_dsa_65_base64 != pqc_pubkey_b64
+        {
+            return Ok(RebindOutcome::Refused {
+                reason: KeyRefusalReason::PubkeySwap,
+            });
+        }
+
+        let mut registration_envelope = existing.registration_envelope.clone();
+        let valid_until_text = existing.valid_until.map(|t| t.to_rfc3339());
+        crate::federation::admission::bind_subject_into_envelope(
+            &mut registration_envelope,
+            &key_id,
+            identity_type,
+            &pubkey_ed25519_base64,
+            pqc_pubkey_b64.as_deref(),
+            valid_until_text.as_deref(),
+        )
+        .map_err(crate::federation::Error::InvalidArgument)?;
+        let canonical = ceg_produce_canonicalize(&registration_envelope).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "rebind_self registration_envelope canonicalize: {e}"
+            ))
+        })?;
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let now = {
+            use chrono::Timelike as _;
+            let dt = chrono::Utc::now();
+            let micros = dt.nanosecond() / 1000;
+            dt.with_nanosecond(micros * 1000).unwrap_or(dt)
+        };
+        let (scrub_signature_classical, scrub_signature_pqc, pqc_completed_at) =
+            if pqc_pubkey_b64.is_some() {
+                let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!("rebind_self hybrid sign: {e}"))
+                })?;
+                (
+                    B64.encode(&sig.classical.signature),
+                    Some(B64.encode(&sig.pqc.signature)),
+                    Some(now),
+                )
+            } else {
+                let classical_sig = self.signer.sign(&canonical).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!("rebind_self classical sign: {e}"))
+                })?;
+                (B64.encode(&classical_sig), None, None)
+            };
+        let record = crate::federation::KeyRecord {
+            registration_envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            scrub_timestamp: now,
+            pqc_completed_at,
+            persist_row_hash: String::new(),
+            ..existing
+        };
+        self.rebind_key_record(crate::federation::SignedKeyRecord { record })
+            .await
+    }
+
     /// v19.2.0 (CIRISPersist#493) — the node's own content-tier
     /// self-encryption pubkeys (x25519 + ML-KEM-768), derived internally
     /// from the engine's local signing seed via `ciris_crypto::self_enc`.

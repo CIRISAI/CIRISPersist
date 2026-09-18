@@ -848,11 +848,48 @@ pub trait FederationDirectory: Send + Sync {
             // honestly report is that the store step found a different row.
             // Claiming a policy branch it never evaluated would be the
             // mislabelled-refusal failure #565 exists to end.
+            // v44.7.0 (#864) — a differing row may be the holder rebinding its
+            // own unbound registration; that is the plan's call, and this
+            // body has no plan (it cannot: `&Self` is unsized here). Every
+            // real backend overrides with an apply that runs the plan and
+            // dispatches its `Rebind` arm to `store_rebound_key_record`.
             Err(Error::Conflict(_)) => Ok(register::ReplicatedKeyOutcome::Refused {
                 reason: register::KeyRefusalReason::StoreConflict,
             }),
             Err(e) => Err(e),
         }
+    }
+
+    /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §3) — **the
+    /// rebind store step.** Reached only through the plan's `Rebind` arm
+    /// (the rule lives in `plan_replicated_key_apply`; this re-asserts only
+    /// what an atomic `WHERE` can): replace the stored self-signed unbound
+    /// registration envelope + signatures with the incoming bound ones over
+    /// the same pubkeys, recompute `persist_row_hash`, move the serve
+    /// position (`mutated_at`) so a cursor that passed the row re-serves it,
+    /// append the previous bytes to `federation_key_registration_history`,
+    /// and re-index the stored row. `Conflict` if the row changed under the
+    /// plan. Default `Unsupported`; every real backend overrides.
+    async fn store_rebound_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        let _ = record;
+        Err(Error::Unsupported {
+            method: "store_rebound_key_record",
+        })
+    }
+
+    /// v44.7.0 (#864) — the replaced registration claims of `key_id`, oldest
+    /// first. Empty for a key that was never rebound.
+    async fn list_key_registration_history(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<types::KeyRegistrationHistoryRow>, Error> {
+        let _ = key_id;
+        Err(Error::Unsupported {
+            method: "list_key_registration_history",
+        })
     }
 
     /// v13.4.2 (CIRISPersist#394) — the **self-signed → accord-scrubbed

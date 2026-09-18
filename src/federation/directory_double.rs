@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 88 delegations, generated. Every one: fault first, then delegate.
+// 90 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -543,6 +543,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_identity_occurrences_for(identity_key_id)
             .await
+    }
+    async fn list_key_registration_history(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<types::KeyRegistrationHistoryRow>, Error> {
+        if let Some(e) = self.faulted("list_key_registration_history") {
+            return Err(e);
+        }
+        self.inner.list_key_registration_history(key_id).await
     }
     async fn list_keys_by_identity_type(
         &self,
@@ -987,6 +996,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.set_consent_role(key_id, consent_role).await
+    }
+    async fn store_rebound_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        if let Some(e) = self.faulted("store_rebound_key_record") {
+            return Err(e);
+        }
+        self.inner.store_rebound_key_record(record).await
     }
     async fn supersede_group_row(
         &self,

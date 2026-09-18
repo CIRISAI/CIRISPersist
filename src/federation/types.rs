@@ -3423,6 +3423,32 @@ pub struct HybridPendingRow {
     /// Base64-encoded Ed25519 signature stored on the row.
     pub classical_sig_b64: String,
 }
+/// v44.7.0 (CIRISPersist#864, V148) — one replaced registration claim of a
+/// key: the bytes `rebind_key_record` superseded, kept so a rebind is
+/// visibly a rebind and the replaced claim stays auditable. Folds and
+/// attestations key on `key_id` and verify against pubkeys, which a rebind
+/// never moves, so nothing resolves through this table; it is history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRegistrationHistoryRow {
+    /// The key whose registration this row USED to be.
+    pub key_id: String,
+    /// The replaced registration envelope, as stored (JCS form).
+    pub registration_envelope: serde_json::Value,
+    /// Hex SHA-256 of the replaced envelope's canonical bytes.
+    pub original_content_hash: String,
+    /// The replaced record's Ed25519 scrub signature (base64).
+    pub scrub_signature_classical: String,
+    /// The replaced record's ML-DSA-65 scrub signature (base64), if any.
+    pub scrub_signature_pqc: Option<String>,
+    /// Who scrubbed the replaced record (== `key_id`: rebinds are self-signed).
+    pub scrub_key_id: String,
+    /// The replaced record's own scrub instant.
+    pub scrub_timestamp: DateTime<Utc>,
+    /// When THIS node replaced it.
+    pub replaced_at: DateTime<Utc>,
+    /// The `persist_row_hash` of the record that replaced it.
+    pub replaced_by_hash: String,
+}
 
 /// Wraps a [`KeyRecord`] payload that the caller has signed but
 /// persist has not yet stored. Persist verifies the scrub-signature

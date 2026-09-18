@@ -63,6 +63,9 @@ DELEGATED_DEFAULTS = (
     "evict_known_wire_hashes",
     "list_wire_hashes_since",
     "lookup_signed_record_by_content_hash",
+    # v44.7.0 (#864) — defaulted `Unsupported`, overridden by every backend.
+    "store_rebound_key_record",
+    "list_key_registration_history",
 )
 
 ROOT = Path(__file__).resolve().parent.parent

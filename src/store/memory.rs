@@ -173,6 +173,11 @@ struct State {
     /// consumer whose cursor passed the row is served the new bytes again.
     /// `admitted_at` above keeps its V126 meaning (first admission) untouched.
     key_record_mutated_at: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// v44.7.0 (CIRISPersist#864) — `federation_key_registration_history`
+    /// (V148): the registration claims each key row has REPLACED through the
+    /// rebind store step, oldest first. Keyed by `key_id`.
+    key_registration_history:
+        HashMap<String, Vec<crate::federation::types::KeyRegistrationHistoryRow>>,
     /// v36.0.0 (CIRISPersist#668) — the in-memory mirror of the V130
     /// `admitted_at` columns, for EVERY remaining serve-cursor plane: plane
     /// kind (the wire-index token) → resume id → THIS node's serve position
@@ -742,6 +747,7 @@ impl Default for MemoryBackend {
                 revocation_admitted_at: HashMap::new(),
                 key_record_admitted_at: HashMap::new(),
                 key_record_mutated_at: HashMap::new(),
+                key_registration_history: HashMap::new(),
                 serve_positions: HashMap::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
@@ -2516,6 +2522,116 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         };
         self.index_stored_key_row(&key_id).await?;
         Ok(())
+    }
+
+    /// v44.7.0 (CIRISPersist#864) — the trait default is first-seen-wins with
+    /// no plan (it cannot run one over an unsized `Self`). This backend runs
+    /// the ONE key plan first, exactly as the sqlite/postgres applies do, and
+    /// dispatches its `Rebind` arm to the store step; `Insert` goes through
+    /// `put_public_key` behind the same fail-closed PoP gate; `Unchanged` and
+    /// every typed refusal are reported as the plan produced them. The memory
+    /// backend has no upgrade/supersede doors, so those arms are the store
+    /// conflict they always were here — not a pretence of having run them.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{
+            KeyRefusalReason, ReplicatedKeyOutcome, ReplicatedKeyPlan,
+        };
+        use crate::federation::Error;
+        const RACED: ReplicatedKeyOutcome = ReplicatedKeyOutcome::Refused {
+            reason: KeyRefusalReason::StoreConflict,
+        };
+        match crate::federation::register::plan_replicated_key_apply(self, &record.record).await? {
+            ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
+            ReplicatedKeyPlan::Insert => {
+                if !crate::federation::register::record_is_role_gated(&record.record) {
+                    crate::federation::verify_key_registration(self, &record.record).await?;
+                }
+                match self.put_public_key(record).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
+                    Err(Error::Conflict(_)) => Ok(RACED),
+                    Err(e) => Err(e),
+                }
+            }
+            ReplicatedKeyPlan::Rebind => match self.store_rebound_key_record(record).await {
+                Ok(outcome) => Ok(outcome),
+                Err(Error::Conflict(_)) => Ok(RACED),
+                Err(e) => Err(e),
+            },
+            ReplicatedKeyPlan::Upgrade | ReplicatedKeyPlan::Supersede => Ok(RACED),
+        }
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn store_rebound_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        use crate::federation::Error;
+        let (new, existing_hash) =
+            match crate::federation::register::prepare_rebind(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        let key_id = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            let key_id = new.key_id.clone();
+            let existing = state.federation_keys.get(&key_id).cloned().ok_or_else(|| {
+                Error::Conflict(format!(
+                    "store_rebound_key_record {key_id}: row changed concurrently"
+                ))
+            })?;
+            // The atomic re-assertion: the row is the one the plan saw.
+            if existing.persist_row_hash != existing_hash
+                || existing.scrub_key_id != existing.key_id
+                || existing.pubkey_ed25519_base64 != new.pubkey_ed25519_base64
+            {
+                return Err(Error::Conflict(format!(
+                    "store_rebound_key_record {key_id}: row changed concurrently"
+                )));
+            }
+            let mutated_at = next_key_admission_position(&state);
+            state
+                .key_registration_history
+                .entry(key_id.clone())
+                .or_default()
+                .push(crate::federation::types::KeyRegistrationHistoryRow {
+                    key_id: key_id.clone(),
+                    registration_envelope: existing.registration_envelope,
+                    original_content_hash: existing.original_content_hash,
+                    scrub_signature_classical: existing.scrub_signature_classical,
+                    scrub_signature_pqc: existing.scrub_signature_pqc,
+                    scrub_key_id: existing.scrub_key_id,
+                    scrub_timestamp: existing.scrub_timestamp,
+                    replaced_at: mutated_at,
+                    replaced_by_hash: new.persist_row_hash.clone(),
+                });
+            state
+                .key_record_mutated_at
+                .insert(key_id.clone(), mutated_at);
+            state.federation_keys.insert(key_id.clone(), new);
+            key_id
+        };
+        self.index_stored_key_row(&key_id).await?;
+        Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
+    async fn list_key_registration_history(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<crate::federation::types::KeyRegistrationHistoryRow>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .key_registration_history
+            .get(key_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     // v19.1.0 (#490) — the authenticated re-anchor (memory parity; see the
@@ -20120,9 +20236,13 @@ mod tests {
     /// key_id is a first-seen Inserted; a differing record for an existing
     /// key_id is Refused (fail-closed, first-seen wins) and leaves the row
     /// untouched — no panic, no error propagated up the anti-entropy loop.
+    /// v44.7.0 (#864) — with a backend feature on, the memory apply runs the
+    /// key plan (insert behind the PoP gate, so the records are SIGNED now)
+    /// and names the refusal; without one it is still the plan-less default.
     #[tokio::test]
     async fn apply_replicated_key_record_default_first_seen_wins_memory() {
         use crate::federation::register::ReplicatedKeyOutcome;
+        use crate::federation::tier_ingest::test_support as ts;
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
         let dir: &dyn FederationDirectory = &backend;
@@ -20130,7 +20250,7 @@ mod tests {
         // First-seen insert.
         assert_eq!(
             dir.apply_replicated_key_record(SignedKeyRecord {
-                record: fix_key("node-x", "primitive", "node-x"),
+                record: ts::replicated_key_record("node-x", "primitive", "node-x", "node-x", "n1"),
             })
             .await
             .unwrap(),
@@ -20145,21 +20265,22 @@ mod tests {
         // admission instead of reaching the first-seen-wins decision this
         // test is about — and it would never have reached it on sqlite or
         // postgres either.
-        let mut differing = fix_key("node-x", "primitive", "A1");
-        differing.pubkey_ed25519_base64 =
-            crate::federation::tier_ingest::test_support::hybrid_pubkeys("node-x-other").0;
+        let mut differing =
+            ts::replicated_key_record("node-x", "primitive", "node-x", "node-x", "n2");
+        differing.pubkey_ed25519_base64 = ts::hybrid_pubkeys("node-x-other").0;
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        let expected = crate::federation::register::KeyRefusalReason::PubkeySwap;
+        #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
+        let expected = crate::federation::register::KeyRefusalReason::StoreConflict;
         assert_eq!(
             dir.apply_replicated_key_record(SignedKeyRecord { record: differing })
                 .await
                 .unwrap(),
-            // v24.2.0 (CIRISPersist#565) — `StoreConflict` is the only honest
-            // reason this body can give: it runs no plan, so the single fact
-            // it observed is that the store step found a different row. It
-            // must NOT borrow one of the plan's policy names for a branch it
-            // never evaluated.
-            ReplicatedKeyOutcome::Refused {
-                reason: crate::federation::register::KeyRefusalReason::StoreConflict
-            }
+            // v24.2.0 (CIRISPersist#565) — a body that runs no plan may only
+            // say `StoreConflict`. v44.7.0 (#864) — this backend now runs the
+            // key plan first (it has to, to see a rebind), so the differing
+            // row is refused by NAME. First-seen still wins: the row is kept.
+            ReplicatedKeyOutcome::Refused { reason: expected }
         );
         let row = dir.lookup_public_key("node-x").await.unwrap().unwrap();
         assert_eq!(row.scrub_key_id, "node-x", "original self-signed row kept");

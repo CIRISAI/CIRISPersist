@@ -3731,6 +3731,116 @@ impl PostgresBackend {
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
+    /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §3) — the REBIND
+    /// store step (see the sqlite twin for the invariants): shared pre-check
+    /// (`register::prepare_rebind`), then one transaction that appends the
+    /// replaced claim to `federation_key_registration_history` (V148) and
+    /// rewrites envelope + signatures + `persist_row_hash` + `mutated_at`,
+    /// both statements guarded on the planned-against hash. 0 rows ⇒
+    /// `Conflict`.
+    pub async fn store_rebound_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{RebindPrepared, ReplicatedKeyOutcome};
+        let (row, existing_hash) =
+            match crate::federation::register::prepare_rebind(self, record).await? {
+                RebindPrepared::Unchanged => return Ok(ReplicatedKeyOutcome::Unchanged),
+                RebindPrepared::Replace { new, existing_hash } => (*new, existing_hash),
+            };
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let mutated_at = self.next_key_serve_position(&client).await?;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "store_rebound_key_record {}: begin: {e}",
+                row.key_id
+            ))
+        })?;
+        let replaced = tx
+            .execute(
+                "INSERT INTO cirislens.federation_key_registration_history \
+                    (key_id, registration_envelope, original_content_hash, \
+                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                     scrub_timestamp, replaced_at, replaced_by_hash) \
+                 SELECT key_id, registration_envelope, original_content_hash, \
+                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                     scrub_timestamp, $3::timestamptz, $4::text \
+                 FROM cirislens.federation_keys WHERE key_id = $1 AND persist_row_hash = $2",
+                &[
+                    &row.key_id,
+                    &existing_hash,
+                    &mutated_at,
+                    &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "store_rebound_key_record {}: history: {e}",
+                    row.key_id
+                ))
+            })?;
+        let n = if replaced == 0 {
+            0
+        } else {
+            tx.execute(
+                "UPDATE cirislens.federation_keys SET \
+                    registration_envelope = $2, original_content_hash = $3, \
+                    scrub_signature_classical = $4, scrub_signature_pqc = $5, \
+                    scrub_timestamp = $6, pqc_completed_at = $7, \
+                    persist_row_hash = $8, mutated_at = $9 \
+                 WHERE key_id = $1 AND scrub_key_id = key_id \
+                   AND pubkey_ed25519_base64 = $10 AND persist_row_hash = $11",
+                &[
+                    &row.key_id,
+                    &registration_envelope_text,
+                    &original_content_hash,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
+                    &row.scrub_timestamp,
+                    &row.pqc_completed_at,
+                    &row.persist_row_hash,
+                    &mutated_at,
+                    &row.pubkey_ed25519_base64,
+                    &existing_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "store_rebound_key_record {}: {e}",
+                    row.key_id
+                ))
+            })?
+        };
+        if n == 0 {
+            // Dropping the transaction rolls the history insert back.
+            drop(tx);
+            return Err(crate::federation::Error::Conflict(format!(
+                "store_rebound_key_record {}: row changed concurrently",
+                row.key_id
+            )));
+        }
+        tx.commit().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "store_rebound_key_record {}: commit: {e}",
+                row.key_id
+            ))
+        })?;
+        // Release the pooled client before the reload (see adopt_scrub_upgrade).
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await?;
+        Ok(ReplicatedKeyOutcome::Rebound)
+    }
+
     /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE store, Postgres twin
     /// of [`SqliteBackend::supersede_canonical_record`](crate::store::sqlite::SqliteBackend::supersede_canonical_record).
     /// Replaces an existing anchor-scrubbed canonical row IN PLACE with a
@@ -3963,6 +4073,14 @@ impl PostgresBackend {
                 Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                 Err(e) => Err(e),
             },
+            // v44.7.0 (#864) — existing self-signed UNBOUND → the holder's
+            // bound re-signing of the same claim. A lost race is fail-closed
+            // + re-offerable, like the arms above.
+            ReplicatedKeyPlan::Rebind => match self.store_rebound_key_record(record).await {
+                Ok(outcome) => Ok(outcome),
+                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
+                Err(e) => Err(e),
+            },
             // #405 — existing canonical → strictly-newer, m-of-n-re-verified
             // re-scrub (runtime address move). Backend-symmetric with SQLite.
             ReplicatedKeyPlan::Supersede => match self.supersede_canonical_record(record).await {
@@ -4057,6 +4175,61 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
         PostgresBackend::adopt_scrub_upgrade(self, record).await
+    }
+
+    async fn store_rebound_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        PostgresBackend::store_rebound_key_record(self, record).await
+    }
+
+    async fn list_key_registration_history(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<crate::federation::types::KeyRegistrationHistoryRow>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT key_id, registration_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
+                        scrub_timestamp, replaced_at, replaced_by_hash \
+                 FROM cirislens.federation_key_registration_history \
+                 WHERE key_id = $1 ORDER BY history_id ASC",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
+            })?;
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_key_registration_history: {e}"))
+        };
+        rows.into_iter()
+            .map(|r| {
+                let envelope: String = r.try_get("registration_envelope").map_err(col)?;
+                let hash: Vec<u8> = r.try_get("original_content_hash").map_err(col)?;
+                Ok(crate::federation::types::KeyRegistrationHistoryRow {
+                    key_id: r.try_get("key_id").map_err(col)?,
+                    registration_envelope: serde_json::from_str(&envelope).map_err(|e| {
+                        crate::federation::Error::Backend(format!("history envelope: {e}"))
+                    })?,
+                    original_content_hash: hex::encode(hash),
+                    scrub_signature_classical: r
+                        .try_get("scrub_signature_classical")
+                        .map_err(col)?,
+                    scrub_signature_pqc: r.try_get("scrub_signature_pqc").map_err(col)?,
+                    scrub_key_id: r.try_get("scrub_key_id").map_err(col)?,
+                    scrub_timestamp: r.try_get("scrub_timestamp").map_err(col)?,
+                    replaced_at: r.try_get("replaced_at").map_err(col)?,
+                    replaced_by_hash: r.try_get("replaced_by_hash").map_err(col)?,
+                })
+            })
+            .collect()
     }
 
     // v19.1.0 (#490) — the authenticated re-anchor (see sqlite impl for the

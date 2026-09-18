@@ -243,6 +243,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
     ("adopt_scrub_upgrade", ConnClass::Write),
+    ("store_rebound_key_record", ConnClass::Write),
     // #846 (§6.1) — the adopt floor: row + declared binding + holder claim in
     // one transaction.
     ("adopt_sealed_blob_at", ConnClass::Write),
@@ -364,6 +365,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_consent_peers", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
     ("list_consent_peers_for", ConnClass::Read),
+    ("list_key_registration_history", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),

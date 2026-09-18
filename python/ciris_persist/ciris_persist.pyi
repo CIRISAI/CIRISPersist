@@ -735,6 +735,9 @@ class Engine:
     def community_dek_set_retain_past_epochs(self, community_key_id: str, retain_past_epochs: int | None = None) -> None:
         """(derived) deontic — v43.0.0 (§11.6) — the retention policy the sweep enforces. retain_past_epochs=n: the sweep may evict and destroy epochs more than n behind the curr..."""
 
+    def consent_peers_by_principals(self, key_id: str) -> str:
+        """(derived) deontic — v44.6.0 (#857 §4) — list_consent_peers keyed by ANY key that stands for the machine (the union over its human principals and itself). JSON array of..."""
+
     def corpus_want_admits(self, wire_json: str, content_id: str, object_bytes: int) -> bool:
         """(derived) deontic — #356 (§Q B4 wanted-then-pulled) — may a producer push content_id of object_bytes against this signed CorpusWantV1 wire JSON? True iff the id is wan..."""
 
@@ -1069,6 +1072,12 @@ class Engine:
     def read_stream_chunk_as(self, stream_id: str, seq: int, viewer_key_id: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — #838 (§12.10) — read one chunk of a stream by POSITION as viewer_key_id, base64-encoded. The DVR / catch-up read: the row at (stream_id, seq) autho..."""
 
+    def rebind_key_record(self, signed_key_record_json: str) -> str:
+        """(derived) deontic — v44.7.0 (CIRISPersist#864) — the local REBIND door, see Engine::rebind_key_record. signed_key_record_json is the holder's self-signed re-signing of..."""
+
+    def rebind_self_federation_key(self, identity_type: str) -> str:
+        """(derived) deontic — v44.7.0 (CIRISPersist#864) — the SELF-HEAL door, see Engine::rebind_self_federation_key: rebind THIS engine's own registration (the row register_se..."""
+
     def register_federation_key(
         self,
         signed_key_record_json: str,
@@ -1280,6 +1289,9 @@ class Engine:
         close on elapsed time, with no new row. Read-only -- the objected-to
         row is never touched.
         """
+
+    def resolve_scoped_consent_by_principals(self, target_key_id: str, subject_key_id: str, scope: str, qualifier: str | None = None, now_iso: str | None = None) -> str:
+        """(derived) deontic — v44.6.0 (#857 §4) — resolve_scoped_consent keyed by ANY key that stands for the subject; the per-principal fold combined as a reverse quorum on the..."""
 
     def resolve_transit_eligibility_json(self, user_key_id: str, peer_key_id: str) -> str:
         """v24.1.0 (CIRISPersist#561) — **may ``peer_key_id`` carry our relay
@@ -2960,6 +2972,9 @@ class Engine:
             RuntimeError: backend / IO error.
         """
 
+    def list_key_registration_history(self, key_id: str) -> str:
+        """(derived) empirical — v44.7.0 (CIRISPersist#864) — the registration claims key_id has REPLACED through a rebind, oldest first, as a JSON array of KeyRegistrationHistoryR..."""
+
     def list_llm_calls(self, filter_json: str, cursor_json: str | None, limit: int, caller_occurrence_key_id: str | None) -> str:
         """(derived) empirical — Page through cirislens.trace_llm_calls rows. Filters compose AND-style; cursor-paged newest-first. Returns JSON-encoded LlmCallListPage."""
 
@@ -3969,18 +3984,6 @@ class Engine:
 
     def wholeness_witness_root_hex(self, leaf_bytes_b64_json: str) -> str:
         """(derived) pragmatic — v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme Merkle root (lexicographic leaf order, odd-duplication, WW-v1-empty empty sentinel)..."""
-
-
-    # ==============================================================
-    # CONTINGENT  (descriptive)
-    # Varying one of these out of scope by construction — see `report` for why this is empty.
-    # ==============================================================
-
-    def consent_peers_by_principals(self, key_id: str) -> str:
-        """(derived) contingent — v44.6.0 (#857 §4) — list_consent_peers keyed by ANY key that stands for the machine (the union over its human principals and itself). JSON array of..."""
-
-    def resolve_scoped_consent_by_principals(self, target_key_id: str, subject_key_id: str, scope: str, qualifier: str | None = None, now_iso: str | None = None) -> str:
-        """(derived) contingent — v44.6.0 (#857 §4) — resolve_scoped_consent keyed by ANY key that stands for the subject; the per-principal fold combined as a reverse quorum on the..."""
 
 
 class ScoringFactorStream:

@@ -5,6 +5,75 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.7.0] - 2026-09-18
+
+### Added — the same-key rebind door (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md`)
+- **A registration record can be re-signed by its holder without becoming a
+  new key.** Before #659 a self-registered row's envelope carried only
+  `{key_id}` (the canonical's July row) or nothing at all (529 empty-envelope
+  agent keys); every CIRISVerify v15.2.0 peer now REFUSES those at
+  `verify_envelope_binds_subject`, and the holder could not repair its own
+  row because `put_public_key` on a differing row is `Conflict`. The key plan
+  (`plan_replicated_key_apply`) gains one arm, `ReplicatedKeyPlan::Rebind`,
+  admitted only when: the stored row is self-signed and UNBOUND, the incoming
+  record is self-signed and BOUND, `key_id` + both pubkeys equal the stored
+  row, the claim is byte-equal (`identity_type`, `identity_ref`,
+  `valid_from`, `valid_until`, roles, attestation evidence —
+  `rebind_claim_unchanged`), and the new hybrid signature Strict-verifies
+  against those pubkeys (`verify_key_registration`). Everything else is the
+  typed refusal it was: a pubkey change is `PubkeySwap`, a changed claim is
+  the new `RebindChangesRecord`, a forged signature `UnverifiableSignature`,
+  bound→bound `ConflictingVersion`, an anchor-scrubbed row `Downgrade`.
+- **One rule, every door.** The local door `Engine::rebind_key_record`
+  (PyO3 `rebind_key_record`) runs THE plan and proceeds only on its `Rebind`
+  arm — not self-signed is the new `NotSelfSigned`, no row the new
+  `RecordAbsent`; the self-heal door `Engine::rebind_self_federation_key`
+  (PyO3 `rebind_self_federation_key`) copies the STORED claim, binds the
+  envelope exactly as `register_self_federation_key` does, signs with the
+  engine's own keys and offers it to the same door; and the anti-entropy
+  receive side (`apply_replicated_key_record` on sqlite / postgres / memory)
+  dispatches the same arm to the same store step, so a peer that holds the
+  legacy row heals from the plane and a fresh peer inserts the bound record.
+  Returns `RebindOutcome { Rebound | Unchanged | Refused { reason } }`.
+- **The store step keeps the row's identity and history.**
+  `FederationDirectory::store_rebound_key_record` (`register::prepare_rebind`
+  shared by the three backends) writes the STORED row with only the envelope,
+  its hash, the signatures, `scrub_timestamp` and `pqc_completed_at`
+  replaced and `persist_row_hash` recomputed — `valid_from`, `admitted_at`,
+  `consent_role`, roles, the pubkeys are untouched by construction — inside
+  one transaction that first appends the replaced bytes to the new
+  `federation_key_registration_history` table (V148, both dialects; read
+  through `list_key_registration_history`, PyO3 mirror of the same name)
+  and moves the serve position (`mutated_at`, #707) so a consumer whose
+  cursor passed the row is served the bound bytes. Both statements are
+  guarded on the planned-against `persist_row_hash`; a lost race is
+  `StoreConflict`, re-offerable.
+- Witnesses I99–I103 (`federation::key_rebind_invariants`): the plan
+  classifies each rule by name; the store rebinds, reserves and records
+  history on all three backends; a three-engine identity round (A rebinds,
+  B heals from the plane, C inserts, the user's owner-binding attestation is
+  admitted everywhere); the self-heal door repairs an EMPTY envelope signed
+  with the engine's real keys; and a from-disk check that the plan produces
+  `Rebind` in exactly one place, no store step re-decides the rule, and
+  every PyO3 mirror delegates.
+
+### Changed
+- The memory backend's `apply_replicated_key_record` now runs the key plan
+  first, as the sqlite/postgres applies do (it has to, to see a rebind); a
+  differing row is refused by NAME (`PubkeySwap`, …) instead of the bare
+  `StoreConflict` the plan-less trait default reports. First-seen still
+  wins: the row is untouched.
+- `python/ciris_persist/ciris_persist.pyi` re-emitted from the taxonomy:
+  `consent_peers_by_principals` / `resolve_scoped_consent_by_principals`
+  were classified DEONTIC in v44.6.0's taxonomy but the stub shipped them
+  under CONTINGENT (the stub was emitted before the rows landed).
+
+### Not in scope (filed in the FSD §6)
+- Key rotation (a new pubkey is a new occurrence, #848's ruling stands),
+  tolerating pre-#659 records anywhere, rebinding an anchor-scrubbed row.
+  The server half — calling the door on the canonical and re-serving — is
+  CIRISServer#606.
+
 ## [44.6.0] - 2026-09-17
 
 ### Added — consent is by humans, for THIS machine (CIRISPersist#857, `FSD/CONSENT_BY_HUMANS.md`)
