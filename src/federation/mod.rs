@@ -97,6 +97,9 @@ pub mod key_grant_invariants;
 // LocalSigner exists, so peers admit it at the federation-tier gate.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod claim_signing_invariants;
+// CIRISPersist#864 (`FSD/KEY_RECORD_REBIND.md`) — I99–I103: the same-key rebind.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod key_rebind_invariants;
 // (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
 // + consistency witness: the admission-enforceable subset of the vendored
 // `invariant_registry` (571 invariants / 104 families) and the executed
