@@ -296,6 +296,7 @@ Engine	emit_attestation	deontic
 Engine	emit_attestation_self	deontic	
 Engine	emit_key_grant	deontic
 Engine	emit_pending_key_grants	deontic
+Engine	list_key_registration_history	empirical	
 Engine	publish_self_occurrence	deontic
 Engine	engine_handle	structural	
 Engine	enqueue_outbound	procedural	
@@ -521,6 +522,8 @@ Engine	read_blob_as	deontic
 Engine	read_blob_for_community_viewer	deontic	
 Engine	read_blob_range_as	deontic	
 Engine	read_stream_chunk_as	deontic	
+Engine	rebind_key_record	deontic	
+Engine	rebind_self_federation_key	deontic	
 Engine	rebuild_signed_wire_index	testimonial	upstream_attestation
 Engine	receive_and_persist	testimonial	upstream_attestation
 Engine	register_consumer	structural	

@@ -183,6 +183,22 @@ pub enum KeyRefusalReason {
     /// [`verify_key_registration`] gate (malformed record, canonicalizer
     /// disagreement, unregistered signer, or a bad hybrid signature).
     UnverifiableSignature,
+    /// v44.7.0 (CIRISPersist#864) — a **rebind** that would change the
+    /// claim, not just its binding: `identity_type`, `identity_ref`,
+    /// `valid_from`, `valid_until`, `roles` or `attestation_evidence` of the
+    /// incoming self-signed record differ from the stored row's. A rebind
+    /// replaces an unbound registration envelope with a bound one over the
+    /// SAME pubkeys and the SAME claim; anything else is a different record.
+    RebindChangesRecord,
+    /// v44.7.0 (#864) — `rebind_key_record` was asked to rebind a `key_id`
+    /// this node holds no row for. A rebind heals a stored record; a missing
+    /// record is registered through `register_federation_key`.
+    RecordAbsent,
+    /// v44.7.0 (#864) — `rebind_key_record` was handed a record whose
+    /// `scrub_key_id` is not its `key_id`. Only the holder rebinds a key;
+    /// an anchor-scrubbed record enters through the replication plane's
+    /// `Upgrade` / `Supersede` arms, never through the rebind door.
+    NotSelfSigned,
     /// [`owner_of`](super::admission::owner_of) resolved **no** owner for the
     /// key: the row is not inside any single-owner node set, so replication
     /// may not auto-upgrade it (fail-closed).
@@ -222,6 +238,9 @@ impl KeyRefusalReason {
             Self::ReScrub => "re_scrub",
             Self::AlreadyAnchoredIdentical => "already_anchored_identical",
             Self::UnverifiableSignature => "unverifiable_signature",
+            Self::RebindChangesRecord => "rebind_changes_record",
+            Self::RecordAbsent => "record_absent",
+            Self::NotSelfSigned => "not_self_signed",
             Self::OwnerAbsent => "owner_absent",
             Self::OwnerAmbiguous => "owner_ambiguous",
             Self::StoreConflict => "store_conflict",
@@ -237,6 +256,9 @@ impl KeyRefusalReason {
         Self::ReScrub,
         Self::AlreadyAnchoredIdentical,
         Self::UnverifiableSignature,
+        Self::RebindChangesRecord,
+        Self::RecordAbsent,
+        Self::NotSelfSigned,
         Self::OwnerAbsent,
         Self::OwnerAmbiguous,
         Self::StoreConflict,
@@ -274,6 +296,10 @@ pub enum ReplicatedKeyOutcome {
     /// **anchor-scrubbed** record for the same identity (the #351
     /// `adopt_scrub_upgrade`, now riding replication).
     Upgraded,
+    /// v44.7.0 (#864) — the stored unbound registration was replaced by the
+    /// holder's bound one over the same pubkeys; the previous bytes are in
+    /// `federation_key_registration_history`.
+    Rebound,
     /// The row already carries this exact record — idempotent no-op.
     Unchanged,
     /// The record was NOT applied and the existing row is untouched.
@@ -310,6 +336,13 @@ pub(crate) enum ReplicatedKeyPlan {
     /// the backend's `supersede_canonical_record` (the CEG-native runtime
     /// address move).
     Supersede,
+    /// v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §3) — the
+    /// stored row is self-signed and UNBOUND (pre-#659 envelope), the incoming
+    /// record is self-signed, BOUND, carries the same pubkeys and the same
+    /// claim, and its hybrid signature verifies against those pubkeys: the
+    /// holder is re-signing its own registration. Run the backend's
+    /// `store_rebound_key_record`.
+    Rebind,
     /// Byte-identical re-apply — no-op.
     Unchanged,
     /// Not admitted; leave the row untouched (fail-closed).
@@ -396,6 +429,38 @@ pub(crate) async fn plan_replicated_key_apply(
     let existing_self_signed = existing.scrub_key_id == existing.key_id;
     let incoming_anchor_scrubbed = record.scrub_key_id != record.key_id;
     if !incoming_anchor_scrubbed {
+        // v44.7.0 (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md` §3) — THE
+        // REBIND. A self-signed record over a self-signed row with the same
+        // pubkeys (a swap was refused above) is a rebind iff: the claim is
+        // unchanged; the stored envelope does NOT bind its subject (#659)
+        // and the incoming one DOES — unbound → bound is the only rebind,
+        // so a bound row that differs stays first-seen-wins below; and the
+        // incoming signature verifies against these pubkeys — possession of
+        // the key that is already registered. An anchor-scrubbed row is
+        // never rebound by its holder: that would shed the accord's scrub,
+        // and #659 ruled those records re-mint through genesis (Downgrade,
+        // below). Every refusal carries its reason.
+        if existing_self_signed && rebind_claim_unchanged(&existing, record) == Ok(()) {
+            let stored_unbound =
+                super::admission::verify_envelope_binds_subject(&existing).is_err();
+            let incoming_bound = super::admission::verify_envelope_binds_subject(record).is_ok();
+            if stored_unbound && incoming_bound {
+                return match verify_key_registration(directory, record).await {
+                    Ok(_) => Ok(ReplicatedKeyPlan::Rebind),
+                    Err(Error::SignatureInvalid(_)) | Err(Error::InvalidArgument(_)) => {
+                        Ok(refused(KeyRefusalReason::UnverifiableSignature))
+                    }
+                    Err(other) => Err(other),
+                };
+            }
+        } else if existing_self_signed
+            && super::admission::verify_envelope_binds_subject(&existing).is_err()
+            && super::admission::verify_envelope_binds_subject(record).is_ok()
+        {
+            // The rebind shape, but the claim moved: name it, so the holder
+            // learns to keep the claim and change only the binding.
+            return Ok(refused(KeyRefusalReason::RebindChangesRecord));
+        }
         // v24.2.0 (CIRISPersist#565) — ONE site, TWO policies, and they were
         // fused behind one bare `Refused`. Split them: an incoming self-signed
         // record over an ANCHORED row is a downgrade (never demote); over
@@ -445,6 +510,144 @@ pub(crate) async fn plan_replicated_key_apply(
         Err(Error::AmbiguousNodeOwner { .. }) => Ok(refused(KeyRefusalReason::OwnerAmbiguous)),
         Err(e) => Err(e),
     }
+}
+
+/// v44.7.0 (CIRISPersist#864) — **is the incoming record the same CLAIM as
+/// the stored row**, differing only in its registration envelope and
+/// signature? A rebind changes the binding, never what is claimed:
+/// `identity_type` is authority-bearing, `roles` are lifted from the
+/// envelope, `valid_from` is history. One predicate, used by the plan and by
+/// nothing else — the store steps re-assert only what they can in a `WHERE`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn rebind_claim_unchanged(
+    existing: &KeyRecord,
+    incoming: &KeyRecord,
+) -> Result<(), &'static str> {
+    if existing.identity_type != incoming.identity_type {
+        return Err("identity_type");
+    }
+    if existing.identity_ref != incoming.identity_ref {
+        return Err("identity_ref");
+    }
+    if existing.valid_from != incoming.valid_from {
+        return Err("valid_from");
+    }
+    if existing.valid_until != incoming.valid_until {
+        return Err("valid_until");
+    }
+    if existing.capability_roles != incoming.capability_roles {
+        return Err("roles");
+    }
+    if existing.attestation_evidence != incoming.attestation_evidence {
+        return Err("attestation_evidence");
+    }
+    Ok(())
+}
+
+/// v44.7.0 (CIRISPersist#864) — what [`Engine::rebind_key_record`](crate::Engine::rebind_key_record)
+/// returns. Never coerced: the door runs the plan and only a `Rebind` (or a
+/// byte-identical `Unchanged`) proceeds; every other arm is reported as the
+/// typed refusal the plan produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RebindOutcome {
+    /// The stored unbound registration was replaced by the bound one.
+    Rebound,
+    /// The row already carries exactly this record.
+    Unchanged,
+    /// Not a rebind; the row is untouched. See [`KeyRefusalReason`].
+    Refused {
+        /// Which rule refused it.
+        reason: KeyRefusalReason,
+    },
+}
+
+/// v44.7.0 (CIRISPersist#864) — what every backend's `store_rebound_key_record`
+/// establishes BEFORE its atomic write, so the three store steps share one
+/// pre-check and differ only in SQL. The rule (unbound → bound, same claim,
+/// signature verifies) is the plan's; this is the store-side re-assertion —
+/// the same pubkeys, a self-signed row, the claim byte-equal — plus the
+/// construction of the row to write: the STORED row with only the
+/// registration envelope, its hash, the signatures, `scrub_timestamp` and
+/// `pqc_completed_at` replaced, and `persist_row_hash` recomputed over
+/// that. Nothing else moves, by construction rather than by SET list.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) enum RebindPrepared {
+    /// The stored row already carries exactly these bytes.
+    Unchanged,
+    /// Write `new` in place of the row whose `persist_row_hash` is
+    /// `existing_hash` — the atomic `WHERE` re-asserts that hash.
+    Replace {
+        new: Box<KeyRecord>,
+        existing_hash: String,
+    },
+}
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn prepare_rebind<D: FederationDirectory + ?Sized>(
+    directory: &D,
+    record: super::SignedKeyRecord,
+) -> Result<RebindPrepared, Error> {
+    let mut incoming = record.record;
+    super::canonical_at_rest::canonicalize_in_place(&mut incoming.registration_envelope)?;
+    validate_registration_pubkey(&incoming)?;
+    if incoming.scrub_key_id != incoming.key_id {
+        return Err(Error::InvalidArgument(
+            "store_rebound_key_record requires a self-signed record (scrub_key_id == key_id)"
+                .into(),
+        ));
+    }
+    if incoming.algorithm != super::types::algorithm::HYBRID {
+        return Err(Error::InvalidArgument(format!(
+            "store_rebound_key_record algorithm must be 'hybrid' (got '{}')",
+            incoming.algorithm
+        )));
+    }
+    let existing = directory
+        .lookup_public_key(&incoming.key_id)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "store_rebound_key_record: no existing row for {} — use put_public_key",
+                incoming.key_id
+            ))
+        })?;
+    if existing.pubkey_ed25519_base64 != incoming.pubkey_ed25519_base64
+        || existing.pubkey_ml_dsa_65_base64 != incoming.pubkey_ml_dsa_65_base64
+    {
+        return Err(Error::Conflict(format!(
+            "store_rebound_key_record {}: pubkey change refused (different identity)",
+            incoming.key_id
+        )));
+    }
+    if existing.scrub_key_id != existing.key_id {
+        return Err(Error::Conflict(format!(
+            "store_rebound_key_record {}: row is anchor-scrubbed; rebind refused",
+            incoming.key_id
+        )));
+    }
+    if let Err(what) = rebind_claim_unchanged(&existing, &incoming) {
+        return Err(Error::Conflict(format!(
+            "store_rebound_key_record {}: {what} differs from the stored claim",
+            incoming.key_id
+        )));
+    }
+    let existing_hash = existing.persist_row_hash.clone();
+    let mut new = existing;
+    new.registration_envelope = incoming.registration_envelope;
+    new.original_content_hash = incoming.original_content_hash;
+    new.scrub_signature_classical = incoming.scrub_signature_classical;
+    new.scrub_signature_pqc = incoming.scrub_signature_pqc;
+    new.scrub_timestamp = incoming.scrub_timestamp;
+    new.pqc_completed_at = incoming.pqc_completed_at;
+    new.persist_row_hash = super::types::compute_persist_row_hash(&new)?;
+    if new.persist_row_hash == existing_hash {
+        return Ok(RebindPrepared::Unchanged);
+    }
+    Ok(RebindPrepared::Replace {
+        new: Box::new(new),
+        existing_hash,
+    })
 }
 
 /// v24.2.0 (CIRISPersist#565) — the one constructor for a refused plan, so a

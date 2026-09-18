@@ -205,6 +205,13 @@ pub(crate) const CRYPTO_COLUMNS: &[CryptoColumn] = &[
         column: "scrub_signature_pqc",
         shared_by: None,
     },
+    // v44.7.0 (#864) — one row per REPLACED registration record, keyed by
+    // `history_id`; the signature is that record's own, never shared.
+    CryptoColumn {
+        table: "federation_key_registration_history",
+        column: "scrub_signature_pqc",
+        shared_by: None,
+    },
     CryptoColumn {
         table: "federation_location_proofs",
         column: "scrub_signature_pqc",

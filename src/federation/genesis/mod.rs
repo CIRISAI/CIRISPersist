@@ -851,7 +851,9 @@ where
             Some(_) => {
                 use crate::federation::register::ReplicatedKeyOutcome as O;
                 match dir.apply_replicated_key_record(sr.clone()).await {
-                    Ok(O::Superseded | O::Unchanged | O::Upgraded | O::Inserted) => Ok(()),
+                    Ok(O::Superseded | O::Unchanged | O::Upgraded | O::Inserted | O::Rebound) => {
+                        Ok(())
+                    }
                     // Existing is same-or-newer (or not admissible against the
                     // baked record): do NOT downgrade the node, do NOT brick.
                     // v24.2.0 (CIRISPersist#565) — the warning names the branch
