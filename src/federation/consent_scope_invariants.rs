@@ -591,6 +591,75 @@ pub(crate) mod bodies {
             "I111: a later grant re-opens consent"
         );
     }
+
+    /// **I112 — the capacity gate asks `analyze:capacity`: a grant narrowed
+    /// to another family does not cover it; a bare grant and a grant narrowed
+    /// to this family do.**
+    pub async fn i112_the_gate_honours_the_family_narrowing(d: &dyn FederationDirectory, s: &str) {
+        let (scorer, subject) = (format!("i112-p-{s}"), format!("i112-s-{s}"));
+        ts::register_identity_key(d, &scorer, USER).await;
+        ts::register_identity_key(d, &subject, USER).await;
+        let score = |n: &str| {
+            let id = format!("i112-score-{n}-{s}");
+            let env = serde_json::json!({"id": id, "dimension": "capacity:core_identity:v1", "score": 1.0, "confidence": 0.9,
+                crate::federation::envelope::paths::ASSERTED_AT: at("2026-05-02T00:00:00Z").to_rfc3339()});
+            let mut r = row(
+                &id,
+                &scorer,
+                &subject,
+                env,
+                Vec::new(),
+                at("2026-05-02T00:00:00Z"),
+                None,
+            );
+            r.weight = Some(1.0);
+            ts::reseal(&mut r);
+            r
+        };
+        let refused = put(d, score("none"))
+            .await
+            .expect_err("I112: no consent, no score");
+        assert_eq!(refused.kind(), "federation_consent_gate_refused");
+        // Narrowed to a DIFFERENT family: still refused.
+        put(
+            d,
+            stance(
+                &format!("i112-g-trust-{s}"),
+                &subject,
+                &scorer,
+                "granted",
+                serde_json::json!("analyze:trust"),
+                serde_json::json!({}),
+                "2026-05-01T00:00:00Z",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let refused = put(d, score("trust"))
+            .await
+            .expect_err("I112: `analyze:trust` does not cover capacity scoring");
+        assert_eq!(refused.kind(), "federation_consent_gate_refused");
+        // Narrowed to THIS family: admitted.
+        put(
+            d,
+            stance(
+                &format!("i112-g-cap-{s}"),
+                &subject,
+                &scorer,
+                "granted",
+                serde_json::json!("analyze:capacity"),
+                serde_json::json!({}),
+                "2026-05-01T00:00:01Z",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        put(d, score("cap"))
+            .await
+            .expect("I112: `analyze:capacity` covers it");
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +870,11 @@ mod run {
                     let Some(b) = $fresh.await else { return };
                     bodies::i111_an_expired_row_enters_only_through_its_edge(&b, &super::suffix())
                         .await
+                }
+                #[tokio::test]
+                async fn i112() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i112_the_gate_honours_the_family_narrowing(&b, &super::suffix()).await
                 }
             }
         };
