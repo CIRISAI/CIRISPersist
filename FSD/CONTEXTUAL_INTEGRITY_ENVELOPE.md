@@ -82,7 +82,7 @@ The transfer policy's members, and who reads each (`engine::promote_consented_ba
 | `attestation_prefixes` | dimension prefixes | yes — the covered set |
 | `audience` | `cohort_scope` (default `federation`) | yes |
 | `valid_until` | instant | yes — a lapsed grant covers nothing |
-| `restrictions` | `strip_field` / `recipient_capability` | `strip_field` yes — the placement's strip set (`engine.rs` `load_active_egress_grants` → placement); `recipient_capability` is parsed and **not actioned** on the send path |
+| `restrictions` | `strip_field` / `recipient_capability` | `strip_field` yes — the placement's strip set (`engine.rs` `load_active_egress_grants` → placement); `recipient_capability` is parsed here and **enforced by Edge's bridge as a WITHHOLD** (`CIRISEdge src/replication/bridge.rs#recipient_capability_withholds`, its `field_conformance` table) — the transport, not the promoter, decides per recipient |
 | `for_key_id` | key id | not by the promoter — read by the #857 admission gate and the V147 `consent_peer_set_for` projection, which the by-principals send-set doors consult |
 | `principle` | `retain` / `share` (default) / `analyze` / `train` / `publish` | **no — carried only.** A `principle: train` grant replicates exactly like `share` today. **(cut C2)** |
 | `purpose` | free text | descriptive |
@@ -157,16 +157,20 @@ fold.
 ```
 scope-member := token | [ token, … ]
 token        := kind ( ":" sub )*
-kind         := "retain" | "share" | "analyze" | "train" | "publish"     -- transmission_principle::ALL
-sub          := [a-z0-9_-]+                                             -- per-kind meaning, §4.2
+kind         := [a-z][a-z0-9_]*           -- OPEN (CC 3.3.1); five CANONICAL kinds, §4.2
+sub          := [a-z0-9_-]+               -- per-kind meaning for the canonical kinds; generic otherwise
 ```
 
-- `kind` is closed — `types::transmission_principle::ALL`, the same five the
-  transfer grammar pins. A token whose kind is not one of the five is not a
-  consent scope; today it silently matches nothing (a grant naming an
-  unrelated scope is "unrelated"). After C1 it is **refused at admission**
-  for `consent:state:*` rows, the v44.4.0 canonical-id posture: never admit a
-  token the fold cannot match.
+- `kind` is **open**, as CC 3.3.1 says: the five canonical kinds
+  (`types::transmission_principle::ALL`) have per-kind sub-scope semantics
+  persist honours; any other well-formed kind is a consumer's own scope and
+  gets the generic rule of §4.3 (Server's infohazard gate uses `view` +
+  `content_class` today — `CIRISServer src/safety/infohazard.rs` — and that
+  keeps working unchanged). What is **refused at admission** for
+  `consent:state:*` rows is a *malformed* token — empty or ill-formed
+  segments, a canonical kind whose sub-scope does not parse, a
+  `share:cohort:<x>` wider than the row's own `cohort_scope` — the v44.4.0
+  canonical-id posture: never admit a token the fold cannot match.
 - Sub-scopes ride IN the token (CC 3.3.1: `retain:90d`,
   `share:cohort:family`). `content_class` stays a separate member.
 - `CONSENT_GRAMMAR_HASH` does not move: the `scope` member is not in the
@@ -200,6 +204,11 @@ and a query token `q`:
    duration is not a match criterion, it is a lifecycle fact the resolver
    returns alongside the stance (`ScopedStance { state, retain_until }`,
    C1b) and the retention sweep enforces.
+3b. For a **non-canonical** kind (`view`, …): generic hierarchical
+   narrowing — `g` covers `q` iff `sub(g)` is absent or is a segment-wise
+   prefix of `sub(q)`. A bare `view` covers `view:x`; `view:x` covers
+   `view:x:y` and not `view` or `view:z`. Persist assigns no meaning to the
+   segments; the consumer that minted the kind does.
 4. Then the `content_class` qualifier, exactly as today.
 5. The asymmetry is unchanged (v16.1.1): a **non-grant** naming no genuine
    scope is BLANKET and matches every query; a **grant** naming no genuine
@@ -208,11 +217,14 @@ and a query token `q`:
 ### 4.4 Refusal at the door
 
 Both the local write door and ingest admission for `consent:state:*` rows
-parse every token. Refused, by name: unknown kind; a sub-scope on a kind
-whose sub form is closed (`retain`, `share`, `analyze`) that does not parse
+parse every token. Refused, by name: a malformed token (empty segment, a
+character outside the grammar); a sub-scope on a canonical kind whose sub
+form is closed (`retain`, `share`, `analyze`) that does not parse
 (`retain:soon`, `share:cohort:everyone`); a `share:cohort:<x>` wider than the
 row's own `cohort_scope` (a grant cannot permit propagation the row itself
-does not reach). Open kinds (`train`, `publish`) accept any well-formed sub.
+does not reach). `train`, `publish` and every non-canonical kind accept any
+well-formed sub. An unknown kind is not a refusal — CC 3.3.1 keeps the
+vocabulary open, and a consumer's scope is not persist's to veto.
 
 ## 5. The lifecycle
 
@@ -279,7 +291,8 @@ live stewards). `principle` is not consulted **(C2)**: after the cut, only
 `share` (and `publish`, for the external plane) authorize propagation;
 `retain` / `analyze` / `train` grants cover nothing on the send set, and the
 promoter's report names the principle it declined. `recipient_capability`
-restrictions are parsed and not actioned — noted here, filed as part of C2.
+restrictions are Edge's: the bridge withholds the row from a recipient that
+does not hold the capability (never routed through the strip pipeline).
 
 ### 5.5 Resolve
 
@@ -375,9 +388,11 @@ the contract; a processor that adopts a token files against this document.
 
 ## 7. Invariants (witnessed by the v44.8.0 cut)
 
-- **I104** — a `consent:state:*` row whose `scope` carries an unknown kind,
-  or a closed-kind sub-scope that does not parse, is refused at both doors
-  by name; the row is not stored.
+- **I104** — a `consent:state:*` row whose `scope` carries a malformed
+  token, or a canonical-kind sub-scope that does not parse, or a
+  `share:cohort` wider than the row, is refused at both doors by name; the
+  row is not stored. A well-formed non-canonical kind (`view`) is admitted
+  and matches under the generic rule.
 - **I105** — `share:cohort:family` covers a query `share:cohort:family` and
   `share:cohort:self`, does not cover `share` (federation) or
   `share:cohort:community`; a bare `share` covers all of them.
@@ -392,9 +407,10 @@ the contract; a processor that adopts a token files against this document.
 - **I109** — `consent:state:expired` is emitted by the sweep for a lapsed
   grant, carries `consent_supersedes` naming it, and out-ranks a clock-later
   re-grant that does not name the expiry.
-- **I110** — from disk: `matches_scoped_query` is the only scope matcher;
-  every door that reads a scope token calls it; the five kinds appear in
-  exactly one place.
+- **I110** — from disk: `consent_scope::covers` is the only scope matcher;
+  every door that reads a scope token reaches it through
+  `matches_scoped_query`; the five canonical kinds are spelled in exactly one
+  place (`transmission_principle::ALL`).
 
 ## 8. The cut list
 
@@ -402,7 +418,7 @@ the contract; a processor that adopts a token files against this document.
 |---|---|---|---|
 | C1 | scope-token parser, per-kind match, refusal at both doors | `consent.rs`, `admission.rs`, the local door | none |
 | C1b | `retain:<duration>` honoured by retention + the SLA watch; `ScopedStance` return | `retention/`, `consent.rs`, trait + PyO3 | none (new return type on a new door; the old door stays) |
-| C2 | `principle` read by the promoter; `recipient_capability` actioned or refused at parse | `engine.rs`, `consent_grammar.rs` | none |
+| C2 | `principle` read by the promoter (only `share` / `publish` propagate; the report names what it declined) | `engine.rs` | none |
 | C3 | `consent:state:expired` emission sweep | new sweep, `substrate_persist` signer | none |
 | C4 | decay emission — decide with the Agent team | — | — |
 | — | CC erratum | CIRISConstitution#103 | — |
