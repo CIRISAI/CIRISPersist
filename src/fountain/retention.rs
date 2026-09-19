@@ -83,6 +83,28 @@ pub fn resolve_retention_action(consent: PersistConsentState, is_rare: bool) -> 
     }
 }
 
+/// v44.8.0 (CIRISPersist#866 C1b, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`
+/// §4.2) — [`resolve_retention_action`] with the subject's `retain` stance
+/// beside the all-scope one. A `retain:<window>` grant whose window has
+/// passed (`retain_until <= now`) is **a withdrawal the subject signed in
+/// advance**: the verdict is `HardDelete`, rare or not, exactly as a
+/// revocation — the frozen verify-core rule that withdrawal overrides rarity
+/// is applied to the lapse the subject wrote into the grant. With no window
+/// the all-scope stance decides, as before.
+#[must_use]
+pub fn retention_action_with_retain_window(
+    consent: PersistConsentState,
+    retain: &crate::federation::consent::ScopedStance,
+    now: chrono::DateTime<chrono::Utc>,
+    is_rare: bool,
+) -> RetentionAction {
+    let window_lapsed = retain.retain_until.is_some_and(|until| until <= now);
+    if window_lapsed {
+        return resolve_retention_action(PersistConsentState::Revoked, is_rare);
+    }
+    resolve_retention_action(consent, is_rare)
+}
+
 /// N6: may an inbound `FountainHoldingClaim` count toward another peer's
 /// rarity calculation? Only if its possession is PROVEN (it answered a
 /// symbol challenge / carries a proof-of-possession). An unverified claim

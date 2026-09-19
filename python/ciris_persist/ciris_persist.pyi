@@ -1293,6 +1293,9 @@ class Engine:
     def resolve_scoped_consent_by_principals(self, target_key_id: str, subject_key_id: str, scope: str, qualifier: str | None = None, now_iso: str | None = None) -> str:
         """(derived) deontic — v44.6.0 (#857 §4) — resolve_scoped_consent keyed by ANY key that stands for the subject; the per-principal fold combined as a reverse quorum on the..."""
 
+    def resolve_scoped_stance_by_principals(self, target_key_id: str, subject_key_id: str, scope: str, qualifier: str | None = None, now_iso: str | None = None) -> str:
+        """(derived) deontic — v44.8.0 (CIRISPersist#866 C1b) — resolve_scoped_consent_by_principals WITH its bound. Returns JSON {"state": "granted"|"revoked"|"expired"| "unspec..."""
+
     def resolve_transit_eligibility_json(self, user_key_id: str, peer_key_id: str) -> str:
         """v24.1.0 (CIRISPersist#561) — **may ``peer_key_id`` carry our relay
         traffic?** Returns the verdict as JSON
@@ -3663,6 +3666,9 @@ class Engine:
 
     def replay_abandoned(self, queue_id: str) -> None:
         """(derived) procedural — v0.4.0 — Operator-driven replay. Resets attempt_count=0 and requeues an abandoned row."""
+
+    def run_consent_expiry_sweep_json(self, now_iso: str | None = None) -> str:
+        """(derived) procedural — v44.8.0 (CIRISPersist#866 C3) — the consent expiry sweep: record every lapsed consent:state:granted (its expires_at or its retain:<window> passed)..."""
 
     def run_deletion_window_watch_json(self, now_iso: str | None = None) -> str:
         """(derived) procedural — v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) — drive ONE deletion-window breach sweep and return the pass report as JSON ({rows_scann..."""

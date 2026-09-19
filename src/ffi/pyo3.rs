@@ -23984,6 +23984,95 @@ impl PyEngine {
         })
     }
 
+    /// v44.8.0 (CIRISPersist#866 C1b) — `resolve_scoped_consent_by_principals`
+    /// WITH its bound. Returns JSON `{"state": "granted"|"revoked"|"expired"|
+    /// "unspecified", "retain_until": <RFC-3339>|null}`: `retain_until` is the
+    /// tightest `retain:<window>` any principal signed for this machine; past
+    /// it the `retain` stance reads `expired`. The door a sweep asks before it
+    /// keeps or evicts (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.2).
+    #[pyo3(signature = (target_key_id, subject_key_id, scope, qualifier = None, now_iso = None))]
+    fn resolve_scoped_stance_by_principals(
+        &self,
+        py: Python<'_>,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let now = match now_iso {
+                Some(v) => chrono::DateTime::parse_from_rfc3339(v)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?,
+                None => chrono::Utc::now(),
+            };
+            let (t, sub, sc, q) = (
+                target_key_id.to_owned(),
+                subject_key_id.to_owned(),
+                scope.to_owned(),
+                qualifier.map(str::to_owned),
+            );
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let stance = self
+                    .runtime
+                    .block_on(engine.resolve_scoped_stance_by_principals(
+                        &t,
+                        &sub,
+                        &sc,
+                        q.as_deref(),
+                        now,
+                    ))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&stance).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "resolve_scoped_stance_by_principals encode: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// v44.8.0 (CIRISPersist#866 C3) — **the consent expiry sweep**: record
+    /// every lapsed `consent:state:granted` (its `expires_at` or its
+    /// `retain:<window>` passed) as a `consent:state:expired` row signed by
+    /// this node, carrying `consent_supersedes` naming the grant and asserted
+    /// AT the lapse. Idempotent; call it from the same maintenance loop as
+    /// `run_deletion_window_watch_json`. Returns the
+    /// `ConsentExpirySweepReport` as JSON (`rows_scanned`, `grants_seen`,
+    /// `lapsed`, `already_recorded`, `emitted`, `skipped`, `scan_truncated`).
+    /// Nothing is deleted.
+    #[pyo3(signature = (now_iso = None))]
+    fn run_consent_expiry_sweep_json(
+        &self,
+        py: Python<'_>,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let now = match now_iso {
+            Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("run_consent_expiry_sweep now_iso parse: {e}"))
+                })?
+                .with_timezone(&chrono::Utc),
+            None => chrono::Utc::now(),
+        };
+        catch_panic(|| {
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let report = self
+                    .runtime
+                    .block_on(engine.run_consent_expiry_sweep(now))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&report).map_err(|e| {
+                    PyValueError::new_err(format!("run_consent_expiry_sweep serialize: {e}"))
+                })
+            })
+        })
+    }
+
     /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **single
     /// responsible owner** of `key_id`, purpose-filtered to the owner-binding
     /// sub-relation → **at most one**. Returns a JSON string: the owner's
@@ -32286,6 +32375,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // a trust signal about a subject who authorized no such thing.
         // Caller-fault (4xx shape) — ValueError.
         crate::federation::Error::ConsentGateRefused(_) => PyValueError::new_err(kind),
+        // v44.8.0 (CIRISPersist#866 C1) — a malformed consent scope token is
+        // caller-fault malformed content; ValueError (4xx), the kind names it.
+        crate::federation::Error::ConsentScopeTokenInvalid { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),

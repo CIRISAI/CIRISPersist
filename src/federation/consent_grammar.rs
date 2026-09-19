@@ -111,6 +111,35 @@ pub enum TransmissionPrinciple {
     Publish,
 }
 
+impl TransmissionPrinciple {
+    /// v44.8.0 (CIRISPersist#867 C2, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`
+    /// §5.4) — does a grant under this principle authorize sending the
+    /// covered bytes onward? `share` (propagate across the federation) and
+    /// `publish` (to external systems) do. `retain` is permission to keep,
+    /// `analyze` to derive, `train` to learn — none of them is permission to
+    /// transmit, and the promoter declines them by name. Before this method
+    /// existed the member was carried and never read, so every principle
+    /// replicated like `share`.
+    #[must_use]
+    pub const fn propagates(self) -> bool {
+        matches!(self, Self::Share | Self::Publish)
+    }
+
+    /// The wire token — the same lowercase spelling serde uses, from the
+    /// one vocabulary ([`crate::federation::types::transmission_principle`]).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        use crate::federation::types::transmission_principle as p;
+        match self {
+            Self::Retain => p::RETAIN,
+            Self::Share => p::SHARE,
+            Self::Analyze => p::ANALYZE,
+            Self::Train => p::TRAIN,
+            Self::Publish => p::PUBLISH,
+        }
+    }
+}
+
 /// One restriction a grant places on the covered flow — a closed,
 /// internally-tagged enum (`#[serde(tag = "op")]`). An unrecognized `op`
 /// tag is a serde deserialize ERROR (not a skipped/ignored variant),

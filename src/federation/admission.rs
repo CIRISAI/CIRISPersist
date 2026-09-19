@@ -2599,6 +2599,10 @@ pub async fn check_promotion_admission(
     check_reserved_prefix_admission(directory, row).await?;
 
     // CC 3.4.5 — CONSENT BEFORE SCORING. The MUST this issue is rated on.
+    // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate at the promotion
+    // chokepoint: a local row admitted before the door refused malformed
+    // tokens does not cross with one.
+    super::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
     check_capacity_consent_admission(directory, row).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`
@@ -4357,11 +4361,18 @@ pub async fn check_capacity_consent_admission(
         return Ok(());
     }
 
+    // v44.8.0 (CIRISPersist#866 C1, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`
+    // §4.2) — the gate asks for `analyze:<family>` (`analyze:capacity`): a
+    // bare `analyze` grant covers it (a bare grant is the widest), a grant
+    // narrowed to THIS family covers it, and a grant narrowed to another
+    // family does not. The subject may consent to be scored on capacity and
+    // nothing else, and the gate honours exactly that.
+    let query = format!("{}:{}", ANALYZE_CONSENT_SCOPE, claim.family.as_str());
     let stance = directory
         .resolve_scoped_consent(
             &row.attesting_key_id, // the consent edge points AT the attester P
             &row.attested_key_id,  // and is authored BY the subject S
-            ANALYZE_CONSENT_SCOPE,
+            &query,
             None,
             chrono::Utc::now(),
         )

@@ -5,6 +5,84 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.8.0] - 2026-09-18
+
+### Added — the consent scope grammar, and the lifecycle it was missing (CIRISPersist#866, #867, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`)
+- **The envelope `scope` member is the normative carrier of a consent's
+  scope** (operator decision; CC erratum CIRISConstitution#103). A
+  `consent:scope:{kind}` companion row — the shape CC 3.3.1's composition
+  pattern shows — confers nothing and never did: no fold reads one, and the
+  constitution's own common case resolved `Unspecified` here. Pinned (I107).
+- **One scope-token grammar** (`federation::consent_scope`): `kind[:sub…]`,
+  the kind OPEN per CC 3.3.1 (Server's `view` keeps working), the five
+  canonical kinds with closed sub forms — `share:cohort:<cohort_scope>` an
+  audience NARROWING in the CC 4.4.3.3.1 order, `analyze:<family>` an
+  information-type narrowing, `retain:<n>d|<n>h` a lifecycle BOUND, every
+  other kind generic hierarchical narrowing. One parser
+  (`parse_scope_token`), one covering rule (`covers`: a bare grant is the
+  widest grant, a bare ask the widest ask, a narrowed grant never covers a
+  wider ask). `matches_scoped_query` covers through it instead of matching
+  strings, so `retain:90d` and `share:cohort:family` are no longer silently
+  inert. `content_class` stays the orthogonal CC 3.3.12 qualifier.
+- **The door refuses a token the fold could not match**, by name
+  (`Error::ConsentScopeTokenInvalid`, kind
+  `federation_consent_scope_token_invalid`): a malformed token, a canonical
+  kind whose sub-scope does not parse. Never an unknown kind — a consumer's
+  scope is not persist's to veto. Same pure gate
+  (`check_consent_scope_tokens`) at all seven doors: federation ingest and
+  local write on every backend, and the promotion chokepoint.
+- **`retain:<window>` is honoured.** `resolve_scoped_stance` (trait default,
+  `resolve_scoped_stance_by_principals` twin, PyO3
+  `resolve_scoped_stance_by_principals`) returns `ScopedStance { state,
+  retain_until }`; past the window the `retain` stance reads `Expired`.
+  `Engine::evict_fountain_content_by_consent` treats a lapsed window as a
+  withdrawal the subject signed in advance
+  (`fountain::retention_action_with_retain_window`: HardDelete, rare or
+  not). `run_deletion_window_watch` records `hard_case:retain_window_breach`
+  (its own suffix; `basis: "retain_window"`) for a row the producer still
+  holds about the subject past the window — one fold per (producer,
+  subject) per pass. The capacity gate now asks `analyze:capacity`: a bare
+  `analyze` grant covers it, a grant narrowed to another family does not.
+- **The transfer grant's `principle` is read** (`TransmissionPrinciple::
+  propagates`): only `share` / `publish` authorize propagation; a `retain` /
+  `analyze` / `train` grant is declined by name and counted in
+  `ConsentSweepReport.declined_by_principle`. Before this cut the member was
+  carried and never read — every principle replicated like `share`.
+- **The substrate records a lapse.** `consent_expiry::run_consent_expiry_sweep`
+  (Engine `run_consent_expiry_sweep`, PyO3 `run_consent_expiry_sweep_json`)
+  emits `consent:state:expired` — the leaf CC 3.3.1 makes substrate-emitted
+  and persist had recognised but never emitted — for every grant whose
+  `expires_at` or `retain:<window>` has passed (`consent::grant_lapse_instant`,
+  one spelling): signed by the node, asserted AT the lapse, `scope` /
+  `content_class` copied, `consent_supersedes` naming the grant, `for_key_id`
+  deliberately not (#857). The fold admits such a row into a subject's
+  universe only through that edge, and only when asserted at or after the
+  grant's own lapse: no node can expire a consent early, or someone else's.
+  Idempotent; a later fresh grant re-opens consent (#642).
+- Witnesses I104–I111 (`federation::consent_scope_invariants`), all three
+  backends where a directory is involved: the door's refusals and
+  admissions; the covering table per kind; the retain bound through the
+  resolver, the retention verdict and the watch; the CC literal pattern
+  pinned inert; the promoter declining by principle; the expiry record
+  end-to-end; the edge binding (no edge / other's grant / early ⇒ ignored);
+  from disk: one matcher, one spelling of the kinds, the gate at every door.
+
+### Changed
+- `resolve_scoped_consent` is now `resolve_scoped_stance(..).state` — same
+  answers for every token that parsed before, plus `Expired` past a retain
+  window. A stored token that does not parse (pre-v44.8.0 rows) covers
+  nothing, as an unrecognised scope always did.
+- `check_capacity_consent_admission` asks `analyze:capacity` instead of bare
+  `analyze` (a bare grant still covers; only a grant narrowed to a different
+  family stops covering).
+
+### Not in scope
+- `consent:decay:{stage}` emission — filed as CIRISAgent#1180 (persist
+  recommends the CEM emits the stage rows; the CC row's emitter moves).
+- Moving `content_class` into the token; a fold over `consent:scope:*`
+  companion rows; any `CONSENT_GRAMMAR_HASH` movement (the `scope` member
+  is not in the pinned manifest).
+
 ## [44.7.0] - 2026-09-18
 
 ### Added — the same-key rebind door (CIRISPersist#864, `FSD/KEY_RECORD_REBIND.md`)

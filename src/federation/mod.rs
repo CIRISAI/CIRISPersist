@@ -66,8 +66,16 @@ pub mod consent_peer_set;
 // CIRISPersist#857 (`FSD/CONSENT_BY_HUMANS.md`) — consent is by humans: the
 // principal walk in the consent doors, one combine rule.
 pub mod consent_by_humans;
+// v44.8.0 (#866) — the scope token grammar: one parser, one covering rule, the door gate.
+pub mod consent_scope;
+// v44.8.0 (#866 C3) — the substrate records a lapsed grant as `consent:state:expired`.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod consent_by_humans_invariants;
+pub mod consent_expiry;
+// CIRISPersist#866/#867 (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`) — I104–I111: the scope
+// token grammar, the retain bound, the transfer principle, the expiry record.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod consent_scope_invariants;
 pub mod crossing;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
@@ -214,6 +222,14 @@ pub struct ConsentSweepReport {
     /// Rows on which a crossing returned an error (logged via
     /// `tracing::warn!`).
     pub skipped: u64,
+    /// v44.8.0 (CIRISPersist#867 C2) — live egress grants this sweep set
+    /// aside because their `principle` does not propagate: only `share` and
+    /// `publish` authorize sending bytes onward
+    /// ([`consent_grammar::TransmissionPrinciple::propagates`]). A `retain`
+    /// / `analyze` / `train` grant covers nothing on the send set; before
+    /// this cut it replicated exactly like `share`. Each is logged by id.
+    #[serde(default)]
+    pub declined_by_principle: u64,
 }
 
 pub mod register;
@@ -5776,12 +5792,35 @@ pub trait FederationDirectory: Send + Sync {
         qualifier: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<hard_case::ConsentState, Error> {
+        Ok(self
+            .resolve_scoped_stance(target_key_id, subject_key_id, scope, qualifier, now)
+            .await?
+            .state)
+    }
+
+    /// v44.8.0 (CIRISPersist#866 C1b, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`
+    /// §4.2) — [`resolve_scoped_consent`](Self::resolve_scoped_consent) WITH
+    /// its bound: the same fold, returning the end of the covering
+    /// `retain:<window>` when the winning row named one
+    /// ([`consent::ScopedStance`]). The sweeps that must honour a retention
+    /// window (fountain eviction, the deletion-window watch) ask here; a
+    /// caller that only needs the stance keeps asking the door above, which
+    /// is this one's `.state`. Past the window the stance is `Expired`.
+    async fn resolve_scoped_stance(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<consent::ScopedStance, Error> {
         let rows = self.list_attestations_for(target_key_id).await?;
-        Ok(consent::fold_stance(
+        Ok(consent::fold_scoped_stance(
             &rows,
             subject_key_id,
             now,
-            Some((scope, qualifier)),
+            scope,
+            qualifier,
         ))
     }
 
@@ -6307,6 +6346,19 @@ pub enum Error {
     /// wire from every other argument complaint.
     #[error("{0}")]
     ConsentGateRefused(admission::ConsentGateRefused),
+
+    /// v44.8.0 (CIRISPersist#866, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4)
+    /// — a `consent:state:*` row names a scope token the fold could not
+    /// match (malformed, or a canonical kind whose sub-scope does not parse).
+    /// Refused at every door so a grant is never admitted inert. The token is
+    /// named verbatim; `reason` is [`consent_scope::ScopeTokenError`]'s text.
+    #[error("consent scope token `{token}` refused: {reason}")]
+    ConsentScopeTokenInvalid {
+        /// The offending token, verbatim.
+        token: String,
+        /// Why it did not parse.
+        reason: String,
+    },
 
     /// Row would conflict with an existing row whose content differs.
     /// Idempotent re-submission of the *same* content is OK; this
@@ -8062,6 +8114,7 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
+            Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",

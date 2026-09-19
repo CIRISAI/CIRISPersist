@@ -841,6 +841,45 @@ def test_local_sign_hybrid_matches_hand_composition_470() -> None:
     ciris_persist.reset_engine()
 
 
+def test_consent_expiry_sweep_and_scoped_stance_reachable_from_python_866():
+    """v44.8.0 (CIRISPersist#866) — the two new consent doors are host-reachable:
+    `run_consent_expiry_sweep_json` returns the sweep report shape, and
+    `resolve_scoped_stance_by_principals` returns `{state, retain_until}`."""
+    import json
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="cs-866")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        report = json.loads(eng.run_consent_expiry_sweep_json())
+        assert set(report.keys()) == {
+            "rows_scanned",
+            "grants_seen",
+            "lapsed",
+            "already_recorded",
+            "emitted",
+            "skipped",
+            "scan_truncated",
+        }
+        assert report["emitted"] == 0, "an empty engine records nothing"
+        stance = json.loads(
+            eng.resolve_scoped_stance_by_principals("target-866", "subject-866", "retain")
+        )
+        assert stance == {"state": "unspecified", "retain_until": None}
+        with pytest.raises(ValueError):
+            eng.run_consent_expiry_sweep_json(now_iso="not-a-timestamp")
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
+
+
+
 def test_deletion_window_watch_reachable_from_python_543() -> None:
     """v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) — the
     deletion-window breach sweep is reachable THROUGH the FFI.
@@ -873,6 +912,9 @@ def test_deletion_window_watch_reachable_from_python_543() -> None:
             "deleted_in_time",
             "breaches",
             "malformed",
+            # v44.8.0 (#866 C1b) — the subject's `retain:<window>` bound,
+            # counted beside the producer's `deletion_window` promise.
+            "retain_window_breaches",
             "scan_truncated",
         }
         # An empty substrate owes nobody a breach signal.

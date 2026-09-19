@@ -1,6 +1,6 @@
 # The contextual-integrity envelope — fields, axes, and the consent lifecycle
 
-**Status:** v44.7.0 design record + the v44.8.0 cut list. Filed from
+**Status:** v44.8.0 — designed and built (C1, C1b, C2, C3); C4 filed. Filed from
 CIRISPersist#866 (sub-scoping is two grammars) and #867 (three principles
 have no enforcing layer), both from CIRISEdge's transmission-principle
 audit. Operator decision 2026-09-18: **the envelope member is normative** —
@@ -84,7 +84,7 @@ The transfer policy's members, and who reads each (`engine::promote_consented_ba
 | `valid_until` | instant | yes — a lapsed grant covers nothing |
 | `restrictions` | `strip_field` / `recipient_capability` | `strip_field` yes — the placement's strip set (`engine.rs` `load_active_egress_grants` → placement); `recipient_capability` is parsed here and **enforced by Edge's bridge as a WITHHOLD** (`CIRISEdge src/replication/bridge.rs#recipient_capability_withholds`, its `field_conformance` table) — the transport, not the promoter, decides per recipient |
 | `for_key_id` | key id | not by the promoter — read by the #857 admission gate and the V147 `consent_peer_set_for` projection, which the by-principals send-set doors consult |
-| `principle` | `retain` / `share` (default) / `analyze` / `train` / `publish` | **no — carried only.** A `principle: train` grant replicates exactly like `share` today. **(cut C2)** |
+| `principle` | `retain` / `share` (default) / `analyze` / `train` / `publish` | yes since v44.8.0 (C2): only `share` / `publish` propagate; a `retain` / `analyze` / `train` grant is declined by name and counted in the report. Before, carried only — every principle replicated like `share`. |
 | `purpose` | free text | descriptive |
 
 ## 3. The three consent planes and how they relate
@@ -181,9 +181,9 @@ sub          := [a-z0-9_-]+               -- per-kind meaning for the canonical 
 
 | kind | sub form | meaning | kind of constraint | honoured by |
 |---|---|---|---|---|
-| `retain` | `retain:<n>d` / `retain:<n>h` (a duration) | keep the bytes for at most this long from `asserted_at` of the grant | lifecycle **bound** | persist retention sweep (C1b); the deletion-window watch reads the tighter of this and the row's `deletion_window` |
+| `retain` | `retain:<n>d` / `retain:<n>h` (a duration) | keep the bytes for at most this long from `asserted_at` of the grant | lifecycle **bound** | built (C1b): `resolve_scoped_stance` returns `retain_until` and reads `Expired` past it; `Engine::evict_fountain_content_by_consent` treats a lapsed window as a withdrawal (`fountain::retention_action_with_retain_window`, HardDelete rare or not); `run_deletion_window_watch` records `hard_case:retain_window_breach` for a row the producer still holds about the subject past the window |
 | `share` | `share:cohort:<cohort_scope>` | propagate no wider than this audience | audience **narrowing** | the crossing (`Audience` ⊆ the narrowing) and any caller asking `share` at an audience |
-| `analyze` | `analyze:<family-prefix>` | derive scores only in this family | information-type **narrowing** | `check_capacity_consent_admission` asks `analyze:capacity` (a bare `analyze` grant still covers it) |
+| `analyze` | `analyze:<family>` | derive scores only in this family | information-type **narrowing** | `check_capacity_consent_admission` asks `analyze:capacity` (built: a bare `analyze` grant covers it, `analyze:capacity` covers it, `analyze:trust` does not) |
 | `train` | open | reserved for the processor | narrowing | processor (§6) |
 | `publish` | open | reserved for the processor | narrowing | processor (§6) |
 
@@ -324,10 +324,10 @@ rows that name a *different* machine in `for_key_id` are not this machine's.
 |---|---|---|---|
 | `analyze` | **persist** | `check_capacity_consent_admission` at admission | enforced (v22.0.0) |
 | `share` (stance) | the crossing / callers | a stance is what the subject permits; the **transfer grant** is what the node sends | stance carried; propagation governed by §3.2 |
-| `retain` | **persist** | retention sweeps + the SLA watch honour `retain:<duration>` | **(C1b)** — today the sweeps act on `Revoked` only |
+| `retain` | **persist** | fountain eviction + the deletion-window watch honour `retain:<window>` through `resolve_scoped_stance` | enforced (v44.8.0, C1b) |
 | `train` | the processor (Agent CEM / LensCore) | `resolve_scoped_consent_by_principals(target, k, "train", …)` before training | **carried-only** until adopted; the door exists |
 | `publish` | the processor | same door before any external publication | **carried-only** |
-| `principle` (transfer) | **persist** | the promoter | **(C2)** — carried-only today |
+| `principle` (transfer) | **persist** | the promoter: only `share` / `publish` propagate (`TransmissionPrinciple::propagates`); the report counts `declined_by_principle` | enforced (v44.8.0, C2) |
 
 A subject that declines `analyze` cannot be scored: `capacity:composite` is
 undefined for them (CC 3.4.5 — consent gates scoring, never accountability;
@@ -342,12 +342,20 @@ Widening is a new row; the prior row is never edited.
 
 `expires_at` on a grant lapses it at fold time. CC 3.3.1 says
 `consent:state:expired` is **substrate-emitted** when `valid_until` passes
-without renewal; persist recognises the leaf in the fold
-(`consent::consent_state_of`) but **emits no such row today** — expiry is
-computed, not recorded. **(C3)**: a sweep emits `consent:state:expired` with
-`consent_supersedes` naming the lapsed grant, signed by `substrate_persist`,
-so the lapse is a replicable fact with a causal edge rather than a
-per-node clock reading.
+without renewal; before v44.8.0 persist recognised the leaf in the fold and
+emitted no such row — expiry was computed per node, not recorded. **(C3,
+built)**: `consent_expiry::run_consent_expiry_sweep` (Engine
+`run_consent_expiry_sweep`, PyO3 `run_consent_expiry_sweep_json`, called
+from the same maintenance loop as the deletion-window watch) records every
+lapsed grant — its `expires_at` or its `retain:<window>`, whichever is
+earlier (`consent::grant_lapse_instant`, one spelling) — as a
+`consent:state:expired` row signed by the node, asserted AT the lapse,
+carrying `consent_supersedes` naming the grant, `scope` / `content_class`
+copied, `for_key_id` deliberately not (#857: a machine names only itself;
+the edge binds). The fold admits such a row into the subject's universe only
+through that edge and only when asserted at or after the grant's own lapse
+(`substrate_expiry_bound_to_subject`): no node can expire a consent early,
+or someone else's, by emitting one.
 
 ### 5.8 Delete
 
@@ -372,10 +380,14 @@ sole evidence for `slashing:*` — the WA quorum is.
 ### 5.9 Decay
 
 `consent:decay:{stage}` (`identity_severed` / `patterns_anonymized` /
-`complete`) is substrate-emitted per CC 3.3.1. Persist has no decay
-protocol and emits no such row; the CIRISAgent 90-day decay is the agent's.
-**(C4)**: mark the leaf as agent-emitted in the CC row or give persist the
-sweep — a decision for the Agent team, filed with them.
+`complete`) is substrate-emitted per CC 3.3.1. Persist has a *fountain*
+consent-decay sweep (`Engine::sweep_consent_decay_once`: a per-class clock
+that evicts fountain symbols down a tier — byte eviction, not a protocol
+stage) and emits no `consent:decay:*` row; the three stages are the
+CIRISAgent CEM's 90-day protocol, which only the CEM can observe. **(C4,
+filed as CIRISAgent#1180)**: persist recommends the CEM emits the stage
+rows and the CC row's emitter moves to the agent; until one lands the leaf is
+carried-only.
 
 ## 6. Documentation of duty (the #867 answer)
 
@@ -405,8 +417,14 @@ the contract; a processor that adopts a token files against this document.
 - **I108** — a transfer grant with `principle: train` promotes nothing;
   `share` promotes; the promoter's report names the principle it declined.
 - **I109** — `consent:state:expired` is emitted by the sweep for a lapsed
-  grant, carries `consent_supersedes` naming it, and out-ranks a clock-later
-  re-grant that does not name the expiry.
+  grant (its `expires_at` or its `retain:<window>`, whichever is earlier),
+  signed by the node, asserted AT the lapse, carrying `consent_supersedes`
+  naming the grant; the sweep is idempotent; a later fresh grant re-opens
+  consent (the edge ends the named grant, not the subject's future — #642).
+- **I111** — a substrate-emitted expired row enters a subject's fold only
+  through a resolved edge to that subject's own lapsed grant, asserted at or
+  after the lapse: no edge, someone else's grant, or an early assertion
+  changes nothing.
 - **I110** — from disk: `consent_scope::covers` is the only scope matcher;
   every door that reads a scope token reaches it through
   `matches_scoped_query`; the five canonical kinds are spelled in exactly one
@@ -416,11 +434,11 @@ the contract; a processor that adopts a token files against this document.
 
 | id | what | where | hash |
 |---|---|---|---|
-| C1 | scope-token parser, per-kind match, refusal at both doors | `consent.rs`, `admission.rs`, the local door | none |
-| C1b | `retain:<duration>` honoured by retention + the SLA watch; `ScopedStance` return | `retention/`, `consent.rs`, trait + PyO3 | none (new return type on a new door; the old door stays) |
-| C2 | `principle` read by the promoter (only `share` / `publish` propagate; the report names what it declined) | `engine.rs` | none |
-| C3 | `consent:state:expired` emission sweep | new sweep, `substrate_persist` signer | none |
-| C4 | decay emission — decide with the Agent team | — | — |
+| C1 | scope-token parser, per-kind match, refusal at every door | `consent_scope.rs`, `consent.rs`, the seven door call sites | none — **built v44.8.0** |
+| C1b | `retain:<window>` honoured; `ScopedStance` (`resolve_scoped_stance`, `_by_principals`) | `consent.rs`, `fountain/retention.rs`, `deletion_window.rs`, trait + Engine + PyO3 | none — **built v44.8.0** (the old door stays, and returns `.state`) |
+| C2 | `principle` read by the promoter (only `share` / `publish` propagate; the report counts what it declined) | `engine.rs`, `consent_grammar.rs` | none — **built v44.8.0** |
+| C3 | `consent:state:expired` emission sweep, edge-bound admission in the fold | `consent_expiry.rs`, `consent.rs`, Engine + PyO3 | none — **built v44.8.0** |
+| C4 | decay emission — decide with the Agent team | CIRISAgent#1180 | filed; carried-only until decided |
 | — | CC erratum | CIRISConstitution#103 | — |
 
 ## 9. Not in scope
