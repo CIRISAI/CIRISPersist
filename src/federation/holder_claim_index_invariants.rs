@@ -389,6 +389,9 @@ mod run {
         );
     }
 
+    // Invoked only where a backend exists; without one (CI's `--features server`
+    // job) the definition itself would be an unused macro under `-D warnings`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     macro_rules! runners {
         ($modname:ident, $fresh:expr) => {
             mod $modname {
