@@ -68,6 +68,9 @@ pub mod consent_peer_set;
 pub mod consent_by_humans;
 // v44.8.0 (#866) — the scope token grammar: one parser, one covering rule, the door gate.
 pub mod consent_scope;
+// v45.0.0 (#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media Source struct grammar: one parser,
+// the CC 3.3.13 MUST-NOT list, the door gate, `size` on the holder claim.
+pub mod media_source;
 // v44.8.0 (#866 C3) — the substrate records a lapsed grant as `consent:state:expired`.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod consent_by_humans_invariants;
@@ -6367,6 +6370,24 @@ pub enum Error {
         reason: String,
     },
 
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — a row's
+    /// `media` Source struct did not parse (CC 3.3.13: a missing or
+    /// non-positive `size`, a malformed `format`, a MUST-NOT `safe` /
+    /// `renderable` / tier bit, an unknown member, a `digest` the row does
+    /// not cite in `evidence_refs[]`), or a `holds_bytes` claim carries no
+    /// `size` (CC 5.3.2.5: size is checked first, so a claim without one is
+    /// a claim nobody can check). Refused at every door so a descriptor the
+    /// puller cannot bound its read by is never admitted. `member` names
+    /// WHICH member; `reason` is [`media_source::MediaSourceError`]'s text.
+    #[error("media source member `{member}` refused: {reason}")]
+    MediaSourceInvalid {
+        /// The offending member — a struct member, a MUST-NOT member, an
+        /// unknown key verbatim, or `media` itself when it is not an object.
+        member: String,
+        /// The rule it broke.
+        reason: String,
+    },
+
     /// Row would conflict with an existing row whose content differs.
     /// Idempotent re-submission of the *same* content is OK; this
     /// fires only when the caller is overwriting.
@@ -8122,6 +8143,7 @@ impl Error {
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
+            Error::MediaSourceInvalid { .. } => "federation_media_source_invalid",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
