@@ -12709,12 +12709,25 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // REBUILDS the caller's bytes here rather than storing bytes it was
         // handed, so the builder is what makes "the caller signed the row we
         // are storing" a checkable statement instead of an assumption.
+        // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
+        // the length of the bytes this door stores. Checked BEFORE the rebuild
+        // so the refusal names the size, not a hash: a holder that announces
+        // one length and holds another is refused here, never advertised.
+        if attestation.size != body.size_bytes() {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "holds_bytes claim declares size {} but the stored bytes are {} \
+                 (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                attestation.size,
+                body.size_bytes()
+            )));
+        }
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
             sha256,
             &attestation.attesting_key_id,
             &attestation.attestation_id,
             attestation.asserted_at,
+            attestation.size,
         );
         attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
         attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
@@ -15170,6 +15183,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
             )
         })?;
+        // v45.0.0 (CIRISPersist#871, AV-89) — the announce's declared size must
+        // be the length of the sealed bytes this door stores.
+        if let Some(a) = announce.as_ref() {
+            if a.size != envelope_bytes.len() as u64 {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "holds_bytes claim declares size {} but the adopted bytes are {} \
+                     (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                    a.size,
+                    envelope_bytes.len()
+                )));
+            }
+        }
         // The holder claim is admitted on the same terms as `put_blob`'s.
         let prepared = match announce.as_ref() {
             Some(a) => Some(crate::federation::blobs::prepare_holds_bytes_row(
@@ -27172,6 +27197,7 @@ mod tests {
             &t.attesting_key_id.clone(),
             &t.attestation_id.clone(),
             t.asserted_at,
+            1,
         );
         resign_fed(&mut t); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
@@ -38065,6 +38091,7 @@ mod tests {
         attesting_key_id: &str,
         scrub_key_id: &str,
         attestation_id: &str,
+        size: u64,
     ) -> PutBlobAttestation {
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2): use Utc::now()
         // so the row lands inside the DEFAULT_HOLDS_BYTES_TTL window
@@ -38081,6 +38108,7 @@ mod tests {
             attestation_id,
             now,
             now,
+            size,
         )
     }
 
@@ -38130,6 +38158,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38157,6 +38186,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    ext.size_bytes,
                 ),
             )
             .await
@@ -38173,13 +38203,14 @@ mod tests {
         let err = backend
             .put_blob(
                 &wrong_sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &wrong_sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38197,13 +38228,14 @@ mod tests {
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38226,13 +38258,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38251,13 +38284,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38455,6 +38489,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38464,13 +38499,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-b",
                     "host-b",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38495,6 +38531,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38504,13 +38541,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38548,6 +38586,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38570,6 +38609,7 @@ mod tests {
                     "host-b",
                     "host-b",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38598,6 +38638,7 @@ mod tests {
         scrub_key_id: &str,
         attestation_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        size: u64,
     ) -> PutBlobAttestation {
         crate::federation::blobs::sealed_put_blob_attestation(
             sha256,
@@ -38610,6 +38651,7 @@ mod tests {
             // it is testing, but the two are one value here.
             scrub_timestamp,
             scrub_timestamp,
+            size,
         )
     }
 
@@ -38632,7 +38674,7 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation_at(
                     &sha,
@@ -38640,6 +38682,7 @@ mod tests {
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
                     backdated,
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38676,9 +38719,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", holds_id.as_str()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    holds_id.as_str(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -38730,7 +38779,7 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation_at(
                     &sha,
@@ -38738,6 +38787,7 @@ mod tests {
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
                     backdated,
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38761,7 +38811,7 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation_at(
                     &sha,
@@ -38769,6 +38819,7 @@ mod tests {
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
                     fresh,
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38790,13 +38841,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     holds_bytes_attestation_id.as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -42159,6 +42211,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -42253,6 +42306,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -42346,6 +42400,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -45301,9 +45356,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45337,7 +45398,13 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45371,9 +45438,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45392,7 +45465,13 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45409,9 +45488,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45429,9 +45514,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45457,9 +45548,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45496,7 +45593,13 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    ext.size_bytes,
+                ),
             )
             .await
             .unwrap();
@@ -47182,9 +47285,15 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(huge),
+                BlobBody::Inline(huge.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    huge.len() as u64,
+                ),
             )
             .await
             .expect_err("must trust-reject before size-reject");
@@ -47213,7 +47322,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                 &sha,
                 BlobBody::Inline(b"x".to_vec()),
                 None,
-                blob_attestation(&sha, "", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "", "host-a", &uuid::Uuid::new_v4().to_string(), 1),
             )
             .await
             .expect_err("empty key beats trust");
@@ -47230,9 +47339,15 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .expect("trust admits");

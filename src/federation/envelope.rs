@@ -110,6 +110,16 @@ pub mod paths {
     /// consented payload must be deleted (persist-owned lifecycle
     /// processor — the breach signal). Hoisted from `extra`, byte-invariant.
     pub const DELETION_WINDOW: &str = "deletion_window";
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3) — the multimedia
+    /// Source struct (CC 3.3.13): `digest`, REQUIRED `size`, `format`,
+    /// `codec`, layout hints, `placeholder`, `name`, `content_digest`,
+    /// `derived_from`, `captions`, `digital_source_type`, `init_segment`.
+    /// Byte-preserving here; validated by `media_source::check_media_source`
+    /// at every door, which refuses a malformed struct by member name and
+    /// the CC 5.3.2.6 MUST-NOT members (`safe` / `renderable` / a tier) by
+    /// rule. Listed in the vocabulary DELIBERATELY: a consumer validating an
+    /// envelope against it must know the member exists.
+    pub const MEDIA: &str = "media";
     /// v31.0.0 (CIRISPersist#598) — **the SIGNED assertion instant.** The
     /// `federation_attestations.asserted_at` COLUMN is stored verbatim from
     /// the caller on all three backends and is not covered by any signature
@@ -423,6 +433,10 @@ pub struct EnvelopeCore {
     /// breach signal — see [`super::deletion_window`]). Byte-invariant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_window: Option<String>,
+    /// v45.0.0 (CIRISPersist#871) — [`paths::MEDIA`]: the multimedia Source
+    /// struct, kept as JSON here (byte-preserving) and validated at the door.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<serde_json::Value>,
     /// [`paths::ASSERTED_AT`] — v31.0.0 (#598). RFC-3339. The signed twin
     /// of the `asserted_at` ROW COLUMN the consent fold orders on. Stamped
     /// by [`crate::federation::attestation_emit::stamp_and_canonicalize`]
@@ -873,6 +887,9 @@ fn fully_populated_core() -> EnvelopeCore {
         consent_supersedes: Some("prior-consent-1".into()),
         delivery_mode: Some("mandatory".into()),
         deletion_window: Some("2027-01-01T00:00:00Z".into()),
+        media: Some(
+            serde_json::json!({"digest": "ab".repeat(32), "size": 4096, "format": "image/jpeg"}),
+        ),
         asserted_at: Some("2026-08-12T00:00:00.000000+00:00".into()),
         expires_at: Some("2027-01-01T00:00:00.000000+00:00".into()),
         widened_at: Some("2026-08-12T00:00:01.000Z".into()),
@@ -1060,6 +1077,12 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // would break them a third time for no new capability.
             paths::DELIVERY_MODE,
             paths::DELETION_WINDOW,
+            // v45.0.0 (CIRISPersist#871) — the multimedia Source struct (CC
+            // 3.3.13). Re-pins `ENVELOPE_VOCABULARY_SHA256`, deliberately: a
+            // descriptor's REQUIRED `size` is what a peer's puller budgets by
+            // (AV-88), and a vocabulary that omits it would let a consumer call
+            // the member an unknown extension.
+            paths::MEDIA,
             // v31.0.0 (CIRISPersist#598) — the two signed instants. Added to
             // the vocabulary DELIBERATELY (this re-pins
             // `ENVELOPE_VOCABULARY_SHA256` and every consumer asserting it):
@@ -1178,8 +1201,11 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// capability, not a nicety. Consumers asserting the old hash BREAK,
 /// deliberately: an unadopted reader is one that believes a widening's
 /// `asserted_at` is the placement time, and it should learn that loudly.
+/// v45.0.0 (CIRISPersist#871) — re-pinned from
+/// `e7135559a3d843ecff3ad34ee3b1a10acf92b33f199a327758139969e19f5699`: the
+/// vocabulary lists [`paths::MEDIA`], the multimedia Source struct.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "e7135559a3d843ecff3ad34ee3b1a10acf92b33f199a327758139969e19f5699";
+    "4d7054a6e05306e7b37d30ab2d25c43625a4f382021f39191f55a2c1f833589b";
 
 #[cfg(test)]
 mod vocab_tests {

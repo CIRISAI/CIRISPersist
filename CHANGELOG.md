@@ -5,6 +5,74 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [45.0.0] - 2026-09-19
+
+### BREAKING — size is REQUIRED on every holder claim; the envelope vocabulary re-pins (CIRISPersist#871, `FSD/MEDIA_SOURCE.md`)
+- **`holds_bytes` claims carry `size`, bound into the signed bytes**
+  (`holds_bytes_attestation_row(.., size)`, `sign_holds_bytes_claim(.., size)`,
+  `PutBlobAttestation.size`). CC 5.3.2.5: *"every blob carries its size, and
+  size is checked first"* — a puller caps its read at the declared length
+  BEFORE it hashes (AV-88). **The ingest door refuses a `holds_bytes` row
+  without a positive integer `size`** (`federation_media_source_invalid`,
+  member `size`); both blob doors refuse to announce a claim whose size is
+  not the byte length they stored (AV-89). A pre-45.0.0 holder's claims are
+  invisible to a 45.0.0 node — there are no blobs in production, so every
+  node pins together and the strictness costs nothing now or later. Why
+  required and not optional: an optional size is a size nobody checks.
+- **`ENVELOPE_VOCABULARY_SHA256` re-pins** `e7135559…` → `4d7054a6…`: the
+  vocabulary lists the new `media` member. Every consumer asserting the
+  hash re-pins in the same window (the v31.0.0 / v44.6.0 motion).
+- The FFI `put_blob_json` claim wire (`PutBlobAttestationWire`) requires
+  `size`.
+
+### Added — the multimedia Source struct, refused by name at every door (CC 3.3.13, CIRISConstitution#104 rc5)
+- **`media`**, a typed envelope member (`paths::MEDIA`,
+  `EnvelopeCore.media`, byte-preserving): `digest` (== an `evidence_refs`
+  entry), REQUIRED `size`, `format` (RFC 6838 essence, lowercase, no
+  parameters), `codec` (RFC 6381 family; REQUIRED for `video/mp4` /
+  `audio/mp4`), `width` / `height` / `duration_ms`, `placeholder`
+  (thumbhash, ≤ 64 decoded bytes), `name` (RFC 6266 §4.3 sanitised, display
+  only), `content_digest`, `derived_from`, `captions` (== an
+  `evidence_refs` entry), `digital_source_type` (the closed IPTC set),
+  `init_segment` (live stream, CC 3.3.13 Phase 2). One grammar
+  (`federation::media_source`), one gate (`check_media_source`) at all
+  seven doors — three ingest, three local, the promotion chokepoint —
+  refusing by member name (`Error::MediaSourceInvalid { member, reason }`).
+  The constitution's MUST-NOT members — `safe`, `renderable`, `tier`,
+  `crypto_tier`, `render_tier` — are refused by rule (CC 5.3.2.6: the render
+  tier is receiver policy computed from verified, sniffed bytes), any other
+  unknown member by name. `evidence_refs[]` stays bare sha256 (CC 3.3.13);
+  the `[{sha, size}]` form in the issue's ask 2 contradicts the text and
+  breaks every reader, and is pinned out (I116).
+- **`derived_from` — the rendition index.** V149 `blob_renditions` (both
+  dialects), projected in the same write that admits a row whose struct
+  names an original, removed by the same retraction fold;
+  `list_derived_hex(sha)` (PyO3 `list_derived_json`). Placement (CC
+  3.3.13): a rendition inherits its original's `cohort_scope`; where the
+  original is held locally a rendition at another scope is refused; a blob
+  is never its own rendition.
+- **`list_holders_sized(sha) -> [{key_id, size}]`** (PyO3
+  `list_holders_sized_json`); `list_holders` is unchanged. A claim without
+  a valid size is not a holder a puller can budget for and is skipped.
+- **`store_plaintext_local(sha, bytes, media_type)`** (#863 ask 1): the
+  commons/plaintext LocalOnly store — content-address checked, no claim
+  emitted.
+- Threat model: **AV-88** (unbounded `ContentFetch` — size checked before
+  hashing) and **AV-89** (size divergence between descriptor and holder).
+- Witnesses I115–I120 (`federation::media_source_invariants`) on memory,
+  sqlite and postgres where a directory is involved: every refusal by name
+  and the admissions; the citation rule and the bare-sha pin; the
+  size-less claim refused and the two doors' claims carrying the stored
+  length across two backends (the #870 delivery shape); the rendition index
+  projected, read, retired, and its placement rule; from disk: the gate at
+  every door, the vocabulary entry, the doors storing size + format, the
+  deliberate re-pin.
+
+### Recorded, not decided here
+- `content_digest` on sealed scopes (rc5): AAD binding stops substitution;
+  it does not stop a dictionary check by anyone holding the row. Accepted by
+  the ruling; named in `FSD/MEDIA_SOURCE.md` §2 so it is not discovered.
+
 ## [44.8.1] - 2026-09-19
 
 ### Fixed — a holder claim was advertised but unfetchable (CIRISPersist#870)

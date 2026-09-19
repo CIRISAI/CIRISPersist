@@ -160,6 +160,7 @@ where
                 ctx.our_key_id,
                 uuid::Uuid::new_v4(),
                 chrono::Utc::now(),
+                envelope.len() as u64,
             )
             .await?,
         )

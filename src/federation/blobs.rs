@@ -1738,9 +1738,15 @@ pub trait BlobStorage: Send + Sync {
             // records the AUTHOR, which for a proxy write is the peer —
             // losing it made proxy content look locally authored and slipped
             // the stop-tier proxy-serve refusal.
-            let att =
-                sign_holds_bytes_claim(local, sha256, &local.derived_key_id(), attestation_id, now)
-                    .await?;
+            let att = sign_holds_bytes_claim(
+                local,
+                sha256,
+                &local.derived_key_id(),
+                attestation_id,
+                now,
+                body.size_bytes(),
+            )
+            .await?;
             self.put_blob_with_scope(
                 Some(author_key_id),
                 sha256,
@@ -2751,6 +2757,13 @@ pub struct PutBlobAttestation {
     pub attesting_key_id: String,
     /// Pre-computed UUID v4 for the attestation row's PK.
     pub attestation_id: String,
+    /// v45.0.0 (CIRISPersist#871, CC 5.3.2.5 / 3.3.13) — the byte length the
+    /// holder claims, BOUND into the signed envelope (`size`). A puller caps
+    /// its read at this number before it hashes (AV-88); the door that stores
+    /// the bytes refuses a claim whose size is not the length it stored
+    /// (AV-89). Required: a claim without a size is not a claim a peer can
+    /// budget for.
+    pub size: u64,
     /// SHA-256 of the canonical attestation envelope — the
     /// `original_content_hash` column. Hex-encoded.
     pub original_content_hash_hex: String,
@@ -2885,6 +2898,7 @@ pub async fn sign_holds_bytes_claim(
     attesting_key_id: &str,
     attestation_id: uuid::Uuid,
     now: chrono::DateTime<chrono::Utc>,
+    size: u64,
 ) -> Result<PutBlobAttestation, BlobError> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -2915,11 +2929,19 @@ pub async fn sign_holds_bytes_claim(
     // helper mints the claim and signs it in one motion — a caller
     // that wants to assert an older claim uses `put_blob` directly and
     // states `asserted_at` itself.
+    if size == 0 {
+        return Err(BlobError::InvalidArgument(
+            "holds_bytes claim: size must be the positive byte length of the blob \
+             (CC 5.3.2.5: every blob carries its size, checked first)"
+                .into(),
+        ));
+    }
     let envelope = holds_bytes_attestation_envelope(
         sha256,
         attesting_key_id,
         &attestation_id.to_string(),
         now,
+        size,
     );
     // v4.6 (#176) — produce-side gate (Python pre-cut, JCS post-cut).
     let canonical_bytes =
@@ -2946,6 +2968,7 @@ pub async fn sign_holds_bytes_claim(
     Ok(PutBlobAttestation {
         attesting_key_id: attesting_key_id.to_string(),
         attestation_id: attestation_id.to_string(),
+        size,
         original_content_hash_hex,
         scrub_signature_classical: B64.encode(&sig.classical.signature),
         scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
@@ -2991,6 +3014,7 @@ pub(crate) fn prepare_holds_bytes_row(
         &attestation.attesting_key_id,
         &attestation.attestation_id,
         attestation.asserted_at,
+        attestation.size,
     );
     row.original_content_hash = attestation.original_content_hash_hex.clone();
     row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
@@ -3314,8 +3338,9 @@ pub fn holds_bytes_attestation_envelope(
     attesting_key_id: &str,
     attestation_id: &str,
     asserted_at: chrono::DateTime<chrono::Utc>,
+    size: u64,
 ) -> serde_json::Value {
-    holds_bytes_attestation_row(sha256, attesting_key_id, attestation_id, asserted_at)
+    holds_bytes_attestation_row(sha256, attesting_key_id, attestation_id, asserted_at, size)
         .attestation_envelope
 }
 
@@ -3356,11 +3381,19 @@ pub fn holds_bytes_attestation_envelope(
 /// `weight` (always `None` here) and the instant stamp only on a non-object
 /// envelope (built as an object one line above).
 #[must_use]
+///
+/// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4) — the envelope
+/// carries **`size`**, the blob's byte length, bound into the signed bytes:
+/// CC 5.3.2.5 makes every blob carry its size and every consumer check it
+/// BEFORE hashing; a puller that only holds this claim needs the number
+/// here. Both blob doors pass the length they store and refuse a claim that
+/// declares another (AV-89); the ingest door refuses a claim without one.
 pub fn holds_bytes_attestation_row(
     sha256: &[u8; 32],
     attesting_key_id: &str,
     attestation_id: &str,
     asserted_at: chrono::DateTime<chrono::Utc>,
+    size: u64,
 ) -> crate::federation::Attestation {
     let mut row = crate::federation::Attestation {
         attestation_id: attestation_id.to_owned(),
@@ -3375,6 +3408,7 @@ pub fn holds_bytes_attestation_row(
         attestation_envelope: serde_json::json!({
             "kind": "holds_bytes",
             "evidence_refs": [hex::encode(sha256)],
+            "size": size,
         }),
         original_content_hash: String::new(),
         scrub_signature_classical: String::new(),
@@ -3494,15 +3528,22 @@ pub(crate) fn sealed_put_blob_attestation(
     attestation_id: &str,
     asserted_at: chrono::DateTime<chrono::Utc>,
     scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    size: u64,
 ) -> PutBlobAttestation {
     use sha2::{Digest, Sha256};
-    let envelope =
-        holds_bytes_attestation_envelope(sha256, attesting_key_id, attestation_id, asserted_at);
+    let envelope = holds_bytes_attestation_envelope(
+        sha256,
+        attesting_key_id,
+        attestation_id,
+        asserted_at,
+        size,
+    );
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
         .expect("the holds_bytes envelope canonicalizes");
     PutBlobAttestation {
         attesting_key_id: attesting_key_id.to_owned(),
         attestation_id: attestation_id.to_owned(),
+        size,
         original_content_hash_hex: hex::encode(Sha256::digest(&canonical)),
         scrub_signature_classical: "c2ln".to_owned(),
         scrub_signature_pqc: None,
@@ -3566,7 +3607,15 @@ where
         chrono::Utc::now() + chrono::Duration::days(365),
     );
     let skew_id = format!("blob-skew-{suffix}");
-    let att = sealed_put_blob_attestation(&sha, host, host, &skew_id, far_future, far_future);
+    let att = sealed_put_blob_attestation(
+        &sha,
+        host,
+        host,
+        &skew_id,
+        far_future,
+        far_future,
+        bytes.len() as u64,
+    );
     let err = backend
         .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
         .await
@@ -3586,7 +3635,8 @@ where
     // ── (2) A HASH THAT DOES NOT COVER THE REBUILT ENVELOPE IS REFUSED.
     let liar_id = format!("blob-liar-{suffix}");
     let now = crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-    let mut lying = sealed_put_blob_attestation(&sha, host, host, &liar_id, now, now);
+    let mut lying =
+        sealed_put_blob_attestation(&sha, host, host, &liar_id, now, now, bytes.len() as u64);
     lying.original_content_hash_hex = "00".repeat(32);
     let err = backend
         .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, lying)
@@ -3600,7 +3650,7 @@ where
     // ── (3) CONTROL — an honest claim lands, and so does an honest one about
     //        the PAST, which is the case `asserted_at` was added for.
     let ok_id = format!("blob-ok-{suffix}");
-    let att = sealed_put_blob_attestation(&sha, host, host, &ok_id, now, now);
+    let att = sealed_put_blob_attestation(&sha, host, host, &ok_id, now, now, bytes.len() as u64);
     backend
         .put_blob(&sha, BlobBody::Inline(bytes.clone()), None, att)
         .await
@@ -3610,7 +3660,15 @@ where
         chrono::Utc::now() - chrono::Duration::days(7),
     );
     let past_id = format!("blob-past-{suffix}");
-    let att = sealed_put_blob_attestation(&sha, host, host, &past_id, week_ago, now);
+    let att = sealed_put_blob_attestation(
+        &sha,
+        host,
+        host,
+        &past_id,
+        week_ago,
+        now,
+        bytes.len() as u64,
+    );
     backend
         .put_blob(&sha, BlobBody::Inline(bytes), None, att)
         .await
@@ -4456,7 +4514,13 @@ mod put_blob_binding_tests {
         );
         let scrub_timestamp =
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-        let envelope = holds_bytes_attestation_envelope(&sha, holder, &attestation_id, asserted_at);
+        let envelope = holds_bytes_attestation_envelope(
+            &sha,
+            holder,
+            &attestation_id,
+            asserted_at,
+            payload.len() as u64,
+        );
         let canonical =
             crate::verify::canonical::ceg_produce_canonicalize(&envelope).expect("canonicalize");
         let (och, classical, pqc) =
@@ -4469,11 +4533,12 @@ mod put_blob_binding_tests {
 
         sq.put_blob(
             &sha,
-            crate::federation::BlobBody::Inline(payload),
+            crate::federation::BlobBody::Inline(payload.clone()),
             None,
             PutBlobAttestation {
                 attesting_key_id: holder.to_owned(),
                 attestation_id: attestation_id.clone(),
+                size: payload.len() as u64,
                 original_content_hash_hex: och,
                 scrub_signature_classical: classical,
                 scrub_signature_pqc: pqc,
@@ -4604,17 +4669,24 @@ where
     let attestation_id = uuid::Uuid::new_v4().to_string();
     let asserted_at =
         crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
-    let envelope = holds_bytes_attestation_envelope(&sha, &holder, &attestation_id, asserted_at);
+    let envelope = holds_bytes_attestation_envelope(
+        &sha,
+        &holder,
+        &attestation_id,
+        asserted_at,
+        payload.len() as u64,
+    );
     let (och, classical, pqc) =
         crate::federation::tier_ingest::test_support::sign_envelope(&holder, &envelope);
 
     be.put_blob(
         &sha,
-        BlobBody::Inline(payload),
+        BlobBody::Inline(payload.clone()),
         None,
         PutBlobAttestation {
             attesting_key_id: holder.clone(),
             attestation_id: attestation_id.clone(),
+            size: payload.len() as u64,
             original_content_hash_hex: och,
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
@@ -4678,7 +4750,7 @@ mod tests {
     fn holds_bytes_envelope_shape() {
         let sha = [0x42_u8; 32];
         let at: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
-        let env = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at);
+        let env = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at, 7);
         assert_eq!(env["kind"], "holds_bytes");
         let refs = env["evidence_refs"].as_array().unwrap();
         assert_eq!(refs.len(), 1);
@@ -4721,8 +4793,8 @@ mod tests {
         // signature covers something else.
         assert_eq!(
             env,
-            holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at),
-            "the envelope must be a PURE function of its four inputs"
+            holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at, 7),
+            "the envelope must be a PURE function of its five inputs"
         );
     }
 
@@ -5188,7 +5260,7 @@ mod tests {
 
         let sha = [0x42u8; 32];
         let at: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
-        let envelope = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at);
+        let envelope = holds_bytes_attestation_envelope(&sha, "k-holder", "att-1", at, 7);
 
         // The production canonicalizer's output for this envelope.
         let python_bytes = PythonJsonDumpsCanonicalizer

@@ -13292,12 +13292,25 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // REBUILDS the caller's bytes here rather than storing bytes it was
         // handed, so the builder is what makes "the caller signed the row we
         // are storing" a checkable statement instead of an assumption.
+        // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
+        // the length of the bytes this door stores. Checked BEFORE the rebuild
+        // so the refusal names the size, not a hash: a holder that announces
+        // one length and holds another is refused here, never advertised.
+        if attestation.size != body.size_bytes() {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "holds_bytes claim declares size {} but the stored bytes are {} \
+                 (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                attestation.size,
+                body.size_bytes()
+            )));
+        }
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
             sha256,
             &attestation.attesting_key_id,
             &attestation.attestation_id,
             attestation.asserted_at,
+            attestation.size,
         );
         attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
         attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
@@ -15930,6 +15943,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
             )
         })?;
+        // v45.0.0 (CIRISPersist#871, AV-89) — the announce's declared size must
+        // be the length of the sealed bytes this door stores.
+        if let Some(a) = announce.as_ref() {
+            if a.size != envelope_bytes.len() as u64 {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "holds_bytes claim declares size {} but the adopted bytes are {} \
+                     (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                    a.size,
+                    envelope_bytes.len()
+                )));
+            }
+        }
         // The holder claim is admitted on the same terms as `put_blob`'s.
         let prepared = match announce.as_ref() {
             Some(a) => Some(crate::federation::blobs::prepare_holds_bytes_row(
@@ -35051,6 +35076,7 @@ mod tests {
         sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
+        size: u64,
     ) -> crate::federation::PutBlobAttestation {
         let now = chrono::Utc::now();
         crate::federation::blobs::sealed_put_blob_attestation(
@@ -35060,6 +35086,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            size,
         )
     }
 
@@ -35082,7 +35109,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 Some("application/octet-stream"),
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .expect("put inline");
@@ -35160,7 +35187,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
             )
             .await
             .unwrap();
@@ -35186,9 +35213,9 @@ mod tests {
         let err = backend
             .put_blob(
                 &wrong,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&wrong, &host, &host),
+                pg_blob_attestation(&wrong, &host, &host, bytes.len() as u64),
             )
             .await
             .expect_err("must reject");
@@ -35213,9 +35240,9 @@ mod tests {
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .expect_err("must reject");
@@ -35246,9 +35273,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35276,16 +35303,16 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host_a, &host_a),
+                pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
             )
             .await
             .unwrap();
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host_b, &host_b),
+                pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35315,16 +35342,16 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35353,7 +35380,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host_a, &host_a),
+                pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35366,7 +35393,7 @@ mod tests {
                     media_type: None,
                 }),
                 None,
-                pg_blob_attestation(&sha, &host_b, &host_b),
+                pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38222,6 +38249,7 @@ mod tests {
         attesting_key_id: &str,
         scrub_key_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        size: u64,
     ) -> crate::federation::PutBlobAttestation {
         crate::federation::blobs::sealed_put_blob_attestation(
             sha256,
@@ -38232,6 +38260,7 @@ mod tests {
             // the TTL arms), and as of #652 that is `asserted_at`.
             scrub_timestamp,
             scrub_timestamp,
+            size,
         )
     }
 
@@ -38258,9 +38287,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation_at(&sha, &host, &host, backdated),
+                pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38311,9 +38340,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation_at(&sha, &host, &host, backdated),
+                pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38343,9 +38372,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation_at(&sha, &host, &host, fresh),
+                pg_blob_attestation_at(&sha, &host, &host, fresh, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38372,6 +38401,7 @@ mod tests {
             &host,
             &host,
             chrono::Utc::now() - chrono::Duration::hours(1),
+            bytes.len() as u64,
         );
         let holds_bytes_attestation_id = holds_bytes_attestation.attestation_id.clone();
         backend
@@ -38492,6 +38522,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -38585,6 +38616,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -40636,9 +40668,9 @@ mod tests {
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(huge),
+                BlobBody::Inline(huge.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, huge.len() as u64),
             )
             .await
             .expect_err("trust beats size");
@@ -40668,9 +40700,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40716,7 +40748,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40755,9 +40787,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40788,9 +40820,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40839,7 +40871,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
             )
             .await
             .unwrap();
@@ -41769,9 +41801,9 @@ mod tests {
             backend
                 .put_blob(
                     &sha,
-                    BlobBody::Inline(bytes),
+                    BlobBody::Inline(bytes.clone()),
                     None,
-                    pg_blob_attestation(&sha, &host, &host),
+                    pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
                 )
                 .await
                 .unwrap();

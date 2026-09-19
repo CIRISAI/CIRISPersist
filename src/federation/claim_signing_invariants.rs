@@ -191,6 +191,7 @@ mod tests {
             &key,
             uuid::Uuid::new_v4(),
             chrono::Utc::now(),
+            1,
         )
         .await
         .expect_err("I80: a classical-only producer must not announce");
@@ -215,7 +216,7 @@ mod tests {
         let key = attester.derived_key_id();
         let sha = [0x81u8; 32];
         let (id, now) = (uuid::Uuid::new_v4(), chrono::Utc::now());
-        let err = sign_holds_bytes_claim(&other, &sha, &key, id, now)
+        let err = sign_holds_bytes_claim(&other, &sha, &key, id, now, 1)
             .await
             .expect_err("I81: a foreign LocalSigner must not sign this attester's claim");
         let msg = err.to_string();
@@ -224,7 +225,7 @@ mod tests {
             "I81: the refusal names the mismatch: {msg}"
         );
         // The attester's own LocalSigner signs, hybrid, attributed to itself.
-        let own = sign_holds_bytes_claim(&attester, &sha, &key, id, now)
+        let own = sign_holds_bytes_claim(&attester, &sha, &key, id, now, 1)
             .await
             .expect("I81: the attester signs its own claim");
         assert!(own.scrub_signature_pqc.is_some(), "I81: hybrid");

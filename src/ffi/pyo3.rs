@@ -32835,6 +32835,9 @@ enum PutBlobWireBody {
 struct PutBlobAttestationWire {
     attesting_key_id: String,
     attestation_id: String,
+    /// v45.0.0 (#871) — REQUIRED: the byte length the signer bound into the
+    /// claim. The door refuses a claim whose size is not the length it stores.
+    size: u64,
     original_content_hash_hex: String,
     scrub_signature_classical: String,
     #[serde(default)]
@@ -32925,6 +32928,7 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
     let attestation = crate::federation::PutBlobAttestation {
         attesting_key_id: wire.attestation.attesting_key_id,
         attestation_id: wire.attestation.attestation_id,
+        size: wire.attestation.size,
         original_content_hash_hex: wire.attestation.original_content_hash_hex,
         scrub_signature_classical: wire.attestation.scrub_signature_classical,
         scrub_signature_pqc: wire.attestation.scrub_signature_pqc,
