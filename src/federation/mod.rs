@@ -80,6 +80,10 @@ pub mod consent_scope_invariants;
 pub mod crossing;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod holder_claim_index_invariants;
+// CIRISPersist#871 (`FSD/MEDIA_SOURCE.md`) — I115–I120: the media Source struct, size on the
+// claim, the rendition index.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod media_source_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
