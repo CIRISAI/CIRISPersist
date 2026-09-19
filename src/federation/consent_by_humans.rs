@@ -117,9 +117,35 @@ pub async fn resolve_scoped_consent_by_principals(
     qualifier: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ConsentState, Error> {
-    let mut stances = vec![
+    Ok(resolve_scoped_stance_by_principals(
+        directory,
+        target_key_id,
+        subject_key_id,
+        scope,
+        qualifier,
+        now,
+    )
+    .await?
+    .state)
+}
+
+/// v44.8.0 (CIRISPersist#866 C1b) — [`resolve_scoped_consent_by_principals`]
+/// WITH its bound ([`super::consent::ScopedStance`]): the stance combined by
+/// [`combine_principal_stances`], and `retain_until` the **tightest** window
+/// any principal signed — a human's `retain:30d` for this machine bounds the
+/// machine's own `retain:90d`, never the other way. The one body both doors
+/// run.
+pub async fn resolve_scoped_stance_by_principals(
+    directory: &dyn FederationDirectory,
+    target_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+    qualifier: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<super::consent::ScopedStance, Error> {
+    let mut folded = vec![
         directory
-            .resolve_scoped_consent(target_key_id, subject_key_id, scope, qualifier, now)
+            .resolve_scoped_stance(target_key_id, subject_key_id, scope, qualifier, now)
             .await?,
     ];
     let stewards = super::admission::steward_bindings_of(directory, subject_key_id).await?;
@@ -143,15 +169,16 @@ pub async fn resolve_scoped_consent_by_principals(
                 })
                 .cloned()
                 .collect();
-            stances.push(super::consent::fold_stance(
-                &universe,
-                p,
-                now,
-                Some((scope, qualifier)),
+            folded.push(super::consent::fold_scoped_stance(
+                &universe, p, now, scope, qualifier,
             ));
         }
     }
-    Ok(combine_principal_stances(&stances))
+    let stances: Vec<ConsentState> = folded.iter().map(|s| s.state).collect();
+    Ok(super::consent::ScopedStance {
+        state: combine_principal_stances(&stances),
+        retain_until: folded.iter().filter_map(|s| s.retain_until).min(),
+    })
 }
 
 #[cfg(test)]

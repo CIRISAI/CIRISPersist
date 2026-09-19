@@ -62,7 +62,9 @@ pub(crate) mod bodies {
 
     /// `consent:state:<stance>:v1` by `subject` about `target`, the `scope`
     /// member exactly as given (string, array, or anything else), plus
-    /// `extras` merged into the envelope.
+    /// `extras` merged into the envelope. (Eight arguments on purpose: a
+    /// witness fixture spells every axis it sets.)
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn stance(
         id: &str,
         subject: &str,
@@ -860,10 +862,13 @@ mod run {
             scrub_signature_pqc: None,
         };
         let row_id = sq.attestation_insert_local(local).await.unwrap();
+        // One grant per PEER: the V109 projection keys `(node, peer)`, so a
+        // second grant to the same peer replaces the first and it is no longer
+        // live — the two principles must name different peers to coexist.
         let grant = |principle: &str| {
             let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "dimension": crate::federation::consent_peer_set::DIMENSION,
-                "subject_key_ids": [format!("i108-peer-{run}")],
+                "subject_key_ids": [format!("i108-peer-{principle}-{run}")],
                 "payload": {"grants": "replication", "attestation_prefixes": ["trace:"], "audience": "federation", "principle": principle},
                 "subject_kind": "consent_replication",
             })).unwrap();
@@ -872,7 +877,7 @@ mod run {
                 envelope,
                 cohort_scope::FEDERATION,
             );
-            input.subject_key_ids = vec![format!("i108-peer-{run}")];
+            input.subject_key_ids = vec![format!("i108-peer-{principle}-{run}")];
             input
         };
         engine

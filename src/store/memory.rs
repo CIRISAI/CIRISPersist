@@ -1239,6 +1239,9 @@ impl MemoryBackend {
         // serialize once for the Value-based admission checks.
         let envelope_value = input.attestation_envelope.to_value();
         crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
+        // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
+        // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
+        crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
@@ -3064,6 +3067,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // unknown value is refused HERE instead of being silently demoted
         // to may-drop BestEffort at delivery. Pure predicate, tier 1.
         crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
+        // v44.8.0 (CIRISPersist#866 C1) — a `consent:state:*` row's scope tokens
+        // must parse (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4): never admit
+        // a token the fold cannot match. Pure; same gate at every door.
+        crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
 
         // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries

@@ -1522,6 +1522,28 @@ impl Engine {
         crate::federation::deletion_window::run_deletion_window_watch(&*dir, now).await
     }
 
+    /// v44.8.0 (CIRISPersist#866 C3, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`
+    /// §5.7) — **the consent expiry sweep**: record every lapsed
+    /// `consent:state:granted` (its `expires_at` or its `retain:<window>`
+    /// passed) as a `consent:state:expired` row signed by this node, carrying
+    /// `consent_supersedes` naming the grant and asserted AT the lapse. See
+    /// [`crate::federation::consent_expiry`]. Idempotent; `now` is a parameter
+    /// so a pass can be replayed. Nothing is deleted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn run_consent_expiry_sweep(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::consent_expiry::ConsentExpirySweepReport, crate::federation::Error>
+    {
+        let dir = self.federation_directory();
+        crate::federation::consent_expiry::run_consent_expiry_sweep(
+            &*dir,
+            now,
+            |input| async move { self.emit_attestation_self(input).await },
+        )
+        .await
+    }
+
     /// v24.2.0 (CIRISPersist#564 stage 1) — **is this CEG object load-bearing
     /// on THIS node?**
     ///
@@ -2278,9 +2300,25 @@ impl Engine {
             };
             r.map_err(|e| crate::store::Error::Backend(format!("resolve_consent_state: {e}")))?
         };
+        // v44.8.0 (CIRISPersist#866 C1b) — and the subject's `retain` stance
+        // WITH its bound: a `retain:<window>` that has passed is a withdrawal
+        // the subject signed in advance, and evicts like one.
+        let retain = {
+            self.federation_directory()
+                .resolve_scoped_stance(
+                    target_key_id,
+                    subject_key_id,
+                    crate::federation::types::transmission_principle::RETAIN,
+                    None,
+                    now,
+                )
+                .await
+                .map_err(|e| crate::store::Error::Backend(format!("resolve_scoped_stance: {e}")))?
+        };
         // N5: the FROZEN verify-core verdict decides. Withdrawn/revoked →
         // HardDelete regardless of rarity (revocation overrides rarity).
-        let action = crate::fountain::resolve_retention_action(consent, is_rare);
+        let action =
+            crate::fountain::retention_action_with_retain_window(consent, &retain, now, is_rare);
         if action.is_hard_delete() {
             self.evict_fountain_content_hard_delete(content_id, corpus_kind)
                 .await
@@ -3783,7 +3821,7 @@ impl Engine {
         &self,
     ) -> Result<crate::federation::ConsentSweepReport, crate::federation::Error> {
         let mut report = crate::federation::ConsentSweepReport::default();
-        let (active, prefixes) = self.load_active_egress_grants().await?;
+        let (active, prefixes) = self.load_active_egress_grants(&mut report).await?;
         if active.is_empty() || prefixes.is_empty() {
             return Ok(report);
         }
@@ -3935,6 +3973,7 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn load_active_egress_grants(
         &self,
+        report: &mut crate::federation::ConsentSweepReport,
     ) -> Result<(Vec<ConsentActiveGrant>, Vec<String>), crate::federation::Error> {
         use crate::federation::{consent_grammar, Error, FederationDirectory};
 
@@ -3966,6 +4005,19 @@ impl Engine {
                 }
             };
             if policy.direction != consent_grammar::Direction::Egress {
+                continue;
+            }
+            // v44.8.0 (CIRISPersist#867 C2) — the principle is READ: a grant
+            // that does not authorize transmission covers nothing here, and
+            // the report says so by count, the log by id.
+            if !policy.principle.propagates() {
+                tracing::info!(
+                    attestation_id = %grant.attestation_id,
+                    principle = policy.principle.as_str(),
+                    "consent sweep: live egress grant declined — its principle does not \
+                     authorize propagation (only `share` / `publish` do)"
+                );
+                report.declined_by_principle += 1;
                 continue;
             }
             if !policy.kinds.iter().any(|k| k == "Attestation") {
@@ -7604,6 +7656,30 @@ impl Engine {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::hard_case::ConsentState, crate::federation::Error> {
         crate::federation::consent_by_humans::resolve_scoped_consent_by_principals(
+            self.federation_directory().as_ref(),
+            target_key_id,
+            subject_key_id,
+            scope,
+            qualifier,
+            now,
+        )
+        .await
+    }
+
+    /// v44.8.0 (CIRISPersist#866 C1b) — [`Self::resolve_scoped_consent_by_principals`]
+    /// WITH its bound: `retain_until` is the tightest `retain:<window>` any
+    /// principal signed for this machine. The door a sweep asks before it
+    /// keeps or evicts. See `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.2.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn resolve_scoped_stance_by_principals(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::consent::ScopedStance, crate::federation::Error> {
+        crate::federation::consent_by_humans::resolve_scoped_stance_by_principals(
             self.federation_directory().as_ref(),
             target_key_id,
             subject_key_id,

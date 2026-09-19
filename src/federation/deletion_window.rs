@@ -127,6 +127,12 @@ pub mod kind {
     /// erasure deadline elapsed without proof of deletion.
     /// ([`DeletionWindowStatus::BreachedNotDeleted`](super::DeletionWindowStatus::BreachedNotDeleted))
     pub const DELETION_WINDOW_BREACH: &str = "deletion_window_breach";
+    /// v44.8.0 (CIRISPersist#866 C1b) — a subject's `retain:<window>` grant to
+    /// the producer lapsed with a row about that subject still present and
+    /// un-retracted. The subject's bound, not the producer's promise — its
+    /// own suffix so the two are never conflated. Detail carries
+    /// `basis: "retain_window"`, the subject, and the deadline.
+    pub const RETAIN_WINDOW_BREACH: &str = "retain_window_breach";
     /// The row carries a `deletion_window` that is not an RFC-3339 timestamp
     /// ([`DeletionWindowStatus::MalformedWindow`](super::DeletionWindowStatus::MalformedWindow)).
     /// A producer defect, emitted under its OWN suffix rather than folded into
@@ -169,6 +175,15 @@ pub struct DeletionWindowWatchReport {
     /// Rows whose `deletion_window` does not parse. One
     /// `hard_case:deletion_window_malformed` per condition.
     pub malformed: usize,
+    /// v44.8.0 (CIRISPersist#866 C1b) — **the retain-window breach**: a
+    /// subject named in the row granted its producer `retain:<window>`, the
+    /// window has passed, and the row is still present and un-retracted. One
+    /// `hard_case:retain_window_breach` per (row, subject) condition. Counted
+    /// beside `breaches`, not inside it: a signed `deletion_window` is the
+    /// producer's promise, a `retain:<window>` is the subject's bound, and a
+    /// consumer must be able to tell which one was broken.
+    #[serde(default)]
+    pub retain_window_breaches: usize,
     /// The scan filled its page ([`DELETION_WINDOW_SCAN_CAP`]) — rows beyond it
     /// were NOT examined this pass.
     pub scan_truncated: bool,
@@ -231,6 +246,53 @@ pub fn breach_event(
             "subject_key_ids": row.subject_key_ids,
             "published_at": row.asserted_at.to_rfc3339(),
             "deletion_window": deadline.to_rfc3339(),
+            "observed_at": now.to_rfc3339(),
+        }),
+        emitted_at: now,
+    }
+}
+
+/// Deterministic `event_id` for a [`kind::RETAIN_WINDOW_BREACH`] emission —
+/// one per (row, subject, deadline), so a re-run records nothing new.
+#[must_use]
+pub fn retain_window_breach_event_id(
+    attestation_id: &str,
+    subject_key_id: &str,
+    deadline: DateTime<Utc>,
+) -> String {
+    format!(
+        "hc-{}-{}-{}-{}",
+        kind::RETAIN_WINDOW_BREACH,
+        attestation_id,
+        subject_key_id,
+        deadline.timestamp_millis()
+    )
+}
+
+/// The retain-window breach observation (v44.8.0, #866 C1b): the subject's
+/// `retain:<window>` to this producer ended at `deadline` and the row is
+/// still held. Evidence, never a verdict — see [`breach_event`].
+#[must_use]
+pub fn retain_window_breach_event(
+    row: &Attestation,
+    subject_key_id: &str,
+    deadline: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> HardCaseEvent {
+    HardCaseEvent {
+        event_id: retain_window_breach_event_id(&row.attestation_id, subject_key_id, deadline),
+        kind: kind::RETAIN_WINDOW_BREACH.to_string(),
+        target_key_id: Some(row.attestation_id.clone()),
+        subject_key_id: Some(row.attesting_key_id.clone()),
+        detail: serde_json::json!({
+            "basis": "retain_window",
+            "attestation_id": row.attestation_id,
+            "producer_key_id": row.attesting_key_id,
+            "attested_key_id": row.attested_key_id,
+            "subject_key_id": subject_key_id,
+            "dimension": super::admission::envelope_dimension(&row.attestation_envelope),
+            "published_at": row.asserted_at.to_rfc3339(),
+            "retain_until": deadline.to_rfc3339(),
             "observed_at": now.to_rfc3339(),
         }),
         emitted_at: now,
@@ -314,6 +376,9 @@ pub async fn run_deletion_window_watch(
     /// windowed rows costs ONE `list_attestations_by`, not one per row.
     type RetractionCache = HashMap<String, HashSet<String>>;
     let mut retracted: RetractionCache = HashMap::new();
+    // v44.8.0 (#866 C1b) — (producer, subject) → the end of the subject's
+    // `retain:<window>` to that producer, if any. One fold per pair per pass.
+    let mut retain_until: HashMap<(String, String), Option<DateTime<Utc>>> = HashMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     // v36.0.0 (CIRISPersist#668) — the cursor is the `(position, id)` PAIR,
     // so a page boundary landing inside a group of rows sharing one instant
@@ -342,6 +407,49 @@ pub async fn run_deletion_window_watch(
                 continue;
             }
             report.rows_scanned += 1;
+            let producer = &row.attesting_key_id;
+
+            // v44.8.0 (#866 C1b) — the subject's bound, on the rows the
+            // producer holds ABOUT the subject: a lapsed `retain:<window>` is
+            // an erasure deadline the subject signed, and a row still present
+            // past it is a breach under its own suffix. One fold per
+            // (producer, subject) pair per pass; rows about nobody cost nothing.
+            for subject in &row.subject_key_ids {
+                if subject == producer {
+                    continue;
+                }
+                let key = (producer.clone(), subject.clone());
+                if !retain_until.contains_key(&key) {
+                    let stance = dir
+                        .resolve_scoped_stance(
+                            producer,
+                            subject,
+                            super::types::transmission_principle::RETAIN,
+                            None,
+                            now,
+                        )
+                        .await?;
+                    retain_until.insert(key.clone(), stance.retain_until);
+                }
+                let Some(Some(deadline)) = retain_until.get(&key).copied() else {
+                    continue;
+                };
+                if deadline > now {
+                    continue;
+                }
+                if !retracted.contains_key(producer) {
+                    let ids = producer_retracted_ids(dir, producer).await?;
+                    retracted.insert(producer.clone(), ids);
+                }
+                let still_present = !retracted
+                    .get(producer)
+                    .is_some_and(|ids| ids.contains(&row.attestation_id));
+                if still_present {
+                    dir.record_hard_case(retain_window_breach_event(row, subject, deadline, now))
+                        .await?;
+                    report.retain_window_breaches += 1;
+                }
+            }
 
             // `NoWindow` — the lifecycle rule does not apply. Checked with the
             // module's OWN parser (never a re-derived one) and BEFORE any
@@ -353,7 +461,6 @@ pub async fn run_deletion_window_watch(
 
             // Proof of deletion: the producer's own structural retraction.
             // Resolved per producer and cached for the pass.
-            let producer = &row.attesting_key_id;
             if !retracted.contains_key(producer) {
                 let ids = producer_retracted_ids(dir, producer).await?;
                 retracted.insert(producer.clone(), ids);
@@ -837,6 +944,7 @@ pub(crate) mod watch_witness {
                     deleted_in_time: 1,
                     breaches: 1,
                     malformed: 1,
+                    retain_window_breaches: 0,
                     scan_truncated: false,
                 },
                 "the pass reports exactly what it saw"

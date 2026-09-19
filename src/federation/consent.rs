@@ -433,24 +433,122 @@ pub fn envelope_names_scope(a: &super::Attestation, scope: &str) -> bool {
 /// qualifier check applies only to scope-naming rows: a blanket revoke has no
 /// `content_class` to match and closes all classes by construction.
 pub fn matches_scoped_query(a: &super::Attestation, scope: &str, qualifier: Option<&str>) -> bool {
+    covering_token(a, scope, qualifier).is_some()
+}
+
+/// v44.8.0 (CIRISPersist#866, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.3) —
+/// the token of `a` that covers the query `(scope, qualifier)`, if any: the
+/// body of [`matches_scoped_query`], returning WHICH token matched so the
+/// resolver can read its bound ([`super::consent_scope::retain_until`]).
+///
+/// Tokens are parsed by [`super::consent_scope::parse_scope_token`] and
+/// compared by [`super::consent_scope::covers`] — the one covering rule,
+/// per kind (`share:cohort:<x>` narrows, `retain:<window>` bounds, other
+/// kinds narrow hierarchically). A stored token that does not parse (a row
+/// from before the door refused them) covers nothing: it is unrelated, as an
+/// unrecognised scope always was. A query that does not parse is covered by
+/// nothing but a blanket non-grant, which covers *every* query.
+///
+/// The asymmetry is unchanged (v16.1.1): a scope-naming row must cover the
+/// query and, when a qualifier is given, match `content_class`; a NON-grant
+/// naming no genuine scope is BLANKET; a grant naming no genuine scope covers
+/// nothing.
+pub fn covering_token(
+    a: &super::Attestation,
+    scope: &str,
+    qualifier: Option<&str>,
+) -> Option<super::consent_scope::ScopeToken> {
     let named = named_scopes(a);
-    if named.contains(&scope) {
-        return match qualifier {
-            Some(q) => a
-                .attestation_envelope
-                .get("content_class")
-                .and_then(|v| v.as_str())
-                .is_some_and(|c| c == q),
-            None => true,
-        };
+    if named.is_empty() {
+        // Names no genuine scope: BLANKET for every non-grant stance; a grant
+        // matches nothing (the only stance that fails open must be exact).
+        let is_grant = envelope_dimension(a)
+            .is_some_and(|d| d.starts_with(consent_dimension::STATE_GRANTED_PREFIX));
+        return (!is_grant).then(|| super::consent_scope::ScopeToken {
+            kind: scope.to_owned(),
+            sub: super::consent_scope::SubScope::Whole,
+        });
     }
-    if !named.is_empty() {
-        // Genuinely names OTHER scope(s) → unrelated, never blanket.
+    let query = super::consent_scope::parse_scope_token(scope).ok()?;
+    let token = named
+        .iter()
+        .filter_map(|s| super::consent_scope::parse_scope_token(s).ok())
+        .find(|g| super::consent_scope::covers(g, &query))?;
+    match qualifier {
+        Some(q) => a
+            .attestation_envelope
+            .get("content_class")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| c == q)
+            .then_some(token),
+        None => Some(token),
+    }
+}
+
+/// v44.8.0 (CIRISPersist#866 C1b) — what a scoped resolution returns: the
+/// stance, and — when the covering grant is a `retain:<window>` — the instant
+/// the window ends. `retain_until` is a lifecycle fact for the sweeps
+/// (`fountain` eviction, the deletion-window watch); it never changes what
+/// covers what. Past the window the stance is `Expired`: a bound the subject
+/// signed in advance has the force of a lapse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScopedStance {
+    /// The resolved stance for the query.
+    pub state: super::hard_case::ConsentState,
+    /// The end of the covering `retain:<window>`, if the winning row named
+    /// one. `None` when no window bounds this stance.
+    pub retain_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// v44.8.0 (CIRISPersist#866 C3) — the instant a grant lapses on its own
+/// terms: the earlier of its signed `expires_at` and the end of any
+/// `retain:<window>` its scope names. `None` for a grant that never lapses.
+/// One spelling, read by the expiry sweep (which records the lapse) and by
+/// the fold (which admits the record through its edge).
+#[must_use]
+pub fn grant_lapse_instant(a: &super::Attestation) -> Option<chrono::DateTime<chrono::Utc>> {
+    let window_end = named_scopes(a)
+        .iter()
+        .filter_map(|s| super::consent_scope::parse_scope_token(s).ok())
+        .filter_map(|t| super::consent_scope::retain_until(&t, a.asserted_at))
+        .min();
+    match (a.expires_at, window_end) {
+        (Some(e), Some(w)) => Some(e.min(w)),
+        (Some(e), None) => Some(e),
+        (None, w) => w,
+    }
+}
+
+/// v44.8.0 (CIRISPersist#866 C3) — is `a` a substrate-emitted
+/// `consent:state:expired` row bound to a grant `subject` authored, in
+/// `rows`, that had lapsed by the time `a` was asserted? CC 3.3.1 makes
+/// `expired` the one `consent:state:` leaf the substrate emits, so the fold
+/// admits it into a subject's universe — but only through a RESOLVED edge
+/// (`consent_supersedes` naming the grant) to a grant of the subject's own,
+/// asserted at or after that grant's own lapse instant. Without the edge, or
+/// naming someone else's grant, or asserted before the lapse, it is a stranger
+/// row and changes nothing: no node can expire a consent early, or someone
+/// else's, by emitting a row.
+fn substrate_expiry_bound_to_subject(
+    a: &super::Attestation,
+    rows: &[super::Attestation],
+    subject_key_id: &str,
+) -> bool {
+    if !envelope_dimension(a)
+        .is_some_and(|d| d.starts_with(consent_dimension::STATE_EXPIRED_PREFIX))
+    {
         return false;
     }
-    // Names no genuine scope: BLANKET for every non-grant stance; a grant
-    // matches nothing (the only stance that fails open must be exact).
-    !envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:granted"))
+    let ConsentCausalEdge::Names(grant_id) = causal_edge(a) else {
+        return false;
+    };
+    rows.iter().any(|g| {
+        g.attestation_id == grant_id
+            && g.attesting_key_id == subject_key_id
+            && envelope_dimension(g)
+                .is_some_and(|d| d.starts_with(consent_dimension::STATE_GRANTED_PREFIX))
+            && grant_lapse_instant(g).is_some_and(|lapse| lapse <= a.asserted_at)
+    })
 }
 
 /// v36.0.0 (CIRISPersist#642) — **THE consent fold**, single-sourced.
@@ -519,15 +617,68 @@ pub fn fold_stance(
     now: chrono::DateTime<chrono::Utc>,
     scoped: Option<(&str, Option<&str>)>,
 ) -> super::hard_case::ConsentState {
+    match scoped {
+        Some((scope, qualifier)) => {
+            fold_scoped_stance(rows, subject_key_id, now, scope, qualifier).state
+        }
+        None => fold_winner(rows, subject_key_id, now, None).0,
+    }
+}
+
+/// v44.8.0 (CIRISPersist#866 C1b) — the scoped fold WITH its bound: the same
+/// body as [`fold_stance`], returning the winning row's `retain:<window>` end
+/// when it named one. Past that instant the stance reads `Expired` — the
+/// subject signed the lapse in advance, and a window that has passed must not
+/// read as a live grant to the sweep that asks.
+#[must_use]
+pub fn fold_scoped_stance(
+    rows: &[super::Attestation],
+    subject_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    scope: &str,
+    qualifier: Option<&str>,
+) -> ScopedStance {
+    let (state, winner) = fold_winner(rows, subject_key_id, now, Some((scope, qualifier)));
+    let retain_until = winner
+        .and_then(|w| covering_token(w, scope, qualifier).map(|t| (w, t)))
+        .and_then(|(w, t)| super::consent_scope::retain_until(&t, w.asserted_at));
+    let state = match retain_until {
+        Some(until) if state == super::hard_case::ConsentState::Granted && until <= now => {
+            super::hard_case::ConsentState::Expired
+        }
+        _ => state,
+    };
+    ScopedStance {
+        state,
+        retain_until,
+    }
+}
+
+/// The fold proper: the stance, and the row that decided it (`None` when
+/// no candidate remained — `Unspecified`).
+fn fold_winner<'a>(
+    rows: &'a [super::Attestation],
+    subject_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    scoped: Option<(&str, Option<&str>)>,
+) -> (
+    super::hard_case::ConsentState,
+    Option<&'a super::Attestation>,
+) {
     use std::collections::HashSet;
 
     // (1) the universe — the subject's own consent statements about this
-    // target, pre-expiry and pre-scope (see the doc: an edge resolves here).
+    // target, pre-expiry and pre-scope (see the doc: an edge resolves here),
+    // plus the substrate's expiry records bound to those statements by a
+    // resolved edge (`substrate_expiry_bound_to_subject`, v44.8.0 #866 C3).
     let universe: Vec<&super::Attestation> = rows
         .iter()
-        .filter(|a| a.attesting_key_id == subject_key_id)
         .filter(|a| {
             envelope_dimension(a).is_some_and(|d| d.starts_with(consent_dimension::STATE_PREFIX))
+        })
+        .filter(|a| {
+            a.attesting_key_id == subject_key_id
+                || substrate_expiry_bound_to_subject(a, rows, subject_key_id)
         })
         .collect();
     let known: HashSet<&str> = universe.iter().map(|a| a.attestation_id.as_str()).collect();
@@ -547,12 +698,11 @@ pub fn fold_stance(
 
     // (3a) THE CLOCK FOLD — v31.0.0 verbatim, and the floor the causal plane
     // may only tighten.
-    let by_clock = stance(
-        candidates
-            .iter()
-            .copied()
-            .max_by_key(|a| fold_ordering_key(a)),
-    );
+    let clock_winner = candidates
+        .iter()
+        .copied()
+        .max_by_key(|a| fold_ordering_key(a));
+    let by_clock = stance(clock_winner);
 
     // (3b) THE CAUSAL FOLD. `eliminated` is the union of the two ways a
     // statement can be causally dead: named by another candidate's consent
@@ -566,19 +716,18 @@ pub fn fold_stance(
             eliminated.insert(target);
         }
     }
-    let by_causality = stance(
-        candidates
-            .iter()
-            .copied()
-            .filter(|a| !eliminated.contains(a.attestation_id.as_str()))
-            .max_by_key(|a| causal_fold_ordering_key(a, &known)),
-    );
+    let causal_winner = candidates
+        .iter()
+        .copied()
+        .filter(|a| !eliminated.contains(a.attestation_id.as_str()))
+        .max_by_key(|a| causal_fold_ordering_key(a, &known));
+    let by_causality = stance(causal_winner);
 
     // (4) THE RATCHET.
     if restriction_rank(by_causality) > restriction_rank(by_clock) {
-        by_causality
+        (by_causality, causal_winner)
     } else {
-        by_clock
+        (by_clock, clock_winner)
     }
 }
 

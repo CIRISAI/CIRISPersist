@@ -66,7 +66,8 @@ pub use decay::{
 };
 pub use eviction::FountainTier;
 pub use retention::{
-    holding_claim_counts, map_consent_state, resolve_retention_action, RetentionAction,
+    holding_claim_counts, map_consent_state, resolve_retention_action,
+    retention_action_with_retain_window, RetentionAction,
 };
 pub use types::{
     cohort_scope_from_envelope, FountainContent, FountainHeldMeta, FountainManifestV1,

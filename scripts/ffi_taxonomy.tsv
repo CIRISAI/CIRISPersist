@@ -539,6 +539,7 @@ Engine	resolve_key_statement_standing_json	deontic
 Engine	resolve_mesh_config_json	deontic	
 Engine	resolve_quarantine_json	deontic	
 Engine	resolve_reverse_quorum_json	deontic	
+Engine	resolve_scoped_stance_by_principals	deontic	
 Engine	resolve_scores	axiotic	
 Engine	resolve_transit_eligibility_json	deontic	
 Engine	respond_classical_kex_b64	ontological	
@@ -547,6 +548,7 @@ Engine	revocations_for	empirical
 Engine	revoke_delegation	deontic	
 Engine	revoke_trust_grant	deontic	
 Engine	root_binding	ontological	
+Engine	run_consent_expiry_sweep_json	procedural	
 Engine	run_deletion_window_watch_json	procedural	
 Engine	run_legacy_graph_migration	procedural	
 Engine	run_pqc_sweep	procedural	

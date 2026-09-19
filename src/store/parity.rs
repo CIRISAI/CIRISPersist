@@ -186,6 +186,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v44.6.0 (#857) — a machine author may name only itself in for_key_id;
     // refuses on the caller's input.
     ("check_consent_for_key_admission", Class::Gate),
+    // v44.8.0 (#866 C1) — the scope-token grammar gate: a `consent:state:*`
+    // envelope whose `scope` names a token the fold cannot match is refused.
+    ("check_consent_scope_tokens", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
     ("check_encryption_pubkeys", Class::Gate),
