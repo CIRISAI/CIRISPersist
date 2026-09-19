@@ -32378,6 +32378,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v44.8.0 (CIRISPersist#866 C1) — a malformed consent scope token is
         // caller-fault malformed content; ValueError (4xx), the kind names it.
         crate::federation::Error::ConsentScopeTokenInvalid { .. } => PyValueError::new_err(kind),
+        // v45.0.0 (CIRISPersist#871) — a malformed media Source struct, or a
+        // `holds_bytes` claim without a size, is caller-fault malformed
+        // content; ValueError (4xx), the kind names it.
+        crate::federation::Error::MediaSourceInvalid { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
