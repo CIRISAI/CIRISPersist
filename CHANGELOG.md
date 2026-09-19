@@ -5,6 +5,36 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [44.8.1] - 2026-09-19
+
+### Fixed — a holder claim was advertised but unfetchable (CIRISPersist#870)
+- **`put_blob_with_scope` and `adopt_sealed_blob_at` now index the
+  `holds_bytes` claim they write**, on sqlite and postgres, exactly as
+  `put_attestation` indexes every federation-tier row (`index_holder_claim`
+  → `index_stored_record("Attestation", …)`, after the transaction commits,
+  the pooled client released first). Before this, the claim was INSERTed
+  inside the door's own transaction and never entered `signed_wire_index`
+  until the holder's next restart rebuilt it: the summary advertised the row
+  (it reads `list_attestations_since`), the packer could not resolve the
+  want (it reads the index), so no peer ever learned a holder and every
+  blob-backed body read `not_fetched` across nodes — measured on the
+  three-node chat ladder, 27 of 28 attestations indexed, the one missing
+  being the holder claim. #610's rule, the index moves WITH the row, held at
+  every door but the two that write a claim.
+- Witnesses (`federation::holder_claim_index_invariants`), sqlite and
+  postgres (the memory backend has no `BlobStorage`): I113 the put door's
+  claim is on the wire-hash plane and resolvable by the point read the
+  moment it is written; I113b the same for the adopt door's re-announcement
+  at the CommunityDek shape; **I113c the production path on two backends —
+  A writes a community blob as `Engine::put_blob_scoped` does, B learns the
+  holder ONLY through A's advertised hashes and point reads, and B's
+  `list_holders` names A** (this is the row-for-row reproduction of the
+  ladder, red before the fix); I114 from disk: every
+  `INSERT INTO federation_attestations` outside `put_attestation` runs the
+  index hook, or is a named local-tier writer — the class "a second write
+  door for the same table without the first door's post-write" reds the
+  build on its next instance.
+
 ## [44.8.0] - 2026-09-18
 
 ### Added — the consent scope grammar, and the lifecycle it was missing (CIRISPersist#866, #867, `FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md`)

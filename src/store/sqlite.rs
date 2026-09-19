@@ -2842,6 +2842,31 @@ impl SqliteBackend {
     /// content-hash index is stale for this row, the self-healing point read
     /// and `rebuild_signed_wire_index` are the repair paths, and the error is
     /// logged at ERROR so an operator can see it rather than swallowed silently.
+    /// v44.8.1 (CIRISPersist#870) — index a `holds_bytes` claim a blob door
+    /// just wrote, exactly as `put_attestation` indexes every federation-tier
+    /// row: the `Attestation` kind, keyed by `attestation_id`. A claim at any
+    /// other tier (there is none today) is not on the wire and is skipped,
+    /// mirroring `put_attestation`'s `tier == FEDERATION` guard. Maps the
+    /// directory error into the blob door's error type so both doors read the
+    /// same one-liner.
+    async fn index_holder_claim(
+        &self,
+        attestation_id: &str,
+        tier: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        if tier != crate::federation::types::attestation_tier::FEDERATION {
+            return Ok(());
+        }
+        let key = crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
+        self.index_stored_record("Attestation", &key)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "holds_bytes claim {attestation_id}: signed_wire_index: {e}"
+                ))
+            })
+    }
+
     async fn index_stored_record(
         &self,
         kind: &str,
@@ -12732,6 +12757,11 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // replicates.
         let cohort_scope_owned = attestation_row.cohort_scope.clone();
         let attestation_id_owned = attestation.attestation_id.clone();
+        // #870 — kept OUTSIDE the write closure for the post-write index hook.
+        let claim_to_index = (
+            attestation.attestation_id.clone(),
+            attestation_row.tier.clone(),
+        );
         let attesting_key_id_owned = attestation.attesting_key_id.clone();
         // §20.5 (PR #852 review) — the ROW's author is the supplied one (a
         // proxy write's peer); absent that, the claim's attester, which for a
@@ -12868,6 +12898,17 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 crate::federation::BlobError::Backend(format!("put_blob tx: {msg}"))
             }
         })?;
+        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
+        // holder claim just written is a federation-tier attestation like every
+        // one `put_attestation` writes, and gets its `signed_wire_index` entry
+        // now — not at the next boot's rebuild. Without it the claim was
+        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
+        // resolves a want through the index), so no peer ever learned a holder
+        // and every blob-backed body read `not_fetched`. Same hook, same
+        // posture as `put_attestation`: the primary write is durable; an index
+        // failure is logged loudly by the hook and repaired by the rebuild.
+        self.index_holder_claim(&claim_to_index.0, &claim_to_index.1)
+            .await?;
 
         Ok(())
     }
@@ -15136,6 +15177,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
             )?),
             None => None,
         };
+        // #870 — kept OUTSIDE the write closure for the post-write index hook.
+        let claim_to_index = prepared
+            .as_ref()
+            .map(|p| (p.row.attestation_id.clone(), p.row.tier.clone()));
         let sha_vec = sha256.to_vec();
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
@@ -15233,6 +15278,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at tx: {msg}"))
             }
         })?;
+        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
+        // holder claim just written is a federation-tier attestation like every
+        // one `put_attestation` writes, and gets its `signed_wire_index` entry
+        // now — not at the next boot's rebuild. Without it the claim was
+        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
+        // resolves a want through the index), so no peer ever learned a holder
+        // and every blob-backed body read `not_fetched`. Same hook, same
+        // posture as `put_attestation`: the primary write is durable; an index
+        // failure is logged loudly by the hook and repaired by the rebuild.
+        if let Some((id, tier)) = &claim_to_index {
+            self.index_holder_claim(id, tier).await?;
+        }
         Ok(sha256)
     }
 

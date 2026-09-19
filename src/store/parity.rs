@@ -281,6 +281,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("get_attestation", Class::Delegates),
     ("get_client", Class::Delegates),
     ("get_mut", Class::Plumbing),
+    // v44.8.1 (#870) — the blob doors' post-write index hook for the holder
+    // claim; same-file helper over `index_stored_record`, followed like it.
+    ("index_holder_claim", Class::Delegates),
     ("index_stored_key_row", Class::Delegates),
     ("index_stored_record", Class::Delegates),
     ("insert_trace_events_batch", Class::Delegates),

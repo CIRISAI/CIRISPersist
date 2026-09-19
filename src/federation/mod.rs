@@ -76,7 +76,10 @@ pub mod consent_expiry;
 // token grammar, the retain bound, the transfer principle, the expiry record.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod consent_scope_invariants;
+// CIRISPersist#870 — I113/I113b/I114: a holder claim's wire-index entry moves with the row.
 pub mod crossing;
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod holder_claim_index_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
