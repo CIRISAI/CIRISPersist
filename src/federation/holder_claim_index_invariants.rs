@@ -64,7 +64,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         assert!(
-            advertised.iter().any(|h| *h == hash),
+            advertised.contains(&hash),
             "{tag}: the claim's hash is on the wire-hash plane the moment it is written (#870): \
              {hash} not among {} advertised",
             advertised.len()
@@ -348,12 +348,32 @@ mod run {
                     .unwrap_or(prod.len());
                 let body = &prod[fn_start.0..body_end];
                 sites_seen += 1;
+                // The hook itself, or the one-line helper both blob doors
+                // share (`index_holder_claim`, pinned below to BE the hook).
                 let indexed = body.contains("index_stored_record(\"Attestation\"")
-                    || body.contains("index_stored_record(\n") && body.contains("\"Attestation\",");
+                    || body.contains("index_holder_claim(");
                 if !indexed && !LOCAL_TIER_WRITERS.contains(&name) {
                     offenders.push(format!("{rel}: `{name}` inserts a federation_attestations row and never indexes it"));
                 }
             }
+        }
+        // The helper is the hook: its body reaches `index_stored_record("Attestation"`.
+        for (rel, text) in [
+            ("src/store/sqlite.rs", include_str!("../store/sqlite.rs")),
+            (
+                "src/store/postgres.rs",
+                include_str!("../store/postgres.rs"),
+            ),
+        ] {
+            let helper = text
+                .split("async fn index_holder_claim(")
+                .nth(1)
+                .unwrap_or_else(|| panic!("I114: {rel} has the index_holder_claim helper"));
+            let helper = &helper[..helper.find("\n    }\n").expect("helper end")];
+            assert!(
+                helper.contains("index_stored_record(\"Attestation\""),
+                "I114: {rel}'s index_holder_claim is the Attestation index hook, not a stand-in"
+            );
         }
         assert!(
             sites_seen >= 8,

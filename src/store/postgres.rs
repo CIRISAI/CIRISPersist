@@ -1047,6 +1047,27 @@ impl PostgresBackend {
     /// index is stale for this row, the self-healing point read and
     /// `rebuild_signed_wire_index` are the repair paths, and the error is
     /// logged at ERROR rather than swallowed silently.
+    /// v44.8.1 (CIRISPersist#870) — see the sqlite twin: index a `holds_bytes`
+    /// claim a blob door just wrote, as `put_attestation` indexes every
+    /// federation-tier row.
+    async fn index_holder_claim(
+        &self,
+        attestation_id: &str,
+        tier: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        if tier != crate::federation::types::attestation_tier::FEDERATION {
+            return Ok(());
+        }
+        let key = crate::federation::wire_index::record_key(&[("attestation_id", attestation_id)]);
+        self.index_stored_record("Attestation", &key)
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "holds_bytes claim {attestation_id}: signed_wire_index: {e}"
+                ))
+            })
+    }
+
     async fn index_stored_record(
         &self,
         kind: &str,
@@ -13489,6 +13510,20 @@ impl crate::federation::BlobStorage for PostgresBackend {
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("commit blob+attestation: {e}"))
         })?;
+        // The pooled client is RELEASED before the index reload takes its own
+        // — holding one while acquiring another is how a small pool deadlocks.
+        drop(client);
+        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
+        // holder claim just written is a federation-tier attestation like every
+        // one `put_attestation` writes, and gets its `signed_wire_index` entry
+        // now — not at the next boot's rebuild. Without it the claim was
+        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
+        // resolves a want through the index), so no peer ever learned a holder
+        // and every blob-backed body read `not_fetched`. Same hook, same
+        // posture as `put_attestation`: the primary write is durable; an index
+        // failure is logged loudly by the hook and repaired by the rebuild.
+        self.index_holder_claim(&attestation.attestation_id, &attestation_row.tier)
+            .await?;
 
         Ok(())
     }
@@ -16019,6 +16054,20 @@ impl crate::federation::BlobStorage for PostgresBackend {
         tx.commit().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("adopt_sealed_blob_at commit: {e}"))
         })?;
+        drop(client);
+        // v44.8.1 (CIRISPersist#870) — the index moves WITH the row (#610). The
+        // holder claim just written is a federation-tier attestation like every
+        // one `put_attestation` writes, and gets its `signed_wire_index` entry
+        // now — not at the next boot's rebuild. Without it the claim was
+        // ADVERTISED (the summary reads the row) and UNFETCHABLE (the packer
+        // resolves a want through the index), so no peer ever learned a holder
+        // and every blob-backed body read `not_fetched`. Same hook, same
+        // posture as `put_attestation`: the primary write is durable; an index
+        // failure is logged loudly by the hook and repaired by the rebuild.
+        if let Some(p) = &prepared {
+            self.index_holder_claim(&p.row.attestation_id, &p.row.tier)
+                .await?;
+        }
         Ok(sha256)
     }
 
