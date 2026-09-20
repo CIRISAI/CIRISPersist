@@ -5069,6 +5069,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule: a rendition (`media.derived_from`) whose original THIS node
+        // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
+        // reads the blob store, so it sits with the other state-reading gates.
+        // Backend-symmetric; memory holds no blobs and answers "not held".
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &row.attestation_envelope,
+            &row.cohort_scope,
+        )
+        .await?;
 
         // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
         // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
@@ -5254,6 +5265,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // projection (grant upsert / withdraws-revocation fold) in the
             // SAME locked scope as the insert above.
             sqlite_project_consent_peer_set(conn, &row)?;
+            // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+            // `blob_renditions` projection in the SAME locked scope.
+            sqlite_project_rendition_row(conn, &row)?;
             Ok(true)
         }).await
         .map_err(|e| {
@@ -12698,6 +12712,20 @@ fn parse_ledger_instant(t: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|n| n.and_utc())
 }
 
+/// v45.0.0 (CIRISPersist#871, FSD §5) — what the placement gate asks: the
+/// cohort this node holds a blob under, from the blob row the write NAMED.
+impl crate::federation::renditions::HeldBlobScope for SqliteBackend {
+    async fn held_blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::BlobStorage as _;
+        self.blob_cohort_scope(sha256)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("held blob cohort_scope: {e}")))
+    }
+}
+
 impl crate::federation::BlobStorage for SqliteBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -18563,6 +18591,17 @@ impl SqliteBackend {
                 .unwrap_or(&input.attesting_key_id),
         )
         .await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule at the local door: a rendition (`media.derived_from`) whose
+        // original THIS node holds must name the original's own
+        // `cohort_scope`. Reads the blob store, so it sits with the other
+        // directory-reading gates, before the write. Backend-symmetric.
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &envelope_value,
+            &input.cohort_scope,
+        )
+        .await?;
 
         // FK precondition + §7.0.1 emitter gate: the attesting key must
         // exist; its identity_type gates the dimension. Mirrors
@@ -18670,6 +18709,16 @@ impl SqliteBackend {
                 // (occurrence, dimension). History is carried by the
                 // `supersedes` composer, not by retaining stale current
                 // state (CIRISAgent review).
+                // v45.0.0 (#871) — a replaced row's rendition leaves the V149
+                // index with it (no FK: the index is keyed by the rendition's
+                // digest, the row by its id).
+                tx.execute(
+                    "DELETE FROM blob_renditions WHERE source_attestation_id IN (\
+                        SELECT attestation_id FROM federation_attestations \
+                         WHERE attesting_key_id = ?1 AND tier = 'local' \
+                           AND json_extract(attestation_envelope, '$.dimension') = ?2)",
+                    rusqlite::params![attesting_key_id, dimension],
+                )?;
                 tx.execute(
                     "DELETE FROM federation_attestations \
                       WHERE attesting_key_id = ?1 AND tier = 'local' \
@@ -18734,6 +18783,9 @@ impl SqliteBackend {
                 &row,
                 crate::federation::types::attestation_tier::LOCAL,
             )?;
+            // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+            // projection at the local door, in the same transaction.
+            sqlite_project_rendition_row(&tx, &row)?;
             tx.commit()?;
             Ok(())
         })

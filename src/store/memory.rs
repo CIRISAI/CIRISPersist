@@ -1326,6 +1326,17 @@ impl MemoryBackend {
                 .unwrap_or(&input.attesting_key_id),
         )
         .await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule at the local door: a rendition (`media.derived_from`) whose
+        // original THIS node holds must name the original's own
+        // `cohort_scope`. Reads the blob store, so it sits with the other
+        // directory-reading gates, before the write. Backend-symmetric.
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &envelope_value,
+            &input.cohort_scope,
+        )
+        .await?;
 
         let mut state = self.state.lock().expect("memory backend lock");
         let identity_type = match state.federation_keys.get(&input.attesting_key_id) {
@@ -1432,15 +1443,31 @@ impl MemoryBackend {
         }
 
         if replace {
-            state.federation_attestations.retain(|a| {
-                !(a.attesting_key_id == attesting_key_id
-                    && a.tier == crate::federation::types::attestation_tier::LOCAL
-                    && a.attestation_envelope
-                        .get("dimension")
-                        .and_then(|v| v.as_str())
-                        == Some(dimension.as_str()))
-            });
+            let replaced: Vec<String> = state
+                .federation_attestations
+                .iter()
+                .filter(|a| {
+                    a.attesting_key_id == attesting_key_id
+                        && a.tier == crate::federation::types::attestation_tier::LOCAL
+                        && a.attestation_envelope
+                            .get("dimension")
+                            .and_then(|v| v.as_str())
+                            == Some(dimension.as_str())
+                })
+                .map(|a| a.attestation_id.clone())
+                .collect();
+            state
+                .federation_attestations
+                .retain(|a| !replaced.contains(&a.attestation_id));
+            // v45.0.0 (#871) — a replaced row's rendition leaves the V149
+            // mirror with it.
+            state
+                .blob_renditions
+                .retain(|r| !replaced.contains(&r.source_attestation_id));
         }
+        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+        // mirror at the local door, under the same lock as the push below.
+        project_rendition_row(&mut state, &row);
         // v17.4.0 (V106) — maintain the subject-index mirror at local tier.
         for subj in &row.subject_key_ids {
             state
@@ -2479,6 +2506,20 @@ fn mem_scores_row_matches(
     }
     // §4.3 scope gate (target = attested_key_id, mirroring the SQL).
     scope.admits(&r.cohort_scope, &r.attested_key_id)
+}
+
+/// v45.0.0 (CIRISPersist#871, FSD §5) — the memory backend has no blob
+/// storage (the trait is sqlite/postgres-only, see the scope-blob note
+/// above), so it holds no original and the placement rule is always the
+/// node's here. Answering `None` is the truth, not a bypass: the gate runs by
+/// the same name at the same door on all three backends.
+impl crate::federation::renditions::HeldBlobScope for MemoryBackend {
+    async fn held_blob_cohort_scope(
+        &self,
+        _sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::Error> {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -3531,6 +3572,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule: a rendition (`media.derived_from`) whose original THIS node
+        // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
+        // reads the blob store, so it sits with the other state-reading gates.
+        // Backend-symmetric; memory holds no blobs and answers "not held".
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &row.attestation_envelope,
+            &row.cohort_scope,
+        )
+        .await?;
 
         // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
         // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
@@ -3733,6 +3785,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     });
                 }
             }
+            // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+            // `blob_renditions` mirror under the same lock, before `row` moves.
+            project_rendition_row(&mut state, &row);
             // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-
             // tier only, the E5 invariant). `Attestation` IS its own signed
             // wrapper (inline scrub signature). Computed before the push

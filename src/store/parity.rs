@@ -193,6 +193,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // claim's required size: a malformed descriptor is refused by member.
     ("check_media_source", Class::Gate),
     ("check_holder_claim_size", Class::Gate),
+    // v45.0.0 (#871, FSD §5) — the placement rule: a rendition whose
+    // original THIS node holds must name the original's `cohort_scope`.
+    // One name at the six write doors on all three backends (memory's
+    // `HeldBlobScope` answers "not held": it has no blob store).
+    ("check_rendition_placement", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
     ("check_encryption_pubkeys", Class::Gate),
@@ -424,6 +429,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_load_stream_chunk_hashes", Class::Delegates),
     ("pg_project_attestation_subjects", Class::Delegates),
     ("pg_project_consent_peer_set", Class::Delegates),
+    // v45.0.0 (#871) — the V149 `blob_renditions` projection helpers, one
+    // per backend; each runs no gate of its own (the fold reads only what
+    // the door already admitted).
+    ("pg_project_rendition_row", Class::Delegates),
     // #838 — row mapping for `stream_chunks` / `stream_chunk_at`: decodes a
     // stream index row joined to its chunk row. It fails only on a corrupt
     // row (a sha that is not 32 bytes, a tier string the enum does not
@@ -534,6 +543,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_next_plane_position", Class::Plumbing),
     ("sqlite_project_attestation_subjects", Class::Delegates),
     ("sqlite_project_consent_peer_set", Class::Delegates),
+    ("sqlite_project_rendition_row", Class::Delegates),
     // #838 — the sqlite twin of `pg_stream_chunk_ref`: row mapping.
     ("sqlite_stream_chunk_ref", Class::Plumbing),
     // v36.0.0 (CIRISPersist#668) — newly VISIBLE for the whole cursor

@@ -220,14 +220,10 @@ impl From<MediaSourceError> for super::Error {
 
 /// One sized holder, as the sized holder read returns it: WHO claims to hold
 /// the bytes and HOW MANY bytes the claim says. A puller compares `size`
-/// against the author's descriptor before fetching (AV-89).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HolderClaim {
-    /// The holder's key id — the `attesting_key_id` of its `holds_bytes` row.
-    pub key_id: String,
-    /// The byte length the holder's signed claim declares.
-    pub size: u64,
-}
+/// against the author's descriptor before fetching (AV-89). ONE definition,
+/// beside the index it is read from (`renditions`); re-exported here because
+/// this module is where the claim's `size` rule lives.
+pub use super::renditions::HolderClaim;
 
 fn refuse(member: &str, reason: impl Into<String>) -> MediaSourceError {
     MediaSourceError {

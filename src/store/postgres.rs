@@ -5663,6 +5663,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule: a rendition (`media.derived_from`) whose original THIS node
+        // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
+        // reads the blob store, so it sits with the other state-reading gates.
+        // Backend-symmetric; memory holds no blobs and answers "not held".
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &row.attestation_envelope,
+            &row.cohort_scope,
+        )
+        .await?;
 
         // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
         // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
@@ -5913,6 +5924,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
             })?;
+        // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+        // `blob_renditions` projection on the same client.
+        pg_project_rendition_row(&**client, &row).await?;
         drop(client);
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`
@@ -13297,6 +13311,20 @@ fn scope_blob_symbol_from_pg_row(
 // the same transaction so a holder-attestation FK violation rolls back
 // the blob row too (atomic put_blob semantic).
 
+/// v45.0.0 (CIRISPersist#871, FSD §5) — what the placement gate asks: the
+/// cohort this node holds a blob under, from the blob row the write NAMED.
+impl crate::federation::renditions::HeldBlobScope for PostgresBackend {
+    async fn held_blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::BlobStorage as _;
+        self.blob_cohort_scope(sha256)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("held blob cohort_scope: {e}")))
+    }
+}
+
 impl crate::federation::BlobStorage for PostgresBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -19059,6 +19087,17 @@ impl PostgresBackend {
                 .unwrap_or(&input.attesting_key_id),
         )
         .await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule at the local door: a rendition (`media.derived_from`) whose
+        // original THIS node holds must name the original's own
+        // `cohort_scope`. Reads the blob store, so it sits with the other
+        // directory-reading gates, before the write. Backend-symmetric.
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &envelope_value,
+            &input.cohort_scope,
+        )
+        .await?;
 
         let mut client = self
             .get_client()
@@ -19165,6 +19204,18 @@ impl PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
         if replace {
+            // v45.0.0 (#871) — a replaced row's rendition leaves the V149
+            // index with it (no FK: the index is keyed by the rendition's
+            // digest, the row by its id).
+            tx.execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id IN (\
+                    SELECT attestation_id::text FROM cirislens.federation_attestations \
+                     WHERE attesting_key_id = $1 AND tier = 'local' \
+                       AND attestation_envelope::jsonb->>'dimension' = $2)",
+                &[&attesting_key_id, &dimension],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("local upsert rendition delete: {e}")))?;
             tx.execute(
                 "DELETE FROM cirislens.federation_attestations \
                   WHERE attesting_key_id = $1 AND tier = 'local' \
@@ -19232,6 +19283,9 @@ impl PostgresBackend {
         )
         .await
         .map_err(|e| Error::Backend(format!("local attestation projection: {e}")))?;
+        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+        // projection at the local door, in the same transaction.
+        pg_project_rendition_row(&*tx, &row).await?;
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;

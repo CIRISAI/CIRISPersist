@@ -182,6 +182,84 @@ pub fn decode_sha256_hex(hex64: &str) -> Result<[u8; 32], Error> {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// v45.0.0 (#871, FSD §5) — the placement rule, enforced where persist can
+// see it.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// What the placement check asks a backend: the `cohort_scope` under which
+/// THIS node holds the blob `sha256`, or `None` when it holds no such blob.
+///
+/// Sqlite and postgres answer from the blob row they wrote
+/// ([`super::BlobStorage::blob_cohort_scope`]: the cohort the write NAMED).
+/// Memory has no blob storage and answers `None` — it never holds an
+/// original, so on that backend the rule is always the node's (FSD §5).
+/// The trait exists so the three attestation doors run ONE gate by ONE name
+/// (`store::parity` pins the sequence) rather than two backends checking
+/// and one silently not.
+pub trait HeldBlobScope {
+    /// The stored `cohort_scope` of the blob `sha256` if this node holds it.
+    fn held_blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> impl std::future::Future<Output = Result<Option<String>, Error>> + Send;
+}
+
+/// The `derived_from` digest a row's struct names, when it names one.
+/// Reads only that member: a row reaching the placement check has already
+/// passed `check_media_source`, so the spelling is 64 hex by then.
+#[must_use]
+pub fn derived_from_of(envelope: &serde_json::Value) -> Option<&str> {
+    envelope
+        .get("media")?
+        .as_object()?
+        .get("derived_from")?
+        .as_str()
+}
+
+/// **The placement rule, pure.** CC 3.3.13: a rendition inherits the
+/// original's `cohort_scope` and audience and is placed in the same
+/// crossing. Given the scope a row names and the scope this node holds the
+/// original under, refuse a mismatch by the member that made the row a
+/// rendition (`derived_from`), naming both scopes.
+pub fn check_placement_against(row_scope: &str, original_scope: &str) -> Result<(), Error> {
+    if row_scope == original_scope {
+        return Ok(());
+    }
+    Err(super::media_source::MediaSourceError {
+        member: "derived_from".to_owned(),
+        reason: format!(
+            "this node holds the original at cohort_scope `{original_scope}`; a rendition is \
+             placed in the same crossing as its original (CC 3.3.13, FSD/MEDIA_SOURCE.md §5), \
+             not `{row_scope}`"
+        ),
+    }
+    .into())
+}
+
+/// **The placement gate at the six attestation write doors** (three ingest
+/// doors, three local writers; FSD §5–§6). A row whose struct names a
+/// `derived_from` this node holds is refused unless it names the original's
+/// own `cohort_scope`. A row with no `derived_from`, or whose original this
+/// node does not hold, passes: the rule is then the node's, not persist's.
+///
+/// AV-76 TIER 4 — it reads the blob store, so it runs after the crypto and
+/// beside the other state-reading gates, never ahead of them.
+pub async fn check_rendition_placement<B: HeldBlobScope + ?Sized>(
+    backend: &B,
+    envelope: &serde_json::Value,
+    cohort_scope: &str,
+) -> Result<(), Error> {
+    let Some(derived_from) = derived_from_of(envelope) else {
+        return Ok(());
+    };
+    let sha = decode_sha256_hex(derived_from)?;
+    let Some(held) = backend.held_blob_cohort_scope(&sha).await? else {
+        return Ok(());
+    };
+    check_placement_against(cohort_scope, &held)
+}
+
 /// v45.0.0 (#871) — the backend-agnostic witness bodies for the two reads
 /// and the retraction fold, run by memory, sqlite and postgres from
 /// [`runs`] and from each backend's projection-helper test (the helper is
