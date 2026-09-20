@@ -66,6 +66,9 @@ DELEGATED_DEFAULTS = (
     # v44.7.0 (#864) — defaulted `Unsupported`, overridden by every backend.
     "store_rebound_key_record",
     "list_key_registration_history",
+    # v45.0.0 (#871) — defaulted `Unsupported`, overridden by every backend.
+    "list_holders_sized",
+    "list_derived_hex",
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -108,6 +111,24 @@ def split_args(arg_str: str) -> list[str]:
     return out
 
 
+def terminates(line: str) -> bool:
+    """True iff `line` carries a `;` OUTSIDE any bracket — a statement end.
+
+    A `;` inside a type (`&[u8; 32]`) is not one. v45.0.0 (#871): the first
+    trait method taking a 32-byte array argument made the bare `";" in line`
+    test reset the buffer mid-signature and drop the method silently.
+    """
+    depth = 0
+    for ch in line:
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif ch == ";" and depth <= 0:
+            return True
+    return False
+
+
 def parse_defaults(body: str):
     """Yield (name, args_src, ret) for each DELEGATED_DEFAULTS method.
 
@@ -130,7 +151,7 @@ def parse_defaults(body: str):
                         (m.group(1), m.group(2), (m.group(3) or "()").strip())
                     )
                 buf = ""
-            elif ";" in line:
+            elif terminates(line):
                 buf = ""
         depth += line.count("{") - line.count("}")
         if depth < 0:
@@ -153,7 +174,7 @@ def parse(body: str):
     for line in body.split("\n"):
         if depth == 0:
             buf += line + "\n"
-            if re.search(r"\bfn\s+[a-z0-9_]+", buf) and ";" in line and "{" not in buf:
+            if re.search(r"\bfn\s+[a-z0-9_]+", buf) and terminates(line) and "{" not in buf:
                 one = " ".join(buf.split())
                 m = re.match(
                     r".*?\bfn\s+([a-z0-9_]+)\s*\((.*?)\)\s*(?:->\s*(.+?))?\s*;$", one

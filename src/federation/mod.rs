@@ -243,6 +243,9 @@ pub struct ConsentSweepReport {
 }
 
 pub mod register;
+// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4–§5) — the rendition
+// index (V149 `blob_renditions`) and the sized holder claim, the pure half.
+pub mod renditions;
 // CIRISPersist#571 — `regime:*` experimental-regime research artifacts:
 // the CC-blocked registry finding + the replication decision.
 pub mod regime;
@@ -920,6 +923,46 @@ pub trait FederationDirectory: Send + Sync {
         let _ = key_id;
         Err(Error::Unsupported {
             method: "list_key_registration_history",
+        })
+    }
+
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
+    /// **the puller's budget read.** Every live `holds_bytes` claim for
+    /// `sha256` with the byte length the holder SIGNED, sorted by `key_id`.
+    /// The selection is `list_holders`'s — the claim's type prefix, the
+    /// full digest in its `evidence_refs`, and the holder's own
+    /// `withdraws` / `recants` folded out — WITHOUT the CEG §10.1.2 freshness
+    /// window (this read answers "what did the holder commit to", the way
+    /// `list_local_holders` does; freshness is the discovery read's axis).
+    /// A claim whose envelope has no positive integer `size` is SKIPPED, not
+    /// an error: the receive door refuses those from this cut on, and a
+    /// legacy row without one is not a holder a puller can budget for.
+    /// Default `Unsupported`; every real backend overrides.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<renditions::HolderClaim>, Error> {
+        let _ = sha256;
+        Err(Error::Unsupported {
+            method: "list_holders_sized",
+        })
+    }
+
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §5, CC 3.3.13) —
+    /// **the rendition index read.** Every V149 `blob_renditions` row whose
+    /// `original_sha256` is `original_sha256_hex` (64 hex characters, else
+    /// `InvalidArgument`), ordered by `rendition_sha256`. The rows were
+    /// projected in the same write that admitted a row carrying
+    /// `media.derived_from` and removed by the retraction fold that retired
+    /// it, so this is a plain read of a fold already done. Default
+    /// `Unsupported`; every real backend overrides.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<renditions::Rendition>, Error> {
+        let _ = original_sha256_hex;
+        Err(Error::Unsupported {
+            method: "list_derived_hex",
         })
     }
 

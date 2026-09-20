@@ -421,6 +421,12 @@ struct State {
     /// the value shapes differ too — the wire index stores a `record_key`
     /// pointing at a held row, which these entries have no such thing as.
     known_wire_hashes: HashMap<(String, String), (chrono::DateTime<chrono::Utc>, Option<String>)>,
+    /// v45.0.0 (CIRISPersist#871, V149 mirror) — the `blob_renditions`
+    /// projection: one row per admitted attestation whose `media.derived_from`
+    /// is set, keyed by `rendition_sha256_hex`. Maintained by
+    /// [`project_rendition_row`] in the same lock as the row insert and
+    /// removed by the retraction fold that retires the source row.
+    blob_renditions: Vec<crate::federation::renditions::Rendition>,
 }
 
 /// v21.0.0 (CIRISPersist#502 E7) — one row of the in-memory
@@ -718,6 +724,28 @@ fn transport_destination_rows(state: &State) -> Vec<(String, chrono::DateTime<ch
         })
         .collect()
 }
+/// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149 `blob_renditions`
+/// mirror for `row` under the state lock the caller already holds: when
+/// [`crate::federation::renditions::rendition_of_row`] answers `Some`, upsert
+/// it keyed by `rendition_sha256_hex` (the SQL backends' `ON CONFLICT`).
+/// A row that projects nothing is left alone.
+///
+/// **Call sites (the door bodies, in the SAME lock as the row insert):**
+/// `put_attestation_with_origin`, `memory_write_local_attestation`, and the
+/// promotion door (`enter_mesh`). The retraction fold that removes a row's
+/// projection lives with `consent_peer_set`'s in `put_attestation_with_origin`
+/// and in `purge_attestation_projections`.
+// TODO(#871 merge): remove the allow once the three doors call this.
+#[allow(dead_code)]
+fn project_rendition_row(state: &mut State, row: &crate::federation::Attestation) {
+    if let Some(r) = crate::federation::renditions::rendition_of_row(row) {
+        state
+            .blob_renditions
+            .retain(|e| e.rendition_sha256_hex != r.rendition_sha256_hex);
+        state.blob_renditions.push(r);
+    }
+}
+
 fn attestation_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
     state
         .federation_attestations
@@ -797,6 +825,7 @@ impl Default for MemoryBackend {
                 federation_location_proof_authority_sigs: HashMap::new(),
                 signed_wire_index: HashMap::new(),
                 known_wire_hashes: HashMap::new(),
+                blob_renditions: Vec::new(),
             }),
             hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::HardwareAttestationPolicy::default(),
@@ -2655,6 +2684,58 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .unwrap_or_default())
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
+    /// `holds_bytes` claim for `sha256` (type prefix + full digest cited),
+    /// the holder's own `withdraws` / `recants` folded out, no freshness
+    /// window; a claim with no positive `size` is skipped. Sorted by key.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
+        use crate::federation::types::attestation_type::{RECANTS, WITHDRAWS};
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let state = self.state.lock().expect("memory backend lock");
+        let retracted = |attester: &str, attestation_id: &str| {
+            state.federation_attestations.iter().any(|w| {
+                (w.attestation_type == WITHDRAWS || w.attestation_type == RECANTS)
+                    && w.attesting_key_id == attester
+                    && crate::federation::precedence::references_attestation_id_from_envelope(
+                        &w.attestation_envelope,
+                    ) == Some(attestation_id)
+            })
+        };
+        Ok(crate::federation::renditions::sized_holder_claims(
+            &full_hex,
+            state
+                .federation_attestations
+                .iter()
+                .filter(|a| a.attestation_type == attestation_type)
+                .filter(|a| !retracted(&a.attesting_key_id, &a.attestation_id))
+                .map(|a| (a.attesting_key_id.clone(), a.attestation_envelope.clone())),
+        ))
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read over the
+    /// V149 mirror, ordered by `rendition_sha256`.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let original = hex::encode(crate::federation::renditions::decode_sha256_hex(
+            original_sha256_hex,
+        )?);
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<crate::federation::renditions::Rendition> = state
+            .blob_renditions
+            .iter()
+            .filter(|r| r.original_sha256_hex == original)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.rendition_sha256_hex.cmp(&b.rendition_sha256_hex));
+        Ok(out)
+    }
+
     // v19.1.0 (#490) — the authenticated re-anchor (memory parity; see the
     // sqlite impl for the full invariants).
     async fn adopt_genesis_reanchor(
@@ -3619,6 +3700,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 state
                     .consent_peer_set_for
                     .retain(|r| r.source_attestation_id != target_id);
+                // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+                state
+                    .blob_renditions
+                    .retain(|r| r.source_attestation_id != target_id);
             } else if crate::federation::consent_peer_set::is_consent_replication_grant(&row) {
                 let for_key =
                     crate::federation::consent_by_humans::for_key_id_of(&row.attestation_envelope)
@@ -4357,6 +4442,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend lock");
         state
             .consent_peer_set
+            .retain(|r| r.source_attestation_id != attestation_id);
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        state
+            .blob_renditions
             .retain(|r| r.source_attestation_id != attestation_id);
         state
             .signed_wire_index
@@ -14318,6 +14407,48 @@ mod tests {
         g.subject_key_ids = vec![peer.to_string()];
         resign_fix(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         g
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the memory leg of the V149
+    /// `blob_renditions` projection: `project_rendition_row` under the state
+    /// lock feeds the SAME read-and-fold body sqlite and postgres run
+    /// (`renditions::witnesses::index_reads_and_folds`), so the three cannot
+    /// diverge on what the index answers or on which fold retires a row.
+    #[tokio::test]
+    async fn blob_renditions_projection_reads_and_folds_871() {
+        use crate::federation::renditions::witnesses;
+        use crate::federation::FederationDirectory;
+        let b = MemoryBackend::new();
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        let (original, r_hi, r_lo) = witnesses::two_rendition_rows(&b, &s).await;
+        let project = |r: &crate::federation::Attestation| {
+            let mut st = b.state.lock().expect("memory backend lock");
+            project_rendition_row(&mut st, r);
+        };
+        project(&r_hi);
+        project(&r_lo);
+        // A row that describes no rendition projects nothing.
+        let plain = crate::federation::media_source_invariants::bodies::row(
+            &format!("871-plain-{s}"),
+            &r_hi.attesting_key_id,
+            &r_hi.attested_key_id,
+            serde_json::json!({"dimension": "x:y:v1", "score": 1.0}),
+            crate::federation::types::cohort_scope::FEDERATION,
+        );
+        project(&plain);
+        assert_eq!(b.list_derived_hex(&original).await.unwrap().len(), 2);
+        witnesses::index_reads_and_folds(
+            &b,
+            &original,
+            &r_hi,
+            &r_lo,
+            |r| {
+                project(&r);
+                async {}
+            },
+            &s,
+        )
+        .await;
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — THE witness: a `consent:replication:v1`

@@ -1089,6 +1089,54 @@ pub trait BlobStorage: Send + Sync {
         author_key_id: Option<&str>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4; CIRISPersist#863
+    /// ask 1) — **the LocalOnly plaintext door**: store commons bytes this
+    /// node verified itself, announcing nothing.
+    ///
+    /// The consumer-reachable form of
+    /// [`store_blob_local`](BlobStorage::store_blob_local), with the two
+    /// arguments a consumer cannot supply fixed by this door: `cohort_scope`
+    /// is `federation` and the floor is
+    /// [`CryptoTier::Plaintext`](crate::federation::types::cohort_scope::CryptoTier::Plaintext)
+    /// (a [`StorageFloor`] is unconstructible outside the crate, I22). It is
+    /// the plaintext twin of the sealed adopt door's `LocalOnly` disposition:
+    /// a node that pulled a commons blob from a holder, checked its size
+    /// (CC 5.3.2.5) and its digest, keeps the bytes for its own consumers
+    /// without becoming a holder the mesh can be pointed at. No
+    /// `holds_bytes` claim is emitted, no signer is involved, and nothing
+    /// here decides a render tier (CC 5.3.2.6: the node's, from sniffed
+    /// bytes).
+    ///
+    /// Content-address checked: `sha2::Sha256(bytes)` must equal `sha256`
+    /// ([`BlobError::HashMismatch`]), and `bytes.len()` is bounded by
+    /// [`inline_bytes_cap`](BlobStorage::inline_bytes_cap)
+    /// ([`BlobError::InlineSizeExceeded`]) — both enforced by the door this
+    /// delegates to. Idempotent on the address (first-write-wins).
+    ///
+    /// **Unannounced is not private** (v43.0.0 §11.2): the row is
+    /// `federation` / `plaintext` and `read_blob_as` serves it to any viewer.
+    /// Sealed cohorts go through `put_blob_scoped`.
+    fn store_plaintext_local<'s>(
+        &'s self,
+        sha256: &'s [u8; 32],
+        bytes: Vec<u8>,
+        media_type: Option<&'s str>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send + 's
+    where
+        Self: Sync,
+    {
+        self.store_blob_local(
+            sha256,
+            BlobBody::Inline(bytes),
+            media_type,
+            crate::federation::types::cohort_scope::FEDERATION,
+            StorageFloor::resolved(crate::federation::types::cohort_scope::CryptoTier::Plaintext),
+            // #846 — this door carries no signer; unknown classifies as proxy
+            // (fail toward evictable), exactly as `store_blob_local_json`.
+            None,
+        )
+    }
+
     /// #846 (`BLOB_REPLICATION.md` §6.1, I45/I51/I52) — **the adopt floor.**
     /// Store a sealed [`AtRestEnvelope`](crate::federation::at_rest_cascade::AtRestEnvelope)
     /// received from a peer VERBATIM, addressed by the SHA-256 of its bytes,

@@ -4250,6 +4250,109 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
+    /// `holds_bytes` claim for `sha256` (type prefix, then the full digest
+    /// confirmed in `evidence_refs`), the holder's own `withdraws` /
+    /// `recants` folded out by the same `NOT EXISTS` `list_holders` uses, no
+    /// freshness window; a claim with no positive `size` is skipped. Sorted
+    /// by key; one entry per holder.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT a.attesting_key_id, a.attestation_envelope \
+                 FROM cirislens.federation_attestations a \
+                 WHERE a.attestation_type = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM cirislens.federation_attestations w \
+                     WHERE w.attestation_type IN ($2, $3) \
+                       AND w.attesting_key_id = a.attesting_key_id \
+                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
+                           a.attestation_id::text \
+                   ) \
+                 ORDER BY a.attesting_key_id ASC, a.attestation_id ASC",
+                &[
+                    &attestation_type,
+                    &crate::federation::types::attestation_type::WITHDRAWS,
+                    &crate::federation::types::attestation_type::RECANTS,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_holders_sized: {e}")))?;
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_holders_sized: {e}"))
+        };
+        let mut candidates: Vec<(String, serde_json::Value)> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let key_id: String = r.try_get("attesting_key_id").map_err(col)?;
+            // TEXT since V122; a row whose envelope does not parse is not a claim.
+            let text: String = r.try_get("attestation_envelope").map_err(col)?;
+            if let Ok(env) = serde_json::from_str(&text) {
+                candidates.push((key_id, env));
+            }
+        }
+        Ok(crate::federation::renditions::sized_holder_claims(
+            &full_hex, candidates,
+        ))
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
+    /// SELECT over V149 `cirislens.blob_renditions`, ordered by
+    /// `rendition_sha256`.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let original = crate::federation::renditions::decode_sha256_hex(original_sha256_hex)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT rendition_sha256, original_sha256, format, size, width, height, \
+                        role, source_attestation_id, cohort_scope \
+                 FROM cirislens.blob_renditions WHERE original_sha256 = $1 \
+                 ORDER BY rendition_sha256 ASC",
+                &[&original.to_vec()],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_derived_hex: {e}")))?;
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_derived_hex: {e}"))
+        };
+        rows.into_iter()
+            .map(|r| {
+                let size: i64 = r.try_get("size").map_err(col)?;
+                let width: Option<i32> = r.try_get("width").map_err(col)?;
+                let height: Option<i32> = r.try_get("height").map_err(col)?;
+                Ok(crate::federation::renditions::Rendition {
+                    rendition_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("rendition_sha256").map_err(col)?,
+                    ),
+                    original_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("original_sha256").map_err(col)?,
+                    ),
+                    format: r.try_get("format").map_err(col)?,
+                    size: u64::try_from(size).unwrap_or(0),
+                    width: width.and_then(|w| u32::try_from(w).ok()),
+                    height: height.and_then(|h| u32::try_from(h).ok()),
+                    role: r.try_get("role").map_err(col)?,
+                    source_attestation_id: r.try_get("source_attestation_id").map_err(col)?,
+                    cohort_scope: r.try_get("cohort_scope").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+
     // v19.1.0 (#490) — the authenticated re-anchor (see sqlite impl for the
     // full invariants: internal quorum re-verify + bundle-carried check +
     // lift + gates + identity/anti-rollback guards).
@@ -6535,6 +6638,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("purge consent_peer_set: {e}"))
+            })?;
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        client
+            .execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id = $1",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge blob_renditions: {e}"))
             })?;
         Ok(())
     }
@@ -19351,6 +19464,13 @@ where
                 &[&target_id],
             )
             .await?;
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        client
+            .execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id = $1",
+                &[&target_id],
+            )
+            .await?;
         return Ok(());
     }
     if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
@@ -19389,6 +19509,75 @@ where
             )
             .await?;
     }
+    Ok(())
+}
+
+/// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+/// `cirislens.blob_renditions` projection for `row` on the given
+/// client/transaction: when
+/// [`crate::federation::renditions::rendition_of_row`] answers `Some`,
+/// upsert it keyed by `rendition_sha256` (`ON CONFLICT DO UPDATE`). A row
+/// that projects nothing is left alone. Generic over `GenericClient` like
+/// `pg_project_consent_peer_set`, so a door mid-transaction passes its
+/// `&Transaction` and the projection lands in the SAME commit as the row.
+///
+/// **Call sites (the door bodies, in the SAME client/transaction as the row
+/// insert):** `put_attestation_with_origin` (beside
+/// `pg_project_consent_peer_set`), `pg_write_local_attestation` (beside its
+/// `pg_project_attestation_subjects`, before `tx.commit()`), and the
+/// promotion door (`enter_mesh`). The retraction fold that removes a row's
+/// projection lives in `pg_project_consent_peer_set` and
+/// `purge_attestation_projections`.
+// TODO(#871 merge): remove the allow once the three doors call this.
+#[allow(dead_code)]
+async fn pg_project_rendition_row<C>(
+    client: &C,
+    row: &crate::federation::Attestation,
+) -> Result<(), crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let Some(r) = crate::federation::renditions::rendition_of_row(row) else {
+        return Ok(());
+    };
+    let rendition = hex::decode(&r.rendition_sha256_hex)
+        .map_err(|e| crate::federation::Error::Backend(format!("rendition sha256 hex: {e}")))?;
+    let original = hex::decode(&r.original_sha256_hex)
+        .map_err(|e| crate::federation::Error::Backend(format!("original sha256 hex: {e}")))?;
+    let size = i64::try_from(r.size).unwrap_or(i64::MAX);
+    let width = r.width.and_then(|w| i32::try_from(w).ok());
+    let height = r.height.and_then(|h| i32::try_from(h).ok());
+    client
+        .execute(
+            "INSERT INTO cirislens.blob_renditions \
+                (rendition_sha256, original_sha256, format, size, width, height, role, \
+                 source_attestation_id, cohort_scope) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (rendition_sha256) DO UPDATE SET \
+                original_sha256 = EXCLUDED.original_sha256, \
+                format = EXCLUDED.format, \
+                size = EXCLUDED.size, \
+                width = EXCLUDED.width, \
+                height = EXCLUDED.height, \
+                role = EXCLUDED.role, \
+                source_attestation_id = EXCLUDED.source_attestation_id, \
+                cohort_scope = EXCLUDED.cohort_scope",
+            &[
+                &rendition,
+                &original,
+                &r.format,
+                &size,
+                &width,
+                &height,
+                &r.role,
+                &r.source_attestation_id,
+                &r.cohort_scope,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("blob_renditions projection: {e}"))
+        })?;
     Ok(())
 }
 
@@ -27338,6 +27527,42 @@ mod tests {
             &backend, &suffix,
         )
         .await;
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the postgres leg of the V149
+    /// `blob_renditions` projection: `pg_project_rendition_row` on a pooled
+    /// client feeds the SAME read-and-fold body memory and sqlite run
+    /// (`renditions::witnesses::index_reads_and_folds`).
+    #[tokio::test]
+    async fn blob_renditions_projection_reads_and_folds_871_postgres() {
+        use crate::federation::renditions::witnesses;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let b = PostgresBackend::connect(&dsn).await.expect("connect");
+        b.run_migrations().await.expect("migrations run");
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        let (original, r_hi, r_lo) = witnesses::two_rendition_rows(&b, &s).await;
+        let b = &b;
+        let project = |r: crate::federation::Attestation| async move {
+            let client = b.get_client().await.expect("client");
+            pg_project_rendition_row(&**client, &r).await.unwrap();
+        };
+        project(r_hi.clone()).await;
+        project(r_lo.clone()).await;
+        // A row that describes no rendition projects nothing.
+        project(crate::federation::media_source_invariants::bodies::row(
+            &format!("871-plain-{s}"),
+            &r_hi.attesting_key_id,
+            &r_hi.attested_key_id,
+            serde_json::json!({"dimension": "x:y:v1", "score": 1.0}),
+            crate::federation::types::cohort_scope::FEDERATION,
+        ))
+        .await;
+        assert_eq!(b.list_derived_hex(&original).await.unwrap().len(), 2);
+        witnesses::index_reads_and_folds(b, &original, &r_hi, &r_lo, project, &s).await;
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the postgres leg of the shared
