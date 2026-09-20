@@ -464,6 +464,75 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I118c — the local door projects too, and an upsert-replace retires
+    /// the replaced row's rendition with it.** A `(local, self)` rendition
+    /// row lands in the index on write; replacing it under the same
+    /// `(attesting, dimension)` with a different rendition digest leaves ONE
+    /// index row, the new one — the index is keyed by the rendition's digest
+    /// and the row by its id, so without the cleanup the old row's projection
+    /// would outlive the row.
+    pub async fn i118c_the_local_door_projects_and_replace_retires(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::envelope::EnvelopeCore;
+        use crate::federation::types::LocalAttestationInput;
+        let signer = format!("i118c-s-{s}");
+        ts::register_identity_key(d, &signer, USER).await;
+        let original = hex64(&format!("i118c-orig-{s}"));
+        let (thumb_a, thumb_b) = (
+            hex64(&format!("i118c-a-{s}")),
+            hex64(&format!("i118c-b-{s}")),
+        );
+        let local = |id: &str, thumb: &str| LocalAttestationInput {
+            attestation_id: Some(id.to_owned()),
+            attesting_key_id: signer.clone(),
+            attested_key_id: Some(signer.clone()),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: EnvelopeCore::from_value(serde_json::json!({
+                "dimension": "external_content:image:v1", "evidence_refs": [thumb],
+                "media": {"digest": thumb, "size": 96, "format": "image/webp", "name": "poster", "derived_from": original},
+            }))
+            .unwrap(),
+            subject_key_ids: Vec::new(),
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        let id_a = format!("i118c-a-row-{s}");
+        d.attestation_upsert_local(local(&id_a, &thumb_a))
+            .await
+            .expect("I118c: a local rendition row is admitted");
+        let got = d.list_derived_hex(&original).await.unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|r| (r.rendition_sha256_hex.as_str(), r.role.as_str(), r.source_attestation_id.as_str(), r.cohort_scope.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(thumb_a.as_str(), "poster", id_a.as_str(), cohort_scope::SELF)],
+            "I118c: the local door projects in the same write"
+        );
+        // Upsert-replace under the same (attesting, dimension): a NEW
+        // rendition digest. The old projection must go with the old row.
+        let id_b = format!("i118c-b-row-{s}");
+        d.attestation_upsert_local(local(&id_b, &thumb_b))
+            .await
+            .expect("I118c: the replacing local row is admitted");
+        assert!(
+            d.get_attestation(&id_a).await.unwrap().is_none(),
+            "I118c: the replaced row is gone"
+        );
+        let got = d.list_derived_hex(&original).await.unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|r| (r.rendition_sha256_hex.as_str(), r.source_attestation_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(thumb_b.as_str(), id_b.as_str())],
+            "I118c: exactly the replacing row's rendition remains"
+        );
+    }
+
     /// **I118b (blob half) — placement: a rendition at a different scope
     /// than a locally held original is refused.**
     // The blob-half bodies reach `key_grant_invariants::two_node`, which
@@ -733,6 +802,12 @@ mod run {
                 async fn i118() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i118_the_rendition_index(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i118c() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i118c_the_local_door_projects_and_replace_retires(&b, &super::suffix())
+                        .await
                 }
             }
         };
