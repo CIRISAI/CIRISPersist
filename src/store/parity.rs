@@ -189,6 +189,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v44.8.0 (#866 C1) — the scope-token grammar gate: a `consent:state:*`
     // envelope whose `scope` names a token the fold cannot match is refused.
     ("check_consent_scope_tokens", Class::Gate),
+    // v45.0.0 (#871) — the media Source struct grammar gate and the holder
+    // claim's required size: a malformed descriptor is refused by member.
+    ("check_media_source", Class::Gate),
+    ("check_holder_claim_size", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
     ("check_encryption_pubkeys", Class::Gate),

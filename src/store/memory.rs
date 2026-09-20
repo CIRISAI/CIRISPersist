@@ -1242,6 +1242,10 @@ impl MemoryBackend {
         // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
         // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
         crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
+        // v45.0.0 (CIRISPersist#871) — the media Source struct gate, at the local
+        // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
+        // holder claim, so only the struct is checked here.
+        crate::federation::media_source::check_media_source(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
@@ -3071,6 +3075,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // must parse (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4): never admit
         // a token the fold cannot match. Pure; same gate at every door.
         crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
+        // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media
+        // Source struct is refused by member name, and a `holds_bytes` claim
+        // without a positive `size` is refused: a descriptor a puller cannot
+        // budget by is not admitted. Pure; the same gate at every door.
+        crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
+        crate::federation::media_source::check_holder_claim_size(
+            &row.attestation_envelope,
+            &row.attestation_type,
+        )?;
 
         // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries
