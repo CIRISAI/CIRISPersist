@@ -4960,6 +4960,7 @@ pub mod blob_invariants {
             community_key_id: Some(comm.to_owned()),
             epoch: Some(epoch),
             tier: crate::federation::types::cohort_scope::CryptoTier::CommunityDek,
+            minter_key_id: None,
         }
     }
 
@@ -5078,6 +5079,7 @@ pub mod blob_invariants {
                 community_key_id: Some(owner.clone()),
                 epoch: None,
                 tier: CryptoTier::InvisibleEncrypted,
+                minter_key_id: None,
             };
             adopt_sealed_blob(
                 backend,
@@ -5205,6 +5207,7 @@ pub mod blob_invariants {
                 community_key_id: Some(bob.clone()),
                 epoch: None,
                 tier: CryptoTier::InvisibleEncrypted,
+                minter_key_id: None,
             };
             let err = adopt_sealed_blob(
                 backend,
@@ -5703,6 +5706,7 @@ pub mod blob_invariants {
                 community_key_id: Some(format!("{tag}-owner-{run}")),
                 epoch: None,
                 tier: CryptoTier::InvisibleEncrypted,
+                minter_key_id: None,
             };
             let err = adopt_sealed_blob(
                 backend,

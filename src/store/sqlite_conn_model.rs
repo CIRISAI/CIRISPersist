@@ -369,6 +369,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v45.0.0 (#871) — the rendition index read and the puller's budget
     // read; plain SELECTs on the reader path.
     ("list_derived_hex", ConnClass::Read),
+    // v46.0.0 (#876) — the derivation input is a plain SELECT on the reader
+    // path; the repair is a single guarded UPDATE on the writer's.
+    ("community_dek_minters_granting", ConnClass::Read),
+    ("rebind_stranded_blob_epochs", ConnClass::Write),
     ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_delivery_receipts_for", ConnClass::Read),

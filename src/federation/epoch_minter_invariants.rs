@@ -62,10 +62,11 @@ pub(crate) mod bodies {
                 .expect("register the engine's own key");
         }
         let (sa, sb) = (pick(&engine_a), pick(&engine_b));
-        let kem = |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
-            x25519_base64: id.x25519_pubkey_b64,
-            ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
-        };
+        let kem =
+            |id: crate::federation::identity_aggregate::ContentKemIdentity| EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            };
         let a = Node {
             backend: sa.as_ref(),
             signer: ts::local_signer(&alias_a),
@@ -96,7 +97,10 @@ pub(crate) mod bodies {
     }
 
     /// A's seal through the production door, and the epoch set it emitted.
-    async fn seal_and_set<B>(l: &Ladder<B>, plaintext: &[u8]) -> ([u8; 32], Vec<u8>, SignedKeyGrantSet)
+    async fn seal_and_set<B>(
+        l: &Ladder<B>,
+        plaintext: &[u8],
+    ) -> ([u8; 32], Vec<u8>, SignedKeyGrantSet)
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
@@ -145,8 +149,12 @@ pub(crate) mod bodies {
     /// **I126 — the ladder, author ≠ sealer.** A row attested by A's OWNER
     /// and sealed by A's NODE opens on B; the recorded binding names the
     /// NODE. Without the set carried, it still refuses.
-    pub(crate) async fn i126_author_is_not_the_sealer<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
-    where
+    pub(crate) async fn i126_author_is_not_the_sealer<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -195,12 +203,11 @@ pub(crate) mod bodies {
                 .expect("I126: the body OPENS for B's node key"),
             b"chat body"
         );
-        let (_c, minter, _e) = l
-            .bb
-            .community_dek_blob_epoch(&sha)
-            .await
-            .unwrap()
-            .expect("I126: the binding exists");
+        let (_c, minter, _e) =
+            l.bb.community_dek_blob_epoch(&sha)
+                .await
+                .unwrap()
+                .expect("I126: the binding exists");
         assert_eq!(
             minter, l.node_a,
             "I126: the binding names the SEALER, not the author"
@@ -208,8 +215,12 @@ pub(crate) mod bodies {
     }
 
     /// **I127 — explicit wins, and an empty one is refused by member.**
-    pub(crate) async fn i127_explicit_minter_wins<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
-    where
+    pub(crate) async fn i127_explicit_minter_wins<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -238,23 +249,25 @@ pub(crate) mod bodies {
             )
             .await
             .expect("I127: the named minter is admitted");
-        let (_c, minter, _e) = l
-            .bb
-            .community_dek_blob_epoch(&sha)
-            .await
-            .unwrap()
-            .unwrap();
+        let (_c, minter, _e) = l.bb.community_dek_blob_epoch(&sha).await.unwrap().unwrap();
         assert_eq!(minter, l.node_a, "I127: the NAMED minter is recorded");
         assert_eq!(
-            l.engine_b.read_blob_as(&sha, &l.node_b, None).await.unwrap(),
+            l.engine_b
+                .read_blob_as(&sha, &l.node_b, None)
+                .await
+                .unwrap(),
             b"explicit"
         );
     }
 
     /// **I128 — derivation answers from ONE admitted set, and declines to
     /// guess between two.**
-    pub(crate) async fn i128_derivation_and_its_limit<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
-    where
+    pub(crate) async fn i128_derivation_and_its_limit<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -285,7 +298,15 @@ pub(crate) mod bodies {
         // A second minter at the same (community, epoch): no guess.
         let other = format!("em-other-{run}");
         ts::register_identity_key(b.as_ref(), &other, USER).await;
-        b.as_ref().community_dek_put_member_grant(&l.comm, &other, 0, &l.node_b, "x", b"wrap")
+        b.as_ref()
+            .community_dek_put_member_grant(
+                &l.comm,
+                &other,
+                0,
+                &l.node_b,
+                crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2,
+                "d3JhcA",
+            )
             .await
             .unwrap();
         let mut minters = b
@@ -326,8 +347,12 @@ pub(crate) mod bodies {
 
     /// **I129 — repair: bytes before the key set rebind when it lands; a
     /// binding whose minter holds state is never touched.**
-    pub(crate) async fn i129_a_stranded_binding_rebinds<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
-    where
+    pub(crate) async fn i129_a_stranded_binding_rebinds<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -356,7 +381,10 @@ pub(crate) mod bodies {
         let (_c, minter, _e) = b.community_dek_blob_epoch(&sha).await.unwrap().unwrap();
         assert_eq!(minter, l.node_a, "I129: rebound to the set's minter");
         assert_eq!(
-            l.engine_b.read_blob_as(&sha, &l.node_b, None).await.unwrap(),
+            l.engine_b
+                .read_blob_as(&sha, &l.node_b, None)
+                .await
+                .unwrap(),
             b"out of order"
         );
         // A correct binding is NOT rebound by a later set from elsewhere.
@@ -395,16 +423,26 @@ pub(crate) mod bodies {
         );
     }
 
+    /// The source lines that are not comments, `//` tails removed. A
+    /// commented-out call is not a call, and a comment QUOTING the old
+    /// spelling is not the old spelling — #871's M27 taught this grep the
+    /// hard way.
+    fn live_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .filter(|l| !l.trim().is_empty())
+    }
+
     /// **I130 — from disk: one derivation, and the old spelling is gone.**
     #[test]
     fn i130_one_derivation_for_every_minter_writer() {
         const ADOPT: &str = include_str!("adopt_cascade.rs");
         assert!(
-            !ADOPT.contains("minter_key_id: provenance.author_key_id"),
+            !live_lines(ADOPT).any(|l| l.contains("minter_key_id: provenance.author_key_id")),
             "I130: the adopt no longer infers the minter from the author"
         );
         assert!(
-            ADOPT.contains("epoch_minter::resolve("),
+            live_lines(ADOPT).any(|l| l.contains("epoch_minter::resolve(")),
             "I130: it resolves through the one function"
         );
         for (name, text) in [
@@ -412,13 +450,18 @@ pub(crate) mod bodies {
             ("postgres.rs", include_str!("../store/postgres.rs")),
         ] {
             assert!(
-                text.contains("rebind_stranded_blob_epochs"),
+                live_lines(text).any(|l| l.contains("rebind_stranded_blob_epochs")),
                 "I130: {name} implements the repair"
             );
         }
+        const GRANT: &str = include_str!("key_grant.rs");
+        assert!(
+            live_lines(GRANT).any(|l| l.contains("rebind_stranded_blob_epochs(")),
+            "I130: admitting a key_grant set runs the repair"
+        );
         const CASCADE: &str = include_str!("community_dek.rs");
         assert!(
-            CASCADE.contains("epoch_minter::"),
+            live_lines(CASCADE).any(|l| l.contains("epoch_minter::")),
             "I130: the seal path names the minter through the same function"
         );
     }

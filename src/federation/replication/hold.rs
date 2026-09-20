@@ -58,6 +58,17 @@ pub struct BlobProvenance {
     /// on (I2). `Plaintext` provenance is refused by the adopt doors — that
     /// is `put_blob`'s job.
     pub tier: CryptoTier,
+    /// v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md`) — **the key whose
+    /// cascade MINTED the epoch**: the key that signed the `key_grant` set,
+    /// which is the sealing node, not necessarily the row's author. `None`
+    /// means "derive it" — from the one admitted set that granted this node
+    /// a wrap at `(community, epoch)`, else from `author_key_id`.
+    ///
+    /// Before v46 this was inferred from [`Self::author_key_id`] on the
+    /// premise that the author's cascade minted the epoch; that holds only
+    /// where the author IS the sealing engine, and a chat row is authored
+    /// by a person and sealed by their node.
+    pub minter_key_id: Option<String>,
 }
 
 /// #846 (§4) — how WIDELY this node holds within the cohorts it is party

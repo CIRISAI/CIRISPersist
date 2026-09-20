@@ -5080,6 +5080,8 @@ impl Engine {
             community_key_id: None,
             epoch: None,
             tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            // #876 — a plaintext commons probe mints no epoch and names no minter.
+            minter_key_id: None,
         })
         .await?;
 
@@ -14054,6 +14056,7 @@ mod tests {
             community_key_id: Some(comm.clone()),
             epoch: Some(epoch),
             tier: CryptoTier::CommunityDek,
+            minter_key_id: None,
         };
         let err = engine
             .adopt_sealed_blob(&env, prov.clone(), None, AdoptDisposition::LocalOnly)
@@ -14113,6 +14116,7 @@ mod tests {
                     community_key_id: Some(comm),
                     epoch: Some(epoch),
                     tier: CryptoTier::CommunityDek,
+                    minter_key_id: None,
                 },
                 None,
                 AdoptDisposition::Announce,

@@ -578,9 +578,14 @@ mod tests {
             "pub async fn adopt_sealed_chunk<",
             "\n}\n",
         );
+        // v46.0.0 (#876) — `resolve_adopt` became `async fn resolve_adopt<B>`
+        // when the binding's minter stopped being inferred from the author;
+        // the anchor moves with the spelling (an exact-match identifier has
+        // exactly one spelling), and the body is still held to "never
+        // decrypts".
         check(
             "src/federation/adopt_cascade.rs",
-            "fn resolve_adopt(",
+            "async fn resolve_adopt<",
             "\n}\n",
         );
         // The Engine facades and the floors (impl-level fns end at `\n    }\n`).

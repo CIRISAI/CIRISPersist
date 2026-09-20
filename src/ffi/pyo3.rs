@@ -1463,6 +1463,8 @@ impl PyEngine {
             community_key_id: None,
             epoch: None,
             tier: crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            // #876 — a plaintext commons probe mints no epoch.
+            minter_key_id: None,
         };
         engine.would_hold(&provenance).await.map_err(blob_err_to_py)
     }
@@ -33026,6 +33028,11 @@ struct ProvenanceWire {
     #[serde(default)]
     epoch: Option<u64>,
     tier: String,
+    /// v46.0.0 (#876) — the key whose cascade MINTED the epoch (the key
+    /// that signed the `key_grant` set). Optional: absent means "derive
+    /// it". The JSON surface stays compatible with pre-46 callers.
+    #[serde(default)]
+    minter_key_id: Option<String>,
 }
 
 impl ProvenanceWire {
@@ -33043,6 +33050,7 @@ impl ProvenanceWire {
             community_key_id: self.community_key_id,
             epoch: self.epoch,
             tier,
+            minter_key_id: self.minter_key_id,
         })
     }
 }

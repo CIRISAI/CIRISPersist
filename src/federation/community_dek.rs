@@ -226,19 +226,11 @@ pub mod orchestrate {
     where
         B: FederationDirectory,
     {
-        if let Some(a) = author_key_id {
-            if !a.is_empty() {
-                return Ok(a.to_owned());
-            }
-        }
-        backend.node_key_id().ok_or_else(|| {
-            BlobError::InvalidArgument(
-                "community DEK cascade: no minter — the write named no author and the backend \
-                 knows no node key. An epoch belongs to its minter (BLOB_REPLICATION.md §11); \
-                 pass the author's derived key id"
-                    .into(),
-            )
-        })
+        // v46.0.0 (CIRISPersist#876) — ONE function answers "who minted
+        // this epoch" for the seal side and the adopt side, so the two
+        // halves of `(community, minter, epoch)` cannot be computed from
+        // two different axes (the #876 class).
+        crate::federation::epoch_minter::for_seal(backend, author_key_id)
     }
 
     /// Resolve the **current** members of a community, each with its

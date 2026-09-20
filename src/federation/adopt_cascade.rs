@@ -55,10 +55,18 @@ pub struct AdoptOutcome {
 /// the provenance must be at a sealed tier, and a `CommunityDek` provenance
 /// must name its `(community, epoch)`. Returns the floor token and the
 /// binding to write AS DECLARED.
-fn resolve_adopt(
+/// v46.0.0 (#876) — async because the binding's minter is resolved, not
+/// inferred: `backend` is asked which admitted `key_grant` set names it,
+/// and `our_key_id` is the viewer whose wrap identifies that set.
+async fn resolve_adopt<B>(
+    backend: &B,
+    our_key_id: &str,
     envelope: &[u8],
     provenance: &BlobProvenance,
-) -> Result<(StorageFloor, Option<EpochBinding>), BlobError> {
+) -> Result<(StorageFloor, Option<EpochBinding>), BlobError>
+where
+    B: BlobStorage + Sync + ?Sized,
+{
     AtRestEnvelope::from_bytes(envelope).map_err(|e| {
         BlobError::InvalidArgument(format!(
             "adopt: the bytes do not have the at-rest envelope shape ({e}); an adopt stores \
@@ -84,13 +92,23 @@ fn resolve_adopt(
                         .into(),
                 ));
             };
+            // v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md`) — the minter
+            // is NAMED or DERIVED, never inferred from the author. The old
+            // spelling (`minter_key_id: provenance.author_key_id`) assumed
+            // the author's cascade minted the epoch; a chat row is authored
+            // by a person and sealed by their node, and the binding then
+            // named a key that holds no DEK and no grants.
             Some(EpochBinding {
                 community_key_id: community.to_owned(),
-                // #848 (§11) — the AUTHOR is the minter; `BlobProvenance`
-                // needs no new field: its `author_key_id` IS the epoch's
-                // minter, because the author's cascade minted the epoch the
-                // blob is sealed under.
-                minter_key_id: provenance.author_key_id.clone(),
+                minter_key_id: super::epoch_minter::resolve(
+                    backend,
+                    provenance.minter_key_id.as_deref(),
+                    community,
+                    epoch,
+                    our_key_id,
+                    &provenance.author_key_id,
+                )
+                .await?,
                 epoch,
             })
         }
@@ -131,7 +149,7 @@ where
 {
     // Carried, not recorded — see the module doc.
     let _ = aad;
-    let (floor, binding) = resolve_adopt(envelope, provenance)?;
+    let (floor, binding) = resolve_adopt(backend, ctx.our_key_id, envelope, provenance).await?;
     let announce = disposition == AdoptDisposition::Announce;
     if announce && cs::suppresses_holds_bytes(&provenance.cohort_scope) {
         return Err(BlobError::InvalidArgument(format!(
@@ -218,7 +236,7 @@ where
     B: BlobStorage + FederationDirectory + Sync,
     F: Fn(&str) -> bool,
 {
-    let (floor, binding) = resolve_adopt(envelope, provenance)?;
+    let (floor, binding) = resolve_adopt(backend, ctx.our_key_id, envelope, provenance).await?;
     would_hold(backend, ctx, provenance).await?;
     let sha256 = backend
         .adopt_sealed_chunk_at(
