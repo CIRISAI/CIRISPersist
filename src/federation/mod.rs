@@ -2343,6 +2343,14 @@ pub trait FederationDirectory: Send + Sync {
     /// — `lookup_identity_for_occurrence(K)?.identity_key_id == X`.
     /// Returns the full row so the caller can also see the
     /// `device_class` / `hardware_attestation` / freshness fields.
+    ///
+    /// v45.0.1 (CIRISPersist#873) — **ordered.** When the key is bound under
+    /// several identities (every claimed node: its boot singleton and its
+    /// owner's login anchor), the row returned is the non-singleton one
+    /// (`identity_key_id != occurrence_key_id`) first, newest `asserted_at`
+    /// next, then `identity_key_id` — the same order on every backend. This
+    /// is the HISTORICAL row (revocation leaves it intact); the admission
+    /// resolver is [`Self::active_identity_for_occurrence`].
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -3475,27 +3483,72 @@ pub trait FederationDirectory: Send + Sync {
     /// revoked occurrence falls back to its SINGLETON identity (it is its
     /// own key and nothing more), which strips the inherited memberships
     /// without inventing a new refusal class.
+    ///
+    /// v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §2) — **the
+    /// first of [`Self::active_identities_for_occurrence`], else the
+    /// occurrence itself.** Before this cut the resolver took ONE row from
+    /// [`Self::lookup_identity_for_occurrence`] — a `LIMIT 1` with no order —
+    /// and every claimed node (boot singleton + login anchor) drew the
+    /// singleton written first: the node resolved to ITSELF and was "not
+    /// party" to its owner's rooms. Deterministic now, on every backend.
     async fn active_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
     ) -> Result<String, Error> {
-        let Some(io) = self
-            .lookup_identity_for_occurrence(occurrence_key_id)
+        Ok(self
+            .active_identities_for_occurrence(occurrence_key_id)
             .await?
-        else {
-            return Ok(occurrence_key_id.to_owned());
-        };
-        let active = self
-            .list_identity_occurrences_active(&io.identity_key_id)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| occurrence_key_id.to_owned()))
+    }
+
+    /// v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §2) — **every
+    /// PRINCIPAL of an occurrence**: the identities whose ACTIVE fold
+    /// ([`Self::list_identity_occurrences_active`], the #421 re-assert
+    /// semantics) still contains `occurrence_key_id`, the singleton
+    /// (`identity == occurrence`) excluded, ordered newest `asserted_at`
+    /// first and then by `identity_key_id`. The login anchor is re-asserted
+    /// at each login, so the newest binding is the human at the keyboard.
+    /// Empty when the occurrence has no live non-singleton binding — the
+    /// caller falls back to the occurrence itself (a revoked device is its
+    /// own key and nothing more; v38.2.0, unchanged).
+    ///
+    /// The hold-side audience walk unions over all of these (a shared device
+    /// is party to both humans' rooms); the write-side resolver takes the
+    /// first. Default impl over
+    /// [`Self::list_identity_occurrences_by_occurrence_key`]; backends need
+    /// not override.
+    async fn active_identities_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<String>, Error> {
+        let rows = self
+            .list_identity_occurrences_by_occurrence_key(occurrence_key_id)
             .await?;
-        if active
-            .iter()
-            .any(|o| o.occurrence_key_id == occurrence_key_id)
-        {
-            Ok(io.identity_key_id)
-        } else {
-            Ok(occurrence_key_id.to_owned())
+        // (identity, newest asserted_at among its rows for this occurrence)
+        let mut principals: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        for io in rows {
+            if io.identity_key_id == occurrence_key_id {
+                continue;
+            }
+            if principals.iter().any(|(id, _)| *id == io.identity_key_id) {
+                continue;
+            }
+            let active = self
+                .list_identity_occurrences_active(&io.identity_key_id)
+                .await?;
+            let newest = active
+                .iter()
+                .filter(|o| o.occurrence_key_id == occurrence_key_id)
+                .map(|o| o.asserted_at)
+                .max();
+            if let Some(at) = newest {
+                principals.push((io.identity_key_id, at));
+            }
         }
+        principals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(principals.into_iter().map(|(id, _)| id).collect())
     }
 
     /// v38.2.0 (CIRISPersist#757 follow-on) — the family key_ids `identity`

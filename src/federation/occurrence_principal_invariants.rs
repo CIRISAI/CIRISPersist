@@ -91,7 +91,12 @@ pub(crate) mod bodies {
 
     /// `would_hold` on `node` for community content of `comm` authored by a
     /// stranger — the #873 shape, exactly.
-    async fn holds(d: &dyn FederationDirectory, node: &str, comm: &str, author: &str) -> Result<(), BlobError> {
+    async fn holds(
+        d: &dyn FederationDirectory,
+        node: &str,
+        comm: &str,
+        author: &str,
+    ) -> Result<(), BlobError> {
         let ctx = HoldContext {
             pressure: DiskPressureSnapshot::normal(),
             is_local_or_family: |k: &str| k == node,
@@ -162,10 +167,18 @@ pub(crate) mod bodies {
         let lone = format!("i121-lone-{s}");
         ts::register_identity_key(d, &lone, NODE).await;
         assert_eq!(d.active_identity_for_occurrence(&lone).await.unwrap(), lone);
-        assert!(d.active_identities_for_occurrence(&lone).await.unwrap().is_empty());
+        assert!(d
+            .active_identities_for_occurrence(&lone)
+            .await
+            .unwrap()
+            .is_empty());
         bind(d, &lone, &lone, "2026-06-01T00:00:00Z").await;
         assert_eq!(d.active_identity_for_occurrence(&lone).await.unwrap(), lone);
-        assert!(d.active_identities_for_occurrence(&lone).await.unwrap().is_empty());
+        assert!(d
+            .active_identities_for_occurrence(&lone)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// **I122 — `would_hold` admits community content of a room the owner
@@ -205,7 +218,10 @@ pub(crate) mod bodies {
     /// **I123 — a revoked anchor returns the device to itself: the resolver
     /// answers the node, the owner's room leaves its audience, `would_hold`
     /// refuses `NotPartyTo` again.**
-    pub async fn i123_a_revoked_anchor_is_the_singleton_again(d: &dyn FederationDirectory, s: &str) {
+    pub async fn i123_a_revoked_anchor_is_the_singleton_again(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
         let (node, owner, other, comm) = (
             format!("i123-node-{s}"),
             format!("i123-owner-{s}"),
@@ -218,14 +234,20 @@ pub(crate) mod bodies {
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await;
         bind(d, &owner, &node, "2026-06-02T00:00:00Z").await;
         room(d, &comm, &[&owner, &other]).await;
-        holds(d, &node, &comm, &other).await.expect("I123: party while the anchor is live");
+        holds(d, &node, &comm, &other)
+            .await
+            .expect("I123: party while the anchor is live");
         revoke(d, &owner, &node, "2026-06-03T00:00:00Z").await;
         assert_eq!(
             d.active_identity_for_occurrence(&node).await.unwrap(),
             node,
             "I123: a revoked anchor is not a principal"
         );
-        assert!(d.active_identities_for_occurrence(&node).await.unwrap().is_empty());
+        assert!(d
+            .active_identities_for_occurrence(&node)
+            .await
+            .unwrap()
+            .is_empty());
         let memberships = crate::federation::replication::hold::audience_memberships(d, &node)
             .await
             .unwrap();
@@ -246,7 +268,12 @@ pub(crate) mod bodies {
             format!("i124-b-{s}"),
             format!("i124-other-{s}"),
         );
-        for (k, t) in [(&node, NODE), (&first, USER), (&second, USER), (&other, USER)] {
+        for (k, t) in [
+            (&node, NODE),
+            (&first, USER),
+            (&second, USER),
+            (&other, USER),
+        ] {
             ts::register_identity_key(d, k, t).await;
         }
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await;
@@ -272,8 +299,12 @@ pub(crate) mod bodies {
             memberships.contains(&room_a) && memberships.contains(&room_b),
             "I124: party to both humans' rooms: {memberships:?}"
         );
-        holds(d, &node, &room_a, &other).await.expect("I124: room of the older binding");
-        holds(d, &node, &room_b, &other).await.expect("I124: room of the newer binding");
+        holds(d, &node, &room_a, &other)
+            .await
+            .expect("I124: room of the older binding");
+        holds(d, &node, &room_b, &other)
+            .await
+            .expect("I124: room of the newer binding");
     }
 
     /// **I125 — from disk: no `LIMIT 1` without an order at this site; the
