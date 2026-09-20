@@ -42,7 +42,19 @@ threat-model citations because this crate's audit story is the point.
   `(community, MINTER, epoch)`. The minter is the occurrence whose cascade
   minted the epoch; the author is the row's attester. They coincide only
   when a node authors its own content.
-- Witnesses I126–I130 (`federation::epoch_minter_invariants`) on sqlite and
+- **DX: the row and the provenance are one relation, in code.**
+  `BLOB_REPLICATION.md` §5 says provenance lives on the referencing
+  attestation; **`BlobProvenance::from_attestation(row, sha256, epoch,
+  minter)`** is that sentence as a constructor (PyO3:
+  `blob_provenance_from_attestation_json`). It fills `author_key_id` from
+  the row's attester, `cohort_scope` from the row, `community_key_id` from
+  the cohort the SIGNED envelope names, and resolves the tier — and it
+  refuses a row that does not cite these bytes in `evidence_refs[]`. The
+  key-plane facts (`epoch`, `minter_key_id`) are arguments, because they
+  live on the `key_grant` set and not on the row. No caller transcribes a
+  member by hand any more, and none can put the author where the minter
+  goes: that transcription IS #876.
+- Witnesses I126–I131 (`federation::epoch_minter_invariants`) on sqlite and
   postgres, over an **author ≠ sealer** two-node fixture that is now the
   default shape for this plane: a row attested by A's owner and sealed by
   A's node, adopted on B, OPENS for B's node key.

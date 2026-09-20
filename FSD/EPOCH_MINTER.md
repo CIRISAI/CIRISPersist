@@ -69,6 +69,7 @@ declaration or from verified state; there is no third source.
 | `federation::epoch_minter::resolve(...)` | NEW. The ONE answer to §2, used by the adopt path, the repair sweep and the from-disk gate |
 | `FederationDirectory::community_dek_minters_granting(community, epoch, viewer)` | NEW read: the minters of every admitted set that granted `viewer` a wrap at `(community, epoch)`, sorted, deduped. The derivation input, on all three backends |
 | `rebind_stranded_blob_epochs(community, minter, epoch)` | NEW. On admitting a `key_grant` set, rebind every `federation_community_blob_epoch` row at that `(community, epoch)` whose recorded minter holds no DEK state and no grants — the bytes-before-key ordering (§3 of BLOB_REPLICATION) and every row written under the v45 premise |
+| `BlobProvenance::from_attestation(row, sha256, epoch, minter)` | NEW (PyO3 `blob_provenance_from_attestation_json`). The relation `BLOB_REPLICATION.md` §5 states in prose — provenance lives on the referencing attestation — as a constructor: author from the row's attester, cohort from the row, community from the cohort the SIGNED envelope names, tier resolved; refuses a row that does not cite the bytes in `evidence_refs[]`. `epoch` / `minter_key_id` are arguments because they are key-plane facts carried by the `key_grant` set, not by the row |
 | `BLOB_REPLICATION.md` §11 | corrected: the key identity is `(community, MINTER, epoch)` |
 
 No migration: the four tables already carry `minter_key_id`. No vocabulary
@@ -102,6 +103,11 @@ change. MAJOR for the struct member alone.
   before the set) rebinds when the naming set is admitted, and the body
   then OPENS; a binding whose recorded minter DOES hold state is never
   rebound (the sweep touches only stranded rows).
+- **I131** — **the row IS the provenance**: a person-attested row naming
+  its community and citing the sealed bytes yields a provenance whose
+  author is the attester, whose community is the named cohort and whose
+  tier is resolved; a row citing other bytes is refused by member; and the
+  adopt carried on that derived provenance OPENS on the peer.
 - **I130** — from disk: every writer of a minter-keyed table takes its
   minter from `epoch_minter`; `adopt_cascade.rs` contains no
   `minter_key_id: provenance.author_key_id` spelling; the `author ≠ sealer`

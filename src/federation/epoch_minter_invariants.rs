@@ -433,6 +433,85 @@ pub(crate) mod bodies {
             .filter(|l| !l.trim().is_empty())
     }
 
+    /// **I131 — the row IS the provenance.** `BLOB_REPLICATION.md` §5 puts
+    /// provenance on the referencing attestation;
+    /// [`BlobProvenance::from_attestation`] is that sentence as code. The
+    /// product shape: a row attested by the PERSON, naming its community in
+    /// the signed envelope, citing the sealed bytes in `evidence_refs`. The
+    /// adopt takes the provenance READ OFF that row — no member is
+    /// transcribed by hand, which is how #876 was written in the first
+    /// place — and the body opens.
+    pub(crate) async fn i131_the_row_is_the_provenance<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::media_source_invariants::bodies::row as fixture_row;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, bytes, set) = seal_and_set(&l, b"row-derived").await;
+        let sha_hex = hex::encode(sha);
+        // The referencing row: ATTESTED BY THE PERSON, naming the community,
+        // citing the bytes.
+        let referencing = fixture_row(
+            &format!("em-row-{run}"),
+            &l.alice,
+            &l.alice,
+            serde_json::json!({
+                "dimension": "external_content:image:v1",
+                "evidence_refs": [sha_hex],
+                "community_key_id": l.comm,
+            }),
+            COMMUNITY,
+        );
+        let p = BlobProvenance::from_attestation(&referencing, &sha, Some(0), None)
+            .expect("I131: the row answers every member persist can know");
+        assert_eq!(p.author_key_id, l.alice, "I131: the author is the attester");
+        assert_eq!(p.community_key_id.as_deref(), Some(l.comm.as_str()));
+        assert_eq!(
+            p.tier,
+            CryptoTier::CommunityDek,
+            "I131: the tier is resolved, not declared"
+        );
+        assert!(
+            p.minter_key_id.is_none(),
+            "I131: the minter is a key-plane fact, not a row one"
+        );
+        // A row that does not cite these bytes is not the row they flowed from.
+        let other = fixture_row(
+            &format!("em-row-other-{run}"),
+            &l.alice,
+            &l.alice,
+            serde_json::json!({
+                "dimension": "external_content:image:v1",
+                "evidence_refs": ["ab".repeat(32)],
+                "community_key_id": l.comm,
+            }),
+            COMMUNITY,
+        );
+        let err = BlobProvenance::from_attestation(&other, &sha, Some(0), None)
+            .expect_err("I131: a row that cites other bytes is refused");
+        assert!(
+            err.to_string().contains("evidence_refs"),
+            "I131: by member: {err}"
+        );
+        // And the derived provenance carries the adopt end to end.
+        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        l.engine_b
+            .adopt_sealed_blob(&bytes, p, None, AdoptDisposition::LocalOnly)
+            .await
+            .expect("I131: B adopts on the row's own provenance");
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&sha, &l.node_b, None)
+                .await
+                .unwrap(),
+            b"row-derived"
+        );
+    }
+
     /// **I130 — from disk: one derivation, and the old spelling is gone.**
     #[test]
     fn i130_one_derivation_for_every_minter_writer() {
@@ -458,6 +537,11 @@ pub(crate) mod bodies {
         assert!(
             live_lines(GRANT).any(|l| l.contains("rebind_stranded_blob_epochs(")),
             "I130: admitting a key_grant set runs the repair"
+        );
+        const SELF_SRC: &str = include_str!("epoch_minter_invariants.rs");
+        assert!(
+            live_lines(SELF_SRC).any(|l| l.contains("BlobProvenance::from_attestation(")),
+            "I130: the DX path (provenance READ off the row) is the tested path"
         );
         const CASCADE: &str = include_str!("community_dek.rs");
         assert!(
@@ -491,6 +575,11 @@ mod run {
                 async fn i128() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i128_derivation_and_its_limit(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i131() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i131_the_row_is_the_provenance(&a, &b, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
                 async fn i129() {

@@ -415,6 +415,11 @@ Engine	list_held_by_json	empirical
 Engine	list_held_fountain_content	empirical	
 Engine	list_holders_json	empirical	
 Engine	list_holders_sized_json	empirical	
+# v46.0.0 (#876) — `blob_provenance_from_attestation_json` is EMPIRICAL: it
+# READS the signed row and reports the provenance that row already states
+# (BLOB_REPLICATION.md §5). It permits nothing, stores nothing, and refuses
+# by member when the row does not cite the bytes.
+Engine	blob_provenance_from_attestation_json	empirical	
 Engine	list_identity_occurrences_for_json	ontological	
 Engine	list_live_occurrences	ontological	
 Engine	list_llm_calls	empirical	

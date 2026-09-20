@@ -2368,6 +2368,9 @@ class Engine:
     def blackhole_list_json(self) -> str:
         """(derived) empirical — Federation blackhole rules: list every rule."""
 
+    def blob_provenance_from_attestation_json(self, attestation_json: str, sha256_hex: str, epoch: int | None = None, minter_key_id: str | None = None) -> str:
+        """(derived) empirical — v46.0.0 (CIRISPersist#876, FSD/EPOCH_MINTER.md) — the provenance of a blob, read off the attestation it flowed from."""
+
     def ceremony_get(self, ceremony_id: str) -> str | None:
         """v1.5.16 — Point lookup. Returns JSON-encoded
         ``CreationCeremony`` or ``None`` when no matching row."""

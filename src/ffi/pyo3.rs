@@ -13912,6 +13912,57 @@ impl PyEngine {
         })
     }
 
+    /// v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md`) — **the provenance
+    /// of a blob, read off the attestation it flowed from.**
+    ///
+    /// `BLOB_REPLICATION.md` §5: the blob row carries no author; provenance
+    /// lives on the referencing attestation. Give this the SIGNED row (the
+    /// CEG envelope / scores attestation that cites the bytes in
+    /// `evidence_refs[]`) and the blob's sha256, and it returns the exact
+    /// `provenance` object `adopt_sealed_blob_json` and `would_hold_json`
+    /// take — so no caller transcribes `author_key_id`, `cohort_scope` or
+    /// `community_key_id` by hand, and no caller can put the author where
+    /// the minter goes (that transcription IS CIRISPersist#876).
+    ///
+    /// `attestation_json` is one attestation as
+    /// `list_attestations_*_json` returns it. `epoch` and `minter_key_id`
+    /// are the KEY-plane facts the row does not carry: pass the epoch the
+    /// `key_grant` set named, and the minter when you admitted that set
+    /// (omit it and persist derives it). Raises `ValueError` naming the
+    /// member when the row does not cite these bytes or a community row
+    /// names no community.
+    #[pyo3(signature = (attestation_json, sha256_hex, epoch=None, minter_key_id=None))]
+    fn blob_provenance_from_attestation_json(
+        &self,
+        attestation_json: &str,
+        sha256_hex: &str,
+        epoch: Option<u64>,
+        minter_key_id: Option<&str>,
+    ) -> PyResult<String> {
+        catch_panic(|| {
+            let attestation: crate::federation::Attestation =
+                serde_json::from_str(attestation_json)
+                    .map_err(|e| PyValueError::new_err(format!("attestation_json: {e}")))?;
+            let sha = parse_sha256_hex(sha256_hex)?;
+            let p = crate::federation::BlobProvenance::from_attestation(
+                &attestation,
+                &sha,
+                epoch,
+                minter_key_id,
+            )
+            .map_err(blob_err_to_py)?;
+            serde_json::to_string(&serde_json::json!({
+                "author_key_id": p.author_key_id,
+                "cohort_scope": p.cohort_scope,
+                "community_key_id": p.community_key_id,
+                "epoch": p.epoch,
+                "tier": p.tier.as_str(),
+                "minter_key_id": p.minter_key_id,
+            }))
+            .map_err(|e| PyValueError::new_err(format!("provenance encode: {e}")))
+        })
+    }
+
     /// #846 (`BLOB_REPLICATION.md` §6.1) — **adopt a sealed blob received
     /// from a peer**: store the `AtRestEnvelope` verbatim at the tier and
     /// under the `(community, epoch)` binding its provenance declares, and

@@ -71,6 +71,77 @@ pub struct BlobProvenance {
     pub minter_key_id: Option<String>,
 }
 
+impl BlobProvenance {
+    /// v46.0.0 (CIRISPersist#876) — **read the provenance off the row the
+    /// blob flowed from.** `BLOB_REPLICATION.md` §5: *"the blob row carries
+    /// no author. Provenance lives on the referencing attestation — that is
+    /// the CEG-native place."* This is that sentence as code, so a caller
+    /// never transcribes it by hand.
+    ///
+    /// From the SIGNED envelope and the row's own columns:
+    /// - `author_key_id` ← `attestation.attesting_key_id` (the attester of
+    ///   the row, which for a chat row is the PERSON);
+    /// - `cohort_scope` ← `attestation.cohort_scope`;
+    /// - `community_key_id` ← the cohort the row NAMES in its envelope
+    ///   ([`admission::envelope_cohort_target`], the `community_key_id` /
+    ///   `community_id` / `cohort_key_id` aliases), required for
+    ///   `community` / `affiliations` and refused elsewhere;
+    /// - `tier` ← resolved from the scope, never declared by the caller.
+    ///
+    /// `epoch` and `minter_key_id` are **key-plane** facts and are NOT on
+    /// the row: an epoch belongs to its minter and is named by the
+    /// `key_grant` set (`FSD/EPOCH_MINTER.md`). Pass the epoch the set
+    /// named; pass `minter` when you know it (you do, if you admitted that
+    /// set) and `None` to have persist derive it. **Transcribing the author
+    /// into the minter is exactly the #876 defect** — this constructor
+    /// cannot express it.
+    ///
+    /// The row must CITE the bytes: `sha256_hex` has to appear in the
+    /// envelope's `evidence_refs[]`
+    /// ([`admission::envelope_binds_content`]), which is the relation
+    /// between the attestation and the blob. A row that does not cite these
+    /// bytes is not the row they flowed from, and is refused by member.
+    pub fn from_attestation(
+        attestation: &crate::federation::Attestation,
+        sha256: &[u8; 32],
+        epoch: Option<u64>,
+        minter_key_id: Option<&str>,
+    ) -> Result<Self, BlobError> {
+        use crate::federation::admission;
+        let env = &attestation.attestation_envelope;
+        let sha_hex = hex::encode(sha256);
+        if !admission::envelope_binds_content(env, &sha_hex) {
+            return Err(BlobError::InvalidArgument(format!(
+                "evidence_refs: attestation {} does not cite {sha_hex} — provenance comes from                  the row the bytes flowed from (BLOB_REPLICATION.md §5), and this row is not it",
+                attestation.attestation_id
+            )));
+        }
+        let scope = attestation.cohort_scope.clone();
+        let tier = cs::crypto_tier(&scope, None);
+        let community_key_id = if matches!(tier, CryptoTier::CommunityDek) {
+            let named = admission::envelope_cohort_target(env)
+                .map_err(|e| BlobError::InvalidArgument(format!("community_key_id: {e}")))?
+                .ok_or_else(|| {
+                    BlobError::InvalidArgument(format!(
+                        "community_key_id: a {scope:?} row must NAME its cohort in the signed                          envelope (community_key_id / community_id / cohort_key_id);                          attestation {} names none",
+                        attestation.attestation_id
+                    ))
+                })?;
+            Some(named.to_owned())
+        } else {
+            None
+        };
+        Ok(Self {
+            author_key_id: attestation.attesting_key_id.clone(),
+            cohort_scope: scope,
+            community_key_id,
+            epoch,
+            tier,
+            minter_key_id: minter_key_id.map(str::to_owned),
+        })
+    }
+}
+
 /// #846 (§4) — how WIDELY this node holds within the cohorts it is party
 /// to. Derived from serve standing; it refuses nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
