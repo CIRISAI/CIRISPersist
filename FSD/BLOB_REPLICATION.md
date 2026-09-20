@@ -374,8 +374,17 @@ concurrent unleased writes at one sequence number are a fork (ledger clause
 layer. An epoch belongs to its **minter** M — the occurrence whose cascade
 minted it. Key state, self-retention and grants are keyed
 `(community_key_id, minter_key_id, epoch)`; a blob's key identity is
-`(community, author, epoch)`, and the author is already on the row
-(`author_key_id`, §5). Each minter owns its counter: the local bump on
+`(community, MINTER, epoch)`.
+
+> **Corrected in v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md`).** This
+> paragraph used to read *"a blob's key identity is `(community, author,
+> epoch)`, and the author is already on the row (`author_key_id`, §5)"* —
+> and the adopt door wrote that premise into code. It holds only where the
+> author IS the sealing engine. A chat row is authored by a PERSON and
+> sealed by their NODE, so the binding was keyed by the person while the
+> grants were keyed by the node, and every cross-node community body read
+> `NotGranted`. The minter is now named or derived, never inferred from the
+> author. Each minter owns its counter: the local bump on
 admitting a removal is correct by construction, the signer rule falls out
 (M signs M's counter), and nothing consumes "one DEK per community epoch".
 The write-lease shape was rejected: more surface for a property nothing
