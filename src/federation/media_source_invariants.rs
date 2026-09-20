@@ -466,6 +466,10 @@ pub(crate) mod bodies {
 
     /// **I118b (blob half) — placement: a rendition at a different scope
     /// than a locally held original is refused.**
+    // The blob-half bodies reach `key_grant_invariants::two_node`, which
+    // exists only where a backend does (the #870 lesson: CI's
+    // `--features server` job compiles tests with no backend and -D warnings).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i118b_placement_follows_the_original<B>(b: &B, s: &str)
     where
         B: crate::federation::BlobStorage + FederationDirectory + Sync,
@@ -529,6 +533,7 @@ pub(crate) mod bodies {
 
     /// **I117 (blob half) — the two doors' claims carry the stored length,
     /// and it crosses to a peer.**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i117b_the_doors_carry_the_stored_length<B>(a: &B, b: &B, s: &str)
     where
         B: crate::federation::BlobStorage + FederationDirectory + Sync,

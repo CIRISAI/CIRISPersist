@@ -259,6 +259,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("compute_persist_row_hash", Class::Plumbing),
     ("connect", Class::Plumbing),
     ("decode", Class::Plumbing),
+    // v45.0.0 (#871) — `list_derived_hex`'s argument decode: refuses a digest
+    // that is not 64 hex characters, which is a fact about the caller's
+    // input, so a Gate — and the same one on all three backends by
+    // construction (one fn in `renditions.rs`).
+    ("decode_sha256_hex", Class::Gate),
     ("dedicated_connect", Class::Delegates),
     ("delete_blob", Class::Delegates),
     ("deserialize_signature", Class::Plumbing),

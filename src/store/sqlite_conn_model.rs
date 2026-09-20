@@ -366,6 +366,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
     ("list_consent_peers_for", ConnClass::Read),
     ("list_key_registration_history", ConnClass::Read),
+    // v45.0.0 (#871) — the rendition index read and the puller's budget
+    // read; plain SELECTs on the reader path.
+    ("list_derived_hex", ConnClass::Read),
+    ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),
@@ -574,6 +578,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         ConnClass::HelperWrite,
     ),
     ("sqlite_project_consent_peer_set", ConnClass::HelperWrite),
+    // v45.0.0 (#871) — the V149 `blob_renditions` projection, a free fn over
+    // the writer's connection called from the three attestation doors.
+    ("sqlite_project_rendition_row", ConnClass::HelperWrite),
     ("sqlite_update_peer_field", ConnClass::Write),
     ("sqlite_upsert_wire_index", ConnClass::HelperWrite),
     ("sqlite_write_local_attestation", ConnClass::Write),

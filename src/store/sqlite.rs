@@ -3740,6 +3740,93 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .collect()
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
+    /// `holds_bytes` claim for `sha256` (type prefix, then the full digest
+    /// confirmed in `evidence_refs`), the holder's own `withdraws` /
+    /// `recants` folded out by the same `NOT EXISTS` `list_holders` uses, no
+    /// freshness window; a claim with no positive `size` is skipped. Sorted
+    /// by key; one entry per holder.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let candidates = self
+            .read(
+                move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT a.attesting_key_id, a.attestation_envelope \
+                     FROM federation_attestations a \
+                     WHERE a.attestation_type = ?1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM federation_attestations w \
+                         WHERE w.attestation_type IN (?2, ?3) \
+                           AND w.attesting_key_id = a.attesting_key_id \
+                           AND json_extract(w.attestation_envelope, '$.references_attestation_id') \
+                               = a.attestation_id \
+                       ) \
+                     ORDER BY a.attesting_key_id ASC, a.attestation_id ASC",
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![
+                            attestation_type,
+                            crate::federation::types::attestation_type::WITHDRAWS,
+                            crate::federation::types::attestation_type::RECANTS,
+                        ],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )?;
+                    rows.collect()
+                },
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_holders_sized: {e}")))?;
+        Ok(crate::federation::renditions::sized_holder_claims(
+            &full_hex,
+            candidates
+                .into_iter()
+                .filter_map(|(k, t)| serde_json::from_str(&t).ok().map(|v| (k, v))),
+        ))
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
+    /// SELECT over V149 `blob_renditions`, ordered by `rendition_sha256`.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let original = crate::federation::renditions::decode_sha256_hex(original_sha256_hex)?;
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::renditions::Rendition>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT rendition_sha256, original_sha256, format, size, width, height, \
+                            role, source_attestation_id, cohort_scope \
+                     FROM blob_renditions WHERE original_sha256 = ?1 \
+                     ORDER BY rendition_sha256 ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![original.to_vec()], |r| {
+                    let size: i64 = r.get("size")?;
+                    let width: Option<i64> = r.get("width")?;
+                    let height: Option<i64> = r.get("height")?;
+                    Ok(crate::federation::renditions::Rendition {
+                        rendition_sha256_hex: hex::encode(r.get::<_, Vec<u8>>("rendition_sha256")?),
+                        original_sha256_hex: hex::encode(r.get::<_, Vec<u8>>("original_sha256")?),
+                        format: r.get("format")?,
+                        size: u64::try_from(size).unwrap_or(0),
+                        width: width.and_then(|w| u32::try_from(w).ok()),
+                        height: height.and_then(|h| u32::try_from(h).ok()),
+                        role: r.get("role")?,
+                        source_attestation_id: r.get("source_attestation_id")?,
+                        cohort_scope: r.get("cohort_scope")?,
+                    })
+                })?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_derived_hex: {e}")))
+    }
+
     // v19.1.0 (#490) — the authenticated re-anchor. Re-verifies the bundle
     // quorum INTERNALLY (own roster + pinned keys) before any write; the
     // record must be one the bundle carries; identity + anti-rollback
@@ -5912,6 +5999,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )?;
             guard.execute(
                 "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+            guard.execute(
+                "DELETE FROM blob_renditions WHERE source_attestation_id = ?1",
                 rusqlite::params![id],
             )?;
             Ok(())
@@ -18882,6 +18974,11 @@ fn sqlite_project_consent_peer_set(
             "DELETE FROM consent_peer_set_for WHERE source_attestation_id = ?1",
             rusqlite::params![target_id],
         )?;
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        conn.execute(
+            "DELETE FROM blob_renditions WHERE source_attestation_id = ?1",
+            rusqlite::params![target_id],
+        )?;
         return Ok(());
     }
     if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
@@ -18916,6 +19013,60 @@ fn sqlite_project_consent_peer_set(
             )?;
         }
     }
+    Ok(())
+}
+
+/// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149 `blob_renditions`
+/// projection for `row` on the given (already-locked) connection or
+/// transaction: when [`crate::federation::renditions::rendition_of_row`]
+/// answers `Some`, `INSERT OR REPLACE` it keyed by `rendition_sha256`. A row
+/// that projects nothing is left alone.
+///
+/// **Call sites (the door bodies, in the SAME write as the row insert):**
+/// `put_attestation_with_origin` (beside `sqlite_project_consent_peer_set`),
+/// `sqlite_write_local_attestation` (beside its
+/// `sqlite_project_attestation_subjects`), and the promotion door
+/// (`enter_mesh`, in the UPDATE's write closure). The retraction fold that
+/// removes a row's projection lives in `sqlite_project_consent_peer_set` and
+/// `purge_attestation_projections`.
+// TODO(#871 merge): remove the allow once the three doors call this.
+#[allow(dead_code)]
+fn sqlite_project_rendition_row(
+    conn: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+) -> rusqlite::Result<()> {
+    let Some(r) = crate::federation::renditions::rendition_of_row(row) else {
+        return Ok(());
+    };
+    let rendition = hex::decode(&r.rendition_sha256_hex).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        )))
+    })?;
+    let original = hex::decode(&r.original_sha256_hex).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        )))
+    })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO blob_renditions \
+            (rendition_sha256, original_sha256, format, size, width, height, role, \
+             source_attestation_id, cohort_scope) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            rendition,
+            original,
+            r.format,
+            i64::try_from(r.size).unwrap_or(i64::MAX),
+            r.width.map(i64::from),
+            r.height.map(i64::from),
+            r.role,
+            r.source_attestation_id,
+            r.cohort_scope,
+        ],
+    )?;
     Ok(())
 }
 
@@ -25886,6 +26037,39 @@ mod tests {
         g.subject_key_ids = vec![peer.to_string()];
         resign_fed(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         g
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the sqlite leg of the V149
+    /// `blob_renditions` projection: `sqlite_project_rendition_row` on the
+    /// writer's connection feeds the SAME read-and-fold body memory and
+    /// postgres run (`renditions::witnesses::index_reads_and_folds`).
+    #[tokio::test]
+    async fn blob_renditions_projection_reads_and_folds_871_sqlite() {
+        use crate::federation::renditions::witnesses;
+        use crate::federation::FederationDirectory;
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        let (original, r_hi, r_lo) = witnesses::two_rendition_rows(&b, &s).await;
+        let b = &b;
+        let project = |r: crate::federation::Attestation| async move {
+            b.write(move |conn| sqlite_project_rendition_row(conn, &r))
+                .await
+                .unwrap();
+        };
+        project(r_hi.clone()).await;
+        project(r_lo.clone()).await;
+        // A row that describes no rendition projects nothing.
+        project(crate::federation::media_source_invariants::bodies::row(
+            &format!("871-plain-{s}"),
+            &r_hi.attesting_key_id,
+            &r_hi.attested_key_id,
+            serde_json::json!({"dimension": "x:y:v1", "score": 1.0}),
+            crate::federation::types::cohort_scope::FEDERATION,
+        ))
+        .await;
+        assert_eq!(b.list_derived_hex(&original).await.unwrap().len(), 2);
+        witnesses::index_reads_and_folds(b, &original, &r_hi, &r_lo, project, &s).await;
     }
 
     /// v21.0.0 (CIRISPersist#502 E7) — the sqlite-path assertion of the

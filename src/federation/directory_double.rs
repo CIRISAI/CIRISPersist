@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 90 delegations, generated. Every one: fault first, then delegate.
+// 92 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -444,6 +444,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_community_membership_revocations_for(community_key_id)
             .await
     }
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<renditions::Rendition>, Error> {
+        if let Some(e) = self.faulted("list_derived_hex") {
+            return Err(e);
+        }
+        self.inner.list_derived_hex(original_sha256_hex).await
+    }
     async fn list_families_for_member(
         &self,
         member_identity_key_id: &str,
@@ -486,6 +495,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .list_held_fountain_content(publisher_key_id)
             .await
+    }
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<renditions::HolderClaim>, Error> {
+        if let Some(e) = self.faulted("list_holders_sized") {
+            return Err(e);
+        }
+        self.inner.list_holders_sized(sha256).await
     }
     async fn list_hybrid_pending_attestations(
         &self,
