@@ -484,7 +484,8 @@ pub(crate) mod bodies {
             hex64(&format!("i118c-a-{s}")),
             hex64(&format!("i118c-b-{s}")),
         );
-        let local = |id: &str, thumb: &str| LocalAttestationInput {
+        let local = |id: &str, thumb: &str| {
+            LocalAttestationInput {
             attestation_id: Some(id.to_owned()),
             attesting_key_id: signer.clone(),
             attested_key_id: Some(signer.clone()),
@@ -500,6 +501,7 @@ pub(crate) mod bodies {
             cohort_scope: cohort_scope::SELF.to_owned(),
             scrub_signature_classical: None,
             scrub_signature_pqc: None,
+        }
         };
         let id_a = format!("i118c-a-row-{s}");
         d.attestation_upsert_local(local(&id_a, &thumb_a))
@@ -508,9 +510,19 @@ pub(crate) mod bodies {
         let got = d.list_derived_hex(&original).await.unwrap();
         assert_eq!(
             got.iter()
-                .map(|r| (r.rendition_sha256_hex.as_str(), r.role.as_str(), r.source_attestation_id.as_str(), r.cohort_scope.as_str()))
+                .map(|r| (
+                    r.rendition_sha256_hex.as_str(),
+                    r.role.as_str(),
+                    r.source_attestation_id.as_str(),
+                    r.cohort_scope.as_str()
+                ))
                 .collect::<Vec<_>>(),
-            vec![(thumb_a.as_str(), "poster", id_a.as_str(), cohort_scope::SELF)],
+            vec![(
+                thumb_a.as_str(),
+                "poster",
+                id_a.as_str(),
+                cohort_scope::SELF
+            )],
             "I118c: the local door projects in the same write"
         );
         // Upsert-replace under the same (attesting, dimension): a NEW
@@ -526,7 +538,10 @@ pub(crate) mod bodies {
         let got = d.list_derived_hex(&original).await.unwrap();
         assert_eq!(
             got.iter()
-                .map(|r| (r.rendition_sha256_hex.as_str(), r.source_attestation_id.as_str()))
+                .map(|r| (
+                    r.rendition_sha256_hex.as_str(),
+                    r.source_attestation_id.as_str()
+                ))
                 .collect::<Vec<_>>(),
             vec![(thumb_b.as_str(), id_b.as_str())],
             "I118c: exactly the replacing row's rendition remains"
@@ -610,7 +625,9 @@ pub(crate) mod bodies {
     {
         use crate::federation::at_rest_cascade::{fresh_dek, seal};
         use crate::federation::blobs::sign_holds_bytes_claim;
-        use crate::federation::key_grant_invariants::two_node::{node_as, seed_community_everywhere};
+        use crate::federation::key_grant_invariants::two_node::{
+            node_as, seed_community_everywhere,
+        };
         use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
         use crate::federation::types::identity_type::NODE;
         use crate::federation::{BlobBody, BlobError, EpochBinding, StorageFloor};
@@ -626,10 +643,14 @@ pub(crate) mod bodies {
         let zero = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, 0)
             .await
             .expect_err("I117d: the signer refuses a zero size");
-        assert!(matches!(zero, BlobError::InvalidArgument(_)), "I117d: {zero}");
-        let wrong = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, len + 1)
-            .await
-            .unwrap();
+        assert!(
+            matches!(zero, BlobError::InvalidArgument(_)),
+            "I117d: {zero}"
+        );
+        let wrong =
+            sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, len + 1)
+                .await
+                .unwrap();
         let err = b
             .put_blob_with_scope(
                 None,
@@ -669,9 +690,13 @@ pub(crate) mod bodies {
         // The adopt door, at the sealed community shape.
         let comm = format!("i117d-comm-{s}");
         seed_community_everywhere(&[&n], &comm, &[(&format!("i117d-m-{s}"), Some(&n))]).await;
-        let envelope = seal(&fresh_dek().unwrap(), format!("i117d sealed {s}").as_bytes(), None)
-            .unwrap()
-            .to_bytes();
+        let envelope = seal(
+            &fresh_dek().unwrap(),
+            format!("i117d sealed {s}").as_bytes(),
+            None,
+        )
+        .unwrap()
+        .to_bytes();
         let elen = envelope.len() as u64;
         let esha: [u8; 32] = {
             use sha2::Digest as _;
@@ -684,9 +709,16 @@ pub(crate) mod bodies {
                 epoch: 0,
             })
         };
-        let wrong = sign_holds_bytes_claim(&n.signer, &esha, &n.key, uuid::Uuid::new_v4(), now, elen + 1)
-            .await
-            .unwrap();
+        let wrong = sign_holds_bytes_claim(
+            &n.signer,
+            &esha,
+            &n.key,
+            uuid::Uuid::new_v4(),
+            now,
+            elen + 1,
+        )
+        .await
+        .unwrap();
         let err = b
             .adopt_sealed_blob_at(
                 envelope.clone(),
@@ -698,7 +730,9 @@ pub(crate) mod bodies {
                 Some(wrong),
             )
             .await
-            .expect_err("I117d: the adopt door refuses an announce whose size is not the sealed length");
+            .expect_err(
+                "I117d: the adopt door refuses an announce whose size is not the sealed length",
+            );
         assert!(
             matches!(err, BlobError::InvalidArgument(_)) && err.to_string().contains("AV-89"),
             "I117d: {err}"
@@ -707,9 +741,10 @@ pub(crate) mod bodies {
             b.blob_cohort_scope(&esha).await.unwrap().is_none(),
             "I117d: a refused adopt stores nothing"
         );
-        let right = sign_holds_bytes_claim(&n.signer, &esha, &n.key, uuid::Uuid::new_v4(), now, elen)
-            .await
-            .unwrap();
+        let right =
+            sign_holds_bytes_claim(&n.signer, &esha, &n.key, uuid::Uuid::new_v4(), now, elen)
+                .await
+                .unwrap();
         let got = b
             .adopt_sealed_blob_at(
                 envelope,
@@ -752,7 +787,11 @@ pub(crate) mod bodies {
         let err = check_promotion_admission(d, &bad, None)
             .await
             .expect_err("I119b: the chokepoint refuses a malformed struct");
-        assert_eq!(err.kind(), "federation_media_source_invalid", "I119b: {err}");
+        assert_eq!(
+            err.kind(),
+            "federation_media_source_invalid",
+            "I119b: {err}"
+        );
         let good = media_row(
             &format!("i119b-good-{s}"),
             &signer,
@@ -786,7 +825,11 @@ pub(crate) mod bodies {
         let err = check_promotion_admission(d, &sizeless, None)
             .await
             .expect_err("I119b: the chokepoint refuses a size-less holder claim");
-        assert_eq!(err.kind(), "federation_media_source_invalid", "I119b: {err}");
+        assert_eq!(
+            err.kind(),
+            "federation_media_source_invalid",
+            "I119b: {err}"
+        );
         assert!(err.to_string().contains("size"), "I119b: {err}");
     }
 

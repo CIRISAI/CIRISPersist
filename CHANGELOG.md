@@ -63,10 +63,16 @@ threat-model citations because this crate's audit story is the point.
   sqlite and postgres where a directory is involved: every refusal by name
   and the admissions; the citation rule and the bare-sha pin; the
   size-less claim refused and the two doors' claims carrying the stored
-  length across two backends (the #870 delivery shape); the rendition index
-  projected, read, retired, and its placement rule; from disk: the gate at
-  every door, the vocabulary entry, the doors storing size + format, the
-  deliberate re-pin.
+  length across two backends (the #870 delivery shape); AV-89's refusal
+  itself at both blob doors (I117d); the rendition index projected, read,
+  retired, its placement rule, and the local door's projection with the
+  upsert-replace retiring the replaced row's (I118c); the promotion
+  chokepoint driven directly with a malformed struct and a size-less
+  claim (I119b); from disk: the gate at every door on live lines only, the
+  vocabulary entry, the doors storing size + format, the deliberate re-pin.
+- Placement is asked through one trait (`renditions::HeldBlobScope`) so
+  the three backends run one gate by one name; memory has no blob store
+  and answers "not held".
 
 ### Recorded, not decided here
 - `content_digest` on sealed scopes (rc5): AAD binding stops substitution;
