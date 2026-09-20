@@ -726,6 +726,50 @@ pub(crate) mod bodies {
         assert_eq!(b.list_holders_sized(&esha).await.unwrap()[0].size, elen);
     }
 
+    /// **I119b — the promotion chokepoint refuses the struct, behaviourally.**
+    /// A local row admitted before this cut carries no guarantee; the crossing
+    /// asks the same gate (`check_promotion_admission`, the one function every
+    /// promotion runs through `plan_enter_mesh`). Driven directly, as the
+    /// bootstrap witnesses drive it: a malformed struct is refused by kind, a
+    /// well-formed one is not refused by THIS kind.
+    pub async fn i119b_the_promotion_chokepoint_refuses_the_struct(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::admission::check_promotion_admission;
+        let (signer, target) = (format!("i119b-s-{s}"), format!("i119b-t-{s}"));
+        ts::register_identity_key(d, &signer, USER).await;
+        ts::register_identity_key(d, &target, USER).await;
+        let digest = hex64(&format!("i119b-{s}"));
+        let bad = media_row(
+            &format!("i119b-bad-{s}"),
+            &signer,
+            &target,
+            &digest,
+            serde_json::json!({"digest": digest, "format": "image/png", "safe": true}),
+            cohort_scope::FEDERATION,
+        );
+        let err = check_promotion_admission(d, &bad, None)
+            .await
+            .expect_err("I119b: the chokepoint refuses a malformed struct");
+        assert_eq!(err.kind(), "federation_media_source_invalid", "I119b: {err}");
+        let good = media_row(
+            &format!("i119b-good-{s}"),
+            &signer,
+            &target,
+            &digest,
+            serde_json::json!({"digest": digest, "size": 7, "format": "image/png"}),
+            cohort_scope::FEDERATION,
+        );
+        if let Err(err) = check_promotion_admission(d, &good, None).await {
+            assert_ne!(
+                err.kind(),
+                "federation_media_source_invalid",
+                "I119b: a well-formed struct is not what the chokepoint refuses: {err}"
+            );
+        }
+    }
+
     /// **I117 (blob half) — the two doors' claims carry the stored length,
     /// and it crosses to a peer.**
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -851,6 +895,13 @@ mod run {
         uuid::Uuid::new_v4().simple().to_string()
     }
 
+    /// The source lines that are not comments, `//` tails removed.
+    fn live_lines(text: &str) -> impl Iterator<Item = &str> {
+        text.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .filter(|l| !l.trim().is_empty())
+    }
+
     /// **I119 — from disk: the gate at every door, the vocabulary lists the
     /// member, and every blob write door stores size + validated format.**
     #[test]
@@ -866,7 +917,11 @@ mod run {
             ("memory.rs", MEM, 2),
             ("admission.rs", ADMISSION, 1),
         ] {
-            let calls = text.matches("check_media_source(").count();
+            // Comment lines do not count: a commented-out call is not a door
+            // (the `store::parity` discipline, applied to this grep).
+            let calls = live_lines(text)
+                .filter(|l| l.contains("check_media_source("))
+                .count();
             assert!(
                 calls >= n,
                 "I119: {name} runs the media gate at its doors ({calls} < {n})"
@@ -893,7 +948,7 @@ mod run {
                     "I119: {name} {door} stores the size"
                 );
                 assert!(
-                    body.contains("index_holder_claim("),
+                    live_lines(body).any(|l| l.contains("index_holder_claim(")),
                     "I119: {name} {door} indexes the claim (#870)"
                 );
             }
@@ -928,6 +983,12 @@ mod run {
                 async fn i118() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i118_the_rendition_index(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i119b() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i119b_the_promotion_chokepoint_refuses_the_struct(&b, &super::suffix())
+                        .await
                 }
                 #[tokio::test]
                 async fn i118c() {

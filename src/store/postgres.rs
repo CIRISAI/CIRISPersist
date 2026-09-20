@@ -19577,13 +19577,13 @@ where
 ///
 /// **Call sites (the door bodies, in the SAME client/transaction as the row
 /// insert):** `put_attestation_with_origin` (beside
-/// `pg_project_consent_peer_set`), `pg_write_local_attestation` (beside its
-/// `pg_project_attestation_subjects`, before `tx.commit()`), and the
-/// promotion door (`enter_mesh`). The retraction fold that removes a row's
-/// projection lives in `pg_project_consent_peer_set` and
-/// `purge_attestation_projections`.
-// TODO(#871 merge): remove the allow once the three doors call this.
-#[allow(dead_code)]
+/// `pg_project_consent_peer_set`) and `pg_write_local_attestation` (beside
+/// its `pg_project_attestation_subjects`, before `tx.commit()`). The
+/// promotion door (`enter_mesh`) updates the row IN PLACE under its id, so
+/// the projection written at the local door is already the federation
+/// row's. The retraction fold that removes a row's projection lives in
+/// `pg_project_consent_peer_set`; the local upsert-replace retires the
+/// replaced row's; `purge_attestation_projections` the purged row's.
 async fn pg_project_rendition_row<C>(
     client: &C,
     row: &crate::federation::Attestation,

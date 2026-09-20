@@ -19113,14 +19113,14 @@ fn sqlite_project_consent_peer_set(
 /// that projects nothing is left alone.
 ///
 /// **Call sites (the door bodies, in the SAME write as the row insert):**
-/// `put_attestation_with_origin` (beside `sqlite_project_consent_peer_set`),
-/// `sqlite_write_local_attestation` (beside its
-/// `sqlite_project_attestation_subjects`), and the promotion door
-/// (`enter_mesh`, in the UPDATE's write closure). The retraction fold that
-/// removes a row's projection lives in `sqlite_project_consent_peer_set` and
-/// `purge_attestation_projections`.
-// TODO(#871 merge): remove the allow once the three doors call this.
-#[allow(dead_code)]
+/// `put_attestation_with_origin` (beside `sqlite_project_consent_peer_set`)
+/// and `sqlite_write_local_attestation` (beside its
+/// `sqlite_project_attestation_subjects`). The promotion door (`enter_mesh`)
+/// updates the row IN PLACE under its id, so the projection written at the
+/// local door is already the federation row's. The retraction fold that
+/// removes a row's projection lives in `sqlite_project_consent_peer_set`; the
+/// local upsert-replace retires the replaced row's;
+/// `purge_attestation_projections` the purged row's.
 fn sqlite_project_rendition_row(
     conn: &rusqlite::Connection,
     row: &crate::federation::Attestation,

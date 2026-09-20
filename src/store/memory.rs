@@ -731,12 +731,13 @@ fn transport_destination_rows(state: &State) -> Vec<(String, chrono::DateTime<ch
 /// A row that projects nothing is left alone.
 ///
 /// **Call sites (the door bodies, in the SAME lock as the row insert):**
-/// `put_attestation_with_origin`, `memory_write_local_attestation`, and the
-/// promotion door (`enter_mesh`). The retraction fold that removes a row's
-/// projection lives with `consent_peer_set`'s in `put_attestation_with_origin`
-/// and in `purge_attestation_projections`.
-// TODO(#871 merge): remove the allow once the three doors call this.
-#[allow(dead_code)]
+/// `put_attestation_with_origin` and `memory_write_local_attestation`. The
+/// promotion door (`enter_mesh`) updates the row IN PLACE under its id, so the
+/// projection written at the local door is already the federation row's. The
+/// retraction fold that removes a row's projection lives with
+/// `consent_peer_set`'s in `put_attestation_with_origin`, the local
+/// upsert-replace retires the replaced row's, and
+/// `purge_attestation_projections` the purged row's.
 fn project_rendition_row(state: &mut State, row: &crate::federation::Attestation) {
     if let Some(r) = crate::federation::renditions::rendition_of_row(row) {
         state
