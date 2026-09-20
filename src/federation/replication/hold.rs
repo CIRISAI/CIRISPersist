@@ -112,19 +112,16 @@ pub async fn audience_memberships<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let principal = directory.active_identity_for_occurrence(our_key_id).await?;
+    // v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §3) — EVERY
+    // principal, plus the node's own key: a shared device is party to both
+    // humans' rooms, and the node's own memberships were always its own.
+    let mut keys = directory
+        .active_identities_for_occurrence(our_key_id)
+        .await?;
+    keys.push(our_key_id.to_owned());
     let mut out = HashSet::new();
-    for c in directory
-        .list_communities_for_member_active(&principal)
-        .await?
-    {
-        out.insert(c.community_key_id);
-    }
-    if principal != our_key_id {
-        for c in directory
-            .list_communities_for_member_active(our_key_id)
-            .await?
-        {
+    for key in keys {
+        for c in directory.list_communities_for_member_active(&key).await? {
             out.insert(c.community_key_id);
         }
     }

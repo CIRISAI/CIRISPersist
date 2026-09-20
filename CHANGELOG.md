@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [45.0.1] - 2026-09-20
+
+### Fixed — an occurrence resolves to its PRINCIPAL, deterministically (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md`)
+- `active_identity_for_occurrence` answered the NODE for every claimed node:
+  `lookup_identity_for_occurrence` was a `LIMIT 1` with no `ORDER BY` on
+  sqlite and postgres (and a HashMap walk on memory), so with the boot
+  singleton and the owner's login anchor both present it drew the singleton
+  written first. `audience_memberships` then asked the roster about the
+  instrument, and `would_hold` refused every community blob a non-author
+  pulled — `NotPartyTo` on a room the owner founded. Now: the principal is
+  the ACTIVE non-singleton binding (newest `asserted_at` first, then key),
+  the singleton is the fallback, and the historical lookup carries the same
+  order on every backend. A revoked anchor still returns the device to
+  itself (v38.2.0, unchanged).
+- **`active_identities_for_occurrence(occ) -> Vec<String>`** (new trait
+  default): every live principal in that order. `audience_memberships`
+  unions over all of them and the node's own key — a shared device is party
+  to both humans' rooms. Write admission keeps the single-valued resolver,
+  now deterministic: a shared device writes as its newest-anchored human
+  (the login anchor is re-asserted at login).
+- Witnesses I121–I125 (`federation::occurrence_principal_invariants`) on
+  memory, sqlite and postgres: the owner resolved regardless of insertion
+  order; `would_hold` admits through the owner and still refuses a room the
+  owner is not in; a revoked anchor refused again; two anchors party to
+  both; from disk: no unordered `LIMIT 1` at this site, the audience walk
+  asks the plural.
+
 ## [45.0.0] - 2026-09-19
 
 ### BREAKING — size is REQUIRED on every holder claim; the envelope vocabulary re-pins (CIRISPersist#871, `FSD/MEDIA_SOURCE.md`)

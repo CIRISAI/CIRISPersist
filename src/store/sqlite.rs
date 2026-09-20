@@ -6676,7 +6676,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         hardware_attestation, asserted_at, valid_until, persist_row_hash, \
                         pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
                      FROM federation_identity_occurrences \
-                     WHERE occurrence_key_id = ?1 LIMIT 1",
+                     WHERE occurrence_key_id = ?1 \
+                     ORDER BY (identity_key_id = occurrence_key_id) ASC, \
+                              asserted_at DESC, identity_key_id ASC \
+                     LIMIT 1",
                     [&key],
                     sqlite_row_to_identity_occurrence,
                 )

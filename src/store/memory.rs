@@ -5464,10 +5464,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         occurrence_key_id: &str,
     ) -> Result<Option<crate::federation::IdentityOccurrence>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        // v45.0.1 (#873) — the SQL backends' order, not the map's: the
+        // non-singleton binding first, newest `asserted_at`, then key.
         Ok(state
             .federation_identity_occurrences
             .values()
-            .find(|o| o.occurrence_key_id == occurrence_key_id)
+            .filter(|o| o.occurrence_key_id == occurrence_key_id)
+            .min_by(|a, b| {
+                (a.identity_key_id == a.occurrence_key_id)
+                    .cmp(&(b.identity_key_id == b.occurrence_key_id))
+                    .then_with(|| b.asserted_at.cmp(&a.asserted_at))
+                    .then_with(|| a.identity_key_id.cmp(&b.identity_key_id))
+            })
             .cloned())
     }
 
