@@ -206,6 +206,21 @@ pub(crate) mod bodies {
         holds(d, &node, &comm, &other)
             .await
             .expect("I122: party to a room the owner founded — the #873 refusal is gone");
+        // The node's OWN roster membership is still its own: a room that
+        // lists the node itself (an infrastructure co-op) is in its audience
+        // with no principal involved.
+        let own_room = format!("i122-own-{s}");
+        room(d, &own_room, &[&node, &other]).await;
+        let memberships = crate::federation::replication::hold::audience_memberships(d, &node)
+            .await
+            .unwrap();
+        assert!(
+            memberships.contains(&own_room),
+            "I122: the node's own memberships are not lost to the principal walk: {memberships:?}"
+        );
+        holds(d, &node, &own_room, &other)
+            .await
+            .expect("I122: party in its own right");
         // A room the owner is NOT in stays refused: the fix widened nothing.
         let stranger_room = format!("i122-elsewhere-{s}");
         room(d, &stranger_room, &[&other]).await;
