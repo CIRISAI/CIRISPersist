@@ -87,6 +87,10 @@ pub mod holder_claim_index_invariants;
 // claim, the rendition index.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod media_source_invariants;
+// CIRISPersist#873 (`FSD/OCCURRENCE_PRINCIPAL.md`) — I121–I125: an occurrence resolves to its
+// principal, deterministically; the audience walk unions every principal.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod occurrence_principal_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.

@@ -1,0 +1,90 @@
+# The principal of an occurrence — resolved, not drawn (CIRISPersist#873)
+
+v45.0.1 (PATCH). Status: normative for persist's occurrence → identity
+resolvers and the hold-side audience question. Fixes CIRISPersist#873.
+
+## 1. The shape that broke
+
+Every claimed node carries TWO rows in `federation_identity_occurrences`
+for its own key: the boot **singleton** (`identity = node, occurrence =
+node`, the row that carries its content-KEM pubkeys) and the owner's
+**login anchor** (`identity = human, occurrence = node`, CIRISServer's
+`anchor_agent_to_owner`, 0.5.211: the node as an occurrence of the human).
+Both are correct by design. Boot precedes claim, so the singleton is always
+written first.
+
+`lookup_identity_for_occurrence` was `WHERE occurrence_key_id = ? LIMIT 1`
+with no `ORDER BY` on sqlite and postgres, and `.values().find()` over a
+HashMap on memory. It returned the singleton (or, on memory, either row,
+run to run). `active_identity_for_occurrence` confirmed that row active and
+answered **the node**. `audience_memberships` (`replication/hold.rs`, #846)
+then asked the roster about the instrument instead of the principal, and
+`would_hold` refused every community blob a non-author pulled: `NotPartyTo`
+on a room the owner founded. The write side never hit it because
+`admission_identity_for_writer` (#765) falls back to `owner_of` when the
+occurrence resolves to itself — a guarantee that was not carried to the
+hold site.
+
+## 2. The rule (stated once)
+
+**An occurrence's principal is its ACTIVE non-singleton binding.** Among the
+rows for `occurrence_key_id`, keep those whose identity's active fold
+(`list_identity_occurrences_active`, the #421 re-assert semantics) still
+contains this occurrence; of those, the ones with `identity_key_id !=
+occurrence_key_id` are the **principals**; the singleton is the fallback
+when there is none. A revoked anchor is not active, so the device is its
+own key again — the v38.2.0 semantics, unchanged.
+
+**Order is part of the answer.** Principals are ordered newest
+`asserted_at` first, then `identity_key_id` ascending. The login anchor is
+re-asserted at each login (`self_at_login`), so the newest binding is the
+human currently at the keyboard. This is the rule the single-valued
+resolver applies; it is deterministic on every backend and identical on
+every backend.
+
+## 3. Surface
+
+| symbol | change |
+|---|---|
+| `FederationDirectory::active_identities_for_occurrence(occ) -> Vec<String>` | NEW, default impl over `list_identity_occurrences_by_occurrence_key` + the active fold; every principal in §2 order; empty when the occurrence has no live non-singleton binding |
+| `FederationDirectory::active_identity_for_occurrence(occ) -> String` | now the FIRST of the plural, else `occ` — deterministic; callers unchanged (`admission_identity_for_writer`, the three `Backend::resolve_identity_for_occurrence`s, `audience_memberships`) |
+| `FederationDirectory::lookup_identity_for_occurrence(occ)` | keeps its historical-row contract, ordered: non-singleton first, newest `asserted_at`, then `identity_key_id` — `ORDER BY` on sqlite and postgres, a sort on memory. A `LIMIT 1` without an order is the defect class; none remains at this site (from-disk) |
+| `replication::hold::audience_memberships(our_key_id)` | unions the active memberships of EVERY principal AND of `our_key_id` itself (a shared device is party to both humans' rooms; the node's own memberships were already included) |
+| `admission_identity_for_writer` | unchanged in text; now deterministic by §2. A shared device writes as its newest-anchored human. Not a refusal: the anchor is re-asserted at login, so "newest" is a fact the node itself signed, not a coin toss |
+
+No wire change, no migration, no vocabulary change. PATCH.
+
+## 4. Invariants
+
+- **I121** (3 backends) — singleton then anchor, in that order:
+  `active_identity_for_occurrence(node) == owner`;
+  `lookup_identity_for_occurrence(node)` is the anchor row. Anchor then
+  singleton: the same answers (order of insertion is not the order of
+  the answer).
+- **I122** (sqlite, postgres) — `would_hold` admits community content of a
+  room the owner is an active member of, for a node with both rows;
+  `audience_memberships(node)` contains the room.
+- **I123** (3 backends) — revoking the anchor (an
+  `IdentityOccurrenceRevocation` effective now) returns the node to its
+  singleton: the resolver answers the node, `audience_memberships` no longer
+  contains the owner's room, and `would_hold` refuses `NotPartyTo` again.
+- **I124** (3 backends) — two live anchors (two humans, asserted at
+  different instants): the plural lists both, newest first; the single
+  resolver answers the newest; `audience_memberships` contains both
+  humans' rooms.
+- **I125** (from disk) — the `lookup_identity_for_occurrence` bodies in
+  sqlite.rs and postgres.rs contain `ORDER BY`; `hold.rs`'s
+  `audience_memberships` calls `active_identities_for_occurrence`.
+
+Mutations: drop the non-singleton preference (I121/I122 red); drop the
+`ORDER BY` on each backend (I121 red where the singleton was written
+first); drop the union (I124 red); drop the active filter (I123 red).
+
+## 5. Not in scope
+
+A refusal for a multi-principal WRITER. Considered and not taken: the
+newest login anchor is a signed fact about who is at the keyboard, and a
+refusal would brick every shared device's community writes. If a
+deployment needs single-principal devices, that is an admission gate on
+the anchor plane (a sibling of `check_single_node_owner_admission`), filed
+separately if asked.
