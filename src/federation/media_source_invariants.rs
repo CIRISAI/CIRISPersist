@@ -600,6 +600,132 @@ pub(crate) mod bodies {
         .expect("I118b: same scope as the original");
     }
 
+    /// **I117d (blob half) — AV-89 at both doors: a claim whose `size` is
+    /// not the byte length the door stores is refused before anything is
+    /// written; the signer refuses a zero size outright; the same claim with
+    /// the true length is admitted (the control).**
+    pub async fn i117d_a_claim_with_the_wrong_size_is_refused<B>(b: &B, s: &str)
+    where
+        B: crate::federation::BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::{fresh_dek, seal};
+        use crate::federation::blobs::sign_holds_bytes_claim;
+        use crate::federation::key_grant_invariants::two_node::{node_as, seed_community_everywhere};
+        use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+        use crate::federation::types::identity_type::NODE;
+        use crate::federation::{BlobBody, BlobError, EpochBinding, StorageFloor};
+        let n = node_as(b, &format!("i117d-n-{s}"), NODE).await;
+        let now = chrono::Utc::now();
+        // The put door.
+        let bytes = format!("i117d public bytes {s}").into_bytes();
+        let len = bytes.len() as u64;
+        let sha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&bytes).into()
+        };
+        let zero = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, 0)
+            .await
+            .expect_err("I117d: the signer refuses a zero size");
+        assert!(matches!(zero, BlobError::InvalidArgument(_)), "I117d: {zero}");
+        let wrong = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, len + 1)
+            .await
+            .unwrap();
+        let err = b
+            .put_blob_with_scope(
+                None,
+                &sha,
+                BlobBody::Inline(bytes.clone()),
+                None,
+                wrong,
+                cohort_scope::FEDERATION,
+                StorageFloor::resolved(CryptoTier::Plaintext),
+            )
+            .await
+            .expect_err("I117d: the put door refuses a claim whose size is not the stored length");
+        assert!(
+            matches!(err, BlobError::InvalidArgument(_)) && err.to_string().contains("AV-89"),
+            "I117d: {err}"
+        );
+        assert!(
+            b.blob_cohort_scope(&sha).await.unwrap().is_none()
+                && b.list_holders_sized(&sha).await.unwrap().is_empty(),
+            "I117d: a refused put stores nothing and announces nothing"
+        );
+        let right = sign_holds_bytes_claim(&n.signer, &sha, &n.key, uuid::Uuid::new_v4(), now, len)
+            .await
+            .unwrap();
+        b.put_blob_with_scope(
+            None,
+            &sha,
+            BlobBody::Inline(bytes),
+            None,
+            right,
+            cohort_scope::FEDERATION,
+            StorageFloor::resolved(CryptoTier::Plaintext),
+        )
+        .await
+        .expect("I117d: the true length is admitted");
+        assert_eq!(b.list_holders_sized(&sha).await.unwrap()[0].size, len);
+        // The adopt door, at the sealed community shape.
+        let comm = format!("i117d-comm-{s}");
+        seed_community_everywhere(&[&n], &comm, &[(&format!("i117d-m-{s}"), Some(&n))]).await;
+        let envelope = seal(&fresh_dek().unwrap(), format!("i117d sealed {s}").as_bytes(), None)
+            .unwrap()
+            .to_bytes();
+        let elen = envelope.len() as u64;
+        let esha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&envelope).into()
+        };
+        let binding = || {
+            Some(EpochBinding {
+                community_key_id: comm.clone(),
+                minter_key_id: n.key.clone(),
+                epoch: 0,
+            })
+        };
+        let wrong = sign_holds_bytes_claim(&n.signer, &esha, &n.key, uuid::Uuid::new_v4(), now, elen + 1)
+            .await
+            .unwrap();
+        let err = b
+            .adopt_sealed_blob_at(
+                envelope.clone(),
+                None,
+                COMMUNITY,
+                &n.key,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                binding(),
+                Some(wrong),
+            )
+            .await
+            .expect_err("I117d: the adopt door refuses an announce whose size is not the sealed length");
+        assert!(
+            matches!(err, BlobError::InvalidArgument(_)) && err.to_string().contains("AV-89"),
+            "I117d: {err}"
+        );
+        assert!(
+            b.blob_cohort_scope(&esha).await.unwrap().is_none(),
+            "I117d: a refused adopt stores nothing"
+        );
+        let right = sign_holds_bytes_claim(&n.signer, &esha, &n.key, uuid::Uuid::new_v4(), now, elen)
+            .await
+            .unwrap();
+        let got = b
+            .adopt_sealed_blob_at(
+                envelope,
+                None,
+                COMMUNITY,
+                &n.key,
+                StorageFloor::resolved(CryptoTier::CommunityDek),
+                binding(),
+                Some(right),
+            )
+            .await
+            .expect("I117d: the true sealed length is admitted");
+        assert_eq!(got, esha);
+        assert_eq!(b.list_holders_sized(&esha).await.unwrap()[0].size, elen);
+    }
+
     /// **I117 (blob half) — the two doors' claims carry the stored length,
     /// and it crosses to a peer.**
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -822,6 +948,11 @@ mod run {
                     let Some(a) = $fresh.await else { return };
                     let Some(b) = $fresh.await else { return };
                     bodies::i117b_the_doors_carry_the_stored_length(&a, &b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i117d() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i117d_a_claim_with_the_wrong_size_is_refused(&b, &super::suffix()).await
                 }
                 #[tokio::test]
                 async fn i118b() {
