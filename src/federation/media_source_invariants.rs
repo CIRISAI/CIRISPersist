@@ -768,6 +768,26 @@ pub(crate) mod bodies {
                 "I119b: a well-formed struct is not what the chokepoint refuses: {err}"
             );
         }
+        // The holder claim's size, carried to the same site: a `holds_bytes`
+        // row without `size` does not cross either.
+        let sha: [u8; 32] = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(format!("i119b-bytes-{s}").as_bytes()).into()
+        };
+        let mut sizeless = row(
+            &format!("i119b-sizeless-{s}"),
+            &signer,
+            &signer,
+            serde_json::json!({"kind": "holds_bytes", "evidence_refs": [hex::encode(sha)]}),
+            cohort_scope::FEDERATION,
+        );
+        sizeless.attestation_type = crate::federation::holds_bytes_attestation_type(&sha);
+        ts::reseal(&mut sizeless);
+        let err = check_promotion_admission(d, &sizeless, None)
+            .await
+            .expect_err("I119b: the chokepoint refuses a size-less holder claim");
+        assert_eq!(err.kind(), "federation_media_source_invalid", "I119b: {err}");
+        assert!(err.to_string().contains("size"), "I119b: {err}");
     }
 
     /// **I117 (blob half) — the two doors' claims carry the stored length,
