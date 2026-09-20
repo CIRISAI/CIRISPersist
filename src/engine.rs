@@ -2066,6 +2066,31 @@ impl Engine {
         }
     }
 
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4; #863 ask 1) —
+    /// **the LocalOnly plaintext door**: keep commons bytes this node
+    /// verified itself (size first, then digest — CC 5.3.2.5), announcing
+    /// nothing. Fixed at `cohort_scope = federation`, `crypto_tier =
+    /// plaintext`; content-address checked; no `holds_bytes` claim. A thin
+    /// dispatch onto
+    /// [`BlobStorage::store_plaintext_local`](crate::federation::BlobStorage::store_plaintext_local).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn store_plaintext_local(
+        &self,
+        sha256: &[u8; 32],
+        bytes: Vec<u8>,
+        media_type: Option<&str>,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobStorage as _;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.store_plaintext_local(sha256, bytes, media_type).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.store_plaintext_local(sha256, bytes, media_type).await,
+        }
+    }
+
     /// v3.4.0 (CIRISPersist#123) — delete one blob row by SHA from
     /// the underlying backend.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -12338,8 +12363,13 @@ mod tests {
         let now =
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let attestation_id = uuid::Uuid::new_v4();
-        let envelope =
-            holds_bytes_attestation_envelope(&sha, &signer_alias, &attestation_id.to_string(), now);
+        let envelope = holds_bytes_attestation_envelope(
+            &sha,
+            &signer_alias,
+            &attestation_id.to_string(),
+            now,
+            bytes.len() as u64,
+        );
         let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
         engine
@@ -12798,8 +12828,13 @@ mod tests {
         let now =
             crate::federation::admission::truncate_to_substrate_resolution(chrono::Utc::now());
         let attestation_id = uuid::Uuid::new_v4();
-        let envelope =
-            holds_bytes_attestation_envelope(&sha, &key_id, &attestation_id.to_string(), now);
+        let envelope = holds_bytes_attestation_envelope(
+            &sha,
+            &key_id,
+            &attestation_id.to_string(),
+            now,
+            ext.size_bytes,
+        );
         let gate_canonical = ceg_produce_canonicalize(&envelope).expect("ceg produce canonicalize");
         let expected_hash_hex = hex::encode(Sha256::digest(&gate_canonical));
         engine
@@ -13145,6 +13180,7 @@ mod tests {
                     &uuid::Uuid::new_v4().to_string(),
                     now,
                     now,
+                    1024,
                 )
             })
             .await

@@ -68,6 +68,9 @@ pub mod consent_peer_set;
 pub mod consent_by_humans;
 // v44.8.0 (#866) — the scope token grammar: one parser, one covering rule, the door gate.
 pub mod consent_scope;
+// v45.0.0 (#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media Source struct grammar: one parser,
+// the CC 3.3.13 MUST-NOT list, the door gate, `size` on the holder claim.
+pub mod media_source;
 // v44.8.0 (#866 C3) — the substrate records a lapsed grant as `consent:state:expired`.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod consent_by_humans_invariants;
@@ -80,6 +83,10 @@ pub mod consent_scope_invariants;
 pub mod crossing;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod holder_claim_index_invariants;
+// CIRISPersist#871 (`FSD/MEDIA_SOURCE.md`) — I115–I120: the media Source struct, size on the
+// claim, the rendition index.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod media_source_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -236,6 +243,9 @@ pub struct ConsentSweepReport {
 }
 
 pub mod register;
+// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4–§5) — the rendition
+// index (V149 `blob_renditions`) and the sized holder claim, the pure half.
+pub mod renditions;
 // CIRISPersist#571 — `regime:*` experimental-regime research artifacts:
 // the CC-blocked registry finding + the replication decision.
 pub mod regime;
@@ -913,6 +923,46 @@ pub trait FederationDirectory: Send + Sync {
         let _ = key_id;
         Err(Error::Unsupported {
             method: "list_key_registration_history",
+        })
+    }
+
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
+    /// **the puller's budget read.** Every live `holds_bytes` claim for
+    /// `sha256` with the byte length the holder SIGNED, sorted by `key_id`.
+    /// The selection is `list_holders`'s — the claim's type prefix, the
+    /// full digest in its `evidence_refs`, and the holder's own
+    /// `withdraws` / `recants` folded out — WITHOUT the CEG §10.1.2 freshness
+    /// window (this read answers "what did the holder commit to", the way
+    /// `list_local_holders` does; freshness is the discovery read's axis).
+    /// A claim whose envelope has no positive integer `size` is SKIPPED, not
+    /// an error: the receive door refuses those from this cut on, and a
+    /// legacy row without one is not a holder a puller can budget for.
+    /// Default `Unsupported`; every real backend overrides.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<renditions::HolderClaim>, Error> {
+        let _ = sha256;
+        Err(Error::Unsupported {
+            method: "list_holders_sized",
+        })
+    }
+
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §5, CC 3.3.13) —
+    /// **the rendition index read.** Every V149 `blob_renditions` row whose
+    /// `original_sha256` is `original_sha256_hex` (64 hex characters, else
+    /// `InvalidArgument`), ordered by `rendition_sha256`. The rows were
+    /// projected in the same write that admitted a row carrying
+    /// `media.derived_from` and removed by the retraction fold that retired
+    /// it, so this is a plain read of a fold already done. Default
+    /// `Unsupported`; every real backend overrides.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<renditions::Rendition>, Error> {
+        let _ = original_sha256_hex;
+        Err(Error::Unsupported {
+            method: "list_derived_hex",
         })
     }
 
@@ -6363,6 +6413,24 @@ pub enum Error {
         reason: String,
     },
 
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — a row's
+    /// `media` Source struct did not parse (CC 3.3.13: a missing or
+    /// non-positive `size`, a malformed `format`, a MUST-NOT `safe` /
+    /// `renderable` / tier bit, an unknown member, a `digest` the row does
+    /// not cite in `evidence_refs[]`), or a `holds_bytes` claim carries no
+    /// `size` (CC 5.3.2.5: size is checked first, so a claim without one is
+    /// a claim nobody can check). Refused at every door so a descriptor the
+    /// puller cannot bound its read by is never admitted. `member` names
+    /// WHICH member; `reason` is [`media_source::MediaSourceError`]'s text.
+    #[error("media source member `{member}` refused: {reason}")]
+    MediaSourceInvalid {
+        /// The offending member — a struct member, a MUST-NOT member, an
+        /// unknown key verbatim, or `media` itself when it is not an object.
+        member: String,
+        /// The rule it broke.
+        reason: String,
+    },
+
     /// Row would conflict with an existing row whose content differs.
     /// Idempotent re-submission of the *same* content is OK; this
     /// fires only when the caller is overwriting.
@@ -8118,6 +8186,7 @@ impl Error {
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::ConsentScopeTokenInvalid { .. } => "federation_consent_scope_token_invalid",
+            Error::MediaSourceInvalid { .. } => "federation_media_source_invalid",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",

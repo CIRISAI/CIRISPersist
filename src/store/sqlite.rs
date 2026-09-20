@@ -3740,6 +3740,93 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .collect()
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
+    /// `holds_bytes` claim for `sha256` (type prefix, then the full digest
+    /// confirmed in `evidence_refs`), the holder's own `withdraws` /
+    /// `recants` folded out by the same `NOT EXISTS` `list_holders` uses, no
+    /// freshness window; a claim with no positive `size` is skipped. Sorted
+    /// by key; one entry per holder.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let candidates = self
+            .read(
+                move |conn| -> Result<Vec<(String, String)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT a.attesting_key_id, a.attestation_envelope \
+                     FROM federation_attestations a \
+                     WHERE a.attestation_type = ?1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM federation_attestations w \
+                         WHERE w.attestation_type IN (?2, ?3) \
+                           AND w.attesting_key_id = a.attesting_key_id \
+                           AND json_extract(w.attestation_envelope, '$.references_attestation_id') \
+                               = a.attestation_id \
+                       ) \
+                     ORDER BY a.attesting_key_id ASC, a.attestation_id ASC",
+                    )?;
+                    let rows = stmt.query_map(
+                        rusqlite::params![
+                            attestation_type,
+                            crate::federation::types::attestation_type::WITHDRAWS,
+                            crate::federation::types::attestation_type::RECANTS,
+                        ],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )?;
+                    rows.collect()
+                },
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_holders_sized: {e}")))?;
+        Ok(crate::federation::renditions::sized_holder_claims(
+            &full_hex,
+            candidates
+                .into_iter()
+                .filter_map(|(k, t)| serde_json::from_str(&t).ok().map(|v| (k, v))),
+        ))
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
+    /// SELECT over V149 `blob_renditions`, ordered by `rendition_sha256`.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let original = crate::federation::renditions::decode_sha256_hex(original_sha256_hex)?;
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::renditions::Rendition>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT rendition_sha256, original_sha256, format, size, width, height, \
+                            role, source_attestation_id, cohort_scope \
+                     FROM blob_renditions WHERE original_sha256 = ?1 \
+                     ORDER BY rendition_sha256 ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![original.to_vec()], |r| {
+                    let size: i64 = r.get("size")?;
+                    let width: Option<i64> = r.get("width")?;
+                    let height: Option<i64> = r.get("height")?;
+                    Ok(crate::federation::renditions::Rendition {
+                        rendition_sha256_hex: hex::encode(r.get::<_, Vec<u8>>("rendition_sha256")?),
+                        original_sha256_hex: hex::encode(r.get::<_, Vec<u8>>("original_sha256")?),
+                        format: r.get("format")?,
+                        size: u64::try_from(size).unwrap_or(0),
+                        width: width.and_then(|w| u32::try_from(w).ok()),
+                        height: height.and_then(|h| u32::try_from(h).ok()),
+                        role: r.get("role")?,
+                        source_attestation_id: r.get("source_attestation_id")?,
+                        cohort_scope: r.get("cohort_scope")?,
+                    })
+                })?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_derived_hex: {e}")))
+    }
+
     // v19.1.0 (#490) — the authenticated re-anchor. Re-verifies the bundle
     // quorum INTERNALLY (own roster + pinned keys) before any write; the
     // record must be one the bundle carries; identity + anti-rollback
@@ -4550,6 +4637,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // must parse (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4): never admit
         // a token the fold cannot match. Pure; same gate at every door.
         crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
+        // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media
+        // Source struct is refused by member name, and a `holds_bytes` claim
+        // without a positive `size` is refused: a descriptor a puller cannot
+        // budget by is not admitted. Pure; the same gate at every door.
+        crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
+        crate::federation::media_source::check_holder_claim_size(
+            &row.attestation_envelope,
+            &row.attestation_type,
+        )?;
 
         // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries
@@ -4973,6 +5069,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule: a rendition (`media.derived_from`) whose original THIS node
+        // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
+        // reads the blob store, so it sits with the other state-reading gates.
+        // Backend-symmetric; memory holds no blobs and answers "not held".
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &row.attestation_envelope,
+            &row.cohort_scope,
+        )
+        .await?;
 
         // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
         // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
@@ -5158,6 +5265,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // projection (grant upsert / withdraws-revocation fold) in the
             // SAME locked scope as the insert above.
             sqlite_project_consent_peer_set(conn, &row)?;
+            // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+            // `blob_renditions` projection in the SAME locked scope.
+            sqlite_project_rendition_row(conn, &row)?;
             Ok(true)
         }).await
         .map_err(|e| {
@@ -5912,6 +6022,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )?;
             guard.execute(
                 "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
+                rusqlite::params![id],
+            )?;
+            // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+            guard.execute(
+                "DELETE FROM blob_renditions WHERE source_attestation_id = ?1",
                 rusqlite::params![id],
             )?;
             Ok(())
@@ -12597,6 +12712,20 @@ fn parse_ledger_instant(t: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|n| n.and_utc())
 }
 
+/// v45.0.0 (CIRISPersist#871, FSD §5) — what the placement gate asks: the
+/// cohort this node holds a blob under, from the blob row the write NAMED.
+impl crate::federation::renditions::HeldBlobScope for SqliteBackend {
+    async fn held_blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::BlobStorage as _;
+        self.blob_cohort_scope(sha256)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("held blob cohort_scope: {e}")))
+    }
+}
+
 impl crate::federation::BlobStorage for SqliteBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -12709,12 +12838,25 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // REBUILDS the caller's bytes here rather than storing bytes it was
         // handed, so the builder is what makes "the caller signed the row we
         // are storing" a checkable statement instead of an assumption.
+        // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
+        // the length of the bytes this door stores. Checked BEFORE the rebuild
+        // so the refusal names the size, not a hash: a holder that announces
+        // one length and holds another is refused here, never advertised.
+        if attestation.size != body.size_bytes() {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "holds_bytes claim declares size {} but the stored bytes are {} \
+                 (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                attestation.size,
+                body.size_bytes()
+            )));
+        }
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
             sha256,
             &attestation.attesting_key_id,
             &attestation.attestation_id,
             attestation.asserted_at,
+            attestation.size,
         );
         attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
         attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
@@ -15170,6 +15312,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
             )
         })?;
+        // v45.0.0 (CIRISPersist#871, AV-89) — the announce's declared size must
+        // be the length of the sealed bytes this door stores.
+        if let Some(a) = &announce {
+            if a.size != envelope_bytes.len() as u64 {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "holds_bytes claim declares size {} but the adopted bytes are {} \
+                     (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                    a.size,
+                    envelope_bytes.len()
+                )));
+            }
+        }
         // The holder claim is admitted on the same terms as `put_blob`'s.
         let prepared = match announce.as_ref() {
             Some(a) => Some(crate::federation::blobs::prepare_holds_bytes_row(
@@ -18368,6 +18522,10 @@ impl SqliteBackend {
         // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
         // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
         crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
+        // v45.0.0 (CIRISPersist#871) — the media Source struct gate, at the local
+        // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
+        // holder claim, so only the struct is checked here.
+        crate::federation::media_source::check_media_source(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
@@ -18431,6 +18589,17 @@ impl SqliteBackend {
                 .attested_key_id
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
+        )
+        .await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule at the local door: a rendition (`media.derived_from`) whose
+        // original THIS node holds must name the original's own
+        // `cohort_scope`. Reads the blob store, so it sits with the other
+        // directory-reading gates, before the write. Backend-symmetric.
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &envelope_value,
+            &input.cohort_scope,
         )
         .await?;
 
@@ -18540,6 +18709,16 @@ impl SqliteBackend {
                 // (occurrence, dimension). History is carried by the
                 // `supersedes` composer, not by retaining stale current
                 // state (CIRISAgent review).
+                // v45.0.0 (#871) — a replaced row's rendition leaves the V149
+                // index with it (no FK: the index is keyed by the rendition's
+                // digest, the row by its id).
+                tx.execute(
+                    "DELETE FROM blob_renditions WHERE source_attestation_id IN (\
+                        SELECT attestation_id FROM federation_attestations \
+                         WHERE attesting_key_id = ?1 AND tier = 'local' \
+                           AND json_extract(attestation_envelope, '$.dimension') = ?2)",
+                    rusqlite::params![attesting_key_id, dimension],
+                )?;
                 tx.execute(
                     "DELETE FROM federation_attestations \
                       WHERE attesting_key_id = ?1 AND tier = 'local' \
@@ -18604,6 +18783,9 @@ impl SqliteBackend {
                 &row,
                 crate::federation::types::attestation_tier::LOCAL,
             )?;
+            // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+            // projection at the local door, in the same transaction.
+            sqlite_project_rendition_row(&tx, &row)?;
             tx.commit()?;
             Ok(())
         })
@@ -18882,6 +19064,11 @@ fn sqlite_project_consent_peer_set(
             "DELETE FROM consent_peer_set_for WHERE source_attestation_id = ?1",
             rusqlite::params![target_id],
         )?;
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        conn.execute(
+            "DELETE FROM blob_renditions WHERE source_attestation_id = ?1",
+            rusqlite::params![target_id],
+        )?;
         return Ok(());
     }
     if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
@@ -18916,6 +19103,60 @@ fn sqlite_project_consent_peer_set(
             )?;
         }
     }
+    Ok(())
+}
+
+/// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149 `blob_renditions`
+/// projection for `row` on the given (already-locked) connection or
+/// transaction: when [`crate::federation::renditions::rendition_of_row`]
+/// answers `Some`, `INSERT OR REPLACE` it keyed by `rendition_sha256`. A row
+/// that projects nothing is left alone.
+///
+/// **Call sites (the door bodies, in the SAME write as the row insert):**
+/// `put_attestation_with_origin` (beside `sqlite_project_consent_peer_set`)
+/// and `sqlite_write_local_attestation` (beside its
+/// `sqlite_project_attestation_subjects`). The promotion door (`enter_mesh`)
+/// updates the row IN PLACE under its id, so the projection written at the
+/// local door is already the federation row's. The retraction fold that
+/// removes a row's projection lives in `sqlite_project_consent_peer_set`; the
+/// local upsert-replace retires the replaced row's;
+/// `purge_attestation_projections` the purged row's.
+fn sqlite_project_rendition_row(
+    conn: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+) -> rusqlite::Result<()> {
+    let Some(r) = crate::federation::renditions::rendition_of_row(row) else {
+        return Ok(());
+    };
+    let rendition = hex::decode(&r.rendition_sha256_hex).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        )))
+    })?;
+    let original = hex::decode(&r.original_sha256_hex).map_err(|e| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        )))
+    })?;
+    conn.execute(
+        "INSERT OR REPLACE INTO blob_renditions \
+            (rendition_sha256, original_sha256, format, size, width, height, role, \
+             source_attestation_id, cohort_scope) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            rendition,
+            original,
+            r.format,
+            i64::try_from(r.size).unwrap_or(i64::MAX),
+            r.width.map(i64::from),
+            r.height.map(i64::from),
+            r.role,
+            r.source_attestation_id,
+            r.cohort_scope,
+        ],
+    )?;
     Ok(())
 }
 
@@ -25888,6 +26129,39 @@ mod tests {
         g
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the sqlite leg of the V149
+    /// `blob_renditions` projection: `sqlite_project_rendition_row` on the
+    /// writer's connection feeds the SAME read-and-fold body memory and
+    /// postgres run (`renditions::witnesses::index_reads_and_folds`).
+    #[tokio::test]
+    async fn blob_renditions_projection_reads_and_folds_871_sqlite() {
+        use crate::federation::renditions::witnesses;
+        use crate::federation::FederationDirectory;
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        let (original, r_hi, r_lo) = witnesses::two_rendition_rows(&b, &s).await;
+        let b = &b;
+        let project = |r: crate::federation::Attestation| async move {
+            b.write(move |conn| sqlite_project_rendition_row(conn, &r))
+                .await
+                .unwrap();
+        };
+        project(r_hi.clone()).await;
+        project(r_lo.clone()).await;
+        // A row that describes no rendition projects nothing.
+        project(crate::federation::media_source_invariants::bodies::row(
+            &format!("871-plain-{s}"),
+            &r_hi.attesting_key_id,
+            &r_hi.attested_key_id,
+            serde_json::json!({"dimension": "x:y:v1", "score": 1.0}),
+            crate::federation::types::cohort_scope::FEDERATION,
+        ))
+        .await;
+        assert_eq!(b.list_derived_hex(&original).await.unwrap().len(), 2);
+        witnesses::index_reads_and_folds(b, &original, &r_hi, &r_lo, project, &s).await;
+    }
+
     /// v21.0.0 (CIRISPersist#502 E7) — the sqlite-path assertion of the
     /// `consent_peer_set` revocation fold (memory-backend witness:
     /// `consent_peer_set_folds_revocation_502e7`). A grant to peer P1 makes
@@ -27172,6 +27446,7 @@ mod tests {
             &t.attesting_key_id.clone(),
             &t.attestation_id.clone(),
             t.asserted_at,
+            1,
         );
         resign_fed(&mut t); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
@@ -38065,6 +38340,7 @@ mod tests {
         attesting_key_id: &str,
         scrub_key_id: &str,
         attestation_id: &str,
+        size: u64,
     ) -> PutBlobAttestation {
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §10.1.2): use Utc::now()
         // so the row lands inside the DEFAULT_HOLDS_BYTES_TTL window
@@ -38081,6 +38357,7 @@ mod tests {
             attestation_id,
             now,
             now,
+            size,
         )
     }
 
@@ -38130,6 +38407,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38157,6 +38435,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    ext.size_bytes,
                 ),
             )
             .await
@@ -38173,13 +38452,14 @@ mod tests {
         let err = backend
             .put_blob(
                 &wrong_sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &wrong_sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38197,13 +38477,14 @@ mod tests {
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38226,13 +38507,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38251,13 +38533,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38455,6 +38738,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38464,13 +38748,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-b",
                     "host-b",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38495,6 +38780,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38504,13 +38790,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38548,6 +38835,7 @@ mod tests {
                     "host-a",
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38570,6 +38858,7 @@ mod tests {
                     "host-b",
                     "host-b",
                     uuid::Uuid::new_v4().to_string().as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38598,6 +38887,7 @@ mod tests {
         scrub_key_id: &str,
         attestation_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        size: u64,
     ) -> PutBlobAttestation {
         crate::federation::blobs::sealed_put_blob_attestation(
             sha256,
@@ -38610,6 +38900,7 @@ mod tests {
             // it is testing, but the two are one value here.
             scrub_timestamp,
             scrub_timestamp,
+            size,
         )
     }
 
@@ -38632,7 +38923,7 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation_at(
                     &sha,
@@ -38640,6 +38931,7 @@ mod tests {
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
                     backdated,
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38676,9 +38968,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", holds_id.as_str()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    holds_id.as_str(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -38730,7 +39028,7 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation_at(
                     &sha,
@@ -38738,6 +39036,7 @@ mod tests {
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
                     backdated,
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38761,7 +39060,7 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation_at(
                     &sha,
@@ -38769,6 +39068,7 @@ mod tests {
                     "host-a",
                     uuid::Uuid::new_v4().to_string().as_str(),
                     fresh,
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -38790,13 +39090,14 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
                 blob_attestation(
                     &sha,
                     "host-a",
                     "host-a",
                     holds_bytes_attestation_id.as_str(),
+                    bytes.len() as u64,
                 ),
             )
             .await
@@ -42159,6 +42460,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -42253,6 +42555,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -42346,6 +42649,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -45301,9 +45605,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45337,7 +45647,13 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45371,9 +45687,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45392,7 +45714,13 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45409,9 +45737,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45429,9 +45763,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45457,9 +45797,15 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .unwrap();
@@ -45496,7 +45842,13 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    ext.size_bytes,
+                ),
             )
             .await
             .unwrap();
@@ -47182,9 +47534,15 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(huge),
+                BlobBody::Inline(huge.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    huge.len() as u64,
+                ),
             )
             .await
             .expect_err("must trust-reject before size-reject");
@@ -47213,7 +47571,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                 &sha,
                 BlobBody::Inline(b"x".to_vec()),
                 None,
-                blob_attestation(&sha, "", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(&sha, "", "host-a", &uuid::Uuid::new_v4().to_string(), 1),
             )
             .await
             .expect_err("empty key beats trust");
@@ -47230,9 +47588,15 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                blob_attestation(&sha, "host-a", "host-a", &uuid::Uuid::new_v4().to_string()),
+                blob_attestation(
+                    &sha,
+                    "host-a",
+                    "host-a",
+                    &uuid::Uuid::new_v4().to_string(),
+                    bytes.len() as u64,
+                ),
             )
             .await
             .expect("trust admits");

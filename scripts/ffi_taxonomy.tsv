@@ -31,6 +31,12 @@
 # which prefix of a live stream a producer-signed STH commits to, and a wrong
 # entry makes a DVR consumer treat an uncommitted tail as tamper-evident.
 #
+# v45.0.0 (#871) — `store_plaintext_local` is DEONTIC: it decides what bytes
+# this node holds (the LocalOnly plaintext door, announcing nothing), and a
+# wrong stub stores bytes the node never verified. `list_holders_sized_json`
+# and `list_derived_json` are EMPIRICAL: listings of a signed claim's size and
+# of the rendition index; they permit nothing.
+#
 # CIRISPersist#595 / CIRISConstitution#83. One row per symbol PyO3 exports:
 #
 #     <stub owner>\t<exported name>\t<class>\t<frame>
@@ -399,6 +405,7 @@ Engine	list_consent_peers	empirical
 Engine	list_consent_revocation_promotion_overdue_json	empirical	
 Engine	list_consent_revocation_promotion_overdue_readonly_json	empirical	
 Engine	list_consumers	structural	
+Engine	list_derived_json	empirical	
 Engine	list_delivery_receipts_for	testimonial	delivery_event
 Engine	list_families_for_member_active_json	empirical	
 Engine	list_families_for_member_json	empirical	
@@ -407,6 +414,7 @@ Engine	list_federation_keys	empirical
 Engine	list_held_by_json	empirical	
 Engine	list_held_fountain_content	empirical	
 Engine	list_holders_json	empirical	
+Engine	list_holders_sized_json	empirical	
 Engine	list_identity_occurrences_for_json	ontological	
 Engine	list_live_occurrences	ontological	
 Engine	list_llm_calls	empirical	
@@ -602,6 +610,7 @@ Engine	steward_binding_chain_json	empirical
 Engine	steward_bindings_of_json	empirical	
 Engine	storage_budget_supersedes	deontic	
 Engine	store_blob_local_json	empirical	
+Engine	store_plaintext_local	deontic	
 Engine	stream_chunks_json	testimonial	log_commitment
 Engine	stream_consistency_proof	testimonial	log_commitment
 Engine	stream_inclusion_proof	testimonial	log_commitment

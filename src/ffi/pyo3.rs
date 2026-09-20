@@ -10206,6 +10206,60 @@ impl PyEngine {
         })
     }
 
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4; #863 ask 1) —
+    /// **the LocalOnly plaintext door.** Store commons bytes this node
+    /// verified itself (size first, then digest — CC 5.3.2.5), announcing
+    /// nothing: `cohort_scope = federation`, `crypto_tier = plaintext`, no
+    /// `holds_bytes` claim, no signer. Content-address checked
+    /// (`sha256(bytes) == sha256_hex`, else `HashMismatch`) and bounded by
+    /// the inline cap. Idempotent on the address. The plaintext twin of
+    /// `adopt_sealed_blob_json`'s `LocalOnly` disposition; the raw-bytes
+    /// form of `store_blob_local_json` for a consumer that holds the body
+    /// in memory and wants no base64 round trip.
+    ///
+    /// **Unannounced is not private** (v43.0.0 §11.2): `read_blob_as`
+    /// serves the row to any viewer. Sealed cohorts use `put_blob_scoped`.
+    #[pyo3(signature = (sha256_hex, bytes, media_type=None))]
+    fn store_plaintext_local(
+        &self,
+        py: Python<'_>,
+        sha256_hex: &str,
+        bytes: &[u8],
+        media_type: Option<&str>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            let body = bytes.to_vec();
+            let media_type = media_type.map(str::to_owned);
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .store_plaintext_local(&sha, body, media_type.as_deref())
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .store_plaintext_local(&sha, body, media_type.as_deref())
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
     ///
     /// Inserts each chunk row + the chunk_dag manifest row in ONE
@@ -13034,6 +13088,96 @@ impl PyEngine {
                     })
                 }
             })
+        })
+    }
+
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4, AV-88/AV-89) —
+    /// **the puller's budget read.** Every live `holds_bytes` claim for the
+    /// blob with the byte length the holder SIGNED, as a JSON array of
+    /// `{"key_id": "...", "size": N}` sorted by `key_id`. The selection is
+    /// `list_holders_json`'s without the CEG §10.1.2 freshness window (the
+    /// holder's own `withdraws` / `recants` are still folded out); a claim
+    /// with no positive integer `size` is skipped. A puller caps its
+    /// `ContentFetch` read at `size` BEFORE hashing and refuses a holder
+    /// whose number disagrees with the descriptor it is fetching for.
+    fn list_holders_sized_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            let rows = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::list_holders_sized(
+                            backend.as_ref(),
+                            &sha,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::list_holders_sized(
+                            backend.as_ref(),
+                            &sha,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&rows)
+                .map_err(|e| PyValueError::new_err(format!("list_holders_sized encode: {e}")))
+        })
+    }
+
+    /// v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §5, CC 3.3.13) —
+    /// **the rendition index read.** Every V149 `blob_renditions` row whose
+    /// original is `original_sha256_hex`, as a JSON array of `Rendition`
+    /// (`rendition_sha256_hex`, `original_sha256_hex`, `format`, `size`,
+    /// `width`, `height`, `role`, `source_attestation_id`, `cohort_scope`)
+    /// ordered by `rendition_sha256_hex`. Rows are projected in the same
+    /// write that admits a row carrying `media.derived_from` and removed by
+    /// the retraction fold that retires it. A malformed digest is a
+    /// `ValueError`.
+    fn list_derived_json(&self, py: Python<'_>, original_sha256_hex: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let original = original_sha256_hex.to_owned();
+            let rows = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::list_derived_hex(
+                            backend.as_ref(),
+                            &original,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::list_derived_hex(
+                            backend.as_ref(),
+                            &original,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&rows)
+                .map_err(|e| PyValueError::new_err(format!("list_derived encode: {e}")))
         })
     }
 
@@ -32378,6 +32522,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v44.8.0 (CIRISPersist#866 C1) — a malformed consent scope token is
         // caller-fault malformed content; ValueError (4xx), the kind names it.
         crate::federation::Error::ConsentScopeTokenInvalid { .. } => PyValueError::new_err(kind),
+        // v45.0.0 (CIRISPersist#871) — a malformed media Source struct, or a
+        // `holds_bytes` claim without a size, is caller-fault malformed
+        // content; ValueError (4xx), the kind names it.
+        crate::federation::Error::MediaSourceInvalid { .. } => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
@@ -32835,6 +32983,9 @@ enum PutBlobWireBody {
 struct PutBlobAttestationWire {
     attesting_key_id: String,
     attestation_id: String,
+    /// v45.0.0 (#871) — REQUIRED: the byte length the signer bound into the
+    /// claim. The door refuses a claim whose size is not the length it stores.
+    size: u64,
     original_content_hash_hex: String,
     scrub_signature_classical: String,
     #[serde(default)]
@@ -32925,6 +33076,7 @@ fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {
     let attestation = crate::federation::PutBlobAttestation {
         attesting_key_id: wire.attestation.attesting_key_id,
         attestation_id: wire.attestation.attestation_id,
+        size: wire.attestation.size,
         original_content_hash_hex: wire.attestation.original_content_hash_hex,
         scrub_signature_classical: wire.attestation.scrub_signature_classical,
         scrub_signature_pqc: wire.attestation.scrub_signature_pqc,

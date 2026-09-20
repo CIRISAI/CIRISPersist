@@ -283,3 +283,5 @@ sqlite	147	consent_peer_set_for	8332404306030852117
 postgres	147	consent_peer_set_for	4079803879488622867
 sqlite	148	key_registration_history	17394385412746748785
 postgres	148	key_registration_history	4164581860194465064
+sqlite	149	blob_renditions	17356472952008256851
+postgres	149	blob_renditions	10144278107610230793

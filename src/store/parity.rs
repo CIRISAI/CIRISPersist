@@ -189,6 +189,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v44.8.0 (#866 C1) — the scope-token grammar gate: a `consent:state:*`
     // envelope whose `scope` names a token the fold cannot match is refused.
     ("check_consent_scope_tokens", Class::Gate),
+    // v45.0.0 (#871) — the media Source struct grammar gate and the holder
+    // claim's required size: a malformed descriptor is refused by member.
+    ("check_media_source", Class::Gate),
+    ("check_holder_claim_size", Class::Gate),
+    // v45.0.0 (#871, FSD §5) — the placement rule: a rendition whose
+    // original THIS node holds must name the original's `cohort_scope`.
+    // One name at the six write doors on all three backends (memory's
+    // `HeldBlobScope` answers "not held": it has no blob store).
+    ("check_rendition_placement", Class::Gate),
     ("check_delivery_mode_vocabulary", Class::Gate),
     ("check_device_class", Class::Gate),
     ("check_encryption_pubkeys", Class::Gate),
@@ -259,6 +268,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("compute_persist_row_hash", Class::Plumbing),
     ("connect", Class::Plumbing),
     ("decode", Class::Plumbing),
+    // v45.0.0 (#871) — `list_derived_hex`'s argument decode: refuses a digest
+    // that is not 64 hex characters, which is a fact about the caller's
+    // input, so a Gate — and the same one on all three backends by
+    // construction (one fn in `renditions.rs`).
+    ("decode_sha256_hex", Class::Gate),
     ("dedicated_connect", Class::Delegates),
     ("delete_blob", Class::Delegates),
     ("deserialize_signature", Class::Plumbing),
@@ -415,6 +429,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("pg_load_stream_chunk_hashes", Class::Delegates),
     ("pg_project_attestation_subjects", Class::Delegates),
     ("pg_project_consent_peer_set", Class::Delegates),
+    // v45.0.0 (#871) — the V149 `blob_renditions` projection helpers, one
+    // per backend; each runs no gate of its own (the fold reads only what
+    // the door already admitted).
+    ("pg_project_rendition_row", Class::Delegates),
     // #838 — row mapping for `stream_chunks` / `stream_chunk_at`: decodes a
     // stream index row joined to its chunk row. It fails only on a corrupt
     // row (a sha that is not 32 bytes, a tier string the enum does not
@@ -525,6 +543,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("sqlite_next_plane_position", Class::Plumbing),
     ("sqlite_project_attestation_subjects", Class::Delegates),
     ("sqlite_project_consent_peer_set", Class::Delegates),
+    ("sqlite_project_rendition_row", Class::Delegates),
     // #838 — the sqlite twin of `pg_stream_chunk_ref`: row mapping.
     ("sqlite_stream_chunk_ref", Class::Plumbing),
     // v36.0.0 (CIRISPersist#668) — newly VISIBLE for the whole cursor

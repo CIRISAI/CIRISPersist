@@ -2603,6 +2603,12 @@ pub async fn check_promotion_admission(
     // chokepoint: a local row admitted before the door refused malformed
     // tokens does not cross with one.
     super::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
+    // v45.0.0 (CIRISPersist#871) — the media Source struct gate at the promotion
+    // chokepoint: a local row admitted before this cut does not cross with a
+    // malformed struct; a promoted holder claim (there is none) would need its
+    // size.
+    super::media_source::check_media_source(&row.attestation_envelope)?;
+    super::media_source::check_holder_claim_size(&row.attestation_envelope, &row.attestation_type)?;
     check_capacity_consent_admission(directory, row).await?;
 
     // v38.7.0 (CIRISPersist#778) — CC 3.4.5's OTHER emitter rule: `config:*`

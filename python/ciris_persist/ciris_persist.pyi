@@ -1463,6 +1463,9 @@ class Engine:
     def storage_budget_supersedes(self, candidate_json: str, existing_json: str) -> bool:
         """(derived) deontic — #356 (§Q B3 anti-rollback) — does candidate supersede existing? Both are signed StorageBudgetV1 wire JSONs; True iff same node_id and strictly-high..."""
 
+    def store_plaintext_local(self, sha256_hex: str, bytes: bytes, media_type: str | None = None) -> None:
+        """(derived) deontic — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4; #863 ask 1) — the LocalOnly plaintext door. Store commons bytes this node verified itself (size..."""
+
     def supersede_canonical(self, old_key_id: str, signed_key_record_json: str, proposal_digest: str) -> None:
         """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — supersede (rotate) a canonical server. signed_key_record_json is the successor's SignedKe..."""
 
@@ -2941,6 +2944,9 @@ class Engine:
         is ``True`` even when nothing is overdue. ``json.loads`` it.
         """
 
+    def list_derived_json(self, original_sha256_hex: str) -> str:
+        """(derived) empirical — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5, CC 3.3.13) — the rendition index read. Every V149 blob_renditions row whose original is original..."""
+
     def list_families_for_member_active_json(self, member_identity_key_id: str) -> str:
         """(derived) empirical — #249 Cut A — families member_identity_key_id is currently an active member of (roster − effective revocations). Returns JSON array of Family object..."""
 
@@ -2974,6 +2980,9 @@ class Engine:
             ValueError: ``blob_invalid_argument`` on malformed SHA.
             RuntimeError: backend / IO error.
         """
+
+    def list_holders_sized_json(self, sha256_hex: str) -> str:
+        """(derived) empirical — v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §4, AV-88/AV-89) — the puller's budget read. Every live holds_bytes claim for the blob with the byte..."""
 
     def list_key_registration_history(self, key_id: str) -> str:
         """(derived) empirical — v44.7.0 (CIRISPersist#864) — the registration claims key_id has REPLACED through a rebind, oldest first, as a JSON array of KeyRegistrationHistoryR..."""

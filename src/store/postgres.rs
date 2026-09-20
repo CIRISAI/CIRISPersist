@@ -4250,6 +4250,109 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §4) — the puller's budget read: every
+    /// `holds_bytes` claim for `sha256` (type prefix, then the full digest
+    /// confirmed in `evidence_refs`), the holder's own `withdraws` /
+    /// `recants` folded out by the same `NOT EXISTS` `list_holders` uses, no
+    /// freshness window; a claim with no positive `size` is skipped. Sorted
+    /// by key; one entry per holder.
+    async fn list_holders_sized(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<crate::federation::renditions::HolderClaim>, crate::federation::Error> {
+        let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
+        let full_hex = hex::encode(sha256);
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT a.attesting_key_id, a.attestation_envelope \
+                 FROM cirislens.federation_attestations a \
+                 WHERE a.attestation_type = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM cirislens.federation_attestations w \
+                     WHERE w.attestation_type IN ($2, $3) \
+                       AND w.attesting_key_id = a.attesting_key_id \
+                       AND w.attestation_envelope::jsonb->>'references_attestation_id' = \
+                           a.attestation_id::text \
+                   ) \
+                 ORDER BY a.attesting_key_id ASC, a.attestation_id ASC",
+                &[
+                    &attestation_type,
+                    &crate::federation::types::attestation_type::WITHDRAWS,
+                    &crate::federation::types::attestation_type::RECANTS,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_holders_sized: {e}")))?;
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_holders_sized: {e}"))
+        };
+        let mut candidates: Vec<(String, serde_json::Value)> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let key_id: String = r.try_get("attesting_key_id").map_err(col)?;
+            // TEXT since V122; a row whose envelope does not parse is not a claim.
+            let text: String = r.try_get("attestation_envelope").map_err(col)?;
+            if let Ok(env) = serde_json::from_str(&text) {
+                candidates.push((key_id, env));
+            }
+        }
+        Ok(crate::federation::renditions::sized_holder_claims(
+            &full_hex, candidates,
+        ))
+    }
+
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the rendition index read: a plain
+    /// SELECT over V149 `cirislens.blob_renditions`, ordered by
+    /// `rendition_sha256`.
+    async fn list_derived_hex(
+        &self,
+        original_sha256_hex: &str,
+    ) -> Result<Vec<crate::federation::renditions::Rendition>, crate::federation::Error> {
+        let original = crate::federation::renditions::decode_sha256_hex(original_sha256_hex)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT rendition_sha256, original_sha256, format, size, width, height, \
+                        role, source_attestation_id, cohort_scope \
+                 FROM cirislens.blob_renditions WHERE original_sha256 = $1 \
+                 ORDER BY rendition_sha256 ASC",
+                &[&original.to_vec()],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_derived_hex: {e}")))?;
+        let col = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("list_derived_hex: {e}"))
+        };
+        rows.into_iter()
+            .map(|r| {
+                let size: i64 = r.try_get("size").map_err(col)?;
+                let width: Option<i32> = r.try_get("width").map_err(col)?;
+                let height: Option<i32> = r.try_get("height").map_err(col)?;
+                Ok(crate::federation::renditions::Rendition {
+                    rendition_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("rendition_sha256").map_err(col)?,
+                    ),
+                    original_sha256_hex: hex::encode(
+                        r.try_get::<_, Vec<u8>>("original_sha256").map_err(col)?,
+                    ),
+                    format: r.try_get("format").map_err(col)?,
+                    size: u64::try_from(size).unwrap_or(0),
+                    width: width.and_then(|w| u32::try_from(w).ok()),
+                    height: height.and_then(|h| u32::try_from(h).ok()),
+                    role: r.try_get("role").map_err(col)?,
+                    source_attestation_id: r.try_get("source_attestation_id").map_err(col)?,
+                    cohort_scope: r.try_get("cohort_scope").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+
     // v19.1.0 (#490) — the authenticated re-anchor (see sqlite impl for the
     // full invariants: internal quorum re-verify + bundle-carried check +
     // lift + gates + identity/anti-rollback guards).
@@ -5128,6 +5231,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // must parse (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4): never admit
         // a token the fold cannot match. Pure; same gate at every door.
         crate::federation::consent_scope::check_consent_scope_tokens(&row.attestation_envelope)?;
+        // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §3–§4) — the media
+        // Source struct is refused by member name, and a `holds_bytes` claim
+        // without a positive `size` is refused: a descriptor a puller cannot
+        // budget by is not admitted. Pure; the same gate at every door.
+        crate::federation::media_source::check_media_source(&row.attestation_envelope)?;
+        crate::federation::media_source::check_holder_claim_size(
+            &row.attestation_envelope,
+            &row.attestation_type,
+        )?;
 
         // v31.0.0 (CIRISPersist#598) — THE CONSENT INSTANT BINDING. A
         // `consent:state:*` row is refused unless its signed envelope carries
@@ -5551,6 +5663,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
         crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule: a rendition (`media.derived_from`) whose original THIS node
+        // holds must name the original's own `cohort_scope`. AV-76 TIER 4: it
+        // reads the blob store, so it sits with the other state-reading gates.
+        // Backend-symmetric; memory holds no blobs and answers "not held".
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &row.attestation_envelope,
+            &row.cohort_scope,
+        )
+        .await?;
 
         // v38.7.0 (CIRISPersist#778, CC 3.4.5) — `config:{scope}` IS A
         // SELF-REPORT: `attesting_key_id` must be `attested_key_id` or its
@@ -5801,6 +5924,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
             })?;
+        // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+        // `blob_renditions` projection on the same client.
+        pg_project_rendition_row(&**client, &row).await?;
         drop(client);
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`
@@ -6526,6 +6652,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("purge consent_peer_set: {e}"))
+            })?;
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        client
+            .execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id = $1",
+                &[&attestation_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("purge blob_renditions: {e}"))
             })?;
         Ok(())
     }
@@ -13175,6 +13311,20 @@ fn scope_blob_symbol_from_pg_row(
 // the same transaction so a holder-attestation FK violation rolls back
 // the blob row too (atomic put_blob semantic).
 
+/// v45.0.0 (CIRISPersist#871, FSD §5) — what the placement gate asks: the
+/// cohort this node holds a blob under, from the blob row the write NAMED.
+impl crate::federation::renditions::HeldBlobScope for PostgresBackend {
+    async fn held_blob_cohort_scope(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::Error> {
+        use crate::federation::BlobStorage as _;
+        self.blob_cohort_scope(sha256)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("held blob cohort_scope: {e}")))
+    }
+}
+
 impl crate::federation::BlobStorage for PostgresBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -13292,12 +13442,25 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // REBUILDS the caller's bytes here rather than storing bytes it was
         // handed, so the builder is what makes "the caller signed the row we
         // are storing" a checkable statement instead of an assumption.
+        // v45.0.0 (CIRISPersist#871, AV-89) — the claim's declared size must be
+        // the length of the bytes this door stores. Checked BEFORE the rebuild
+        // so the refusal names the size, not a hash: a holder that announces
+        // one length and holds another is refused here, never advertised.
+        if attestation.size != body.size_bytes() {
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "holds_bytes claim declares size {} but the stored bytes are {} \
+                 (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                attestation.size,
+                body.size_bytes()
+            )));
+        }
         let attestation_type = crate::federation::holds_bytes_attestation_type(sha256);
         let mut attestation_row = crate::federation::blobs::holds_bytes_attestation_row(
             sha256,
             &attestation.attesting_key_id,
             &attestation.attestation_id,
             attestation.asserted_at,
+            attestation.size,
         );
         attestation_row.original_content_hash = attestation.original_content_hash_hex.clone();
         attestation_row.scrub_signature_classical = attestation.scrub_signature_classical.clone();
@@ -15930,6 +16093,18 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 "adopt_sealed_blob_at: size_bytes exceeds i64".into(),
             )
         })?;
+        // v45.0.0 (CIRISPersist#871, AV-89) — the announce's declared size must
+        // be the length of the sealed bytes this door stores.
+        if let Some(a) = &announce {
+            if a.size != envelope_bytes.len() as u64 {
+                return Err(crate::federation::BlobError::InvalidArgument(format!(
+                    "holds_bytes claim declares size {} but the adopted bytes are {} \
+                     (CC 5.3.2.5 / AV-89: a holder announces exactly what it holds)",
+                    a.size,
+                    envelope_bytes.len()
+                )));
+            }
+        }
         // The holder claim is admitted on the same terms as `put_blob`'s.
         let prepared = match announce.as_ref() {
             Some(a) => Some(crate::federation::blobs::prepare_holds_bytes_row(
@@ -18848,6 +19023,10 @@ impl PostgresBackend {
         // v44.8.0 (CIRISPersist#866 C1) — the scope-token gate, at the local
         // door too (`FSD/CONTEXTUAL_INTEGRITY_ENVELOPE.md` §4.4).
         crate::federation::consent_scope::check_consent_scope_tokens(&envelope_value)?;
+        // v45.0.0 (CIRISPersist#871) — the media Source struct gate, at the local
+        // door too (`FSD/MEDIA_SOURCE.md` §6). A local row never carries a
+        // holder claim, so only the struct is checked here.
+        crate::federation::media_source::check_media_source(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
@@ -18906,6 +19085,17 @@ impl PostgresBackend {
                 .attested_key_id
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
+        )
+        .await?;
+        // v45.0.0 (CIRISPersist#871, FSD/MEDIA_SOURCE.md §5) — the placement
+        // rule at the local door: a rendition (`media.derived_from`) whose
+        // original THIS node holds must name the original's own
+        // `cohort_scope`. Reads the blob store, so it sits with the other
+        // directory-reading gates, before the write. Backend-symmetric.
+        crate::federation::renditions::check_rendition_placement(
+            self,
+            &envelope_value,
+            &input.cohort_scope,
         )
         .await?;
 
@@ -19014,6 +19204,18 @@ impl PostgresBackend {
             .await
             .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
         if replace {
+            // v45.0.0 (#871) — a replaced row's rendition leaves the V149
+            // index with it (no FK: the index is keyed by the rendition's
+            // digest, the row by its id).
+            tx.execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id IN (\
+                    SELECT attestation_id::text FROM cirislens.federation_attestations \
+                     WHERE attesting_key_id = $1 AND tier = 'local' \
+                       AND attestation_envelope::jsonb->>'dimension' = $2)",
+                &[&attesting_key_id, &dimension],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("local upsert rendition delete: {e}")))?;
             tx.execute(
                 "DELETE FROM cirislens.federation_attestations \
                   WHERE attesting_key_id = $1 AND tier = 'local' \
@@ -19081,6 +19283,9 @@ impl PostgresBackend {
         )
         .await
         .map_err(|e| Error::Backend(format!("local attestation projection: {e}")))?;
+        // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
+        // projection at the local door, in the same transaction.
+        pg_project_rendition_row(&*tx, &row).await?;
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;
@@ -19313,6 +19518,13 @@ where
                 &[&target_id],
             )
             .await?;
+        // v45.0.0 (#871) — a retired row's rendition leaves the index with it.
+        client
+            .execute(
+                "DELETE FROM cirislens.blob_renditions WHERE source_attestation_id = $1",
+                &[&target_id],
+            )
+            .await?;
         return Ok(());
     }
     if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
@@ -19351,6 +19563,75 @@ where
             )
             .await?;
     }
+    Ok(())
+}
+
+/// v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+/// `cirislens.blob_renditions` projection for `row` on the given
+/// client/transaction: when
+/// [`crate::federation::renditions::rendition_of_row`] answers `Some`,
+/// upsert it keyed by `rendition_sha256` (`ON CONFLICT DO UPDATE`). A row
+/// that projects nothing is left alone. Generic over `GenericClient` like
+/// `pg_project_consent_peer_set`, so a door mid-transaction passes its
+/// `&Transaction` and the projection lands in the SAME commit as the row.
+///
+/// **Call sites (the door bodies, in the SAME client/transaction as the row
+/// insert):** `put_attestation_with_origin` (beside
+/// `pg_project_consent_peer_set`) and `pg_write_local_attestation` (beside
+/// its `pg_project_attestation_subjects`, before `tx.commit()`). The
+/// promotion door (`enter_mesh`) updates the row IN PLACE under its id, so
+/// the projection written at the local door is already the federation
+/// row's. The retraction fold that removes a row's projection lives in
+/// `pg_project_consent_peer_set`; the local upsert-replace retires the
+/// replaced row's; `purge_attestation_projections` the purged row's.
+async fn pg_project_rendition_row<C>(
+    client: &C,
+    row: &crate::federation::Attestation,
+) -> Result<(), crate::federation::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let Some(r) = crate::federation::renditions::rendition_of_row(row) else {
+        return Ok(());
+    };
+    let rendition = hex::decode(&r.rendition_sha256_hex)
+        .map_err(|e| crate::federation::Error::Backend(format!("rendition sha256 hex: {e}")))?;
+    let original = hex::decode(&r.original_sha256_hex)
+        .map_err(|e| crate::federation::Error::Backend(format!("original sha256 hex: {e}")))?;
+    let size = i64::try_from(r.size).unwrap_or(i64::MAX);
+    let width = r.width.and_then(|w| i32::try_from(w).ok());
+    let height = r.height.and_then(|h| i32::try_from(h).ok());
+    client
+        .execute(
+            "INSERT INTO cirislens.blob_renditions \
+                (rendition_sha256, original_sha256, format, size, width, height, role, \
+                 source_attestation_id, cohort_scope) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (rendition_sha256) DO UPDATE SET \
+                original_sha256 = EXCLUDED.original_sha256, \
+                format = EXCLUDED.format, \
+                size = EXCLUDED.size, \
+                width = EXCLUDED.width, \
+                height = EXCLUDED.height, \
+                role = EXCLUDED.role, \
+                source_attestation_id = EXCLUDED.source_attestation_id, \
+                cohort_scope = EXCLUDED.cohort_scope",
+            &[
+                &rendition,
+                &original,
+                &r.format,
+                &size,
+                &width,
+                &height,
+                &r.role,
+                &r.source_attestation_id,
+                &r.cohort_scope,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("blob_renditions projection: {e}"))
+        })?;
     Ok(())
 }
 
@@ -27302,6 +27583,42 @@ mod tests {
         .await;
     }
 
+    /// v45.0.0 (CIRISPersist#871, FSD §5) — the postgres leg of the V149
+    /// `blob_renditions` projection: `pg_project_rendition_row` on a pooled
+    /// client feeds the SAME read-and-fold body memory and sqlite run
+    /// (`renditions::witnesses::index_reads_and_folds`).
+    #[tokio::test]
+    async fn blob_renditions_projection_reads_and_folds_871_postgres() {
+        use crate::federation::renditions::witnesses;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let b = PostgresBackend::connect(&dsn).await.expect("connect");
+        b.run_migrations().await.expect("migrations run");
+        let s = uuid::Uuid::new_v4().simple().to_string();
+        let (original, r_hi, r_lo) = witnesses::two_rendition_rows(&b, &s).await;
+        let b = &b;
+        let project = |r: crate::federation::Attestation| async move {
+            let client = b.get_client().await.expect("client");
+            pg_project_rendition_row(&**client, &r).await.unwrap();
+        };
+        project(r_hi.clone()).await;
+        project(r_lo.clone()).await;
+        // A row that describes no rendition projects nothing.
+        project(crate::federation::media_source_invariants::bodies::row(
+            &format!("871-plain-{s}"),
+            &r_hi.attesting_key_id,
+            &r_hi.attested_key_id,
+            serde_json::json!({"dimension": "x:y:v1", "score": 1.0}),
+            crate::federation::types::cohort_scope::FEDERATION,
+        ))
+        .await;
+        assert_eq!(b.list_derived_hex(&original).await.unwrap().len(), 2);
+        witnesses::index_reads_and_folds(b, &original, &r_hi, &r_lo, project, &s).await;
+    }
+
     /// v21.0.0 (CIRISPersist#502 E7) — the postgres leg of the shared
     /// `consent_peer_set` revocation-fold backend-parity witness (see
     /// `sqlite::tests::consent_peer_set_parity_sqlite_502e7`); both call the
@@ -35051,6 +35368,7 @@ mod tests {
         sha256: &[u8; 32],
         attesting_key_id: &str,
         scrub_key_id: &str,
+        size: u64,
     ) -> crate::federation::PutBlobAttestation {
         let now = chrono::Utc::now();
         crate::federation::blobs::sealed_put_blob_attestation(
@@ -35060,6 +35378,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            size,
         )
     }
 
@@ -35082,7 +35401,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 Some("application/octet-stream"),
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .expect("put inline");
@@ -35160,7 +35479,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
             )
             .await
             .unwrap();
@@ -35186,9 +35505,9 @@ mod tests {
         let err = backend
             .put_blob(
                 &wrong,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&wrong, &host, &host),
+                pg_blob_attestation(&wrong, &host, &host, bytes.len() as u64),
             )
             .await
             .expect_err("must reject");
@@ -35213,9 +35532,9 @@ mod tests {
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .expect_err("must reject");
@@ -35246,9 +35565,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35276,16 +35595,16 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host_a, &host_a),
+                pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
             )
             .await
             .unwrap();
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host_b, &host_b),
+                pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35315,16 +35634,16 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35353,7 +35672,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host_a, &host_a),
+                pg_blob_attestation(&sha, &host_a, &host_a, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -35366,7 +35685,7 @@ mod tests {
                     media_type: None,
                 }),
                 None,
-                pg_blob_attestation(&sha, &host_b, &host_b),
+                pg_blob_attestation(&sha, &host_b, &host_b, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38222,6 +38541,7 @@ mod tests {
         attesting_key_id: &str,
         scrub_key_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
+        size: u64,
     ) -> crate::federation::PutBlobAttestation {
         crate::federation::blobs::sealed_put_blob_attestation(
             sha256,
@@ -38232,6 +38552,7 @@ mod tests {
             // the TTL arms), and as of #652 that is `asserted_at`.
             scrub_timestamp,
             scrub_timestamp,
+            size,
         )
     }
 
@@ -38258,9 +38579,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation_at(&sha, &host, &host, backdated),
+                pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38311,9 +38632,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation_at(&sha, &host, &host, backdated),
+                pg_blob_attestation_at(&sha, &host, &host, backdated, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38343,9 +38664,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation_at(&sha, &host, &host, fresh),
+                pg_blob_attestation_at(&sha, &host, &host, fresh, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -38372,6 +38693,7 @@ mod tests {
             &host,
             &host,
             chrono::Utc::now() - chrono::Duration::hours(1),
+            bytes.len() as u64,
         );
         let holds_bytes_attestation_id = holds_bytes_attestation.attestation_id.clone();
         backend
@@ -38492,6 +38814,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -38585,6 +38908,7 @@ mod tests {
             &uuid::Uuid::new_v4().to_string(),
             now,
             now,
+            schema_bytes.len() as u64,
         );
         backend
             .put_blob(
@@ -40636,9 +40960,9 @@ mod tests {
         let err = backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(huge),
+                BlobBody::Inline(huge.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, huge.len() as u64),
             )
             .await
             .expect_err("trust beats size");
@@ -40668,9 +40992,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40716,7 +41040,7 @@ mod tests {
                 &sha,
                 BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40755,9 +41079,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40788,9 +41112,9 @@ mod tests {
         backend
             .put_blob(
                 &sha,
-                BlobBody::Inline(bytes),
+                BlobBody::Inline(bytes.clone()),
                 None,
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
             )
             .await
             .unwrap();
@@ -40839,7 +41163,7 @@ mod tests {
                 &sha,
                 BlobBody::External(ext.clone()),
                 Some("video/mp4"),
-                pg_blob_attestation(&sha, &host, &host),
+                pg_blob_attestation(&sha, &host, &host, ext.size_bytes),
             )
             .await
             .unwrap();
@@ -41769,9 +42093,9 @@ mod tests {
             backend
                 .put_blob(
                     &sha,
-                    BlobBody::Inline(bytes),
+                    BlobBody::Inline(bytes.clone()),
                     None,
-                    pg_blob_attestation(&sha, &host, &host),
+                    pg_blob_attestation(&sha, &host, &host, bytes.len() as u64),
                 )
                 .await
                 .unwrap();
