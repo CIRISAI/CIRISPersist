@@ -619,6 +619,7 @@ pub(crate) mod bodies {
     /// not the byte length the door stores is refused before anything is
     /// written; the signer refuses a zero size outright; the same claim with
     /// the true length is admitted (the control).**
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i117d_a_claim_with_the_wrong_size_is_refused<B>(b: &B, s: &str)
     where
         B: crate::federation::BlobStorage + FederationDirectory + Sync,
