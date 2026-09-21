@@ -67,18 +67,6 @@ where
     Ok(author_key_id.to_owned())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_empty_named_minter_is_refused_by_member() {
-        let e = check_named("   ").expect_err("empty is not a key id");
-        assert!(e.to_string().contains("minter_key_id"), "{e}");
-        check_named("node-a").expect("a real key id");
-    }
-}
-
 /// **The seal side of the same question** (`FSD/EPOCH_MINTER.md` §2/§4).
 /// The minter of an epoch this node is minting is the key that will sign
 /// the `key_grant` set: the caller's named key, else this node's own key.
@@ -102,4 +90,16 @@ where
                 .into(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_named_minter_is_refused_by_member() {
+        let e = check_named("   ").expect_err("empty is not a key id");
+        assert!(e.to_string().contains("minter_key_id"), "{e}");
+        check_named("node-a").expect("a real key id");
+    }
 }
