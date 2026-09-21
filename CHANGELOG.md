@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.2.0] - 2026-09-21
+
+### Changed — CIRISVerify re-pinned v15.2.0 → v16.1.0 (all seven Cargo pins together; the Python bound `ciris-verify>=16.0.0,<17`)
+- **v16.0.0** removed `hw_token::get_token_signer`, an orphan stub persist
+  never called — the verify MAJOR is inert here. **v16.1.0** adds
+  `create_federation_identity_in(keys_dir, …)` and `preflight_keys_dir`
+  (CIRISVerify#285): a caller with its own home can seal a freshly minted
+  identity's ML-DSA half under that home instead of the global keys dir —
+  the gap CIRISServer#621 named for a dedicated `--home`. Persist mints no
+  identities itself (Server and Edge call verify directly), so no persist
+  surface changes; this cut is the pin so the stack builds against one
+  verify.
+- The Python transitive bound moves to the new major. Its floor is 16.0.0
+  rather than 16.1.0 because that is what PyPI carried when this shipped;
+  the Rust pin is 16.1.0 and nothing in persist depends on the minor.
+- No wire, migration or vocabulary change. Minor: what `pip` resolves
+  changes.
+
 ## [46.1.0] - 2026-09-21
 
 ### Fixed — `from_attestation` reads the key plane from the POINTER, not the row's scope (CIRISPersist#878)
