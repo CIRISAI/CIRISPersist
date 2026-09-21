@@ -91,6 +91,24 @@ row that is neither. The tier taken from the pointer is still checked
 against the placement it implies, through the one
 `StorageFloor::check_scope` rule.
 
+Three refusals keep the pointer from ever being a silent choice:
+
+- **The pointer does not choose the audience.** A `community` /
+  `affiliations` row is signed for one cohort (`envelope_cohort_target`);
+  `would_hold` takes the audience from `provenance.community_key_id`, so a
+  pointer naming a different community is refused by member. `self` /
+  `family` rows carry no such target; their audience is the owner's and
+  the pointer's community is the key plane only.
+- **Pointer-shaped but unreadable is a refusal, not absence.** A member
+  with a 64-hex `content_sha256` beside a `community_key_id` member IS a
+  pointer; if its community is not a string, its tier is unknown or not a
+  string, or its epoch is not an integer, `from_attestation` refuses by
+  member. Treating it as "no pointer" would fall through to the citation
+  path and derive a tier from the row's scope — the v46.0.0 defect.
+- **One blob, one key plane.** Two references to the same sha that
+  disagree on tier, community or epoch are refused; identical duplicates
+  (the same blob as `content` and as an attachment) are one reference.
+
 No migration: the four tables already carry `minter_key_id`. No vocabulary
 change. MAJOR for the struct member alone.
 

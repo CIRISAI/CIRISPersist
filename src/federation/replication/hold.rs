@@ -113,7 +113,12 @@ impl BlobProvenance {
         // v46.1.0 (#878) — a reference is a CITATION or a typed POINTER at
         // these bytes. The pointer carries the key plane the write door
         // resolved; the citation says only which bytes.
-        let pointer = crate::federation::blob_pointer::pointer_for(env, &sha_hex);
+        // A pointer-shaped member at these bytes that persist cannot read is
+        // a refusal by member, never "no pointer" (review P2: falling back to
+        // the citation would record the bytes under a tier derived from the
+        // row's scope).
+        let pointer = crate::federation::blob_pointer::pointer_for(env, &sha_hex)
+            .map_err(|e| BlobError::InvalidArgument(format!("pointer at {sha_hex}: {e}")))?;
         if pointer.is_none() && !admission::envelope_binds_content(env, &sha_hex) {
             return Err(BlobError::InvalidArgument(format!(
                 "evidence_refs / content_sha256: attestation {} does not reference {sha_hex} \
@@ -148,6 +153,37 @@ impl BlobProvenance {
                 // admits. Reading a wider cohort off the pointer would grant
                 // party-to the signer never signed for.
                 let scope = attestation.cohort_scope.clone();
+                // Review P1 — a `community` / `affiliations` row is signed
+                // for ONE cohort (`envelope_cohort_target`, the member the
+                // write gate admitted and routed on). `would_hold` takes the
+                // audience from `provenance.community_key_id`, so a pointer
+                // naming a different community would make ITS members party
+                // to content the signer placed in another room. The
+                // pointer's community must be the row's. `self` / `family`
+                // rows carry no such target — the audience is the owner's,
+                // and the pointer's community is the key plane only.
+                if matches!(scope.as_str(), cs::COMMUNITY | cs::AFFILIATIONS) {
+                    let signed = admission::envelope_cohort_target(env).map_err(|e| {
+                        BlobError::InvalidArgument(format!("community_key_id: {e}"))
+                    })?;
+                    match (signed, community.as_deref()) {
+                        (Some(s), Some(c)) if s == c => {}
+                        (Some(s), c) => {
+                            return Err(BlobError::InvalidArgument(format!(
+                                "community_key_id: the row is signed for cohort {s:?} but its \
+                                 pointer at {sha_hex} names {c:?} — the pointer does not choose \
+                                 the audience (FSD/EPOCH_MINTER.md)"
+                            )));
+                        }
+                        (None, _) => {
+                            return Err(BlobError::InvalidArgument(format!(
+                                "community_key_id: a {scope:?} row must NAME its cohort in the \
+                                 signed envelope; attestation {} names none",
+                                attestation.attestation_id
+                            )));
+                        }
+                    }
+                }
                 // The tier is still checked against the placement it implies
                 // — the floor's own rule, one spelling (§11.1 / I25).
                 crate::federation::StorageFloor::resolved(p.tier).check_scope(&scope)?;

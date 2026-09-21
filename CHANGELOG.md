@@ -34,16 +34,28 @@ threat-model citations because this crate's audit story is the point.
 - Refusals stay by member: a community-DEK pointer with no community, a
   pointer whose tier contradicts the placement it implies (the
   `StorageFloor::check_scope` rule, one spelling), and a row that
-  references the bytes neither way.
+  references the bytes neither way. From review of the cut (Codex on
+  #883), three more, all of the "never silently pick" kind: **the pointer
+  does not choose the audience** — a `community` / `affiliations` row is
+  signed for one cohort and a pointer naming another is refused (its
+  members are not party to this room's content); **a pointer-shaped member
+  persist cannot read** (a non-string community, an unknown or non-string
+  tier, a non-integer epoch) **is a refusal, never "no pointer"** — falling
+  back to the citation would record the bytes under a tier derived from
+  the row's scope, the defect this cut closes; and **two pointers at one
+  sha that disagree on the key plane are refused** (identical duplicates,
+  as when a blob is both `content` and an attachment, are one reference).
 - Additive: no signature change, no struct change. A row that cites only
   `evidence_refs` resolves exactly as it did in v46.0.0.
-- Witnesses I132–I135 (`federation::epoch_minter_invariants`) on sqlite and
+- Witnesses I132–I136 (`federation::epoch_minter_invariants`) on sqlite and
   postgres: the chat shape end to end (a `community` row authored by a
   person, its pointer at `content`, its body under the room's DEK, adopted
   on a member's node and OPENED); a pointer is a reference on its own and
   the caller's epoch wins; the refusals by member; and the attestation is
   the grant — a `self` row keeps `self`, and a non-owner peer is refused
-  `NotPartyTo` at `would_hold`.
+  `NotPartyTo` at `would_hold`; and (I136) a pointer naming another room
+  than the row is signed for is refused, as is a citation whose companion
+  pointer persist cannot read.
 
 ## [46.0.0] - 2026-09-20
 
