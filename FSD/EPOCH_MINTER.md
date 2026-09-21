@@ -83,7 +83,7 @@ where it needed the other:
 | `tier` | the POINTER | the write door RESOLVED it and recorded it there; a chat row sits at `self` while its body is under the room's DEK |
 | `community_key_id` | the POINTER | which key plane, not which row |
 | `epoch` | the caller, else the POINTER | a key-plane fact; absent on a `CommunityDek` pointer means the adopt refuses rather than guesses |
-| `cohort_scope` | the POINTER's tier | community-DEK bytes are placed in the community whose DEK sealed them; otherwise the row's placement stands |
+| `cohort_scope` | the ROW, always | the attestation IS the access grant (`is_audience`, CC 5.2 / 4.4.3.3.1). A room message reaches a member's node only as a `community` row — crossed or born there; a `self` row pointing at community-DEK bytes is the owner's fan-out to their own node. The pointer never widens it |
 
 A reference is an `evidence_refs[]` citation OR a pointer whose
 `content_sha256` is the blob in hand; persist accepts either and refuses a

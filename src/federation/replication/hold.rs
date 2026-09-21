@@ -123,11 +123,12 @@ impl BlobProvenance {
             )));
         }
         let (scope, tier, community_key_id, pointer_epoch) = match &pointer {
-            // THE POINTER IS AUTHORITATIVE FOR THE KEY PLANE. A chat row is
-            // placed at `self` while its body is sealed under the room's
-            // DEK; reading the tier off the row's scope answered
-            // `InvisibleEncrypted` for community-DEK ciphertext, and the
-            // adopt recorded that for every later read to dispatch on (I2).
+            // THE POINTER IS AUTHORITATIVE FOR THE KEY PLANE — tier,
+            // community, epoch are facts about the bytes, which the row's
+            // placement cannot carry: the owner's own second node holds a
+            // `self` row pointing at community-DEK ciphertext, and reading
+            // the tier off the scope answered `InvisibleEncrypted` for it
+            // (#878), recorded for every later read to dispatch on (I2).
             Some(p) => {
                 let community =
                     (!p.community_key_id.trim().is_empty()).then(|| p.community_key_id.clone());
@@ -138,14 +139,15 @@ impl BlobProvenance {
                          (FSD/EPOCH_MINTER.md)"
                     )));
                 }
-                // Community-DEK bytes ARE placed in the community whose DEK
-                // sealed them, whatever the row's own placement; otherwise
-                // the row's placement stands.
-                let scope = if matches!(p.tier, CryptoTier::CommunityDek) {
-                    cs::COMMUNITY.to_owned()
-                } else {
-                    attestation.cohort_scope.clone()
-                };
+                // THE ROW'S PLACEMENT STANDS. The attestation is the access
+                // grant (BLOB_REPLICATION.md §4, `is_audience`): a room
+                // message reaches a member's node only as a `community` row —
+                // crossed or born there (`crossing.rs`, CC 5.2 / 4.4.3.3.1) —
+                // and a `self` row pointing at community-DEK bytes is the
+                // owner's fan-out to their own node, which the self arm
+                // admits. Reading a wider cohort off the pointer would grant
+                // party-to the signer never signed for.
+                let scope = attestation.cohort_scope.clone();
                 // The tier is still checked against the placement it implies
                 // — the floor's own rule, one spelling (§11.1 / I25).
                 crate::federation::StorageFloor::resolved(p.tier).check_scope(&scope)?;

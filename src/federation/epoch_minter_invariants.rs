@@ -624,6 +624,32 @@ pub(crate) mod bodies {
         epoch: Option<u64>,
         cite: bool,
     ) -> crate::federation::Attestation {
+        chat_row_at(
+            id,
+            author,
+            comm,
+            sha_hex,
+            tier,
+            epoch,
+            cite,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        )
+    }
+
+    /// The same row at an explicit placement — `self` is the owner's
+    /// fan-out to their own node; `community` is what a room member's node
+    /// receives (crossed or born there).
+    #[allow(clippy::too_many_arguments)]
+    fn chat_row_at(
+        id: &str,
+        author: &str,
+        comm: &str,
+        sha_hex: &str,
+        tier: &str,
+        epoch: Option<u64>,
+        cite: bool,
+        scope: &str,
+    ) -> crate::federation::Attestation {
         use crate::federation::media_source_invariants::bodies::row as fixture_row;
         let mut pointer = serde_json::json!({
             "community_key_id": comm,
@@ -641,20 +667,15 @@ pub(crate) mod bodies {
         if cite {
             env["evidence_refs"] = serde_json::json!([sha_hex]);
         }
-        fixture_row(
-            id,
-            author,
-            author,
-            env,
-            crate::federation::types::cohort_scope::SELF,
-        )
+        fixture_row(id, author, author, env, scope)
     }
 
-    /// **I132 — the chat shape, end to end.** A `self`-scoped row authored by
-    /// a person, its body under the room's DEK, referenced by a pointer: the
-    /// provenance read off it names the ROOM and the room's tier (not `self`
-    /// / `InvisibleEncrypted`), and the peer OPENS the body with it. This is
-    /// the shape v46.0.0's constructor answered wrongly.
+    /// **I132 — the chat shape, end to end.** A room message as a member's
+    /// node receives it: a `community` row authored by a person, its body
+    /// under the room's DEK, referenced by a typed pointer. The provenance
+    /// read off it takes the TIER from the pointer (v46.0.0 answered
+    /// `InvisibleEncrypted` here) and the PLACEMENT from the row, and the
+    /// peer OPENS the body with it.
     pub(crate) async fn i132_the_chat_shape_opens<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -677,8 +698,8 @@ pub(crate) mod bodies {
         );
         assert_eq!(
             row.cohort_scope,
-            crate::federation::types::cohort_scope::SELF,
-            "I132: the row sits at self"
+            crate::federation::types::cohort_scope::COMMUNITY,
+            "I132: a room message reaches a member's node as a community row"
         );
         let p = BlobProvenance::from_attestation(&row, &sha, None, None)
             .expect("I132: the pointer is a reference");
@@ -697,7 +718,7 @@ pub(crate) mod bodies {
         assert_eq!(
             p.cohort_scope,
             crate::federation::types::cohort_scope::COMMUNITY,
-            "I132: community-DEK bytes are placed in the community whose DEK sealed them"
+            "I132: the placement is the ROW's — the attestation is the grant"
         );
         assert!(
             p.minter_key_id.is_none(),
@@ -715,6 +736,60 @@ pub(crate) mod bodies {
                 .unwrap(),
             b"chat body under the room dek"
         );
+    }
+
+    /// **I135 — the attestation is the grant.** A `self` row pointing at
+    /// community-DEK bytes is the owner's fan-out to their own node: the
+    /// provenance keeps `self` (the pointer's community does NOT widen it),
+    /// the tier still comes from the pointer, and a node that is not the
+    /// owner's is refused `NotPartyTo` at `would_hold` — a room message
+    /// that never widened to the room is not the room's to hold.
+    pub(crate) async fn i135_the_attestation_is_the_grant<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::{would_hold, DiskPressureSnapshot, HoldContext};
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, _bytes, _set) = seal_and_set(&l, b"owner fan-out").await;
+        let sha_hex = hex::encode(sha);
+        let row = chat_row_at(
+            &format!("i135-{run}"),
+            &l.alice,
+            &l.comm,
+            &sha_hex,
+            "community_dek",
+            Some(0),
+            true,
+            crate::federation::types::cohort_scope::SELF,
+        );
+        let p = BlobProvenance::from_attestation(&row, &sha, None, None)
+            .expect("I135: a self row with a community-DEK pointer is a legitimate shape");
+        assert_eq!(
+            p.cohort_scope,
+            crate::federation::types::cohort_scope::SELF,
+            "I135: the row's placement stands; the pointer does not widen it"
+        );
+        assert_eq!(
+            p.tier,
+            CryptoTier::CommunityDek,
+            "I135: the tier is still the pointer's"
+        );
+        assert_eq!(p.community_key_id.as_deref(), Some(l.comm.as_str()));
+        // B is a room member's node, not alice's: the self arm refuses it.
+        let bb = l.bb.clone();
+        let ctx = HoldContext {
+            pressure: DiskPressureSnapshot::normal(),
+            is_local_or_family: |k: &str| k == l.node_b,
+            our_key_id: &l.node_b,
+        };
+        let err = would_hold(bb.as_ref(), &ctx, &p)
+            .await
+            .expect_err("I135: a self row is the owner's; a member's node is not party to it");
+        assert!(matches!(err, BlobError::NotPartyTo { .. }), "I135: {err}");
     }
 
     /// **I133 — a pointer is a reference on its own, and the pointer wins.**
@@ -791,7 +866,7 @@ pub(crate) mod bodies {
         assert!(err.to_string().contains("community_key_id"), "I134: {err}");
         // A `self` row whose pointer claims plaintext: the floor's own rule
         // (a self/family row is never plaintext) refuses it, one spelling.
-        let plaintext_self = chat_row(
+        let plaintext_self = chat_row_at(
             &format!("i134-plain-{run}"),
             &l.alice,
             &l.comm,
@@ -799,6 +874,7 @@ pub(crate) mod bodies {
             "plaintext",
             None,
             true,
+            crate::federation::types::cohort_scope::SELF,
         );
         let err = BlobProvenance::from_attestation(&plaintext_self, &sha, None, None)
             .expect_err("I134: a self row is never plaintext");
@@ -910,6 +986,11 @@ mod run {
                 async fn i132() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i132_the_chat_shape_opens(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i135() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i135_the_attestation_is_the_grant(&a, &b, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
                 async fn i133() {

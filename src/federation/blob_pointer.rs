@@ -148,6 +148,16 @@ mod tests {
     }
 
     #[test]
+    fn a_sha_alone_is_not_a_pointer() {
+        // The producer's type carries `community_key_id` on every pointer
+        // (required, possibly empty). A member that merely mentions a sha —
+        // a note, a receipt, a future reference of some other kind — must
+        // not be read as a claim about the key plane.
+        let env = json!({"receipt": {"content_sha256": sha("e"), "note": "seen"}});
+        assert!(pointer_for(&env, &sha("e")).is_none());
+    }
+
+    #[test]
     fn a_tierless_pointer_reads_as_commons() {
         let env = json!({"content": {"community_key_id": "", "content_sha256": sha("c")}});
         assert_eq!(
