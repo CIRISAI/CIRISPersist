@@ -92,6 +92,9 @@ pub mod media_source_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod occurrence_principal_invariants;
 // CIRISPersist#876 (`FSD/EPOCH_MINTER.md`) — the ONE answer to "who minted this epoch".
+// CIRISPersist#878 (`FSD/EPOCH_MINTER.md`) — the typed reference a producer writes: which
+// bytes, and which key plane they are under.
+pub mod blob_pointer;
 pub mod epoch_minter;
 // CIRISPersist#876 (`FSD/EPOCH_MINTER.md`) — I126–I130: the epoch's minter is named or
 // derived, never inferred from the row's author. The fixture is author != sealer.

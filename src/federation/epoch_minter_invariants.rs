@@ -611,6 +611,379 @@ pub(crate) mod bodies {
         );
     }
 
+    /// The chat shape (CIRISEdge#646 / #878): a row placed at `self`,
+    /// authored by the PERSON, whose body is sealed under the ROOM's DEK and
+    /// referenced by a typed `BlobPointer` under a named member — plus the
+    /// blob-native citation edge now writes beside it.
+    fn chat_row(
+        id: &str,
+        author: &str,
+        comm: &str,
+        sha_hex: &str,
+        tier: &str,
+        epoch: Option<u64>,
+        cite: bool,
+    ) -> crate::federation::Attestation {
+        chat_row_at(
+            id,
+            author,
+            comm,
+            sha_hex,
+            tier,
+            epoch,
+            cite,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        )
+    }
+
+    /// The same row at an explicit placement — `self` is the owner's
+    /// fan-out to their own node; `community` is what a room member's node
+    /// receives (crossed or born there).
+    #[allow(clippy::too_many_arguments)]
+    fn chat_row_at(
+        id: &str,
+        author: &str,
+        comm: &str,
+        sha_hex: &str,
+        tier: &str,
+        epoch: Option<u64>,
+        cite: bool,
+        scope: &str,
+    ) -> crate::federation::Attestation {
+        use crate::federation::media_source_invariants::bodies::row as fixture_row;
+        let mut pointer = serde_json::json!({
+            "community_key_id": comm,
+            "tier": tier,
+            "content_sha256": sha_hex,
+            "content_field": "body",
+        });
+        if let Some(e) = epoch {
+            pointer["epoch"] = serde_json::json!(e);
+        }
+        let mut env = serde_json::json!({
+            "dimension": "chat:message:v1",
+            "content": pointer,
+        });
+        // A community row NAMES its cohort at top level — the write gate
+        // admits and routes on that member; the pointer's community is the
+        // key plane, not the audience (review P1). A self row carries none.
+        if scope == crate::federation::types::cohort_scope::COMMUNITY {
+            env["community_key_id"] = serde_json::json!(comm);
+        }
+        if cite {
+            env["evidence_refs"] = serde_json::json!([sha_hex]);
+        }
+        fixture_row(id, author, author, env, scope)
+    }
+
+    /// **I132 — the chat shape, end to end.** A room message as a member's
+    /// node receives it: a `community` row authored by a person, its body
+    /// under the room's DEK, referenced by a typed pointer. The provenance
+    /// read off it takes the TIER from the pointer (v46.0.0 answered
+    /// `InvisibleEncrypted` here) and the PLACEMENT from the row, and the
+    /// peer OPENS the body with it.
+    pub(crate) async fn i132_the_chat_shape_opens<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, bytes, set) = seal_and_set(&l, b"chat body under the room dek").await;
+        let sha_hex = hex::encode(sha);
+        let row = chat_row(
+            &format!("i132-{run}"),
+            &l.alice,
+            &l.comm,
+            &sha_hex,
+            "community_dek",
+            Some(0),
+            true,
+        );
+        assert_eq!(
+            row.cohort_scope,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            "I132: a room message reaches a member's node as a community row"
+        );
+        let p = BlobProvenance::from_attestation(&row, &sha, None, None)
+            .expect("I132: the pointer is a reference");
+        assert_eq!(p.author_key_id, l.alice, "I132: authorship is the row's");
+        assert_eq!(
+            p.tier,
+            CryptoTier::CommunityDek,
+            "I132: the tier is the POINTER's"
+        );
+        assert_eq!(
+            p.community_key_id.as_deref(),
+            Some(l.comm.as_str()),
+            "I132: the key plane is the POINTER's"
+        );
+        assert_eq!(p.epoch, Some(0), "I132: the epoch rides the pointer");
+        assert_eq!(
+            p.cohort_scope,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            "I132: the placement is the ROW's — the attestation is the grant"
+        );
+        assert!(
+            p.minter_key_id.is_none(),
+            "I132: the minter is still derived"
+        );
+        l.engine_b.apply_replicated_key_grant(set).await.unwrap();
+        l.engine_b
+            .adopt_sealed_blob(&bytes, p, None, AdoptDisposition::LocalOnly)
+            .await
+            .expect("I132: B adopts on the row's own provenance");
+        assert_eq!(
+            l.engine_b
+                .read_blob_as(&sha, &l.node_b, None)
+                .await
+                .unwrap(),
+            b"chat body under the room dek"
+        );
+    }
+
+    /// **I135 — the attestation is the grant.** A `self` row pointing at
+    /// community-DEK bytes is the owner's fan-out to their own node: the
+    /// provenance keeps `self` (the pointer's community does NOT widen it),
+    /// the tier still comes from the pointer, and a node that is not the
+    /// owner's is refused `NotPartyTo` at `would_hold` — a room message
+    /// that never widened to the room is not the room's to hold.
+    pub(crate) async fn i135_the_attestation_is_the_grant<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::{would_hold, DiskPressureSnapshot, HoldContext};
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, _bytes, _set) = seal_and_set(&l, b"owner fan-out").await;
+        let sha_hex = hex::encode(sha);
+        let row = chat_row_at(
+            &format!("i135-{run}"),
+            &l.alice,
+            &l.comm,
+            &sha_hex,
+            "community_dek",
+            Some(0),
+            true,
+            crate::federation::types::cohort_scope::SELF,
+        );
+        let p = BlobProvenance::from_attestation(&row, &sha, None, None)
+            .expect("I135: a self row with a community-DEK pointer is a legitimate shape");
+        assert_eq!(
+            p.cohort_scope,
+            crate::federation::types::cohort_scope::SELF,
+            "I135: the row's placement stands; the pointer does not widen it"
+        );
+        assert_eq!(
+            p.tier,
+            CryptoTier::CommunityDek,
+            "I135: the tier is still the pointer's"
+        );
+        assert_eq!(p.community_key_id.as_deref(), Some(l.comm.as_str()));
+        // B is a room member's node, not alice's: the self arm refuses it.
+        let bb = l.bb.clone();
+        let ctx = HoldContext {
+            pressure: DiskPressureSnapshot::normal(),
+            is_local_or_family: |k: &str| k == l.node_b,
+            our_key_id: &l.node_b,
+        };
+        let err = would_hold(bb.as_ref(), &ctx, &p)
+            .await
+            .expect_err("I135: a self row is the owner's; a member's node is not party to it");
+        assert!(matches!(err, BlobError::NotPartyTo { .. }), "I135: {err}");
+    }
+
+    /// **I133 — a pointer is a reference on its own, and the pointer wins.**
+    /// A row that carries no `evidence_refs` at all still resolves through
+    /// its pointer; a row carrying BOTH takes the key plane from the
+    /// pointer, never from its own scope.
+    pub(crate) async fn i133_the_pointer_is_a_reference<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, _bytes, _set) = seal_and_set(&l, b"pointer only").await;
+        let sha_hex = hex::encode(sha);
+        let uncited = chat_row(
+            &format!("i133-uncited-{run}"),
+            &l.alice,
+            &l.comm,
+            &sha_hex,
+            "community_dek",
+            Some(0),
+            false,
+        );
+        let p = BlobProvenance::from_attestation(&uncited, &sha, None, None)
+            .expect("I133: a typed pointer IS the reference (BLOB_REPLICATION §5)");
+        assert_eq!(p.tier, CryptoTier::CommunityDek);
+        assert_eq!(p.community_key_id.as_deref(), Some(l.comm.as_str()));
+        // A pointer for OTHER bytes is not a reference to these.
+        let elsewhere = chat_row(
+            &format!("i133-elsewhere-{run}"),
+            &l.alice,
+            &l.comm,
+            &"ab".repeat(32),
+            "community_dek",
+            Some(0),
+            false,
+        );
+        let err = BlobProvenance::from_attestation(&elsewhere, &sha, None, None)
+            .expect_err("I133: a pointer at other bytes does not reference these");
+        assert!(
+            err.to_string().contains("evidence_refs") || err.to_string().contains("content_sha256"),
+            "I133: refused by member: {err}"
+        );
+        // An explicit epoch still wins over the pointer's.
+        let p = BlobProvenance::from_attestation(&uncited, &sha, Some(7), None).unwrap();
+        assert_eq!(p.epoch, Some(7), "I133: the caller's epoch wins");
+    }
+
+    /// **I134 — the pointer's refusals, by member.** A community-DEK pointer
+    /// naming no community, and a pointer whose tier contradicts the
+    /// placement it implies, are refused; an `evidence_refs`-only row still
+    /// resolves exactly as v46.0.0 resolved it.
+    pub(crate) async fn i134_pointer_refusals<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, _bytes, _set) = seal_and_set(&l, b"refusals").await;
+        let sha_hex = hex::encode(sha);
+        let no_community = chat_row(
+            &format!("i134-nocomm-{run}"),
+            &l.alice,
+            "",
+            &sha_hex,
+            "community_dek",
+            Some(0),
+            true,
+        );
+        let err = BlobProvenance::from_attestation(&no_community, &sha, None, None)
+            .expect_err("I134: community-DEK names its community");
+        assert!(err.to_string().contains("community_key_id"), "I134: {err}");
+        // A `self` row whose pointer claims plaintext: the floor's own rule
+        // (a self/family row is never plaintext) refuses it, one spelling.
+        let plaintext_self = chat_row_at(
+            &format!("i134-plain-{run}"),
+            &l.alice,
+            &l.comm,
+            &sha_hex,
+            "plaintext",
+            None,
+            true,
+            crate::federation::types::cohort_scope::SELF,
+        );
+        let err = BlobProvenance::from_attestation(&plaintext_self, &sha, None, None)
+            .expect_err("I134: a self row is never plaintext");
+        assert!(
+            err.to_string().contains("tier") || err.to_string().contains("storage floor"),
+            "I134: {err}"
+        );
+        // And the v46.0.0 shape is untouched: evidence_refs only, community row.
+        use crate::federation::media_source_invariants::bodies::row as fixture_row;
+        let cited_only = fixture_row(
+            &format!("i134-cited-{run}"),
+            &l.alice,
+            &l.alice,
+            serde_json::json!({
+                "dimension": "external_content:image:v1",
+                "evidence_refs": [sha_hex],
+                "community_key_id": l.comm,
+            }),
+            COMMUNITY,
+        );
+        let p = BlobProvenance::from_attestation(&cited_only, &sha, Some(0), None)
+            .expect("I134: the v46.0.0 path is unchanged");
+        assert_eq!(p.tier, CryptoTier::CommunityDek);
+        assert_eq!(p.cohort_scope, COMMUNITY);
+    }
+
+    /// **I136 — the pointer does not choose the audience, and a malformed
+    /// pointer never falls back to the citation.** (Review of PR #883.)
+    /// A `community` row signed for room C1 whose pointer names C2 is
+    /// refused by member — `would_hold` takes the audience from
+    /// `community_key_id`, and C2's members are not party to C1's content.
+    /// A row citing the bytes in `evidence_refs` AND carrying a pointer with
+    /// a tier persist cannot read is refused, not resolved through the
+    /// citation with a tier derived from the row's scope.
+    pub(crate) async fn i136_the_pointer_does_not_choose_the_audience<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::media_source_invariants::bodies::row as fixture_row;
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let (sha, _bytes, _set) = seal_and_set(&l, b"audience").await;
+        let sha_hex = hex::encode(sha);
+        let other_room = format!("em-other-room-{run}");
+        // Signed for l.comm at top level; the pointer names another room.
+        let mismatched = fixture_row(
+            &format!("i136-mismatch-{run}"),
+            &l.alice,
+            &l.alice,
+            serde_json::json!({
+                "dimension": "chat:message:v1",
+                "community_key_id": l.comm,
+                "evidence_refs": [sha_hex],
+                "content": {"community_key_id": other_room, "tier": "community_dek",
+                             "content_sha256": sha_hex, "content_field": "body", "epoch": 0},
+            }),
+            crate::federation::types::cohort_scope::COMMUNITY,
+        );
+        let err = BlobProvenance::from_attestation(&mismatched, &sha, None, None)
+            .expect_err("I136: a pointer naming another room does not widen the audience");
+        assert!(
+            err.to_string().contains("community_key_id") && err.to_string().contains(&other_room),
+            "I136: by member, naming both: {err}"
+        );
+        // The same row with the pointer agreeing is admitted.
+        let agreeing = chat_row(
+            &format!("i136-agree-{run}"),
+            &l.alice,
+            &l.comm,
+            &sha_hex,
+            "community_dek",
+            Some(0),
+            true,
+        );
+        // chat_row puts community_key_id inside the pointer only; sign the
+        // top-level target too, as the write gate requires of a community row.
+        let mut agreeing = agreeing;
+        agreeing.attestation_envelope["community_key_id"] = serde_json::json!(l.comm);
+        let p = BlobProvenance::from_attestation(&agreeing, &sha, None, None)
+            .expect("I136: pointer and signed cohort agree");
+        assert_eq!(p.community_key_id.as_deref(), Some(l.comm.as_str()));
+        // A citation plus an unreadable pointer: refused, never the citation path.
+        let bad_tier = fixture_row(
+            &format!("i136-badtier-{run}"),
+            &l.alice,
+            &l.alice,
+            serde_json::json!({
+                "dimension": "chat:message:v1",
+                "community_key_id": l.comm,
+                "evidence_refs": [sha_hex],
+                "content": {"community_key_id": l.comm, "tier": "quantum",
+                             "content_sha256": sha_hex, "content_field": "body"},
+            }),
+            crate::federation::types::cohort_scope::COMMUNITY,
+        );
+        let err = BlobProvenance::from_attestation(&bad_tier, &sha, None, None)
+            .expect_err("I136: an unreadable pointer at these bytes is a refusal, not a fallback");
+        assert!(err.to_string().contains("tier"), "I136: by member: {err}");
+    }
+
     /// **I130 — from disk: one derivation, and the old spelling is gone.**
     #[test]
     fn i130_one_derivation_for_every_minter_writer() {
@@ -641,6 +1014,23 @@ pub(crate) mod bodies {
         assert!(
             live_lines(SELF_SRC).any(|l| l.contains("BlobProvenance::from_attestation(")),
             "I130: the DX path (provenance READ off the row) is the tested path"
+        );
+        // #878 — the constructor must read the key plane from the pointer,
+        // not from the row's scope. A grep, so a future edit that "simplifies"
+        // it back to `crypto_tier(&row.cohort_scope)` has to argue with this.
+        const HOLD: &str = include_str!("replication/hold.rs");
+        let ctor = HOLD
+            .split("pub fn from_attestation(")
+            .nth(1)
+            .expect("I130: from_attestation exists");
+        let ctor = &ctor[..ctor.find("\n    }\n").expect("end")];
+        assert!(
+            live_lines(ctor).any(|l| l.contains("blob_pointer::pointer_for(")),
+            "I130: the constructor consults the typed pointer (#878)"
+        );
+        assert!(
+            live_lines(ctor).any(|l| l.contains("check_scope(")),
+            "I130: and the pointer's tier is checked against the placement it implies"
         );
         const CASCADE: &str = include_str!("community_dek.rs");
         assert!(
@@ -674,6 +1064,37 @@ mod run {
                 async fn i128() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i128_derivation_and_its_limit(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i132() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i132_the_chat_shape_opens(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i136() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i136_the_pointer_does_not_choose_the_audience(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i135() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i135_the_attestation_is_the_grant(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i133() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i133_the_pointer_is_a_reference(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i134() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i134_pointer_refusals(&a, &b, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
                 async fn i131() {

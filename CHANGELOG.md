@@ -5,6 +5,58 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.1.0] - 2026-09-21
+
+### Fixed — `from_attestation` reads the key plane from the POINTER, not the row's scope (CIRISPersist#878)
+- v46.0.0's DX constructor took `cohort_scope` and the resolved tier from
+  the referencing row. A chat row sits at **`self`** while its body is
+  sealed under the **room's DEK**, so the constructor answered
+  `InvisibleEncrypted` for community-DEK ciphertext and `self` for bytes
+  placed in a community. Before CIRISEdge#646 taught chat to cite its blob
+  in `evidence_refs`, such a row was REFUSED, which was loud and safe; with
+  citations it was ACCEPTED and silently wrong, and the adopt records that
+  tier on the blob row for every later read to dispatch on (I2). The row is
+  authoritative for **authorship**; the typed pointer is authoritative for
+  the **key plane**.
+- **`from_attestation` is pointer-aware.** A reference is now either an
+  `evidence_refs[]` citation or a typed `BlobPointer` in any envelope
+  member whose `content_sha256` is the blob being adopted (structural
+  detection — attachments and future blob-bearing members are covered by
+  construction). When the reference IS a pointer, `tier`,
+  `community_key_id` and `epoch` come from it. **The row's placement
+  stands**: the attestation is the access grant (`is_audience`, CC 5.2 /
+  4.4.3.3.1) — a room message reaches a member's node only as a
+  `community` row, and a `self` row pointing at community-DEK bytes is the
+  owner's fan-out to their own node. The pointer never widens the cohort.
+  `author_key_id` still comes from the row's attester and
+  `minter_key_id` is unchanged from v46.0.0 — explicit, else derived from
+  the one admitted `key_grant` set, never the author.
+- Refusals stay by member: a community-DEK pointer with no community, a
+  pointer whose tier contradicts the placement it implies (the
+  `StorageFloor::check_scope` rule, one spelling), and a row that
+  references the bytes neither way. From review of the cut (Codex on
+  #883), three more, all of the "never silently pick" kind: **the pointer
+  does not choose the audience** — a `community` / `affiliations` row is
+  signed for one cohort and a pointer naming another is refused (its
+  members are not party to this room's content); **a pointer-shaped member
+  persist cannot read** (a non-string community, an unknown or non-string
+  tier, a non-integer epoch) **is a refusal, never "no pointer"** — falling
+  back to the citation would record the bytes under a tier derived from
+  the row's scope, the defect this cut closes; and **two pointers at one
+  sha that disagree on the key plane are refused** (identical duplicates,
+  as when a blob is both `content` and an attachment, are one reference).
+- Additive: no signature change, no struct change. A row that cites only
+  `evidence_refs` resolves exactly as it did in v46.0.0.
+- Witnesses I132–I136 (`federation::epoch_minter_invariants`) on sqlite and
+  postgres: the chat shape end to end (a `community` row authored by a
+  person, its pointer at `content`, its body under the room's DEK, adopted
+  on a member's node and OPENED); a pointer is a reference on its own and
+  the caller's epoch wins; the refusals by member; and the attestation is
+  the grant — a `self` row keeps `self`, and a non-owner peer is refused
+  `NotPartyTo` at `would_hold`; and (I136) a pointer naming another room
+  than the row is signed for is refused, as is a citation whose companion
+  pointer persist cannot read.
+
 ## [46.0.0] - 2026-09-20
 
 ### BREAKING — the epoch's minter is NAMED, not inferred from the author (CIRISPersist#876, `FSD/EPOCH_MINTER.md`)
