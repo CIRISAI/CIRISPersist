@@ -295,6 +295,47 @@ pub(crate) mod bodies {
             l.node_a,
             "I128: an unnamed provenance derives the sealer"
         );
+        // A set that granted only a THIRD PARTY is not a minter THIS node can
+        // derive from: the derivation asks "who granted ME a wrap", and a
+        // wrap addressed to someone else proves nothing about our own.
+        let elsewhere = format!("em-elsewhere-{run}");
+        let third = format!("em-third-{run}");
+        for k in [&elsewhere, &third] {
+            ts::register_identity_key(b.as_ref(), k, USER).await;
+        }
+        b.as_ref()
+            .community_dek_put_member_grant(
+                &l.comm,
+                &elsewhere,
+                0,
+                &third,
+                crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2,
+                "dGhpcmQ",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b.community_dek_minters_granting(&l.comm, 0, &l.node_b)
+                .await
+                .unwrap(),
+            vec![l.node_a.clone()],
+            "I128: a set that granted only a third party is not ours to derive from"
+        );
+        assert_eq!(
+            crate::federation::epoch_minter::resolve(
+                b.as_ref(),
+                None,
+                &l.comm,
+                0,
+                &l.node_b,
+                &l.alice,
+            )
+            .await
+            .unwrap(),
+            l.node_a,
+            "I128: and the derivation still answers the one that granted US"
+        );
+
         // A second minter at the same (community, epoch): no guess.
         let other = format!("em-other-{run}");
         ts::register_identity_key(b.as_ref(), &other, USER).await;
@@ -387,6 +428,36 @@ pub(crate) mod bodies {
                 .unwrap(),
             b"out of order"
         );
+        // The OTHER half of "stranded": a binding whose minter holds DEK
+        // STATE but no member grant (the minter's own node, which does not
+        // wrap to itself) is bound, not stranded, and a set from a
+        // DIFFERENT minter at the same (community, epoch) must not steal
+        // it. Asked on node A, which minted.
+        let ba = l.ba.clone();
+        let (_c, own_minter, _e) = ba
+            .community_dek_blob_epoch(&sha)
+            .await
+            .unwrap()
+            .expect("A's own binding");
+        assert_eq!(
+            own_minter, l.node_a,
+            "the minter's own node binds to itself"
+        );
+        let interloper = format!("em-interloper-{run}");
+        let stolen = ba
+            .rebind_stranded_blob_epochs(&l.comm, &interloper, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            stolen, 0,
+            "I129: a minter that HOLDS THE DEK is bound — another minter's set does not take it"
+        );
+        assert_eq!(
+            ba.community_dek_blob_epoch(&sha).await.unwrap().unwrap().1,
+            l.node_a,
+            "I129: and the binding is untouched"
+        );
+
         // A correct binding is NOT rebound by a later set from elsewhere.
         let l2 = ladder(dsn_a, dsn_b, &format!("{run}y"), pick).await;
         let (sha2, bytes2, set2) = seal_and_set(&l2, b"already right").await;
