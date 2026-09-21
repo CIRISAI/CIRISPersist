@@ -110,32 +110,75 @@ impl BlobProvenance {
         use crate::federation::admission;
         let env = &attestation.attestation_envelope;
         let sha_hex = hex::encode(sha256);
-        if !admission::envelope_binds_content(env, &sha_hex) {
+        // v46.1.0 (#878) — a reference is a CITATION or a typed POINTER at
+        // these bytes. The pointer carries the key plane the write door
+        // resolved; the citation says only which bytes.
+        let pointer = crate::federation::blob_pointer::pointer_for(env, &sha_hex);
+        if pointer.is_none() && !admission::envelope_binds_content(env, &sha_hex) {
             return Err(BlobError::InvalidArgument(format!(
-                "evidence_refs: attestation {} does not cite {sha_hex} — provenance comes from                  the row the bytes flowed from (BLOB_REPLICATION.md §5), and this row is not it",
+                "evidence_refs / content_sha256: attestation {} does not reference {sha_hex} \
+                 — provenance comes from the row the bytes flowed from \
+                 (BLOB_REPLICATION.md §5), and this row is not it",
                 attestation.attestation_id
             )));
         }
-        let scope = attestation.cohort_scope.clone();
-        let tier = cs::crypto_tier(&scope, None);
-        let community_key_id = if matches!(tier, CryptoTier::CommunityDek) {
-            let named = admission::envelope_cohort_target(env)
-                .map_err(|e| BlobError::InvalidArgument(format!("community_key_id: {e}")))?
-                .ok_or_else(|| {
-                    BlobError::InvalidArgument(format!(
-                        "community_key_id: a {scope:?} row must NAME its cohort in the signed                          envelope (community_key_id / community_id / cohort_key_id);                          attestation {} names none",
-                        attestation.attestation_id
-                    ))
-                })?;
-            Some(named.to_owned())
-        } else {
-            None
+        let (scope, tier, community_key_id, pointer_epoch) = match &pointer {
+            // THE POINTER IS AUTHORITATIVE FOR THE KEY PLANE. A chat row is
+            // placed at `self` while its body is sealed under the room's
+            // DEK; reading the tier off the row's scope answered
+            // `InvisibleEncrypted` for community-DEK ciphertext, and the
+            // adopt recorded that for every later read to dispatch on (I2).
+            Some(p) => {
+                let community =
+                    (!p.community_key_id.trim().is_empty()).then(|| p.community_key_id.clone());
+                if matches!(p.tier, CryptoTier::CommunityDek) && community.is_none() {
+                    return Err(BlobError::InvalidArgument(format!(
+                        "community_key_id: the pointer at {sha_hex} is `community_dek` and \
+                         names no community — an epoch belongs to a community's key plane \
+                         (FSD/EPOCH_MINTER.md)"
+                    )));
+                }
+                // Community-DEK bytes ARE placed in the community whose DEK
+                // sealed them, whatever the row's own placement; otherwise
+                // the row's placement stands.
+                let scope = if matches!(p.tier, CryptoTier::CommunityDek) {
+                    cs::COMMUNITY.to_owned()
+                } else {
+                    attestation.cohort_scope.clone()
+                };
+                // The tier is still checked against the placement it implies
+                // — the floor's own rule, one spelling (§11.1 / I25).
+                crate::federation::StorageFloor::resolved(p.tier).check_scope(&scope)?;
+                (scope, p.tier, community, p.epoch)
+            }
+            // The v46.0.0 path, unchanged: a citation, and the row answers.
+            None => {
+                let scope = attestation.cohort_scope.clone();
+                let tier = cs::crypto_tier(&scope, None);
+                let community = if matches!(tier, CryptoTier::CommunityDek) {
+                    let named = admission::envelope_cohort_target(env)
+                        .map_err(|e| BlobError::InvalidArgument(format!("community_key_id: {e}")))?
+                        .ok_or_else(|| {
+                            BlobError::InvalidArgument(format!(
+                                "community_key_id: a {scope:?} row must NAME its cohort in the \
+                                 signed envelope (community_key_id / community_id / \
+                                 cohort_key_id); attestation {} names none",
+                                attestation.attestation_id
+                            ))
+                        })?;
+                    Some(named.to_owned())
+                } else {
+                    None
+                };
+                (scope, tier, community, None)
+            }
         };
         Ok(Self {
             author_key_id: attestation.attesting_key_id.clone(),
             cohort_scope: scope,
             community_key_id,
-            epoch,
+            // The caller's epoch wins; the pointer's is the fallback.
+            epoch: epoch.or(pointer_epoch),
             tier,
             minter_key_id: minter_key_id.map(str::to_owned),
         })

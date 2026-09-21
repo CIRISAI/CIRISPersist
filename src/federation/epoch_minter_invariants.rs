@@ -641,7 +641,13 @@ pub(crate) mod bodies {
         if cite {
             env["evidence_refs"] = serde_json::json!([sha_hex]);
         }
-        fixture_row(id, author, author, env, crate::federation::types::cohort_scope::SELF)
+        fixture_row(
+            id,
+            author,
+            author,
+            env,
+            crate::federation::types::cohort_scope::SELF,
+        )
     }
 
     /// **I132 — the chat shape, end to end.** A `self`-scoped row authored by
@@ -649,8 +655,12 @@ pub(crate) mod bodies {
     /// provenance read off it names the ROOM and the room's tier (not `self`
     /// / `InvisibleEncrypted`), and the peer OPENS the body with it. This is
     /// the shape v46.0.0's constructor answered wrongly.
-    pub(crate) async fn i132_the_chat_shape_opens<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
-    where
+    pub(crate) async fn i132_the_chat_shape_opens<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -665,11 +675,19 @@ pub(crate) mod bodies {
             Some(0),
             true,
         );
-        assert_eq!(row.cohort_scope, crate::federation::types::cohort_scope::SELF, "I132: the row sits at self");
+        assert_eq!(
+            row.cohort_scope,
+            crate::federation::types::cohort_scope::SELF,
+            "I132: the row sits at self"
+        );
         let p = BlobProvenance::from_attestation(&row, &sha, None, None)
             .expect("I132: the pointer is a reference");
         assert_eq!(p.author_key_id, l.alice, "I132: authorship is the row's");
-        assert_eq!(p.tier, CryptoTier::CommunityDek, "I132: the tier is the POINTER's");
+        assert_eq!(
+            p.tier,
+            CryptoTier::CommunityDek,
+            "I132: the tier is the POINTER's"
+        );
         assert_eq!(
             p.community_key_id.as_deref(),
             Some(l.comm.as_str()),
@@ -681,14 +699,20 @@ pub(crate) mod bodies {
             crate::federation::types::cohort_scope::COMMUNITY,
             "I132: community-DEK bytes are placed in the community whose DEK sealed them"
         );
-        assert!(p.minter_key_id.is_none(), "I132: the minter is still derived");
+        assert!(
+            p.minter_key_id.is_none(),
+            "I132: the minter is still derived"
+        );
         l.engine_b.apply_replicated_key_grant(set).await.unwrap();
         l.engine_b
             .adopt_sealed_blob(&bytes, p, None, AdoptDisposition::LocalOnly)
             .await
             .expect("I132: B adopts on the row's own provenance");
         assert_eq!(
-            l.engine_b.read_blob_as(&sha, &l.node_b, None).await.unwrap(),
+            l.engine_b
+                .read_blob_as(&sha, &l.node_b, None)
+                .await
+                .unwrap(),
             b"chat body under the room dek"
         );
     }
@@ -697,8 +721,12 @@ pub(crate) mod bodies {
     /// A row that carries no `evidence_refs` at all still resolves through
     /// its pointer; a row carrying BOTH takes the key plane from the
     /// pointer, never from its own scope.
-    pub(crate) async fn i133_the_pointer_is_a_reference<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
-    where
+    pub(crate) async fn i133_the_pointer_is_a_reference<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
         B: BlobStorage + FederationDirectory + Sync,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
@@ -827,6 +855,23 @@ pub(crate) mod bodies {
         assert!(
             live_lines(SELF_SRC).any(|l| l.contains("BlobProvenance::from_attestation(")),
             "I130: the DX path (provenance READ off the row) is the tested path"
+        );
+        // #878 — the constructor must read the key plane from the pointer,
+        // not from the row's scope. A grep, so a future edit that "simplifies"
+        // it back to `crypto_tier(&row.cohort_scope)` has to argue with this.
+        const HOLD: &str = include_str!("replication/hold.rs");
+        let ctor = HOLD
+            .split("pub fn from_attestation(")
+            .nth(1)
+            .expect("I130: from_attestation exists");
+        let ctor = &ctor[..ctor.find("\n    }\n").expect("end")];
+        assert!(
+            live_lines(ctor).any(|l| l.contains("blob_pointer::pointer_for(")),
+            "I130: the constructor consults the typed pointer (#878)"
+        );
+        assert!(
+            live_lines(ctor).any(|l| l.contains("check_scope(")),
+            "I130: and the pointer's tier is checked against the placement it implies"
         );
         const CASCADE: &str = include_str!("community_dek.rs");
         assert!(
