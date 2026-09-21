@@ -428,34 +428,55 @@ pub(crate) mod bodies {
                 .unwrap(),
             b"out of order"
         );
-        // The OTHER half of "stranded": a binding whose minter holds DEK
-        // STATE but no member grant (the minter's own node, which does not
-        // wrap to itself) is bound, not stranded, and a set from a
-        // DIFFERENT minter at the same (community, epoch) must not steal
-        // it. Asked on node A, which minted.
+        // The OTHER half of "stranded", on its own: DEK STATE with NO member
+        // grant. Reachable in production when a community's other members
+        // hold no encryption pubkeys — the cascade mints, self-retains and
+        // wraps to nobody (#843's fail-secure exclusion) — and the binding
+        // is then protected by the DEK check ALONE. Built with the doors
+        // that write exactly that state, and probed toward an INTERLOPER so
+        // the guard is what has to hold (rebinding toward the row's own
+        // minter is excluded by `minter <> new` and witnesses nothing).
         let ba = l.ba.clone();
-        let (_c, own_minter, _e) = ba
-            .community_dek_blob_epoch(&sha)
-            .await
-            .unwrap()
-            .expect("A's own binding");
-        assert_eq!(
-            own_minter, l.node_a,
-            "the minter's own node binds to itself"
+        let keyless = format!("em-keyless-{run}");
+        ts::register_identity_key(ba.as_ref(), &keyless, USER).await;
+        assert!(
+            ba.community_dek_minters_granting(&l.comm, 0, &keyless)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I129: this minter wrapped to nobody — no grant row exists"
         );
+        let (sha_k, bytes_k, _set_k) = seal_and_set(&l, b"keyless-minter").await;
+        let bb = l.bb.clone();
+        bb.community_dek_put_self_retention(&l.comm, &keyless, 0, "c2VsZg")
+            .await
+            .expect("the minter self-retains its DEK");
+        l.engine_b
+            .adopt_sealed_blob(
+                &bytes_k,
+                person_authored(&l, Some(&keyless)),
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("B adopts naming the keyless minter");
         let interloper = format!("em-interloper-{run}");
-        let stolen = ba
+        let stolen = bb
             .rebind_stranded_blob_epochs(&l.comm, &interloper, 0)
             .await
             .unwrap();
         assert_eq!(
             stolen, 0,
-            "I129: a minter that HOLDS THE DEK is bound — another minter's set does not take it"
+            "I129: DEK state with no grants is BOUND — the repair must not steal it"
         );
         assert_eq!(
-            ba.community_dek_blob_epoch(&sha).await.unwrap().unwrap().1,
-            l.node_a,
-            "I129: and the binding is untouched"
+            bb.community_dek_blob_epoch(&sha_k)
+                .await
+                .unwrap()
+                .unwrap()
+                .1,
+            keyless,
+            "I129: and that binding is untouched"
         );
 
         // A correct binding is NOT rebound by a later set from elsewhere.
@@ -477,12 +498,19 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .unwrap();
+        // Toward an INTERLOPER: the row names node_a, which holds a GRANT
+        // here (B admitted A's set) but no DEK state, so the grants guard is
+        // the only thing between this binding and the interloper.
+        let interloper2 = format!("em-interloper2-{run}");
         let count = l2
             .bb
-            .rebind_stranded_blob_epochs(&l2.comm, &l2.node_a, 0)
+            .rebind_stranded_blob_epochs(&l2.comm, &interloper2, 0)
             .await
             .unwrap();
-        assert_eq!(count, 0, "I129: a bound row is not stranded");
+        assert_eq!(
+            count, 0,
+            "I129: a minter that HOLDS A GRANT is bound — an interloper does not take it"
+        );
         assert_eq!(
             l2.bb
                 .community_dek_blob_epoch(&sha2)
