@@ -1206,10 +1206,40 @@ where
             community_key_id,
             minter_key_id,
             epoch,
-        } => backend
-            .community_dek_put_member_grants(community_key_id, minter_key_id, *epoch, &parsed.wraps)
-            .await
-            .map_err(map_blob_err)?,
+        } => {
+            let n = backend
+                .community_dek_put_member_grants(
+                    community_key_id,
+                    minter_key_id,
+                    *epoch,
+                    &parsed.wraps,
+                )
+                .await
+                .map_err(map_blob_err)?;
+            // v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md` §3) — THE
+            // REPAIR. This set is the proof of who minted
+            // `(community, epoch)`. Any blob binding at that community and
+            // epoch whose recorded minter holds neither DEK state nor a
+            // grant is stranded — written before the key set arrived, or
+            // under the pre-v46 premise that the row's AUTHOR minted it —
+            // and can never authorize anyone. Rebind it here, because
+            // nobody re-sends bytes to fix a key column. A binding whose
+            // minter does hold state is left exactly as it is.
+            let rebound = backend
+                .rebind_stranded_blob_epochs(community_key_id, minter_key_id, *epoch)
+                .await
+                .map_err(map_blob_err)?;
+            if rebound > 0 {
+                tracing::info!(
+                    community = %community_key_id,
+                    minter = %minter_key_id,
+                    epoch = *epoch,
+                    rebound,
+                    "key_grant admission rebound stranded blob epoch bindings (#876)"
+                );
+            }
+            n
+        }
         KeyGrantAxis::Content {
             at_rest_sha256,
             cohort_scope,

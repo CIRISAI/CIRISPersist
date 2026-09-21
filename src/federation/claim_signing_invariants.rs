@@ -948,6 +948,7 @@ mod tests {
                     community_key_id: Some(comm.clone()),
                     epoch: Some(0),
                     tier: CryptoTier::CommunityDek,
+                    minter_key_id: None,
                 },
                 None,
                 AdoptDisposition::LocalOnly,

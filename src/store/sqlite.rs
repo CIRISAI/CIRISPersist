@@ -14506,6 +14506,76 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }))
     }
 
+    /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §2) — the derivation input: the
+    /// minters of every admitted set that granted `viewer_key_id` a wrap at
+    /// `(community, epoch)`. DISTINCT and ordered, so two backends cannot
+    /// disagree on what "exactly one" means.
+    async fn community_dek_minters_granting(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let (c, e, v) = (
+            community_key_id.to_owned(),
+            epoch as i64,
+            viewer_key_id.to_owned(),
+        );
+        self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT minter_key_id FROM federation_community_dek_member_grants \
+                  WHERE community_key_id = ?1 AND epoch = ?2 AND member_key_id = ?3 \
+                  ORDER BY minter_key_id ASC",
+            )?;
+            let rows: Result<Vec<String>, rusqlite::Error> = stmt
+                .query_map(rusqlite::params![c, e, v], |r| r.get::<_, String>(0))?
+                .collect();
+            rows
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_minters_granting: {e}"))
+        })
+    }
+
+    /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §3) — the repair. A binding whose
+    /// recorded minter holds neither DEK state nor a grant at this
+    /// `(community, epoch)` is STRANDED — it can never authorize anyone —
+    /// and rebinds onto the minter that just proved it holds the epoch. A
+    /// row whose minter DOES hold state is left alone.
+    async fn rebind_stranded_blob_epochs(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<usize, crate::federation::BlobError> {
+        let (c, m, e) = (
+            community_key_id.to_owned(),
+            minter_key_id.to_owned(),
+            epoch as i64,
+        );
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_community_blob_epoch \
+                    SET minter_key_id = ?2 \
+                  WHERE community_key_id = ?1 AND epoch = ?3 AND minter_key_id <> ?2 \
+                    AND NOT EXISTS (SELECT 1 FROM federation_community_dek d \
+                                     WHERE d.community_key_id = federation_community_blob_epoch.community_key_id \
+                                       AND d.minter_key_id = federation_community_blob_epoch.minter_key_id \
+                                       AND d.epoch = federation_community_blob_epoch.epoch) \
+                    AND NOT EXISTS (SELECT 1 FROM federation_community_dek_member_grants g \
+                                     WHERE g.community_key_id = federation_community_blob_epoch.community_key_id \
+                                       AND g.minter_key_id = federation_community_blob_epoch.minter_key_id \
+                                       AND g.epoch = federation_community_blob_epoch.epoch)",
+                rusqlite::params![c, m, e],
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("rebind_stranded_blob_epochs: {e}"))
+        })
+    }
+
     async fn community_dek_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],

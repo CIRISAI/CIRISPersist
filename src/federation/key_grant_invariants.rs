@@ -241,6 +241,10 @@ pub mod two_node {
                 community_key_id: Some(community_or_owner.to_owned()),
                 epoch,
                 tier,
+                // #876 — this two-node fixture seals with the node's own
+                // key, so author == minter here; the author != sealer
+                // ladder lives in `epoch_minter_invariants`.
+                minter_key_id: None,
             },
             None,
             AdoptDisposition::LocalOnly,
@@ -3540,6 +3544,7 @@ mod tests {
                         community_key_id: Some(comm.clone()),
                         epoch: r.epoch,
                         tier: CryptoTier::CommunityDek,
+                        minter_key_id: None,
                     },
                     None,
                     AdoptDisposition::LocalOnly,
@@ -4414,6 +4419,7 @@ mod tests {
                         community_key_id: Some(comm.clone()),
                         epoch: Some(0),
                         tier: CryptoTier::CommunityDek,
+                        minter_key_id: None,
                     },
                     None,
                     AdoptDisposition::LocalOnly,

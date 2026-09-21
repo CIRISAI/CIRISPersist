@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.0.0] - 2026-09-20
+
+### BREAKING — the epoch's minter is NAMED, not inferred from the author (CIRISPersist#876, `FSD/EPOCH_MINTER.md`)
+- **`BlobProvenance` gains `minter_key_id: Option<String>`** (FFI: an
+  optional `minter_key_id` member on the adopt / would-hold provenance
+  wire, so the JSON surface stays compatible; the Rust struct literal does
+  not). Adopting a `community_dek` blob recorded
+  `minter_key_id = author_key_id` under the premise — stated in
+  `BLOB_REPLICATION.md` §11 and in `adopt_cascade.rs` — that *"the author's
+  cascade minted the epoch"*. That premise holds only where the author IS
+  the sealing engine. Where a row is authored by a **person** and sealed by
+  their **node** (every chat row since server 0.5.211), the adopt wrote
+  `(community, person, epoch)` while the seal path and the `key_grant` set
+  wrote `(community, node, epoch)`: `authorize_viewer_by_tier` missed on the
+  minter member alone and every cross-node community body read
+  `NotGranted` — the viewer and its wrap both correct.
+- **One derivation, three call sites.** `federation::epoch_minter` is the
+  single answer to "who minted `(community, epoch)`": the explicit
+  `minter_key_id` when the producer names it, else the minter of the ONE
+  admitted `key_grant` set that granted this node a wrap at that
+  `(community, epoch)`, else `author_key_id` (the pre-46 behaviour, so no
+  caller changes by upgrading). The seal path, the adopt path and the
+  repair sweep all resolve through it.
+- **A binding written under the wrong minter REBINDS** when the naming
+  `key_grant` set is admitted (`rebind_stranded_blob_epochs`): bytes may
+  arrive before their key set (§3), and nobody re-sends bytes to fix a key
+  column.
+- **Structural gate:** every writer of a minter-keyed table
+  (`federation_community_dek_epoch`, `federation_community_dek`,
+  `federation_community_dek_member_grants`, `federation_community_blob_epoch`)
+  takes its minter from that one function — asserted from disk, in the
+  `store::parity` discipline, so a fifth writer cannot answer from the
+  other axis.
+- **`BLOB_REPLICATION.md` §11 corrected**: a blob's key identity is
+  `(community, MINTER, epoch)`. The minter is the occurrence whose cascade
+  minted the epoch; the author is the row's attester. They coincide only
+  when a node authors its own content.
+- **DX: the row and the provenance are one relation, in code.**
+  `BLOB_REPLICATION.md` §5 says provenance lives on the referencing
+  attestation; **`BlobProvenance::from_attestation(row, sha256, epoch,
+  minter)`** is that sentence as a constructor (PyO3:
+  `blob_provenance_from_attestation_json`). It fills `author_key_id` from
+  the row's attester, `cohort_scope` from the row, `community_key_id` from
+  the cohort the SIGNED envelope names, and resolves the tier — and it
+  refuses a row that does not cite these bytes in `evidence_refs[]`. The
+  key-plane facts (`epoch`, `minter_key_id`) are arguments, because they
+  live on the `key_grant` set and not on the row. No caller transcribes a
+  member by hand any more, and none can put the author where the minter
+  goes: that transcription IS #876.
+- Witnesses I126–I131 (`federation::epoch_minter_invariants`) on sqlite and
+  postgres, over an **author ≠ sealer** two-node fixture that is now the
+  default shape for this plane: a row attested by A's owner and sealed by
+  A's node, adopted on B, OPENS for B's node key.
+
 ## [45.0.1] - 2026-09-20
 
 ### Fixed — an occurrence resolves to its PRINCIPAL, deterministically (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md`)

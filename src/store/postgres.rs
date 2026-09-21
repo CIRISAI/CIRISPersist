@@ -15258,6 +15258,80 @@ impl crate::federation::BlobStorage for PostgresBackend {
         }))
     }
 
+    /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §2) — the sqlite twin: the
+    /// minters of every admitted set that granted `viewer_key_id` a wrap at
+    /// `(community, epoch)`, DISTINCT and ordered.
+    async fn community_dek_minters_granting(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let e = i64::try_from(epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("epoch exceeds i64".into())
+        })?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT minter_key_id \
+                   FROM cirislens.federation_community_dek_member_grants \
+                  WHERE community_key_id = $1 AND epoch = $2 AND member_key_id = $3 \
+                  ORDER BY minter_key_id ASC",
+                &[&community_key_id, &e, &viewer_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_minters_granting: {e}"
+                ))
+            })?;
+        rows.iter()
+            .map(|r| r.safe_get_with("minter_key_id", crate::federation::BlobError::Backend))
+            .collect()
+    }
+
+    /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §3) — the sqlite twin of the
+    /// repair: rebind only the STRANDED rows (recorded minter holds neither
+    /// DEK state nor a grant at this community and epoch).
+    async fn rebind_stranded_blob_epochs(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> Result<usize, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let e = i64::try_from(epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("epoch exceeds i64".into())
+        })?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_community_blob_epoch b \
+                    SET minter_key_id = $2 \
+                  WHERE b.community_key_id = $1 AND b.epoch = $3 AND b.minter_key_id <> $2 \
+                    AND NOT EXISTS (SELECT 1 FROM cirislens.federation_community_dek d \
+                                     WHERE d.community_key_id = b.community_key_id \
+                                       AND d.minter_key_id = b.minter_key_id \
+                                       AND d.epoch = b.epoch) \
+                    AND NOT EXISTS (SELECT 1 FROM cirislens.federation_community_dek_member_grants g \
+                                     WHERE g.community_key_id = b.community_key_id \
+                                       AND g.minter_key_id = b.minter_key_id \
+                                       AND g.epoch = b.epoch)",
+                &[&community_key_id, &minter_key_id, &e],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("rebind_stranded_blob_epochs: {e}"))
+            })?;
+        usize::try_from(n)
+            .map_err(|_| crate::federation::BlobError::Backend("rebind count exceeds usize".into()))
+    }
+
     async fn community_dek_blob_epoch(
         &self,
         at_rest_sha256: &[u8; 32],

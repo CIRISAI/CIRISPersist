@@ -111,6 +111,7 @@ pub(crate) mod bodies {
                 community_key_id: Some(comm.to_owned()),
                 epoch: Some(0),
                 tier: cohort_scope::CryptoTier::CommunityDek,
+                minter_key_id: None,
             },
         )
         .await

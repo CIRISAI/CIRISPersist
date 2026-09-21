@@ -91,6 +91,12 @@ pub mod media_source_invariants;
 // principal, deterministically; the audience walk unions every principal.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod occurrence_principal_invariants;
+// CIRISPersist#876 (`FSD/EPOCH_MINTER.md`) — the ONE answer to "who minted this epoch".
+pub mod epoch_minter;
+// CIRISPersist#876 (`FSD/EPOCH_MINTER.md`) — I126–I130: the epoch's minter is named or
+// derived, never inferred from the row's author. The fixture is author != sealer.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod epoch_minter_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.

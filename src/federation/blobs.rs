@@ -2488,6 +2488,44 @@ pub trait BlobStorage: Send + Sync {
         member_key_id: &str,
     ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
+    /// v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md` §2) — **the
+    /// derivation input**: the minters of every admitted `key_grant` set
+    /// that granted `viewer_key_id` a wrap at `(community, epoch)`, sorted
+    /// and deduped.
+    ///
+    /// A set is signed by its minter and admitted before it lands here, so
+    /// this is verified state, not a declaration. **One** entry answers
+    /// "who minted this epoch" for an adopt that was not told; two or more
+    /// is the multi-minter state #848 made the key three-part for, and the
+    /// caller must NOT guess between them
+    /// ([`super::epoch_minter::resolve`]).
+    fn community_dek_minters_granting(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md` §3) — **the
+    /// repair.** Rebind every `federation_community_blob_epoch` row at
+    /// `(community_key_id, epoch)` whose recorded `minter_key_id` is
+    /// **stranded** — holds no DEK state and no member grants at that
+    /// community and epoch — onto `minter_key_id`. Returns the number of
+    /// rows rebound.
+    ///
+    /// Called when a `key_grant` set is admitted: the bytes may arrive
+    /// before their key set (`BLOB_REPLICATION.md` §3), and every binding
+    /// written before v46 recorded the row's AUTHOR. Nobody re-sends bytes
+    /// to fix a key column. A row whose recorded minter DOES hold state is
+    /// never touched — the sweep repairs the stranded, it does not
+    /// re-point the bound.
+    fn rebind_stranded_blob_epochs(
+        &self,
+        community_key_id: &str,
+        minter_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<usize, BlobError>> + Send;
+
     /// #848 (§13, §17) — the viewer's OWN wrap on `(community, minter,
     /// epoch)`: `(wrap_algorithm, wrapped_dek)`, or `None`. This is what a
     /// member's node opens a PEER-minted epoch with: it holds no
