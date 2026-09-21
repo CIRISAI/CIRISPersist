@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [46.2.0] - 2026-09-21
 
-### Changed — CIRISVerify re-pinned v15.2.0 → v16.1.0 (all seven Cargo pins together; the Python bound `ciris-verify>=16.0.0,<17`)
+### Changed — CIRISVerify re-pinned v15.2.0 → v16.1.0 (all seven Cargo pins together; the Python bound `ciris-verify>=16.1.0,<17`)
 - **v16.0.0** removed `hw_token::get_token_signer`, an orphan stub persist
   never called — the verify MAJOR is inert here. **v16.1.0** adds
   `create_federation_identity_in(keys_dir, …)` and `preflight_keys_dir`
@@ -17,9 +17,9 @@ threat-model citations because this crate's audit story is the point.
   identities itself (Server and Edge call verify directly), so no persist
   surface changes; this cut is the pin so the stack builds against one
   verify.
-- The Python transitive bound moves to the new major. Its floor is 16.0.0
-  rather than 16.1.0 because that is what PyPI carried when this shipped;
-  the Rust pin is 16.1.0 and nothing in persist depends on the minor.
+- The Python transitive bound moves with the tag: `ciris-verify>=16.1.0,<17`.
+  Persist consumes verify by git tag; the wheel bound is one spelling of
+  the same adoption, not a separate decision.
 - No wire, migration or vocabulary change. Minor: what `pip` resolves
   changes.
 
