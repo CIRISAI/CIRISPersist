@@ -72,6 +72,25 @@ declaration or from verified state; there is no third source.
 | `BlobProvenance::from_attestation(row, sha256, epoch, minter)` | NEW (PyO3 `blob_provenance_from_attestation_json`). The relation `BLOB_REPLICATION.md` §5 states in prose — provenance lives on the referencing attestation — as a constructor: author from the row's attester, cohort from the row, community from the cohort the SIGNED envelope names, tier resolved; refuses a row that does not cite the bytes in `evidence_refs[]`. `epoch` / `minter_key_id` are arguments because they are key-plane facts carried by the `key_grant` set, not by the row |
 | `BLOB_REPLICATION.md` §11 | corrected: the key identity is `(community, MINTER, epoch)` |
 
+**v46.1.0 (CIRISPersist#878) — which side answers what.** The referencing
+row and the typed `BlobPointer` inside it are two axes, and v46.0.0 read one
+where it needed the other:
+
+| fact | authority | why |
+|---|---|---|
+| `author_key_id` | the ROW's attester | authorship is the row's, and it is the member #876 was written by transcribing |
+| `minter_key_id` | explicit, else the one admitted `key_grant` set | §2, unchanged |
+| `tier` | the POINTER | the write door RESOLVED it and recorded it there; a chat row sits at `self` while its body is under the room's DEK |
+| `community_key_id` | the POINTER | which key plane, not which row |
+| `epoch` | the caller, else the POINTER | a key-plane fact; absent on a `CommunityDek` pointer means the adopt refuses rather than guesses |
+| `cohort_scope` | the POINTER's tier | community-DEK bytes are placed in the community whose DEK sealed them; otherwise the row's placement stands |
+
+A reference is an `evidence_refs[]` citation OR a pointer whose
+`content_sha256` is the blob in hand; persist accepts either and refuses a
+row that is neither. The tier taken from the pointer is still checked
+against the placement it implies, through the one
+`StorageFloor::check_scope` rule.
+
 No migration: the four tables already carry `minter_key_id`. No vocabulary
 change. MAJOR for the struct member alone.
 

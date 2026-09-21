@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.1.0] - 2026-09-21
+
+### Fixed — `from_attestation` reads the key plane from the POINTER, not the row's scope (CIRISPersist#878)
+- v46.0.0's DX constructor took `cohort_scope` and the resolved tier from
+  the referencing row. A chat row sits at **`self`** while its body is
+  sealed under the **room's DEK**, so the constructor answered
+  `InvisibleEncrypted` for community-DEK ciphertext and `self` for bytes
+  placed in a community. Before CIRISEdge#646 taught chat to cite its blob
+  in `evidence_refs`, such a row was REFUSED, which was loud and safe; with
+  citations it was ACCEPTED and silently wrong, and the adopt records that
+  tier on the blob row for every later read to dispatch on (I2). The row is
+  authoritative for **authorship**; the typed pointer is authoritative for
+  the **key plane**.
+- **`from_attestation` is pointer-aware.** A reference is now either an
+  `evidence_refs[]` citation or a typed `BlobPointer` in any envelope
+  member whose `content_sha256` is the blob being adopted (structural
+  detection — attachments and future blob-bearing members are covered by
+  construction). When the reference IS a pointer, `tier`,
+  `community_key_id` and `epoch` come from it, and the cohort follows the
+  key plane: community-DEK bytes are placed in the community whose DEK
+  sealed them. `author_key_id` still comes from the row's attester and
+  `minter_key_id` is unchanged from v46.0.0 — explicit, else derived from
+  the one admitted `key_grant` set, never the author.
+- Refusals stay by member: a community-DEK pointer with no community, a
+  pointer whose tier contradicts the placement it implies (the
+  `StorageFloor::check_scope` rule, one spelling), and a row that
+  references the bytes neither way.
+- Additive: no signature change, no struct change. A row that cites only
+  `evidence_refs` resolves exactly as it did in v46.0.0.
+- Witnesses I132–I134 (`federation::epoch_minter_invariants`) on sqlite and
+  postgres: the chat shape end to end (a `self`-scoped row authored by a
+  person, its pointer at `content`, its body under the room's DEK, adopted
+  on the peer and OPENED); the pointer's members win over the row's scope;
+  the refusals by member.
+
 ## [46.0.0] - 2026-09-20
 
 ### BREAKING — the epoch's minter is NAMED, not inferred from the author (CIRISPersist#876, `FSD/EPOCH_MINTER.md`)
