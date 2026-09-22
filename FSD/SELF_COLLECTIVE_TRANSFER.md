@@ -96,9 +96,13 @@ for the community source rule's symmetry (R4), not load-bearing here.
   peers too; does not contain A itself, the owner's key, or an occurrence
   that owns no node (a phone); `send_set_for(A_node, community)` equals
   `consent_peers_by_principals(A_node)`; for `family`, a family member's node
-  is included, for `self` it is not. Mutants: drop the node union (self red);
+  is included, for `self` it is not. An owned node that is no KEM occurrence
+  is an endpoint AND a sender (`send_set_for(C, self)` names the owner's other
+  nodes — the leg that exercises `owner_of` inside `principals_of`; without it
+  "drop the owner" survived). Mutants: drop the node union (self red);
   union occurrences instead of nodes (phone red); apply it at community
-  (community red); include family nodes at self (self red).
+  (community red); include family nodes at self (self red); `principals_of`
+  drops `owner_of` (C's set red).
 - **I138** — two NODE engines, owner-bound and occurrence-bound to the same
   human on both directories: seal a self blob on A while A is the only
   occurrence; admit B after; `send_set_for(A, self)` names B;
@@ -111,9 +115,13 @@ for the community source rule's symmetry (R4), not load-bearing here.
   device projects); the re-key emits no set.
 - **I65** (existing, re-cast) — the forger is the owner's REVOKED device.
 - **I139** — `minter_of_blob(sha)` is the node key for a community blob and
-  the content set's attester for a self blob; `None` for an unknown sha.
-  Mutant: the self arm returns the row's author (a person) instead of the
-  set's attester.
+  the content set's attester for a PERSON-authored self blob — on the sealing
+  node and on a peer that adopted the bytes with the person as author;
+  `None` for an unknown sha. Mutant: the self arm returns the row's author
+  instead of the set's attester (survives on the sealing node alone, where
+  the door records the node as author — the peer's adopt is the leg that
+  kills it). "attesting → attested key" is EQUIVALENT (a self-spoken set has
+  both equal) and is not a property.
 - **I140** — from disk: the three PyO3 doors exist and are classified.
 
 ## 6. Not in scope
@@ -121,3 +129,20 @@ for the community source rule's symmetry (R4), not load-bearing here.
 Push-on-write (`deliverables_for_occurrence`): an optimisation once the pull
 floor has a witness on edge. Any holder claim at any scope. The self room
 (edge §6.3) and the drive (server).
+
+## 7. Mutation table (sqlite lane, 2026-09-22)
+
+| Mutant | Verdict |
+|---|---|
+| M1 drop the node union at self | KILLED by memory::i137 sqlite::i137 sqlite_engine::i138 |
+| M2 union occurrence keys instead of nodes | KILLED by memory::i137 sqlite::i137 |
+| M3 apply the collective at community | KILLED by memory::i137 sqlite::i137 |
+| M4 family nodes at self | KILLED by memory::i137 sqlite::i137 |
+| M5 speaks_for = signer == author only | KILLED by sqlite_engine::i138 |
+| M6 speaks_for = true | KILLED by i65_content_axis_second_device_sqlite sqlite_engine::i138 |
+| M8 hold self arm back to key equality | KILLED by sqlite_engine::i138 |
+| M9 key_grant admission accepts any signer once the author is known | KILLED by sqlite_engine::i138 |
+| M10 pending projection back to signer != author | KILLED by sqlite_engine::i138 |
+| M7 principals_of drops the owner | KILLED by memory::i137 sqlite::i137  |
+| M11' minter_of_blob self arm returns the blob's AUTHOR | KILLED by sqlite_engine::i139  |
+| M11 (attesting → attested key) | EQUIVALENT — a self-spoken set has attested == attesting; replaced by M11' |
