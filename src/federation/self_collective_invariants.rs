@@ -78,6 +78,11 @@ pub(crate) mod bodies {
         let phone = format!("i137-phone-{s}");
         ts::register_identity_key(d, &phone, USER).await;
         bind(d, &owner, &phone, None).await;
+        // A node the owner OWNS but never bound as a KEM occurrence still
+        // receives the owner's rows: ownership is the endpoint fact.
+        let node_c = format!("i137-node-c-{s}");
+        ts::register_identity_key(d, &node_c, crate::federation::types::identity_type::NODE).await;
+        ts::put_owner_binding(d, &owner, &node_c).await;
         let consent = crate::federation::consent_by_humans::consent_peers_by_principals(d, &node_a)
             .await
             .unwrap();
@@ -100,6 +105,10 @@ pub(crate) mod bodies {
         assert!(
             !self_set.contains(&phone),
             "I137: an occurrence that owns no node is not an endpoint: {self_set:?}"
+        );
+        assert!(
+            self_set.contains(&node_c),
+            "I137: an owned node that is no KEM occurrence is still an endpoint: {self_set:?}"
         );
         assert!(
             !self_set.contains(&owner),
