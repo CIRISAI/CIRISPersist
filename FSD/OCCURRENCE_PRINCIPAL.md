@@ -137,8 +137,13 @@ No wire change, no migration, no vocabulary change. PATCH.
   binding + occurrence) writes two `self` rows about itself (`config:*`);
   the node reads both; the owner's key reads both; the owner's second device
   reads both (CC 5.2); a node the owner OWNS but never bound as an occurrence
-  reads both; a stranger node reads none. Unclaimed (singleton) the node still
-  reads its own.
+  reads both; the node reads what the device and the owned-only node write
+  about themselves; a stranger node reads none. The node's `config:admission`
+  leaf is read by the node alone — not the device, not the owner's key, not
+  the other node. After the owner REVOKES the node's occurrence (owner
+  binding kept): the node reads only its own rows, `speaks_for(node, owner)`
+  is false, the device still reads the (owned) node's plain rows. Unclaimed
+  (singleton) the node still reads its own.
 - Mutants: self set = `{identity}` only (node red); drop the occurrence union
   (the DEVICE's own row unread — every reader in the first draft was also an
   owned node, so only a writer that owns no node exercises this fold); drop
@@ -148,7 +153,7 @@ No wire change, no migration, no vocabulary change. PATCH.
   the device's row); drop the sensitive clause in the Rust twin (device reads
   the leaf, memory/sqlite); drop it in the SQL twin (sqlite).
 
-### 6.1 Mutation table (sqlite lane, 2026-09-22)
+### 6.1 Mutation table (sqlite lane, 2026-09-22; rounds a–c)
 
 | Mutant | Verdict |
 |---|---|
@@ -157,3 +162,6 @@ No wire change, no migration, no vocabulary change. PATCH.
 | M5 admits(self) = true | KILLED by memory::i141 sqlite::i141  |
 | M2 drop the occurrence union | KILLED by memory::i141 sqlite::i141  |
 | M3 drop nodes_owned_by | KILLED by memory::i141 sqlite::i141  |
+| M6 principals_of ignores the revocation | KILLED by memory::i141 sqlite::i141  |
+| M7 Rust twin drops the sensitive clause | KILLED by memory::i141 sqlite::i141  |
+| M8 SQL twin drops the sensitive clause | KILLED by sqlite::i141  |
