@@ -165,8 +165,13 @@ pub fn cohort_scope_sql_predicate_with_dimension(
                     })
                     .collect::<Vec<_>>()
                     .join(" OR ");
-                self_branch =
-                    format!("({self_branch} AND ({target_col} = {occ_ph} OR NOT ({sensitive})))");
+                // A row with NO dimension is not a sensitive leaf: `NOT (NULL)`
+                // is NULL in SQL and would exclude it for every reader but
+                // the writer (PR #889 review, round two) — the Rust twin's
+                // `None` is spelled `IS NULL` here.
+                self_branch = format!(
+                    "({self_branch} AND ({target_col} = {occ_ph} OR {dim} IS NULL OR NOT ({sensitive})))"
+                );
             }
 
             // family — target ∈ the reader's admitted families.
@@ -423,12 +428,18 @@ mod tests {
             assert!(frag.contains(expect_dim), "{frag}");
             assert!(frag.contains("t.dimension = 'config:transport'"), "{frag}");
             assert!(
-                frag.contains(&format!("t.cohort_target_id {expect_occ} OR NOT (")),
+                frag.contains(&format!(
+                    "t.cohort_target_id {expect_occ} OR t.dimension IS NULL OR NOT ("
+                )),
                 "{frag}"
             );
             assert!(
                 !frag.contains("LIKE"),
                 "no LIKE — its case rule differs by backend: {frag}"
+            );
+            assert!(
+                frag.contains("OR t.dimension IS NULL OR NOT ("),
+                "a NULL dimension is not sensitive (SQL three-valued logic): {frag}"
             );
             // the occurrence key is bound once more, AFTER the self set
             assert_eq!(
