@@ -137,6 +137,18 @@ No wire change, no migration, no vocabulary change. PATCH.
   reads both; a stranger node reads none. Unclaimed (singleton) the node still
   reads its own.
 - Mutants: self set = `{identity}` only (node red); drop the occurrence union
-  (second device red); drop `nodes_owned_by` (owned-only node red); SQL branch
-  back to `= identity` (sqlite/postgres red); `admits(self) → true` (stranger red).
+  (the DEVICE's own row unread — every reader in the first draft was also an
+  owned node, so only a writer that owns no node exercises this fold); drop
+  `nodes_owned_by` (the owned-only node's own row unread — the mirror gap);
+  SQL branch back to `= identity` (sqlite red); `admits(self) → true`
+  (stranger red).
 
+### 6.1 Mutation table (sqlite lane, 2026-09-22)
+
+| Mutant | Verdict |
+|---|---|
+| M1 self set = {identity} only | KILLED by memory::i141 sqlite::i141  |
+| M4 SQL self branch back to = identity | KILLED by sqlite::i141  |
+| M5 admits(self) = true | KILLED by memory::i141 sqlite::i141  |
+| M2 drop the occurrence union | KILLED by memory::i141 sqlite::i141  |
+| M3 drop nodes_owned_by | KILLED by memory::i141 sqlite::i141  |
