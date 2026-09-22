@@ -110,6 +110,14 @@ pub(crate) mod bodies {
             self_set.contains(&node_c),
             "I137: an owned node that is no KEM occurrence is still an endpoint: {self_set:?}"
         );
+        let c_set =
+            crate::federation::self_collective::send_set_for(d, &node_c, cohort_scope::SELF)
+                .await
+                .unwrap();
+        assert!(
+            c_set.contains(&node_b) && c_set.contains(&node_a),
+            "I137: an owned node that is no KEM occurrence SENDS to its owner's other nodes (principal by owner_of): {c_set:?}"
+        );
         assert!(
             !self_set.contains(&owner),
             "I137: the human's key is not an endpoint: {self_set:?}"
@@ -225,8 +233,11 @@ pub(crate) mod bodies {
             "I139: unknown sha → None"
         );
         // self: seal on A, carry the content set to B, ask B.
-        // The sealing node is an occurrence of itself (the boot singleton), so
-        // the self write has a recipient to wrap to and a set to emit.
+        // A PERSON authors the self write; the node that seals it is the
+        // person's occurrence. The minter is the NODE — never the author.
+        let owner = format!("i139-owner-{run}");
+        ts::register_hybrid_key_as(l.ba.as_ref(), &owner, &owner, USER).await;
+        ts::register_hybrid_key_as(l.bb.as_ref(), &owner, &owner, USER).await;
         let kem_a = {
             let id = l.ba.load_or_init_content_kem_identity().await.unwrap();
             EncryptionPubkeys {
@@ -234,19 +245,25 @@ pub(crate) mod bodies {
                 ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
             }
         };
-        bind(l.ba.as_ref(), &l.node_a, &l.node_a, Some(kem_a)).await;
+        bind(l.ba.as_ref(), &owner, &l.node_a, Some(kem_a)).await;
         let rs = l
             .engine_a
-            .put_blob_scoped(
-                cohort_scope::SELF,
-                Some(&l.node_a),
-                b"self minter",
-                None,
-                None,
-            )
+            .put_blob_scoped(cohort_scope::SELF, Some(&owner), b"self minter", None, None)
             .await
             .unwrap();
         assert_eq!(rs.tier, CryptoTier::InvisibleEncrypted);
+        assert_eq!(
+            l.ba.minter_of_blob(&rs.at_rest_sha256)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(l.node_a.as_str()),
+            "I139: the self blob's minter is the sealing NODE, not the author"
+        );
+        assert_ne!(
+            owner, l.node_a,
+            "I139: the fixture's point — author ≠ sealer"
+        );
         // The content set is emitted by the door or drained by the host's
         // emission sweep — the same sweep edge runs; either way it is a row.
         l.engine_a.emit_pending_key_grants().await.unwrap();
