@@ -313,6 +313,69 @@ pub(crate) mod bodies {
             2,
             "I141: the owner's other node reads them (owned, not occurrence-bound)",
         );
+        // The other direction — the bound node READS what the collective's
+        // other members WRITE about themselves. The device is an occurrence
+        // that owns no node (the occurrence union is the only path to it);
+        // node C is an owned node bound as no occurrence (`nodes_owned_by`
+        // is the only path to it). One self row each, under `profile:`.
+        for (i, writer) in [&device, &node_c].iter().enumerate() {
+            let mut row = ts::bare_attestation(
+                &format!("i141-peer-row-{i}-{s}"),
+                writer,
+                writer,
+                &serde_json::json!({"cohort_scope": "self", "dimension": format!("profile:display_name:v{i}")}),
+            );
+            row.attestation_type = "scores".into();
+            row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+            row.subject_key_ids = vec![(*writer).clone()];
+            ts::seal_row_in_place(writer, &mut row);
+            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("I141: a collective member writes its own self row: {e}")
+                });
+        }
+        let reads_of = |caller: &str, writer: &str| {
+            let (caller, writer) = (caller.to_owned(), writer.to_owned());
+            async move {
+                let scope = caller_scope_from_directory(d, &caller).await.unwrap();
+                let rust_twin = scope.admits(crate::federation::types::cohort_scope::SELF, &writer);
+                let rows = match crate::ceg::ReadEngine::list_attestations(
+                    d,
+                    crate::ceg::AttestationFilter {
+                        attesting_key_id: Some(writer.clone()),
+                        dimension_prefixes: vec!["profile:".into()],
+                        ..Default::default()
+                    },
+                    None,
+                    10,
+                    scope,
+                )
+                .await
+                {
+                    Ok(page) => Some(page.items.len()),
+                    Err(crate::ceg::Error::Backend(m))
+                        if m.contains("no relational read substrate") =>
+                    {
+                        None
+                    }
+                    Err(e) => panic!("I141: list_attestations: {e}"),
+                };
+                (rust_twin, rows)
+            }
+        };
+        expect(
+            reads_of(&node, &device).await,
+            true,
+            1,
+            "I141: the node reads its owner's DEVICE's self row (occurrence union)",
+        );
+        expect(
+            reads_of(&node, &node_c).await,
+            true,
+            1,
+            "I141: the node reads its owner's OTHER NODE's self row (nodes_owned_by)",
+        );
         // A stranger node under another human reads none — the fix widened
         // `self` to the collective, not to the world.
         bind(d, &other, &stranger, "2026-06-03T00:00:00Z").await;
@@ -322,6 +385,18 @@ pub(crate) mod bodies {
             false,
             0,
             "I141: a stranger node reads none",
+        );
+        expect(
+            reads_of(&stranger, &device).await,
+            false,
+            0,
+            "I141: nor the device's",
+        );
+        expect(
+            reads_of(&stranger, &node_c).await,
+            false,
+            0,
+            "I141: nor node C's",
         );
         let _ = CallerScope::Unauthenticated;
     }
