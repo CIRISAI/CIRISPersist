@@ -32,8 +32,9 @@ threat-model citations because this crate's audit story is the point.
   twins now admit them at `self` only when the caller IS the target:
   `CallerScope::admits` takes the row's dimension, and the attestation doors
   compose `cohort_scope_sql_predicate_with_dimension` (pinned from disk).
-  `admits` gains a parameter (crate API; not on PyO3). No wire, migration or
-  vocabulary change.
+  `admits` gains a parameter (crate API; not on PyO3). A row with no
+  dimension member (a generated NULL) is not a sensitive leaf in SQL either
+  (`IS NULL`, review round two). No wire, migration or vocabulary change.
 
 ## [46.3.0] - 2026-09-22
 

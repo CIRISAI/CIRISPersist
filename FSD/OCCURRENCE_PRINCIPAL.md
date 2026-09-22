@@ -151,7 +151,10 @@ No wire change, no migration, no vocabulary change. PATCH.
   SQL branch back to `= identity` (sqlite red); `admits(self) → true`
   (stranger red); `principals_of` ignores the revocation (revoked node reads
   the device's row); drop the sensitive clause in the Rust twin (device reads
-  the leaf, memory/sqlite); drop it in the SQL twin (sqlite).
+  the leaf, memory/sqlite); drop it in the SQL twin (sqlite); drop the SQL
+  twin's `dimension IS NULL` (review round two: `dimension` is a GENERATED
+  column, NULL for every attestation type without a dimension member, and
+  `NOT (NULL)` is NULL — the shape test pins the clause on both backends).
 
 ### 6.1 Mutation table (sqlite lane, 2026-09-22; rounds a–c)
 
