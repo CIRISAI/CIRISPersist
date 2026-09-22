@@ -5,6 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.3.0] - 2026-09-22
+
+### Added — self/family bytes are delivered, not discovered: the send set, the re-grant doors, the minter read (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md`)
+- **`send_set_for(k, cohort_scope) -> Vec<String>`** (PyO3 `send_set_for_json`):
+  the peers a `SelfOwn`-projected record of key `k` reaches. For `self`:
+  `consent_peers_by_principals(k)` ∪ the active occurrences of every
+  principal of `k` (#873's `active_identities_for_occurrence`, then
+  `list_identity_occurrences_active`), `k` itself excluded. For `family`:
+  additionally the occurrences of every active member of the principal's
+  families. For `community` / `affiliations` / the commons: the consent set,
+  unchanged. No grant is read or authored for one's own occurrences — CC 3.2
+  makes a person's consent to their own node a category error, which is
+  why this is a sibling of the consent read and not a widening of it.
+  Before this cut persist only CLASSIFIED the basis (`RecipientBasis::OwnRoster`)
+  and the resolver edge used was grants-only, so a `self` row — and the
+  `key_grant` set the retroactive re-key emits for it — reached no second
+  device. Edge's `FSD/CONTENT_TRANSFER.md` §5.3 rung R2.
+- **The retroactive re-grant doors reach Python:** `rekey_self_occurrence_add_json`
+  and `rekey_family_member_add_json` (v6.1.0's `rekey_for_newcomers`, which
+  re-wraps every extant blob to a newcomer and emits the full content-axis
+  `key_grant` set). `Engine::self_at_login` already runs the self door; a
+  host that admits an occurrence by another path (device pairing) now can.
+  Rung R3-retroactive: *a device admitted after the write opens the write.*
+- **`minter_of_blob(sha) -> Option<String>`** (PyO3 `minter_of_blob_json`):
+  who sealed the bytes — for `community_dek` the epoch binding's minter
+  (#876); for `self` / `family` the attester of the admitted
+  `key_grant:content:v1` set naming the sha. One read for both source
+  rules; no new column, no new authority (it reads what the minter signed).
+  Rung R4: the puller asks the minter, never `list_holders`.
+- **Not changed:** `suppresses_holds_bytes` and I52 — no holder claim at any
+  scope (CC 5.2 is unconditional). Witnesses I137–I140 on sqlite and
+  postgres (memory where a directory suffices).
+
 ## [46.2.0] - 2026-09-21
 
 ### Changed — CIRISVerify re-pinned v15.2.0 → v16.1.0 (all seven Cargo pins together; the Python bound `ciris-verify>=16.1.0,<17`)

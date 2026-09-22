@@ -100,6 +100,10 @@ pub mod epoch_minter;
 // derived, never inferred from the row's author. The fixture is author != sealer.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod epoch_minter_invariants;
+// CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
+// delivered, not discovered — the send set, the re-grant doors, the minter read.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod self_collective_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
