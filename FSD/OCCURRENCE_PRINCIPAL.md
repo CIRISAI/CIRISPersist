@@ -164,7 +164,7 @@ No wire change, no migration, no vocabulary change. PATCH.
   digest drops the self set (the `cache::key` test's `wider` /
   `other_device` digests collide).
 
-### 6.1 Mutation table (sqlite lane, 2026-09-22; rounds a–c)
+### 6.1 Mutation table (sqlite lane, 2026-09-22; rounds a–e, 12/12 killed)
 
 | Mutant | Verdict |
 |---|---|
@@ -176,3 +176,7 @@ No wire change, no migration, no vocabulary change. PATCH.
 | M6 principals_of ignores the revocation | KILLED by memory::i141 sqlite::i141  |
 | M7 Rust twin drops the sensitive clause | KILLED by memory::i141 sqlite::i141  |
 | M8 SQL twin drops the sensitive clause | KILLED by sqlite::i141  |
+| M9 SQL twin drops `dimension IS NULL` (NOT (NULL) hides dimension-less rows) | KILLED by sql::with_dimension_keeps_sensitive_leaves_node_only_both_backends  |
+| M10 admits_local_tier = true (local rows leak to the collective, Rust twin) | KILLED by memory::i141 sqlite::i141  |
+| M11 SQL local-tier clause dropped | KILLED by sqlite::i141  |
+| M12 scope digest drops the self set and the occurrence | KILLED by key::scope_digest_is_set_order_invariant  |
