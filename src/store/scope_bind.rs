@@ -181,13 +181,13 @@ mod tests {
         let (frag, params) =
             scope_predicate_pg(&auth_full(), "t.cohort_scope", "t.cohort_target_id", 3);
         assert!(
-            frag.contains("t.cohort_target_id = $4"),
-            "self → $4: {frag}"
+            frag.contains("t.cohort_target_id = ANY($4)"),
+            "self set → ANY($4) (v46.3.1): {frag}"
         );
         assert!(frag.contains("= ANY($5)"), "family array → $5: {frag}");
         assert!(frag.contains("= ANY($6)"), "community array → $6: {frag}");
         assert!(!frag.contains("$1"), "no original $1 remains: {frag}");
-        assert_eq!(params.len(), 3, "identity + family-list + community-list");
+        assert_eq!(params.len(), 3, "self-list + family-list + community-list");
     }
 
     #[cfg(feature = "postgres")]
