@@ -66,8 +66,27 @@ where
 /// `use_node_identity` (CIRISEdge#541) an actor occurrence's key is not the
 /// key peers see. The send set is homogeneous in node key ids, as the consent
 /// half already is.
-async fn nodes_of(dir: &dyn FederationDirectory, p: &str) -> Result<Vec<String>, Error> {
+pub(crate) async fn nodes_of<D>(dir: &D, p: &str) -> Result<Vec<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
     super::admission::nodes_owned_by(dir, p).await
+}
+
+/// **The active occurrences of a human** — the KEM targets of the
+/// self-collective (CC 3.3.6). Read by the read-side `self` gate
+/// (`scope::build_caller_admission_from_directory`, v46.3.1 / #888) beside
+/// [`nodes_of`]: a row targeted at any of them is the caller's own.
+pub(crate) async fn occurrences_of<D>(dir: &D, identity: &str) -> Result<Vec<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(dir
+        .list_identity_occurrences_active(identity)
+        .await?
+        .into_iter()
+        .map(|o| o.occurrence_key_id)
+        .collect())
 }
 
 /// **Does `signer` speak for `author` on the key plane?** (FSD §4.1) —

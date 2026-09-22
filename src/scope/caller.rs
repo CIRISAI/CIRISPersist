@@ -76,7 +76,9 @@ impl CallerScope {
         match self {
             CallerScope::Unauthenticated => false,
             CallerScope::Authenticated { admission } => match cohort_scope {
-                "self" => target == admission.identity_key_id,
+                // v46.3.1 (#888): the target is one of the caller's own keys
+                // — resolved on BOTH sides (FSD/OCCURRENCE_PRINCIPAL.md §6).
+                "self" => admission.self_key_ids.contains(target),
                 "family" => admission.family_key_ids.contains(target),
                 "community" => admission.community_key_ids.contains(target),
                 _ => false,

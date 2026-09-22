@@ -184,6 +184,148 @@ pub(crate) mod bodies {
 
     /// **I122 — `would_hold` admits community content of a room the owner
     /// is a member of, for a node carrying both rows.**
+    /// **I141 — the read-side `self` gate admits the caller's self-collective
+    /// (v46.3.1, CIRISPersist#888 / CIRISServer#624).** A claimed node's own
+    /// `self` rows about itself (`config:*`) are readable by the node, by its
+    /// owner, by the owner's other device and by the owner's other node; a
+    /// stranger node reads none. Rust twin on every backend; the SQL twin
+    /// through `ReadEngine::list_attestations` on sqlite / postgres.
+    pub async fn i141_a_claimed_node_reads_its_own_self_rows<B>(d: &B, s: &str)
+    where
+        B: FederationDirectory + crate::ceg::ReadEngine,
+    {
+        use crate::scope::{caller_scope_from_directory, CallerScope};
+        let (node, owner, device, node_c, stranger, other) = (
+            format!("i141-node-{s}"),
+            format!("i141-owner-{s}"),
+            format!("i141-device-{s}"),
+            format!("i141-node-c-{s}"),
+            format!("i141-stranger-{s}"),
+            format!("i141-other-{s}"),
+        );
+        for (k, t) in [
+            (&node, NODE),
+            (&node_c, NODE),
+            (&stranger, NODE),
+            (&owner, USER),
+            (&device, USER),
+            (&other, USER),
+        ] {
+            ts::register_identity_key(d, k, t).await;
+        }
+        // The node's own self rows, written UNCLAIMED (singleton): the CC 3.4.5
+        // self-or-owner stamping — attester == attested == node, target = node.
+        let dims = [
+            "config:net.bootstrap_peers:v1",
+            "config:net.announce_ownership:v1",
+        ];
+        for (i, dim) in dims.iter().enumerate() {
+            let mut row = ts::bare_attestation(
+                &format!("i141-row-{i}-{s}"),
+                &node,
+                &node,
+                &serde_json::json!({"cohort_scope": "self", "dimension": dim}),
+            );
+            row.attestation_type = "scores".into();
+            row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+            row.subject_key_ids = vec![node.clone()];
+            ts::seal_row_in_place(&node, &mut row);
+            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .unwrap_or_else(|e| panic!("I141: the node writes its own self row: {e}"));
+        }
+        let reads = |caller: &str| {
+            let caller = caller.to_owned();
+            let node = node.clone();
+            async move {
+                let scope = caller_scope_from_directory(d, &caller).await.unwrap();
+                let rust_twin = scope.admits(crate::federation::types::cohort_scope::SELF, &node);
+                // The SQL twin, where there is SQL: the memory backend has no
+                // CEG read substrate, so its leg measures the Rust twin only.
+                let rows = match crate::ceg::ReadEngine::list_attestations(
+                    d,
+                    crate::ceg::AttestationFilter {
+                        attesting_key_id: Some(node.clone()),
+                        dimension_prefixes: vec!["config:".into()],
+                        ..Default::default()
+                    },
+                    None,
+                    10,
+                    scope,
+                )
+                .await
+                {
+                    Ok(page) => Some(page.items.len()),
+                    Err(crate::ceg::Error::Backend(m))
+                        if m.contains("no relational read substrate") =>
+                    {
+                        None
+                    }
+                    Err(e) => panic!("I141: list_attestations: {e}"),
+                };
+                (rust_twin, rows)
+            }
+        };
+        let expect = |got: (bool, Option<usize>), admitted: bool, rows: usize, why: &str| {
+            assert_eq!(got.0, admitted, "{why} (Rust twin)");
+            if let Some(n) = got.1 {
+                assert_eq!(n, rows, "{why} (SQL twin)");
+            }
+        };
+        expect(
+            reads(&node).await,
+            true,
+            2,
+            "I141: unclaimed, the node reads its own rows",
+        );
+        // THE CLAIM: owner binding + occurrence binding. Resolution now answers the owner.
+        bind(d, &owner, &node, "2026-06-02T00:00:00Z").await;
+        ts::put_owner_binding(d, &owner, &node).await;
+        assert_eq!(
+            d.active_identity_for_occurrence(&node).await.unwrap(),
+            owner,
+            "I141: the claimed node resolves to its owner (#873)"
+        );
+        expect(
+            reads(&node).await,
+            true,
+            2,
+            "I141: CLAIMED, the node still reads its own self rows (#888)",
+        );
+        expect(
+            reads(&owner).await,
+            true,
+            2,
+            "I141: the owner reads the node's self rows",
+        );
+        // The owner's other device (an occurrence) and other node (owned, never bound).
+        bind(d, &owner, &device, "2026-06-03T00:00:00Z").await;
+        ts::put_owner_binding(d, &owner, &node_c).await;
+        expect(
+            reads(&device).await,
+            true,
+            2,
+            "I141: the owner's other device reads them (CC 5.2)",
+        );
+        expect(
+            reads(&node_c).await,
+            true,
+            2,
+            "I141: the owner's other node reads them (owned, not occurrence-bound)",
+        );
+        // A stranger node under another human reads none — the fix widened
+        // `self` to the collective, not to the world.
+        bind(d, &other, &stranger, "2026-06-03T00:00:00Z").await;
+        ts::put_owner_binding(d, &other, &stranger).await;
+        expect(
+            reads(&stranger).await,
+            false,
+            0,
+            "I141: a stranger node reads none",
+        );
+        let _ = CallerScope::Unauthenticated;
+    }
+
     pub async fn i122_the_node_is_party_through_its_owner(d: &dyn FederationDirectory, s: &str) {
         let (node, owner, other, comm) = (
             format!("i122-node-{s}"),
@@ -392,6 +534,11 @@ mod run {
                 async fn i124() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i124_a_shared_device_is_party_to_both(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i141() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i141_a_claimed_node_reads_its_own_self_rows(&b, &super::suffix()).await
                 }
             }
         };

@@ -212,12 +212,15 @@ mod tests {
         // 2 filter params bound → scope params start at ?3.
         let (frag, values) =
             scope_predicate_sqlite(&auth_full(), "t.cohort_scope", "t.cohort_target_id", 2);
-        // self → ?3 ; family F1,F2 → ?4,?5 ; community C1 → ?6
-        assert!(frag.contains("t.cohort_target_id = ?3"), "{frag}");
-        assert!(frag.contains("IN (?4,?5)"), "{frag}");
-        assert!(frag.contains("IN (?6)"), "{frag}");
+        // self {id-1, occ-1} → ?3,?4 ; family F1,F2 → ?5,?6 ; community C1 → ?7
+        assert!(
+            frag.contains("t.cohort_target_id IN (?3,?4)"),
+            "self set {{id-1, occ-1}} → ?3,?4: {frag}"
+        );
+        assert!(frag.contains("IN (?5,?6)"), "{frag}");
+        assert!(frag.contains("IN (?7)"), "{frag}");
         assert!(!frag.contains("(?)"), "no bare ? left: {frag}");
-        assert_eq!(values.len(), 4, "identity + F1 + F2 + C1");
+        assert_eq!(values.len(), 5, "id-1 + occ-1 + F1 + F2 + C1");
     }
 
     #[cfg(feature = "sqlite")]

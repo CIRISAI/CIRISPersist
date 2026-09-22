@@ -88,3 +88,55 @@ refusal would brick every shared device's community writes. If a
 deployment needs single-principal devices, that is an admission gate on
 the anchor plane (a sibling of `check_single_node_owner_admission`), filed
 separately if asked.
+
+## 6. The read gate — v46.3.1 (CIRISPersist#888, from CIRISServer#624)
+
+**The shape that broke.** §2 resolved the CALLER: `build_caller_admission`
+step 1 answers a claimed node's principal (its owner). The read-side `self`
+arm — `CallerScope::admits` (`scope/caller.rs`) and its SQL twin
+`cohort_scope_sql_predicate` (`scope/sql.rs`) — kept comparing that resolved
+identity to the row's RAW target (`attested_key_id` on memory,
+`cohort_target_id` on sqlite/postgres). A node's own `self` rows about itself
+(`config:*`, CC 3.4.5 self-or-owner, stamped correctly) became unreadable on
+the node that wrote them: `owner == node` is false. Before #873 the singleton
+resolved to itself, so raw == resolved and the asymmetry was invisible. Observed
+as CIRISServer#624: `GET /v1/config` → `{}`, re-announce 500.
+
+**The rule (stated once).** Both sides of the comparison are resolved the same
+way, by the fold `FSD/SELF_COLLECTIVE_TRANSFER.md` §4.1 already names:
+
+```
+admits(self, target) := target ∈ self_key_ids(caller)
+self_key_ids(caller) := {caller, identity(caller)}
+                      ∪ P ∪ ⋃_{p ∈ P} (active occurrences of p ∪ nodes_owned_by(p))
+where P := principals_of(caller) ∪ {identity(caller)}
+```
+— the caller's self-collective (CC 3.3.6; CC 5.2 `recipients := all current
+identity_occurrences of C.attesting_key_id`), built by the substrate inside
+`build_caller_admission_from_directory` (AV-44: never caller-asserted; the
+seal stays). The SQL twin binds the same set (`IN` / `= ANY`), exactly as the
+family and community arms already do. The write-side assembler
+(`CallerAdmission::from_resolved`, the trace-ingest pipeline) carries
+`{occurrence, identity}` — it never evaluates the self read arm.
+
+| symbol | change |
+|---|---|
+| `CallerAdmission::self_key_ids` | NEW, sealed; the caller's self-collective as key ids |
+| `CallerScope::admits` `"self"` arm | `target ∈ self_key_ids` (was `target == identity_key_id`) |
+| `cohort_scope_sql_predicate` `self` branch | `target_membership_branch(.., "self", self_key_ids, ..)` (was `= $identity`) |
+| `self_collective::occurrences_of`, `nodes_of` | `pub(crate)`, generic over an unsized directory — the folds the admission builder reads |
+
+No wire change, no migration, no vocabulary change. PATCH.
+
+**Invariants.**
+- **I141** (3 backends, Rust twin; sqlite + postgres also through
+  `ReadEngine::list_attestations`, the SQL twin) — a claimed node (owner
+  binding + occurrence) writes two `self` rows about itself (`config:*`);
+  the node reads both; the owner's key reads both; the owner's second device
+  reads both (CC 5.2); a node the owner OWNS but never bound as an occurrence
+  reads both; a stranger node reads none. Unclaimed (singleton) the node still
+  reads its own.
+- Mutants: self set = `{identity}` only (node red); drop the occurrence union
+  (second device red); drop `nodes_owned_by` (owned-only node red); SQL branch
+  back to `= identity` (sqlite/postgres red); `admits(self) → true` (stranger red).
+

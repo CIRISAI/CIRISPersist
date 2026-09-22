@@ -69,6 +69,16 @@ pub struct CallerAdmission {
     /// identity-keys-as-members shape as families.
     pub community_key_ids: BTreeSet<KeyId>,
 
+    /// v46.3.1 (CIRISPersist#888, `FSD/OCCURRENCE_PRINCIPAL.md` §6) — the
+    /// caller's SELF-COLLECTIVE as key ids: the occurrence, its identity,
+    /// every principal (`self_collective::principals_of`), and every active
+    /// occurrence and owned node of each. The read-side `self` arm admits a
+    /// row whose target is any of them — so both sides of that comparison
+    /// are resolved the same way (a claimed node's own `config:*` rows,
+    /// targeted at the node, are readable by the node whose principal is
+    /// its owner). Substrate-built, never caller-asserted (AV-44).
+    pub self_key_ids: BTreeSet<KeyId>,
+
     /// Construction seal — see [`AdmissionSeal`]. Not `pub`; blocks
     /// external struct-literal construction (AV-44).
     _seal: AdmissionSeal,
@@ -189,13 +199,42 @@ pub async fn build_caller_admission_from_directory(
         .map(|community| community.community_key_id)
         .collect();
 
+    // Step 4 (v46.3.1, #888) — the self-collective, by the fold the hold
+    // path and the key gate read (`FSD/SELF_COLLECTIVE_TRANSFER.md` §4.1).
+    let self_key_ids = self_collective_of(directory, occurrence_key_id, &identity_key_id).await?;
     Ok(CallerAdmission {
         occurrence_key_id: occurrence_key_id.clone(),
         identity_key_id,
         family_key_ids,
         community_key_ids,
+        self_key_ids,
         _seal: AdmissionSeal,
     })
+}
+
+/// v46.3.1 (CIRISPersist#888) — `{occurrence, identity} ∪ P ∪ ⋃_{p∈P}
+/// (active occurrences of p ∪ nodes owned by p)` where
+/// `P = principals_of(occurrence) ∪ {identity}`. The set the read-side
+/// `self` arm admits targets from. Sorted, deduped by construction.
+async fn self_collective_of(
+    directory: &dyn crate::federation::FederationDirectory,
+    occurrence_key_id: &KeyId,
+    identity_key_id: &KeyId,
+) -> Result<BTreeSet<KeyId>, crate::federation::Error> {
+    use crate::federation::self_collective::{nodes_of, occurrences_of, principals_of};
+    let mut out: BTreeSet<KeyId> = BTreeSet::new();
+    out.insert(occurrence_key_id.clone());
+    out.insert(identity_key_id.clone());
+    let mut principals = principals_of(directory, occurrence_key_id).await?;
+    principals.push(identity_key_id.clone());
+    principals.sort();
+    principals.dedup();
+    for p in &principals {
+        out.insert(p.clone());
+        out.extend(occurrences_of(directory, p).await?);
+        out.extend(nodes_of(directory, p).await?);
+    }
+    Ok(out)
 }
 
 /// v17.4.0 — resolve a caller occurrence key to its [`CallerScope`] via a
@@ -235,11 +274,17 @@ impl CallerAdmission {
         family_key_ids: impl IntoIterator<Item = KeyId>,
         community_key_ids: impl IntoIterator<Item = KeyId>,
     ) -> Self {
+        let occurrence_key_id: KeyId = occurrence_key_id.into();
+        let identity_key_id: KeyId = identity_key_id.into();
         Self {
-            occurrence_key_id: occurrence_key_id.into(),
-            identity_key_id: identity_key_id.into(),
+            occurrence_key_id: occurrence_key_id.clone(),
+            identity_key_id: identity_key_id.clone(),
             family_key_ids: family_key_ids.into_iter().collect(),
             community_key_ids: community_key_ids.into_iter().collect(),
+            // Only the read-side builder walks the directory for the
+            // collective; this assembler carries the two keys it was given
+            // (v46.3.1, #888).
+            self_key_ids: [occurrence_key_id, identity_key_id].into_iter().collect(),
             _seal: AdmissionSeal,
         }
     }
@@ -258,11 +303,17 @@ impl CallerAdmission {
         family_key_ids: impl IntoIterator<Item = KeyId>,
         community_key_ids: impl IntoIterator<Item = KeyId>,
     ) -> Self {
+        let occurrence_key_id: KeyId = occurrence_key_id.into();
+        let identity_key_id: KeyId = identity_key_id.into();
         Self {
-            occurrence_key_id: occurrence_key_id.into(),
-            identity_key_id: identity_key_id.into(),
+            occurrence_key_id: occurrence_key_id.clone(),
+            identity_key_id: identity_key_id.clone(),
             family_key_ids: family_key_ids.into_iter().collect(),
             community_key_ids: community_key_ids.into_iter().collect(),
+            // Only the read-side builder walks the directory for the
+            // collective; this assembler carries the two keys it was given
+            // (v46.3.1, #888).
+            self_key_ids: [occurrence_key_id, identity_key_id].into_iter().collect(),
             _seal: AdmissionSeal,
         }
     }

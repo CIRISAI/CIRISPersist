@@ -118,11 +118,19 @@ pub fn cohort_scope_sql_predicate(
             let mut params: Vec<ScopeParam> = Vec::new();
             let mut next = 1usize;
 
-            // self — the row's target IS an owner identity; reader sees it
-            // iff that identity is the reader's own.
-            let id_ph = placeholder(backend, &mut next);
-            params.push(ScopeParam::Key(admission.identity_key_id.clone()));
-            let self_branch = format!("({scope_col} = 'self' AND {target_col} = {id_ph})");
+            // self — target ∈ the reader's self-collective (v46.3.1, #888:
+            // the occurrence, its identity, its principals and their
+            // occurrences / owned nodes — resolved the way the hold path
+            // resolves the caller, so a claimed node reads its own rows).
+            let self_branch = target_membership_branch(
+                backend,
+                scope_col,
+                target_col,
+                "self",
+                &admission.self_key_ids,
+                &mut next,
+                &mut params,
+            );
 
             // family — target ∈ the reader's admitted families.
             let family_branch = target_membership_branch(
@@ -276,7 +284,7 @@ mod tests {
             frag.contains("t.cohort_scope IN ('affiliations','species','biosphere','federation')")
         );
         // self: target == reader identity ($1). No join, no subquery.
-        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = $1)"));
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ANY($1))"));
         assert!(
             !frag.contains("EXISTS"),
             "target-membership uses no subquery"
@@ -286,7 +294,7 @@ mod tests {
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
         assert!(frag.contains("(t.cohort_scope = 'community' AND 1=0)"));
         // only the identity param
-        assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
+        assert_eq!(params, vec![ScopeParam::KeyList(vec!["occ-1".to_string()])]);
     }
 
     #[test]
@@ -297,7 +305,7 @@ mod tests {
             "t.cohort_target_id",
             &auth_singleton(),
         );
-        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ?)"));
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id IN (?))"));
         assert!(!frag.contains("$1"), "sqlite never emits $n");
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
         assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
@@ -311,8 +319,8 @@ mod tests {
             "t.cohort_target_id",
             &auth_full(),
         );
-        // self: target == $1 (identity)
-        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = $1)"));
+        // self: target ∈ {id-1, occ-1} via ANY($1) (v46.3.1)
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ANY($1))"));
         // family: target ∈ reader families via ANY($2)
         assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id = ANY($2))"));
         // community: target ∈ reader communities via ANY($3)
@@ -323,7 +331,7 @@ mod tests {
         assert_eq!(
             params,
             vec![
-                ScopeParam::Key("id-1".to_string()),
+                ScopeParam::KeyList(vec!["id-1".to_string(), "occ-1".to_string()]),
                 ScopeParam::KeyList(vec!["F1".to_string(), "F2".to_string()]),
                 ScopeParam::KeyList(vec!["C1".to_string()]),
             ]
@@ -341,11 +349,12 @@ mod tests {
         // family has 2 keys -> IN (?,?); community 1 -> IN (?)
         assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id IN (?,?))"));
         assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id IN (?))"));
-        // params expanded: identity, F1, F2, C1 (BTreeSet-sorted)
+        // params expanded: id-1, occ-1 (the self set), F1, F2, C1 (BTreeSet-sorted)
         assert_eq!(
             params,
             vec![
                 ScopeParam::Key("id-1".to_string()),
+                ScopeParam::Key("occ-1".to_string()),
                 ScopeParam::Key("F1".to_string()),
                 ScopeParam::Key("F2".to_string()),
                 ScopeParam::Key("C1".to_string()),

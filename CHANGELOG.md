@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.3.1] - 2026-09-22
+
+### Fixed — a claimed node could not read its own `self` rows (CIRISPersist#888, CIRISServer#624; `FSD/OCCURRENCE_PRINCIPAL.md` §6)
+- Since v45.0.1 (#873) the read-side `self` gate compared the caller's
+  RESOLVED identity (a claimed node's owner) to the row's RAW target (the
+  node), so every `self`-scoped row a node emits about itself — `config:*`
+  and the CC 3.4.5 self-or-owner families — was invisible on that node,
+  including to the node itself (`GET /v1/config` → `{}`; the re-announce
+  500). Both twins of the gate — `CallerScope::admits` and
+  `cohort_scope_sql_predicate` — now test the target against the caller's
+  **self-collective**, built by the substrate into the sealed
+  `CallerAdmission` (`self_key_ids`: the caller, its identity, its
+  principals, and every active occurrence and owned node of each) — the
+  same fold v46.3.0's `speaks_for` and the hold path use (CC 3.3.6, CC 5.2).
+  The owner's other devices read the node's rows; a stranger node does not.
+  Witness I141 on memory, sqlite, postgres. No surface, wire, migration or
+  vocabulary change.
+
 ## [46.3.0] - 2026-09-22
 
 ### Added — self/family bytes are delivered, not discovered: the send set, the re-grant doors, the minter read (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md`)
