@@ -57,6 +57,12 @@ threat-model citations because this crate's audit story is the point.
   self row was `NotPartyTo` on the person's own second node (edge §5.3 R7
   never had a witness). Now `speaks_for(our_key, author)` — the same fold.
   The operator's family predicate is unchanged.
+- **Witness:** `local_authorship_804::the_sync_budget_is_shared_and_finite`
+  measured the scheduler — the bucket refills per second from
+  `Instant::now()`, so a stall under a loaded lane accrued a token between
+  exhausting the shared budget and the second peer's check (1 of 1622 in the
+  `default` lane). It now runs on one pinned instant through the
+  clock-injected core; the door is still exercised once.
 - **Not changed:** `suppresses_holds_bytes` and I52 — no holder claim at any
   scope (CC 5.2 is unconditional). Witnesses I137–I140 on sqlite and
   postgres (memory where a directory suffices).
