@@ -373,6 +373,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // path; the repair is a single guarded UPDATE on the writer's.
     ("community_dek_minters_granting", ConnClass::Read),
     ("rebind_stranded_blob_epochs", ConnClass::Write),
+    // v46.3.0 (#884) — the content-axis half of `minter_of_blob` is one
+    // SELECT on the reader path (the community half delegates to
+    // `community_dek_blob_epoch`, itself Read).
+    ("minter_of_blob", ConnClass::Read),
     ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_delivery_receipts_for", ConnClass::Read),
