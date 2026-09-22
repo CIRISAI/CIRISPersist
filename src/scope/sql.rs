@@ -103,6 +103,52 @@ pub fn cohort_scope_sql_predicate(
     target_col: &str,
     scope: &CallerScope,
 ) -> (String, Vec<ScopeParam>) {
+    cohort_scope_sql_predicate_with_dimension(backend, scope_col, target_col, None, scope)
+}
+
+/// v46.3.1 (PR #889 review, round three) — **the local-tier gate**, the SQL
+/// twin of [`CallerScope::admits_local_tier`]: `tier <> 'local' OR
+/// attester = caller occurrence` (unauthenticated: `tier <> 'local'`).
+/// `FSD/V4_4_SHARED_ATTESTATION_SURFACE.md` §3 — a local-tier row is
+/// producer-only authority and visible to its producing occurrence alone;
+/// the `self` arm's collective widening never reaches it. Composed by every
+/// door over `federation_attestations` that takes a `CallerScope` (pinned
+/// from disk). `tier` is `NOT NULL DEFAULT 'federation'` (V066).
+pub fn local_tier_sql_predicate(
+    backend: BackendKind,
+    tier_col: &str,
+    attester_col: &str,
+    scope: &CallerScope,
+) -> (String, Vec<ScopeParam>) {
+    match scope {
+        CallerScope::Unauthenticated => (format!("({tier_col} <> 'local')"), Vec::new()),
+        CallerScope::Authenticated { admission } => {
+            let mut next = 1usize;
+            let ph = placeholder(backend, &mut next);
+            (
+                format!("({tier_col} <> 'local' OR {attester_col} = {ph})"),
+                vec![ScopeParam::Key(admission.occurrence_key_id.clone())],
+            )
+        }
+    }
+}
+
+/// v46.3.1 (PR #889 review) — [`cohort_scope_sql_predicate`] for a table
+/// that carries a `dimension` column (the attestation doors): the `self`
+/// branch additionally keeps a SENSITIVE `config:*` leaf (CC 3.4.5.1,
+/// [`CONFIG_SENSITIVE_LEAVES`](crate::federation::admission::CONFIG_SENSITIVE_LEAVES))
+/// node-local — admitted only when the row's target IS the caller's
+/// occurrence key — rendered with `substr`/`length` so the SQL matches
+/// `scope_covers` byte-for-byte (no `LIKE`, whose case rule differs by
+/// backend). Tables without a dimension column pass `None` and carry no
+/// config rows.
+pub fn cohort_scope_sql_predicate_with_dimension(
+    backend: BackendKind,
+    scope_col: &str,
+    target_col: &str,
+    dimension_col: Option<&str>,
+    scope: &CallerScope,
+) -> (String, Vec<ScopeParam>) {
     let broad = broad_tiers_sql();
 
     match scope {
@@ -118,11 +164,42 @@ pub fn cohort_scope_sql_predicate(
             let mut params: Vec<ScopeParam> = Vec::new();
             let mut next = 1usize;
 
-            // self — the row's target IS an owner identity; reader sees it
-            // iff that identity is the reader's own.
-            let id_ph = placeholder(backend, &mut next);
-            params.push(ScopeParam::Key(admission.identity_key_id.clone()));
-            let self_branch = format!("({scope_col} = 'self' AND {target_col} = {id_ph})");
+            // self — target ∈ the reader's self-collective (v46.3.1, #888:
+            // the occurrence, its identity, its principals and their
+            // occurrences / owned nodes — resolved the way the hold path
+            // resolves the caller, so a claimed node reads its own rows).
+            let mut self_branch = target_membership_branch(
+                backend,
+                scope_col,
+                target_col,
+                "self",
+                &admission.self_key_ids,
+                &mut next,
+                &mut params,
+            );
+            if let Some(dim) = dimension_col {
+                // node-only for the sensitive leaves: target = caller's
+                // occurrence, OR the dimension is not a sensitive leaf.
+                let occ_ph = placeholder(backend, &mut next);
+                params.push(ScopeParam::Key(admission.occurrence_key_id.clone()));
+                let sensitive = crate::federation::admission::CONFIG_SENSITIVE_LEAVES
+                    .iter()
+                    .map(|leaf| {
+                        let n = leaf.len() + 1;
+                        format!(
+                            "{dim} = '{leaf}' OR (substr({dim}, 1, {n}) = '{leaf}:' AND length({dim}) > {n})"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                // A row with NO dimension is not a sensitive leaf: `NOT (NULL)`
+                // is NULL in SQL and would exclude it for every reader but
+                // the writer (PR #889 review, round two) — the Rust twin's
+                // `None` is spelled `IS NULL` here.
+                self_branch = format!(
+                    "({self_branch} AND ({target_col} = {occ_ph} OR {dim} IS NULL OR NOT ({sensitive})))"
+                );
+            }
 
             // family — target ∈ the reader's admitted families.
             let family_branch = target_membership_branch(
@@ -276,7 +353,7 @@ mod tests {
             frag.contains("t.cohort_scope IN ('affiliations','species','biosphere','federation')")
         );
         // self: target == reader identity ($1). No join, no subquery.
-        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = $1)"));
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ANY($1))"));
         assert!(
             !frag.contains("EXISTS"),
             "target-membership uses no subquery"
@@ -286,7 +363,7 @@ mod tests {
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
         assert!(frag.contains("(t.cohort_scope = 'community' AND 1=0)"));
         // only the identity param
-        assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
+        assert_eq!(params, vec![ScopeParam::KeyList(vec!["occ-1".to_string()])]);
     }
 
     #[test]
@@ -297,7 +374,7 @@ mod tests {
             "t.cohort_target_id",
             &auth_singleton(),
         );
-        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ?)"));
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id IN (?))"));
         assert!(!frag.contains("$1"), "sqlite never emits $n");
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
         assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
@@ -311,8 +388,8 @@ mod tests {
             "t.cohort_target_id",
             &auth_full(),
         );
-        // self: target == $1 (identity)
-        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = $1)"));
+        // self: target ∈ {id-1, occ-1} via ANY($1) (v46.3.1)
+        assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ANY($1))"));
         // family: target ∈ reader families via ANY($2)
         assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id = ANY($2))"));
         // community: target ∈ reader communities via ANY($3)
@@ -323,7 +400,7 @@ mod tests {
         assert_eq!(
             params,
             vec![
-                ScopeParam::Key("id-1".to_string()),
+                ScopeParam::KeyList(vec!["id-1".to_string(), "occ-1".to_string()]),
                 ScopeParam::KeyList(vec!["F1".to_string(), "F2".to_string()]),
                 ScopeParam::KeyList(vec!["C1".to_string()]),
             ]
@@ -341,16 +418,143 @@ mod tests {
         // family has 2 keys -> IN (?,?); community 1 -> IN (?)
         assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id IN (?,?))"));
         assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id IN (?))"));
-        // params expanded: identity, F1, F2, C1 (BTreeSet-sorted)
+        // params expanded: id-1, occ-1 (the self set), F1, F2, C1 (BTreeSet-sorted)
         assert_eq!(
             params,
             vec![
                 ScopeParam::Key("id-1".to_string()),
+                ScopeParam::Key("occ-1".to_string()),
                 ScopeParam::Key("F1".to_string()),
                 ScopeParam::Key("F2".to_string()),
                 ScopeParam::Key("C1".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn with_dimension_keeps_sensitive_leaves_node_only_both_backends() {
+        for (backend, expect_occ, expect_dim) in [
+            (
+                BackendKind::Postgres,
+                "= $2",
+                "substr(t.dimension, 1, 17) = 'config:admission:'",
+            ),
+            (
+                BackendKind::Sqlite,
+                "= ?",
+                "substr(t.dimension, 1, 17) = 'config:admission:'",
+            ),
+        ] {
+            let (frag, params) = cohort_scope_sql_predicate_with_dimension(
+                backend,
+                "t.cohort_scope",
+                "t.cohort_target_id",
+                Some("t.dimension"),
+                &auth_singleton(),
+            );
+            assert!(frag.contains(expect_dim), "{frag}");
+            assert!(frag.contains("t.dimension = 'config:transport'"), "{frag}");
+            assert!(
+                frag.contains(&format!(
+                    "t.cohort_target_id {expect_occ} OR t.dimension IS NULL OR NOT ("
+                )),
+                "{frag}"
+            );
+            assert!(
+                !frag.contains("LIKE"),
+                "no LIKE — its case rule differs by backend: {frag}"
+            );
+            assert!(
+                frag.contains("OR t.dimension IS NULL OR NOT ("),
+                "a NULL dimension is not sensitive (SQL three-valued logic): {frag}"
+            );
+            // the occurrence key is bound once more, AFTER the self set
+            assert_eq!(
+                params.last(),
+                Some(&ScopeParam::Key("occ-1".to_string())),
+                "{params:?}"
+            );
+            // without a dimension column: the plain shape, no extra param
+            let (plain, pparams) = cohort_scope_sql_predicate(
+                backend,
+                "t.cohort_scope",
+                "t.cohort_target_id",
+                &auth_singleton(),
+            );
+            assert!(!plain.contains("substr("), "{plain}");
+            assert_eq!(pparams.len() + 1, params.len());
+        }
+    }
+
+    #[test]
+    fn local_tier_rows_are_their_producers_alone() {
+        let (frag, params) = local_tier_sql_predicate(
+            BackendKind::Postgres,
+            "tier",
+            "attesting_key_id",
+            &auth_singleton(),
+        );
+        assert_eq!(frag, "(tier <> 'local' OR attesting_key_id = $1)");
+        assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
+        let (frag, params) = local_tier_sql_predicate(
+            BackendKind::Sqlite,
+            "tier",
+            "attesting_key_id",
+            &auth_full(),
+        );
+        assert_eq!(frag, "(tier <> 'local' OR attesting_key_id = ?)");
+        assert_eq!(
+            params,
+            vec![ScopeParam::Key("occ-1".to_string())],
+            "the OCCURRENCE, never the identity"
+        );
+        let (frag, params) = local_tier_sql_predicate(
+            BackendKind::Sqlite,
+            "tier",
+            "attesting_key_id",
+            &CallerScope::Unauthenticated,
+        );
+        assert_eq!(frag, "(tier <> 'local')");
+        assert!(params.is_empty());
+    }
+
+    /// From disk (PR #889 review): every scope-gated door over
+    /// `federation_attestations` — the only tables that carry `config:*`
+    /// rows — composes the dimension-aware form. A door that passes the
+    /// attested key as target without the dimension column would leak the
+    /// sensitive leaves to the collective again.
+    #[test]
+    fn every_attestation_door_composes_the_dimension_aware_predicate() {
+        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+            let src =
+                std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_owned() + file)
+                    .unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            let mut doors = 0;
+            for (i, l) in lines.iter().enumerate() {
+                if l.trim() == "\"attested_key_id\"," || l.trim() == "\"fa.attested_key_id\"," {
+                    let window = lines[i.saturating_sub(4)..i].join("\n");
+                    if window.contains("scope_predicate_") {
+                        doors += 1;
+                        assert!(
+                            window.contains("_with_dimension("),
+                            "{file}:{}: an attestation door composes the scope predicate without its dimension column",
+                            i + 1
+                        );
+                        let after = lines[i..(i + 16).min(lines.len())].join("\n");
+                        assert!(
+                            after.contains("local_tier_predicate_"),
+                            "{file}:{}: an attestation door composes the scope predicate without the local-tier gate (V4.4 §3)",
+                            i + 1
+                        );
+                    }
+                }
+            }
+            assert!(
+                doors >= 3,
+                "{file}: expected the attestation doors, found {doors}"
+            );
+        }
     }
 
     /// The leak the target-membership model fixes: a reader sharing

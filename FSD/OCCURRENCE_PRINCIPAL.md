@@ -88,3 +88,95 @@ refusal would brick every shared device's community writes. If a
 deployment needs single-principal devices, that is an admission gate on
 the anchor plane (a sibling of `check_single_node_owner_admission`), filed
 separately if asked.
+
+## 6. The read gate — v46.3.1 (CIRISPersist#888, from CIRISServer#624)
+
+**The shape that broke.** §2 resolved the CALLER: `build_caller_admission`
+step 1 answers a claimed node's principal (its owner). The read-side `self`
+arm — `CallerScope::admits` (`scope/caller.rs`) and its SQL twin
+`cohort_scope_sql_predicate` (`scope/sql.rs`) — kept comparing that resolved
+identity to the row's RAW target (`attested_key_id` on memory,
+`cohort_target_id` on sqlite/postgres). A node's own `self` rows about itself
+(`config:*`, CC 3.4.5 self-or-owner, stamped correctly) became unreadable on
+the node that wrote them: `owner == node` is false. Before #873 the singleton
+resolved to itself, so raw == resolved and the asymmetry was invisible. Observed
+as CIRISServer#624: `GET /v1/config` → `{}`, re-announce 500.
+
+**The rule (stated once).** Both sides of the comparison are resolved the same
+way, by the fold `FSD/SELF_COLLECTIVE_TRANSFER.md` §4.1 already names:
+
+```
+admits(self, target) := target ∈ self_key_ids(caller)
+self_key_ids(caller) := {caller, identity(caller)}
+                      ∪ P ∪ ⋃_{p ∈ P} (active occurrences of p ∪ nodes_owned_by(p))
+where P := principals_of(caller) ∪ {identity(caller)}
+```
+— the caller's self-collective (CC 3.3.6; CC 5.2 `recipients := all current
+identity_occurrences of C.attesting_key_id`), built by the substrate inside
+`build_caller_admission_from_directory` (AV-44: never caller-asserted; the
+seal stays). The SQL twin binds the same set (`IN` / `= ANY`), exactly as the
+family and community arms already do. The write-side assembler
+(`CallerAdmission::from_resolved`, the trace-ingest pipeline) carries
+`{occurrence, identity}` — it never evaluates the self read arm.
+
+| symbol | change |
+|---|---|
+| `CallerAdmission::self_key_ids` | NEW, sealed; the caller's self-collective as key ids |
+| `CallerScope::admits` `"self"` arm | `target ∈ self_key_ids` (was `target == identity_key_id`) |
+| `cohort_scope_sql_predicate` `self` branch | `target_membership_branch(.., "self", self_key_ids, ..)` (was `= $identity`) |
+| `self_collective::occurrences_of`, `nodes_of` | `pub(crate)`, generic over an unsized directory — the folds the admission builder reads |
+| `self_collective::principals_of` | a REVOKED occurrence does not inherit its owner through a live owner binding (PR #889 review P1): `k` bound to `owner` at some time and not active now ⇒ `owner ∉ principals_of(k)`. One fold, so `speaks_for`, the send set and the read gate all say it |
+| `CallerScope::admits(cohort_scope, target, dimension)` | takes the row's dimension: a `CONFIG_SENSITIVE_LEAVES` leaf (CC 3.4.5.1, node-local by the write floor) is admitted at `self` only when `target == occurrence_key_id` (PR #889 review P1) |
+| `cohort_scope_sql_predicate_with_dimension` / `scope_predicate_{pg,sqlite}_with_dimension` | the same node-only clause in SQL, rendered with `substr`/`length` (no `LIKE`: its case rule differs by backend); composed by every door over `federation_attestations` — the only tables carrying `config:*` rows — pinned from disk |
+| `CallerScope::admits_local_tier(tier, attesting_key_id)` / `local_tier_sql_predicate` | NEW (PR #889 review, round three): a `local`-tier row (V4.4 §3, producer-only authority) is visible to its producing OCCURRENCE alone — `tier <> 'local' OR attester = occurrence`; the collective widening never reaches it. Composed by the same six attestation doors; pinned from disk |
+| `cache::key::scope_digest` | folds the occurrence and `self_key_ids` (domain tag `CallerScope:v46.3.1`): two admissions differing only in the collective, or in the occurrence, never share an aggregate cache entry (PR #889 review, round three) |
+
+No wire change, no migration, no vocabulary change. PATCH.
+
+**Invariants.**
+- **I141** (3 backends, Rust twin; sqlite + postgres also through
+  `ReadEngine::list_attestations`, the SQL twin) — a claimed node (owner
+  binding + occurrence) writes two `self` rows about itself (`config:*`);
+  the node reads both; the owner's key reads both; the owner's second device
+  reads both (CC 5.2); a node the owner OWNS but never bound as an occurrence
+  reads both; the node reads what the device and the owned-only node write
+  about themselves; a stranger node reads none. The node's `config:admission`
+  leaf is read by the node alone — not the device, not the owner's key, not
+  the other node. After the owner REVOKES the node's occurrence (owner
+  binding kept): the node reads only its own rows, `speaks_for(node, owner)`
+  is false, the device still reads the (owned) node's plain rows. A
+  `local`-tier row the node wrote through the local door is read by the node
+  alone — not the device, not the owner, not the other node. Unclaimed
+  (singleton) the node still reads its own.
+- Mutants: self set = `{identity}` only (node red); drop the occurrence union
+  (the DEVICE's own row unread — every reader in the first draft was also an
+  owned node, so only a writer that owns no node exercises this fold); drop
+  `nodes_owned_by` (the owned-only node's own row unread — the mirror gap);
+  SQL branch back to `= identity` (sqlite red); `admits(self) → true`
+  (stranger red); `principals_of` ignores the revocation (revoked node reads
+  the device's row); drop the sensitive clause in the Rust twin (device reads
+  the leaf, memory/sqlite); drop it in the SQL twin (sqlite); drop the SQL
+  twin's `dimension IS NULL` (review round two: `dimension` is a GENERATED
+  column, NULL for every attestation type without a dimension member, and
+  `NOT (NULL)` is NULL — the shape test pins the clause on both backends).
+  Round three: `admits_local_tier → true` (device reads the local row,
+  memory/sqlite); the SQL local-tier clause dropped (sqlite); the scope
+  digest drops the self set (the `cache::key` test's `wider` /
+  `other_device` digests collide).
+
+### 6.1 Mutation table (sqlite lane, 2026-09-22; rounds a–e, 12/12 killed)
+
+| Mutant | Verdict |
+|---|---|
+| M1 self set = {identity} only | KILLED by memory::i141 sqlite::i141  |
+| M4 SQL self branch back to = identity | KILLED by sqlite::i141  |
+| M5 admits(self) = true | KILLED by memory::i141 sqlite::i141  |
+| M2 drop the occurrence union | KILLED by memory::i141 sqlite::i141  |
+| M3 drop nodes_owned_by | KILLED by memory::i141 sqlite::i141  |
+| M6 principals_of ignores the revocation | KILLED by memory::i141 sqlite::i141  |
+| M7 Rust twin drops the sensitive clause | KILLED by memory::i141 sqlite::i141  |
+| M8 SQL twin drops the sensitive clause | KILLED by sqlite::i141  |
+| M9 SQL twin drops `dimension IS NULL` (NOT (NULL) hides dimension-less rows) | KILLED by sql::with_dimension_keeps_sensitive_leaves_node_only_both_backends  |
+| M10 admits_local_tier = true (local rows leak to the collective, Rust twin) | KILLED by memory::i141 sqlite::i141  |
+| M11 SQL local-tier clause dropped | KILLED by sqlite::i141  |
+| M12 scope digest drops the self set and the occurrence | KILLED by key::scope_digest_is_set_order_invariant  |

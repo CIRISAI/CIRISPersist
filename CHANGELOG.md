@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.3.1] - 2026-09-22
+
+### Fixed — a claimed node could not read its own `self` rows (CIRISPersist#888, CIRISServer#624; `FSD/OCCURRENCE_PRINCIPAL.md` §6)
+- Since v45.0.1 (#873) the read-side `self` gate compared the caller's
+  RESOLVED identity (a claimed node's owner) to the row's RAW target (the
+  node), so every `self`-scoped row a node emits about itself — `config:*`
+  and the CC 3.4.5 self-or-owner families — was invisible on that node,
+  including to the node itself (`GET /v1/config` → `{}`; the re-announce
+  500). Both twins of the gate — `CallerScope::admits` and
+  `cohort_scope_sql_predicate` — now test the target against the caller's
+  **self-collective**, built by the substrate into the sealed
+  `CallerAdmission` (`self_key_ids`: the caller, its identity, its
+  principals, and every active occurrence and owned node of each) — the
+  same fold v46.3.0's `speaks_for` and the hold path use (CC 3.3.6, CC 5.2).
+  The owner's other devices read the node's rows; a stranger node does not.
+  Witness I141 on memory, sqlite, postgres.
+- **Review (PR #889), two holes the widening opened, closed in the same
+  fold:** (1) a REVOKED occurrence with a live owner binding got its owner
+  back through `principals_of` — a lost device could read the collective's
+  self rows; a revocation is the owner's signed "no longer acts for me" and
+  now overrides the owner binding in `principals_of`, so `speaks_for`, the
+  send set and the read gate all agree. (2) the sensitive `config:*` leaves
+  (`config:admission`, `config:transport`; node-local by the CC 3.4.5.1 write
+  floor) were readable by the whole collective on a shared node — both gate
+  twins now admit them at `self` only when the caller IS the target:
+  `CallerScope::admits` takes the row's dimension, and the attestation doors
+  compose `cohort_scope_sql_predicate_with_dimension` (pinned from disk).
+  `admits` gains a parameter (crate API; not on PyO3). A row with no
+  dimension member (a generated NULL) is not a sensitive leaf in SQL either
+  (`IS NULL`, review round two). Round three: a `local`-tier row (V4.4 §3,
+  producer-only authority) had relied on the old equality for its
+  occurrence-privacy — now its own gate in both twins
+  (`admits_local_tier` / `local_tier_sql_predicate`, composed by the six
+  attestation doors, pinned from disk); and the aggregate cache's scope
+  digest folds the occurrence and the self-collective, so two admissions
+  that admit different `self` rows never share an entry (domain tag
+  `CallerScope:v46.3.1` — existing entries simply miss). No wire, migration
+  or vocabulary change.
+
 ## [46.3.0] - 2026-09-22
 
 ### Added — self/family bytes are delivered, not discovered: the send set, the re-grant doors, the minter read (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md`)

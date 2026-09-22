@@ -184,6 +184,396 @@ pub(crate) mod bodies {
 
     /// **I122 — `would_hold` admits community content of a room the owner
     /// is a member of, for a node carrying both rows.**
+    /// **I141 — the read-side `self` gate admits the caller's self-collective
+    /// (v46.3.1, CIRISPersist#888 / CIRISServer#624).** A claimed node's own
+    /// `self` rows about itself (`config:*`) are readable by the node, by its
+    /// owner, by the owner's other device and by the owner's other node; a
+    /// stranger node reads none. Rust twin on every backend; the SQL twin
+    /// through `ReadEngine::list_attestations` on sqlite / postgres.
+    pub async fn i141_a_claimed_node_reads_its_own_self_rows<B>(d: &B, s: &str)
+    where
+        B: FederationDirectory + crate::ceg::ReadEngine,
+    {
+        use crate::scope::{caller_scope_from_directory, CallerScope};
+        let (node, owner, device, node_c, stranger, other) = (
+            format!("i141-node-{s}"),
+            format!("i141-owner-{s}"),
+            format!("i141-device-{s}"),
+            format!("i141-node-c-{s}"),
+            format!("i141-stranger-{s}"),
+            format!("i141-other-{s}"),
+        );
+        for (k, t) in [
+            (&node, NODE),
+            (&node_c, NODE),
+            (&stranger, NODE),
+            (&owner, USER),
+            (&device, USER),
+            (&other, USER),
+        ] {
+            ts::register_identity_key(d, k, t).await;
+        }
+        // The node's own self rows, written UNCLAIMED (singleton): the CC 3.4.5
+        // self-or-owner stamping — attester == attested == node, target = node.
+        let dims = [
+            "config:net.bootstrap_peers:v1",
+            "config:net.announce_ownership:v1",
+        ];
+        for (i, dim) in dims.iter().enumerate() {
+            let mut row = ts::bare_attestation(
+                &format!("i141-row-{i}-{s}"),
+                &node,
+                &node,
+                &serde_json::json!({"cohort_scope": "self", "dimension": dim}),
+            );
+            row.attestation_type = "scores".into();
+            row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+            row.subject_key_ids = vec![node.clone()];
+            ts::seal_row_in_place(&node, &mut row);
+            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .unwrap_or_else(|e| panic!("I141: the node writes its own self row: {e}"));
+        }
+        let reads = |caller: &str| {
+            let caller = caller.to_owned();
+            let node = node.clone();
+            async move {
+                let scope = caller_scope_from_directory(d, &caller).await.unwrap();
+                let rust_twin = scope.admits(
+                    crate::federation::types::cohort_scope::SELF,
+                    &node,
+                    Some("config:net.bootstrap_peers:v1"),
+                );
+                // The SQL twin, where there is SQL: the memory backend has no
+                // CEG read substrate, so its leg measures the Rust twin only.
+                let rows = match crate::ceg::ReadEngine::list_attestations(
+                    d,
+                    crate::ceg::AttestationFilter {
+                        attesting_key_id: Some(node.clone()),
+                        dimension_prefixes: vec!["config:".into()],
+                        ..Default::default()
+                    },
+                    None,
+                    10,
+                    scope,
+                )
+                .await
+                {
+                    Ok(page) => Some(page.items.len()),
+                    Err(crate::ceg::Error::Backend(m))
+                        if m.contains("no relational read substrate") =>
+                    {
+                        None
+                    }
+                    Err(e) => panic!("I141: list_attestations: {e}"),
+                };
+                (rust_twin, rows)
+            }
+        };
+        let expect = |got: (bool, Option<usize>), admitted: bool, rows: usize, why: &str| {
+            assert_eq!(got.0, admitted, "{why} (Rust twin)");
+            if let Some(n) = got.1 {
+                assert_eq!(n, rows, "{why} (SQL twin)");
+            }
+        };
+        expect(
+            reads(&node).await,
+            true,
+            2,
+            "I141: unclaimed, the node reads its own rows",
+        );
+        // THE CLAIM: owner binding + occurrence binding. Resolution now answers the owner.
+        bind(d, &owner, &node, "2026-06-02T00:00:00Z").await;
+        ts::put_owner_binding(d, &owner, &node).await;
+        assert_eq!(
+            d.active_identity_for_occurrence(&node).await.unwrap(),
+            owner,
+            "I141: the claimed node resolves to its owner (#873)"
+        );
+        expect(
+            reads(&node).await,
+            true,
+            2,
+            "I141: CLAIMED, the node still reads its own self rows (#888)",
+        );
+        expect(
+            reads(&owner).await,
+            true,
+            2,
+            "I141: the owner reads the node's self rows",
+        );
+        // The owner's other device (an occurrence) and other node (owned, never bound).
+        bind(d, &owner, &device, "2026-06-03T00:00:00Z").await;
+        ts::put_owner_binding(d, &owner, &node_c).await;
+        expect(
+            reads(&device).await,
+            true,
+            2,
+            "I141: the owner's other device reads them (CC 5.2)",
+        );
+        expect(
+            reads(&node_c).await,
+            true,
+            2,
+            "I141: the owner's other node reads them (owned, not occurrence-bound)",
+        );
+        // The other direction — the bound node READS what the collective's
+        // other members WRITE about themselves. The device is an occurrence
+        // that owns no node (the occurrence union is the only path to it);
+        // node C is an owned node bound as no occurrence (`nodes_owned_by`
+        // is the only path to it). One self row each, under `profile:`.
+        for (i, writer) in [&device, &node_c].iter().enumerate() {
+            let mut row = ts::bare_attestation(
+                &format!("i141-peer-row-{i}-{s}"),
+                writer,
+                writer,
+                &serde_json::json!({"cohort_scope": "self", "dimension": format!("profile:display_name:v{i}")}),
+            );
+            row.attestation_type = "scores".into();
+            row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+            row.subject_key_ids = vec![(*writer).clone()];
+            ts::seal_row_in_place(writer, &mut row);
+            d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("I141: a collective member writes its own self row: {e}")
+                });
+        }
+        let reads_dim = |caller: &str, writer: &str, prefix: &str, dimension: &str| {
+            let (caller, writer, prefix, dimension) = (
+                caller.to_owned(),
+                writer.to_owned(),
+                prefix.to_owned(),
+                dimension.to_owned(),
+            );
+            async move {
+                let scope = caller_scope_from_directory(d, &caller).await.unwrap();
+                let rust_twin = scope.admits(
+                    crate::federation::types::cohort_scope::SELF,
+                    &writer,
+                    Some(&dimension),
+                );
+                let rows = match crate::ceg::ReadEngine::list_attestations(
+                    d,
+                    crate::ceg::AttestationFilter {
+                        attesting_key_id: Some(writer.clone()),
+                        dimension_prefixes: vec![prefix.clone()],
+                        ..Default::default()
+                    },
+                    None,
+                    10,
+                    scope,
+                )
+                .await
+                {
+                    Ok(page) => Some(page.items.len()),
+                    Err(crate::ceg::Error::Backend(m))
+                        if m.contains("no relational read substrate") =>
+                    {
+                        None
+                    }
+                    Err(e) => panic!("I141: list_attestations: {e}"),
+                };
+                (rust_twin, rows)
+            }
+        };
+        let reads_of = |caller: &str, writer: &str| {
+            reads_dim(caller, writer, "profile:", "profile:display_name:v1")
+        };
+        expect(
+            reads_of(&node, &device).await,
+            true,
+            1,
+            "I141: the node reads its owner's DEVICE's self row (occurrence union)",
+        );
+        expect(
+            reads_of(&node, &node_c).await,
+            true,
+            1,
+            "I141: the node reads its owner's OTHER NODE's self row (nodes_owned_by)",
+        );
+        // A stranger node under another human reads none — the fix widened
+        // `self` to the collective, not to the world.
+        bind(d, &other, &stranger, "2026-06-03T00:00:00Z").await;
+        ts::put_owner_binding(d, &other, &stranger).await;
+        expect(
+            reads(&stranger).await,
+            false,
+            0,
+            "I141: a stranger node reads none",
+        );
+        expect(
+            reads_of(&stranger, &device).await,
+            false,
+            0,
+            "I141: nor the device's",
+        );
+        expect(
+            reads_of(&stranger, &node_c).await,
+            false,
+            0,
+            "I141: nor node C's",
+        );
+        // Review (PR #889, round three): a LOCAL-tier row is producer-only
+        // authority (V4.4 §3) — visible to the producing occurrence alone,
+        // whatever the collective. The node writes one through the local door.
+        d.attestation_upsert_local(crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: node.clone(),
+            attested_key_id: None,
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: Some(1.0),
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({"id": format!("i141-local-{s}"), "dimension": "identity_binding:v1", "score": 1.0, "confidence": 0.9}),
+            )
+            .unwrap(),
+            subject_key_ids: vec![],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("I141: the node writes a local-tier row: {e}"));
+        let reads_local = |caller: &str| {
+            let (caller, node) = (caller.to_owned(), node.clone());
+            async move {
+                let scope = caller_scope_from_directory(d, &caller).await.unwrap();
+                let rust_twin = scope
+                    .admits_local_tier(crate::federation::types::attestation_tier::LOCAL, &node);
+                let rows = match crate::ceg::ReadEngine::list_attestations(
+                    d,
+                    crate::ceg::AttestationFilter {
+                        attesting_key_id: Some(node.clone()),
+                        dimension_prefixes: vec!["identity_binding".into()],
+                        tier: Some(crate::ceg::list::federation::Tier::Local),
+                        ..Default::default()
+                    },
+                    None,
+                    10,
+                    scope,
+                )
+                .await
+                {
+                    Ok(page) => Some(page.items.len()),
+                    Err(crate::ceg::Error::Backend(m))
+                        if m.contains("no relational read substrate") =>
+                    {
+                        None
+                    }
+                    Err(e) => panic!("I141: list_attestations: {e}"),
+                };
+                (rust_twin, rows)
+            }
+        };
+        expect(
+            reads_local(&node).await,
+            true,
+            1,
+            "I141: the producing occurrence reads its own local-tier row",
+        );
+        expect(
+            reads_local(&device).await,
+            false,
+            0,
+            "I141: the owner's device does NOT read the node's local-tier row",
+        );
+        expect(
+            reads_local(&owner).await,
+            false,
+            0,
+            "I141: nor the owner's key",
+        );
+        expect(
+            reads_local(&node_c).await,
+            false,
+            0,
+            "I141: nor the owner's other node",
+        );
+        // Review (PR #889, P1): a SENSITIVE config leaf (CC 3.4.5.1,
+        // `CONFIG_SENSITIVE_LEAVES`) is node-local by the write floor; the
+        // collective widening must not carry it to the owner's other keys on
+        // a shared node. Node-only: the caller IS the target.
+        let mut row = ts::bare_attestation(
+            &format!("i141-sensitive-{s}"),
+            &node,
+            &node,
+            &serde_json::json!({"cohort_scope": "self", "dimension": "config:admission:v1"}),
+        );
+        row.attestation_type = "scores".into();
+        row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        row.subject_key_ids = vec![node.clone()];
+        ts::seal_row_in_place(&node, &mut row);
+        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .unwrap_or_else(|e| panic!("I141: the node writes its sensitive leaf at self: {e}"));
+        expect(
+            reads_dim(&node, &node, "config:admission", "config:admission:v1").await,
+            true,
+            1,
+            "I141: the node reads its own sensitive leaf",
+        );
+        expect(
+            reads_dim(&device, &node, "config:admission", "config:admission:v1").await,
+            false,
+            0,
+            "I141: the owner's device does NOT read the node's sensitive leaf",
+        );
+        expect(
+            reads_dim(&owner, &node, "config:admission", "config:admission:v1").await,
+            false,
+            0,
+            "I141: nor does the owner's own key",
+        );
+        expect(
+            reads_dim(&node_c, &node, "config:admission", "config:admission:v1").await,
+            false,
+            0,
+            "I141: nor the owner's other node",
+        );
+        // Review (PR #889, P1): a REVOKED occurrence with a live owner binding
+        // is the lost device. It reads its own rows and nothing of the
+        // collective's; `speaks_for` says the same (one fold).
+        assert!(
+            crate::federation::self_collective::speaks_for(d, &node, &owner)
+                .await
+                .unwrap(),
+            "I141: before revocation the node speaks for its owner"
+        );
+        revoke(d, &owner, &node, "2026-06-04T00:00:00Z").await;
+        assert!(
+            !crate::federation::self_collective::speaks_for(d, &node, &owner)
+                .await
+                .unwrap(),
+            "I141: a revoked occurrence no longer speaks for its owner, owner binding or not"
+        );
+        expect(
+            reads(&node).await,
+            true,
+            3,
+            "I141: revoked, the node still reads its OWN rows — all three config rows, its sensitive leaf included",
+        );
+        expect(
+            reads_of(&node, &device).await,
+            false,
+            0,
+            "I141: revoked, the node no longer reads the device's row",
+        );
+        expect(
+            reads_of(&node, &node_c).await,
+            false,
+            0,
+            "I141: revoked, the node no longer reads the other node's row",
+        );
+        expect(
+            reads(&device).await,
+            true,
+            2,
+            "I141: the owner's device still reads the (owned) node's rows — the two plain ones, never the sensitive leaf",
+        );
+        let _ = CallerScope::Unauthenticated;
+    }
+
     pub async fn i122_the_node_is_party_through_its_owner(d: &dyn FederationDirectory, s: &str) {
         let (node, owner, other, comm) = (
             format!("i122-node-{s}"),
@@ -392,6 +782,11 @@ mod run {
                 async fn i124() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i124_a_shared_device_is_party_to_both(&b, &super::suffix()).await
+                }
+                #[tokio::test]
+                async fn i141() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i141_a_claimed_node_reads_its_own_self_rows(&b, &super::suffix()).await
                 }
             }
         };

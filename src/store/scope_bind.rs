@@ -42,10 +42,27 @@ pub(crate) fn scope_predicate_pg(
     String,
     Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) {
-    let (frag, params) = crate::scope::cohort_scope_sql_predicate(
+    scope_predicate_pg_with_dimension(scope, scope_col, target_col, None, bound_so_far)
+}
+
+/// v46.3.1 (PR #889 review) — the dimension-aware form for the attestation
+/// doors; see `cohort_scope_sql_predicate_with_dimension`.
+#[cfg(feature = "postgres")]
+pub(crate) fn scope_predicate_pg_with_dimension(
+    scope: &CallerScope,
+    scope_col: &str,
+    target_col: &str,
+    dimension_col: Option<&str>,
+    bound_so_far: usize,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    let (frag, params) = crate::scope::cohort_scope_sql_predicate_with_dimension(
         BackendKind::Postgres,
         scope_col,
         target_col,
+        dimension_col,
         scope,
     );
     let frag = rebase_pg_placeholders(&frag, bound_so_far);
@@ -77,8 +94,26 @@ pub(crate) fn scope_predicate_sqlite(
     target_col: &str,
     bound_so_far: usize,
 ) -> (String, Vec<rusqlite::types::Value>) {
-    let (frag, params) =
-        crate::scope::cohort_scope_sql_predicate(BackendKind::Sqlite, scope_col, target_col, scope);
+    scope_predicate_sqlite_with_dimension(scope, scope_col, target_col, None, bound_so_far)
+}
+
+/// v46.3.1 (PR #889 review) — the dimension-aware form for the attestation
+/// doors; see `cohort_scope_sql_predicate_with_dimension`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn scope_predicate_sqlite_with_dimension(
+    scope: &CallerScope,
+    scope_col: &str,
+    target_col: &str,
+    dimension_col: Option<&str>,
+    bound_so_far: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (frag, params) = crate::scope::cohort_scope_sql_predicate_with_dimension(
+        BackendKind::Sqlite,
+        scope_col,
+        target_col,
+        dimension_col,
+        scope,
+    );
     let frag = rebase_sqlite_placeholders(&frag, bound_so_far);
     let values: Vec<rusqlite::types::Value> = params
         .into_iter()
@@ -157,6 +192,61 @@ pub(crate) fn and_compose(where_sql: &str, scope_frag: &str) -> String {
     }
 }
 
+/// v46.3.1 (PR #889 review, round three) — the local-tier gate, rebased
+/// onto a Postgres statement; see `scope::local_tier_sql_predicate`.
+#[cfg(feature = "postgres")]
+pub(crate) fn local_tier_predicate_pg(
+    scope: &CallerScope,
+    tier_col: &str,
+    attester_col: &str,
+    bound_so_far: usize,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    let (frag, params) = crate::scope::local_tier_sql_predicate(
+        BackendKind::Postgres,
+        tier_col,
+        attester_col,
+        scope,
+    );
+    let frag = rebase_pg_placeholders(&frag, bound_so_far);
+    let boxed = params
+        .into_iter()
+        .map(|p| match p {
+            ScopeParam::Key(k) => {
+                Box::new(k) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            ScopeParam::KeyList(ks) => {
+                Box::new(ks) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+        })
+        .collect();
+    (frag, boxed)
+}
+
+/// v46.3.1 (PR #889 review, round three) — the local-tier gate, numbered
+/// for SQLite; see `scope::local_tier_sql_predicate`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn local_tier_predicate_sqlite(
+    scope: &CallerScope,
+    tier_col: &str,
+    attester_col: &str,
+    bound_so_far: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (frag, params) =
+        crate::scope::local_tier_sql_predicate(BackendKind::Sqlite, tier_col, attester_col, scope);
+    let frag = rebase_sqlite_placeholders(&frag, bound_so_far);
+    let values = params
+        .into_iter()
+        .map(|p| match p {
+            ScopeParam::Key(k) => rusqlite::types::Value::Text(k),
+            ScopeParam::KeyList(ks) => rusqlite::types::Value::Text(ks.join(",")),
+        })
+        .collect();
+    (frag, values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,13 +271,13 @@ mod tests {
         let (frag, params) =
             scope_predicate_pg(&auth_full(), "t.cohort_scope", "t.cohort_target_id", 3);
         assert!(
-            frag.contains("t.cohort_target_id = $4"),
-            "self → $4: {frag}"
+            frag.contains("t.cohort_target_id = ANY($4)"),
+            "self set → ANY($4) (v46.3.1): {frag}"
         );
         assert!(frag.contains("= ANY($5)"), "family array → $5: {frag}");
         assert!(frag.contains("= ANY($6)"), "community array → $6: {frag}");
         assert!(!frag.contains("$1"), "no original $1 remains: {frag}");
-        assert_eq!(params.len(), 3, "identity + family-list + community-list");
+        assert_eq!(params.len(), 3, "self-list + family-list + community-list");
     }
 
     #[cfg(feature = "postgres")]
@@ -212,12 +302,15 @@ mod tests {
         // 2 filter params bound → scope params start at ?3.
         let (frag, values) =
             scope_predicate_sqlite(&auth_full(), "t.cohort_scope", "t.cohort_target_id", 2);
-        // self → ?3 ; family F1,F2 → ?4,?5 ; community C1 → ?6
-        assert!(frag.contains("t.cohort_target_id = ?3"), "{frag}");
-        assert!(frag.contains("IN (?4,?5)"), "{frag}");
-        assert!(frag.contains("IN (?6)"), "{frag}");
+        // self {id-1, occ-1} → ?3,?4 ; family F1,F2 → ?5,?6 ; community C1 → ?7
+        assert!(
+            frag.contains("t.cohort_target_id IN (?3,?4)"),
+            "self set {{id-1, occ-1}} → ?3,?4: {frag}"
+        );
+        assert!(frag.contains("IN (?5,?6)"), "{frag}");
+        assert!(frag.contains("IN (?7)"), "{frag}");
         assert!(!frag.contains("(?)"), "no bare ? left: {frag}");
-        assert_eq!(values.len(), 4, "identity + F1 + F2 + C1");
+        assert_eq!(values.len(), 5, "id-1 + occ-1 + F1 + F2 + C1");
     }
 
     #[cfg(feature = "sqlite")]

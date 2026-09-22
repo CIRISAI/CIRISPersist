@@ -2500,13 +2500,21 @@ fn mem_scores_row_matches(
         }
         Some(Tier::Any) => {}
     }
+    // V4.4 §3 (PR #889 review) — a local-tier row is its producer's alone.
+    if !scope.admits_local_tier(&r.tier, &r.attesting_key_id) {
+        return false;
+    }
     if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
         if !keys.iter().any(|k| k == &r.attesting_key_id) {
             return false;
         }
     }
     // §4.3 scope gate (target = attested_key_id, mirroring the SQL).
-    scope.admits(&r.cohort_scope, &r.attested_key_id)
+    scope.admits(
+        &r.cohort_scope,
+        &r.attested_key_id,
+        crate::federation::admission::envelope_dimension(&r.attestation_envelope),
+    )
 }
 
 /// v45.0.0 (CIRISPersist#871, FSD §5) — the memory backend has no blob

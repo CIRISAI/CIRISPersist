@@ -85,7 +85,8 @@ pub fn repository_stats_cache_key(
 /// Derive the 32-byte scope digest from a [`crate::scope::CallerScope`]
 /// (§7.3 scope-disjoint). Unauthenticated → the canonical
 /// unauthenticated digest; Authenticated → folds the resolved
-/// identity + family + community admission sets.
+/// identity + family + community admission sets, the occurrence, and the
+/// self-collective (v46.3.1).
 ///
 /// `pub(crate)` so the scoring-factors cache key
 /// ([`crate::ceg::aggregates::scoring::scoring_factors_cache_key`])
@@ -93,12 +94,22 @@ pub fn repository_stats_cache_key(
 pub(crate) fn scope_digest_for(scope: &crate::scope::CallerScope) -> [u8; 32] {
     match scope {
         crate::scope::CallerScope::Unauthenticated => {
-            crate::cache::key::scope_digest(false, "", &[], &[])
+            crate::cache::key::scope_digest(false, "", &[], &[], "", &[])
         }
         crate::scope::CallerScope::Authenticated { admission } => {
             let fams: Vec<String> = admission.family_key_ids.iter().cloned().collect();
             let coms: Vec<String> = admission.community_key_ids.iter().cloned().collect();
-            crate::cache::key::scope_digest(true, &admission.identity_key_id, &fams, &coms)
+            // v46.3.1 (PR #889 review) — the self-collective and the
+            // occurrence are scope: they decide which `self` rows a read admits.
+            let slf: Vec<String> = admission.self_key_ids.iter().cloned().collect();
+            crate::cache::key::scope_digest(
+                true,
+                &admission.identity_key_id,
+                &fams,
+                &coms,
+                &admission.occurrence_key_id,
+                &slf,
+            )
         }
     }
 }

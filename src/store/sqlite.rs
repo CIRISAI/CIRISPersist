@@ -19102,10 +19102,23 @@ fn sqlite_scores_shared_predicates(
     sqlite_selection_axes(filter, "fa.", true, &mut parts, &mut binds);
     // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
     {
-        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
             scope,
             "fa.cohort_scope",
             "fa.attested_key_id",
+            Some("fa.dimension"),
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+            scope,
+            "fa.tier",
+            "fa.attesting_key_id",
             binds.len(),
         );
         parts.push(frag);
@@ -22147,10 +22160,23 @@ impl crate::read::ReadEngine for SqliteBackend {
         // gate compares the row's cohort_scope/attested_key_id against the
         // reader's admission.
         {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("dimension"),
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
+        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+        // producing occurrence alone; the collective never reaches it.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+                &scope,
+                "tier",
+                "attesting_key_id",
                 binds.len(),
             );
             parts.push(frag);
@@ -22241,10 +22267,23 @@ impl crate::read::ReadEngine for SqliteBackend {
         // §4.3 scope gate on the attestation's own cohort_scope /
         // attested_key_id (subject doubles as membership target).
         {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("dimension"),
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
+        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+        // producing occurrence alone; the collective never reaches it.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+                &scope,
+                "tier",
+                "attesting_key_id",
                 binds.len(),
             );
             parts.push(frag);
@@ -36519,11 +36558,16 @@ mod tests {
         seed("new-fed", "k1", "2026-12-01T00:00:00Z", "federation");
         seed("mid-loc", "k2", "2026-06-02T00:00:00Z", "local");
 
-        let q = |f: AttestationFilter| {
+        // v46.3.1 (PR #889 review, V4.4 §3): a LOCAL-tier row is its producing
+        // occurrence's alone. The unauthenticated reader is nobody's producer,
+        // so `mid-loc` (attester k2) is absent from every unauthenticated read
+        // below and present for k2 — `tier: None` still means "no tier
+        // predicate" on this handle; the local-tier GATE is not a tier filter.
+        let q_as = |f: AttestationFilter, scope: crate::scope::CallerScope| {
             let backend = &backend;
             async move {
                 let mut ids: Vec<String> = backend
-                    .list_attestations(f, None, 100, crate::scope::CallerScope::Unauthenticated)
+                    .list_attestations(f, None, 100, scope)
                     .await
                     .unwrap()
                     .items
@@ -36534,14 +36578,22 @@ mod tests {
                 ids
             }
         };
+        let q = |f: AttestationFilter| q_as(f, crate::scope::CallerScope::Unauthenticated);
+        let as_k2 = || crate::scope::CallerScope::Authenticated {
+            admission: crate::scope::CallerAdmission::for_test("k2", "k2", [], []),
+        };
 
         // The unfiltered baseline every assertion below is measured against.
         let all = q(AttestationFilter::default()).await;
         assert_eq!(
             all,
+            vec!["mid-fed", "new-fed", "old-fed"],
+            "baseline: no filter returns every seeded FEDERATION row; the local row is its producer's alone (V4.4 §3), and an unauthenticated reader is nobody's producer"
+        );
+        assert_eq!(
+            q_as(AttestationFilter::default(), as_k2()).await,
             vec!["mid-fed", "mid-loc", "new-fed", "old-fed"],
-            "baseline: no filter returns every seeded row (and `tier: None` on THIS handle \
-             still means no predicate, so the local row is present)"
+            "the producing occurrence sees its own local row beside every federation row"
         );
 
         // window — half-open [start, end)
@@ -36555,7 +36607,7 @@ mod tests {
         .await;
         assert_eq!(
             windowed,
-            vec!["mid-fed", "mid-loc"],
+            vec!["mid-fed"],
             "`window` must BIND. Before #596 this returned all {} rows — an operator \
              ratifying a selection hash over a window got a hash over everything.",
             all.len()
@@ -36568,8 +36620,20 @@ mod tests {
                 ..Default::default()
             })
             .await,
+            Vec::<String>::new(),
+            "`tier: Local` selects local rows — and the unauthenticated reader owns none"
+        );
+        assert_eq!(
+            q_as(
+                AttestationFilter {
+                    tier: Some(Tier::Local),
+                    ..Default::default()
+                },
+                as_k2()
+            )
+            .await,
             vec!["mid-loc"],
-            "`tier: Local` must select only local rows"
+            "`tier: Local` must select only local rows, for their producer"
         );
         assert_eq!(
             q(AttestationFilter {

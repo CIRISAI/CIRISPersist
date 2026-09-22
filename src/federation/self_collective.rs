@@ -41,7 +41,24 @@ where
 {
     let mut out = dir.active_identities_for_occurrence(k).await?;
     match super::admission::owner_of(dir, k).await {
-        Ok(Some(owner)) => out.push(owner),
+        Ok(Some(owner)) => {
+            // PR #889 review (P1) — a REVOKED occurrence does not get its
+            // owner back through the owner binding. An occurrence
+            // revocation is the owner's signed "k no longer acts for me"; a
+            // live `delegates_to(owner → k)` beside it is the lost device's
+            // shape, not a second vote. `k` bound to `owner` at some time and
+            // not active now ⇒ the owner is not k's principal. A node the
+            // owner never bound as an occurrence (KEM-less) keeps its owner:
+            // ownership is then the only fact, and it is a live one.
+            let ever_bound = dir
+                .list_identity_occurrences_by_occurrence_key(k)
+                .await?
+                .iter()
+                .any(|o| o.identity_key_id == owner);
+            if !ever_bound || out.contains(&owner) {
+                out.push(owner);
+            }
+        }
         Ok(None) | Err(Error::AmbiguousNodeOwner { .. }) => {}
         Err(e) => return Err(e),
     }
@@ -66,8 +83,27 @@ where
 /// `use_node_identity` (CIRISEdge#541) an actor occurrence's key is not the
 /// key peers see. The send set is homogeneous in node key ids, as the consent
 /// half already is.
-async fn nodes_of(dir: &dyn FederationDirectory, p: &str) -> Result<Vec<String>, Error> {
+pub(crate) async fn nodes_of<D>(dir: &D, p: &str) -> Result<Vec<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
     super::admission::nodes_owned_by(dir, p).await
+}
+
+/// **The active occurrences of a human** — the KEM targets of the
+/// self-collective (CC 3.3.6). Read by the read-side `self` gate
+/// (`scope::build_caller_admission_from_directory`, v46.3.1 / #888) beside
+/// [`nodes_of`]: a row targeted at any of them is the caller's own.
+pub(crate) async fn occurrences_of<D>(dir: &D, identity: &str) -> Result<Vec<String>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    Ok(dir
+        .list_identity_occurrences_active(identity)
+        .await?
+        .into_iter()
+        .map(|o| o.occurrence_key_id)
+        .collect())
 }
 
 /// **Does `signer` speak for `author` on the key plane?** (FSD §4.1) —
