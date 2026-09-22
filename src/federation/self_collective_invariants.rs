@@ -289,14 +289,43 @@ pub(crate) mod bodies {
                 })
                 .await;
         }
+        // The peer ADOPTS the bytes with the row's author — the PERSON — so
+        // its provenance names the author and the set names the sealer; the
+        // read must answer the sealer. (B is the owner's occurrence too.)
+        let kem_b = {
+            let id = l.bb.load_or_init_content_kem_identity().await.unwrap();
+            EncryptionPubkeys {
+                x25519_base64: id.x25519_pubkey_b64,
+                ml_kem_768_base64: id.ml_kem_768_pubkey_b64,
+            }
+        };
+        bind(l.bb.as_ref(), &owner, &l.node_b, Some(kem_b)).await;
+        let Some(BlobBody::Inline(bytes)) = l.ba.get_blob(&rs.at_rest_sha256).await.unwrap() else {
+            panic!("inline")
+        };
+        l.engine_b
+            .adopt_sealed_blob(
+                &bytes,
+                BlobProvenance {
+                    author_key_id: owner.clone(),
+                    cohort_scope: cohort_scope::SELF.to_owned(),
+                    community_key_id: None,
+                    epoch: None,
+                    tier: CryptoTier::InvisibleEncrypted,
+                    minter_key_id: Some(l.node_a.clone()),
+                },
+                None,
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("I139: the peer adopts the person-authored self bytes");
+        let on_b = l.bb.minter_of_blob(&rs.at_rest_sha256).await.unwrap();
         assert_eq!(
-            l.bb.minter_of_blob(&rs.at_rest_sha256)
-                .await
-                .unwrap()
-                .as_deref(),
+            on_b.as_deref(),
             Some(l.node_a.as_str()),
-            "I139: on the peer, a self blob's minter is the content set's attester"
+            "I139: on the peer, a self blob's minter is the content set's attester, not the row's author"
         );
+        assert_ne!(on_b.as_deref(), Some(owner.as_str()));
     }
 
     /// **I138 — a device admitted after the write opens the write.** Seal a
