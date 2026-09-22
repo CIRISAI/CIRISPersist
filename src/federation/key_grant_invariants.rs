@@ -949,9 +949,32 @@ pub mod two_node {
         let sha = sealed.at_rest_sha256;
         // (1) A FORGED content set from the second device — a recipient who
         // knows the DEK — naming an outsider, delivered BEFORE the bytes.
-        // The author is not yet known here, so the signer cannot be checked
-        // against it: the carrier is stored, NOTHING is projected (§13,
-        // PR #850 review) — and nothing ever will be, see (3).
+        // v46.3.0 (#884, §4.1): an ACTIVE occurrence of the owner speaks
+        // with the owner's voice on the key plane (the sealing node is one),
+        // so the forger here is the owner's LOST device — its occurrence
+        // revoked, no owner binding — which still knows the DEK. The author
+        // is not yet known here, so the signer cannot be checked against it:
+        // the carrier is stored, NOTHING is projected (§13, PR #850 review)
+        // — and nothing ever will be, see (3).
+        // Revoked NOW: `IdentityOccurrenceRevocation::revokes` treats an
+        // occurrence asserted after its revocation as re-established.
+        let revoked_at = chrono::Utc::now();
+        a2.backend
+            .put_identity_occurrence_revocation_local(
+                crate::federation::types::IdentityOccurrenceRevocation {
+                    identity_key_id: owner.clone(),
+                    occurrence_key_id: a2.key.clone(),
+                    revoked_at,
+                    effective_at: revoked_at,
+                    reason: Some("lost device (I65)".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag} I65: the second device's occurrence is revoked: {e}")
+            });
         let outsider = format!("{tag}-outsider-{run}");
         let forged = KeyGrantSet {
             axis: KeyGrantAxis::Content {

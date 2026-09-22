@@ -332,7 +332,19 @@ pub async fn is_audience<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let author_local = is_local_or_family(author_key_id);
+    let mut author_local = is_local_or_family(author_key_id);
+    // v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §4.1) —
+    // the self/family arm by PRINCIPAL, not by key: a row authored by the
+    // human (or their actor occurrence) is this node's own content when
+    // the same human owns this node. #873 lifted only the community
+    // memberships; `self` still compared the author to the node's key, so
+    // a person-authored self row was `NotPartyTo` on the person's own
+    // second device. The operator's family predicate is kept as-is.
+    if !author_local && matches!(cohort_scope, cs::SELF | cs::FAMILY) {
+        author_local =
+            crate::federation::self_collective::speaks_for(directory, our_key_id, author_key_id)
+                .await?;
+    }
     // Only the community arms need the walk; do not pay for it otherwise.
     let members = match cohort_scope {
         cs::COMMUNITY | cs::AFFILIATIONS => audience_memberships(directory, our_key_id).await?,

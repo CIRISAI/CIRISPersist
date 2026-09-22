@@ -24110,6 +24110,141 @@ impl PyEngine {
         })
     }
 
+    /// v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §4) — **the
+    /// send set of `key_id` for a record at `cohort_scope`**: the consent peers
+    /// (`consent_peers_by_principals`) plus, for `self` / `family`, the active
+    /// occurrences of every principal of the key (the self-collective, CC
+    /// 3.3.6 — no consent row is read or needed, CC 3.2), and for `family`
+    /// the members' collectives too. `community` / `affiliations` / the
+    /// commons return the consent set unchanged. JSON `[key_id, …]`, sorted,
+    /// the key itself excluded. Edge's `resolved_peer_set` calls this for
+    /// `SelfOwn` planes so a self row reaches the owner's other devices.
+    fn send_set_for_json(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        cohort_scope: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let key_id = key_id.to_owned();
+            let scope = cohort_scope.to_owned();
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let peers = self
+                    .runtime
+                    .block_on(engine.send_set_for(&key_id, &scope))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&peers)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Vec<String> JSON encode: {e}")))
+            })
+        })
+    }
+
+    /// v46.3.0 (CIRISPersist#884, §3 R4) — **who sealed these bytes**: for a
+    /// `community_dek` blob the epoch binding's minter (#876); for a `self` /
+    /// `family` blob the attester of the admitted `key_grant:content:v1` set
+    /// naming the sha; `null` when this node holds neither. A puller for a
+    /// self/family blob asks THIS, never `list_holders` (CC 5.2: no holder
+    /// claim exists at those scopes). JSON string or `null`.
+    fn minter_of_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            let minter = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend.minter_of_blob(&sha).await.map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend.minter_of_blob(&sha).await.map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&minter)
+                .map_err(|e| PyValueError::new_err(format!("minter_of_blob encode: {e}")))
+        })
+    }
+
+    /// v46.3.0 (CIRISPersist#884, §3 R3-retroactive; CC 8.1.12.4) — **the
+    /// retroactive re-grant for a self occurrence-add**, v6.1.0's
+    /// `rekey_for_newcomers`: every extant `self` blob of `identity_key_id`
+    /// is re-wrapped to each of `new_occurrence_key_ids` and the blob's full
+    /// content-axis `key_grant` set is emitted so the remote device receives
+    /// it (through the `send_set_for` fan-out). `Engine::self_at_login` runs
+    /// this itself; a host that admits an occurrence by another path (device
+    /// pairing) calls it here. JSON `{blobs_scanned, granted: [[recipient,
+    /// wraps]], excluded: [recipient], changed_blobs: [sha_hex]}`;
+    /// fail-secure exclusions (no encryption pubkeys) are reported, never
+    /// silently dropped.
+    fn rekey_self_occurrence_add_json(
+        &self,
+        py: Python<'_>,
+        identity_key_id: &str,
+        new_occurrence_key_ids: Vec<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let identity = identity_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(engine.rekey_self_occurrence_add(&identity, &new_occurrence_key_ids))
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({
+                    "blobs_scanned": r.blobs_scanned,
+                    "granted": r.granted,
+                    "excluded": r.excluded,
+                    "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
+                }))
+                .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
+            })
+        })
+    }
+
+    /// v46.3.0 (CIRISPersist#884, §3 R3-retroactive) — the family twin of
+    /// `rekey_self_occurrence_add_json`: every extant `family` blob of
+    /// `family_key_id` is re-wrapped to the occurrences of
+    /// `new_member_identity_key_id` and the sets emitted. Same JSON shape.
+    fn rekey_family_member_add_json(
+        &self,
+        py: Python<'_>,
+        family_key_id: &str,
+        new_member_identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let (fam, member) = (
+                family_key_id.to_owned(),
+                new_member_identity_key_id.to_owned(),
+            );
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(engine.rekey_family_member_add(&fam, &member))
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({
+                    "blobs_scanned": r.blobs_scanned,
+                    "granted": r.granted,
+                    "excluded": r.excluded,
+                    "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
+                }))
+                .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
+            })
+        })
+    }
+
     /// v44.6.0 (#857 §4) — `list_consent_peers` keyed by ANY key that stands
     /// for the machine (the union over its human principals and itself). JSON
     /// array of strings. FFI mirror of

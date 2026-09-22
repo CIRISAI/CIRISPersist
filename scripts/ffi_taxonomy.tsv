@@ -420,6 +420,14 @@ Engine	list_holders_sized_json	empirical
 # (BLOB_REPLICATION.md §5). It permits nothing, stores nothing, and refuses
 # by member when the row does not cite the bytes.
 Engine	blob_provenance_from_attestation_json	empirical	
+# v46.3.0 (#884) — `send_set_for_json` and `minter_of_blob_json` are EMPIRICAL:
+# they report who a record reaches / who sealed bytes, from rows this node
+# already admitted; they permit nothing. The two re-key doors are DEONTIC:
+# they wrap a DEK to a newcomer and emit the set — a wrong stub grants a key.
+Engine	send_set_for_json	empirical	
+Engine	minter_of_blob_json	empirical	
+Engine	rekey_self_occurrence_add_json	deontic	
+Engine	rekey_family_member_add_json	deontic	
 Engine	list_identity_occurrences_for_json	ontological	
 Engine	list_live_occurrences	ontological	
 Engine	list_llm_calls	empirical	

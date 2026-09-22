@@ -15258,6 +15258,35 @@ impl crate::federation::BlobStorage for PostgresBackend {
         }))
     }
 
+    /// v46.3.0 (#884, FSD/SELF_COLLECTIVE_TRANSFER.md §3 R4) — the sqlite
+    /// twin: the community binding's minter, else the content set's attester.
+    async fn minter_of_blob(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        if let Some((_c, minter, _e)) = self.community_dek_blob_epoch(at_rest_sha256).await? {
+            return Ok(Some(minter));
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let hex = hex::encode(at_rest_sha256);
+        let ty = crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE;
+        let row = client
+            .query_opt(
+                "SELECT attesting_key_id FROM cirislens.federation_attestations \
+                  WHERE attestation_type = $1 \
+                    AND attestation_envelope::jsonb->>'at_rest_sha256' = $2 \
+                  ORDER BY asserted_at ASC LIMIT 1",
+                &[&ty, &hex],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("minter_of_blob: {e}")))?;
+        row.map(|r| r.safe_get_with("attesting_key_id", crate::federation::BlobError::Backend))
+            .transpose()
+    }
+
     /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §2) — the sqlite twin: the
     /// minters of every admitted set that granted `viewer_key_id` a wrap at
     /// `(community, epoch)`, DISTINCT and ordered.

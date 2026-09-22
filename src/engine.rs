@@ -7671,6 +7671,24 @@ impl Engine {
         .await
     }
 
+    /// v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §4) — the
+    /// send set of `key_id` for a record at `cohort_scope`: the consent peers
+    /// plus, for `self` / `family`, the self-collective (and the members'
+    /// collectives for `family`). See
+    /// [`self_collective::send_set_for`](crate::federation::self_collective::send_set_for).
+    pub async fn send_set_for(
+        &self,
+        key_id: &str,
+        cohort_scope: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        crate::federation::self_collective::send_set_for(
+            self.federation_directory().as_ref(),
+            key_id,
+            cohort_scope,
+        )
+        .await
+    }
+
     /// v44.6.0 (#857 §4) — see
     /// [`consent_by_humans::resolve_scoped_consent_by_principals`](crate::federation::consent_by_humans::resolve_scoped_consent_by_principals).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]

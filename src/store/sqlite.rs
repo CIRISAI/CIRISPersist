@@ -14506,6 +14506,32 @@ impl crate::federation::BlobStorage for SqliteBackend {
         }))
     }
 
+    /// v46.3.0 (#884, FSD/SELF_COLLECTIVE_TRANSFER.md §3 R4) — the minter of
+    /// the bytes: the community binding's, else the content set's attester.
+    async fn minter_of_blob(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        if let Some((_c, minter, _e)) = self.community_dek_blob_epoch(at_rest_sha256).await? {
+            return Ok(Some(minter));
+        }
+        let hex = hex::encode(at_rest_sha256);
+        let ty = crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE.to_owned();
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT attesting_key_id FROM federation_attestations \
+                  WHERE attestation_type = ?1 \
+                    AND json_extract(attestation_envelope, '$.at_rest_sha256') = ?2 \
+                  ORDER BY asserted_at ASC LIMIT 1",
+                rusqlite::params![ty, hex],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("minter_of_blob: {e}")))
+    }
+
     /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §2) — the derivation input: the
     /// minters of every admitted set that granted `viewer_key_id` a wrap at
     /// `(community, epoch)`. DISTINCT and ordered, so two backends cannot
