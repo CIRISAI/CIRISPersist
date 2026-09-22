@@ -51,7 +51,9 @@ pub use admission::CallerAdmission;
 pub use admission::{build_caller_admission, AdmissionError};
 pub use admission::{build_caller_admission_from_directory, caller_scope_from_directory};
 pub use caller::CallerScope;
-pub use sql::{cohort_scope_sql_predicate, BackendKind, ScopeParam};
+pub use sql::{
+    cohort_scope_sql_predicate, cohort_scope_sql_predicate_with_dimension, BackendKind, ScopeParam,
+};
 
 /// Structured reason a read (or, post-Commit-F, a write) was refused
 /// by the cohort_scope admission gate (FSD §8.2).

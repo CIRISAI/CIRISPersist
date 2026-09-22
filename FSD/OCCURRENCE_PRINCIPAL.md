@@ -125,6 +125,9 @@ family and community arms already do. The write-side assembler
 | `CallerScope::admits` `"self"` arm | `target ∈ self_key_ids` (was `target == identity_key_id`) |
 | `cohort_scope_sql_predicate` `self` branch | `target_membership_branch(.., "self", self_key_ids, ..)` (was `= $identity`) |
 | `self_collective::occurrences_of`, `nodes_of` | `pub(crate)`, generic over an unsized directory — the folds the admission builder reads |
+| `self_collective::principals_of` | a REVOKED occurrence does not inherit its owner through a live owner binding (PR #889 review P1): `k` bound to `owner` at some time and not active now ⇒ `owner ∉ principals_of(k)`. One fold, so `speaks_for`, the send set and the read gate all say it |
+| `CallerScope::admits(cohort_scope, target, dimension)` | takes the row's dimension: a `CONFIG_SENSITIVE_LEAVES` leaf (CC 3.4.5.1, node-local by the write floor) is admitted at `self` only when `target == occurrence_key_id` (PR #889 review P1) |
+| `cohort_scope_sql_predicate_with_dimension` / `scope_predicate_{pg,sqlite}_with_dimension` | the same node-only clause in SQL, rendered with `substr`/`length` (no `LIKE`: its case rule differs by backend); composed by every door over `federation_attestations` — the only tables carrying `config:*` rows — pinned from disk |
 
 No wire change, no migration, no vocabulary change. PATCH.
 
@@ -141,7 +144,9 @@ No wire change, no migration, no vocabulary change. PATCH.
   owned node, so only a writer that owns no node exercises this fold); drop
   `nodes_owned_by` (the owned-only node's own row unread — the mirror gap);
   SQL branch back to `= identity` (sqlite red); `admits(self) → true`
-  (stranger red).
+  (stranger red); `principals_of` ignores the revocation (revoked node reads
+  the device's row); drop the sensitive clause in the Rust twin (device reads
+  the leaf, memory/sqlite); drop it in the SQL twin (sqlite).
 
 ### 6.1 Mutation table (sqlite lane, 2026-09-22)
 

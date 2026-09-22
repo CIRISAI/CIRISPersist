@@ -68,7 +68,14 @@ impl CallerScope {
     /// this caller. Byte-for-byte the same semantics: broad tiers always
     /// admit; `self`/`family`/`community` admit only on target-membership;
     /// the unauthenticated reader sees only the broad tiers.
-    pub fn admits(&self, cohort_scope: &str, target: &str) -> bool {
+    ///
+    /// `dimension` is the row's dimension (`envelope_dimension`), consulted
+    /// on the `self` arm only: a SENSITIVE `config:*` leaf (CC 3.4.5.1,
+    /// `CONFIG_SENSITIVE_LEAVES`) is node-local by the write floor and is
+    /// admitted only when the caller IS the target — the collective widening
+    /// of v46.3.1 (#888) must not carry it to the owner's other keys on a
+    /// shared node (PR #889 review). `None` = a row with no dimension.
+    pub fn admits(&self, cohort_scope: &str, target: &str, dimension: Option<&str>) -> bool {
         const BROAD: &[&str] = &["affiliations", "species", "biosphere", "federation"];
         if BROAD.contains(&cohort_scope) {
             return true;
@@ -78,7 +85,13 @@ impl CallerScope {
             CallerScope::Authenticated { admission } => match cohort_scope {
                 // v46.3.1 (#888): the target is one of the caller's own keys
                 // — resolved on BOTH sides (FSD/OCCURRENCE_PRINCIPAL.md §6).
-                "self" => admission.self_key_ids.contains(target),
+                "self" => {
+                    admission.self_key_ids.contains(target)
+                        && (target == admission.occurrence_key_id
+                            || !dimension.is_some_and(
+                                crate::federation::admission::is_sensitive_config_leaf,
+                            ))
+                }
                 "family" => admission.family_key_ids.contains(target),
                 "community" => admission.community_key_ids.contains(target),
                 _ => false,

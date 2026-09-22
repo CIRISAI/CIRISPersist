@@ -103,6 +103,25 @@ pub fn cohort_scope_sql_predicate(
     target_col: &str,
     scope: &CallerScope,
 ) -> (String, Vec<ScopeParam>) {
+    cohort_scope_sql_predicate_with_dimension(backend, scope_col, target_col, None, scope)
+}
+
+/// v46.3.1 (PR #889 review) — [`cohort_scope_sql_predicate`] for a table
+/// that carries a `dimension` column (the attestation doors): the `self`
+/// branch additionally keeps a SENSITIVE `config:*` leaf (CC 3.4.5.1,
+/// [`CONFIG_SENSITIVE_LEAVES`](crate::federation::admission::CONFIG_SENSITIVE_LEAVES))
+/// node-local — admitted only when the row's target IS the caller's
+/// occurrence key — rendered with `substr`/`length` so the SQL matches
+/// `scope_covers` byte-for-byte (no `LIKE`, whose case rule differs by
+/// backend). Tables without a dimension column pass `None` and carry no
+/// config rows.
+pub fn cohort_scope_sql_predicate_with_dimension(
+    backend: BackendKind,
+    scope_col: &str,
+    target_col: &str,
+    dimension_col: Option<&str>,
+    scope: &CallerScope,
+) -> (String, Vec<ScopeParam>) {
     let broad = broad_tiers_sql();
 
     match scope {
@@ -122,7 +141,7 @@ pub fn cohort_scope_sql_predicate(
             // the occurrence, its identity, its principals and their
             // occurrences / owned nodes — resolved the way the hold path
             // resolves the caller, so a claimed node reads its own rows).
-            let self_branch = target_membership_branch(
+            let mut self_branch = target_membership_branch(
                 backend,
                 scope_col,
                 target_col,
@@ -131,6 +150,24 @@ pub fn cohort_scope_sql_predicate(
                 &mut next,
                 &mut params,
             );
+            if let Some(dim) = dimension_col {
+                // node-only for the sensitive leaves: target = caller's
+                // occurrence, OR the dimension is not a sensitive leaf.
+                let occ_ph = placeholder(backend, &mut next);
+                params.push(ScopeParam::Key(admission.occurrence_key_id.clone()));
+                let sensitive = crate::federation::admission::CONFIG_SENSITIVE_LEAVES
+                    .iter()
+                    .map(|leaf| {
+                        let n = leaf.len() + 1;
+                        format!(
+                            "{dim} = '{leaf}' OR (substr({dim}, 1, {n}) = '{leaf}:' AND length({dim}) > {n})"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                self_branch =
+                    format!("({self_branch} AND ({target_col} = {occ_ph} OR NOT ({sensitive})))");
+            }
 
             // family — target ∈ the reader's admitted families.
             let family_branch = target_membership_branch(
@@ -360,6 +397,88 @@ mod tests {
                 ScopeParam::Key("C1".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn with_dimension_keeps_sensitive_leaves_node_only_both_backends() {
+        for (backend, expect_occ, expect_dim) in [
+            (
+                BackendKind::Postgres,
+                "= $2",
+                "substr(t.dimension, 1, 17) = 'config:admission:'",
+            ),
+            (
+                BackendKind::Sqlite,
+                "= ?",
+                "substr(t.dimension, 1, 17) = 'config:admission:'",
+            ),
+        ] {
+            let (frag, params) = cohort_scope_sql_predicate_with_dimension(
+                backend,
+                "t.cohort_scope",
+                "t.cohort_target_id",
+                Some("t.dimension"),
+                &auth_singleton(),
+            );
+            assert!(frag.contains(expect_dim), "{frag}");
+            assert!(frag.contains("t.dimension = 'config:transport'"), "{frag}");
+            assert!(
+                frag.contains(&format!("t.cohort_target_id {expect_occ} OR NOT (")),
+                "{frag}"
+            );
+            assert!(
+                !frag.contains("LIKE"),
+                "no LIKE — its case rule differs by backend: {frag}"
+            );
+            // the occurrence key is bound once more, AFTER the self set
+            assert_eq!(
+                params.last(),
+                Some(&ScopeParam::Key("occ-1".to_string())),
+                "{params:?}"
+            );
+            // without a dimension column: the plain shape, no extra param
+            let (plain, pparams) = cohort_scope_sql_predicate(
+                backend,
+                "t.cohort_scope",
+                "t.cohort_target_id",
+                &auth_singleton(),
+            );
+            assert!(!plain.contains("substr("), "{plain}");
+            assert_eq!(pparams.len() + 1, params.len());
+        }
+    }
+
+    /// From disk (PR #889 review): every scope-gated door over
+    /// `federation_attestations` — the only tables that carry `config:*`
+    /// rows — composes the dimension-aware form. A door that passes the
+    /// attested key as target without the dimension column would leak the
+    /// sensitive leaves to the collective again.
+    #[test]
+    fn every_attestation_door_composes_the_dimension_aware_predicate() {
+        for file in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
+            let src =
+                std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_owned() + file)
+                    .unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            let mut doors = 0;
+            for (i, l) in lines.iter().enumerate() {
+                if l.trim() == "\"attested_key_id\"," || l.trim() == "\"fa.attested_key_id\"," {
+                    let window = lines[i.saturating_sub(4)..i].join("\n");
+                    if window.contains("scope_predicate_") {
+                        doors += 1;
+                        assert!(
+                            window.contains("_with_dimension("),
+                            "{file}:{}: an attestation door composes the scope predicate without its dimension column",
+                            i + 1
+                        );
+                    }
+                }
+            }
+            assert!(
+                doors >= 3,
+                "{file}: expected the attestation doors, found {doors}"
+            );
+        }
     }
 
     /// The leak the target-membership model fixes: a reader sharing

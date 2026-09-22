@@ -19544,10 +19544,11 @@ fn pg_scores_shared_predicates(
     pg_selection_axes(filter, "fa.", true, &mut where_parts, &mut params);
     // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
     {
-        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
             scope,
             "fa.cohort_scope",
             "fa.attested_key_id",
+            Some("fa.dimension"),
             params.len(),
         );
         where_parts.push(frag);
@@ -22596,10 +22597,11 @@ impl crate::read::ReadEngine for PostgresBackend {
         // §4.3 scope gate — federation_attestations carries cohort_scope
         // (V056) + attested_key_id (target identity, V055).
         {
-            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("dimension"),
                 params.len(),
             );
             where_parts.push(frag);
@@ -22696,10 +22698,11 @@ impl crate::read::ReadEngine for PostgresBackend {
         // §4.3 scope gate on the attestation's own cohort_scope /
         // attested_key_id (subject doubles as membership target).
         {
-            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg_with_dimension(
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("dimension"),
                 params.len(),
             );
             where_parts.push(frag);

@@ -20,7 +20,19 @@ threat-model citations because this crate's audit story is the point.
   principals, and every active occurrence and owned node of each) — the
   same fold v46.3.0's `speaks_for` and the hold path use (CC 3.3.6, CC 5.2).
   The owner's other devices read the node's rows; a stranger node does not.
-  Witness I141 on memory, sqlite, postgres. No surface, wire, migration or
+  Witness I141 on memory, sqlite, postgres.
+- **Review (PR #889), two holes the widening opened, closed in the same
+  fold:** (1) a REVOKED occurrence with a live owner binding got its owner
+  back through `principals_of` — a lost device could read the collective's
+  self rows; a revocation is the owner's signed "no longer acts for me" and
+  now overrides the owner binding in `principals_of`, so `speaks_for`, the
+  send set and the read gate all agree. (2) the sensitive `config:*` leaves
+  (`config:admission`, `config:transport`; node-local by the CC 3.4.5.1 write
+  floor) were readable by the whole collective on a shared node — both gate
+  twins now admit them at `self` only when the caller IS the target:
+  `CallerScope::admits` takes the row's dimension, and the attestation doors
+  compose `cohort_scope_sql_predicate_with_dimension` (pinned from disk).
+  `admits` gains a parameter (crate API; not on PyO3). No wire, migration or
   vocabulary change.
 
 ## [46.3.0] - 2026-09-22

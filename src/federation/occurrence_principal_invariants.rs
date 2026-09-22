@@ -239,7 +239,11 @@ pub(crate) mod bodies {
             let node = node.clone();
             async move {
                 let scope = caller_scope_from_directory(d, &caller).await.unwrap();
-                let rust_twin = scope.admits(crate::federation::types::cohort_scope::SELF, &node);
+                let rust_twin = scope.admits(
+                    crate::federation::types::cohort_scope::SELF,
+                    &node,
+                    Some("config:net.bootstrap_peers:v1"),
+                );
                 // The SQL twin, where there is SQL: the memory backend has no
                 // CEG read substrate, so its leg measures the Rust twin only.
                 let rows = match crate::ceg::ReadEngine::list_attestations(
@@ -335,16 +339,25 @@ pub(crate) mod bodies {
                     panic!("I141: a collective member writes its own self row: {e}")
                 });
         }
-        let reads_of = |caller: &str, writer: &str| {
-            let (caller, writer) = (caller.to_owned(), writer.to_owned());
+        let reads_dim = |caller: &str, writer: &str, prefix: &str, dimension: &str| {
+            let (caller, writer, prefix, dimension) = (
+                caller.to_owned(),
+                writer.to_owned(),
+                prefix.to_owned(),
+                dimension.to_owned(),
+            );
             async move {
                 let scope = caller_scope_from_directory(d, &caller).await.unwrap();
-                let rust_twin = scope.admits(crate::federation::types::cohort_scope::SELF, &writer);
+                let rust_twin = scope.admits(
+                    crate::federation::types::cohort_scope::SELF,
+                    &writer,
+                    Some(&dimension),
+                );
                 let rows = match crate::ceg::ReadEngine::list_attestations(
                     d,
                     crate::ceg::AttestationFilter {
                         attesting_key_id: Some(writer.clone()),
-                        dimension_prefixes: vec!["profile:".into()],
+                        dimension_prefixes: vec![prefix.clone()],
                         ..Default::default()
                     },
                     None,
@@ -363,6 +376,9 @@ pub(crate) mod bodies {
                 };
                 (rust_twin, rows)
             }
+        };
+        let reads_of = |caller: &str, writer: &str| {
+            reads_dim(caller, writer, "profile:", "profile:display_name:v1")
         };
         expect(
             reads_of(&node, &device).await,
@@ -397,6 +413,87 @@ pub(crate) mod bodies {
             false,
             0,
             "I141: nor node C's",
+        );
+        // Review (PR #889, P1): a SENSITIVE config leaf (CC 3.4.5.1,
+        // `CONFIG_SENSITIVE_LEAVES`) is node-local by the write floor; the
+        // collective widening must not carry it to the owner's other keys on
+        // a shared node. Node-only: the caller IS the target.
+        let mut row = ts::bare_attestation(
+            &format!("i141-sensitive-{s}"),
+            &node,
+            &node,
+            &serde_json::json!({"cohort_scope": "self", "dimension": "config:admission:v1"}),
+        );
+        row.attestation_type = "scores".into();
+        row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        row.subject_key_ids = vec![node.clone()];
+        ts::seal_row_in_place(&node, &mut row);
+        d.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .unwrap_or_else(|e| panic!("I141: the node writes its sensitive leaf at self: {e}"));
+        expect(
+            reads_dim(&node, &node, "config:admission", "config:admission:v1").await,
+            true,
+            1,
+            "I141: the node reads its own sensitive leaf",
+        );
+        expect(
+            reads_dim(&device, &node, "config:admission", "config:admission:v1").await,
+            false,
+            0,
+            "I141: the owner's device does NOT read the node's sensitive leaf",
+        );
+        expect(
+            reads_dim(&owner, &node, "config:admission", "config:admission:v1").await,
+            false,
+            0,
+            "I141: nor does the owner's own key",
+        );
+        expect(
+            reads_dim(&node_c, &node, "config:admission", "config:admission:v1").await,
+            false,
+            0,
+            "I141: nor the owner's other node",
+        );
+        // Review (PR #889, P1): a REVOKED occurrence with a live owner binding
+        // is the lost device. It reads its own rows and nothing of the
+        // collective's; `speaks_for` says the same (one fold).
+        assert!(
+            crate::federation::self_collective::speaks_for(d, &node, &owner)
+                .await
+                .unwrap(),
+            "I141: before revocation the node speaks for its owner"
+        );
+        revoke(d, &owner, &node, "2026-06-04T00:00:00Z").await;
+        assert!(
+            !crate::federation::self_collective::speaks_for(d, &node, &owner)
+                .await
+                .unwrap(),
+            "I141: a revoked occurrence no longer speaks for its owner, owner binding or not"
+        );
+        expect(
+            reads(&node).await,
+            true,
+            3,
+            "I141: revoked, the node still reads its OWN rows — all three config rows, its sensitive leaf included",
+        );
+        expect(
+            reads_of(&node, &device).await,
+            false,
+            0,
+            "I141: revoked, the node no longer reads the device's row",
+        );
+        expect(
+            reads_of(&node, &node_c).await,
+            false,
+            0,
+            "I141: revoked, the node no longer reads the other node's row",
+        );
+        expect(
+            reads(&device).await,
+            true,
+            2,
+            "I141: the owner's device still reads the (owned) node's rows — the two plain ones, never the sensitive leaf",
         );
         let _ = CallerScope::Unauthenticated;
     }

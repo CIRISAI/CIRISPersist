@@ -19102,10 +19102,11 @@ fn sqlite_scores_shared_predicates(
     sqlite_selection_axes(filter, "fa.", true, &mut parts, &mut binds);
     // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
     {
-        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
             scope,
             "fa.cohort_scope",
             "fa.attested_key_id",
+            Some("fa.dimension"),
             binds.len(),
         );
         parts.push(frag);
@@ -22147,10 +22148,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         // gate compares the row's cohort_scope/attested_key_id against the
         // reader's admission.
         {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("dimension"),
                 binds.len(),
             );
             parts.push(frag);
@@ -22241,10 +22243,11 @@ impl crate::read::ReadEngine for SqliteBackend {
         // §4.3 scope gate on the attestation's own cohort_scope /
         // attested_key_id (subject doubles as membership target).
         {
-            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite_with_dimension(
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("dimension"),
                 binds.len(),
             );
             parts.push(frag);

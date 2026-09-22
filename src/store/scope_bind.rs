@@ -42,10 +42,27 @@ pub(crate) fn scope_predicate_pg(
     String,
     Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) {
-    let (frag, params) = crate::scope::cohort_scope_sql_predicate(
+    scope_predicate_pg_with_dimension(scope, scope_col, target_col, None, bound_so_far)
+}
+
+/// v46.3.1 (PR #889 review) — the dimension-aware form for the attestation
+/// doors; see `cohort_scope_sql_predicate_with_dimension`.
+#[cfg(feature = "postgres")]
+pub(crate) fn scope_predicate_pg_with_dimension(
+    scope: &CallerScope,
+    scope_col: &str,
+    target_col: &str,
+    dimension_col: Option<&str>,
+    bound_so_far: usize,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    let (frag, params) = crate::scope::cohort_scope_sql_predicate_with_dimension(
         BackendKind::Postgres,
         scope_col,
         target_col,
+        dimension_col,
         scope,
     );
     let frag = rebase_pg_placeholders(&frag, bound_so_far);
@@ -77,8 +94,26 @@ pub(crate) fn scope_predicate_sqlite(
     target_col: &str,
     bound_so_far: usize,
 ) -> (String, Vec<rusqlite::types::Value>) {
-    let (frag, params) =
-        crate::scope::cohort_scope_sql_predicate(BackendKind::Sqlite, scope_col, target_col, scope);
+    scope_predicate_sqlite_with_dimension(scope, scope_col, target_col, None, bound_so_far)
+}
+
+/// v46.3.1 (PR #889 review) — the dimension-aware form for the attestation
+/// doors; see `cohort_scope_sql_predicate_with_dimension`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn scope_predicate_sqlite_with_dimension(
+    scope: &CallerScope,
+    scope_col: &str,
+    target_col: &str,
+    dimension_col: Option<&str>,
+    bound_so_far: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (frag, params) = crate::scope::cohort_scope_sql_predicate_with_dimension(
+        BackendKind::Sqlite,
+        scope_col,
+        target_col,
+        dimension_col,
+        scope,
+    );
     let frag = rebase_sqlite_placeholders(&frag, bound_so_far);
     let values: Vec<rusqlite::types::Value> = params
         .into_iter()
