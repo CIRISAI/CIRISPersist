@@ -144,7 +144,9 @@ No wire change, no migration, no vocabulary change. PATCH.
   leaf is read by the node alone — not the device, not the owner's key, not
   the other node. After the owner REVOKES the node's occurrence (owner
   binding kept): the node reads only its own rows, `speaks_for(node, owner)`
-  is false, the device still reads the (owned) node's plain rows. Unclaimed
+  is false, the device still reads the (owned) node's plain rows. A
+  `local`-tier row the node wrote through the local door is read by the node
+  alone — not the device, not the owner, not the other node. Unclaimed
   (singleton) the node still reads its own.
 - Mutants: self set = `{identity}` only (node red); drop the occurrence union
   (the DEVICE's own row unread — every reader in the first draft was also an
