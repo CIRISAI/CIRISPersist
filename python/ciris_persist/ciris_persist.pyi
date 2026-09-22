@@ -1129,6 +1129,12 @@ class Engine:
         a different key for an existing key id raises).
         """
 
+    def rekey_family_member_add_json(self, family_key_id: str, new_member_identity_key_id: str) -> str:
+        """(derived) deontic — v46.3.0 (CIRISPersist#884, §3 R3-retroactive) — the family twin of rekey_self_occurrence_add_json: every extant family blob of family_key_id is re-..."""
+
+    def rekey_self_occurrence_add_json(self, identity_key_id: str, new_occurrence_key_ids: list[str]) -> str:
+        """(derived) deontic — v46.3.0 (CIRISPersist#884, §3 R3-retroactive; CC 8.1.12.4) — the retroactive re-grant for a self occurrence-add, v6.1.0's rekey_for_newcomers: ever..."""
+
     def rematerialize_role_withdrawals(self) -> str:
         """(derived) deontic — v31.1.0 (CIRISPersist#662) — the repair door: re-derive every role-withdrawal tombstone this node's stored accord evidence supports, returning the..."""
 
@@ -3051,6 +3057,9 @@ class Engine:
         of ``TrustGrantRow`` objects. Wildcard scope grants (``"*"``)
         surface alongside exact matches per FSD §3.3."""
 
+    def minter_of_blob_json(self, sha256_hex: str) -> str:
+        """(derived) empirical — v46.3.0 (CIRISPersist#884, §3 R4) — who sealed these bytes: for a community_dek blob the epoch binding's minter (#876); for a self / family blob th..."""
+
     def moderators_of_json(self, community_key_id: str, duty: str) -> str:
         """(derived) empirical — #249 Cut B — the FULL named-moderator set of community_key_id for duty (moderate / takedown / review): steward-bound authority roots ∪ their duty-s..."""
 
@@ -3124,6 +3133,9 @@ class Engine:
 
     def secrets_list_stored(self, limit: int, filter_json: str) -> str:
         """(derived) empirical — v0.6.1 — Metadata-only listing. Returns JSON array of SecretReference. [build-conditional: #[cfg(feature = "secrets")]]"""
+
+    def send_set_for_json(self, key_id: str, cohort_scope: str) -> str:
+        """(derived) empirical — v46.3.0 (CIRISPersist#884, FSD/SELF_COLLECTIVE_TRANSFER.md §4) — the send set of key_id for a record at cohort_scope: the consent peers (consent_pe..."""
 
     def service_token_revocation_list(self) -> str:
         """v1.5.23 (CIRISPersist#64) — List ALL revoked tokens.

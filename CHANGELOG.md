@@ -5,6 +5,68 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.3.0] - 2026-09-22
+
+### Added — self/family bytes are delivered, not discovered: the send set, the re-grant doors, the minter read (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md`)
+- **`send_set_for(k, cohort_scope) -> Vec<String>`** (PyO3 `send_set_for_json`):
+  the peers a `SelfOwn`-projected record of key `k` reaches. For `self`:
+  `consent_peers_by_principals(k)` ∪ the NODES owned by every principal of
+  `k` (`self_collective::principals_of` — the identities `k` is an active
+  occurrence of, `owner_of(k)`, `k` if user-role — then `nodes_owned_by`,
+  the owner-binding fold; a node always has exactly one human owner), `k`
+  itself excluded.
+  Never occurrence keys: an occurrence is a KEM target, not a replication
+  endpoint (edge `FSD/CONTENT_TRANSFER.md` §6.1). For `family`: additionally
+  the nodes owned by every active member of the principal's families. For
+  `community` / `affiliations` / the commons: the consent set, unchanged. No grant is read or authored for one's own occurrences — CC 3.2
+  makes a person's consent to their own node a category error, which is
+  why this is a sibling of the consent read and not a widening of it.
+  Before this cut persist only CLASSIFIED the basis (`RecipientBasis::OwnRoster`)
+  and the resolver edge used was grants-only, so a `self` row — and the
+  `key_grant` set the retroactive re-key emits for it — reached no second
+  device. Edge's `FSD/CONTENT_TRANSFER.md` §5.3 rung R2.
+- **The retroactive re-grant doors reach Python:** `rekey_self_occurrence_add_json`
+  and `rekey_family_member_add_json` (v6.1.0's `rekey_for_newcomers`, which
+  re-wraps every extant blob to a newcomer and emits the full content-axis
+  `key_grant` set). `Engine::self_at_login` already runs the self door; a
+  host that admits an occurrence by another path (device pairing) now can.
+  Rung R3-retroactive: *a device admitted after the write opens the write.*
+- **`minter_of_blob(sha) -> Option<String>`** (PyO3 `minter_of_blob_json`):
+  who sealed the bytes — for `community_dek` the epoch binding's minter
+  (#876); for `self` / `family` the attester of the admitted
+  `key_grant:content:v1` set naming the sha. One read for both source
+  rules; no new column, no new authority (it reads what the minter signed).
+  Rung R4: the puller asks the minter, never `list_holders`.
+### Fixed — a node-signed content set was retired as "not the author" on every second device (CIRISPersist#884, FSD §4.1)
+- The content-axis `key_grant` set is signed by the NODE that sealed the
+  bytes; the row a receiving node adopts names the PERSON (or their actor
+  occurrence) as author. All three content-axis sites (`admit_replicated_key_grant`,
+  its race double-check, `project_pending_content_grants`) required
+  `signer == author`, so a person-authored self/family blob's set was
+  retired at the adopt's pending projection — silently — and the second
+  device read `NotGranted`. v46.0.0 had split author from sealer on the
+  epoch axis only. Now **`self_collective::speaks_for(signer, author)`**:
+  the signer is the author or shares a principal with them
+  (`principals_of`, the same fold the send set reads). A revoked
+  occurrence with no live owner binding shares none — I65's forger is
+  re-cast as the owner's lost device; a stranger's set is refused
+  `signer_not_author` by name (I138).
+- **`is_audience` / `would_hold`, the self/family arm by principal:** #873
+  lifted only the community memberships to the node's principal; `self`
+  still compared the row's author to the node's KEY, so a person-authored
+  self row was `NotPartyTo` on the person's own second node (edge §5.3 R7
+  never had a witness). Now `speaks_for(our_key, author)` — the same fold.
+  The operator's family predicate is unchanged.
+- **Witness:** `local_authorship_804::the_sync_budget_is_shared_and_finite`
+  measured the scheduler — the bucket refills per second from
+  `Instant::now()`, so a stall under a loaded lane accrued a token between
+  exhausting the shared budget and the second peer's check (1 of 1622 in the
+  `default` lane). It now runs on one pinned instant through the
+  clock-injected core; the door is still exercised once.
+- **Not changed:** `suppresses_holds_bytes` and I52 — no holder claim at any
+  scope (CC 5.2 is unconditional). Witnesses I137–I140 on sqlite and
+  postgres (memory where a directory suffices).
+
 ## [46.2.0] - 2026-09-21
 
 ### Changed — CIRISVerify re-pinned v15.2.0 → v16.1.0 (all seven Cargo pins together; the Python bound `ciris-verify>=16.1.0,<17`)

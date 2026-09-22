@@ -198,8 +198,9 @@ where
         .await?;
     // #848 §13 (CIRISPersist#850 review) — the row now names its author:
     // project every content-axis `KeyGrant` set the AUTHOR signed that
-    // arrived before the bytes. A set signed by anyone else stays a stored
-    // attestation and grants nothing. Order independence is kept here, not
+    // arrived before the bytes — or, since v46.3.0 (#884), one of the
+    // author's ACTIVE occurrences, the node that sealed the bytes. A set
+    // signed by anyone else stays a stored attestation and grants nothing. Order independence is kept here, not
     // by projecting an unverifiable set at admission.
     let pending_wraps = crate::federation::key_grant::project_pending_content_grants(
         backend,

@@ -3001,14 +3001,30 @@ mod local_authorship_804 {
     #[test]
     fn the_sync_budget_is_shared_and_finite() {
         let q = PeerWriteQuota::new();
-        let mut admitted = 0u64;
+        // The door, once: it spends the CohortSync class for the authenticated
+        // peer. The rest of the scenario runs on ONE pinned instant through
+        // the clock-injected core, because the bucket refills at a per-second
+        // rate from `Instant::now()` — under a loaded lane a scheduling stall
+        // between exhausting the budget and the second peer's check accrued a
+        // token and the "shared, spent" assertion below read a refill as a
+        // hole (v46.3.0 certify, `default` lane, 1 of 1622). A wall clock is
+        // not a cursor; this witness measures the budget, not the scheduler.
+        q.check_write_synced(&row("a"), "mate-a")
+            .expect("#804: the first sync row of a cohort mate is admitted");
+        let now = Instant::now();
+        let cost = |attester: &str| {
+            WriteCost::for_envelope_bytes(envelope_charged_bytes(
+                &row(attester).attestation_envelope,
+            ))
+        };
+        let mut admitted = 1u64;
         // The refusal must come from the SYNC budget BY NAME. Asserting only
         // that the loop ends proves nothing: the node ceiling is checked first
         // and would end it even with the sync budget deleted entirely — which
         // is exactly what an earlier version of this witness failed to catch
         // when that mutation was applied.
         let refusal = loop {
-            match q.check_write_synced(&row("a"), "mate-a") {
+            match q.charge("mate-a", WriteAdmissionClass::CohortSync, &cost("a"), now) {
                 Ok(()) => {
                     admitted += 1;
                     assert!(admitted < 1_000_000, "the sync budget must be FINITE");
@@ -3027,7 +3043,7 @@ mod local_authorship_804 {
         );
         // A SECOND cohort mate now meets a budget the first has spent: the
         // allowance is shared, so one peer catching up cannot take the node.
-        let second = q.check_write_synced(&row("b"), "mate-b");
+        let second = q.charge("mate-b", WriteAdmissionClass::CohortSync, &cost("b"), now);
         assert!(
             second.is_err_and(|e| e.to_string().contains(QuotaBudget::CohortSync.as_str())),
             "#804: the sync budget is SHARED — a second cohort peer must meet the same spent \

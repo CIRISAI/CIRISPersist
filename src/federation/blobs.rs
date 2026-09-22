@@ -2488,6 +2488,23 @@ pub trait BlobStorage: Send + Sync {
         member_key_id: &str,
     ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
+    /// v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §3 R4) —
+    /// **who sealed these bytes.** The puller's source for a `self` /
+    /// `family` blob asks the MINTER, never `list_holders` (CC 5.2: no holder
+    /// claim exists at those scopes). One read for both key planes:
+    ///
+    /// - a `community_dek` blob → the epoch binding's minter (#876);
+    /// - a `self` / `family` blob → the `attesting_key_id` of the admitted
+    ///   `key_grant:content:v1` set naming `at_rest_sha256` — the node whose
+    ///   cascade sealed the bytes and signed their wraps;
+    /// - `None` when this node holds neither a binding nor a set for the sha.
+    ///
+    /// No new column and no new authority: it reads what the minter signed.
+    fn minter_of_blob(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<String>, BlobError>> + Send;
+
     /// v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md` §2) — **the
     /// derivation input**: the minters of every admitted `key_grant` set
     /// that granted `viewer_key_id` a wrap at `(community, epoch)`, sorted

@@ -74,6 +74,7 @@
 
 use crate::federation::attestation_apply::ReplicatedAttestationOutcome;
 use crate::federation::envelope::EnvelopeCore;
+use crate::federation::self_collective::speaks_for;
 use crate::federation::types::cohort_scope;
 use crate::federation::{
     Attestation, BlobError, BlobStorage, EmitAttestationInput, Error, FederationDirectory,
@@ -1089,16 +1090,23 @@ where
                 .map_err(map_blob_err)?
                 .and_then(|p| p.author_key_id)
             {
-                Some(author) if author != signer => {
-                    return Err(refuse(
-                        KeyGrantRefusalReason::SignerNotAuthor,
-                        format!(
-                            "signer {signer:?} is not the author {author:?} of blob \
-                             {at_rest_sha256}"
-                        ),
-                    ));
+                // v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md`
+                // §4.1) — the set is signed by the node that SEALED the
+                // bytes; the row is authored by a PERSON. The signer speaks
+                // for the author when it is the author or one of the
+                // author's ACTIVE occurrences (CC 3.3.6) — never a revoked
+                // one, never a family member's device (I65).
+                Some(author) => {
+                    if !speaks_for(backend, signer, &author).await? {
+                        return Err(refuse(
+                            KeyGrantRefusalReason::SignerNotAuthor,
+                            format!(
+                                "signer {signer:?} is neither the author {author:?} of blob \
+                                 {at_rest_sha256} nor an active occurrence of them"
+                            ),
+                        ));
+                    }
                 }
-                Some(_) => {}
                 // The bytes have not arrived: the author is not yet known
                 // to this node, so the signer cannot be checked against it.
                 // The carrier row is admitted (it is a signed attestation
@@ -1161,12 +1169,16 @@ where
         // interleaving is covered: if the adopt's row landed before this
         // read we project here; if after, the adopt's take sees our index
         // row (written before this read).
-        match backend
+        let author = backend
             .blob_provenance(&sha)
             .await
             .map_err(map_blob_err)?
-            .and_then(|p| p.author_key_id)
-        {
+            .and_then(|p| p.author_key_id);
+        let speaks = match &author {
+            Some(a) => speaks_for(backend, signer, a).await?,
+            None => false,
+        };
+        match author {
             None => {
                 return Ok(KeyGrantAdmission {
                     wraps_offered: parsed.wraps.len(),
@@ -1176,10 +1188,10 @@ where
                     pending: true,
                 });
             }
-            Some(author) if author != signer => {
-                // The author is known now and it is not the signer: the
-                // carrier stays a stored attestation, its index row is
-                // dropped, nothing projects.
+            Some(author) if !speaks => {
+                // The author is known now and the signer does not speak for
+                // them (§4.1): the carrier stays a stored attestation, its
+                // index row is dropped, nothing projects.
                 backend
                     .key_grant_pending_delete(&sha, cohort_scope, &row_id)
                     .await
@@ -1187,7 +1199,8 @@ where
                 return Err(refuse(
                     KeyGrantRefusalReason::SignerNotAuthor,
                     format!(
-                        "signer {signer:?} is not the author {author:?} of blob {at_rest_sha256}"
+                        "signer {signer:?} is neither the author {author:?} of blob \
+                         {at_rest_sha256} nor an active occurrence of them"
                     ),
                 ));
             }
@@ -1299,8 +1312,10 @@ where
     {
         // A definitive non-author verdict retires the row; anything that
         // fails or is not yet resolvable leaves it pending for the next
-        // adopt (PR #850 review, round three).
-        if signer != author_key_id {
+        // adopt (PR #850 review, round three). v46.3.0 (#884, §4.1): the
+        // author's own active occurrence — the node that sealed the bytes —
+        // speaks for the author.
+        if !speaks_for(backend, &signer, author_key_id).await? {
             backend
                 .key_grant_pending_delete(sha256, cohort_scope, &attestation_id)
                 .await
@@ -1311,7 +1326,7 @@ where
             continue;
         };
         let projectable = row.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
-            && row.scrub_key_id == author_key_id
+            && row.scrub_key_id == signer
             && KeyGrantSet::from_attestation(&row).ok().is_some_and(|parsed| {
                 matches!(&parsed.axis, KeyGrantAxis::Content { at_rest_sha256, cohort_scope: set_scope, .. }
                     if *at_rest_sha256 == want && set_scope == cohort_scope)
