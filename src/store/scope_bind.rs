@@ -192,6 +192,61 @@ pub(crate) fn and_compose(where_sql: &str, scope_frag: &str) -> String {
     }
 }
 
+/// v46.3.1 (PR #889 review, round three) — the local-tier gate, rebased
+/// onto a Postgres statement; see `scope::local_tier_sql_predicate`.
+#[cfg(feature = "postgres")]
+pub(crate) fn local_tier_predicate_pg(
+    scope: &CallerScope,
+    tier_col: &str,
+    attester_col: &str,
+    bound_so_far: usize,
+) -> (
+    String,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    let (frag, params) = crate::scope::local_tier_sql_predicate(
+        BackendKind::Postgres,
+        tier_col,
+        attester_col,
+        scope,
+    );
+    let frag = rebase_pg_placeholders(&frag, bound_so_far);
+    let boxed = params
+        .into_iter()
+        .map(|p| match p {
+            ScopeParam::Key(k) => {
+                Box::new(k) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            ScopeParam::KeyList(ks) => {
+                Box::new(ks) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+        })
+        .collect();
+    (frag, boxed)
+}
+
+/// v46.3.1 (PR #889 review, round three) — the local-tier gate, numbered
+/// for SQLite; see `scope::local_tier_sql_predicate`.
+#[cfg(feature = "sqlite")]
+pub(crate) fn local_tier_predicate_sqlite(
+    scope: &CallerScope,
+    tier_col: &str,
+    attester_col: &str,
+    bound_so_far: usize,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let (frag, params) =
+        crate::scope::local_tier_sql_predicate(BackendKind::Sqlite, tier_col, attester_col, scope);
+    let frag = rebase_sqlite_placeholders(&frag, bound_so_far);
+    let values = params
+        .into_iter()
+        .map(|p| match p {
+            ScopeParam::Key(k) => rusqlite::types::Value::Text(k),
+            ScopeParam::KeyList(ks) => rusqlite::types::Value::Text(ks.join(",")),
+        })
+        .collect();
+    (frag, values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

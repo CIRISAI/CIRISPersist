@@ -106,6 +106,33 @@ pub fn cohort_scope_sql_predicate(
     cohort_scope_sql_predicate_with_dimension(backend, scope_col, target_col, None, scope)
 }
 
+/// v46.3.1 (PR #889 review, round three) — **the local-tier gate**, the SQL
+/// twin of [`CallerScope::admits_local_tier`]: `tier <> 'local' OR
+/// attester = caller occurrence` (unauthenticated: `tier <> 'local'`).
+/// `FSD/V4_4_SHARED_ATTESTATION_SURFACE.md` §3 — a local-tier row is
+/// producer-only authority and visible to its producing occurrence alone;
+/// the `self` arm's collective widening never reaches it. Composed by every
+/// door over `federation_attestations` that takes a `CallerScope` (pinned
+/// from disk). `tier` is `NOT NULL DEFAULT 'federation'` (V066).
+pub fn local_tier_sql_predicate(
+    backend: BackendKind,
+    tier_col: &str,
+    attester_col: &str,
+    scope: &CallerScope,
+) -> (String, Vec<ScopeParam>) {
+    match scope {
+        CallerScope::Unauthenticated => (format!("({tier_col} <> 'local')"), Vec::new()),
+        CallerScope::Authenticated { admission } => {
+            let mut next = 1usize;
+            let ph = placeholder(backend, &mut next);
+            (
+                format!("({tier_col} <> 'local' OR {attester_col} = {ph})"),
+                vec![ScopeParam::Key(admission.occurrence_key_id.clone())],
+            )
+        }
+    }
+}
+
 /// v46.3.1 (PR #889 review) — [`cohort_scope_sql_predicate`] for a table
 /// that carries a `dimension` column (the attestation doors): the `self`
 /// branch additionally keeps a SENSITIVE `config:*` leaf (CC 3.4.5.1,
@@ -459,6 +486,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_tier_rows_are_their_producers_alone() {
+        let (frag, params) = local_tier_sql_predicate(
+            BackendKind::Postgres,
+            "tier",
+            "attesting_key_id",
+            &auth_singleton(),
+        );
+        assert_eq!(frag, "(tier <> 'local' OR attesting_key_id = $1)");
+        assert_eq!(params, vec![ScopeParam::Key("occ-1".to_string())]);
+        let (frag, params) = local_tier_sql_predicate(
+            BackendKind::Sqlite,
+            "tier",
+            "attesting_key_id",
+            &auth_full(),
+        );
+        assert_eq!(frag, "(tier <> 'local' OR attesting_key_id = ?)");
+        assert_eq!(
+            params,
+            vec![ScopeParam::Key("occ-1".to_string())],
+            "the OCCURRENCE, never the identity"
+        );
+        let (frag, params) = local_tier_sql_predicate(
+            BackendKind::Sqlite,
+            "tier",
+            "attesting_key_id",
+            &CallerScope::Unauthenticated,
+        );
+        assert_eq!(frag, "(tier <> 'local')");
+        assert!(params.is_empty());
+    }
+
     /// From disk (PR #889 review): every scope-gated door over
     /// `federation_attestations` — the only tables that carry `config:*`
     /// rows — composes the dimension-aware form. A door that passes the
@@ -480,6 +539,12 @@ mod tests {
                         assert!(
                             window.contains("_with_dimension("),
                             "{file}:{}: an attestation door composes the scope predicate without its dimension column",
+                            i + 1
+                        );
+                        let after = lines[i..(i + 16).min(lines.len())].join("\n");
+                        assert!(
+                            after.contains("local_tier_predicate_"),
+                            "{file}:{}: an attestation door composes the scope predicate without the local-tier gate (V4.4 §3)",
                             i + 1
                         );
                     }

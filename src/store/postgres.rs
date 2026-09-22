@@ -19554,6 +19554,18 @@ fn pg_scores_shared_predicates(
         where_parts.push(frag);
         params.extend(sparams);
     }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
+            scope,
+            "fa.tier",
+            "fa.attesting_key_id",
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+    }
     (where_parts, params)
 }
 
@@ -22607,6 +22619,18 @@ impl crate::read::ReadEngine for PostgresBackend {
             where_parts.push(frag);
             params.extend(sparams);
         }
+        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+        // producing occurrence alone; the collective never reaches it.
+        {
+            let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
+                &scope,
+                "tier",
+                "attesting_key_id",
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
+        }
         if let Some(c) = &cursor {
             if c.version != "v1" {
                 return Err(crate::read::Error::InvalidCursor(format!(
@@ -22703,6 +22727,18 @@ impl crate::read::ReadEngine for PostgresBackend {
                 "cohort_scope",
                 "attested_key_id",
                 Some("dimension"),
+                params.len(),
+            );
+            where_parts.push(frag);
+            params.extend(sparams);
+        }
+        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+        // producing occurrence alone; the collective never reaches it.
+        {
+            let (frag, sparams) = crate::store::scope_bind::local_tier_predicate_pg(
+                &scope,
+                "tier",
+                "attesting_key_id",
                 params.len(),
             );
             where_parts.push(frag);

@@ -630,8 +630,8 @@ mod tests {
     #[test]
     fn scope_disjoint_keys_do_not_share() {
         let cache: Cache<i64> = Cache::with_config(cfg());
-        let unauth = key::scope_digest(false, "", &[], &[]);
-        let auth = key::scope_digest(true, "id1", &[], &[]);
+        let unauth = key::scope_digest(false, "", &[], &[], "", &[]);
+        let auth = key::scope_digest(true, "id1", &[], &[], "id1", &["id1".into()]);
         let k_unauth = CacheKey::new("agg", &[1u8; 32], &unauth, 0, HOUR_MS, HOUR);
         let k_auth = CacheKey::new("agg", &[1u8; 32], &auth, 0, HOUR_MS, HOUR);
 

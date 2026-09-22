@@ -232,9 +232,15 @@ pub fn scope_digest(
     identity_key_id: &str,
     family_key_ids: &[IdentityKeyId],
     community_key_ids: &[IdentityKeyId],
+    occurrence_key_id: &str,
+    self_key_ids: &[IdentityKeyId],
 ) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"CallerScope:v4.0\0");
+    // v46.3.1 (PR #889 review) — the domain tag moved with the shape: the
+    // self-collective and the occurrence decide which `self` rows (and
+    // which sensitive leaves) a read admits, so two admissions differing
+    // only there must never share an aggregate cache entry.
+    h.update(b"CallerScope:v46.3.1\0");
     if !authenticated {
         h.update([0u8]);
         return h.finalize().into();
@@ -259,6 +265,15 @@ pub fn scope_digest(
     for c in com {
         h.update((c.len() as u64).to_le_bytes());
         h.update(c.as_bytes());
+    }
+    h.update((occurrence_key_id.len() as u64).to_le_bytes());
+    h.update(occurrence_key_id.as_bytes());
+    let mut slf: Vec<&IdentityKeyId> = self_key_ids.iter().collect();
+    slf.sort();
+    h.update((slf.len() as u64).to_le_bytes());
+    for s in slf {
+        h.update((s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
     }
 
     h.finalize().into()
@@ -327,15 +342,40 @@ mod tests {
             "id1",
             &["famA".into(), "famB".into()],
             &["comX".into()],
+            "occ1",
+            &["occ1".into(), "id1".into()],
         );
         let b = scope_digest(
             true,
             "id1",
             &["famB".into(), "famA".into()],
             &["comX".into()],
+            "occ1",
+            &["id1".into(), "occ1".into()],
         );
         assert_eq!(a, b);
-        let unauth = scope_digest(false, "id1", &[], &[]);
+        let unauth = scope_digest(false, "id1", &[], &[], "", &[]);
         assert_ne!(a, unauth);
+        // v46.3.1 (PR #889 review): the self set and the occurrence are part
+        // of the scope — same identity + memberships, different collective
+        // (or a different occurrence of the same human) ⇒ different digest.
+        let wider = scope_digest(
+            true,
+            "id1",
+            &["famA".into(), "famB".into()],
+            &["comX".into()],
+            "occ1",
+            &["occ1".into(), "id1".into(), "node-2".into()],
+        );
+        assert_ne!(a, wider);
+        let other_device = scope_digest(
+            true,
+            "id1",
+            &["famA".into(), "famB".into()],
+            &["comX".into()],
+            "occ2",
+            &["occ1".into(), "id1".into()],
+        );
+        assert_ne!(a, other_device);
     }
 }

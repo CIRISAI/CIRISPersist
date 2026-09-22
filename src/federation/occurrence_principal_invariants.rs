@@ -414,6 +414,82 @@ pub(crate) mod bodies {
             0,
             "I141: nor node C's",
         );
+        // Review (PR #889, round three): a LOCAL-tier row is producer-only
+        // authority (V4.4 §3) — visible to the producing occurrence alone,
+        // whatever the collective. The node writes one through the local door.
+        d.attestation_upsert_local(crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: node.clone(),
+            attested_key_id: None,
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: Some(1.0),
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({"id": format!("i141-local-{s}"), "dimension": "identity_binding:v1", "score": 1.0, "confidence": 0.9}),
+            )
+            .unwrap(),
+            subject_key_ids: vec![],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("I141: the node writes a local-tier row: {e}"));
+        let reads_local = |caller: &str| {
+            let (caller, node) = (caller.to_owned(), node.clone());
+            async move {
+                let scope = caller_scope_from_directory(d, &caller).await.unwrap();
+                let rust_twin = scope
+                    .admits_local_tier(crate::federation::types::attestation_tier::LOCAL, &node);
+                let rows = match crate::ceg::ReadEngine::list_attestations(
+                    d,
+                    crate::ceg::AttestationFilter {
+                        attesting_key_id: Some(node.clone()),
+                        dimension_prefixes: vec!["identity_binding".into()],
+                        tier: Some(crate::ceg::list::federation::Tier::Local),
+                        ..Default::default()
+                    },
+                    None,
+                    10,
+                    scope,
+                )
+                .await
+                {
+                    Ok(page) => Some(page.items.len()),
+                    Err(crate::ceg::Error::Backend(m))
+                        if m.contains("no relational read substrate") =>
+                    {
+                        None
+                    }
+                    Err(e) => panic!("I141: list_attestations: {e}"),
+                };
+                (rust_twin, rows)
+            }
+        };
+        expect(
+            reads_local(&node).await,
+            true,
+            1,
+            "I141: the producing occurrence reads its own local-tier row",
+        );
+        expect(
+            reads_local(&device).await,
+            false,
+            0,
+            "I141: the owner's device does NOT read the node's local-tier row",
+        );
+        expect(
+            reads_local(&owner).await,
+            false,
+            0,
+            "I141: nor the owner's key",
+        );
+        expect(
+            reads_local(&node_c).await,
+            false,
+            0,
+            "I141: nor the owner's other node",
+        );
         // Review (PR #889, P1): a SENSITIVE config leaf (CC 3.4.5.1,
         // `CONFIG_SENSITIVE_LEAVES`) is node-local by the write floor; the
         // collective widening must not carry it to the owner's other keys on

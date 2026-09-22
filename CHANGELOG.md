@@ -34,7 +34,15 @@ threat-model citations because this crate's audit story is the point.
   compose `cohort_scope_sql_predicate_with_dimension` (pinned from disk).
   `admits` gains a parameter (crate API; not on PyO3). A row with no
   dimension member (a generated NULL) is not a sensitive leaf in SQL either
-  (`IS NULL`, review round two). No wire, migration or vocabulary change.
+  (`IS NULL`, review round two). Round three: a `local`-tier row (V4.4 §3,
+  producer-only authority) had relied on the old equality for its
+  occurrence-privacy — now its own gate in both twins
+  (`admits_local_tier` / `local_tier_sql_predicate`, composed by the six
+  attestation doors, pinned from disk); and the aggregate cache's scope
+  digest folds the occurrence and the self-collective, so two admissions
+  that admit different `self` rows never share an entry (domain tag
+  `CallerScope:v46.3.1` — existing entries simply miss). No wire, migration
+  or vocabulary change.
 
 ## [46.3.0] - 2026-09-22
 

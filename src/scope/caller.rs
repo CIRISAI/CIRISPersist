@@ -98,4 +98,22 @@ impl CallerScope {
             },
         }
     }
+
+    /// v46.3.1 (PR #889 review, round three) — **the local-tier gate**,
+    /// `FSD/V4_4_SHARED_ATTESTATION_SURFACE.md` §3: a `local`-tier row is
+    /// producer-only authority (signature deferred) and is visible ONLY to
+    /// the occurrence that produced it — never to the rest of the
+    /// self-collective the `self` arm of [`Self::admits`] now admits. The
+    /// SQL twin is [`local_tier_sql_predicate`](super::local_tier_sql_predicate).
+    pub fn admits_local_tier(&self, tier: &str, attesting_key_id: &str) -> bool {
+        if tier != crate::federation::types::attestation_tier::LOCAL {
+            return true;
+        }
+        match self {
+            CallerScope::Unauthenticated => false,
+            CallerScope::Authenticated { admission } => {
+                admission.occurrence_key_id == attesting_key_id
+            }
+        }
+    }
 }

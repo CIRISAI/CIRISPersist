@@ -128,6 +128,8 @@ family and community arms already do. The write-side assembler
 | `self_collective::principals_of` | a REVOKED occurrence does not inherit its owner through a live owner binding (PR #889 review P1): `k` bound to `owner` at some time and not active now ⇒ `owner ∉ principals_of(k)`. One fold, so `speaks_for`, the send set and the read gate all say it |
 | `CallerScope::admits(cohort_scope, target, dimension)` | takes the row's dimension: a `CONFIG_SENSITIVE_LEAVES` leaf (CC 3.4.5.1, node-local by the write floor) is admitted at `self` only when `target == occurrence_key_id` (PR #889 review P1) |
 | `cohort_scope_sql_predicate_with_dimension` / `scope_predicate_{pg,sqlite}_with_dimension` | the same node-only clause in SQL, rendered with `substr`/`length` (no `LIKE`: its case rule differs by backend); composed by every door over `federation_attestations` — the only tables carrying `config:*` rows — pinned from disk |
+| `CallerScope::admits_local_tier(tier, attesting_key_id)` / `local_tier_sql_predicate` | NEW (PR #889 review, round three): a `local`-tier row (V4.4 §3, producer-only authority) is visible to its producing OCCURRENCE alone — `tier <> 'local' OR attester = occurrence`; the collective widening never reaches it. Composed by the same six attestation doors; pinned from disk |
+| `cache::key::scope_digest` | folds the occurrence and `self_key_ids` (domain tag `CallerScope:v46.3.1`): two admissions differing only in the collective, or in the occurrence, never share an aggregate cache entry (PR #889 review, round three) |
 
 No wire change, no migration, no vocabulary change. PATCH.
 
@@ -155,6 +157,10 @@ No wire change, no migration, no vocabulary change. PATCH.
   twin's `dimension IS NULL` (review round two: `dimension` is a GENERATED
   column, NULL for every attestation type without a dimension member, and
   `NOT (NULL)` is NULL — the shape test pins the clause on both backends).
+  Round three: `admits_local_tier → true` (device reads the local row,
+  memory/sqlite); the SQL local-tier clause dropped (sqlite); the scope
+  digest drops the self set (the `cache::key` test's `wider` /
+  `other_device` digests collide).
 
 ### 6.1 Mutation table (sqlite lane, 2026-09-22; rounds a–c)
 

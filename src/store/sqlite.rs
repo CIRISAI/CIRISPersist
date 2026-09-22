@@ -19112,6 +19112,18 @@ fn sqlite_scores_shared_predicates(
         parts.push(frag);
         binds.extend(sbinds);
     }
+    // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+    // producing occurrence alone; the collective never reaches it.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+            scope,
+            "fa.tier",
+            "fa.attesting_key_id",
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
     (parts, binds)
 }
 
@@ -22158,6 +22170,18 @@ impl crate::read::ReadEngine for SqliteBackend {
             parts.push(frag);
             binds.extend(sbinds);
         }
+        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+        // producing occurrence alone; the collective never reaches it.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+                &scope,
+                "tier",
+                "attesting_key_id",
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
         if let Some(c) = &cursor {
             if c.version != "v1" {
                 return Err(crate::read::Error::InvalidCursor(format!(
@@ -22248,6 +22272,18 @@ impl crate::read::ReadEngine for SqliteBackend {
                 "cohort_scope",
                 "attested_key_id",
                 Some("dimension"),
+                binds.len(),
+            );
+            parts.push(frag);
+            binds.extend(sbinds);
+        }
+        // V4.4 §3 (PR #889 review) — a LOCAL-tier row is visible to its
+        // producing occurrence alone; the collective never reaches it.
+        {
+            let (frag, sbinds) = crate::store::scope_bind::local_tier_predicate_sqlite(
+                &scope,
+                "tier",
+                "attesting_key_id",
                 binds.len(),
             );
             parts.push(frag);
