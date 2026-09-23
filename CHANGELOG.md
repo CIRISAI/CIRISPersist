@@ -45,7 +45,15 @@ the other plane.
 **I144** (`drive_query_invariants`, sqlite + postgres + memory): a member of
 room R reads a correctly-shaped row in R; a caller who shares a *different*
 room with the same producer does not; `family` takes the same shape on
-`family_key_id`; the #888 `self` legs stay green. Seven mutants (FSD §5).
+`family_key_id`; the #888 `self` legs stay green. The legs fold through the
+SCORES plane first, on all three backends — the memory leg had been
+returning early on "no relational read substrate" and measured nothing.
+A room-less targeted row is refused at the write gate; the read-side
+fail-closed arm is witnessed on the twin (`targeted_arm_tests`). Eight
+mutants, eight killed (FSD §5.1).
+
+Not changed here, filed as **#897**: `affiliations` is a broad tier on this
+gate but room-gated on the hold path — the same split, failing open.
 
 ### Fixed — `v141_rebuild_...828` asserted more than its name (CIRISPersist#893)
 The witness snapshotted the fourteen rebuilt tables at V140 and re-snapshotted

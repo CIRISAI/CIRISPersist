@@ -96,4 +96,5 @@ Both survivors were gaps in the WITNESS, not holes in the fix:
 
 - The trace plane, which has its own `cohort_target_id` column and whose gate already reads it — it passes `None` for the new parameter and its SQL is byte-identical to before (the three `scope::sql` shape tests assert exactly that, unchanged).
 - `list_attestations_since`, the ungated replication cursor.
+- `affiliations` (CIRISPersist#897). The read gate treats it as a BROAD tier — admitted to any caller — while `replication/hold.rs` gates it on room membership exactly like `community`. Same class as this issue (two gates, one scope, different questions), opposite direction: it fails open. Which one moves is a visibility ruling, not part of this repair; V150's partial index already covers `affiliations` so either answer needs no new migration.
 - A gap-free filtered listing (`admitted_at`-ordered) — raised with edge on their PR #657; a third door if a consumer needs it.
