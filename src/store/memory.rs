@@ -2424,6 +2424,13 @@ fn mem_scores_row_matches(
     scope: &crate::scope::CallerScope,
 ) -> bool {
     use crate::read::{AttesterSet, Tier};
+    // v46.4.0 (CIRISPersist#891) — the cohort axes, the memory twin of
+    // `sqlite_cohort_axes` / `pg_cohort_axes`.
+    if let Some(cs) = &filter.cohort_scope {
+        if &r.cohort_scope != cs {
+            return false;
+        }
+    }
     let dimension = crate::federation::admission::envelope_dimension(&r.attestation_envelope);
     if let Some(subj) = &filter.subject_key_id {
         if !r.subject_key_ids.iter().any(|s| s == subj) {

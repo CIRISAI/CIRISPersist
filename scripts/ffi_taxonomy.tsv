@@ -150,6 +150,7 @@ Engine	add_moderator	deontic
 Engine	add_peer_record_json	deontic	
 Engine	adopt_scrub_upgrade	deontic	
 Engine	adopt_sealed_blob_json	deontic	
+Engine	adopt_sealed_chunk_json	deontic	
 Engine	age_band_fine_json	epistemic	
 Engine	age_band_json	epistemic	
 Engine	aggregate_audit_chain	axiotic	

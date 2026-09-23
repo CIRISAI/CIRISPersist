@@ -5,6 +5,107 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [46.4.0] - 2026-09-23
+
+### Added — the drive query and the chunk adopt (CIRISPersist#891, CIRISPersist#821; `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md`)
+- **`AttestationFilter::cohort_scope`** — filter the attestation plane by the
+  row's cohort (`self`, `family`, `community`, …). Exact match on the V056
+  column, which already carries a partial index
+  (`WHERE cohort_scope != 'federation'`) — a drive listing's rows. The axis is
+  a SELECTION and never a widening: the §4.3 caller-visibility gate composes
+  independently and refuses a cohort the caller is not in even when the
+  filter names it (I142). Pushed in ONE spelling per backend
+  (`sqlite_cohort_axes` / `pg_cohort_axes` / the memory twin), called from
+  both the attestation and scores read paths, so a cohort axis cannot mean
+  two things through two doors.
+  **The door it composes with already existed:** `list_attestations(filter,
+  cursor, limit, scope)` has been filtered, cursor-paged and scope-gated
+  since v4.0, on the Rust trait and on PyO3. Edge was walking
+  `list_attestations_since`, which is a different plane — the replication
+  cursor, ascending by `COALESCE(admitted_at, …)`, composing no visibility
+  gate — and it keeps that signature.
+- **`adopt_sealed_chunk_json`** (PyO3) — the receiving half of the scoped
+  chunk DAG (#832/#838 shipped `put_blob_chunk_scoped` → `seal_stream_scoped`
+  → `read_stream_chunk_as`). `Engine::adopt_sealed_chunk` had no binding, so
+  a sibling device could be SENT a video and could not store it. Same gates
+  as the blob twin, applied by the Engine door.
+
+### Fixed — concurrent test provisioning raced on a CLUSTER-GLOBAL role (CIRISPersist#894)
+`V005__readonly_role` creates `cirislens_reader` behind
+`IF NOT EXISTS (SELECT 1 FROM pg_roles …)`. A role is cluster-global and that
+guard is a check-then-act: two processes migrating two DIFFERENT per-test
+databases both see "absent", both `CREATE ROLE`, and the loser gets `23505`.
+The migration advisory lock does not cover it — Postgres advisory locks are
+per-database and these callers are in different databases. Latent since V005
+shipped; it surfaced the moment the nextest `postgres` cap went 1 → 16 and a
+CI cluster is fresh every run (a developer's already carries the role).
+A shipped migration is immutable as BYTES, so the fix is in test
+provisioning: `test_pg::empty_dsn` pre-creates the role with an
+exception-safe `CREATE ROLE … EXCEPTION WHEN duplicate_object`, after which
+V005's guard always sees it. Measured 24-way from absent: the check-then-act
+pattern fails ~1 in 24, the exception-safe pattern zero.
+
+### Not claimed — the targeted cohorts (CIRISPersist#893)
+A `community` / `family` attestation names its own PRODUCER in
+`attested_key_id` (AV-84, hard since v38.2.0), and the §4.3 read gate
+compares that column against the caller's room set — an empty intersection by
+construction, so **no member can read their own room's rows through this
+plane**. Found by this cut's fixture, filed with a reproduction as #893. It
+survived because `federation_attestations` has no `cohort_target_id` column
+(that is a `trace_events` column) and no test read a targeted-cohort
+attestation back. `cohort_scope` ships regardless: it narrows what the gate
+already admitted.
+
+
+### Changed — the release cycle: certify 97 min → 20 min, measured (CIRISPersist#879, #880, #881; rides the next feature cut per the no-micro-release rule)
+
+Full certification, same tree, same box, every leg green by exit code:
+
+| leg | before (LANES=1) | after (2 lanes x 16) |
+|---|---|---|
+| python | 603 s | 12 s |
+| core | 592 s | 173 s |
+| cirisaudit | 605 s | 311 s |
+| secrets | 667 s | 271 s |
+| cirisnode | 612 s | 255 s |
+| cirisgraph | 609 s | 245 s |
+| telemetry | 606 s | 246 s |
+| rest (carries the proptest gauntlet) | 761 s | 334 s |
+| test-anchor / default / clippy | 387 s | 323 s |
+| **wall** | **~97 min** | **19.9 min** |
+
+- **nextest `postgres` test group: `max-threads` 1 → 16.** The cap was written
+  at v3.5.1 when every PG test shared one database. Since v42.1.0
+  `test_pg::dsn()` gives each test PROCESS its own database (a ~50 ms
+  template copy, reaped by PID), so the cap only cost: certify's expensive
+  legs ran at ~40% thread efficiency. Measured on `store::postgres::tests`
+  (398 tests): 252 s serialized → 31 s at 16 threads, 398/398 both ways.
+  The group stays as a connection budget (each test process opens its own
+  pool; `max_connections = 400`). The ten `tests/*.rs` integration tests that
+  read `CIRIS_PERSIST_TEST_PG_URL` DIRECTLY — `test_pg` is private to the
+  lib, so no integration test can provision its own database — genuinely
+  share that one database and now sit in a second group,
+  `postgres-shared` (`max-threads = 1`). Lifting the first cap found them:
+  three went red on exactly that sharing, which is the honest split. 530/530
+  twice with both groups in force. The 679 `#[serial_test::serial(postgres)]`
+  markers are inert under nextest (in-process lock, one process per test)
+  and are left as documentation.
+- **certify: the `substrate_machine` property harness runs in the `rest` leg
+  only** (`-E 'not test(/substrate_machine/)'` elsewhere), mirroring CI's
+  gauntlet leg; it tests backend parity and varies by no feature axis. Full
+  case count where it runs.
+- **certify: the python leg (the peak-RAM thin-LTO cdylib build) runs ALONE
+  before the lane pool**, and lanes are sized at 6 G each (was 2 G, the guess
+  that OOM-killed legs twice), so the feature legs run at more than one lane.
+- **CI: `tag-precheck`** — on a `v*` tag, when a successful CI run exists for
+  the same sha on a branch push (polled up to 45 min), the seven-leg matrix
+  is skipped; the asset jobs are unchanged (nothing `needs` the matrix).
+- **`scripts/release_ship.sh`** — the ship half of the release method,
+  checked in: merge, tree-compare (a merge whose tree equals the PR head's
+  skips the main-CI wait — the PR run certified those bytes), tag from the
+  CHANGELOG section with the byte-count assert, tag CI, then the release
+  body set only after the release exists (the edit raced its creation once).
+
 ## [46.3.1] - 2026-09-22
 
 ### Fixed — a claimed node could not read its own `self` rows (CIRISPersist#888, CIRISServer#624; `FSD/OCCURRENCE_PRINCIPAL.md` §6)

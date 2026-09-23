@@ -106,11 +106,40 @@ pub fn empty_dsn() -> Option<String> {
     let (host_part, base_db) = split(&base)?;
     let name = unique_name();
     let admin = format!("{host_part}/{base_db}");
+    ensure_cluster_global_role(&admin);
     let sql = format!("CREATE DATABASE \"{name}\"");
     match run_sql(&admin, &sql) {
         Ok(()) => Some(format!("{host_part}/{name}")),
         Err(e) => panic!("test_pg: could not provision an empty database ({e}).\nSQL: {sql}"),
     }
+}
+
+/// v46.4.0 (CIRISPersist#894) — **pre-create the one CLUSTER-GLOBAL object the
+/// migrations declare, before any caller races on it.**
+///
+/// `V005__readonly_role` creates the `cirislens_reader` role behind
+/// `IF NOT EXISTS (SELECT 1 FROM pg_roles …)`. A role is cluster-global, and
+/// that guard is a check-then-act: two processes migrating two DIFFERENT
+/// per-test databases both see "absent", both `CREATE ROLE`, and the loser
+/// gets `23505` — the migration fails and its test dies. The migration
+/// advisory lock does NOT cover it, because Postgres advisory locks are
+/// per-database and these callers are in different databases.
+///
+/// A shipped migration is immutable as BYTES, so the fix cannot live in V005.
+/// It lives here: every caller that is about to `run_migrations()` against a
+/// fresh database first makes the role exist, with an exception-safe create
+/// (the pattern the check-then-act should have been). After that V005's guard
+/// always sees it and never tries.
+///
+/// Latent since V005 shipped; it surfaced when the nextest `postgres` group's
+/// cap went 1 → 16 (#879) and CI's cluster is fresh every run, where a
+/// developer's cluster already carries the role from an earlier run.
+fn ensure_cluster_global_role(admin: &str) {
+    let _ = run_sql(
+        admin,
+        "DO $$ BEGIN CREATE ROLE cirislens_reader NOLOGIN; \
+         EXCEPTION WHEN duplicate_object THEN NULL; END $$;",
+    );
 }
 
 fn split(url: &str) -> Option<(&str, &str)> {

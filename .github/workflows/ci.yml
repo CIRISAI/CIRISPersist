@@ -41,10 +41,45 @@ permissions:
   packages: write   # CIRISCache save pushes to GHCR; PRs only restore, so fork PRs are unaffected
 
 jobs:
+  # 2026-09-22 (CIRISPersist#881) — a release tag points at a commit main CI
+  # just passed; re-running the seven-leg matrix on the same SHA is machine
+  # time for no coverage. On a tag push this job waits (up to 45 min) for a
+  # completed, successful CI run of the SAME sha on a branch push, and when
+  # one exists the matrix below is skipped. Any other outcome — no run,
+  # failure, timeout — runs the matrix as before. Nothing `needs` the matrix
+  # job, so skipping it changes no asset job. On non-tag refs this job is a
+  # no-op that outputs skip=false.
+  tag-precheck:
+    name: tag precheck (skip the matrix when this sha already passed on main)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skip: ${{ steps.probe.outputs.skip }}
+    steps:
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          for i in $(seq 1 45); do
+            n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&event=push&per_page=50" \
+                  --jq '[.workflow_runs[] | select(.name=="CI" and (.head_branch|startswith("refs/tags/")|not) and .conclusion=="success")] | length' 2>/dev/null || echo 0)
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "a successful CI run exists for ${GITHUB_SHA} on a branch push — the matrix is skipped on this tag"
+              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            echo "no completed successful branch run for ${GITHUB_SHA} yet ($i/45) — waiting 60s"; sleep 60
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
   linux-x86_64-test:
+    needs: tag-precheck
+    if: needs.tag-precheck.outputs.skip != 'true'
     # v2.0.1 (CIRISPersist#95-track) — substrate-axis matrix. The 2.0
     # feature-gap fix turned every substrate on (audit/secrets/nodecore/
     # graph/telemetry) and the single test job ballooned to ~12 min.
