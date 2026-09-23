@@ -32575,6 +32575,14 @@ async fn reverse_quorum_by_action_id(
 /// Shape: `"{kind}: {token} (retry_after_seconds={n})"`. `kind` and `token` are
 /// both program constants; the parentheses and the word order are not, and no
 /// consumer should parse them positionally.
+/// v47.0.0 (CIRISPersist#797) — `"<kind>: <reason-kind>"` for an AV-45
+/// refusal, so a host can tell `scope_membership_unresolved` (retryable) from
+/// `scope_no_community_membership` (terminal). The leading `kind` token is
+/// unchanged, so a `startswith` check keeps working.
+fn write_scope_refused_message(kind: &str, reason: &crate::scope::ScopeRefusalReason) -> String {
+    format!("{kind}: {}", reason.kind())
+}
+
 fn rate_limited_message(
     kind: &str,
     reason: crate::federation::PeerQuotaRefusal,
@@ -32788,7 +32796,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // `str(e).startswith("federation_write_scope_refused")` keep working;
         // only an EQUALITY match on the message breaks.
         crate::federation::Error::WriteScopeRefused(reason) => {
-            PyValueError::new_err(format!("{kind}: {}", reason.kind()))
+            PyValueError::new_err(write_scope_refused_message(kind, &reason))
         }
         // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — a refused
         // `withdraws` (issuer satisfies none of the 4 admission rules)
@@ -34787,6 +34795,25 @@ mod tests {
     /// distinctness assertion is what makes that real — 16 messages that all
     /// carry *a* token but not a *distinguishing* one would satisfy a
     /// per-variant `contains` check and still leave the caller guessing.
+    /// v47.0.0 (CIRISPersist#797) — the AV-45 reason reaches the host, and
+    /// the retryable one is distinguishable from the terminal ones.
+    #[test]
+    fn write_scope_refused_message_carries_the_reason_797() {
+        use crate::scope::ScopeRefusalReason as R;
+        let kind = "federation_write_scope_refused";
+        let unresolved = write_scope_refused_message(kind, &R::MembershipUnresolved);
+        let terminal = write_scope_refused_message(kind, &R::NoCommunityMembership);
+        assert_eq!(
+            unresolved,
+            "federation_write_scope_refused: scope_membership_unresolved"
+        );
+        assert_eq!(
+            terminal,
+            "federation_write_scope_refused: scope_no_community_membership"
+        );
+        assert!(unresolved.starts_with(kind) && terminal.starts_with(kind));
+    }
+
     #[test]
     fn every_quota_refusal_reason_survives_the_ffi_boundary() {
         use crate::federation::PeerQuotaRefusal;
