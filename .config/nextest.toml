@@ -81,8 +81,27 @@ max-threads = 16
 # process boundary. The test-group's max-threads=1 IS the cross-process
 # serializer — we just need to make sure av26 (and any future qa_harness
 # tests with similar destructive schema ops) is in the group.
-filter = 'test(/_pg$/) + test(/_postgres$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/) + test(av26_concurrent_boot_advisory_lock)'
+filter = 'test(/_pg$/) + test(/_postgres$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/)'
 test-group = "postgres"
+
+# 2026-09-22 (CIRISPersist#879) — the TEN tests that genuinely share ONE
+# database. The `tests/*.rs` integration binaries read
+# `CIRIS_PERSIST_TEST_PG_URL` directly, because `test_pg` (the per-test
+# database provisioner) is a private module of the lib and no integration
+# test can reach it. They mutate global state in that one database — schema
+# objects, whole-corpus counts, `av26`'s `DROP SCHEMA cirislens CASCADE`
+# above — so they serialize against each other, exactly as the whole PG
+# suite used to. Lifting the `postgres` cap to 16 raised the concurrency
+# around them and three went red on precisely this sharing (`db error` from
+# a torn-down connection): the honest split is that these ten share and the
+# other 508 do not. Making `test_pg` reachable from an integration test
+# would let these go wide too — tracked on #879.
+[test-groups.postgres-shared]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(/^(dedup_shard|accord_holder_real_custody|qa_harness|wholeness_witness|trace_hybrid_hard_cut|aggregation_tier|fountain_content)$/) and (test(/^postgres_/) + test(av26_concurrent_boot_advisory_lock))'
+test-group = "postgres-shared"
 
 # v22.0.0 (CIRISPersist#543) — THE SUBSTRATE GAUNTLET NEEDS A LONGER LEASH.
 #

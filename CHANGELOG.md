@@ -15,7 +15,13 @@ threat-model citations because this crate's audit story is the point.
   legs ran at ~40% thread efficiency. Measured on `store::postgres::tests`
   (398 tests): 252 s serialized → 31 s at 16 threads, 398/398 both ways.
   The group stays as a connection budget (each test process opens its own
-  pool; `max_connections = 400`). The 679 `#[serial_test::serial(postgres)]`
+  pool; `max_connections = 400`). The ten `tests/*.rs` integration tests that
+  read `CIRIS_PERSIST_TEST_PG_URL` DIRECTLY — `test_pg` is private to the
+  lib, so no integration test can provision its own database — genuinely
+  share that one database and now sit in a second group,
+  `postgres-shared` (`max-threads = 1`). Lifting the first cap found them:
+  three went red on exactly that sharing, which is the honest split. 530/530
+  twice with both groups in force. The 679 `#[serial_test::serial(postgres)]`
   markers are inert under nextest (in-process lock, one process per test)
   and are left as documentation.
 - **certify: the `substrate_machine` property harness runs in the `rest` leg
