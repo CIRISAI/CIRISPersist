@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### Fixed — the tag precheck asked a question that could never be answered yes (CIRISPersist#895)
+v46.4.0's `tag-precheck` skipped the tag's test matrix when "a successful CI
+run exists for this SHA on a branch push", polling up to 45 minutes. It never
+exists: the `concurrency` group keys push events on the SHA (#397) so the tag
+run **cancels** the redundant main-push run on that commit — the run the
+precheck is waiting for is cancelled by the run the precheck is part of.
+Observed on v46.4.0: main CI for `e03ba447` is `completed/cancelled`. The
+"saving" cost 45 minutes per release. It now compares **trees** — one API
+page, no polling — and skips only when a successful CI run was built from a
+commit with the same tree, which is the same argument
+`scripts/release_ship.sh` uses to skip its own main-CI wait. Any doubt runs
+the matrix.
+
 ## [46.4.0] - 2026-09-23
 
 ### Added — the drive query and the chunk adopt (CIRISPersist#891, CIRISPersist#821; `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md`)

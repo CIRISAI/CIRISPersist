@@ -41,16 +41,25 @@ permissions:
   packages: write   # CIRISCache save pushes to GHCR; PRs only restore, so fork PRs are unaffected
 
 jobs:
-  # 2026-09-22 (CIRISPersist#881) — a release tag points at a commit main CI
-  # just passed; re-running the seven-leg matrix on the same SHA is machine
-  # time for no coverage. On a tag push this job waits (up to 45 min) for a
-  # completed, successful CI run of the SAME sha on a branch push, and when
-  # one exists the matrix below is skipped. Any other outcome — no run,
-  # failure, timeout — runs the matrix as before. Nothing `needs` the matrix
-  # job, so skipping it changes no asset job. On non-tag refs this job is a
-  # no-op that outputs skip=false.
+  # 2026-09-22 (CIRISPersist#881, corrected #895) — skip the tag's test matrix
+  # when the SAME TREE has already passed CI.
+  #
+  # The first version of this job asked the wrong question: "is there a
+  # successful CI run for this SHA on a branch push?" There never is. The
+  # `concurrency` group above keys push events on the SHA precisely so the tag
+  # run CANCELS the redundant main run (#397) — so the merge commit's only
+  # completed run IS this one. That version polled 45 minutes for a run its own
+  # workflow had just cancelled and then ran the matrix anyway: strictly slower.
+  #
+  # What actually justifies skipping is TREE equality, which is also what
+  # `scripts/release_ship.sh` uses to skip its main-CI wait: a merge commit
+  # whose tree equals the PR head's contains the identical bytes the PR run
+  # tested. So: resolve this commit's tree, walk recent successful CI runs, and
+  # skip only when one of them was built from a commit with the same tree.
+  # Bounded and non-blocking — no polling, one API page; any doubt runs the
+  # matrix.
   tag-precheck:
-    name: tag precheck (skip the matrix when this sha already passed on main)
+    name: tag precheck (skip the matrix when this TREE already passed)
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -64,15 +73,19 @@ jobs:
         run: |
           set -uo pipefail
           if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          for i in $(seq 1 45); do
-            n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&event=push&per_page=50" \
-                  --jq '[.workflow_runs[] | select(.name=="CI" and (.head_branch|startswith("refs/tags/")|not) and .conclusion=="success")] | length' 2>/dev/null || echo 0)
-            if [ "${n:-0}" -gt 0 ]; then
-              echo "a successful CI run exists for ${GITHUB_SHA} on a branch push — the matrix is skipped on this tag"
+          tree=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.tree.sha' 2>/dev/null || echo "")
+          if [ -z "$tree" ]; then echo "could not resolve this commit's tree — running the matrix"; echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "this tag's tree: $tree"
+          for sha in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=success&per_page=40" \
+                         --jq '.workflow_runs[] | select(.name=="CI") | .head_sha' 2>/dev/null | head -40); do
+            [ "$sha" = "${GITHUB_SHA}" ] && continue
+            other=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq '.commit.tree.sha' 2>/dev/null || echo "")
+            if [ -n "$other" ] && [ "$other" = "$tree" ]; then
+              echo "tree $tree already passed CI as ${sha} — skipping this tag's matrix"
               echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
             fi
-            echo "no completed successful branch run for ${GITHUB_SHA} yet ($i/45) — waiting 60s"; sleep 60
           done
+          echo "no successful CI run for this tree — running the matrix"
           echo "skip=false" >> "$GITHUB_OUTPUT"
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
