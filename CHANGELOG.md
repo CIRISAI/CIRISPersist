@@ -30,6 +30,21 @@ threat-model citations because this crate's audit story is the point.
   a sibling device could be SENT a video and could not store it. Same gates
   as the blob twin, applied by the Engine door.
 
+### Fixed — concurrent test provisioning raced on a CLUSTER-GLOBAL role (CIRISPersist#894)
+`V005__readonly_role` creates `cirislens_reader` behind
+`IF NOT EXISTS (SELECT 1 FROM pg_roles …)`. A role is cluster-global and that
+guard is a check-then-act: two processes migrating two DIFFERENT per-test
+databases both see "absent", both `CREATE ROLE`, and the loser gets `23505`.
+The migration advisory lock does not cover it — Postgres advisory locks are
+per-database and these callers are in different databases. Latent since V005
+shipped; it surfaced the moment the nextest `postgres` cap went 1 → 16 and a
+CI cluster is fresh every run (a developer's already carries the role).
+A shipped migration is immutable as BYTES, so the fix is in test
+provisioning: `test_pg::empty_dsn` pre-creates the role with an
+exception-safe `CREATE ROLE … EXCEPTION WHEN duplicate_object`, after which
+V005's guard always sees it. Measured 24-way from absent: the check-then-act
+pattern fails ~1 in 24, the exception-safe pattern zero.
+
 ### Not claimed — the targeted cohorts (CIRISPersist#893)
 A `community` / `family` attestation names its own PRODUCER in
 `attested_key_id` (AV-84, hard since v38.2.0), and the §4.3 read gate
