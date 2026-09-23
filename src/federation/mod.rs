@@ -105,6 +105,9 @@ pub mod epoch_minter_invariants;
 pub mod self_collective;
 // CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
 // delivered, not discovered — the send set, the re-grant doors, the minter read.
+/// v47.0.0 (CIRISPersist#897, #796, #797) — one scope, one question, every
+/// gate: I145 / I147 (`FSD/SCOPE_CLASSIFIER.md` §5).
+pub mod scope_classifier_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The

@@ -7,6 +7,11 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.0.0] - 2026-09-23
+
+### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796, #797)
+In progress — see `FSD/SCOPE_CLASSIFIER.md`.
+
 ## [46.5.0] - 2026-09-23
 
 ### Fixed — the targeted read gate asks the ROW's room, not the producer's key (CIRISPersist#893)
