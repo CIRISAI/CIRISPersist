@@ -65,6 +65,24 @@ pub mod bodies {
     ) where
         B: crate::federation::FederationDirectory + Sync,
     {
+        seed_row(b, id, attester, scope, target, dim)
+            .await
+            .unwrap_or_else(|e| panic!("I142 seed {id}: {e}"));
+    }
+
+    /// `seed`, but handing back the door's verdict — a witness that a row
+    /// class is REFUSED needs the error, not a panic.
+    pub async fn seed_row<B>(
+        b: &B,
+        id: &str,
+        attester: &str,
+        scope: &str,
+        target: Option<&str>,
+        dim: &str,
+    ) -> Result<crate::federation::AttestationOutcome, crate::federation::Error>
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
         // The cohort TARGET rides `attested_key_id` on this plane (V114 admits
         // a keyless family there) — it is the column the §4.3 gate compares.
         let mut row = ts::bare_attestation(
@@ -73,10 +91,10 @@ pub mod bodies {
             attester,
             &serde_json::json!({ "id": id, "dimension": dim, "cohort_scope": scope }),
         );
-        // A real cohort row names its target TWICE, and the two gates read
-        // different places: the WRITE gate (AV-45) reads the signed
-        // envelope's cohort-target member, the READ gate (§4.3) compares the
-        // `attested_key_id` column. The filter axis follows the read gate.
+        // AV-84 (#592): the row is attested to its own PRODUCER, and names
+        // its ROOM in the signed envelope's cohort-target member. Both gates
+        // read the envelope member — the write gate (AV-45) directly, the
+        // read gate (§4.3) through V150's generated column (#893).
         if let Some(tk) = target {
             let member = match scope {
                 "community" | "affiliations" => "community_key_id",
@@ -93,7 +111,6 @@ pub mod bodies {
         ts::seal_row_in_place(attester, &mut row);
         b.put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await
-            .unwrap_or_else(|e| panic!("I142 seed {id}: {e}"));
     }
 
     /// **I142 — the drive query.** The cohort axes select, AND with the other
@@ -355,19 +372,6 @@ pub mod bodies {
     where
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
-        if let Err(crate::ceg::Error::Backend(msg)) = crate::ceg::ReadEngine::list_attestations(
-            b,
-            AttestationFilter::default(),
-            None,
-            1,
-            CallerScope::Unauthenticated,
-        )
-        .await
-        {
-            if msg.contains("no relational read substrate") {
-                return;
-            }
-        }
         let producer = format!("i144-producer-{s}");
         let member = format!("i144-member-{s}");
         let elsewhere = format!("i144-elsewhere-{s}");
@@ -385,7 +389,94 @@ pub mod bodies {
         // the signed envelope.
         let id = format!("i144-row-{s}");
         seed(b, &id, &producer, "community", Some(&room), "file:doc:v1").await;
+        // A targeted row that names NO room cannot be STORED: the write gate
+        // has nothing to check membership against and refuses. So the read
+        // gate's fail-closed arm (`cohort_target.is_some_and(..)`) is defence
+        // in depth for a row that arrived some other way, and its witness is
+        // the twin's own unit test (`scope::caller::tests`), not this door.
+        let refusal = seed_row(
+            b,
+            &format!("i144-noroom-{s}"),
+            &producer,
+            "community",
+            None,
+            "file:doc:v1",
+        )
+        .await
+        .expect_err("I144: a community row naming NO room must be refused at the write gate");
+        assert!(
+            refusal.to_string().contains("cohort_scope refused"),
+            "I144: expected the write-path cohort_scope refusal, got: {refusal}"
+        );
+        let nobody = format!("i144-nobody-{s}");
+        ts::register_identity_key(b, &nobody, crate::federation::types::identity_type::USER).await;
 
+        // ── A. the SCORES plane ────────────────────────────────────────────
+        // Every backend, including memory. `list_scores` builds the caller
+        // scope from the directory and folds through the RUST twin
+        // (`CallerScope::admits`) on memory, and through the SQL twin on
+        // sqlite/postgres — so this section measures the gate on all three.
+        // The relational section below cannot: the memory backend has no
+        // `list_attestations` substrate and returns early, which is how the
+        // memory leg of this witness was vacuous for two mutants.
+        let scores = |caller: &str| {
+            let caller = caller.to_owned();
+            async move {
+                let mut v: Vec<String> =
+                    <B as crate::federation::FederationDirectory>::list_scores(
+                        b,
+                        &caller,
+                        AttestationFilter {
+                            cohort_scope: Some("community".into()),
+                            dimension_prefixes: vec!["file:".into()],
+                            ..Default::default()
+                        },
+                        None,
+                        100,
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        assert_eq!(
+            scores(&member).await,
+            vec![id.clone()],
+            "I144/A1: a member of room R reads R's row on the scores plane"
+        );
+        assert!(
+            scores(&elsewhere).await.is_empty(),
+            "I144/A2: sharing another room with the producer admits nothing on the scores plane"
+        );
+        assert_eq!(
+            scores(&producer).await,
+            vec![id.clone()],
+            "I144/A3: the producer is in R and reads it too"
+        );
+        assert!(
+            scores(&nobody).await.is_empty(),
+            "I144/A4: a caller in no room reads nothing"
+        );
+
+        // ── B. the relational plane (`list_attestations`) ──────────────────
+        if let Err(crate::ceg::Error::Backend(msg)) = crate::ceg::ReadEngine::list_attestations(
+            b,
+            AttestationFilter::default(),
+            None,
+            1,
+            CallerScope::Unauthenticated,
+        )
+        .await
+        {
+            if msg.contains("no relational read substrate") {
+                return;
+            }
+        }
         let ids = |caller: &str| {
             let caller = caller.to_owned();
             async move {
@@ -431,8 +522,6 @@ pub mod bodies {
             vec![id.clone()],
             "I144/3: the producer is in R and reads it too"
         );
-        let nobody = format!("i144-nobody-{s}");
-        ts::register_identity_key(b, &nobody, crate::federation::types::identity_type::USER).await;
         assert!(
             ids(&nobody).await.is_empty(),
             "I144/3: a caller in no room reads nothing"

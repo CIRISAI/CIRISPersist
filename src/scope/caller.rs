@@ -136,3 +136,69 @@ impl CallerScope {
         }
     }
 }
+
+/// v46.5.0 (CIRISPersist#893) — **the targeted arms ask the ROW's room, and a
+/// row that names none is nobody's.**
+///
+/// The write gate refuses a `community` / `family` row that names no room
+/// (there is nothing to check membership against), so `I144` asserts that
+/// refusal at the door. This is the read side of the same claim, for a row
+/// that arrived some other way: the fail-closed arm is a property of the
+/// gate, not of what persist happens to store today.
+#[cfg(test)]
+mod targeted_arm_tests {
+    use super::*;
+    use crate::scope::admission::CallerAdmission;
+
+    fn member_of(room: &str) -> CallerScope {
+        CallerScope::Authenticated {
+            admission: CallerAdmission::for_test(
+                "occ-1",
+                "id-1",
+                ["fam-1".to_owned()],
+                [room.to_owned()],
+            ),
+        }
+    }
+
+    #[test]
+    fn the_targeted_arms_compare_the_rows_room_not_the_producer() {
+        let s = member_of("room-1");
+        // The AV-84 shape: the row is attested to its PRODUCER and names its
+        // room separately. Admission follows the room.
+        assert!(s.admits("community", "producer-key", Some("room-1"), None));
+        assert!(!s.admits("community", "producer-key", Some("room-2"), None));
+        // The producer's key is never a room: comparing the target against
+        // the room set — the pre-#893 predicate — admits nothing.
+        assert!(!s.admits("community", "room-1", Some("room-2"), None));
+        assert!(s.admits("family", "producer-key", Some("fam-1"), None));
+        assert!(!s.admits("family", "producer-key", Some("fam-2"), None));
+    }
+
+    #[test]
+    fn a_targeted_row_that_names_no_room_is_refused() {
+        let s = member_of("room-1");
+        assert!(
+            !s.admits("community", "producer-key", None, None),
+            "fail closed: a community row naming no room is nobody's, not everybody's"
+        );
+        assert!(
+            !s.admits("family", "producer-key", None, None),
+            "fail closed: a family row naming no room is nobody's"
+        );
+        // …including when the producer key happens to BE one of the caller's
+        // rooms, which is the shape that would slip through a fallback to
+        // `target`.
+        assert!(!s.admits("community", "room-1", None, None));
+    }
+
+    #[test]
+    fn the_self_arm_does_not_take_a_room() {
+        let s = member_of("room-1");
+        // `self` keys on the caller's self-collective and ignores the room
+        // column entirely (V150 generates NULL for such rows).
+        assert!(s.admits("self", "occ-1", None, None));
+        assert!(s.admits("self", "id-1", None, None));
+        assert!(!s.admits("self", "someone-else", Some("room-1"), None));
+    }
+}
