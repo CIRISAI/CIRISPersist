@@ -408,6 +408,26 @@ pub struct AttestationFilter {
     #[serde(default, skip_serializing_if = "is_default_lifecycle")]
     pub lifecycle: LifecycleView,
 
+    /// v46.4.0 (CIRISPersist#891, `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md` §3) —
+    /// filter by the row's **cohort scope**: `self`, `family`, `community`,
+    /// `affiliations`, `species`, `biosphere`, `federation`. Exact match on
+    /// the V056 column, which carries a partial index
+    /// (`WHERE cohort_scope != 'federation'`) — a drive listing's rows.
+    ///
+    /// This is a SELECTION, never a widening: the §4.3 caller-visibility gate
+    /// composes independently and refuses a cohort the caller is not in even
+    /// when the filter names it (I142). Edge's drive listing is this axis AND
+    /// [`Self::dimension_prefixes`].
+    ///
+    /// **The cohort TARGET is [`Self::attested_key_id`]**, not a field of its
+    /// own: on this plane the row's target is `attested_key_id` — which V114
+    /// widened to admit a family or community key — and it is the column the
+    /// §4.3 gate itself compares against. (`cohort_target_id` is a
+    /// `trace_events` column; `federation_attestations` has none.) A
+    /// community drive is `cohort_scope: "community"` + `attested_key_id:
+    /// <community key>`.
+    pub cohort_scope: Option<String>,
+
     /// v17.4.0 (Appendix C.2) — trust-perspective attester filter. `None`
     /// = no restriction (equivalent to `AttesterSet::All`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

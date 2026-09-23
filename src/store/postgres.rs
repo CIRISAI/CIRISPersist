@@ -19425,6 +19425,23 @@ const PG_SCORES_FA_COLS: &str = "fa.attestation_id::text AS attestation_id, fa.a
 /// Both backends dropped all three from `list_attestations` identically —
 /// parity held, in the sense that both were wrong the same way. `alias` is the
 /// table prefix (`"fa."` where the query joins, `""` where it does not).
+/// v46.4.0 (CIRISPersist#891, `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md` §3) — the
+/// **cohort axes** for Postgres, in ONE spelling called from both read paths
+/// (`pg_selection_axes`, `pg_scores_shared_predicates`). The sqlite twin is
+/// `sqlite_cohort_axes`; a cohort axis pushed at one site and forgotten at
+/// another is a filter that means two things through two doors.
+fn pg_cohort_axes(
+    filter: &crate::read::AttestationFilter,
+    alias: &str,
+    where_parts: &mut Vec<String>,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    if let Some(cs) = &filter.cohort_scope {
+        params.push(Box::new(cs.clone()));
+        where_parts.push(format!("{alias}cohort_scope = ${}", params.len()));
+    }
+}
+
 fn pg_selection_axes(
     filter: &crate::read::AttestationFilter,
     alias: &str,
@@ -19462,6 +19479,7 @@ fn pg_selection_axes(
             where_parts.push(format!("{alias}attesting_key_id = ANY(${})", params.len()));
         }
     }
+    pg_cohort_axes(filter, alias, where_parts, params);
 }
 
 fn pg_scores_shared_predicates(
@@ -19473,6 +19491,7 @@ fn pg_scores_shared_predicates(
 ) {
     let mut where_parts: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    pg_cohort_axes(filter, "fa.", &mut where_parts, &mut params);
     if let Some(subj) = &filter.subject_key_id {
         params.push(Box::new(subj.clone()));
         where_parts.push(format!("s.subject_key_id = ${}", params.len()));

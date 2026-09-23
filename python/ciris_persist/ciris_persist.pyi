@@ -594,6 +594,9 @@ class Engine:
     def adopt_sealed_blob_json(self, payload_json: str) -> str:
         """(derived) deontic — #846 (BLOB_REPLICATION.md §6.1) — adopt a sealed blob received from a peer: store the AtRestEnvelope verbatim at the tier and under the (community,..."""
 
+    def adopt_sealed_chunk_json(self, payload_json: str) -> str:
+        """(derived) deontic — v46.4.0 (CIRISPersist#821, FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md §3) — the chunk twin of adopt_sealed_blob_json: take one sealed chunk of a stream thi..."""
+
     def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
         """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
 

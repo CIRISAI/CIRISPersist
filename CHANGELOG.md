@@ -5,7 +5,42 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased]
+## [46.4.0] - 2026-09-23
+
+### Added — the drive query and the chunk adopt (CIRISPersist#891, CIRISPersist#821; `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md`)
+- **`AttestationFilter::cohort_scope`** — filter the attestation plane by the
+  row's cohort (`self`, `family`, `community`, …). Exact match on the V056
+  column, which already carries a partial index
+  (`WHERE cohort_scope != 'federation'`) — a drive listing's rows. The axis is
+  a SELECTION and never a widening: the §4.3 caller-visibility gate composes
+  independently and refuses a cohort the caller is not in even when the
+  filter names it (I142). Pushed in ONE spelling per backend
+  (`sqlite_cohort_axes` / `pg_cohort_axes` / the memory twin), called from
+  both the attestation and scores read paths, so a cohort axis cannot mean
+  two things through two doors.
+  **The door it composes with already existed:** `list_attestations(filter,
+  cursor, limit, scope)` has been filtered, cursor-paged and scope-gated
+  since v4.0, on the Rust trait and on PyO3. Edge was walking
+  `list_attestations_since`, which is a different plane — the replication
+  cursor, ascending by `COALESCE(admitted_at, …)`, composing no visibility
+  gate — and it keeps that signature.
+- **`adopt_sealed_chunk_json`** (PyO3) — the receiving half of the scoped
+  chunk DAG (#832/#838 shipped `put_blob_chunk_scoped` → `seal_stream_scoped`
+  → `read_stream_chunk_as`). `Engine::adopt_sealed_chunk` had no binding, so
+  a sibling device could be SENT a video and could not store it. Same gates
+  as the blob twin, applied by the Engine door.
+
+### Not claimed — the targeted cohorts (CIRISPersist#893)
+A `community` / `family` attestation names its own PRODUCER in
+`attested_key_id` (AV-84, hard since v38.2.0), and the §4.3 read gate
+compares that column against the caller's room set — an empty intersection by
+construction, so **no member can read their own room's rows through this
+plane**. Found by this cut's fixture, filed with a reproduction as #893. It
+survived because `federation_attestations` has no `cohort_target_id` column
+(that is a `trace_events` column) and no test read a targeted-cohort
+attestation back. `cohort_scope` ships regardless: it narrows what the gate
+already admitted.
+
 
 ### Changed — the release cycle: certify 97 min → 20 min, measured (CIRISPersist#879, #880, #881; rides the next feature cut per the no-micro-release rule)
 

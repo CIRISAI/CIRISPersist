@@ -14032,6 +14032,61 @@ impl PyEngine {
         })
     }
 
+    /// v46.4.0 (CIRISPersist#821, `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md` §3) —
+    /// **the chunk twin of `adopt_sealed_blob_json`**: take one sealed chunk
+    /// of a stream this node was SENT, under the provenance the author's row
+    /// declares. The receiving half of the scoped chunk DAG
+    /// (`put_blob_chunk_scoped` -> `seal_stream_scoped`) — without it a
+    /// sibling device can be handed a video and cannot store it.
+    ///
+    /// Same gates as the blob twin, applied by the Engine door: `would_hold`
+    /// (never store what this node is not party to) and the adopt path's own
+    /// checks. Never opens the envelope; the binding is the author's fact.
+    ///
+    /// Payload JSON:
+    /// ```json
+    /// {
+    ///   "envelope_b64": "<the sealed chunk envelope, verbatim>",
+    ///   "stream_id": "<the stream this chunk belongs to>",
+    ///   "seq": 0,
+    ///   "epoch": 0,
+    ///   "plaintext_size": 1048576,
+    ///   "author_key_id": "<attesting_key_id of the referencing attestation>",
+    ///   "cohort_scope": "self",
+    ///   "community_key_id": "<community | owner/family key | null>",
+    ///   "tier": "community_dek | invisible_encrypted"
+    /// }
+    /// ```
+    /// Returns JSON `{"chunk_sha256": "<hex>"}` — the CIPHERTEXT address.
+    fn adopt_sealed_chunk_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptSealedChunkWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_chunk_json decode: {e}"))
+            })?;
+            let envelope = B64.decode(&wire.envelope_b64).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_chunk_json envelope_b64 decode: {e}"))
+            })?;
+            let provenance = wire.provenance.into_provenance("adopt_sealed_chunk_json")?;
+            let (stream_id, seq, epoch, size) =
+                (wire.stream_id, wire.seq, wire.epoch, wire.plaintext_size);
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(async move {
+                        engine
+                            .adopt_sealed_chunk(&stream_id, seq, &envelope, epoch, size, provenance)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({ "chunk_sha256": hex::encode(sha) }).to_string())
+            })
+        })
+    }
+
     /// #846 (`BLOB_REPLICATION.md` §6.3) — **the WILL decision as a door**,
     /// asked before a fetch: would this node hold content with this
     /// provenance, now? Writes nothing. Payload JSON is the provenance
@@ -33250,6 +33305,20 @@ struct AdoptSealedBlobWire {
     #[serde(default)]
     aad_b64: Option<String>,
     disposition: String,
+}
+
+/// v46.4.0 (CIRISPersist#821) — the wire for `adopt_sealed_chunk_json`: the
+/// blob wire plus the chunk's position in its stream. No `disposition` — a
+/// chunk adopt announces nothing; the DAG's manifest is what a holder claims.
+#[derive(serde::Deserialize)]
+struct AdoptSealedChunkWire {
+    envelope_b64: String,
+    stream_id: String,
+    seq: u64,
+    epoch: u64,
+    plaintext_size: u64,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
 }
 
 fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {

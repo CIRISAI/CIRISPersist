@@ -18949,6 +18949,25 @@ const SCORES_FA_COLS: &str = "fa.attestation_id, fa.attesting_key_id, fa.atteste
 /// `list_attestations` would silently stop returning callers' own local rows —
 /// a quiet behaviour change dressed as a consistency fix. An EXPLICIT `tier` is
 /// honoured identically on both, which is what #596 asked for.
+/// v46.4.0 (CIRISPersist#891, `FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md` §3) — the
+/// **cohort axes**, in ONE spelling called from both read paths
+/// (`sqlite_selection_axes` for the attestation plane,
+/// `sqlite_scores_shared_predicates` for the scores plane). A new cohort axis
+/// pushed at one site and forgotten at the other is a filter that silently
+/// means different things through two doors; this function is why that cannot
+/// happen. `alias` is `""` or `"fa."`.
+fn sqlite_cohort_axes(
+    filter: &crate::read::AttestationFilter,
+    alias: &str,
+    parts: &mut Vec<String>,
+    binds: &mut Vec<SqlValue>,
+) {
+    if let Some(cs) = &filter.cohort_scope {
+        binds.push(SqlValue::Text(cs.clone()));
+        parts.push(format!("{alias}cohort_scope = ?{}", binds.len()));
+    }
+}
+
 fn sqlite_selection_axes(
     filter: &crate::read::AttestationFilter,
     alias: &str,
@@ -18990,6 +19009,7 @@ fn sqlite_selection_axes(
             parts.push(format!("{alias}attesting_key_id IN ({})", ph.join(",")));
         }
     }
+    sqlite_cohort_axes(filter, alias, parts, binds);
 }
 
 fn sqlite_scores_shared_predicates(
@@ -18998,6 +19018,7 @@ fn sqlite_scores_shared_predicates(
 ) -> (Vec<String>, Vec<SqlValue>) {
     let mut parts: Vec<String> = Vec::new();
     let mut binds: Vec<SqlValue> = Vec::new();
+    sqlite_cohort_axes(filter, "fa.", &mut parts, &mut binds);
     if let Some(subj) = &filter.subject_key_id {
         binds.push(SqlValue::Text(subj.clone()));
         parts.push(format!("s.subject_key_id = ?{}", binds.len()));
