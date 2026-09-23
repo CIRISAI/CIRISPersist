@@ -15146,7 +15146,9 @@ mod tests {
     }
 
     /// `emit_509_grant_audience`, naming the cohort a targeted audience
-    /// places rows in (its cohort-target alias, `community_key_id`).
+    /// places rows in (its cohort-target alias, `community_key_id`). Gated as
+    /// its sibling is: `emit_attestation_self` needs a backend.
+    #[cfg(feature = "sqlite")]
     async fn emit_509_grant_audience_in(
         engine: &Engine,
         peer: &str,
