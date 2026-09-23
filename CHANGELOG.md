@@ -51,7 +51,11 @@ dropped every AAD mismatch into the generic arm with nothing going red.
   not this one; a unit pin now asserts that split. One mapper,
   `at_rest_cascade::open_err`, carries it at all four read sites; every
   other error goes to each site's existing mapper, unchanged.
-- Python: `ValueError("blob_seal_did_not_open: <sha>")`.
+- Python: `RuntimeError("blob_seal_did_not_open: <sha>")`. The exception
+  type is unchanged from the `Backend` arm it replaces (the Python contract
+  splits `RuntimeError`, after authorization, from `ValueError`, a caller
+  refusal); only the token changes. Three wheel tests that pinned
+  `match="blob_backend"` now pin the new token.
 - I40 (a wrong or absent AAD after authorization, every scope, sqlite +
   postgres) and I42 (a chunk moved to another position or lifted to another
   stream) now assert the typed arm naming the blob, where they used to

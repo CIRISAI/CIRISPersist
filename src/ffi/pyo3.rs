@@ -33175,8 +33175,15 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // not open" (look at the row: the associated data) from "may not read"
         // (`blob_not_granted`: get a grant) without reading prose. The sha rides
         // after the token, the `QuarantineWithheld` shape.
+        //
+        // The exception TYPE stays `RuntimeError`: this outcome was `Backend`
+        // (RuntimeError, a crypto-class failure AFTER authorization) before this
+        // cut, and the Python contract splits RuntimeError (after authorization)
+        // from ValueError (a caller refusal such as `blob_not_granted`). Only the
+        // token changes, so `except RuntimeError` keeps catching it and a
+        // `match="blob_backend"` pin is the one thing that breaks — by design.
         crate::federation::BlobError::SealDidNotOpen { ref sha256_hex } => {
-            PyValueError::new_err(seal_did_not_open_message(kind, sha256_hex))
+            PyRuntimeError::new_err(seal_did_not_open_message(kind, sha256_hex))
         }
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
         // so a caller sees this only if every retry lost the race.

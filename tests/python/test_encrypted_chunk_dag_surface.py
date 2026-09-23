@@ -131,7 +131,7 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
         # #831 — associated data is REAL on every new surface: a read
         # presenting data the seal was not bound to fails after
         # authorization, as a backend/crypto error, never as not-granted.
-        with pytest.raises(RuntimeError, match="blob_backend"):
+        with pytest.raises(RuntimeError, match="blob_seal_did_not_open"):
             eng.read_blob_range_as(manifest, kid, 0, 9, aad_b64=_b64(b"x"))
 
         # And the bound case, end to end on the chunk surface: chunks and
@@ -147,7 +147,7 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
         )["manifest_sha256"]
         assert base64.b64decode(eng.read_blob_range_as(bound, kid, 2990, 3010, aad_b64=row_data)) == plain[2990:3011]
         assert base64.b64decode(eng.read_blob_as(bound, kid, aad_b64=row_data)) == plain
-        with pytest.raises(RuntimeError, match="blob_backend"):
+        with pytest.raises(RuntimeError, match="blob_seal_did_not_open"):
             eng.read_blob_as(bound, kid)
 
         # RFC 9110 bounds against the PLAINTEXT total.
@@ -191,7 +191,7 @@ def test_a_stream_belongs_to_its_first_append_and_a_chunk_to_its_position_837_83
     this node's derived key); an append naming another cohort on the same id
     is refused with the stable `blob_invalid_argument` token; a chunk reads
     by POSITION (`read_stream_chunk_as`) and no longer by its sha alone
-    (`blob_backend`: a crypto-class error after authorization); a stranger
+    (`blob_seal_did_not_open`, v47.1.0 #842: a typed crypto-class error after authorization); a stranger
     is `blob_not_granted`; an unknown position is `blob_invalid_argument`."""
     eng = _engine(tmp_path)
     try:
@@ -240,9 +240,9 @@ def test_a_stream_belongs_to_its_first_append_and_a_chunk_to_its_position_837_83
             eng.read_stream_chunk_as(stream, 0, "stranger-" + secrets.token_hex(4))
         with pytest.raises(ValueError, match="blob_invalid_argument"):
             eng.read_stream_chunk_as(stream, 9, kid)
-        with pytest.raises(RuntimeError, match="blob_backend"):
+        with pytest.raises(RuntimeError, match="blob_seal_did_not_open"):
             eng.read_blob_as(shas[0], kid)
-        with pytest.raises(RuntimeError, match="blob_backend"):
+        with pytest.raises(RuntimeError, match="blob_seal_did_not_open"):
             eng.read_stream_chunk_as(stream, 0, kid, aad_b64=_b64(b"not what it was written under"))
 
         # The sealed DAG still assembles through the manifest, whole and by range.
