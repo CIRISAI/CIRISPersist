@@ -70,21 +70,23 @@ Every site in §1's table switches from `==`/`matches!` on strings to `Scope::pa
 - **`crypto_tier(&str, ..)`** keeps its signature for its callers and delegates. An unparseable scope stays `Plaintext` on an **explicit** `None` arm, documented as "a corrupt column, not a scope" (#796's "if a runtime wildcard is still wanted, make it a distinct arm that says so").
 - **AV-45** (`check_write_cohort_scope`): `Targeted(Family)` → `family_key_ids`; `Targeted(Room)` → `community_key_ids`; `Commons` → `Ok`; `SelfCollective` → `Ok`. The three enforcement sites share one `needs_admission = placement is Targeted`.
 - **AV-84** and the federation-tier floor: `is_targeted()`.
-- **Read gate:** `BROAD_TIERS` becomes `Scope::ALL.filter(Commons)`. The targeted arms iterate `Targeted(Room)` scopes, so `affiliations` joins `community` on V150's `cohort_target`. The SQL twin renders `cohort_scope IN ('community','affiliations') AND cohort_target = ANY($n)`.
+- **Read gate:** `BROAD_TIERS` becomes `cohort_scope::commons()`, derived from the classifier. The SQL twin renders **one arm per roster**, `cohort_scope IN ('community','affiliations') AND cohort_target = ANY($n)`, so the reader's community set is bound once. (A first cut rendered one arm per scope and bound it twice; the `scope_bind` parameter-count test caught it.) A single-scope roster (`family`) renders `= 'family'`, byte-identical to before.
 - **`Audience::Affiliations { community_key_id }`**: `from_cohort_scope` refuses a room-less `affiliations` with the same `need(..)` as `community`; `cohort_target` and `cohort_target_member` (`"community_key_id"`) follow.
 
-The hold path, `namespace`, `at_rest_cascade` and `blobs.rs` already answer "room" and are moved onto the classifier in the same cut, so there is one spelling left, not two.
+The hold path, `at_rest_cascade` and `blobs.rs` already answered "room" and are moved onto the classifier in the same cut, so there is one spelling left, not two. `namespace::projection_for` is **not** moved: it classifies a different axis (per-plane projection: `SelfOwn` / `Cohort` / `Global`), its tables already group `affiliations` with `community`, and its fallback arm fails *narrow* (`Cohort`), not open.
 
 ## 4. #797: a membership the resolver cannot answer yet
 
 `check_write_cohort_scope_for` resolves membership for the ONE claimed target. `contains_or_absent` maps "that cohort's roster is unknown here" (`Err(InvalidArgument)`) to `Ok(false)`, which refuses as `NoCommunityMembership` / `NoFamilyMembership`, exactly as a genuine non-member is refused. The code comment already calls this "the transient-correct answer for a row arriving ahead of its roster (CIRISEdge#522)". The refusal is correct; its *name* is wrong, and callers log and act on the name. The consent sweep counts both outcomes as `skipped`.
 
-New arm: **`ScopeRefusalReason::MembershipUnresolved { plane }`**, kind `scope_membership_unresolved`. It is produced only where the roster for the claimed target **does not exist in this directory**. Both still refuse the write (fail-secure is unchanged); the caller learns which one it got.
+New arm: **`ScopeRefusalReason::MembershipUnresolved`**, kind `scope_membership_unresolved`. (A unit variant: the scope is already logged beside it, so carrying the plane would repeat it.) It is produced only where the roster for the claimed target **does not exist in this directory**. Both still refuse the write (fail-secure is unchanged); the caller learns which one it got.
 
 - Terminal (`NoFamilyMembership` / `NoCommunityMembership`): the roster exists and the writer's principal is not an active member.
 - Transient (`MembershipUnresolved`): no roster for that target, so nothing can yet answer.
 
 Backend errors still propagate as errors. They are not refusals.
+
+It is produced at both write doors. The attestation put door looks the roster up before resolving membership. The trace-ingest door looks it up **only on the refusal path**, so an admitted batch pays nothing. The reason reaches Python as `"<kind>: <reason>"` (the `rate_limited` shape); the exception type and the leading token are unchanged.
 
 `sweep_widen` gains a report counter, `awaiting_roster`, beside `awaiting_actor`, so the background walk stops logging "not a member" for a room it has not received yet.
 
@@ -96,6 +98,26 @@ Backend errors still propagate as errors. They are not refusals.
 - The #893 legs (I144), the #888 self legs, and the V141 rebuild witness stay green.
 
 **Mutants planned:** `affiliations` back to `Commons` in `placement()` (I145 red at every gate at once, which is the point); one gate reverting to a local `FAMILY || COMMUNITY` spelling (I145 red on that gate alone, with the answer-sets unequal); `crypto_tier` regaining a `_` arm (I146 red: a new variant no longer fails the build; see §6); `MembershipUnresolved` collapsed into `NoCommunityMembership` (I147 red); the room-less `affiliations` audience admitted (I145 widen leg red).
+
+### 5.1 Mutation round: 11 / 11
+
+Run under `scripts/pg_test_db.sh`. M9's pass condition is DID-NOT-COMPILE (§6).
+
+| # | Mutant | Verdict |
+|---|--------|---------|
+| M1 | the classifier puts `affiliations` back in the Commons | KILLED: I145 + I147 (all backends), the conformance gate |
+| M2 | the attestation put door re-spells "targeted" locally as `FAMILY \|\| COMMUNITY` | KILLED: I145, I147 (all backends) |
+| M3 | the SQL twin's room arm drops `affiliations` | KILLED: I145 sqlite + postgres (the two read doors disagree) |
+| M4 | the Rust twin reads `affiliations` as broad | KILLED: I145 memory |
+| M5 | the put door's unresolved refusal collapses into `NoCommunityMembership` | KILLED: I147 (all backends), the sweep's `awaiting_roster` test |
+| M6 | the trace door's unresolved refusal collapses | KILLED: `write_gate_unresolved_roster_is_retryable_797` |
+| M7 | a room-less `affiliations` audience is admitted at the widen door | KILLED: I145 (all backends) |
+| M8 | `crypto_tier` stores `affiliations` in plaintext | KILLED: the conformance gate (the #796 class, now catchable) |
+| M9 | a new `Scope` variant with no classification | **DID-NOT-COMPILE** (the pass condition) |
+| M10′ | the hold path sends `affiliations` to everyone | KILLED: I145 (all backends) |
+| M11 | the Python message drops the reason | KILLED: `write_scope_refused_message_carries_the_reason_797` |
+
+M10 as first written was malformed Rust (a `||` after a `match` statement), so its DID-NOT-COMPILE measured my mutant, not the witness. It was rewritten as a valid mutation (M10′) and re-run.
 
 ## 6. Measuring the build-error claim
 

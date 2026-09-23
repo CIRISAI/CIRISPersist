@@ -9,8 +9,93 @@ threat-model citations because this crate's audit story is the point.
 
 ## [47.0.0] - 2026-09-23
 
-### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796, #797)
-In progress — see `FSD/SCOPE_CLASSIFIER.md`.
+### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)
+#893 and #897 are one defect from opposite directions: **for one
+`cohort_scope`, persist's gates asked different questions.** #893 failed
+closed and was reported within a day. #897 fails open, and nothing reports
+that.
+
+The cause was structural. `cohort_scope` was a closed vocabulary held as
+`&str` constants, so every gate re-spelled its own classification, and
+nothing compared the spellings. Eight sites spelled "targeted cohort" as
+`FAMILY || COMMUNITY` and so read `affiliations` as broad: AV-45 at three
+write paths, AV-84 at two, the federation-tier floor, both read-gate twins,
+and `crossing::Audience`. Meanwhile every at-rest site already read it as a
+room. `resolve_write_tier` refused to **store** an `affiliations` row naming
+no community, while AV-45 **admitted** one.
+
+Edge ruled on #897, from CC 4.4.3.2.1 / 4.4.3.2.8: `affiliations` is in the
+Community tier, so readers are the roster. An affiliation "shares the
+CommunityDek crypto tier and all the community machinery". A public
+affiliation record is *promoted* to a commons row; it is never read through
+`affiliations`.
+
+- **`cohort_scope::Scope`**: the vocabulary as a type. **`Scope::placement()`**
+  (`SelfCollective | Targeted(Family | Room) | Commons`) is the one
+  exhaustive classifier, and every gate reads it: AV-45 (the attestation put
+  door and trace ingest), AV-84, the federation-tier floor, the read gate
+  (both twins), the hold path, `resolve_write_tier`, the blob storage floor,
+  and `crypto_tier`. Adding a variant is a build error at each match, where
+  before it silently fell through a `_`.
+- **`Audience::Affiliations { community_key_id }`** (BREAKING: was a unit
+  variant). `from_cohort_scope` refuses a room-less `affiliations`, exactly
+  as it refuses a room-less `community`.
+- The SQL twin renders **one arm per roster**, `cohort_scope IN
+  ('community','affiliations') AND room = ANY($n)`, so the reader's set is
+  bound once. The `family` arm is byte-identical.
+- **#796**: `crypto_tier` matches the enum exhaustively. A value outside the
+  closed set is an explicit, named arm ("a corrupt column, not a scope"),
+  not a `_`. The conformance gate `check_cohort_scope_processor_is_total`
+  asserted only that `crypto_tier` did not panic; with a `_` arm it could
+  not panic, so it could not fail. It now pins `(placement, tier)` for each
+  scope and checks the table's length against the type's.
+- **No grammar change.** A consent grant already carries its room as a
+  cohort-target alias, and `sweep_widen` already passes it. A grant naming
+  `affiliations` *and* its room widens into that room (tested). A grant
+  naming `affiliations` alone is skipped, as a room-less `community` grant
+  already was. `CONSENT_GRAMMAR_HASH` does not move.
+
+**Migration.** A stored `affiliations` row naming no room becomes
+read-refused. That is correct: the hold path never sent one, and it was
+readable only through this bug. No persist migration is needed (V150's
+partial index already covers `affiliations`). Census before adopting:
+`SELECT count(*) FROM federation_attestations WHERE cohort_scope =
+'affiliations' AND cohort_target IS NULL`. No producer is known in edge,
+server or agent.
+
+### Added — `MembershipUnresolved`: a roster not held yet is not "not a member" (CIRISPersist#797)
+A write naming a cohort whose roster this directory does not **hold** used to
+refuse as `NoFamilyMembership` / `NoCommunityMembership`, which is the same
+answer a genuine non-member gets. The first is transient (the row arrived
+ahead of its roster; CIRISEdge#522 refused rows re-offer), and the second is
+terminal.
+
+- New **`ScopeRefusalReason::MembershipUnresolved`**, kind
+  `scope_membership_unresolved`. It is still a refusal, so fail-secure is
+  unchanged. It is produced only when the roster is **structurally** absent
+  (`lookup_*` returns `None`), never inferred from an error variant. It is
+  produced at the attestation put door and at trace ingest (the ingest door
+  looks up the roster only on the refusal path, so an admitted batch pays
+  nothing).
+- It reaches Python. An AV-45 `ValueError` now reads `"<kind>: <reason>"`,
+  in the `rate_limited` shape: `federation_write_scope_refused:
+  scope_membership_unresolved`. The exception type and the leading token are
+  unchanged; only an **equality** match on the message breaks.
+- `ConsentSweepReport` gains **`awaiting_roster`**, and the Python sweep
+  dict gains the same key. A widening waiting on a roster is no longer
+  counted, or logged, as a `skipped` non-member.
+
+**Witnesses:**
+- **I145** (sqlite + postgres + memory): one `affiliations` row, asked of
+  write, widen, hold and both read doors, with the admitted sets asserted
+  **equal to each other**. A gate that drifts is red against its siblings,
+  not only against a constant. This is Edge's test shape: the one thing
+  #893 and #897 had in common is that no test asked one gate what another
+  had answered.
+- **I147**: unresolved vs terminal vs admitted, for `community` and
+  `affiliations`.
+- The counter at the sweep, and the Python message pin.
+- Mutation round: **11 / 11** (10 killed; M9, a new unclassified `Scope` variant, fails to compile, which is the claim) (`FSD/SCOPE_CLASSIFIER.md` §5.1).
 
 ## [46.5.0] - 2026-09-23
 
