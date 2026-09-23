@@ -27,10 +27,13 @@ use super::admission::CallerAdmission;
 ///   [`build_caller_admission`](super::build_caller_admission)).
 #[derive(Clone, Debug)]
 pub enum CallerScope {
-    /// Unauthenticated reader. Admits rows tagged cohort_scope ∈
-    /// {community, affiliations, species, biosphere, federation} —
-    /// the non-suppressed tiers per §8.1.13.3. Refuses self + family
-    /// (cohort_scope::suppresses_holds_bytes returns true for those).
+    /// Unauthenticated reader. Admits the Commons only — cohort_scope ∈
+    /// {species, biosphere, federation}
+    /// ([`cohort_scope::commons`](crate::federation::types::cohort_scope::commons)).
+    /// Every scope with a roster (self, family, community, affiliations)
+    /// is refused: an unauthenticated reader proves no membership.
+    /// (v47.0.0, #897: this doc listed `community` and `affiliations` as
+    /// admitted; the gate itself had not admitted `community` since v4.0.)
     Unauthenticated,
 
     /// Authenticated caller. Admission is *substrate-built* from the

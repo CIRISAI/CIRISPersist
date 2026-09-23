@@ -296,7 +296,7 @@ mod tests {
         );
         assert_eq!(
             frag,
-            "(t.cohort_scope IN ('affiliations','species','biosphere','federation'))"
+            "(t.cohort_scope IN ('species','biosphere','federation'))"
         );
     }
 

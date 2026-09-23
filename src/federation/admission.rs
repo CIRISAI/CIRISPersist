@@ -1407,13 +1407,12 @@ impl DimensionAdmissionPolicy {
     ///   [`ScopeRefusalReason::NoFamilyMembership`]. A `None` target
     ///   (claiming family visibility without naming a family) cannot be
     ///   membership-validated and is refused.
-    /// - `community` — `Ok` iff `claimed_target_id ∈
-    ///   writer_admission.community_key_ids`, else
-    ///   [`ScopeRefusalReason::NoCommunityMembership`].
-    /// - `affiliations` / `species` / `biosphere` / `federation` —
-    ///   broad belonging-tiers; no per-row target; any authenticated
-    ///   writer may emit. The federation layer counter-signs (hybrid
-    ///   sigs).
+    /// - `community` / `affiliations` (one room plane, v47.0.0 #897) —
+    ///   `Ok` iff `claimed_target_id ∈ writer_admission.community_key_ids`,
+    ///   else [`ScopeRefusalReason::NoCommunityMembership`].
+    /// - `species` / `biosphere` / `federation` — the commons; no
+    ///   per-row target; any authenticated writer may emit. The
+    ///   federation layer counter-signs (hybrid sigs).
     /// - anything else — [`ScopeRefusalReason::InvalidCohortScope`]
     ///   carrying the offending label (closed-set fall-through).
     ///
