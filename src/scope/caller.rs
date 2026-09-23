@@ -91,16 +91,22 @@ impl CallerScope {
         cohort_target: Option<&str>,
         dimension: Option<&str>,
     ) -> bool {
-        const BROAD: &[&str] = &["affiliations", "species", "biosphere", "federation"];
-        if BROAD.contains(&cohort_scope) {
+        use crate::federation::types::cohort_scope::{Placement, Scope, TargetPlane};
+        // v47.0.0 (CIRISPersist#897) — through the ONE classifier. The local
+        // `BROAD` list here read `affiliations` as a commons tier; the SQL
+        // twin, AV-45 and the hold path now all ask `placement()`.
+        let Some(scope) = Scope::parse(cohort_scope) else {
+            return false; // outside the closed set: nobody's
+        };
+        if scope.placement() == Placement::Commons {
             return true;
         }
         match self {
             CallerScope::Unauthenticated => false,
-            CallerScope::Authenticated { admission } => match cohort_scope {
+            CallerScope::Authenticated { admission } => match scope.placement() {
                 // v46.3.1 (#888): the target is one of the caller's own keys
                 // — resolved on BOTH sides (FSD/OCCURRENCE_PRINCIPAL.md §6).
-                "self" => {
+                Placement::SelfCollective => {
                     admission.self_key_ids.contains(target)
                         && (target == admission.occurrence_key_id
                             || !dimension.is_some_and(
@@ -109,11 +115,13 @@ impl CallerScope {
                 }
                 // The ROW's room, never the producer's rooms — and a row
                 // that names none is nobody's (fail closed).
-                "family" => cohort_target.is_some_and(|r| admission.family_key_ids.contains(r)),
-                "community" => {
+                Placement::Targeted(TargetPlane::Family) => {
+                    cohort_target.is_some_and(|r| admission.family_key_ids.contains(r))
+                }
+                Placement::Targeted(TargetPlane::Room) => {
                     cohort_target.is_some_and(|r| admission.community_key_ids.contains(r))
                 }
-                _ => false,
+                Placement::Commons => true,
             },
         }
     }

@@ -1564,6 +1564,11 @@ pub mod test_support {
         let family = crate::federation::Audience::Family {
             family_key_id: fam.clone(),
         };
+        // v47.0.0 (CIRISPersist#897) — an affiliation is a room (CC
+        // 4.4.3.2.8), so it stands in the targeted arm with the other two.
+        let affiliations = crate::federation::Audience::Affiliations {
+            community_key_id: comm.clone(),
+        };
         let stage = |attested: String| {
             let producer = producer.clone();
             async move {
@@ -1589,7 +1594,7 @@ pub mod test_support {
             }
         };
 
-        for audience in [community.clone(), family.clone()] {
+        for audience in [community.clone(), affiliations.clone(), family.clone()] {
             let scope = audience.cohort_scope();
             let prior = stage(stranger.clone()).await;
             let err = ts::widen(dir, &prior, audience.clone(), &[])
@@ -1657,7 +1662,14 @@ pub mod test_support {
                 .await
                 .expect("({tag}) B9: the federation-tier third-party row admits");
             let prior = dir.get_attestation(&id).await.expect("read").expect("row");
-            // `federation` is the widest scope; widen from a narrower born row.
+            // v47.0.0 (CIRISPersist#897) — a third-party row BORN at
+            // `affiliations` is refused like one born at `community`: the
+            // affiliation is a room, and AV-84's targeted arm now covers it.
+            // (This block used to widen a born-`affiliations` third-party row
+            // to `species` as a broad-to-broad move; that claim died with the
+            // ruling, and "a commons widening admits" is the Federation block
+            // above.)
+            let _ = prior;
             let mut narrower = scores_row(
                 &uuid::Uuid::new_v4().to_string(),
                 &producer,
@@ -1665,22 +1677,23 @@ pub mod test_support {
                 "trust:demo:v1",
             );
             narrower.cohort_scope = cohort_scope::AFFILIATIONS.to_owned();
+            narrower.attestation_envelope["community_key_id"] = serde_json::json!(comm);
             ts::reseal(&mut narrower);
-            let _ = prior;
             let nid = narrower.attestation_id.clone();
-            dir.put_attestation(SignedAttestation {
-                attestation: narrower,
-            })
-            .await
-            .expect("({tag}) B9: an affiliations-tier third-party row admits");
-            let prior = dir.get_attestation(&nid).await.expect("read").expect("row");
-            let err = ts::widen(dir, &prior, crate::federation::Audience::Species, &[])
+            let err = dir
+                .put_attestation(SignedAttestation {
+                    attestation: narrower,
+                })
                 .await
-                .err();
-            // species is a broad tier: no standing to have → admitted.
+                .expect_err("({tag}) B9: an affiliations-tier third-party row is refused");
+            assert_eq!(
+                err.kind(),
+                "federation_cohort_standing_refused",
+                "({tag}) B9: the same kind as the community arm: {err:?}"
+            );
             assert!(
-                err.is_none(),
-                "({tag}) B9: a broad-tier widening admits: {err:?}"
+                dir.get_attestation(&nid).await.expect("read").is_none(),
+                "({tag}) B9: a refused row is not stored (AV-9)"
             );
         }
     }
@@ -2120,8 +2133,15 @@ pub mod test_support {
         // SelfOwn/Cohort boundary and passes on the broken code; this one does
         // not.
         let mid_id = uuid::Uuid::new_v4().to_string();
+        // v47.0.0 (CIRISPersist#897) — "DEK-encrypted to ONE affiliation":
+        // the permission names it, and the licensor is in it (AV-45). Before
+        // v47 this row named no affiliation and AV-45 admitted it anyway.
+        let aff = format!("aff-814-{tag}-{}", uuid::Uuid::new_v4().simple());
+        ts::register_hybrid_key(dir, &aff).await;
+        ts::seed_two_member_community(dir, &aff, &licensor, &licensor).await;
         let mut mid = scores_row(&mid_id, &licensor, &licensor, "consent:scope:share:v1");
         mid.cohort_scope = cohort_scope::AFFILIATIONS.to_owned();
+        mid.attestation_envelope["community_key_id"] = serde_json::json!(aff);
         ts::reseal(&mut mid);
         dir.put_attestation(SignedAttestation { attestation: mid })
             .await
@@ -2930,7 +2950,7 @@ pub mod test_support {
         }
 
         // W7 / W8 — widening is a supersedes by the actor; the prior is untouched.
-        let out = ts::widen(dir, &after, crate::federation::Audience::Affiliations, &[])
+        let out = ts::widen(dir, &after, crate::federation::Audience::Species, &[])
             .await
             .expect("({tag}) W7: the actor widens");
         let MeshCrossingOutcome::Crossed(wreport) = out else {

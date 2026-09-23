@@ -3980,6 +3980,16 @@ impl Engine {
             Ok(MeshCrossingOutcome::AlreadyWidened { .. })
             | Ok(MeshCrossingOutcome::AlreadyInMesh { .. }) => {}
             Ok(MeshCrossingOutcome::AwaitingActor { .. }) => report.awaiting_actor += 1,
+            // v47.0.0 (CIRISPersist#797) — the room's roster has not arrived:
+            // wait for it, and do not log "not a member" for a room this node
+            // simply has not received yet.
+            Err(crate::federation::Error::WriteScopeRefused(
+                crate::scope::ScopeRefusalReason::MembershipUnresolved,
+            )) => {
+                tracing::debug!(attestation_id = %row.attestation_id,
+                    "promote_consented_backlog: the grant's room is not held here yet; awaiting roster");
+                report.awaiting_roster += 1;
+            }
             Err(e) => {
                 tracing::warn!(attestation_id = %row.attestation_id, error = %e,
                     "promote_consented_backlog: widen_audience failed; skipping");
@@ -14561,7 +14571,7 @@ mod tests {
         let err = engine
             .widen_audience(
                 &id,
-                &producer_ci(&local, crate::federation::Audience::Affiliations),
+                &producer_ci(&local, crate::federation::Audience::Species),
                 None,
                 &[],
             )
@@ -14599,7 +14609,7 @@ mod tests {
         let outcome = engine
             .widen_audience(
                 &id,
-                &producer_ci(&prior, crate::federation::Audience::Affiliations),
+                &producer_ci(&prior, crate::federation::Audience::Species),
                 None,
                 &[],
             )
@@ -14609,7 +14619,7 @@ mod tests {
             panic!("expected Crossed, got {outcome:?}");
         };
         assert_ne!(crossing.attestation_id, id, "a NEW row");
-        assert_eq!(crossing.audience, crate::federation::Audience::Affiliations);
+        assert_eq!(crossing.audience, crate::federation::Audience::Species);
         assert!(crossing.replicates.discoverable);
 
         let prior_after = sq.get_attestation(&id).await.unwrap().expect("row");
@@ -14626,7 +14636,7 @@ mod tests {
             .expect("the supersedes row");
         assert_eq!(sup.attestation_type, attestation_type::SUPERSEDES);
         assert_eq!(sup.tier, attestation_tier::FEDERATION);
-        assert_eq!(sup.cohort_scope, cohort_scope::AFFILIATIONS);
+        assert_eq!(sup.cohort_scope, cohort_scope::SPECIES);
         assert_eq!(sup.attesting_key_id, node, "W8: signed by the actor");
         assert_eq!(
             sup.attestation_envelope[paths::REFERENCES_ATTESTATION_ID],
@@ -14697,7 +14707,7 @@ mod tests {
             axis_of(&engine.enter_mesh(&id, &ci, None).await.unwrap_err()),
             "content"
         );
-        let ci = producer_ci(&row, crate::federation::Audience::Affiliations);
+        let ci = producer_ci(&row, crate::federation::Audience::Species);
         assert_eq!(
             axis_of(&engine.enter_mesh(&id, &ci, None).await.unwrap_err()),
             "recipient_see",
@@ -14734,9 +14744,28 @@ mod tests {
             ))
             .await
             .unwrap();
+        // v47.0.0 (CIRISPersist#897) — an `affiliations` audience names its
+        // affiliation, and the grant carries it as its cohort-target alias.
+        // The node is a member, so AV-45 admits the widening into that room.
+        // (Before v47 this grant named no room and widened into a scope
+        // anyone could read.)
+        let room = "aff-39f";
+        // A real affiliation has a human in it: AV-9 refuses to federate a
+        // reference to a room with no steward-bound authority ("better no
+        // group than an unmoderated one"), and a USER key is steward-bound.
+        let human = "human-39f";
+        ts::register_identity_key(&*sq, human, crate::federation::types::identity_type::USER).await;
+        crate::ceg::list::drive_query_invariants::bodies::seed_room(&*sq, room, &[&node, human])
+            .await;
         // The (c) hook fires the sweep right after the grant lands.
-        let _grant =
-            emit_509_grant_audience(&engine, "peer-39f", &["trace:"], "affiliations").await;
+        let _grant = emit_509_grant_audience_in(
+            &engine,
+            "peer-39f",
+            &["trace:"],
+            "affiliations",
+            Some(room),
+        )
+        .await;
 
         let prior = sq.get_attestation(&node_trace).await.unwrap().expect("row");
         assert_eq!(prior.tier, attestation_tier::FEDERATION, "entered");
@@ -14758,6 +14787,13 @@ mod tests {
             cohort_scope::AFFILIATIONS,
             "the grant's audience"
         );
+        assert_eq!(
+            crate::federation::admission::envelope_cohort_target(&widened[0].attestation_envelope)
+                .unwrap(),
+            Some(room),
+            "the widening lands IN the room the grant named — the room rides the grant's \
+             cohort-target alias, so no grammar change was needed (#897)"
+        );
         let waiting = sq
             .get_attestation(&actor_trace)
             .await
@@ -14772,6 +14808,35 @@ mod tests {
         let again = engine.promote_consented_backlog().await.unwrap();
         assert_eq!((again.promoted, again.widened, again.skipped), (0, 0, 0));
         assert_eq!(again.awaiting_actor, 1, "still waiting, still said so");
+    }
+
+    /// v47.0.0 (CIRISPersist#797, I147 at the sweep) — a grant placing rows
+    /// in an affiliation this node has NEVER RECEIVED cannot widen yet: the
+    /// roster is absent, so membership is unresolved. The sweep counts that
+    /// `awaiting_roster` (it will retry) — not `skipped`, which before this
+    /// cut logged it as the writer not being a member.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn consent_sweep_awaits_a_roster_it_does_not_hold_797() {
+        use crate::federation::FederationDirectory;
+        let (engine, sq, node) = engine_with_registered_node("node-797").await;
+        sq.attestation_insert_local(build_509_trace_input(&node, "trace-797"))
+            .await
+            .unwrap();
+        let _grant = emit_509_grant_audience_in(
+            &engine,
+            "peer-797",
+            &["trace:"],
+            "affiliations",
+            Some("aff-797-not-here-yet"),
+        )
+        .await;
+        let report = engine.promote_consented_backlog().await.unwrap();
+        assert_eq!(
+            (report.awaiting_roster, report.skipped),
+            (1, 0),
+            "an absent roster WAITS; it is not a skipped non-member: {report:?}"
+        );
     }
 
     /// Pass 2: a row that entered the mesh BEFORE any grant covered it (the
@@ -14848,7 +14913,7 @@ mod tests {
             serde_json::json!({
                 "grants": "transfer",
                 "attestation_prefixes": ["trace:"],
-                "audience": "affiliations",
+                "audience": "species",
                 "restrictions": [{"op": "strip_field", "path": "operator_note"}],
             }),
         )
@@ -14865,7 +14930,7 @@ mod tests {
         let again = engine
             .widen_audience(
                 &id,
-                &producer_ci(&prior, crate::federation::Audience::Affiliations),
+                &producer_ci(&prior, crate::federation::Audience::Species),
                 None,
                 &["operator_note".to_owned()],
             )
@@ -15077,7 +15142,19 @@ mod tests {
         prefixes: &[&str],
         audience: &str,
     ) -> String {
-        let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+        emit_509_grant_audience_in(engine, peer, prefixes, audience, None).await
+    }
+
+    /// `emit_509_grant_audience`, naming the cohort a targeted audience
+    /// places rows in (its cohort-target alias, `community_key_id`).
+    async fn emit_509_grant_audience_in(
+        engine: &Engine,
+        peer: &str,
+        prefixes: &[&str],
+        audience: &str,
+        room: Option<&str>,
+    ) -> String {
+        let mut value = serde_json::json!({
             "dimension": crate::federation::consent_peer_set::DIMENSION,
             "subject_key_ids": [peer],
             "payload": {
@@ -15086,8 +15163,11 @@ mod tests {
                 "audience": audience,
             },
             "subject_kind": "consent_replication",
-        }))
-        .unwrap();
+        });
+        if let Some(room) = room {
+            value["community_key_id"] = serde_json::json!(room);
+        }
+        let envelope = crate::federation::envelope::EnvelopeCore::from_value(value).unwrap();
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::SCORES,
             envelope,

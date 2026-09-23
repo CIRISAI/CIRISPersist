@@ -119,6 +119,19 @@ pub enum ScopeRefusalReason {
     /// fall-through reusing this enum.
     #[error("cohort_scope label is not in the closed CEG vocabulary: {0}")]
     InvalidCohortScope(String),
+
+    /// v47.0.0 (CIRISPersist#797) — a write named a cohort whose roster this
+    /// directory does not HOLD, so its membership cannot be answered yet.
+    /// Fail-secure: the write is refused exactly as a non-member's is. The
+    /// difference is for the caller — this one is RETRYABLE (the roster may
+    /// simply not have replicated; CIRISEdge#522 refused rows re-offer),
+    /// while [`Self::NoFamilyMembership`] / [`Self::NoCommunityMembership`]
+    /// are terminal. Produced only where the roster is structurally absent
+    /// (`lookup_*` → `None`), never from an error.
+    #[error(
+        "the claimed cohort's roster is not held here yet; membership is unresolved (retryable)"
+    )]
+    MembershipUnresolved,
 }
 
 impl ScopeRefusalReason {
@@ -133,6 +146,7 @@ impl ScopeRefusalReason {
             Self::BoundaryAuthFailed => "scope_boundary_auth_failed",
             Self::UnauthenticatedSuppressedCohort => "scope_unauthenticated_suppressed_cohort",
             Self::InvalidCohortScope(_) => "scope_invalid_cohort_scope",
+            Self::MembershipUnresolved => "scope_membership_unresolved",
         }
     }
 }

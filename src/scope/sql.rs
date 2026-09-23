@@ -72,14 +72,16 @@ pub enum ScopeParam {
     KeyList(Vec<String>),
 }
 
-/// The broad belonging-tiers, admitted with no per-row target. `self`,
-/// `family`, `community` are membership-gated and NOT in this set.
-const BROAD_TIERS: &[&str] = &["affiliations", "species", "biosphere", "federation"];
-
-/// SQL string-literal list of the broad tiers, e.g.
-/// `'affiliations','species','biosphere','federation'`.
+/// SQL string-literal list of the Commons scopes — admitted with no per-row
+/// target — e.g. `'species','biosphere','federation'`.
+///
+/// v47.0.0 (CIRISPersist#897) — DERIVED from the classifier
+/// ([`cohort_scope::commons`](crate::federation::types::cohort_scope::commons)),
+/// not a local list. The local list read `affiliations` as broad, so every
+/// caller, unauthenticated included, read a row CC 4.4.3.2.1 puts in the
+/// Community tier.
 fn broad_tiers_sql() -> String {
-    BROAD_TIERS
+    crate::federation::types::cohort_scope::commons()
         .iter()
         .map(|t| format!("'{t}'"))
         .collect::<Vec<_>>()
@@ -189,7 +191,7 @@ pub fn cohort_scope_sql_predicate_full(
                 backend,
                 scope_col,
                 target_col,
-                "self",
+                &["self"],
                 &admission.self_key_ids,
                 &mut next,
                 &mut params,
@@ -218,8 +220,7 @@ pub fn cohort_scope_sql_predicate_full(
                 );
             }
 
-            // family — target ∈ the reader's admitted families.
-            // The targeted arms key on the ROW's room. `None` means "the
+            // The TARGETED arms key on the ROW's room. `None` means "the
             // target column already IS the room", which is the TRACE plane:
             // `trace_events.cohort_target_id` (V060) is the room, and those
             // arms have always been correct there. Only the ATTESTATION plane
@@ -228,32 +229,47 @@ pub fn cohort_scope_sql_predicate_full(
             // preserves trace exactly and leaves a door that forgets the
             // column with the pre-#893 behaviour — which refuses, never leaks.
             let room_col = cohort_target_col.unwrap_or(target_col);
-            let family_branch = target_membership_branch(
-                backend,
-                scope_col,
-                room_col,
-                "family",
-                &admission.family_key_ids,
-                &mut next,
-                &mut params,
-            );
 
-            // community — target ∈ the reader's admitted communities.
-            let community_branch = target_membership_branch(
-                backend,
-                scope_col,
-                room_col,
-                "community",
-                &admission.community_key_ids,
-                &mut next,
-                &mut params,
-            );
+            // v47.0.0 (CIRISPersist#897) — one arm per TARGETED scope, from
+            // the classifier: `family` against the reader's families, and
+            // each ROOM scope (`community`, `affiliations`) against the
+            // reader's communities. A scope added to the classifier as
+            // targeted joins here with no edit.
+            //
+            // One arm per ROSTER, not per scope: the room plane's two scopes
+            // share one `IN (…)` and bind the reader's communities ONCE. A
+            // single-scope plane (`family`) renders `= 'family'`, exactly as
+            // before.
+            use crate::federation::types::cohort_scope::{Placement, Scope, TargetPlane};
+            let mut targeted_branches: Vec<String> = Vec::new();
+            for (plane, keys) in [
+                (TargetPlane::Family, &admission.family_key_ids),
+                (TargetPlane::Room, &admission.community_key_ids),
+            ] {
+                let labels: Vec<&'static str> = Scope::ALL
+                    .into_iter()
+                    .filter(|s| s.placement() == Placement::Targeted(plane))
+                    .map(Scope::as_str)
+                    .collect();
+                if labels.is_empty() {
+                    continue;
+                }
+                targeted_branches.push(target_membership_branch(
+                    backend,
+                    scope_col,
+                    room_col,
+                    &labels,
+                    keys,
+                    &mut next,
+                    &mut params,
+                ));
+            }
+            let targeted = targeted_branches.join(" OR ");
 
             let frag = format!(
                 "({scope_col} IN ({broad}) \
                  OR {self_branch} \
-                 OR {family_branch} \
-                 OR {community_branch})"
+                 OR {targeted})"
             );
             (frag, params)
         }
@@ -285,13 +301,25 @@ fn target_membership_branch(
     backend: BackendKind,
     scope_col: &str,
     target_col: &str,
-    label: &str,
+    labels: &[&str],
     admission_keys: &std::collections::BTreeSet<String>,
     next: &mut usize,
     params: &mut Vec<ScopeParam>,
 ) -> String {
+    // `= 'x'` for one scope (the shape every pre-v47 arm had), `IN ('x','y')`
+    // for a roster two scopes share (v47.0.0: `community` + `affiliations`).
+    let scope_match = match labels {
+        [one] => format!("{scope_col} = '{one}'"),
+        many => format!(
+            "{scope_col} IN ({})",
+            many.iter()
+                .map(|l| format!("'{l}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    };
     if admission_keys.is_empty() {
-        return format!("({scope_col} = '{label}' AND 1=0)");
+        return format!("({scope_match} AND 1=0)");
     }
 
     let membership = match backend {
@@ -312,7 +340,7 @@ fn target_membership_branch(
         }
     };
 
-    format!("({scope_col} = '{label}' AND {membership})")
+    format!("({scope_match} AND {membership})")
 }
 
 #[cfg(test)]
@@ -356,7 +384,7 @@ mod tests {
             );
             assert_eq!(
                 frag,
-                "(t.cohort_scope IN ('affiliations','species','biosphere','federation'))"
+                "(t.cohort_scope IN ('species','biosphere','federation'))"
             );
             assert!(params.is_empty(), "unauth emits no params");
             // membership-gated cohorts never admitted for the unauthenticated
@@ -375,9 +403,7 @@ mod tests {
             &auth_singleton(),
         );
         // broad tiers (no community — it's membership-gated now)
-        assert!(
-            frag.contains("t.cohort_scope IN ('affiliations','species','biosphere','federation')")
-        );
+        assert!(frag.contains("t.cohort_scope IN ('species','biosphere','federation')"));
         // self: target == reader identity ($1). No join, no subquery.
         assert!(frag.contains("(t.cohort_scope = 'self' AND t.cohort_target_id = ANY($1))"));
         assert!(
@@ -387,7 +413,7 @@ mod tests {
         assert!(!frag.contains("occurrence_key_id"), "no emitter join");
         // family + community constant-false (no admission sets)
         assert!(frag.contains("(t.cohort_scope = 'family' AND 1=0)"));
-        assert!(frag.contains("(t.cohort_scope = 'community' AND 1=0)"));
+        assert!(frag.contains("(t.cohort_scope IN ('community','affiliations') AND 1=0)"));
         // only the identity param
         assert_eq!(params, vec![ScopeParam::KeyList(vec!["occ-1".to_string()])]);
     }
@@ -419,7 +445,9 @@ mod tests {
         // family: target ∈ reader families via ANY($2)
         assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id = ANY($2))"));
         // community: target ∈ reader communities via ANY($3)
-        assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id = ANY($3))"));
+        assert!(frag.contains(
+            "(t.cohort_scope IN ('community','affiliations') AND t.cohort_target_id = ANY($3))"
+        ));
         assert!(!frag.contains("EXISTS"));
         assert!(!frag.contains("federation_families"), "no roster join");
         // params: identity, family-set, community-set (BTreeSet sorts F1<F2)
@@ -443,7 +471,9 @@ mod tests {
         );
         // family has 2 keys -> IN (?,?); community 1 -> IN (?)
         assert!(frag.contains("(t.cohort_scope = 'family' AND t.cohort_target_id IN (?,?))"));
-        assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id IN (?))"));
+        assert!(frag.contains(
+            "(t.cohort_scope IN ('community','affiliations') AND t.cohort_target_id IN (?))"
+        ));
         // params expanded: id-1, occ-1 (the self set), F1, F2, C1 (BTreeSet-sorted)
         assert_eq!(
             params,
@@ -599,7 +629,9 @@ mod tests {
         // The only community admission is target ∈ ANY($3) where $3 = [C1].
         // A row with cohort_target_id = 'C2' fails that membership — there
         // is no emitter-shared-cohort path that could admit it.
-        assert!(frag.contains("(t.cohort_scope = 'community' AND t.cohort_target_id = ANY($3))"));
+        assert!(frag.contains(
+            "(t.cohort_scope IN ('community','affiliations') AND t.cohort_target_id = ANY($3))"
+        ));
         assert!(
             !frag.contains("members"),
             "no roster containment path exists"

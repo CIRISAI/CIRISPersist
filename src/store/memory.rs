@@ -13404,7 +13404,8 @@ mod tests {
 
         // POSITIVE control — every closed-set value that needs no membership
         // target still admits (the gate validates the VALUE, nothing more).
-        for (i, scope) in ["self", "affiliations", "species", "biosphere", "federation"]
+        // v47.0.0 (#897): `affiliations` needs one — it is a room.
+        for (i, scope) in ["self", "species", "biosphere", "federation"]
             .into_iter()
             .enumerate()
         {

@@ -162,7 +162,7 @@ impl BlobProvenance {
                 // pointer's community must be the row's. `self` / `family`
                 // rows carry no such target — the audience is the owner's,
                 // and the pointer's community is the key plane only.
-                if matches!(scope.as_str(), cs::COMMUNITY | cs::AFFILIATIONS) {
+                if cs::target_plane(&scope) == Some(cs::TargetPlane::Room) {
                     let signed = admission::envelope_cohort_target(env).map_err(|e| {
                         BlobError::InvalidArgument(format!("community_key_id: {e}"))
                     })?;
@@ -308,13 +308,20 @@ pub fn is_audience_of(
     author_is_local_or_family: bool,
     member_communities: &HashSet<String>,
 ) -> bool {
-    match cohort_scope {
-        cs::SELF | cs::FAMILY => author_is_local_or_family,
-        cs::COMMUNITY | cs::AFFILIATIONS => {
+    // v47.0.0 (CIRISPersist#897) — through the ONE classifier, so this
+    // path and the write/read gates cannot answer `affiliations` differently
+    // again. (This path was already right; it is moved so it stays right.)
+    let Some(scope) = cs::Scope::parse(cohort_scope) else {
+        return false; // outside the closed set: fail closed
+    };
+    match scope.placement() {
+        cs::Placement::SelfCollective | cs::Placement::Targeted(cs::TargetPlane::Family) => {
+            author_is_local_or_family
+        }
+        cs::Placement::Targeted(cs::TargetPlane::Room) => {
             community_key_id.is_some_and(|c| member_communities.contains(c))
         }
-        cs::SPECIES | cs::BIOSPHERE | cs::FEDERATION => true,
-        _ => false,
+        cs::Placement::Commons => true,
     }
 }
 
@@ -340,15 +347,21 @@ where
     // memberships; `self` still compared the author to the node's key, so
     // a person-authored self row was `NotPartyTo` on the person's own
     // second device. The operator's family predicate is kept as-is.
-    if !author_local && matches!(cohort_scope, cs::SELF | cs::FAMILY) {
+    if !author_local
+        && matches!(
+            cs::Scope::parse(cohort_scope).map(cs::Scope::placement),
+            Some(cs::Placement::SelfCollective | cs::Placement::Targeted(cs::TargetPlane::Family))
+        )
+    {
         author_local =
             crate::federation::self_collective::speaks_for(directory, our_key_id, author_key_id)
                 .await?;
     }
     // Only the community arms need the walk; do not pay for it otherwise.
-    let members = match cohort_scope {
-        cs::COMMUNITY | cs::AFFILIATIONS => audience_memberships(directory, our_key_id).await?,
-        _ => HashSet::new(),
+    let members = if cs::target_plane(cohort_scope) == Some(cs::TargetPlane::Room) {
+        audience_memberships(directory, our_key_id).await?
+    } else {
+        HashSet::new()
     };
     Ok(is_audience_of(
         cohort_scope,

@@ -58,19 +58,78 @@ const COHORT_SCOPE_CLOSED_SET: &[&str] = &[
     cohort_scope::FEDERATION,
 ];
 
-/// `cohort_scope`'s processor (`crypto_tier`) is TOTAL over the closed set: every
-/// declared value is `is_valid` AND maps to a crypto tier without panic. A value
-/// added to the enum but not to `crypto_tier` (the incomplete-processor class)
-/// fails here.
+/// `cohort_scope`'s processors are TOTAL over the closed set AND classify each
+/// value as pinned: every declared value parses to a [`cohort_scope::Scope`],
+/// and its placement and at-rest tier equal the pinned row. Adding a variant
+/// without an arm is a build error at the exhaustive matches; adding a closed-set
+/// value without classifying it here fails the length check (#796, I146).
 fn check_cohort_scope_processor_is_total() -> Result<(), String> {
-    for v in COHORT_SCOPE_CLOSED_SET {
-        if !cohort_scope::is_valid(v) {
+    use cohort_scope::{CryptoTier as T, Placement as P, Scope, TargetPlane as R};
+    // v47.0.0 (CIRISPersist#796, I146) — a CLASSIFICATION per value, not
+    // "did not panic". The previous body only called `crypto_tier` and
+    // discarded the result; with a `_ => Plaintext` arm it could not panic
+    // for any input, so an unclassified scope passed silently and was stored
+    // in plaintext. Each row below is the EXPECTED answer, and the table's
+    // length is asserted against the type's.
+    const EXPECTED: &[(&str, P, T)] = &[
+        (cohort_scope::SELF, P::SelfCollective, T::InvisibleEncrypted),
+        (
+            cohort_scope::FAMILY,
+            P::Targeted(R::Family),
+            T::InvisibleEncrypted,
+        ),
+        (
+            cohort_scope::COMMUNITY,
+            P::Targeted(R::Room),
+            T::CommunityDek,
+        ),
+        // CC 4.4.3.2.1 / 4.4.3.2.8 — an affiliation is a room (#897).
+        (
+            cohort_scope::AFFILIATIONS,
+            P::Targeted(R::Room),
+            T::CommunityDek,
+        ),
+        (cohort_scope::SPECIES, P::Commons, T::Plaintext),
+        (cohort_scope::BIOSPHERE, P::Commons, T::Plaintext),
+        (cohort_scope::FEDERATION, P::Commons, T::Plaintext),
+    ];
+    if EXPECTED.len() != Scope::ALL.len() || COHORT_SCOPE_CLOSED_SET.len() != Scope::ALL.len() {
+        return Err(format!(
+            "the pinned table has {} rows and the closed set {} values for {} `Scope` variants \
+             — a scope was added without being classified here",
+            EXPECTED.len(),
+            COHORT_SCOPE_CLOSED_SET.len(),
+            Scope::ALL.len()
+        ));
+    }
+    for (v, placement, tier) in EXPECTED {
+        let Some(s) = Scope::parse(v) else {
+            return Err(format!("Scope::parse rejects the closed-set value {v:?}"));
+        };
+        if s.as_str() != *v {
+            return Err(format!("{v:?} does not round-trip through Scope"));
+        }
+        if s.placement() != *placement {
             return Err(format!(
-                "cohort_scope::is_valid rejects the closed-set value {v:?}"
+                "{v:?} is classified {:?}, pinned {placement:?}",
+                s.placement()
             ));
         }
-        // Must not panic — the processor is defined for every declared value.
-        let _ = cohort_scope::crypto_tier(v, None);
+        if cohort_scope::crypto_tier(v, None) != *tier {
+            return Err(format!(
+                "{v:?} resolves to {:?} at rest, pinned {tier:?}",
+                cohort_scope::crypto_tier(v, None)
+            ));
+        }
+    }
+    for s in Scope::ALL {
+        if !COHORT_SCOPE_CLOSED_SET.contains(&s.as_str())
+            || !cohort_scope::ALL.contains(&s.as_str())
+        {
+            return Err(format!(
+                "{s:?} is a Scope variant missing from a closed-set list"
+            ));
+        }
     }
     Ok(())
 }

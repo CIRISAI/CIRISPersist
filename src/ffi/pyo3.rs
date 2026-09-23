@@ -5442,6 +5442,8 @@ impl PyEngine {
             dict.set_item("promoted", report.promoted)?;
             dict.set_item("widened", report.widened)?;
             dict.set_item("awaiting_actor", report.awaiting_actor)?;
+            // v47.0.0 (CIRISPersist#797) — waiting on a roster, not skipped.
+            dict.set_item("awaiting_roster", report.awaiting_roster)?;
             dict.set_item("skipped", report.skipped)?;
             Ok(dict)
         })
@@ -32775,7 +32777,19 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v4.0 (CIRISPersist#160, FSD §4.6) — AV-45 write-path
         // cohort_scope refusal is caller-side authorization failure (the
         // writer stamped a cohort it isn't a member of); ValueError (4xx).
-        crate::federation::Error::WriteScopeRefused(_) => PyValueError::new_err(kind),
+        //
+        // v47.0.0 (CIRISPersist#797) — the REASON rides the message as
+        // `"<kind>: <reason-kind>"` (the `rate_limited_message` shape), so a
+        // host can tell `scope_membership_unresolved` (retryable: the roster
+        // has not arrived) from `scope_no_community_membership` (terminal).
+        // Before this the host saw only `federation_write_scope_refused` and
+        // the distinction stopped at the Rust boundary. Exception TYPE and the
+        // leading `kind` token are unchanged: `except ValueError` and
+        // `str(e).startswith("federation_write_scope_refused")` keep working;
+        // only an EQUALITY match on the message breaks.
+        crate::federation::Error::WriteScopeRefused(reason) => {
+            PyValueError::new_err(format!("{kind}: {}", reason.kind()))
+        }
         // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — a refused
         // `withdraws` (issuer satisfies none of the 4 admission rules)
         // is caller-side authorization failure; ValueError (4xx).

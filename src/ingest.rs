@@ -777,8 +777,13 @@ where
                         // an all-`self`/all-broad/all-federation batch
                         // (every current producer) pays no extra reads.
                         let scope = row.cohort_scope.as_str();
-                        if scope == crate::federation::types::cohort_scope::FAMILY
-                            || scope == crate::federation::types::cohort_scope::COMMUNITY
+                        // v47.0.0 (CIRISPersist#897) — "needs a roster" is
+                        // the classifier's answer. The local
+                        // `FAMILY || COMMUNITY` spelling here let an
+                        // `affiliations` trace through with no membership
+                        // check at all.
+                        if let Some(plane) =
+                            crate::federation::types::cohort_scope::target_plane(scope)
                         {
                             let admission = self
                                 .writer_admission(
@@ -786,11 +791,28 @@ where
                                     env_for_row.scrub_key_id.as_str(),
                                 )
                                 .await?;
-                            if let Err(reason) = crate::federation::admission::DimensionAdmissionPolicy::check_write_cohort_scope(
+                            if let Err(mut reason) = crate::federation::admission::DimensionAdmissionPolicy::check_write_cohort_scope(
                                 admission,
                                 scope,
                                 row.cohort_target_id.as_deref(),
                             ) {
+                                // v47.0.0 (CIRISPersist#797) — the same
+                                // unresolved/terminal split as the
+                                // attestation put door, looked up only on the
+                                // refusal path so an admitted batch pays
+                                // nothing: a roster this node does not HOLD
+                                // is retryable, not "not a member".
+                                if let Some(target) = row.cohort_target_id.as_deref() {
+                                    use crate::federation::types::cohort_scope::TargetPlane;
+                                    let held = match plane {
+                                        TargetPlane::Family => crate::federation::FederationDirectory::lookup_family(self.backend, target).await.map(|f| f.is_some()),
+                                        TargetPlane::Room => crate::federation::FederationDirectory::lookup_community(self.backend, target).await.map(|c| c.is_some()),
+                                    }
+                                    .map_err(|e| IngestError::Store(StoreError::Backend(format!("roster lookup: {e}"))))?;
+                                    if !held {
+                                        reason = crate::scope::ScopeRefusalReason::MembershipUnresolved;
+                                    }
+                                }
                                 // §9.3 — Layer-1 write-side refusal counter.
                                 tracing::warn!(
                                     metric = "persist_refused_write_scope_total",
@@ -1732,8 +1754,12 @@ mod tests {
 
         let (signer, signer_key_id) = make_test_signer().await;
         // The writer (signer) is a member of a DIFFERENT community —
-        // not the one the trace claims.
+        // not the one the trace claims. The claimed one EXISTS here with
+        // someone else on its roster, so this is the terminal "not a member"
+        // answer (v47.0.0, #797 — an ABSENT roster is `MembershipUnresolved`,
+        // see `write_gate_unresolved_roster_is_retryable_797`).
         backend.add_community_membership("community-key:mine", &[signer_key_id.as_str()]);
+        backend.add_community_membership("community-key:not-mine", &["someone-else"]);
         let pipeline = IngestPipeline {
             backend: &backend,
             canonicalizer: &PythonJsonDumpsCanonicalizer,
@@ -1757,6 +1783,42 @@ mod tests {
         assert!(
             backend.snapshot_events().is_empty(),
             "a refused cohort_scope downgrade must produce zero rows"
+        );
+    }
+
+    /// v47.0.0 (CIRISPersist#797) — a trace naming a community whose roster
+    /// this node does NOT HOLD is refused (fail-secure, zero writes) as
+    /// `MembershipUnresolved`: retryable, the roster may not have arrived.
+    /// Same split as the attestation put door (I147).
+    #[tokio::test]
+    async fn write_gate_unresolved_roster_is_retryable_797() {
+        let (bytes, key_id, vkey) =
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:unseen")).await;
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+        seed_test_pqc_key(&backend).await;
+        let (signer, signer_key_id) = make_test_signer().await;
+        backend.add_community_membership("community-key:mine", &[signer_key_id.as_str()]);
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+        let err = pipeline.receive_and_persist(&bytes).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IngestError::ScopeRefused(crate::scope::ScopeRefusalReason::MembershipUnresolved)
+            ),
+            "an absent roster is unresolved, not 'not a member': {err:?}"
+        );
+        assert_eq!(err.kind(), "write_scope_refused");
+        assert_eq!(err.detail().as_deref(), Some("scope_membership_unresolved"));
+        assert!(
+            backend.snapshot_events().is_empty(),
+            "fail-secure: an unresolved membership still writes nothing"
         );
     }
 
