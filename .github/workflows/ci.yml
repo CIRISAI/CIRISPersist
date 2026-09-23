@@ -41,58 +41,35 @@ permissions:
   packages: write   # CIRISCache save pushes to GHCR; PRs only restore, so fork PRs are unaffected
 
 jobs:
-  # 2026-09-22 (CIRISPersist#881, corrected #895) — skip the tag's test matrix
-  # when the SAME TREE has already passed CI.
+  # 2026-09-23 (CIRISPersist#895) — the `tag-precheck` job that stood here is
+  # REMOVED, not repaired. Recorded so the next person does not re-derive it:
   #
-  # The first version of this job asked the wrong question: "is there a
-  # successful CI run for this SHA on a branch push?" There never is. The
-  # `concurrency` group above keys push events on the SHA precisely so the tag
-  # run CANCELS the redundant main run (#397) — so the merge commit's only
-  # completed run IS this one. That version polled 45 minutes for a run its own
-  # workflow had just cancelled and then ran the matrix anyway: strictly slower.
+  #   * v46.4.0 shipped it asking "does a successful CI run exist for this SHA
+  #     on a branch push?". Never true — the `concurrency` group above keys
+  #     push events on the SHA (#397) so the TAG run cancels the main-push run
+  #     for that commit. It waited 45 min for a run its own workflow had
+  #     cancelled, then ran the matrix anyway: +45 min per release.
+  #   * The tree-comparing repair DID fire, and was worse. The only
+  #     Linux-x86_64 `CIRISCache/save` in this workflow lives in the
+  #     `linux-x86_64-test` matrix (the `core-1` entry, below) and publishes on
+  #     `main || tags/v*`. Main is cancelled by the tag; PR runs restore
+  #     without saving. Skip the matrix on the tag and the versioned Linux
+  #     cache for that release is never published — every consumer cold-
+  #     compiles, which is the global pessimization `always warm the cache`
+  #     exists to prevent. Found by Codex review on PR #896.
+  #   * And it buys nothing anyway: the matrix legs run in PARALLEL (no
+  #     `max-parallel`), so nine legs cost about one leg of wall clock —
+  #     measured on v46.3.1's tag run, 9 legs spanning 21:21→21:57. Skipping
+  #     six of nine saves machine time and ~zero wall.
   #
-  # What actually justifies skipping is TREE equality, which is also what
-  # `scripts/release_ship.sh` uses to skip its main-CI wait: a merge commit
-  # whose tree equals the PR head's contains the identical bytes the PR run
-  # tested. So: resolve this commit's tree, walk recent successful CI runs, and
-  # skip only when one of them was built from a commit with the same tree.
-  # Bounded and non-blocking — no polling, one API page; any doubt runs the
-  # matrix.
-  tag-precheck:
-    name: tag precheck (skip the matrix when this TREE already passed)
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      skip: ${{ steps.probe.outputs.skip }}
-    steps:
-      - id: probe
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          tree=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.tree.sha' 2>/dev/null || echo "")
-          if [ -z "$tree" ]; then echo "could not resolve this commit's tree — running the matrix"; echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          echo "this tag's tree: $tree"
-          for sha in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=success&per_page=40" \
-                         --jq '.workflow_runs[] | select(.name=="CI") | .head_sha' 2>/dev/null | head -40); do
-            [ "$sha" = "${GITHUB_SHA}" ] && continue
-            other=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}" --jq '.commit.tree.sha' 2>/dev/null || echo "")
-            if [ -n "$other" ] && [ "$other" = "$tree" ]; then
-              echo "tree $tree already passed CI as ${sha} — skipping this tag's matrix"
-              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-          done
-          echo "no successful CI run for this tree — running the matrix"
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+  # What actually removed a redundant wait is `scripts/release_ship.sh`: when
+  # the merge commit's TREE equals the PR head's, the PR run already certified
+  # those bytes and the main-CI wait is skipped. That is where tree equality
+  # belongs, and it is measured (−35 min on v46.4.0's ship).
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
   linux-x86_64-test:
-    needs: tag-precheck
-    if: needs.tag-precheck.outputs.skip != 'true'
     # v2.0.1 (CIRISPersist#95-track) — substrate-axis matrix. The 2.0
     # feature-gap fix turned every substrate on (audit/secrets/nodecore/
     # graph/telemetry) and the single test job ballooned to ~12 min.

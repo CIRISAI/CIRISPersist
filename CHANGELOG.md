@@ -7,18 +7,30 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-### Fixed — the tag precheck asked a question that could never be answered yes (CIRISPersist#895)
-v46.4.0's `tag-precheck` skipped the tag's test matrix when "a successful CI
-run exists for this SHA on a branch push", polling up to 45 minutes. It never
-exists: the `concurrency` group keys push events on the SHA (#397) so the tag
-run **cancels** the redundant main-push run on that commit — the run the
-precheck is waiting for is cancelled by the run the precheck is part of.
-Observed on v46.4.0: main CI for `e03ba447` is `completed/cancelled`. The
-"saving" cost 45 minutes per release. It now compares **trees** — one API
-page, no polling — and skips only when a successful CI run was built from a
-commit with the same tree, which is the same argument
-`scripts/release_ship.sh` uses to skip its own main-CI wait. Any doubt runs
-the matrix.
+### Removed — the `tag-precheck` job, and the #881 ask it came from (CIRISPersist#895)
+v46.4.0 shipped a job that skipped the tag's test matrix when "a successful CI
+run exists for this SHA on a branch push". It is removed rather than repaired,
+for three reasons, each measured:
+
+1. **It could never fire.** The `concurrency` group keys push events on the
+   SHA (#397) so the TAG run cancels the main-push run for that commit — the
+   precheck waited 45 minutes for a run its own workflow had cancelled, then
+   ran the matrix anyway. **+45 min per release.** Observed on v46.4.0:
+   main CI for `e03ba447` is `completed/cancelled`.
+2. **The tree-comparing repair fired, and was worse.** The only Linux-x86_64
+   `CIRISCache/save` lives in the `linux-x86_64-test` matrix (`core-1`) and
+   publishes on `main || tags/v*`. Main is cancelled by the tag; PR runs
+   restore without saving. Skipping the matrix on a tag means the versioned
+   Linux cache for that release is never published and every consumer
+   cold-compiles — the global pessimization `always warm the cache` exists to
+   prevent. Found by Codex review on PR #896.
+3. **It bought nothing.** The matrix legs run in PARALLEL — nine legs cost
+   about one leg of wall clock (v46.3.1's tag run: 9 legs, 21:21→21:57).
+   Skipping six of nine saves machine time and ~zero wall.
+
+#881's third ask is therefore withdrawn as specified; #397 had already deduped
+main-vs-tag. What did remove a redundant wait is the tree-compare in
+`scripts/release_ship.sh` (−35 min, measured on v46.4.0's ship), which stays.
 
 ## [46.4.0] - 2026-09-23
 
