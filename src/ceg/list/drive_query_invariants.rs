@@ -60,6 +60,22 @@ pub(crate) mod bodies {
     where
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
+        // `list_attestations` is a relational CEG read: the memory backend has
+        // no substrate for it and says so. Its leg is `i142_mem`, which
+        // measures the same axis through the scores door memory DOES serve.
+        if let Err(crate::ceg::Error::Backend(msg)) = crate::ceg::ReadEngine::list_attestations(
+            b,
+            AttestationFilter::default(),
+            None,
+            1,
+            CallerScope::Unauthenticated,
+        )
+        .await
+        {
+            if msg.contains("no relational read substrate") {
+                return;
+            }
+        }
         let owner = format!("i142-owner-{s}");
         ts::register_identity_key(b, &owner, crate::federation::types::identity_type::USER).await;
         seed(
@@ -220,6 +236,75 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I142-mem — the axis on the scores plane, where the memory backend
+    /// lives.** `list_attestations` has no memory substrate, so the memory
+    /// twin of the cohort axis (`mem_scores_row_matches`) is measured through
+    /// `list_scores` — the other door `sqlite_cohort_axes` / `pg_cohort_axes`
+    /// are called from. Without this leg nothing would fail if the memory
+    /// twin ignored the axis.
+    pub(crate) async fn i142_mem_the_axis_on_the_scores_plane<B>(b: &B, s: &str)
+    where
+        B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
+    {
+        let owner = format!("i142m-owner-{s}");
+        ts::register_identity_key(b, &owner, crate::federation::types::identity_type::USER).await;
+        seed(
+            b,
+            &format!("i142m-self-{s}"),
+            &owner,
+            "self",
+            None,
+            "file:photo:v1",
+        )
+        .await;
+        seed(
+            b,
+            &format!("i142m-fed-{s}"),
+            &owner,
+            "federation",
+            None,
+            "file:public:v1",
+        )
+        .await;
+        let page = |f: AttestationFilter| {
+            let owner = owner.clone();
+            async move {
+                let mut v: Vec<String> =
+                    <B as crate::federation::FederationDirectory>::list_scores(
+                        b, &owner, f, None, 100,
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        let all = page(AttestationFilter {
+            dimension_prefixes: vec!["file:".into()],
+            ..Default::default()
+        })
+        .await;
+        assert!(
+            all.contains(&format!("i142m-fed-{s}")),
+            "I142-mem: the federation row is on the scores plane to begin with: {all:?}"
+        );
+        assert_eq!(
+            page(AttestationFilter {
+                cohort_scope: Some("self".into()),
+                dimension_prefixes: vec!["file:".into()],
+                ..Default::default()
+            })
+            .await,
+            vec![format!("i142m-self-{s}")],
+            "I142-mem: the cohort axis selects on the scores plane too — the memory twin of \
+             sqlite_cohort_axes / pg_cohort_axes"
+        );
+    }
+
     /// **I143 (from disk)** — the chunk adopt reaches Python: the receiving
     /// half of the scoped chunk DAG (#821) is bound, and classified.
     pub(crate) fn i143_the_chunk_adopt_reaches_python() {
@@ -261,9 +346,23 @@ mod run {
                     let Some(b) = $fresh.await else { return };
                     super::super::bodies::i142_the_drive_query(&b, &super::suffix()).await
                 }
+
+                #[tokio::test]
+                async fn i142_mem() {
+                    let Some(b) = $fresh.await else { return };
+                    super::super::bodies::i142_mem_the_axis_on_the_scores_plane(
+                        &b,
+                        &super::suffix(),
+                    )
+                    .await
+                }
             }
         };
     }
+
+    runners!(memory, async {
+        Some(crate::store::memory::MemoryBackend::new())
+    });
 
     #[cfg(feature = "sqlite")]
     runners!(sqlite, async {
