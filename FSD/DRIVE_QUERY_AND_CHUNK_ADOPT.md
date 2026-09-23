@@ -37,7 +37,10 @@ No wire change, no migration, no vocabulary change. MINOR.
 
 ## 4. Invariants
 
-- **I142** (memory, sqlite, postgres) — **the drive query.** Seed rows across `(cohort_scope, cohort_target_id)`: two `self` rows the caller owns, one `family` row of the caller's family, one `community` row of a room the caller is in, one `community` row of a room it is not, one `federation` row. Then:
+- **I142** (sqlite, postgres — `list_attestations`; all three through
+  `list_scores` as `i142_mem`, because the memory backend has no relational
+  CEG read substrate and its twin of the axis would otherwise have no
+  witness) — **the drive query.** Seed rows across `(cohort_scope, cohort_target_id)`: two `self` rows the caller owns, one `family` row of the caller's family, one `community` row of a room the caller is in, one `community` row of a room it is not, one `federation` row. Then:
   - `cohort_scope: "self"` returns exactly the two self rows; combined with `dimension_prefixes: ["file:"]` it returns the drive listing and nothing else;
   - `cohort_target_id: <family key>` returns exactly that family's row;
   - the two axes AND with each other and with the nine existing axes (window, tier, attester) rather than overwriting them;
@@ -45,6 +48,19 @@ No wire change, no migration, no vocabulary change. MINOR.
   - the page is resumable: `limit: 1` twice with the returned cursor yields the second row and no repeat.
   - Mutants: drop the `cohort_scope` predicate (self query returns everything); drop `cohort_target_id` (the other room's row appears); OR the two instead of ANDing (a federation row appears in the self query); apply the axis before the scope gate (the not-a-member room's row appears).
 - **I143** (from disk + sqlite/postgres two-node) — **the chunk adopt reaches Python.** From disk: `adopt_sealed_chunk_json` is present in `ffi/pyo3.rs` and classified in the taxonomy. Two-node: A appends a sealed chunk at `self` and seals the stream; B — the owner's other node — adopts the chunk through the Engine door with the author's provenance and `read_stream_chunk_as` opens it. Mutant: the binding drops the provenance's author (the adopt admits a chunk the caller is not party to).
+
+## 4.1 Mutation table (2026-09-23)
+
+| Mutant | Verdict |
+|---|---|
+| M1 sqlite drops the cohort_scope predicate | KILLED by sqlite::i142_mem sqlite::i142  |
+| M2 postgres drops the cohort_scope predicate | KILLED by postgres::i142 postgres::i142_mem (under scripts/pg_test_db.sh — without a DSN the leg passes vacuously in 0.00s) |
+| M4 memory twin ignores the axis | KILLED by memory::i142_mem  |
+| M5 the chunk binding is unreachable | KILLED by i143  |
+
+The postgres row is the lesson: run under `scripts/pg_test_db.sh` or the leg
+returns early, prints `ok` in 0.00 s, and reports a mutant as surviving when
+it was never exercised.
 
 ## 5. Not in scope
 
