@@ -92,6 +92,14 @@ admitted now. The started window for "the last minute" is empty; the
 admission window holds exactly this agent's traces, each carrying an
 `admitted_at` inside it; and the count equals the list.
 
+### Fixed — six `test_pg.rs` comments cited the wrong issue (CIRISPersist#822)
+The v42.1.0 test-template fixes (build under a scratch name, then rename; hold
+the lock across `f`; name why postgres refused) cited `CIRISPersist#821`, a
+number assumed while writing and later assigned to an unrelated CIRISEdge
+blob-surface question. They now cite #822, the issue filed afterwards as the
+record of what was fixed. The issue listed five; there were six (line 767).
+Every other `#821` in the tree correctly refers to the Edge question.
+
 ## [47.0.0] - 2026-09-23
 
 ### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)

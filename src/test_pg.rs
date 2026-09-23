@@ -292,7 +292,7 @@ fn ensure_template(admin: &str) -> Option<String> {
         if database_exists(admin, &template_db()).unwrap_or(false) {
             return Ok(()); // another process won the race while we waited
         }
-        // v42.1.0 (CIRISPersist#821) — BUILD UNDER A SCRATCH NAME, THEN RENAME.
+        // v42.1.0 (CIRISPersist#822) — BUILD UNDER A SCRATCH NAME, THEN RENAME.
         //
         // The fast path above tests EXISTENCE. Creating the template under its
         // final name and migrating it afterwards made existence arrive BEFORE
@@ -385,7 +385,7 @@ fn with_advisory_lock<F>(admin: &str, key: i64, f: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String>,
 {
-    // v42.1.0 (CIRISPersist#821, Codex review P1) — HOLD THE LOCK ACROSS `f`.
+    // v42.1.0 (CIRISPersist#822, Codex review P1) — HOLD THE LOCK ACROSS `f`.
     //
     // The previous shape took `pg_advisory_lock` on a connection owned by a
     // thread that then RETURNED, closing the session. Advisory locks are
@@ -553,7 +553,7 @@ fn run_sql(dsn: &str, sql: &str) -> Result<(), String> {
         .map_err(|_| "provisioning thread panicked".to_owned())?
 }
 
-/// v42.1.0 (CIRISPersist#821) — spell out WHY postgres refused.
+/// v42.1.0 (CIRISPersist#822) — spell out WHY postgres refused.
 ///
 /// `tokio_postgres::Error`'s `Display` is the string `"db error"` plus nothing
 /// useful: the server's actual message, SQLSTATE, detail and hint all live on
@@ -677,7 +677,7 @@ mod template_naming_tests {
             .is_some()
     }
 
-    /// v42.1.0 (CIRISPersist#821) — the scratch database must look reapable and
+    /// v42.1.0 (CIRISPersist#822) — the scratch database must look reapable and
     /// the finished template must not.
     ///
     /// I got this backwards on the first pass: the scratch was named
@@ -716,7 +716,7 @@ mod template_naming_tests {
 
 #[cfg(test)]
 mod pg_error_detail_tests {
-    /// v42.1.0 (CIRISPersist#821) — a provisioning failure must name its cause.
+    /// v42.1.0 (CIRISPersist#822) — a provisioning failure must name its cause.
     ///
     /// Drives a real refusal (creating a database that already exists) and
     /// asserts the rendered string carries the server's message and SQLSTATE,
@@ -764,7 +764,7 @@ mod advisory_lock_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// v42.1.0 (CIRISPersist#821, Codex review P1) — the lock must be held for
+    /// v42.1.0 (CIRISPersist#822, Codex review P1) — the lock must be held for
     /// the DURATION of the closure, not merely acquired before it.
     ///
     /// The previous implementation took `pg_advisory_lock` on a connection whose
