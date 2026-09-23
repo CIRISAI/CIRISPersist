@@ -27,10 +27,13 @@ use super::admission::CallerAdmission;
 ///   [`build_caller_admission`](super::build_caller_admission)).
 #[derive(Clone, Debug)]
 pub enum CallerScope {
-    /// Unauthenticated reader. Admits rows tagged cohort_scope ∈
-    /// {community, affiliations, species, biosphere, federation} —
-    /// the non-suppressed tiers per §8.1.13.3. Refuses self + family
-    /// (cohort_scope::suppresses_holds_bytes returns true for those).
+    /// Unauthenticated reader. Admits the Commons only — cohort_scope ∈
+    /// {species, biosphere, federation}
+    /// ([`cohort_scope::commons`](crate::federation::types::cohort_scope::commons)).
+    /// Every scope with a roster (self, family, community, affiliations)
+    /// is refused: an unauthenticated reader proves no membership.
+    /// (v47.0.0, #897: this doc listed `community` and `affiliations` as
+    /// admitted; the gate itself had not admitted `community` since v4.0.)
     Unauthenticated,
 
     /// Authenticated caller. Admission is *substrate-built* from the
@@ -91,16 +94,22 @@ impl CallerScope {
         cohort_target: Option<&str>,
         dimension: Option<&str>,
     ) -> bool {
-        const BROAD: &[&str] = &["affiliations", "species", "biosphere", "federation"];
-        if BROAD.contains(&cohort_scope) {
+        use crate::federation::types::cohort_scope::{Placement, Scope, TargetPlane};
+        // v47.0.0 (CIRISPersist#897) — through the ONE classifier. The local
+        // `BROAD` list here read `affiliations` as a commons tier; the SQL
+        // twin, AV-45 and the hold path now all ask `placement()`.
+        let Some(scope) = Scope::parse(cohort_scope) else {
+            return false; // outside the closed set: nobody's
+        };
+        if scope.placement() == Placement::Commons {
             return true;
         }
         match self {
             CallerScope::Unauthenticated => false,
-            CallerScope::Authenticated { admission } => match cohort_scope {
+            CallerScope::Authenticated { admission } => match scope.placement() {
                 // v46.3.1 (#888): the target is one of the caller's own keys
                 // — resolved on BOTH sides (FSD/OCCURRENCE_PRINCIPAL.md §6).
-                "self" => {
+                Placement::SelfCollective => {
                     admission.self_key_ids.contains(target)
                         && (target == admission.occurrence_key_id
                             || !dimension.is_some_and(
@@ -109,11 +118,13 @@ impl CallerScope {
                 }
                 // The ROW's room, never the producer's rooms — and a row
                 // that names none is nobody's (fail closed).
-                "family" => cohort_target.is_some_and(|r| admission.family_key_ids.contains(r)),
-                "community" => {
+                Placement::Targeted(TargetPlane::Family) => {
+                    cohort_target.is_some_and(|r| admission.family_key_ids.contains(r))
+                }
+                Placement::Targeted(TargetPlane::Room) => {
                     cohort_target.is_some_and(|r| admission.community_key_ids.contains(r))
                 }
-                _ => false,
+                Placement::Commons => true,
             },
         }
     }

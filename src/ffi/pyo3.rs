@@ -5442,6 +5442,8 @@ impl PyEngine {
             dict.set_item("promoted", report.promoted)?;
             dict.set_item("widened", report.widened)?;
             dict.set_item("awaiting_actor", report.awaiting_actor)?;
+            // v47.0.0 (CIRISPersist#797) — waiting on a roster, not skipped.
+            dict.set_item("awaiting_roster", report.awaiting_roster)?;
             dict.set_item("skipped", report.skipped)?;
             Ok(dict)
         })
@@ -32573,6 +32575,14 @@ async fn reverse_quorum_by_action_id(
 /// Shape: `"{kind}: {token} (retry_after_seconds={n})"`. `kind` and `token` are
 /// both program constants; the parentheses and the word order are not, and no
 /// consumer should parse them positionally.
+/// v47.0.0 (CIRISPersist#797) — `"<kind>: <reason-kind>"` for an AV-45
+/// refusal, so a host can tell `scope_membership_unresolved` (retryable) from
+/// `scope_no_community_membership` (terminal). The leading `kind` token is
+/// unchanged, so a `startswith` check keeps working.
+fn write_scope_refused_message(kind: &str, reason: &crate::scope::ScopeRefusalReason) -> String {
+    format!("{kind}: {}", reason.kind())
+}
+
 fn rate_limited_message(
     kind: &str,
     reason: crate::federation::PeerQuotaRefusal,
@@ -32775,7 +32785,19 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v4.0 (CIRISPersist#160, FSD §4.6) — AV-45 write-path
         // cohort_scope refusal is caller-side authorization failure (the
         // writer stamped a cohort it isn't a member of); ValueError (4xx).
-        crate::federation::Error::WriteScopeRefused(_) => PyValueError::new_err(kind),
+        //
+        // v47.0.0 (CIRISPersist#797) — the REASON rides the message as
+        // `"<kind>: <reason-kind>"` (the `rate_limited_message` shape), so a
+        // host can tell `scope_membership_unresolved` (retryable: the roster
+        // has not arrived) from `scope_no_community_membership` (terminal).
+        // Before this the host saw only `federation_write_scope_refused` and
+        // the distinction stopped at the Rust boundary. Exception TYPE and the
+        // leading `kind` token are unchanged: `except ValueError` and
+        // `str(e).startswith("federation_write_scope_refused")` keep working;
+        // only an EQUALITY match on the message breaks.
+        crate::federation::Error::WriteScopeRefused(reason) => {
+            PyValueError::new_err(write_scope_refused_message(kind, &reason))
+        }
         // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — a refused
         // `withdraws` (issuer satisfies none of the 4 admission rules)
         // is caller-side authorization failure; ValueError (4xx).
@@ -34773,6 +34795,25 @@ mod tests {
     /// distinctness assertion is what makes that real — 16 messages that all
     /// carry *a* token but not a *distinguishing* one would satisfy a
     /// per-variant `contains` check and still leave the caller guessing.
+    /// v47.0.0 (CIRISPersist#797) — the AV-45 reason reaches the host, and
+    /// the retryable one is distinguishable from the terminal ones.
+    #[test]
+    fn write_scope_refused_message_carries_the_reason_797() {
+        use crate::scope::ScopeRefusalReason as R;
+        let kind = "federation_write_scope_refused";
+        let unresolved = write_scope_refused_message(kind, &R::MembershipUnresolved);
+        let terminal = write_scope_refused_message(kind, &R::NoCommunityMembership);
+        assert_eq!(
+            unresolved,
+            "federation_write_scope_refused: scope_membership_unresolved"
+        );
+        assert_eq!(
+            terminal,
+            "federation_write_scope_refused: scope_no_community_membership"
+        );
+        assert!(unresolved.starts_with(kind) && terminal.starts_with(kind));
+    }
+
     #[test]
     fn every_quota_refusal_reason_survives_the_ffi_boundary() {
         use crate::federation::PeerQuotaRefusal;

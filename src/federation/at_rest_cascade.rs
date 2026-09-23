@@ -376,7 +376,7 @@ where
              {{self, family, community, affiliations, species, biosphere, federation}}"
         )));
     }
-    if cohort_scope != cs::COMMUNITY && cohort_scope != cs::AFFILIATIONS {
+    if cs::target_plane(cohort_scope) != Some(cs::TargetPlane::Room) {
         return Ok(cs::crypto_tier(cohort_scope, None));
     }
     let Some(comm) = community_key_id else {

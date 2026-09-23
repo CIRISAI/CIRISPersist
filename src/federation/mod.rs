@@ -105,6 +105,9 @@ pub mod epoch_minter_invariants;
 pub mod self_collective;
 // CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
 // delivered, not discovered — the send set, the re-grant doors, the minter read.
+/// v47.0.0 (CIRISPersist#897, #796, #797) — one scope, one question, every
+/// gate: I145 / I147 (`FSD/SCOPE_CLASSIFIER.md` §5).
+pub mod scope_classifier_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
@@ -249,6 +252,14 @@ pub struct ConsentSweepReport {
     /// key's claim (no delegated widening; subsidiarity, CC part 3 §308). They
     /// wait; they are not skipped errors.
     pub awaiting_actor: u64,
+    /// v47.0.0 (CIRISPersist#797) — widenings refused because the target
+    /// cohort's roster is not held here YET
+    /// ([`ScopeRefusalReason::MembershipUnresolved`](crate::scope::ScopeRefusalReason::MembershipUnresolved)).
+    /// Like `awaiting_actor` these wait for the next sweep; they are not
+    /// errors, and before this cut they were counted — and logged — as
+    /// `skipped` "not a member".
+    #[serde(default)]
+    pub awaiting_roster: u64,
     /// Rows on which a crossing returned an error (logged via
     /// `tracing::warn!`).
     pub skipped: u64,
@@ -4634,9 +4645,13 @@ pub trait FederationDirectory: Send + Sync {
     /// runs this BEFORE computing `persist_row_hash` / INSERT so a
     /// refused row leaves no trace (verify-then-gate-then-persist).
     ///
-    /// `self` and the broad belonging-tiers are no-op passes that need
-    /// no admission read; only `family` / `community` trigger the
-    /// resolution fan-out. On refusal a §9.3
+    /// `self` and the commons are no-op passes that need no admission
+    /// read; only a TARGETED scope (`family` / `community` /
+    /// `affiliations`, [`types::cohort_scope::is_targeted`]) triggers the
+    /// resolution. A target whose roster is not held here refuses
+    /// [`ScopeRefusalReason::MembershipUnresolved`](crate::scope::ScopeRefusalReason::MembershipUnresolved)
+    /// (retryable, #797); one that excludes the writer refuses the
+    /// plane's membership reason (terminal). On refusal a §9.3
     /// `persist_refused_write_scope_total` event is emitted.
     ///
     /// Provided method (not per-backend SQL): composes the existing
@@ -4648,13 +4663,14 @@ pub trait FederationDirectory: Send + Sync {
         claimed_cohort_scope: &str,
         claimed_target_id: Option<&str>,
     ) -> Result<(), Error> {
-        use crate::federation::types::cohort_scope as cs;
-        // Fast path: `self` + the broad belonging-tiers need no
-        // membership resolution. Only family/community do.
-        let needs_admission =
-            claimed_cohort_scope == cs::FAMILY || claimed_cohort_scope == cs::COMMUNITY;
+        use crate::federation::types::cohort_scope::{self as cs, TargetPlane};
+        // Fast path: `self` + the commons need no membership resolution.
+        // v47.0.0 (CIRISPersist#897): "needs a roster" is the classifier's
+        // answer, not a local `FAMILY || COMMUNITY` spelling — that spelling
+        // let an `affiliations` row through with no admission read at all.
+        let plane = cs::target_plane(claimed_cohort_scope);
 
-        let admission = if needs_admission {
+        let admission = if let Some(plane) = plane {
             // occurrence → identity (singleton fallback: unbound
             // occurrence IS its own identity, FSD §4.4).
             // THE PRINCIPAL FOLD (v38.3.0, #765): occurrence axis first
@@ -4678,47 +4694,59 @@ pub trait FederationDirectory: Send + Sync {
             // argument; measured by the revoked-member arm of
             // `exercise_owner_signed_community_row`.
             //
-            // Resolved for the CLAIMED TARGET ONLY (PR #759 review): the
-            // first shape enumerated every cohort containing the writer and
-            // folded revocations for each — O(N) sequential directory
-            // round-trips on the hot write path for an identity in N groups,
-            // when the predicate only ever asks about the ONE target the row
-            // names. One roster read + one revocation read now. An UNKNOWN
-            // target maps to the empty set — the same membership refusal,
-            // which is also the transient-correct answer for a row arriving
-            // ahead of its roster (CIRISEdge#522: refused rows re-offer);
-            // backend errors still propagate as errors.
-            fn contains_or_absent<M>(
-                members: Result<Vec<M>, Error>,
-                key_of: impl Fn(&M) -> &str,
-                identity: &str,
-            ) -> Result<bool, Error> {
-                match members {
-                    Ok(active) => Ok(active.iter().any(|m| key_of(m) == identity)),
-                    Err(Error::InvalidArgument(_)) => Ok(false),
-                    Err(e) => Err(e),
-                }
-            }
+            // Resolved for the CLAIMED TARGET ONLY (PR #759 review): one
+            // roster read + one revocation read, not every cohort the writer
+            // is in.
+            //
+            // v47.0.0 (CIRISPersist#797) — a roster this directory does NOT
+            // HOLD is a different fact from a roster that excludes the
+            // writer. The first is transient (the row arrived ahead of its
+            // roster, CIRISEdge#522 — refused rows re-offer); the second is
+            // terminal. Both still refuse; the first now says so. Detected
+            // STRUCTURALLY — `lookup_*` returned `None` — never by reading an
+            // error's variant: `InvalidArgument` is not a statement that the
+            // roster is absent.
             let mut family_key_ids: Vec<String> = Vec::new();
             let mut community_key_ids: Vec<String> = Vec::new();
             if let Some(target) = claimed_target_id {
-                if claimed_cohort_scope == cs::FAMILY
-                    && contains_or_absent(
-                        self.active_family_members(target).await,
-                        |m| m.key_id.as_str(),
-                        &identity,
-                    )?
-                {
-                    family_key_ids.push(target.to_owned());
+                let held = match plane {
+                    TargetPlane::Family => self.lookup_family(target).await?.is_some(),
+                    TargetPlane::Room => self.lookup_community(target).await?.is_some(),
+                };
+                if !held {
+                    let reason = crate::scope::ScopeRefusalReason::MembershipUnresolved;
+                    tracing::warn!(
+                        metric = "persist_refused_write_scope_total",
+                        write_path = %write_path,
+                        scope = %claimed_cohort_scope,
+                        reason = %reason.kind(),
+                        target = ?claimed_target_id,
+                        "ciris-persist: write-path cohort_scope refused (AV-45): the claimed \
+                         cohort's roster is not held here yet — retryable"
+                    );
+                    return Err(Error::WriteScopeRefused(reason));
                 }
-                if claimed_cohort_scope == cs::COMMUNITY
-                    && contains_or_absent(
-                        self.active_community_members(target).await,
-                        |m| m.key_id.as_str(),
-                        &identity,
-                    )?
-                {
-                    community_key_ids.push(target.to_owned());
+                match plane {
+                    TargetPlane::Family => {
+                        if self
+                            .active_family_members(target)
+                            .await?
+                            .iter()
+                            .any(|m| m.key_id == identity)
+                        {
+                            family_key_ids.push(target.to_owned());
+                        }
+                    }
+                    TargetPlane::Room => {
+                        if self
+                            .active_community_members(target)
+                            .await?
+                            .iter()
+                            .any(|m| m.key_id == identity)
+                        {
+                            community_key_ids.push(target.to_owned());
+                        }
+                    }
                 }
             }
             crate::scope::CallerAdmission::from_resolved(
@@ -4729,7 +4757,7 @@ pub trait FederationDirectory: Send + Sync {
             )
         } else {
             // No reads needed; an empty admission is sufficient for the
-            // self / broad-tier arms (they ignore the membership sets).
+            // self / commons arms (they ignore the membership sets).
             crate::scope::CallerAdmission::from_resolved(
                 writer_occurrence_key_id.to_owned(),
                 writer_occurrence_key_id.to_owned(),

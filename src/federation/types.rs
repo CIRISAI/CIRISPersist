@@ -2208,10 +2208,168 @@ pub mod cohort_scope {
     /// admission-gate work in v3.10.0+ uses this for early rejection
     /// of malformed envelopes.
     pub fn is_valid(s: &str) -> bool {
+        Scope::parse(s).is_some()
+    }
+
+    /// v47.0.0 (CIRISPersist#897, #796, `FSD/SCOPE_CLASSIFIER.md`) — the
+    /// closed vocabulary as a TYPE.
+    ///
+    /// Held only as `&str` constants, every gate re-spelled its own
+    /// classification with `==`, `matches!` or a `_` arm, and nothing compared
+    /// the spellings: eight sites read `affiliations` as broad while every
+    /// at-rest site read it as a room (#897), and `crypto_tier`'s `_` arm
+    /// classified any unlisted scope as plaintext (#796). Every gate now asks
+    /// [`Scope::placement`], and adding a variant is a build error at each
+    /// exhaustive match instead of a silent fall-through.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub enum Scope {
+        /// [`SELF`].
+        SelfOnly,
+        /// [`FAMILY`].
+        Family,
+        /// [`COMMUNITY`].
+        Community,
+        /// [`AFFILIATIONS`].
+        Affiliations,
+        /// [`SPECIES`].
+        Species,
+        /// [`BIOSPHERE`].
+        Biosphere,
+        /// [`FEDERATION`].
+        Federation,
+    }
+
+    /// What a placement at a scope claims — the ONE classification every gate
+    /// reads (write AV-45, promotion AV-84, the federation-tier floor, the
+    /// read gate's two twins, the hold path, the crossing's audience).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Placement {
+        /// The writer's / reader's own self-collective (v46.3.1).
+        SelfCollective,
+        /// One NAMED cohort: the row names its target, a writer must be in
+        /// it, a reader must be in it, the hold path sends it to its members.
+        Targeted(TargetPlane),
+        /// No roster: anyone (CC 4.4.3.2.1 Commons — plaintext, any reader).
+        Commons,
+    }
+
+    /// Which roster a [`Placement::Targeted`] scope is answered against.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TargetPlane {
+        /// The family record's roster (`family_key_ids`).
+        Family,
+        /// The community record's roster (`community_key_ids`). An
+        /// affiliation IS a community record (CC 4.4.3.2.8: it "shares the
+        /// CommunityDek crypto tier and all the community machinery"), so
+        /// `community` and `affiliations` are one plane.
+        Room,
+    }
+
+    impl Scope {
+        /// Every variant, in [`ALL`]'s widening order.
+        pub const ALL: [Scope; 7] = [
+            Scope::SelfOnly,
+            Scope::Family,
+            Scope::Community,
+            Scope::Affiliations,
+            Scope::Species,
+            Scope::Biosphere,
+            Scope::Federation,
+        ];
+
+        /// The wire value. `None` for anything outside the closed set — a
+        /// caller must say what an unrecognized scope means at its own site;
+        /// there is no default.
+        #[must_use]
+        pub fn parse(s: &str) -> Option<Scope> {
+            Some(match s {
+                SELF => Scope::SelfOnly,
+                FAMILY => Scope::Family,
+                COMMUNITY => Scope::Community,
+                AFFILIATIONS => Scope::Affiliations,
+                SPECIES => Scope::Species,
+                BIOSPHERE => Scope::Biosphere,
+                FEDERATION => Scope::Federation,
+                _ => return None,
+            })
+        }
+
+        /// The wire value.
+        #[must_use]
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Scope::SelfOnly => SELF,
+                Scope::Family => FAMILY,
+                Scope::Community => COMMUNITY,
+                Scope::Affiliations => AFFILIATIONS,
+                Scope::Species => SPECIES,
+                Scope::Biosphere => BIOSPHERE,
+                Scope::Federation => FEDERATION,
+            }
+        }
+
+        /// The classification. Exhaustive — no `_`.
+        #[must_use]
+        pub fn placement(self) -> Placement {
+            match self {
+                Scope::SelfOnly => Placement::SelfCollective,
+                Scope::Family => Placement::Targeted(TargetPlane::Family),
+                // CC 4.4.3.2.1: `community` AND `affiliations` are the
+                // Community tier — readers are the roster (#897 ruling).
+                Scope::Community | Scope::Affiliations => Placement::Targeted(TargetPlane::Room),
+                Scope::Species | Scope::Biosphere | Scope::Federation => Placement::Commons,
+            }
+        }
+
+        /// The at-rest crypto tier. Exhaustive — no `_` (#796).
+        #[must_use]
+        pub fn crypto_tier(self, cohort_subkind: Option<&str>) -> CryptoTier {
+            match self {
+                Scope::SelfOnly | Scope::Family => CryptoTier::InvisibleEncrypted,
+                // The `cohort_subkind: infrastructure` governance carve-out:
+                // the trust root must be inspectable.
+                Scope::Community | Scope::Affiliations => {
+                    if cohort_subkind == Some("infrastructure") {
+                        CryptoTier::Plaintext
+                    } else {
+                        CryptoTier::CommunityDek
+                    }
+                }
+                Scope::Species | Scope::Biosphere | Scope::Federation => CryptoTier::Plaintext,
+            }
+        }
+    }
+
+    /// True iff `s` names ONE cohort (`family` / `community` / `affiliations`)
+    /// — the row carries its target, and membership in it is the question at
+    /// every gate. An unrecognized scope is not targeted (each caller refuses
+    /// it on its own closed-set check first).
+    #[must_use]
+    pub fn is_targeted(s: &str) -> bool {
         matches!(
-            s,
-            SELF | FAMILY | COMMUNITY | AFFILIATIONS | SPECIES | BIOSPHERE | FEDERATION
+            Scope::parse(s).map(Scope::placement),
+            Some(Placement::Targeted(_))
         )
+    }
+
+    /// The roster a targeted scope is answered against; `None` for self,
+    /// the commons, and anything unrecognized.
+    #[must_use]
+    pub fn target_plane(s: &str) -> Option<TargetPlane> {
+        match Scope::parse(s)?.placement() {
+            Placement::Targeted(p) => Some(p),
+            Placement::SelfCollective | Placement::Commons => None,
+        }
+    }
+
+    /// The Commons scopes (any reader), derived — the read gate's broad set.
+    #[must_use]
+    pub fn commons() -> Vec<&'static str> {
+        Scope::ALL
+            .into_iter()
+            .filter(|s| s.placement() == Placement::Commons)
+            .map(Scope::as_str)
+            .collect()
     }
 
     /// v3.9.2 (CIRISPersist#153 Ask 5, CEG 0.7 §10.1.4) — the
@@ -2294,15 +2452,15 @@ pub mod cohort_scope {
     /// `"infrastructure"` (e.g. `ciris-canonical` governance) is the
     /// plaintext-Commons carve-out — the trust root must be inspectable.
     pub fn crypto_tier(cohort_scope: &str, cohort_subkind: Option<&str>) -> CryptoTier {
-        match cohort_scope {
-            SELF | FAMILY => CryptoTier::InvisibleEncrypted,
-            COMMUNITY | AFFILIATIONS if cohort_subkind != Some("infrastructure") => {
-                CryptoTier::CommunityDek
-            }
-            // Negative default: Commons, infrastructure communities, and
-            // any scope this build doesn't recognize → plaintext. New
-            // tiers never silently encrypt-or-leak by falling through.
-            _ => CryptoTier::Plaintext,
+        match Scope::parse(cohort_scope) {
+            // Every closed-set scope is classified by an EXHAUSTIVE match
+            // (v47.0.0, #796): a scope added to [`Scope`] without a tier is a
+            // build error there, not a plaintext row here.
+            Some(s) => s.crypto_tier(cohort_subkind),
+            // A value outside the closed set is a corrupt column, not a
+            // scope — every write door refuses it first. Plaintext keeps the
+            // #188 negative default for that case only, and says so.
+            None => CryptoTier::Plaintext,
         }
     }
 

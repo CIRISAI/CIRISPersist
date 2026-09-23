@@ -1407,13 +1407,12 @@ impl DimensionAdmissionPolicy {
     ///   [`ScopeRefusalReason::NoFamilyMembership`]. A `None` target
     ///   (claiming family visibility without naming a family) cannot be
     ///   membership-validated and is refused.
-    /// - `community` — `Ok` iff `claimed_target_id ∈
-    ///   writer_admission.community_key_ids`, else
-    ///   [`ScopeRefusalReason::NoCommunityMembership`].
-    /// - `affiliations` / `species` / `biosphere` / `federation` —
-    ///   broad belonging-tiers; no per-row target; any authenticated
-    ///   writer may emit. The federation layer counter-signs (hybrid
-    ///   sigs).
+    /// - `community` / `affiliations` (one room plane, v47.0.0 #897) —
+    ///   `Ok` iff `claimed_target_id ∈ writer_admission.community_key_ids`,
+    ///   else [`ScopeRefusalReason::NoCommunityMembership`].
+    /// - `species` / `biosphere` / `federation` — the commons; no
+    ///   per-row target; any authenticated writer may emit. The
+    ///   federation layer counter-signs (hybrid sigs).
     /// - anything else — [`ScopeRefusalReason::InvalidCohortScope`]
     ///   carrying the offending label (closed-set fall-through).
     ///
@@ -1425,34 +1424,41 @@ impl DimensionAdmissionPolicy {
         claimed_cohort_scope: &str,
         claimed_target_id: Option<&str>,
     ) -> Result<(), crate::scope::ScopeRefusalReason> {
-        use crate::federation::types::cohort_scope as cs;
+        use crate::federation::types::cohort_scope::{Placement, Scope, TargetPlane};
         use crate::scope::ScopeRefusalReason;
 
-        match claimed_cohort_scope {
+        let Some(scope) = Scope::parse(claimed_cohort_scope) else {
+            return Err(ScopeRefusalReason::InvalidCohortScope(
+                claimed_cohort_scope.to_string(),
+            ));
+        };
+        // v47.0.0 (CIRISPersist#897) — through the ONE classifier. This arm
+        // used to list `affiliations` with the commons ("any authenticated
+        // writer may emit"), while `resolve_write_tier` refused to STORE an
+        // `affiliations` row naming no community: persist admitted a row its
+        // own at-rest tier said could not exist.
+        match scope.placement() {
             // Self — target IS the writer's identity, resolved + stamped
             // by the substrate from the verified signer (D2 ingest /
             // FSD §4.4). Any caller-supplied self-target is ignored.
             // Always permitted for the writer.
-            cs::SELF => Ok(()),
+            Placement::SelfCollective => Ok(()),
 
             // Family — the writer must be a member of the claimed family.
-            cs::FAMILY => match claimed_target_id {
+            Placement::Targeted(TargetPlane::Family) => match claimed_target_id {
                 Some(fid) if writer_admission.family_key_ids.contains(fid) => Ok(()),
                 _ => Err(ScopeRefusalReason::NoFamilyMembership),
             },
 
-            // Community — the writer must be a member of the claimed
-            // community.
-            cs::COMMUNITY => match claimed_target_id {
+            // A room (`community` / `affiliations`) — the writer must be a
+            // member of the claimed community record's roster.
+            Placement::Targeted(TargetPlane::Room) => match claimed_target_id {
                 Some(cid) if writer_admission.community_key_ids.contains(cid) => Ok(()),
                 _ => Err(ScopeRefusalReason::NoCommunityMembership),
             },
 
-            // Broad belonging-tiers — no per-row target; any
-            // authenticated writer may emit.
-            cs::AFFILIATIONS | cs::SPECIES | cs::BIOSPHERE | cs::FEDERATION => Ok(()),
-
-            other => Err(ScopeRefusalReason::InvalidCohortScope(other.to_string())),
+            // The commons — no roster; any authenticated writer may emit.
+            Placement::Commons => Ok(()),
         }
     }
 
@@ -2217,7 +2223,7 @@ pub async fn check_cohort_standing_resolved(
     row: &super::Attestation,
 ) -> Result<(), Error> {
     use crate::federation::types::cohort_scope as cs;
-    if row.cohort_scope != cs::FAMILY && row.cohort_scope != cs::COMMUNITY {
+    if !cs::is_targeted(&row.cohort_scope) {
         return Ok(());
     }
     // INCREMENTAL, fail-fast (PR #761 review): a row may carry thousands of
@@ -2348,9 +2354,10 @@ pub async fn check_cohort_standing_resolved(
 pub fn check_promotion_cohort_standing(row: &super::Attestation) -> Result<(), Error> {
     use crate::federation::types::cohort_scope as cs;
 
-    // Only the TARGETED cohorts. The broad belonging-tiers have no cohort to
-    // stand in; `self` is already refused by the placement-validity arm.
-    if row.cohort_scope != cs::FAMILY && row.cohort_scope != cs::COMMUNITY {
+    // Only the TARGETED cohorts (v47.0.0: `affiliations` included, #897).
+    // The commons have no cohort to stand in; `self` is already refused by
+    // the placement-validity arm.
+    if !cs::is_targeted(&row.cohort_scope) {
         return Ok(());
     }
 
@@ -12029,9 +12036,7 @@ pub fn check_targeted_cohort_requires_federation_tier(
     cohort_scope: &str,
 ) -> Result<(), Error> {
     use crate::federation::types::{attestation_tier, cohort_scope as cs};
-    if tier != attestation_tier::FEDERATION
-        && (cohort_scope == cs::FAMILY || cohort_scope == cs::COMMUNITY)
-    {
+    if tier != attestation_tier::FEDERATION && cs::is_targeted(cohort_scope) {
         return Err(Error::InvalidArgument(format!(
             "a {cohort_scope}-scoped placement is a membership claim, and only \
              federation-tier rows have their author signature verified \
@@ -14395,10 +14400,11 @@ mod tests {
             Vec::<String>::new(),
         );
 
-        // (1) The two targeted scopes are refused for want of a TARGET, not for
+        // (1) The targeted scopes are refused for want of a TARGET, not for
         // want of membership — pass a real family id and it is still refused,
-        // because the row has no field to carry it.
-        for scope in [cs::FAMILY, cs::COMMUNITY] {
+        // because the row has no field to carry it. (v47.0.0, #897:
+        // `affiliations` is a room, so it is targeted too.)
+        for scope in [cs::FAMILY, cs::COMMUNITY, cs::AFFILIATIONS] {
             assert!(
                 DimensionAdmissionPolicy::check_write_cohort_scope(&unaffiliated, scope, None)
                     .is_err(),
@@ -14408,13 +14414,7 @@ mod tests {
 
         // (2) …and the placements a promotion actually lands at are admitted
         // unconditionally, so AV-45 would contribute no check there.
-        for scope in [
-            cs::SELF,
-            cs::AFFILIATIONS,
-            cs::SPECIES,
-            cs::BIOSPHERE,
-            cs::FEDERATION,
-        ] {
+        for scope in [cs::SELF, cs::SPECIES, cs::BIOSPHERE, cs::FEDERATION] {
             assert!(
                 DimensionAdmissionPolicy::check_write_cohort_scope(&unaffiliated, scope, None)
                     .is_ok(),
@@ -14471,14 +14471,15 @@ mod tests {
         };
 
         // (1) The gate is the TARGETED-cohort arm and nothing else. A row about
-        // a stranger still reaches every broad belonging-tier.
-        for scope in [cs::AFFILIATIONS, cs::SPECIES, cs::BIOSPHERE, cs::FEDERATION] {
+        // a stranger still reaches every commons tier.
+        for scope in [cs::SPECIES, cs::BIOSPHERE, cs::FEDERATION] {
             check_promotion_cohort_standing(&row("stranger-592", &["stranger-592"], scope))
                 .expect("AV-84 is the targeted-cohort arm — broad tiers keep AV-45's own rule");
         }
 
-        // (2) …and on the two targeted cohorts it refuses, naming its branch.
-        for scope in [cs::FAMILY, cs::COMMUNITY] {
+        // (2) …and on the targeted cohorts it refuses, naming its branch.
+        // (v47.0.0, #897: `affiliations` is one of them.)
+        for scope in [cs::FAMILY, cs::COMMUNITY, cs::AFFILIATIONS] {
             let err = check_promotion_cohort_standing(&row("stranger-592", &[], scope))
                 .expect_err("a row ABOUT a stranger is not a producer self-declaration");
             assert!(
@@ -17066,13 +17067,35 @@ mod tests {
         assert_eq!(err, ScopeRefusalReason::NoCommunityMembership);
     }
 
+    /// v47.0.0 (CIRISPersist#897) — `affiliations` is a ROOM at AV-45, as at
+    /// the at-rest tier, the hold path and the read gate (CC 4.4.3.2.1 /
+    /// 4.4.3.2.8). It used to admit any writer with no target.
+    #[test]
+    fn write_affiliations_is_a_room_897() {
+        let w = writer_in_f1_c1();
+        DimensionAdmissionPolicy::check_write_cohort_scope(
+            &w,
+            "affiliations",
+            Some("community-key:c1"),
+        )
+        .expect("a member of the affiliation writes into it");
+        for target in [None, Some("community-key:c9")] {
+            assert_eq!(
+                DimensionAdmissionPolicy::check_write_cohort_scope(&w, "affiliations", target),
+                Err(ScopeRefusalReason::NoCommunityMembership),
+                "an affiliations row naming no affiliation, or one the writer is not in: {target:?}"
+            );
+        }
+    }
+
     #[test]
     fn write_broad_tiers_permitted_for_any_authenticated_writer() {
-        // Broad belonging-tiers carry no per-row target; any
-        // authenticated writer may emit. A writer with empty admission
-        // sets passes all four.
+        // The commons carry no per-row target; any authenticated writer may
+        // emit. A writer with empty admission sets passes all three.
+        // (`affiliations` left this list in v47.0.0 — see
+        // `write_affiliations_is_a_room_897`.)
         let w = CallerAdmission::for_test("sovereign-occ", "sovereign-occ", [], []);
-        for scope in ["affiliations", "species", "biosphere", "federation"] {
+        for scope in ["species", "biosphere", "federation"] {
             DimensionAdmissionPolicy::check_write_cohort_scope(&w, scope, None)
                 .unwrap_or_else(|e| panic!("broad tier {scope} must admit, got {e:?}"));
             // A spurious target on a broad tier is ignored (no target

@@ -190,8 +190,14 @@ pub enum Audience {
         /// The community the row is placed in (`community_key_id`).
         community_key_id: String,
     },
-    /// `affiliations`.
-    Affiliations,
+    /// `affiliations` — that affiliation's members. v47.0.0 (CIRISPersist#897,
+    /// BREAKING: was a unit variant): an affiliation IS a community record
+    /// (CC 4.4.3.2.8, "membership ⊆ roster"), so a placement names ONE, as
+    /// [`Self::Community`] does.
+    Affiliations {
+        /// The affiliation the row is placed in (`community_key_id`).
+        community_key_id: String,
+    },
     /// `species`.
     Species,
     /// `biosphere`.
@@ -208,20 +214,23 @@ impl Audience {
             Self::SelfOnly => cohort_scope::SELF,
             Self::Family { .. } => cohort_scope::FAMILY,
             Self::Community { .. } => cohort_scope::COMMUNITY,
-            Self::Affiliations => cohort_scope::AFFILIATIONS,
+            Self::Affiliations { .. } => cohort_scope::AFFILIATIONS,
             Self::Species => cohort_scope::SPECIES,
             Self::Biosphere => cohort_scope::BIOSPHERE,
             Self::Federation => cohort_scope::FEDERATION,
         }
     }
 
-    /// The cohort the placement names, for `family` / `community`.
+    /// The cohort the placement names, for `family` / `community` /
+    /// `affiliations`.
     #[must_use]
     pub fn cohort_target(&self) -> Option<&str> {
         match self {
             Self::Family { family_key_id } => Some(family_key_id),
-            Self::Community { community_key_id } => Some(community_key_id),
-            _ => None,
+            Self::Community { community_key_id } | Self::Affiliations { community_key_id } => {
+                Some(community_key_id)
+            }
+            Self::SelfOnly | Self::Species | Self::Biosphere | Self::Federation => None,
         }
     }
 
@@ -231,14 +240,15 @@ impl Audience {
     pub fn cohort_target_member(&self) -> Option<&'static str> {
         match self {
             Self::Family { .. } => Some("family_key_id"),
-            Self::Community { .. } => Some("community_key_id"),
-            _ => None,
+            Self::Community { .. } | Self::Affiliations { .. } => Some("community_key_id"),
+            Self::SelfOnly | Self::Species | Self::Biosphere | Self::Federation => None,
         }
     }
 
     /// Build from a wire `cohort_scope` and the cohort target the row names
-    /// (`admission::envelope_cohort_target`). A `family`/`community` scope
-    /// without a target is refused: a cohort placement names its cohort.
+    /// (`admission::envelope_cohort_target`). A targeted scope (`family` /
+    /// `community` / `affiliations`) without a target is refused: a cohort
+    /// placement names its cohort.
     pub fn from_cohort_scope(scope: &str, target: Option<&str>) -> Result<Self, Error> {
         let need = |what: &str| {
             Error::InvalidArgument(format!(
@@ -254,7 +264,9 @@ impl Audience {
             cohort_scope::COMMUNITY => Self::Community {
                 community_key_id: target.ok_or_else(|| need("community_key_id"))?.to_owned(),
             },
-            cohort_scope::AFFILIATIONS => Self::Affiliations,
+            cohort_scope::AFFILIATIONS => Self::Affiliations {
+                community_key_id: target.ok_or_else(|| need("community_key_id"))?.to_owned(),
+            },
             cohort_scope::SPECIES => Self::Species,
             cohort_scope::BIOSPHERE => Self::Biosphere,
             cohort_scope::FEDERATION => Self::Federation,

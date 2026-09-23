@@ -982,10 +982,19 @@ impl StorageFloor {
     pub fn check_scope(self, cohort_scope: &str) -> Result<(), BlobError> {
         use crate::federation::types::cohort_scope::{self as cs, CryptoTier};
         let plaintext = self.tier == CryptoTier::Plaintext;
-        let contradiction = match cohort_scope {
-            cs::SELF | cs::FAMILY => plaintext,
-            cs::COMMUNITY | cs::AFFILIATIONS => self.tier == CryptoTier::InvisibleEncrypted,
-            _ => !plaintext,
+        // v47.0.0 (#796/#897) — through the classifier, exhaustively.
+        let contradiction = match cs::Scope::parse(cohort_scope).map(cs::Scope::placement) {
+            Some(
+                cs::Placement::SelfCollective | cs::Placement::Targeted(cs::TargetPlane::Family),
+            ) => plaintext,
+            Some(cs::Placement::Targeted(cs::TargetPlane::Room)) => {
+                self.tier == CryptoTier::InvisibleEncrypted
+            }
+            Some(cs::Placement::Commons) => !plaintext,
+            // Outside the closed set: a corrupt column, not a scope. The
+            // commons rule (must be plaintext) is the pre-v47 behaviour, kept
+            // and named rather than reached by a `_`.
+            None => !plaintext,
         };
         if contradiction {
             return Err(BlobError::InvalidArgument(format!(
