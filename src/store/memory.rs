@@ -20978,16 +20978,12 @@ mod tests {
         crate::federation::genesis::exercise_genesis_seed_installs(&backend).await;
     }
 
-    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **revocation-door
-    /// parity** witness. This backend is the one that was wrong: it ran neither
-    /// `check_observed_region` nor the anti-rollback check, and it validated no
-    /// hex, so all three shapes sqlite + postgres refuse were accepted here.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     /// v47.1.0 (CIRISPersist#861) — both removal doors are idempotent on
     /// their PK on memory too: a repeat is `Ok`, the first stands, and the
     /// community repeat does not rotate the DEK epoch a second time. (The
     /// sqlite/postgres legs are `exercise_family_revocation_repeat_861` and
     /// step 4b of the cohort lifecycle.)
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn revocation_repeat_is_a_noop_memory_861() {
         use crate::federation::tier_ingest::test_support as ts;
@@ -21085,6 +21081,11 @@ mod tests {
         );
     }
 
+    /// v31.0.0 (CIRISPersist#660) — the MEMORY leg of the **revocation-door
+    /// parity** witness. This backend is the one that was wrong: it ran neither
+    /// `check_observed_region` nor the anti-rollback check, and it validated no
+    /// hex, so all three shapes sqlite + postgres refuse were accepted here.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[tokio::test]
     async fn revocation_door_parity_memory_660() {
         let backend = MemoryBackend::new();

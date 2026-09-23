@@ -20377,6 +20377,7 @@ static SQLITE_TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::Laz
              MIN(deployment_type) AS deployment_type, \
              MIN(ts) AS started_at, \
              MAX(ts) AS completed_at, \
+             MAX(admitted_at) AS admitted_at, \
              MIN(trace_level) AS trace_level, \
              MIN(schema_version) AS schema_version, \
              MIN(signature_verified) AS signature_verified, \
@@ -20436,6 +20437,23 @@ fn sqlite_row_to_trace_summary(
         deployment_type: row.get("deployment_type")?,
         started_at: parse_rfc3339(&started_at),
         completed_at: parse_rfc3339(&completed_at),
+        // v47.1.0 (#844) — ABSENT is `None` (a pre-#606 row has no admission
+        // instant); MALFORMED is a decode error. Neither becomes "now" — the
+        // failure `parse_rfc3339` has under `started_at` / `completed_at`.
+        admitted_at: row
+            .get::<_, Option<String>>("admitted_at")?
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+            })
+            .transpose()?,
         trace_level,
         schema_version: row.get("schema_version")?,
         signature_verified: signature_verified_i.unwrap_or(0) != 0,
@@ -20644,6 +20662,20 @@ fn sqlite_filter_where(
         parts.push(format!("ts >= ?{}", binds.len()));
         binds.push(SqlValue::Text(w.until.to_rfc3339()));
         parts.push(format!("ts < ?{}", binds.len()));
+    }
+    // v47.1.0 (#844) — this node's admission instant (V128). Bound in
+    // the EXACT spelling the ingest writes (`to_rfc3339_opts(Micros, Z)`),
+    // because the column is TEXT and compares as a string: a bind in
+    // another RFC 3339 spelling (`+00:00`, variable precision) orders by
+    // accident, not by construction.
+    if let Some(w) = filter.admitted_window {
+        let at = |d: chrono::DateTime<chrono::Utc>| {
+            d.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        };
+        binds.push(SqlValue::Text(at(w.since)));
+        parts.push(format!("admitted_at >= ?{}", binds.len()));
+        binds.push(SqlValue::Text(at(w.until)));
+        parts.push(format!("admitted_at < ?{}", binds.len()));
     }
     if let Some(h) = &filter.agent_id_hash {
         binds.push(SqlValue::Text(h.clone()));

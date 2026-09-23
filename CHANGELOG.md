@@ -57,6 +57,41 @@ dropped every AAD mismatch into the generic arm with nothing going red.
   stream) now assert the typed arm naming the blob, where they used to
   assert `Backend(_)`.
 
+### Added — a trace's admission instant, per trace and as a filter (CIRISPersist#844)
+#606 gave `trace_events` an `admitted_at` (when **this node** accepted the
+trace) and surfaced it table-wide as `newest_admitted_at`. CIRISServer's
+per-agent receipt (CIRISServer#592) needs it per trace. "Did my run's traces
+land in the last two minutes" is a question about admission, and a producer
+whose clock is skewed, or that replays older traces, gets it wrong on
+`started_at`.
+
+- **`TraceSummary.admitted_at: Option<DateTime<Utc>>`**, the `MAX(admitted_at)`
+  over the trace's rows. `None` for rows admitted before #606. It is never
+  defaulted to "now", and a malformed value is a decode error.
+- **`TraceFilter.admitted_window: Option<TimeWindow>`**, pushed down onto the
+  indexed column beside `time_window`, and AND-composed with the other
+  filters. On sqlite the bind uses the exact spelling ingest writes
+  (`to_rfc3339_opts(Micros, Z)`), because the column is TEXT and compares as
+  a string. Python takes it through the existing `filter_json`.
+- **One postgres predicate.** `list_trace_summaries` and
+  `build_filter_where` (count and aggregate reads) had spelled the
+  `TraceFilter` predicate twice, field for field. Both now call
+  `pg_trace_filter_parts`, so a field added to one cannot be missing from the
+  other.
+- **On ask 3:** `admitted_window` + `limit 1` under the existing `(started_at,
+  trace_id) DESC` ordering returns the newest-*started* trace among those
+  admitted in the window, not the newest-*admitted*. The receipt's question
+  ("did my traces land since T") is answered exactly by `count_traces` with
+  the admitted window, and I148 pins that the count and the list agree.
+- Found and left for its own cut: sqlite's `parse_rfc3339` maps a malformed
+  `started_at` / `completed_at` to `Utc::now()`, the "defaulted to now"
+  failure this entry avoids for `admitted_at`.
+
+**I148** (sqlite + postgres): traces a year old by the producer's clock and
+admitted now. The started window for "the last minute" is empty; the
+admission window holds exactly this agent's traces, each carrying an
+`admitted_at` inside it; and the count equals the list.
+
 ## [47.0.0] - 2026-09-23
 
 ### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)

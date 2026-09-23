@@ -62,6 +62,14 @@ pub struct TraceSummary {
     pub started_at: DateTime<Utc>,
     /// Last-component timestamp.
     pub completed_at: DateTime<Utc>,
+    /// v47.1.0 (CIRISPersist#844) — when THIS node admitted the trace:
+    /// `MAX(admitted_at)` over its rows (#606, V128). A trace admits as one
+    /// batch, so max and min agree in practice; max is the conservative one.
+    /// `None` for rows admitted before #606 — distinct from "now", never
+    /// defaulted to it. `started_at` / `completed_at` are the PRODUCER's
+    /// clock; this is the node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_at: Option<DateTime<Utc>>,
 
     /// Trace verbosity level.
     pub trace_level: TraceLevel,
