@@ -7,6 +7,133 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.1.0] - 2026-09-23
+
+### Fixed — both membership-removal doors are idempotent on their PK, on every backend (CIRISPersist#861)
+The trait documents `put_family_membership_revocation` and
+`put_community_membership_revocation` as idempotent on `(cohort,
+removed_identity)`. Edge reported the sqlite community door (CIRISEdge#608),
+where a repeat raised `UNIQUE constraint failed`. The witnesses found **four**
+doors broken the same way: family and community, on both sqlite and
+postgres. They also found a fifth that was wrong in the opposite direction:
+memory's family door **overwrote** the stored revocation on every repeat.
+Memory's community door copied the SQL error on purpose, "for parity".
+
+- The unique index decides (`ON CONFLICT`), which is race-safe. A
+  check-then-insert would race under READ COMMITTED (the #894 class).
+- **Community:** a repeat is a no-op. The transaction rolls back, so there is
+  no second hard-case event and, above all, **no second DEK rotation for one
+  removal**. The cohort lifecycle witness now asserts exactly one epoch
+  advance.
+- **Family:** a repeat is a no-op **unless it moves the removal earlier**,
+  in which case it replaces the stored revocation. Family removals may be
+  scheduled; community ones may not (SecReview F4). A guardian who
+  scheduled a removal and now needs it immediately must get it. Turning the
+  old `UNIQUE` error into a silent `Ok` that kept the scheduled date would
+  report a removal that had not happened. Memory's own test had encoded this
+  acceleration, and memory was the only backend where it worked.
+
+### Added — `BlobError::SealDidNotOpen`: "did not open" is not "may not read" (CIRISPersist#842)
+A read that was **authorized** but whose AEAD tag did not verify came back
+as `BlobError::Backend(prose)`. Per #831 it arrives after authorization, so
+it is never a permissions problem. But a consumer that wanted to keep that
+distinction had to match persist's wording (`msg.contains("decrypt")`, which
+is Edge's `PersistGroupContentStore::map_err`). A reword upstream would have
+dropped every AAD mismatch into the generic arm with nothing going red.
+
+- **`BlobError::SealDidNotOpen { sha256_hex }`**, kind
+  `blob_seal_did_not_open`. Its remedy is to look at the **row** (almost
+  always the associated data the reader rebuilt), where `NotGranted`'s
+  remedy is a grant.
+- It is produced structurally: `AtRestError::SealDidNotOpen` is raised only
+  by the body open (`open_aad`, and so `open`). A **DEK** that will not
+  unwrap stays `AtRestError::Crypto`, because that is a key or grant fault,
+  not this one; a unit pin now asserts that split. One mapper,
+  `at_rest_cascade::open_err`, carries it at all four read sites; every
+  other error goes to each site's existing mapper, unchanged.
+- Python: `RuntimeError("blob_seal_did_not_open: <sha>")`. The exception
+  type is unchanged from the `Backend` arm it replaces (the Python contract
+  splits `RuntimeError`, after authorization, from `ValueError`, a caller
+  refusal); only the token changes. Three wheel tests that pinned
+  `match="blob_backend"` now pin the new token.
+- I40 (a wrong or absent AAD after authorization, every scope, sqlite +
+  postgres) and I42 (a chunk moved to another position or lifted to another
+  stream) now assert the typed arm naming the blob, where they used to
+  assert `Backend(_)`.
+
+### Added — a trace's admission instant, per trace and as a filter (CIRISPersist#844)
+#606 gave `trace_events` an `admitted_at` (when **this node** accepted the
+trace) and surfaced it table-wide as `newest_admitted_at`. CIRISServer's
+per-agent receipt (CIRISServer#592) needs it per trace. "Did my run's traces
+land in the last two minutes" is a question about admission, and a producer
+whose clock is skewed, or that replays older traces, gets it wrong on
+`started_at`.
+
+- **`TraceSummary.admitted_at: Option<DateTime<Utc>>`**, the `MAX(admitted_at)`
+  over the trace's rows. `None` for rows admitted before #606. It is never
+  defaulted to "now", and a malformed value is a decode error.
+- **`TraceFilter.admitted_window: Option<TimeWindow>`**, pushed down onto the
+  indexed column beside `time_window`, and AND-composed with the other
+  filters. On sqlite the bind uses the exact spelling ingest writes
+  (`to_rfc3339_opts(Micros, Z)`), because the column is TEXT and compares as
+  a string. Python takes it through the existing `filter_json`.
+- **One postgres predicate.** `list_trace_summaries` and
+  `build_filter_where` (count and aggregate reads) had spelled the
+  `TraceFilter` predicate twice, field for field. Both now call
+  `pg_trace_filter_parts`, so a field added to one cannot be missing from the
+  other.
+- **On ask 3:** `admitted_window` + `limit 1` under the existing `(started_at,
+  trace_id) DESC` ordering returns the newest-*started* trace among those
+  admitted in the window, not the newest-*admitted*. The receipt's question
+  ("did my traces land since T") is answered exactly by `count_traces` with
+  the admitted window, and I148 pins that the count and the list agree.
+- Found and left for its own cut: sqlite's `parse_rfc3339` maps a malformed
+  `started_at` / `completed_at` to `Utc::now()`, the "defaulted to now"
+  failure this entry avoids for `admitted_at`.
+
+**I148** (sqlite + postgres): traces a year old by the producer's clock and
+admitted now. The started window for "the last minute" is empty; the
+admission window holds exactly this agent's traces, each carrying an
+`admitted_at` inside it; and the count equals the list.
+
+### Fixed — six `test_pg.rs` comments cited the wrong issue (CIRISPersist#822)
+The v42.1.0 test-template fixes (build under a scratch name, then rename; hold
+the lock across `f`; name why postgres refused) cited `CIRISPersist#821`, a
+number assumed while writing and later assigned to an unrelated CIRISEdge
+blob-surface question. They now cite #822, the issue filed afterwards as the
+record of what was fixed. The issue listed five; there were six (line 767).
+Every other `#821` in the tree correctly refers to the Edge question.
+
+### Changed — `AdmissionGate` is a consumer-owned score floor, not persist's trust posture (CIRISPersist#737)
+`SqliteNodeCoreBackend.admission_gate: None` was documented as "preserves
+pre-#123 bootstrap-permissive behavior", which reads as an unflipped flag day.
+It is not one. The gate (v3.4.0, #123) is a numeric trust-**score** floor
+consulted first on the write paths; the posture CC and the threat model
+mandate — hybrid-strict signature verification before mutation (AV-9), AV-45
+membership at every targeted scope, AV-84 standing, the reserved-prefix and
+accord-holder asymmetries, the §4.3 read gate — runs whether or not a gate is
+installed, and `None` and `Some(gate at 0.0)` are the same state: no
+*additional* floor. The threshold is a consumer knob (Edge derives one in
+`init_edge_runtime`); persist has no basis in CC to invent a default number,
+so it does not. Doc-only: the comment now says this; no API changes.
+
+### Mutation round — 13 / 13 killed
+Run under `scripts/pg_test_db.sh`.
+
+| # | Mutant | Killed by |
+|---|--------|-----------|
+| M1 | the sqlite community door is a plain `INSERT` again | cohort lifecycle 4b (sqlite) |
+| M2 | postgres: a community repeat falls through to the hard-case event and the epoch bump | cohort lifecycle (epoch == before + 1) |
+| M3 | sqlite: every family repeat replaces the stored revocation | family repeat witness (sqlite) |
+| M4 | postgres: the family acceleration comparison flipped | family repeat witness (postgres) |
+| M5 | memory: a family repeat never accelerates | `active_family_members_future_revocation_keeps_member` |
+| M6 | the AAD body open reports `Crypto` again | the `open_aad` unit pins, I40 on postgres |
+| M7 | `open_err` maps the typed arm to the `Backend` fallback | I40 on both backends |
+| M8 | the `kind()` token changes | I40 on both backends |
+| M9 / M10 | sqlite / postgres ignore `admitted_window` | I148 on each |
+| M11 / M12 | sqlite / postgres summaries carry no `admitted_at` | I148 on each |
+| M13 | the Python seal message drops the blob | the boundary pin |
+
 ## [47.0.0] - 2026-09-23
 
 ### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)

@@ -34,6 +34,16 @@ pub struct TraceFilter {
     /// timestamp). `None` returns all timestamps.
     pub time_window: Option<TimeWindow>,
 
+    /// v47.1.0 (CIRISPersist#844) — window on `admitted_at`: when THIS
+    /// node accepted the trace (#606), not when the producer says it
+    /// started. "Did my run's traces land in the last two minutes" is a
+    /// question about admission; a producer whose clock is skewed, or that
+    /// replays older traces, answers it wrong on `started_at`. Pushed down
+    /// onto the indexed column (`trace_events_admitted_at`). Rows admitted
+    /// before #606 carry no `admitted_at` and never match a window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_window: Option<TimeWindow>,
+
     /// Filter by `agent_id_hash`. `None` returns all agents.
     /// **AV-9**: trace-scoped reads MUST gate on `agent_id_hash`
     /// at the caller's authorization layer; this filter narrows

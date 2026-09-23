@@ -8169,41 +8169,70 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ("family_key_id", &row.family_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
         ]);
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668) — THIS node's serve position (V130).
-            let admitted_at = sqlite_next_plane_position(
-                conn,
-                "federation_family_membership_revocations",
-                POS_REMOVED,
-            )?;
-            conn.execute(
-                "INSERT INTO federation_family_membership_revocations (\
+        let inserted = self
+            .write(move |conn| -> Result<bool, rusqlite::Error> {
+                // v47.1.0 (CIRISPersist#861) — one transaction, so a repeat can
+                // leave NOTHING behind (the position below included).
+                let tx = conn.transaction()?;
+                // v36.0.0 (#668) — THIS node's serve position (V130).
+                let admitted_at = sqlite_next_plane_position(
+                    &tx,
+                    "federation_family_membership_revocations",
+                    POS_REMOVED,
+                )?;
+                // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
+                // documents, with ONE exception that is fail-secure: a repeat that
+                // moves the removal EARLIER (a scheduled family removal a guardian
+                // now needs immediately) replaces the stored revocation. Any other
+                // repeat — the retry-after-partial-failure #861 is about — changes
+                // nothing, and the tx is dropped un-committed. Refusing the
+                // acceleration was the pre-v47.1 SQL behaviour (a UNIQUE error);
+                // turning that error into a silent `Ok` that did NOT accelerate
+                // would tell the caller the member was removed while they kept
+                // access. The unique index arbitrates, so this is race-safe.
+                let n = tx.execute(
+                    "INSERT INTO federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                rusqlite::params![
-                    row.family_key_id,
-                    row.removed_identity_key_id,
-                    row.removed_at.to_rfc3339(),
-                    row.effective_at.to_rfc3339(),
-                    row.reason,
-                    witness,
-                    row.persist_row_hash,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(map_revocation_sqlite_err("family_membership_revocation"))?;
-        self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
-            .await?;
-        self.record_hard_case(removal_event).await?;
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (family_key_id, removed_identity_key_id) DO UPDATE SET \
+                    removed_at = excluded.removed_at, effective_at = excluded.effective_at, \
+                    reason = excluded.reason, witness_set = excluded.witness_set, \
+                    persist_row_hash = excluded.persist_row_hash, \
+                    authority_key_id = excluded.authority_key_id, \
+                    scrub_signature_classical = excluded.scrub_signature_classical, \
+                    scrub_signature_pqc = excluded.scrub_signature_pqc, \
+                    admitted_at = excluded.admitted_at \
+                 WHERE excluded.effective_at < federation_family_membership_revocations.effective_at",
+                    rusqlite::params![
+                        row.family_key_id,
+                        row.removed_identity_key_id,
+                        row.removed_at.to_rfc3339(),
+                        row.effective_at.to_rfc3339(),
+                        row.reason,
+                        witness,
+                        row.persist_row_hash,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )?;
+                if n == 0 {
+                    return Ok(false); // a repeat: tx dropped, rolled back
+                }
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(map_revocation_sqlite_err("family_membership_revocation"))?;
+        if inserted {
+            self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
+                .await?;
+            self.record_hard_case(removal_event).await?;
+        }
         Ok(())
     }
 
@@ -8257,104 +8286,120 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // must NOT leave a durable un-rotated revocation. (The prior code
         // called self.record_hard_case / self.community_dek_bump_epoch, each
         // taking its own lock + autocommit — three separate commits.)
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            let tx = conn.transaction()?;
-            // v36.0.0 (#668) — THIS node's serve position (V130), allocated
-            // inside the same transaction as the write.
-            let admitted_at = sqlite_next_plane_position(
-                &tx,
-                "federation_community_membership_revocations",
-                POS_REMOVED,
-            )?;
-            tx.execute(
-                "INSERT INTO federation_community_membership_revocations (\
+        let inserted = self
+            .write(move |conn| -> Result<bool, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                // v36.0.0 (#668) — THIS node's serve position (V130), allocated
+                // inside the same transaction as the write.
+                let admitted_at = sqlite_next_plane_position(
+                    &tx,
+                    "federation_community_membership_revocations",
+                    POS_REMOVED,
+                )?;
+                // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the
+                // trait documents: a repeat of an already-recorded removal is a
+                // no-op. `ON CONFLICT DO NOTHING` lets the unique index decide
+                // (race-safe, unlike a check-then-insert); on a repeat the
+                // transaction is DROPPED un-committed, so nothing it did stands —
+                // not the serve position above, not a second hard_case event,
+                // and above all not a second DEK rotation for one removal. The
+                // first recorded revocation stands.
+                let n = tx.execute(
+                    "INSERT INTO federation_community_membership_revocations (\
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                rusqlite::params![
-                    row.community_key_id,
-                    row.removed_identity_key_id,
-                    row.removed_at.to_rfc3339(),
-                    row.effective_at.to_rfc3339(),
-                    row.reason,
-                    witness,
-                    row.persist_row_hash,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            // v31.0.0 (CIRISPersist#646) — the index entry LEFT this
-            // transaction. Deriving the hash from the row as stored means
-            // reading the row back, and this closure holds the only
-            // connection: reading inside the tx would see state a rollback
-            // could still take away. Written after commit instead — a crash in
-            // the gap leaves a row `rebuild_signed_wire_index` repairs, where
-            // an atomically-committed WRONG hash is permanent and silent.
-            // Idempotent on the deterministic event_id.
-            tx.execute(
-                "INSERT INTO hard_case_events \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (community_key_id, removed_identity_key_id) DO NOTHING",
+                    rusqlite::params![
+                        row.community_key_id,
+                        row.removed_identity_key_id,
+                        row.removed_at.to_rfc3339(),
+                        row.effective_at.to_rfc3339(),
+                        row.reason,
+                        witness,
+                        row.persist_row_hash,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )?;
+                if n == 0 {
+                    return Ok(false); // tx dropped: rolled back
+                }
+                // v31.0.0 (CIRISPersist#646) — the index entry LEFT this
+                // transaction. Deriving the hash from the row as stored means
+                // reading the row back, and this closure holds the only
+                // connection: reading inside the tx would see state a rollback
+                // could still take away. Written after commit instead — a crash in
+                // the gap leaves a row `rebuild_signed_wire_index` repairs, where
+                // an atomically-committed WRONG hash is permanent and silent.
+                // Idempotent on the deterministic event_id.
+                tx.execute(
+                    "INSERT INTO hard_case_events \
                     (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(event_id) DO NOTHING",
-                rusqlite::params![
-                    removal_event.event_id,
-                    removal_event.kind,
-                    removal_event.target_key_id,
-                    removal_event.subject_key_id,
-                    removal_detail,
-                    removal_event.emitted_at.to_rfc3339(),
-                ],
-            )?;
-            // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch
-            // (epoch 0 → first bump yields 1; subsequent bumps +1). Forward-
-            // only — blobs already sealed under the old epoch keep their
-            // grants. A spurious extra bump only skips an epoch number, which
-            // is harmless (the DEK is minted lazily on next emission).
-            //
-            // #848 (§15) — PER MINTER: every counter on this node is one
-            // THIS node owns (a peer's epoch never has a self-retention row
-            // or a pointer here), so all of them advance. A minter that has
-            // minted (a self-retention row) but never rotated has no pointer
-            // row yet — epoch 0 is implicit — so its pointer is materialised
-            // at 0 first and then advanced with the rest; and this node's own
-            // counter advances even before it has minted, when the node key
-            // is known. `ensure_epoch_dek`'s removal-vs-mint compare (§15) is
-            // the backstop for a removal admitted where none of this ran.
-            tx.execute(
-                "INSERT INTO federation_community_dek_epoch \
+                    rusqlite::params![
+                        removal_event.event_id,
+                        removal_event.kind,
+                        removal_event.target_key_id,
+                        removal_event.subject_key_id,
+                        removal_detail,
+                        removal_event.emitted_at.to_rfc3339(),
+                    ],
+                )?;
+                // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch
+                // (epoch 0 → first bump yields 1; subsequent bumps +1). Forward-
+                // only — blobs already sealed under the old epoch keep their
+                // grants. A spurious extra bump only skips an epoch number, which
+                // is harmless (the DEK is minted lazily on next emission).
+                //
+                // #848 (§15) — PER MINTER: every counter on this node is one
+                // THIS node owns (a peer's epoch never has a self-retention row
+                // or a pointer here), so all of them advance. A minter that has
+                // minted (a self-retention row) but never rotated has no pointer
+                // row yet — epoch 0 is implicit — so its pointer is materialised
+                // at 0 first and then advanced with the rest; and this node's own
+                // counter advances even before it has minted, when the node key
+                // is known. `ensure_epoch_dek`'s removal-vs-mint compare (§15) is
+                // the backstop for a removal admitted where none of this ran.
+                tx.execute(
+                    "INSERT INTO federation_community_dek_epoch \
                     (community_key_id, minter_key_id, epoch, rotated_at) \
                  SELECT DISTINCT community_key_id, minter_key_id, 0, \
                         strftime('%Y-%m-%d %H:%M:%f', 'now') \
                    FROM federation_community_dek WHERE community_key_id = ?1 \
                  ON CONFLICT (community_key_id, minter_key_id) DO NOTHING",
-                rusqlite::params![row.community_key_id],
-            )?;
-            if let Some(node) = &node_key {
-                tx.execute(
-                    "INSERT INTO federation_community_dek_epoch \
+                    rusqlite::params![row.community_key_id],
+                )?;
+                if let Some(node) = &node_key {
+                    tx.execute(
+                        "INSERT INTO federation_community_dek_epoch \
                         (community_key_id, minter_key_id, epoch, rotated_at) \
                      VALUES (?1, ?2, 1, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
                      ON CONFLICT (community_key_id, minter_key_id) DO UPDATE SET \
                         epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')",
-                    rusqlite::params![row.community_key_id, node],
-                )?;
-            }
-            tx.execute(
-                "UPDATE federation_community_dek_epoch \
+                        rusqlite::params![row.community_key_id, node],
+                    )?;
+                }
+                tx.execute(
+                    "UPDATE federation_community_dek_epoch \
                     SET epoch = epoch + 1, rotated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
                   WHERE community_key_id = ?1 AND (?2 IS NULL OR minter_key_id <> ?2)",
-                rusqlite::params![row.community_key_id, node_key],
-            )?;
-            tx.commit()
-        })
-        .await
-        .map_err(map_revocation_sqlite_err("community_membership_revocation"))?;
-        self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
-            .await?;
+                    rusqlite::params![row.community_key_id, node_key],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+            .map_err(map_revocation_sqlite_err("community_membership_revocation"))?;
+        if inserted {
+            self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
+                .await?;
+        }
         Ok(())
     }
 
@@ -20332,6 +20377,7 @@ static SQLITE_TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::Laz
              MIN(deployment_type) AS deployment_type, \
              MIN(ts) AS started_at, \
              MAX(ts) AS completed_at, \
+             MAX(admitted_at) AS admitted_at, \
              MIN(trace_level) AS trace_level, \
              MIN(schema_version) AS schema_version, \
              MIN(signature_verified) AS signature_verified, \
@@ -20391,6 +20437,23 @@ fn sqlite_row_to_trace_summary(
         deployment_type: row.get("deployment_type")?,
         started_at: parse_rfc3339(&started_at),
         completed_at: parse_rfc3339(&completed_at),
+        // v47.1.0 (#844) — ABSENT is `None` (a pre-#606 row has no admission
+        // instant); MALFORMED is a decode error. Neither becomes "now" — the
+        // failure `parse_rfc3339` has under `started_at` / `completed_at`.
+        admitted_at: row
+            .get::<_, Option<String>>("admitted_at")?
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })
+            })
+            .transpose()?,
         trace_level,
         schema_version: row.get("schema_version")?,
         signature_verified: signature_verified_i.unwrap_or(0) != 0,
@@ -20599,6 +20662,20 @@ fn sqlite_filter_where(
         parts.push(format!("ts >= ?{}", binds.len()));
         binds.push(SqlValue::Text(w.until.to_rfc3339()));
         parts.push(format!("ts < ?{}", binds.len()));
+    }
+    // v47.1.0 (#844) — this node's admission instant (V128). Bound in
+    // the EXACT spelling the ingest writes (`to_rfc3339_opts(Micros, Z)`),
+    // because the column is TEXT and compares as a string: a bind in
+    // another RFC 3339 spelling (`+00:00`, variable precision) orders by
+    // accident, not by construction.
+    if let Some(w) = filter.admitted_window {
+        let at = |d: chrono::DateTime<chrono::Utc>| {
+            d.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        };
+        binds.push(SqlValue::Text(at(w.since)));
+        parts.push(format!("admitted_at >= ?{}", binds.len()));
+        binds.push(SqlValue::Text(at(w.until)));
+        parts.push(format!("admitted_at < ?{}", binds.len()));
     }
     if let Some(h) = &filter.agent_id_hash {
         binds.push(SqlValue::Text(h.clone()));
@@ -31458,6 +31535,17 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::chunk_dag_cascade::invariants::exercise_i42_a_chunk_is_bound_to_its_position(&backend, "sqlite")
             .await;
+    }
+
+    /// v47.1.0 (CIRISPersist#861) — a repeated family removal is a no-op.
+    #[tokio::test]
+    async fn family_revocation_repeat_is_a_noop_861_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::community_dek::lifecycle_harness::exercise_family_revocation_repeat_861(
+            &backend, "sqlite",
+        )
+        .await;
     }
 
     /// v43.0.0 (§10) — **the full cohort lifecycle on sqlite.**

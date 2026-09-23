@@ -1020,6 +1020,8 @@ def test_put_blob_scoped_aad_b64_binds_the_seal_831() -> None:
         with pytest.raises(RuntimeError) as ei:
             eng.read_blob_as(sha, occ, aad_b64=row_mallory)
         assert "blob_not_granted" not in str(ei.value)
+        # v47.1.0 (#842): typed, and it names the blob that did not open.
+        assert str(ei.value).startswith("blob_seal_did_not_open: " + sha), str(ei.value)
         # Nor does the positional call (no data): the seal demands what bound it.
         with pytest.raises(RuntimeError):
             eng.read_blob_as(sha, occ)

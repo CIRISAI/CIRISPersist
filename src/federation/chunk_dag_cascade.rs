@@ -2889,7 +2889,7 @@ pub mod invariants {
         // The member: a chunk at another index does not open — a
         // crypto-class error, never bytes, never NotGranted.
         match read_any_range_for_viewer(backend, &swapped_sha, &alice_occ, 0, 99, None).await {
-            Err(BlobError::Backend(_)) => {}
+            Err(BlobError::SealDidNotOpen { .. }) => {} // v47.1.0 #842: typed, not prose
             Err(other) => panic!("{tag} I42: wrong refusal class for a moved chunk: {other:?}"),
             Ok(bytes) => panic!(
                 "{tag} I42: a chunk moved to another index OPENED ({} bytes) — the chunk's \
@@ -2898,7 +2898,7 @@ pub mod invariants {
             ),
         }
         match read_any_for_viewer(backend, &swapped_sha, &alice_occ, None).await {
-            Err(BlobError::Backend(_)) => {}
+            Err(BlobError::SealDidNotOpen { .. }) => {} // v47.1.0 #842: typed, not prose
             other => panic!("{tag} I42: the whole read of a swapped DAG: {other:?}"),
         }
 
@@ -2942,7 +2942,7 @@ pub mod invariants {
         .await
         .unwrap_or_else(|e| panic!("{tag} I42: the second stream seals: {e}"));
         match read_any_for_viewer(backend, &sealed2.manifest_sha256, &alice_occ, None).await {
-            Err(BlobError::Backend(_)) => {}
+            Err(BlobError::SealDidNotOpen { .. }) => {} // v47.1.0 #842: typed, not prose
             Err(other) => panic!("{tag} I42: wrong refusal class for a lifted chunk: {other:?}"),
             Ok(_) => panic!(
                 "{tag} I42: a chunk lifted into a second stream's DAG OPENED there — the \
@@ -2968,7 +2968,7 @@ pub mod invariants {
             segs[1]
         );
         match read_stream_chunk_as(backend, &stream2, 0, &alice_occ, None).await {
-            Err(BlobError::Backend(_)) => {}
+            Err(BlobError::SealDidNotOpen { .. }) => {} // v47.1.0 #842: typed, not prose
             other => panic!("{tag} I42: the lifted position opened the chunk: {other:?}"),
         }
         assert!(
@@ -3007,7 +3007,7 @@ pub mod invariants {
             "{tag} I42: associated data at a plaintext position is refused, not dropped"
         );
         match read_any_range_for_viewer(backend, &shas[0], &alice_occ, 0, 9, None).await {
-            Err(BlobError::Backend(_)) => {}
+            Err(BlobError::SealDidNotOpen { .. }) => {} // v47.1.0 #842: typed, not prose
             other => panic!(
                 "{tag} I42: a sealed stream chunk opened by its sha alone — the position \
                  binding is not enforced: {other:?}"

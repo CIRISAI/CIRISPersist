@@ -183,9 +183,18 @@ fn json_value(s: &str) -> Result<serde_json::Value, Error> {
 /// ride the same WAL + PRAGMA settings as the trace-ingest path.
 pub struct SqliteNodeCoreBackend {
     conn: Arc<Mutex<Connection>>,
-    /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate. The
-    /// `put_contribution` write path consults this when set; `None`
-    /// preserves pre-#123 bootstrap-permissive behavior.
+    /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate: a numeric
+    /// trust-SCORE floor `put_contribution` consults first when one is
+    /// installed.
+    ///
+    /// v47.1.0 (CIRISPersist#737) — `None` is "no ADDITIONAL floor", not a
+    /// permissive mode. The posture CC and the threat model mandate — hybrid
+    /// signature verification before mutation (AV-9), AV-45 membership at
+    /// every targeted scope, AV-84 standing, the reserved-prefix and
+    /// accord-holder asymmetries — runs whether or not a gate is installed,
+    /// and `None` and `Some(gate at 0.0)` are the same state. The threshold
+    /// is a consumer knob (CIRISEdge derives one at `init_edge_runtime`);
+    /// persist has no basis in CC to pick a default number, so it does not.
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
 }
 

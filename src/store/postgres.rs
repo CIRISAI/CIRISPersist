@@ -8743,14 +8743,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_family_membership_revocations")
             .await?;
-        client
+        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
+        // documents, except that a repeat moving the removal EARLIER replaces
+        // the stored revocation (fail-secure; see the sqlite door). Any other
+        // repeat returns before the index entry and the hard_case event, so
+        // one removal is recorded — and announced — once. The unique index
+        // arbitrates (race-safe). The serve position is computed from
+        // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (family_key_id, removed_identity_key_id) DO UPDATE SET \
+                    removed_at = EXCLUDED.removed_at, effective_at = EXCLUDED.effective_at, \
+                    reason = EXCLUDED.reason, witness_set = EXCLUDED.witness_set, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    authority_key_id = EXCLUDED.authority_key_id, \
+                    scrub_signature_classical = EXCLUDED.scrub_signature_classical, \
+                    scrub_signature_pqc = EXCLUDED.scrub_signature_pqc, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE EXCLUDED.effective_at \
+                     < cirislens.federation_family_membership_revocations.effective_at",
                 &[
                     &row.family_key_id,
                     &row.removed_identity_key_id,
@@ -8767,6 +8784,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("family_membership_revocation"))?;
+        if inserted == 0 {
+            return Ok(());
+        }
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
         // (`row` still owns its final `persist_row_hash`).
         let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -8837,29 +8857,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&tx, "federation_community_membership_revocations")
             .await?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_community_membership_revocations (\
+        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
+        // documents. The unique index decides (`ON CONFLICT DO NOTHING`): a
+        // check-then-insert here would race under READ COMMITTED and a second
+        // concurrent repeat would still hit the violation (the #894 class).
+        // On a repeat the transaction is ROLLED BACK — the serve position
+        // above returns, and no second hard_case event or DEK rotation is
+        // written for one removal. The first recorded revocation stands.
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_revocations (\
                 community_key_id, removed_identity_key_id, removed_at, effective_at, \
                 reason, witness_set, persist_row_hash, \
                 authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                 admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-            &[
-                &row.community_key_id,
-                &row.removed_identity_key_id,
-                &row.removed_at,
-                &row.effective_at,
-                &row.reason,
-                &witness,
-                &row.persist_row_hash,
-                &authority_key_id,
-                &scrub_signature_classical,
-                &scrub_signature_pqc,
-                &admitted_at,
-            ],
-        )
-        .await
-        .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (community_key_id, removed_identity_key_id) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+        if inserted == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("rollback tx: {e}")))?;
+            return Ok(());
+        }
         // v21.1.0 (CIRISPersist#507b) — was upserted in the SAME transaction as
         // the INSERT above.
         // v31.0.0 (CIRISPersist#646) — it cannot stay there. Deriving the hash
@@ -20878,6 +20913,7 @@ static TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::LazyLock::
          MIN(deployment_type) AS deployment_type, \
          MIN(ts) AS started_at, \
          MAX(ts) AS completed_at, \
+         MAX(admitted_at) AS admitted_at, \
          MIN(trace_level) AS trace_level, \
          MIN(schema_version) AS schema_version, \
          BOOL_AND(signature_verified) AS signature_verified, \
@@ -20924,6 +20960,7 @@ fn pg_row_to_trace_summary(
         deployment_type: row.safe_get("deployment_type")?,
         started_at: row.safe_get("started_at")?,
         completed_at: row.safe_get("completed_at")?,
+        admitted_at: row.safe_get("admitted_at")?,
         trace_level,
         schema_version: row.safe_get("schema_version")?,
         // BOOL_AND result may be NULL for an empty group; default to
@@ -21104,57 +21141,8 @@ impl crate::read::ReadEngine for PostgresBackend {
         // Build the WHERE clause. Bind parameters accumulate in order
         // ($1..$N); we collect typed boxes so the slice can outlive
         // the format! closure.
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        let mut where_parts: Vec<String> = Vec::new();
-
-        if let Some(w) = filter.time_window {
-            params.push(Box::new(w.since));
-            where_parts.push(format!("ts >= ${}", params.len()));
-            params.push(Box::new(w.until));
-            where_parts.push(format!("ts < ${}", params.len()));
-        }
-        if let Some(h) = filter.agent_id_hash {
-            params.push(Box::new(h));
-            where_parts.push(format!("agent_id_hash = ${}", params.len()));
-        }
-        if let Some(n) = filter.agent_name {
-            params.push(Box::new(n));
-            where_parts.push(format!("agent_name = ${}", params.len()));
-        }
-        if let Some(d) = filter.deployment_domain {
-            params.push(Box::new(d));
-            where_parts.push(format!("deployment_domain = ${}", params.len()));
-        }
-        if let Some(d) = filter.deployment_type {
-            params.push(Box::new(d));
-            where_parts.push(format!("deployment_type = ${}", params.len()));
-        }
-        if let Some(level) = filter.trace_level {
-            // TraceLevel serializes as snake_case lowercase; the V001
-            // column is plain TEXT.
-            let s = match serde_json::to_value(level) {
-                Ok(serde_json::Value::String(s)) => s,
-                _ => {
-                    return Err(crate::read::Error::Backend(
-                        "trace_level enum did not serialize to JSON string".into(),
-                    ))
-                }
-            };
-            params.push(Box::new(s));
-            where_parts.push(format!("trace_level = ${}", params.len()));
-        }
-        if let Some(verified) = filter.signature_verified {
-            params.push(Box::new(verified));
-            where_parts.push(format!("signature_verified = ${}", params.len()));
-        }
-        if let Some(v) = filter.schema_version {
-            params.push(Box::new(v));
-            where_parts.push(format!("schema_version = ${}", params.len()));
-        }
-        if let Some(s) = filter.cognitive_state {
-            params.push(Box::new(s));
-            where_parts.push(format!("cognitive_state = ${}", params.len()));
-        }
+        // v47.1.0 (#844) — the shared predicate; see `pg_trace_filter_parts`.
+        let (mut where_parts, mut params) = pg_trace_filter_parts(&filter)?;
 
         // §4.3 scope gate — AND-composed onto the trace WHERE. The
         // predicate's `$n` placeholders are rebased onto the next free
@@ -23758,11 +23746,17 @@ fn build_llm_filter_sql(
     Ok((join_sql, where_sql, params))
 }
 
-fn build_filter_where(
+/// v47.1.0 (CIRISPersist#844) — the ONE postgres spelling of the
+/// [`crate::read::TraceFilter`] predicate. `list_trace_summaries` and
+/// `build_filter_where` (count / aggregate reads) used to spell it twice,
+/// field for field; a field added to one and not the other would make the
+/// list and the count disagree about the same filter. Both call this now.
+#[allow(clippy::type_complexity)]
+fn pg_trace_filter_parts(
     filter: &crate::read::TraceFilter,
 ) -> Result<
     (
-        String,
+        Vec<String>,
         Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
     ),
     crate::read::Error,
@@ -23775,6 +23769,13 @@ fn build_filter_where(
         where_parts.push(format!("ts >= ${}", params.len()));
         params.push(Box::new(w.until));
         where_parts.push(format!("ts < ${}", params.len()));
+    }
+    // v47.1.0 (#844) — this node's admission instant (V128).
+    if let Some(w) = filter.admitted_window {
+        params.push(Box::new(w.since));
+        where_parts.push(format!("admitted_at >= ${}", params.len()));
+        params.push(Box::new(w.until));
+        where_parts.push(format!("admitted_at < ${}", params.len()));
     }
     if let Some(h) = &filter.agent_id_hash {
         params.push(Box::new(h.clone()));
@@ -23816,6 +23817,19 @@ fn build_filter_where(
         params.push(Box::new(s.clone()));
         where_parts.push(format!("cognitive_state = ${}", params.len()));
     }
+    Ok((where_parts, params))
+}
+
+fn build_filter_where(
+    filter: &crate::read::TraceFilter,
+) -> Result<
+    (
+        String,
+        Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+    ),
+    crate::read::Error,
+> {
+    let (where_parts, params) = pg_trace_filter_parts(filter)?;
 
     let where_sql = if where_parts.is_empty() {
         String::new()
@@ -27331,6 +27345,22 @@ mod tests {
                 .unwrap();
             eprintln!("I27 {name}: {out}");
         }
+    }
+
+    /// v47.1.0 (CIRISPersist#861) — a repeated family removal is a no-op.
+    #[tokio::test]
+    async fn family_revocation_repeat_is_a_noop_861_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::community_dek::lifecycle_harness::exercise_family_revocation_repeat_861(
+            &backend,
+            &format!("pgfam{}", uuid_like()),
+        )
+        .await;
     }
 
     /// v43.0.0 (§10) — **the full cohort lifecycle on POSTGRES.**

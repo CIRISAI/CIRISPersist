@@ -32575,6 +32575,13 @@ async fn reverse_quorum_by_action_id(
 /// Shape: `"{kind}: {token} (retry_after_seconds={n})"`. `kind` and `token` are
 /// both program constants; the parentheses and the word order are not, and no
 /// consumer should parse them positionally.
+/// v47.1.0 (CIRISPersist#842) — `"blob_seal_did_not_open: <sha>"`: the host
+/// keys on the leading token (never the prose) and learns WHICH blob did not
+/// open, so it can look at that row's associated data.
+fn seal_did_not_open_message(kind: &str, sha256_hex: &str) -> String {
+    format!("{kind}: {sha256_hex}")
+}
+
 /// v47.0.0 (CIRISPersist#797) — `"<kind>: <reason-kind>"` for an AV-45
 /// refusal, so a host can tell `scope_membership_unresolved` (retryable) from
 /// `scope_no_community_membership` (terminal). The leading `kind` token is
@@ -33164,6 +33171,20 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // Python callers branch on it.
         crate::federation::BlobError::NotGranted { .. }
         | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
+        // v47.1.0 (CIRISPersist#842) — its OWN kind token, so a host tells "did
+        // not open" (look at the row: the associated data) from "may not read"
+        // (`blob_not_granted`: get a grant) without reading prose. The sha rides
+        // after the token, the `QuarantineWithheld` shape.
+        //
+        // The exception TYPE stays `RuntimeError`: this outcome was `Backend`
+        // (RuntimeError, a crypto-class failure AFTER authorization) before this
+        // cut, and the Python contract splits RuntimeError (after authorization)
+        // from ValueError (a caller refusal such as `blob_not_granted`). Only the
+        // token changes, so `except RuntimeError` keeps catching it and a
+        // `match="blob_backend"` pin is the one thing that breaks — by design.
+        crate::federation::BlobError::SealDidNotOpen { ref sha256_hex } => {
+            PyRuntimeError::new_err(seal_did_not_open_message(kind, sha256_hex))
+        }
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
         // so a caller sees this only if every retry lost the race.
         crate::federation::BlobError::EpochNotCurrent { .. } => PyValueError::new_err(kind),
@@ -34795,6 +34816,17 @@ mod tests {
     /// distinctness assertion is what makes that real — 16 messages that all
     /// carry *a* token but not a *distinguishing* one would satisfy a
     /// per-variant `contains` check and still leave the caller guessing.
+    /// v47.1.0 (CIRISPersist#842) — the seal-did-not-open token and the blob it
+    /// names reach the host.
+    #[test]
+    fn seal_did_not_open_message_names_the_token_and_the_blob_842() {
+        let e = crate::federation::BlobError::SealDidNotOpen {
+            sha256_hex: "ab".repeat(32),
+        };
+        let msg = seal_did_not_open_message(e.kind(), &"ab".repeat(32));
+        assert_eq!(msg, format!("blob_seal_did_not_open: {}", "ab".repeat(32)));
+    }
+
     /// v47.0.0 (CIRISPersist#797) — the AV-45 reason reaches the host, and
     /// the retryable one is distinguishable from the terminal ones.
     #[test]

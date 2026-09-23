@@ -10,4 +10,8 @@ pub mod drive_query_invariants;
 pub mod federation;
 pub mod llm;
 pub mod tasks;
+/// v47.1.0 (CIRISPersist#844) — I148: a trace's admission instant, per trace
+/// and as a pushed-down window.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod trace_admission_invariants;
 pub mod traces;
