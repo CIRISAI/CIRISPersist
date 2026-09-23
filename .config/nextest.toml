@@ -55,8 +55,20 @@ fail-fast = false
 # src/continuity_awareness/postgres.rs, src/graph/postgres.rs,
 # src/maintenance/postgres.rs, src/federation/{emit,backfill,read}.rs,
 # plus pg_*_pg test-name pattern across the substrate modules).
+# 2026-09-22 (CIRISPersist#879) — the cap above was written when every PG test
+# shared ONE database. Since v42.1.0 `test_pg::dsn()` hands each test
+# PROCESS its own database — a file-level `CREATE DATABASE … TEMPLATE` copy
+# of the migrated template (~50 ms), reaped by PID — so the tests no longer
+# share state and the serialization was only cost: the expensive certify
+# legs ran at ~40% thread efficiency (CIRISPersist#879, measured). The
+# group is kept as a CONNECTION budget, not an isolation device: each test
+# process opens its own deadpool (default max_size = cpus×4, lazily filled)
+# against a cluster with `max_connections = 400`; sixteen concurrent PG test
+# processes stay well inside it. The `#[serial_test::serial(postgres)]`
+# markers in the tree are inert under nextest (an in-process lock, one
+# process per test) and are left as documentation of the era they came from.
 [test-groups.postgres]
-max-threads = 1
+max-threads = 16
 
 [[profile.default.overrides]]
 # v3.5.2 (CIRISPersist#128) — RCA found `av26_concurrent_boot_advisory_lock`

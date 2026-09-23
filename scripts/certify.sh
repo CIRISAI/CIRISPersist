@@ -259,7 +259,11 @@ RAM_G="$(avail_g)"
 # Budget per lane. A leg is a test binary plus its postgres backends; the floor
 # is deliberately conservative because the failure mode it prevents (the kernel
 # killing a leg mid-run) costs a whole run and reads like a code failure.
-RAM_PER_LANE_G="${CERTIFY_RAM_PER_LANE_G:-2}"
+# 2026-09-22 (CIRISPersist#879) — 2G/lane was a guess that OOM-killed legs twice
+# on the 31G box (a 16-thread nextest lane holds ~5G; the python leg's
+# thin-LTO cdylib build alone peaks past 10G). The python leg now runs
+# ALONE before the lane pool; the feature legs are sized at 6G each.
+RAM_PER_LANE_G="${CERTIFY_RAM_PER_LANE_G:-6}"
 RAM_FLOOR_G="${CERTIFY_RAM_FLOOR_G:-3}"
 
 # ── lane sizing (see note 3) ─────────────────────────────────────────────
@@ -514,8 +518,6 @@ if [ "${CERTIFY_SKIP_PYTHON:-0}" = "1" ]; then
     echo "  !! CERTIFY_SKIP_PYTHON=1 — the python leg (dev-wheel + pytest tests/python) WILL NOT RUN."
     echo "  !! This run cannot vouch for the artifact users install."
     : > "$LOG_DIR/python.skip"
-else
-    echo "python" >> "$LOG_DIR/queue"
 fi
 for leg in $LEGS; do echo "$leg" >> "$LOG_DIR/queue"; done
 echo "default" >> "$LOG_DIR/queue"
@@ -566,11 +568,18 @@ run_job() {
             csv="$(feature_csv "$name")" || {
                 echo "EMPTY or underivable feature set for '$name' — refusing to run a leg that tests nothing" >"$log"
                 echo 1 >"$LOG_DIR/$name.rc"; return; }
+            # 2026-09-22 (CIRISPersist#880) — the substrate_machine property
+            # harness (170 s + 109 s) tests BACKEND parity and varies by no
+            # feature axis; it runs in the `rest` leg only (every backend,
+            # every feature — the gauntlet), exactly as CI's matrix does. Full
+            # case count where it runs; the other legs skip it by filter.
+            local gauntlet=()
+            [ "$name" = "rest" ] || gauntlet=(-E 'not test(/substrate_machine/)')
             if needs_pg "$name"; then
                 scripts/pg_test_db.sh -- env NEXTEST_TEST_THREADS="$PER_LANE" \
-                    cargo nextest run --features "$csv" >"$log" 2>&1
+                    cargo nextest run --features "$csv" "${gauntlet[@]}" >"$log" 2>&1
             else
-                NEXTEST_TEST_THREADS="$PER_LANE" cargo nextest run --features "$csv" >"$log" 2>&1
+                NEXTEST_TEST_THREADS="$PER_LANE" cargo nextest run --features "$csv" "${gauntlet[@]}" >"$log" 2>&1
             fi
             ;;
     esac
@@ -582,9 +591,18 @@ run_job() {
         "$(grep -oE '[0-9]+ tests run: [0-9]+ passed|[0-9]+ passed in [0-9.]+s' "$log" | tail -1)"
 }
 
+T_START=$(date +%s)
+# 2026-09-22 (CIRISPersist#879) — the python leg (dev-wheel: a thin-LTO,
+# codegen-units=1 release cdylib) is the peak-RAM process of the whole run
+# and was the leg the OOM killer took at LANES=2. It runs ALONE, before the
+# lane pool, so the feature legs can run at more than one lane.
+if [ ! -f "$LOG_DIR/python.skip" ]; then
+    echo
+    echo "=== python leg (serial — the peak-RAM build runs alone) ==="
+    run_job python
+fi
 echo
 echo "=== expensive legs (${LANES} lanes x ${PER_LANE} threads; feature sets DERIVED from ci_feature_matrix.py) ==="
-T_START=$(date +%s)
 FIFO="$LOG_DIR/sem"; mkfifo "$FIFO"; exec 9<>"$FIFO"; rm -f "$FIFO"
 for _ in $(seq "$LANES"); do printf '.' >&9; done
 # ── FAIL FAST ────────────────────────────────────────────────────────────

@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### Changed — the release cycle (CIRISPersist#879, #880, #881; rides the next feature cut per the no-micro-release rule)
+- **nextest `postgres` test group: `max-threads` 1 → 16.** The cap was written
+  at v3.5.1 when every PG test shared one database. Since v42.1.0
+  `test_pg::dsn()` gives each test PROCESS its own database (a ~50 ms
+  template copy, reaped by PID), so the cap only cost: certify's expensive
+  legs ran at ~40% thread efficiency. Measured on `store::postgres::tests`
+  (398 tests): 252 s serialized → 31 s at 16 threads, 398/398 both ways.
+  The group stays as a connection budget (each test process opens its own
+  pool; `max_connections = 400`). The 679 `#[serial_test::serial(postgres)]`
+  markers are inert under nextest (in-process lock, one process per test)
+  and are left as documentation.
+- **certify: the `substrate_machine` property harness runs in the `rest` leg
+  only** (`-E 'not test(/substrate_machine/)'` elsewhere), mirroring CI's
+  gauntlet leg; it tests backend parity and varies by no feature axis. Full
+  case count where it runs.
+- **certify: the python leg (the peak-RAM thin-LTO cdylib build) runs ALONE
+  before the lane pool**, and lanes are sized at 6 G each (was 2 G, the guess
+  that OOM-killed legs twice), so the feature legs run at more than one lane.
+- **CI: `tag-precheck`** — on a `v*` tag, when a successful CI run exists for
+  the same sha on a branch push (polled up to 45 min), the seven-leg matrix
+  is skipped; the asset jobs are unchanged (nothing `needs` the matrix).
+- **`scripts/release_ship.sh`** — the ship half of the release method,
+  checked in: merge, tree-compare (a merge whose tree equals the PR head's
+  skips the main-CI wait — the PR run certified those bytes), tag from the
+  CHANGELOG section with the byte-count assert, tag CI, then the release
+  body set only after the release exists (the edit raced its creation once).
+
 ## [46.3.1] - 2026-09-22
 
 ### Fixed — a claimed node could not read its own `self` rows (CIRISPersist#888, CIRISServer#624; `FSD/OCCURRENCE_PRINCIPAL.md` §6)
