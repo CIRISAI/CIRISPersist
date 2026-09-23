@@ -7,7 +7,23 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-### Changed — the release cycle (CIRISPersist#879, #880, #881; rides the next feature cut per the no-micro-release rule)
+### Changed — the release cycle: certify 97 min → 20 min, measured (CIRISPersist#879, #880, #881; rides the next feature cut per the no-micro-release rule)
+
+Full certification, same tree, same box, every leg green by exit code:
+
+| leg | before (LANES=1) | after (2 lanes x 16) |
+|---|---|---|
+| python | 603 s | 12 s |
+| core | 592 s | 173 s |
+| cirisaudit | 605 s | 311 s |
+| secrets | 667 s | 271 s |
+| cirisnode | 612 s | 255 s |
+| cirisgraph | 609 s | 245 s |
+| telemetry | 606 s | 246 s |
+| rest (carries the proptest gauntlet) | 761 s | 334 s |
+| test-anchor / default / clippy | 387 s | 323 s |
+| **wall** | **~97 min** | **19.9 min** |
+
 - **nextest `postgres` test group: `max-threads` 1 → 16.** The cap was written
   at v3.5.1 when every PG test shared one database. Since v42.1.0
   `test_pg::dsn()` gives each test PROCESS its own database (a ~50 ms
