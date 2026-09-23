@@ -42,7 +42,7 @@ pub(crate) fn scope_predicate_pg(
     String,
     Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) {
-    scope_predicate_pg_with_dimension(scope, scope_col, target_col, None, bound_so_far)
+    scope_predicate_pg_with_dimension(scope, scope_col, target_col, None, None, bound_so_far)
 }
 
 /// v46.3.1 (PR #889 review) — the dimension-aware form for the attestation
@@ -52,16 +52,18 @@ pub(crate) fn scope_predicate_pg_with_dimension(
     scope: &CallerScope,
     scope_col: &str,
     target_col: &str,
+    cohort_target_col: Option<&str>,
     dimension_col: Option<&str>,
     bound_so_far: usize,
 ) -> (
     String,
     Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) {
-    let (frag, params) = crate::scope::cohort_scope_sql_predicate_with_dimension(
+    let (frag, params) = crate::scope::cohort_scope_sql_predicate_full(
         BackendKind::Postgres,
         scope_col,
         target_col,
+        cohort_target_col,
         dimension_col,
         scope,
     );
@@ -94,7 +96,7 @@ pub(crate) fn scope_predicate_sqlite(
     target_col: &str,
     bound_so_far: usize,
 ) -> (String, Vec<rusqlite::types::Value>) {
-    scope_predicate_sqlite_with_dimension(scope, scope_col, target_col, None, bound_so_far)
+    scope_predicate_sqlite_with_dimension(scope, scope_col, target_col, None, None, bound_so_far)
 }
 
 /// v46.3.1 (PR #889 review) — the dimension-aware form for the attestation
@@ -104,13 +106,15 @@ pub(crate) fn scope_predicate_sqlite_with_dimension(
     scope: &CallerScope,
     scope_col: &str,
     target_col: &str,
+    cohort_target_col: Option<&str>,
     dimension_col: Option<&str>,
     bound_so_far: usize,
 ) -> (String, Vec<rusqlite::types::Value>) {
-    let (frag, params) = crate::scope::cohort_scope_sql_predicate_with_dimension(
+    let (frag, params) = crate::scope::cohort_scope_sql_predicate_full(
         BackendKind::Sqlite,
         scope_col,
         target_col,
+        cohort_target_col,
         dimension_col,
         scope,
     );

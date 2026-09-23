@@ -7,6 +7,62 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [46.5.0] - 2026-09-23
+
+### Fixed — the targeted read gate asks the ROW's room, not the producer's key (CIRISPersist#893)
+A `community` or `family` attestation names its own PRODUCER in
+`attested_key_id` — that is AV-84 (#592), and the put gate enforces it. The
+§4.3 read gate (CEG §8.1.13.3) compared that same column against the caller's
+admitted ROOM set. The two sets are disjoint by construction: a producer key is
+never a community id, so **no member could read their own room's rows** through
+`list_attestations` on either SQL backend. Reported by edge (#893) after their
+`files::in_room` came back empty against a correctly-shaped row.
+
+The hole survived four releases because the only community round-trip test is
+on the **trace** plane, which has a real `cohort_target_id` column (V060) and
+passed its room to the same predicate. The attestation table had no such
+column; the shape test asserted the SQL string, and the string was right — for
+the other plane.
+
+- **V150** (sqlite + postgres): `cohort_target`, a GENERATED column over
+  `admission::COHORT_TARGET_ENVELOPE_FIELDS` (`community_id`,
+  `community_key_id`, `cohort_key_id`, `family_key_id`) — the V106 `dimension`
+  precedent, so a read cannot key on a different value than the write gate
+  validated, with no backfill and no row rewrite. `envelope_cohort_target`
+  already REFUSES a split-brain row at every write door (PR #759 review), so
+  the COALESCE is total. Partial index on `(cohort_scope, cohort_target)`.
+- Both gate twins now take the row's room **per arm**: `CallerScope::admits`
+  gains `cohort_target`, `cohort_scope_sql_predicate_full` gains
+  `cohort_target_col`. `self` is unchanged and still keys on the caller's
+  self-collective (v46.3.1, #888).
+- `None` for the new parameter means *the target column already IS the room*,
+  which is the trace plane — its SQL is byte-identical and the three
+  `scope::sql` shape tests are unchanged, which is the evidence.
+- A targeted row that names **no** room is nobody's: fail closed.
+- The memory backend's twin reads `envelope_cohort_target`, the same value
+  V150 generates.
+
+**I144** (`drive_query_invariants`, sqlite + postgres + memory): a member of
+room R reads a correctly-shaped row in R; a caller who shares a *different*
+room with the same producer does not; `family` takes the same shape on
+`family_key_id`; the #888 `self` legs stay green. The legs fold through the
+SCORES plane first, on all three backends — the memory leg had been
+returning early on "no relational read substrate" and measured nothing.
+A room-less targeted row is refused at the write gate; the read-side
+fail-closed arm is witnessed on the twin (`targeted_arm_tests`). Eight
+mutants, eight killed (FSD §5.1).
+
+Not changed here, filed as **#897**: `affiliations` is a broad tier on this
+gate but room-gated on the hold path — the same split, failing open.
+
+### Fixed — `v141_rebuild_...828` asserted more than its name (CIRISPersist#893)
+The witness snapshotted the fourteen rebuilt tables at V140 and re-snapshotted
+after `run_migrations()` — i.e. after the WHOLE chain — so it asserted
+"V140's shape == today's shape" and any later migration that legitimately adds
+a column or an index to one of them went red naming V141. V150's `cohort_target`
+did. It now stops at `run_migrations_through(141)`, which is the claim it
+makes; the final schema is `migrations_run_clean_in_memory`'s.
+
 ### Removed — the `tag-precheck` job, and the #881 ask it came from (CIRISPersist#895)
 v46.4.0 shipped a job that skipped the tag's test matrix when "a successful CI
 run exists for this SHA on a branch push". It is removed rather than repaired,

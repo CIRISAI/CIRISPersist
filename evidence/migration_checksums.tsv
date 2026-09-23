@@ -285,3 +285,5 @@ sqlite	148	key_registration_history	17394385412746748785
 postgres	148	key_registration_history	4164581860194465064
 sqlite	149	blob_renditions	17356472952008256851
 postgres	149	blob_renditions	10144278107610230793
+sqlite	150	cohort_target_generated_column	1428640193462281817
+postgres	150	cohort_target_generated_column	1864075029709579296
