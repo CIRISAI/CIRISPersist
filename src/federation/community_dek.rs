@@ -1731,6 +1731,21 @@ pub mod lifecycle_support {
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        revoke_member_result(backend, community_key_id, removed_identity)
+            .await
+            .unwrap_or_else(|e| panic!("revoke {removed_identity} from {community_key_id}: {e}"));
+    }
+
+    /// [`revoke_member`], handing back the door's verdict — the #861 repeat
+    /// witness needs the `Result`, not a panic.
+    pub async fn revoke_member_result<B>(
+        backend: &B,
+        community_key_id: &str,
+        removed_identity: &str,
+    ) -> Result<(), crate::federation::Error>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
         use crate::federation::tier_ingest::test_support as ts;
         let now = chrono::Utc::now();
         backend
@@ -1747,7 +1762,6 @@ pub mod lifecycle_support {
                 },
             ))
             .await
-            .unwrap_or_else(|e| panic!("revoke {removed_identity} from {community_key_id}: {e}"));
     }
 }
 
@@ -1785,6 +1799,102 @@ pub mod lifecycle_support {
 #[allow(dead_code)]
 pub mod lifecycle_harness {
     use crate::federation::{BlobStorage, DekKeyState, FederationDirectory};
+
+    /// v47.1.0 (CIRISPersist#861) — **the family twin of step 4b**: the trait
+    /// documents BOTH removal doors as idempotent on their PK, and a consumer
+    /// retrying after a partial failure (the shape I18 exists for) relies on
+    /// it. A repeat is `Ok` and changes nothing — unless it moves the removal
+    /// EARLIER, which replaces the stored revocation (fail-secure: family
+    /// removals may be scheduled; community ones may not, SecReview F4).
+    pub async fn exercise_family_revocation_repeat_861<B>(backend: &B, tag: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let fam = format!("{tag}-fam861-{run}");
+        let alice = format!("{tag}-alice861-{run}");
+        let bob = format!("{tag}-bob861-{run}");
+        super::lifecycle_support::seed_family_shaped(
+            backend,
+            &fam,
+            &[
+                (&alice, &[(&format!("{alice}-occ"), true)]),
+                (&bob, &[(&format!("{bob}-occ"), true)]),
+            ],
+        )
+        .await;
+        let revoke = |effective_at: chrono::DateTime<chrono::Utc>| {
+            backend.put_family_membership_revocation(ts::sign_family_membership_revocation(
+                &fam,
+                crate::federation::types::FamilyMembershipRevocation {
+                    family_key_id: fam.clone(),
+                    removed_identity_key_id: bob.clone(),
+                    removed_at: chrono::Utc::now(),
+                    effective_at,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+        };
+        let stored_effective = || async {
+            let rows = backend
+                .list_family_membership_revocations_for(&fam)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: read back: {e}"));
+            assert_eq!(rows.len(), 1, "{tag}: one member, one revocation row");
+            rows[0].effective_at
+        };
+        let bob_active = || async {
+            backend
+                .active_family_members(&fam)
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: roster: {e}"))
+                .iter()
+                .any(|m| m.key_id == bob)
+        };
+
+        // (1) A scheduled removal — bob stays active until it takes effect.
+        let scheduled = chrono::Utc::now() + chrono::Duration::days(30);
+        revoke(scheduled)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: a scheduled family removal lands: {e}"));
+        assert!(
+            bob_active().await,
+            "{tag}: a future-dated removal leaves the member active"
+        );
+
+        // (2) THE #861 RETRY — a repeat that does not move the removal earlier
+        // is Ok and changes nothing (sqlite and postgres returned UNIQUE here).
+        revoke(scheduled + chrono::Duration::days(10))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag}: #861 — a repeated family removal is a no-op, got {e}")
+            });
+        assert_eq!(
+            stored_effective().await.timestamp(),
+            scheduled.timestamp(),
+            "{tag}: a repeat that does not move the removal earlier changes nothing"
+        );
+
+        // (3) ACCELERATION — fail-secure: a guardian who scheduled the
+        // removal and now needs it immediately gets it. A silent `Ok` that
+        // kept the 30-day date would report a removal that had not happened.
+        let now = chrono::Utc::now();
+        revoke(now)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: an earlier repeat accelerates the removal: {e}"));
+        assert_eq!(
+            stored_effective().await.timestamp(),
+            now.timestamp(),
+            "{tag}: the earlier effective_at replaced the scheduled one"
+        );
+        assert!(
+            !bob_active().await,
+            "{tag}: the accelerated removal is in effect NOW"
+        );
+    }
 
     /// Drive the full cycle against one backend. `tag` namespaces the keys so
     /// two backends can share a database without colliding.
@@ -1855,6 +1965,17 @@ pub mod lifecycle_harness {
         // ── 4. ROTATE — revoking bob bumps the epoch transactionally ─────
         super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
 
+        // ── 4b. REPEAT — v47.1.0 (CIRISPersist#861) ─────────────────────
+        // The door documents itself idempotent on its PK, and a consumer
+        // retrying after a partial failure relies on that. A repeat is a
+        // no-op: Ok, and NO second rotation (checked at step 5: exactly one
+        // epoch advance).
+        super::lifecycle_support::revoke_member_result(backend, &comm, &bob)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{tag}: #861 — revoking an already-revoked member must be a no-op, got {e}")
+            });
+
         // ── 5. ENCRYPT AGAIN — lands on the NEW epoch ────────────────────
         let after = encrypt_and_cascade_community(
             backend,
@@ -1865,9 +1986,11 @@ pub mod lifecycle_harness {
         )
         .await
         .unwrap_or_else(|e| panic!("{tag}: seal after rotation: {e}"));
-        assert!(
-            after.epoch > before.epoch,
-            "{tag}: rotation must advance the epoch ({} -> {})",
+        assert_eq!(
+            after.epoch,
+            before.epoch + 1,
+            "{tag}: ONE removal is ONE rotation — the #861 repeat at step 4b must not advance \
+             the epoch again ({} -> {})",
             before.epoch,
             after.epoch
         );

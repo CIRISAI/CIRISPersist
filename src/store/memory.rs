@@ -6547,6 +6547,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 row.family_key_id.clone(),
                 row.removed_identity_key_id.clone(),
             );
+            // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as on
+            // sqlite / postgres: a repeat is a no-op UNLESS it moves the
+            // removal earlier, which replaces the stored row (fail-secure; see
+            // the sqlite door). Before this memory overwrote on EVERY repeat,
+            // and the SQL backends refused every repeat.
+            if let Some(stored) = state
+                .federation_family_membership_revocations
+                .get(&revocation_key)
+            {
+                if row.effective_at >= stored.effective_at {
+                    return Ok(());
+                }
+            }
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `revocation.*`.
             let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -6629,25 +6642,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             // Parity with pg/sqlite: the revocation table PK is
-            // (community_key_id, removed_identity_key_id) (V067), so a REPLAYED
-            // revocation hits a unique-violation at the INSERT and errors BEFORE
-            // the hard_case emission + epoch bump. Memory must reject the replay
-            // the same way (else memory would double-bump the DEK epoch where
-            // pg/sqlite leave it untouched — an observable gate-path divergence).
-            // Matches map_revocation_pg_err's non-FK Backend mapping.
+            // (community_key_id, removed_identity_key_id) (V067). A REPLAYED
+            // revocation must not double-bump the DEK epoch or re-announce the
+            // removal. (Until v47.1.0 all three backends REFUSED the replay
+            // with a unique-violation, against the trait's documented
+            // idempotence — CIRISPersist#861; now all three accept it as a
+            // no-op.)
             let revocation_key = (
                 row.community_key_id.clone(),
                 row.removed_identity_key_id.clone(),
             );
+            // v47.1.0 (CIRISPersist#861) — pg/sqlite now honour the
+            // documented idempotence (the unique index decides, a repeat
+            // commits nothing), so memory mirrors THAT: a repeat is `Ok` and
+            // — as before — writes no second hard_case and no second epoch
+            // bump.
             if state
                 .federation_community_membership_revocations
                 .contains_key(&revocation_key)
             {
-                return Err(crate::federation::Error::Backend(format!(
-                    "insert community_membership_revocation: duplicate key value violates unique \
-                 constraint (community_key_id={}, removed_identity_key_id={})",
-                    revocation_key.0, revocation_key.1
-                )));
+                return Ok(());
             }
             // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
             // removal emission (`change_kind: "removed"`). Idempotent on event_id.
@@ -20969,6 +20983,108 @@ mod tests {
     /// `check_observed_region` nor the anti-rollback check, and it validated no
     /// hex, so all three shapes sqlite + postgres refuse were accepted here.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    /// v47.1.0 (CIRISPersist#861) — both removal doors are idempotent on
+    /// their PK on memory too: a repeat is `Ok`, the first stands, and the
+    /// community repeat does not rotate the DEK epoch a second time. (The
+    /// sqlite/postgres legs are `exercise_family_revocation_repeat_861` and
+    /// step 4b of the cohort lifecycle.)
+    #[tokio::test]
+    async fn revocation_repeat_is_a_noop_memory_861() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::FederationDirectory;
+        let b = MemoryBackend::new();
+        let (fam, cid, alice, bob) = ("fam-861", "comm-861", "alice-861", "bob-861");
+        for k in [fam, cid, alice, bob] {
+            ts::register_identity_key(&b, k, crate::federation::types::identity_type::USER).await;
+        }
+        let now = chrono::Utc::now();
+        b.put_family(ts::sign_family(
+            fam,
+            crate::federation::types::Family {
+                family_key_id: fam.into(),
+                family_name: "861".into(),
+                members: [alice, bob]
+                    .iter()
+                    .map(|k| crate::federation::types::FamilyMember {
+                        key_id: (*k).into(),
+                        joined_at: now,
+                        role: None,
+                    })
+                    .collect(),
+                founded_at: now,
+                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("family");
+        ts::seed_two_member_community(&b, cid, alice, bob).await;
+
+        let first = now - chrono::Duration::seconds(5);
+        for at in [first, now] {
+            b.put_family_membership_revocation(ts::sign_family_membership_revocation(
+                fam,
+                crate::federation::types::FamilyMembershipRevocation {
+                    family_key_id: fam.into(),
+                    removed_identity_key_id: bob.into(),
+                    removed_at: at,
+                    effective_at: at,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("#861: a family removal and its repeat both return Ok");
+        }
+        let fam_rows = b.list_family_membership_revocations_for(fam).await.unwrap();
+        assert_eq!(fam_rows.len(), 1);
+        assert_eq!(
+            fam_rows[0].removed_at.timestamp(),
+            first.timestamp(),
+            "the FIRST recorded family revocation stands — memory used to overwrite it"
+        );
+
+        let epoch = || {
+            b.state
+                .lock()
+                .unwrap()
+                .federation_community_dek_epoch
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        };
+        for at in [first, now] {
+            b.put_community_membership_revocation(ts::sign_community_membership_revocation(
+                cid,
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: cid.into(),
+                    removed_identity_key_id: bob.into(),
+                    removed_at: at,
+                    effective_at: at,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("#861: a community removal and its repeat both return Ok");
+        }
+        let after_both = epoch();
+        let com_rows = b
+            .list_community_membership_revocations_for(cid)
+            .await
+            .unwrap();
+        assert_eq!(com_rows.len(), 1);
+        assert_eq!(com_rows[0].removed_at.timestamp(), first.timestamp());
+        assert!(
+            after_both <= 1,
+            "one removal, at most one rotation (got epoch {after_both})"
+        );
+    }
+
     #[tokio::test]
     async fn revocation_door_parity_memory_660() {
         let backend = MemoryBackend::new();

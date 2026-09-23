@@ -7,6 +7,32 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.1.0] - 2026-09-23
+
+### Fixed — both membership-removal doors are idempotent on their PK, on every backend (CIRISPersist#861)
+The trait documents `put_family_membership_revocation` and
+`put_community_membership_revocation` as idempotent on `(cohort,
+removed_identity)`. Edge reported the sqlite community door (CIRISEdge#608),
+where a repeat raised `UNIQUE constraint failed`. The witnesses found **four**
+doors broken the same way: family and community, on both sqlite and
+postgres. They also found a fifth that was wrong in the opposite direction:
+memory's family door **overwrote** the stored revocation on every repeat.
+Memory's community door copied the SQL error on purpose, "for parity".
+
+- The unique index decides (`ON CONFLICT`), which is race-safe. A
+  check-then-insert would race under READ COMMITTED (the #894 class).
+- **Community:** a repeat is a no-op. The transaction rolls back, so there is
+  no second hard-case event and, above all, **no second DEK rotation for one
+  removal**. The cohort lifecycle witness now asserts exactly one epoch
+  advance.
+- **Family:** a repeat is a no-op **unless it moves the removal earlier**,
+  in which case it replaces the stored revocation. Family removals may be
+  scheduled; community ones may not (SecReview F4). A guardian who
+  scheduled a removal and now needs it immediately must get it. Turning the
+  old `UNIQUE` error into a silent `Ok` that kept the scheduled date would
+  report a removal that had not happened. Memory's own test had encoded this
+  acceleration, and memory was the only backend where it worked.
+
 ## [47.0.0] - 2026-09-23
 
 ### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)

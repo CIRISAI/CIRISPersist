@@ -8743,14 +8743,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_family_membership_revocations")
             .await?;
-        client
+        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
+        // documents, except that a repeat moving the removal EARLIER replaces
+        // the stored revocation (fail-secure; see the sqlite door). Any other
+        // repeat returns before the index entry and the hard_case event, so
+        // one removal is recorded — and announced — once. The unique index
+        // arbitrates (race-safe). The serve position is computed from
+        // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (family_key_id, removed_identity_key_id) DO UPDATE SET \
+                    removed_at = EXCLUDED.removed_at, effective_at = EXCLUDED.effective_at, \
+                    reason = EXCLUDED.reason, witness_set = EXCLUDED.witness_set, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    authority_key_id = EXCLUDED.authority_key_id, \
+                    scrub_signature_classical = EXCLUDED.scrub_signature_classical, \
+                    scrub_signature_pqc = EXCLUDED.scrub_signature_pqc, \
+                    admitted_at = EXCLUDED.admitted_at \
+                 WHERE EXCLUDED.effective_at \
+                     < cirislens.federation_family_membership_revocations.effective_at",
                 &[
                     &row.family_key_id,
                     &row.removed_identity_key_id,
@@ -8767,6 +8784,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("family_membership_revocation"))?;
+        if inserted == 0 {
+            return Ok(());
+        }
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
         // (`row` still owns its final `persist_row_hash`).
         let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -8837,29 +8857,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&tx, "federation_community_membership_revocations")
             .await?;
-        tx.execute(
-            "INSERT INTO cirislens.federation_community_membership_revocations (\
+        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
+        // documents. The unique index decides (`ON CONFLICT DO NOTHING`): a
+        // check-then-insert here would race under READ COMMITTED and a second
+        // concurrent repeat would still hit the violation (the #894 class).
+        // On a repeat the transaction is ROLLED BACK — the serve position
+        // above returns, and no second hard_case event or DEK rotation is
+        // written for one removal. The first recorded revocation stands.
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_revocations (\
                 community_key_id, removed_identity_key_id, removed_at, effective_at, \
                 reason, witness_set, persist_row_hash, \
                 authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                 admitted_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-            &[
-                &row.community_key_id,
-                &row.removed_identity_key_id,
-                &row.removed_at,
-                &row.effective_at,
-                &row.reason,
-                &witness,
-                &row.persist_row_hash,
-                &authority_key_id,
-                &scrub_signature_classical,
-                &scrub_signature_pqc,
-                &admitted_at,
-            ],
-        )
-        .await
-        .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (community_key_id, removed_identity_key_id) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.removed_identity_key_id,
+                    &row.removed_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+        if inserted == 0 {
+            tx.rollback()
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("rollback tx: {e}")))?;
+            return Ok(());
+        }
         // v21.1.0 (CIRISPersist#507b) — was upserted in the SAME transaction as
         // the INSERT above.
         // v31.0.0 (CIRISPersist#646) — it cannot stay there. Deriving the hash
@@ -27331,6 +27366,22 @@ mod tests {
                 .unwrap();
             eprintln!("I27 {name}: {out}");
         }
+    }
+
+    /// v47.1.0 (CIRISPersist#861) — a repeated family removal is a no-op.
+    #[tokio::test]
+    async fn family_revocation_repeat_is_a_noop_861_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::community_dek::lifecycle_harness::exercise_family_revocation_repeat_861(
+            &backend,
+            &format!("pgfam{}", uuid_like()),
+        )
+        .await;
     }
 
     /// v43.0.0 (§10) — **the full cohort lifecycle on POSTGRES.**
