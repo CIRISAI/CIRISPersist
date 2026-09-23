@@ -19567,6 +19567,7 @@ fn pg_scores_shared_predicates(
             scope,
             "fa.cohort_scope",
             "fa.attested_key_id",
+            Some("fa.cohort_target"),
             Some("fa.dimension"),
             params.len(),
         );
@@ -22632,6 +22633,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("cohort_target"),
                 Some("dimension"),
                 params.len(),
             );
@@ -22745,6 +22747,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("cohort_target"),
                 Some("dimension"),
                 params.len(),
             );

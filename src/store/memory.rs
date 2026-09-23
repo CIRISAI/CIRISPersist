@@ -2517,9 +2517,17 @@ fn mem_scores_row_matches(
         }
     }
     // §4.3 scope gate (target = attested_key_id, mirroring the SQL).
+    // v46.5.0 (#893) — the memory twin of the per-arm target: the ROW's room
+    // comes from the signed envelope, the same value V150 generates in SQL.
+    // A malformed/split-brain envelope yields None, which refuses — the write
+    // gate already refuses to store one.
+    let room = crate::federation::admission::envelope_cohort_target(&r.attestation_envelope)
+        .ok()
+        .flatten();
     scope.admits(
         &r.cohort_scope,
         &r.attested_key_id,
+        room,
         crate::federation::admission::envelope_dimension(&r.attestation_envelope),
     )
 }

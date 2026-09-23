@@ -242,6 +242,7 @@ pub(crate) mod bodies {
                 let rust_twin = scope.admits(
                     crate::federation::types::cohort_scope::SELF,
                     &node,
+                    None,
                     Some("config:net.bootstrap_peers:v1"),
                 );
                 // The SQL twin, where there is SQL: the memory backend has no
@@ -351,6 +352,7 @@ pub(crate) mod bodies {
                 let rust_twin = scope.admits(
                     crate::federation::types::cohort_scope::SELF,
                     &writer,
+                    None,
                     Some(&dimension),
                 );
                 let rows = match crate::ceg::ReadEngine::list_attestations(

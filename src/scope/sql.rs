@@ -149,6 +149,23 @@ pub fn cohort_scope_sql_predicate_with_dimension(
     dimension_col: Option<&str>,
     scope: &CallerScope,
 ) -> (String, Vec<ScopeParam>) {
+    cohort_scope_sql_predicate_full(backend, scope_col, target_col, None, dimension_col, scope)
+}
+
+/// v46.5.0 (CIRISPersist#893, `FSD/TARGETED_COHORT_READ.md` §3) — the full
+/// form: `cohort_target_col` is the ROW's room (the V150 generated column),
+/// which the `family` / `community` arms bind against while `self` keeps
+/// `target_col`. A caller that passes `None` gets the pre-#893 behaviour for
+/// the targeted arms, which is "refuse everything" — so a door that forgets
+/// the column fails CLOSED and is caught by I144 rather than leaking.
+pub fn cohort_scope_sql_predicate_full(
+    backend: BackendKind,
+    scope_col: &str,
+    target_col: &str,
+    cohort_target_col: Option<&str>,
+    dimension_col: Option<&str>,
+    scope: &CallerScope,
+) -> (String, Vec<ScopeParam>) {
     let broad = broad_tiers_sql();
 
     match scope {
@@ -202,10 +219,19 @@ pub fn cohort_scope_sql_predicate_with_dimension(
             }
 
             // family — target ∈ the reader's admitted families.
+            // The targeted arms key on the ROW's room. `None` means "the
+            // target column already IS the room", which is the TRACE plane:
+            // `trace_events.cohort_target_id` (V060) is the room, and those
+            // arms have always been correct there. Only the ATTESTATION plane
+            // needed a second column, because AV-84 pins its `attested_key_id`
+            // to the producer (#893). Falling back to `target_col` therefore
+            // preserves trace exactly and leaves a door that forgets the
+            // column with the pre-#893 behaviour — which refuses, never leaks.
+            let room_col = cohort_target_col.unwrap_or(target_col);
             let family_branch = target_membership_branch(
                 backend,
                 scope_col,
-                target_col,
+                room_col,
                 "family",
                 &admission.family_key_ids,
                 &mut next,
@@ -216,7 +242,7 @@ pub fn cohort_scope_sql_predicate_with_dimension(
             let community_branch = target_membership_branch(
                 backend,
                 scope_col,
-                target_col,
+                room_col,
                 "community",
                 &admission.community_key_ids,
                 &mut next,

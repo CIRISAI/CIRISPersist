@@ -19127,6 +19127,7 @@ fn sqlite_scores_shared_predicates(
             scope,
             "fa.cohort_scope",
             "fa.attested_key_id",
+            Some("fa.cohort_target"),
             Some("fa.dimension"),
             binds.len(),
         );
@@ -22185,6 +22186,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("cohort_target"),
                 Some("dimension"),
                 binds.len(),
             );
@@ -22292,6 +22294,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                 &scope,
                 "cohort_scope",
                 "attested_key_id",
+                Some("cohort_target"),
                 Some("dimension"),
                 binds.len(),
             );
@@ -47329,6 +47332,14 @@ mod tests {
     ///
     /// Vacuity is pinned first: the seed must land NULLs, or the backfill
     /// leg proves nothing.
+    ///
+    /// The "after" snapshot stops AT V141 (`run_migrations_through(141)`),
+    /// not at HEAD. Running the whole chain made this witness assert
+    /// "V140's shape == today's shape" for all fourteen tables, so any
+    /// later migration that legitimately ADDS a column or an index to one
+    /// of them went red here naming V141 — V150's `cohort_target` did
+    /// (#893). The claim is about V141's transcription; the final schema is
+    /// `migrations_run_clean_in_memory`'s and the per-feature shape tests'.
     #[tokio::test]
     async fn v141_rebuild_backfills_admitted_at_and_preserves_every_index_trigger_and_referrer_828()
     {
@@ -47362,7 +47373,7 @@ mod tests {
         };
 
         backend
-            .run_migrations()
+            .run_migrations_through(141)
             .await
             .expect("V141 applies to a populated V140 database");
 

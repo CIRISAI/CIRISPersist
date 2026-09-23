@@ -75,7 +75,22 @@ impl CallerScope {
     /// admitted only when the caller IS the target — the collective widening
     /// of v46.3.1 (#888) must not carry it to the owner's other keys on a
     /// shared node (PR #889 review). `None` = a row with no dimension.
-    pub fn admits(&self, cohort_scope: &str, target: &str, dimension: Option<&str>) -> bool {
+    /// `cohort_target` is the ROW's room, as its signed envelope states it
+    /// (v46.5.0, CIRISPersist#893). The arms take DIFFERENT targets and that
+    /// is the point: `self` compares `target` (the row's `attested_key_id`)
+    /// against the caller's self-collective by principal (#888), while
+    /// `family` / `community` compare the ROOM against the caller's admitted
+    /// rooms — the predicate the hold path and edge's serve gate already use.
+    /// Passing the attested key to the targeted arms is what #893 was: AV-84
+    /// pins that column to the PRODUCER, so the intersection with a room set
+    /// is empty by construction and no member could read their own room.
+    pub fn admits(
+        &self,
+        cohort_scope: &str,
+        target: &str,
+        cohort_target: Option<&str>,
+        dimension: Option<&str>,
+    ) -> bool {
         const BROAD: &[&str] = &["affiliations", "species", "biosphere", "federation"];
         if BROAD.contains(&cohort_scope) {
             return true;
@@ -92,8 +107,12 @@ impl CallerScope {
                                 crate::federation::admission::is_sensitive_config_leaf,
                             ))
                 }
-                "family" => admission.family_key_ids.contains(target),
-                "community" => admission.community_key_ids.contains(target),
+                // The ROW's room, never the producer's rooms — and a row
+                // that names none is nobody's (fail closed).
+                "family" => cohort_target.is_some_and(|r| admission.family_key_ids.contains(r)),
+                "community" => {
+                    cohort_target.is_some_and(|r| admission.community_key_ids.contains(r))
+                }
                 _ => false,
             },
         }
