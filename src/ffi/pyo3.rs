@@ -33164,6 +33164,13 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // Python callers branch on it.
         crate::federation::BlobError::NotGranted { .. }
         | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
+        // v47.1.0 (CIRISPersist#842) — its OWN kind token, so a host tells "did
+        // not open" (look at the row: the associated data) from "may not read"
+        // (`blob_not_granted`: get a grant) without reading prose. The sha rides
+        // after the token, the `QuarantineWithheld` shape.
+        crate::federation::BlobError::SealDidNotOpen { ref sha256_hex } => {
+            PyValueError::new_err(format!("{kind}: {sha256_hex}"))
+        }
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
         // so a caller sees this only if every retry lost the race.
         crate::federation::BlobError::EpochNotCurrent { .. } => PyValueError::new_err(kind),

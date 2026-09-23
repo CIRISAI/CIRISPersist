@@ -1329,7 +1329,10 @@ pub mod orchestrate {
             },
             other => other,
         })?;
-        open(&dek, envelope, aad).map_err(map_at_rest_err)
+        open(&dek, envelope, aad).map_err(crate::federation::at_rest_cascade::open_err(
+            at_rest_sha256,
+            map_at_rest_err,
+        ))
     }
 
     /// #832 (§12.4) — recover the epoch DEK a COMMUNITY row was sealed under
@@ -1369,7 +1372,10 @@ pub mod orchestrate {
             },
             other => other,
         })?;
-        open(&dek, envelope, aad).map_err(map_at_rest_err)
+        open(&dek, envelope, aad).map_err(crate::federation::at_rest_cascade::open_err(
+            at_rest_sha256,
+            map_at_rest_err,
+        ))
     }
 
     /// Emit one `hard_case:recipient_excluded` per fail-secure-excluded

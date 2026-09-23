@@ -33,6 +33,30 @@ Memory's community door copied the SQL error on purpose, "for parity".
   report a removal that had not happened. Memory's own test had encoded this
   acceleration, and memory was the only backend where it worked.
 
+### Added — `BlobError::SealDidNotOpen`: "did not open" is not "may not read" (CIRISPersist#842)
+A read that was **authorized** but whose AEAD tag did not verify came back
+as `BlobError::Backend(prose)`. Per #831 it arrives after authorization, so
+it is never a permissions problem. But a consumer that wanted to keep that
+distinction had to match persist's wording (`msg.contains("decrypt")`, which
+is Edge's `PersistGroupContentStore::map_err`). A reword upstream would have
+dropped every AAD mismatch into the generic arm with nothing going red.
+
+- **`BlobError::SealDidNotOpen { sha256_hex }`**, kind
+  `blob_seal_did_not_open`. Its remedy is to look at the **row** (almost
+  always the associated data the reader rebuilt), where `NotGranted`'s
+  remedy is a grant.
+- It is produced structurally: `AtRestError::SealDidNotOpen` is raised only
+  by the body open (`open_aad`, and so `open`). A **DEK** that will not
+  unwrap stays `AtRestError::Crypto`, because that is a key or grant fault,
+  not this one; a unit pin now asserts that split. One mapper,
+  `at_rest_cascade::open_err`, carries it at all four read sites; every
+  other error goes to each site's existing mapper, unchanged.
+- Python: `ValueError("blob_seal_did_not_open: <sha>")`.
+- I40 (a wrong or absent AAD after authorization, every scope, sqlite +
+  postgres) and I42 (a chunk moved to another position or lifted to another
+  stream) now assert the typed arm naming the blob, where they used to
+  assert `Backend(_)`.
+
 ## [47.0.0] - 2026-09-23
 
 ### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)

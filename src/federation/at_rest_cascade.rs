@@ -488,6 +488,16 @@ pub enum AtRestError {
     /// A key/nonce/DEK had the wrong length.
     #[error("at-rest invalid length: {0}")]
     InvalidLength(String),
+    /// v47.1.0 (CIRISPersist#842) — the AEAD tag on the BODY did not verify.
+    /// Produced ONLY by [`open_aad`] (and so [`open`]): the reader was
+    /// authorized and held the DEK (#831 — this comes after authorization),
+    /// and the bytes did not open. Almost always an associated-data mismatch
+    /// (the reader rebuilt different binding inputs than the writer sealed
+    /// under), otherwise a tampered body. Distinct from [`Self::Crypto`],
+    /// which is a key/RNG failure — a DEK that will not unwrap is a grant
+    /// problem, not this.
+    #[error("at-rest seal did not open: {0}")]
+    SealDidNotOpen(String),
 }
 
 /// The self-describing at-rest ciphertext envelope.
@@ -694,17 +704,36 @@ pub fn open_aad(
 ) -> Result<Vec<u8>, AtRestError> {
     let Some(aad) = aad else {
         return ciris_crypto::aes_gcm::decrypt(dek, &envelope.nonce, &envelope.ciphertext)
-            .map_err(|e| AtRestError::Crypto(format!("aes-gcm open: {e}")));
+            .map_err(|e| AtRestError::SealDidNotOpen(format!("aes-gcm open: {e}")));
     };
     ciris_crypto::aes_gcm::decrypt_aad(dek, &envelope.nonce, aad, &envelope.ciphertext).map_err(
         |e| {
-            AtRestError::Crypto(format!(
+            AtRestError::SealDidNotOpen(format!(
                 "aes-gcm open under associated data refused ({e}): the viewer was authorized, \
                  but the bytes did not belong to the row they arrived on — the body was altered, \
                  or it was not sealed under the data this reader presented"
             ))
         },
     )
+}
+
+/// v47.1.0 (CIRISPersist#842) — the ONE mapping from a body-open failure to
+/// [`BlobError::SealDidNotOpen`](crate::federation::BlobError::SealDidNotOpen),
+/// used at every read site that opens a blob body. Every other
+/// [`AtRestError`] goes to the site's own mapper, unchanged. Before this a
+/// consumer told "did not open" from "may not read" by matching persist's
+/// prose (`msg.contains("decrypt")`), and a reword upstream would have
+/// silently dropped every AAD mismatch into the generic arm.
+pub(crate) fn open_err<'a>(
+    at_rest_sha256: &'a [u8; 32],
+    fallback: fn(AtRestError) -> crate::federation::BlobError,
+) -> impl Fn(AtRestError) -> crate::federation::BlobError + 'a {
+    move |e| match e {
+        AtRestError::SealDidNotOpen(_) => crate::federation::BlobError::SealDidNotOpen {
+            sha256_hex: hex::encode(at_rest_sha256),
+        },
+        other => fallback(other),
+    }
 }
 
 /// Wrap `dek` under the persist content master key for self-retention.
@@ -2232,7 +2261,7 @@ pub mod orchestrate {
         B: BlobStorage + Sync,
     {
         let dek = recover_blob_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await?;
-        open(&dek, envelope, aad).map_err(map_at_rest_err)
+        open(&dek, envelope, aad).map_err(super::open_err(at_rest_sha256, map_at_rest_err))
     }
 
     /// #848 — recover a self/family blob's DEK: the self-retention row if
@@ -2336,7 +2365,7 @@ pub mod orchestrate {
             unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
 
         // 4. Decrypt + return plaintext. (#831 — this legacy door carries no AAD.)
-        open(&dek, &envelope, None).map_err(map_at_rest_err)
+        open(&dek, &envelope, None).map_err(super::open_err(at_rest_sha256, map_at_rest_err))
     }
 }
 
@@ -2527,7 +2556,7 @@ mod tests {
         let wrong = [0x99u8; DEK_LEN];
         assert!(matches!(
             open(&wrong, &env, None),
-            Err(AtRestError::Crypto(_))
+            Err(AtRestError::SealDidNotOpen(_))
         ));
     }
 
@@ -2547,15 +2576,15 @@ mod tests {
         assert_eq!(open_aad(&dek, Some(row_a), &env).unwrap(), pt);
         assert!(matches!(
             open_aad(&dek, Some(row_m), &env),
-            Err(AtRestError::Crypto(_))
+            Err(AtRestError::SealDidNotOpen(_))
         ));
         assert!(matches!(
             open_aad(&dek, None, &env),
-            Err(AtRestError::Crypto(_))
+            Err(AtRestError::SealDidNotOpen(_))
         ));
         assert!(matches!(
             open(&dek, &env, None),
-            Err(AtRestError::Crypto(_))
+            Err(AtRestError::SealDidNotOpen(_))
         ));
         let msg = open_aad(&dek, Some(row_m), &env).unwrap_err().to_string();
         assert!(msg.contains("did not belong to the row"), "{msg}");
@@ -2567,7 +2596,7 @@ mod tests {
         assert_eq!(open_aad(&dek, None, &plain).unwrap(), pt);
         assert!(matches!(
             open_aad(&dek, Some(row_a), &plain),
-            Err(AtRestError::Crypto(_))
+            Err(AtRestError::SealDidNotOpen(_))
         ));
         // `Some(b"")` ≡ `None` — verify pins encrypt_aad(.., b"", ..) ≡ encrypt.
         let empty = seal_aad(&dek, Some(b""), pt).unwrap();
@@ -4429,11 +4458,16 @@ pub mod blob_invariants {
                     "{tag} I40: the {scope} ciphertext OPENED under another row's data — lifted \
                      onto Mallory's row, Alice's message reads as Mallory's"
                 ));
+            // v47.1.0 (CIRISPersist#842) — a TYPED arm naming the blob, not
+            // `Backend(prose)`: the viewer was authorized and the bytes did not
+            // open, which a consumer must be able to tell from `NotGranted`
+            // without string-matching persist's wording.
             assert!(
-                matches!(err, BlobError::Backend(_)),
-                "{tag} I40: a mismatch after authorization is a crypto-class error (the viewer \
-                 was authorized; the bytes did not belong to the row), got {err:?}"
+                matches!(&err, BlobError::SealDidNotOpen { sha256_hex } if *sha256_hex == hex::encode(id)),
+                "{tag} I40: a mismatch after authorization is `SealDidNotOpen` for THIS blob (the \
+                 viewer was authorized; the bytes did not belong to the row), got {err:?}"
             );
+            assert_eq!(err.kind(), "blob_seal_did_not_open");
             let msg = err.to_string();
             assert!(
                 !msg.contains(&alice_row) && !msg.contains(&mallory_row) && !msg.contains(&comm),
@@ -4448,8 +4482,8 @@ pub mod blob_invariants {
                 "{tag} I40: the {scope} ciphertext opened with NO data — the binding was dropped"
             ));
             assert!(
-                matches!(err, BlobError::Backend(_)),
-                "{tag} I40: an absent binding is the same crypto-class refusal, got {err:?}"
+                matches!(&err, BlobError::SealDidNotOpen { sha256_hex } if *sha256_hex == hex::encode(id)),
+                "{tag} I40: an absent binding is the same typed refusal, got {err:?}"
             );
 
             // A stranger presenting the right data is still refused FIRST, by
@@ -4480,7 +4514,7 @@ pub mod blob_invariants {
             assert!(
                 matches!(
                     read_any_for_viewer(backend, &unbound.at_rest_sha256, viewer, Some(a)).await,
-                    Err(BlobError::Backend(_))
+                    Err(BlobError::SealDidNotOpen { .. })
                 ),
                 "{tag} I40: data presented against an AAD-less seal must refuse — a reader that \
                  believes in a binding that does not exist is told so"

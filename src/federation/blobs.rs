@@ -3372,6 +3372,21 @@ pub enum BlobError {
         /// The declared community, for `community` / `affiliations`.
         community_key_id: Option<String>,
     },
+    /// v47.1.0 (CIRISPersist#842) — the AEAD tag on the body did not verify.
+    /// Raised AFTER authorization (#831), so it is never a permissions problem
+    /// wearing a crypto error: the reader MAY read this blob, and it did not
+    /// open. Almost always the caller-supplied associated data (the reader
+    /// rebuilt different binding inputs than the writer sealed under), not
+    /// corruption. Remedy: look at the ROW, not the roster — distinct from
+    /// [`Self::NotGranted`], whose remedy is a grant.
+    #[error(
+        "blob {sha256_hex} did not open: authorized, but the AEAD tag did not verify — almost \
+         always an associated-data mismatch, not a permissions problem"
+    )]
+    SealDidNotOpen {
+        /// The at-rest SHA-256 of the blob that did not open.
+        sha256_hex: String,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -3397,6 +3412,7 @@ impl BlobError {
             BlobError::EpochNotCurrent { .. } => "blob_epoch_not_current",
             BlobError::Evicted { .. } => "blob_evicted",
             BlobError::NotPartyTo { .. } => "blob_not_party_to",
+            BlobError::SealDidNotOpen { .. } => "blob_seal_did_not_open",
             BlobError::Backend(_) => "blob_backend",
         }
     }
