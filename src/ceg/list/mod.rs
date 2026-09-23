@@ -6,7 +6,7 @@
 
 /// v46.4.0 (CIRISPersist#891) — the drive query's witnesses.
 #[cfg(any(test, feature = "test-anchor"))]
-pub(crate) mod drive_query_invariants;
+pub mod drive_query_invariants;
 pub mod federation;
 pub mod llm;
 pub mod tasks;

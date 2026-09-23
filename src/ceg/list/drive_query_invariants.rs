@@ -12,15 +12,23 @@
 //! room the caller is not in even when the filter names it, so a filter can
 //! never widen an audience.
 
+/// The I142 / I143 bodies, one per backend runner and reusable by a
+/// consumer's own anchor lane (that is what `test-anchor` is for).
 #[cfg(any(test, feature = "test-anchor"))]
-pub(crate) mod bodies {
+pub mod bodies {
     use crate::federation::tier_ingest::test_support as ts;
     use crate::read::AttestationFilter;
-    use crate::scope::{CallerAdmission, CallerScope};
+    use crate::scope::{caller_scope_from_directory, CallerScope};
 
     /// Seed one scoped attestation row through the local put door.
-    async fn seed<B>(b: &B, id: &str, attester: &str, scope: &str, target: Option<&str>, dim: &str)
-    where
+    pub async fn seed<B>(
+        b: &B,
+        id: &str,
+        attester: &str,
+        scope: &str,
+        target: Option<&str>,
+        dim: &str,
+    ) where
         B: crate::federation::FederationDirectory + Sync,
     {
         // The cohort TARGET rides `attested_key_id` on this plane (V114 admits
@@ -56,7 +64,7 @@ pub(crate) mod bodies {
 
     /// **I142 — the drive query.** The cohort axes select, AND with the other
     /// axes, survive paging, and never widen past the §4.3 gate.
-    pub(crate) async fn i142_the_drive_query<B>(b: &B, s: &str)
+    pub async fn i142_the_drive_query<B>(b: &B, s: &str)
     where
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
@@ -115,9 +123,11 @@ pub(crate) mod bodies {
         )
         .await;
 
-        let me = || CallerScope::Authenticated {
-            admission: CallerAdmission::for_test(owner.clone(), owner.clone(), [], []),
-        };
+        // The admission is RESOLVED, never fabricated: `for_test` is
+        // `#[cfg(test)]` by design and this module also compiles under
+        // `test-anchor`. Resolving exercises the builder the doors use.
+        let me = caller_scope_from_directory(b, &owner).await.unwrap();
+        let me = || me.clone();
         let ids = |f: AttestationFilter, sc: CallerScope| async move {
             let mut v: Vec<String> = crate::ceg::ReadEngine::list_attestations(b, f, None, 100, sc)
                 .await
@@ -171,14 +181,7 @@ pub(crate) mod bodies {
                     cohort_scope: Some("self".into()),
                     ..Default::default()
                 },
-                CallerScope::Authenticated {
-                    admission: CallerAdmission::for_test(
-                        stranger.clone(),
-                        stranger.clone(),
-                        [],
-                        []
-                    ),
-                },
+                caller_scope_from_directory(b, &stranger).await.unwrap(),
             )
             .await
             .is_empty(),
@@ -242,7 +245,7 @@ pub(crate) mod bodies {
     /// `list_scores` — the other door `sqlite_cohort_axes` / `pg_cohort_axes`
     /// are called from. Without this leg nothing would fail if the memory
     /// twin ignored the axis.
-    pub(crate) async fn i142_mem_the_axis_on_the_scores_plane<B>(b: &B, s: &str)
+    pub async fn i142_mem_the_axis_on_the_scores_plane<B>(b: &B, s: &str)
     where
         B: crate::federation::FederationDirectory + crate::ceg::ReadEngine + Sync,
     {
@@ -307,7 +310,7 @@ pub(crate) mod bodies {
 
     /// **I143 (from disk)** — the chunk adopt reaches Python: the receiving
     /// half of the scoped chunk DAG (#821) is bound, and classified.
-    pub(crate) fn i143_the_chunk_adopt_reaches_python() {
+    pub fn i143_the_chunk_adopt_reaches_python() {
         let pyo3 = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ffi/pyo3.rs"))
             .expect("read pyo3.rs");
         assert!(
