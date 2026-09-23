@@ -100,6 +100,36 @@ blob-surface question. They now cite #822, the issue filed afterwards as the
 record of what was fixed. The issue listed five; there were six (line 767).
 Every other `#821` in the tree correctly refers to the Edge question.
 
+### Changed — `AdmissionGate` is a consumer-owned score floor, not persist's trust posture (CIRISPersist#737)
+`SqliteNodeCoreBackend.admission_gate: None` was documented as "preserves
+pre-#123 bootstrap-permissive behavior", which reads as an unflipped flag day.
+It is not one. The gate (v3.4.0, #123) is a numeric trust-**score** floor
+consulted first on the write paths; the posture CC and the threat model
+mandate — hybrid-strict signature verification before mutation (AV-9), AV-45
+membership at every targeted scope, AV-84 standing, the reserved-prefix and
+accord-holder asymmetries, the §4.3 read gate — runs whether or not a gate is
+installed, and `None` and `Some(gate at 0.0)` are the same state: no
+*additional* floor. The threshold is a consumer knob (Edge derives one in
+`init_edge_runtime`); persist has no basis in CC to invent a default number,
+so it does not. Doc-only: the comment now says this; no API changes.
+
+### Mutation round — 13 / 13 killed
+Run under `scripts/pg_test_db.sh`.
+
+| # | Mutant | Killed by |
+|---|--------|-----------|
+| M1 | the sqlite community door is a plain `INSERT` again | cohort lifecycle 4b (sqlite) |
+| M2 | postgres: a community repeat falls through to the hard-case event and the epoch bump | cohort lifecycle (epoch == before + 1) |
+| M3 | sqlite: every family repeat replaces the stored revocation | family repeat witness (sqlite) |
+| M4 | postgres: the family acceleration comparison flipped | family repeat witness (postgres) |
+| M5 | memory: a family repeat never accelerates | `active_family_members_future_revocation_keeps_member` |
+| M6 | the AAD body open reports `Crypto` again | the `open_aad` unit pins, I40 on postgres |
+| M7 | `open_err` maps the typed arm to the `Backend` fallback | I40 on both backends |
+| M8 | the `kind()` token changes | I40 on both backends |
+| M9 / M10 | sqlite / postgres ignore `admitted_window` | I148 on each |
+| M11 / M12 | sqlite / postgres summaries carry no `admitted_at` | I148 on each |
+| M13 | the Python seal message drops the blob | the boundary pin |
+
 ## [47.0.0] - 2026-09-23
 
 ### Changed — BREAKING: one scope classifier; `affiliations` is a room at every gate (CIRISPersist#897, #796)
