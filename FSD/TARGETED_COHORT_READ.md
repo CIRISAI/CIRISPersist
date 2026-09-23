@@ -59,7 +59,38 @@ No wire change, no vocabulary change. One migration, generated columns only — 
   3. The same row and caller under the pre-fix predicate — refused for the **wrong reason** — so leg 1 cannot pass vacuously. Today everything is refused, which is exactly how the hole survived.
   4. `family` takes the same shape with `family_key_id` as the target (#887's canonical member).
   5. `self` is unchanged: the #888 legs (a claimed node reads its own rows; the sensitive-leaf and revoked-occurrence arms) stay green.
-- Mutants: point the targeted arms back at `attested_key_id` (leg 1 red); admit on "shares a room with the producer" (leg 2 red); drop the `COALESCE` alias order (a row using a non-canonical alias goes unreadable); apply the generated column to the `self` arm (the #888 legs red).
+
+### 5.1 Mutation round — 8 / 8 killed
+
+Run under `scripts/pg_test_db.sh` so no postgres leg can pass in 0.00 s by
+returning early without a DSN.
+
+| # | Mutant | Verdict |
+|---|--------|---------|
+| M1 | the targeted arms point back at the PRODUCER (`attested_key_id`) — the pre-#893 predicate | KILLED — `i144` sqlite + postgres |
+| M2 | the targeted arms drop the room-MEMBERSHIP test and admit any row that names a room | KILLED — `i144` sqlite + postgres |
+| M3-sqlite | the generated column reads only the FIRST alias (`community_id`) | KILLED — `i144` sqlite |
+| M3-postgres | same, postgres | KILLED — `i144` postgres |
+| M4 | the `self` arm keys on the generated room column too | KILLED — `i141`, `i121`–`i124` (the #888 legs) on both backends |
+| M5 | the Rust twin asks the PRODUCER's rooms | **survived round one** → KILLED — `memory::i144`, `targeted_arm_tests` |
+| M6 | a targeted row that names NO room is admitted (fail OPEN) | **survived round one** → KILLED — `targeted_arm_tests` |
+| M7 | the scores plane drops the row's room before the gate sees it | KILLED — `memory::i144` |
+
+Both survivors were gaps in the WITNESS, not holes in the fix:
+
+- **M5** survived because the memory leg of I144 returned early on "no
+  relational read substrate" — it ran in 0.00 s and measured nothing, the
+  same class as a postgres leg without a DSN. The memory backend has no
+  `list_attestations` substrate, but it *does* serve `list_scores`, and that
+  door folds through `CallerScope::admits` — the Rust twin this cut changes.
+  I144 now folds through the scores plane FIRST, on all three backends, and
+  only then through `list_attestations`. M7 was added to pin that new plane.
+- **M6** survived because no leg built a room-less targeted row — and the
+  write gate refuses one outright (there is nothing to check membership
+  against). So I144 asserts the REFUSAL at the door, and the read-side
+  fail-closed arm is witnessed on the twin itself (`targeted_arm_tests`),
+  where it belongs: it is a property of the gate, not of what persist
+  happens to store today.
 
 ## 6. Not in scope
 
