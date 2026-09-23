@@ -41,45 +41,35 @@ permissions:
   packages: write   # CIRISCache save pushes to GHCR; PRs only restore, so fork PRs are unaffected
 
 jobs:
-  # 2026-09-22 (CIRISPersist#881) — a release tag points at a commit main CI
-  # just passed; re-running the seven-leg matrix on the same SHA is machine
-  # time for no coverage. On a tag push this job waits (up to 45 min) for a
-  # completed, successful CI run of the SAME sha on a branch push, and when
-  # one exists the matrix below is skipped. Any other outcome — no run,
-  # failure, timeout — runs the matrix as before. Nothing `needs` the matrix
-  # job, so skipping it changes no asset job. On non-tag refs this job is a
-  # no-op that outputs skip=false.
-  tag-precheck:
-    name: tag precheck (skip the matrix when this sha already passed on main)
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-    outputs:
-      skip: ${{ steps.probe.outputs.skip }}
-    steps:
-      - id: probe
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
-          for i in $(seq 1 45); do
-            n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&event=push&per_page=50" \
-                  --jq '[.workflow_runs[] | select(.name=="CI" and (.head_branch|startswith("refs/tags/")|not) and .conclusion=="success")] | length' 2>/dev/null || echo 0)
-            if [ "${n:-0}" -gt 0 ]; then
-              echo "a successful CI run exists for ${GITHUB_SHA} on a branch push — the matrix is skipped on this tag"
-              echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-            echo "no completed successful branch run for ${GITHUB_SHA} yet ($i/45) — waiting 60s"; sleep 60
-          done
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+  # 2026-09-23 (CIRISPersist#895) — the `tag-precheck` job that stood here is
+  # REMOVED, not repaired. Recorded so the next person does not re-derive it:
+  #
+  #   * v46.4.0 shipped it asking "does a successful CI run exist for this SHA
+  #     on a branch push?". Never true — the `concurrency` group above keys
+  #     push events on the SHA (#397) so the TAG run cancels the main-push run
+  #     for that commit. It waited 45 min for a run its own workflow had
+  #     cancelled, then ran the matrix anyway: +45 min per release.
+  #   * The tree-comparing repair DID fire, and was worse. The only
+  #     Linux-x86_64 `CIRISCache/save` in this workflow lives in the
+  #     `linux-x86_64-test` matrix (the `core-1` entry, below) and publishes on
+  #     `main || tags/v*`. Main is cancelled by the tag; PR runs restore
+  #     without saving. Skip the matrix on the tag and the versioned Linux
+  #     cache for that release is never published — every consumer cold-
+  #     compiles, which is the global pessimization `always warm the cache`
+  #     exists to prevent. Found by Codex review on PR #896.
+  #   * And it buys nothing anyway: the matrix legs run in PARALLEL (no
+  #     `max-parallel`), so nine legs cost about one leg of wall clock —
+  #     measured on v46.3.1's tag run, 9 legs spanning 21:21→21:57. Skipping
+  #     six of nine saves machine time and ~zero wall.
+  #
+  # What actually removed a redundant wait is `scripts/release_ship.sh`: when
+  # the merge commit's TREE equals the PR head's, the PR run already certified
+  # those bytes and the main-CI wait is skipped. That is where tree equality
+  # belongs, and it is measured (−35 min on v46.4.0's ship).
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
   # real Postgres backing the integration tests.
   linux-x86_64-test:
-    needs: tag-precheck
-    if: needs.tag-precheck.outputs.skip != 'true'
     # v2.0.1 (CIRISPersist#95-track) — substrate-axis matrix. The 2.0
     # feature-gap fix turned every substrate on (audit/secrets/nodecore/
     # graph/telemetry) and the single test job ballooned to ~12 min.
