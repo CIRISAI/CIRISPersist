@@ -852,6 +852,12 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v16.1.0
 # see the base-deps note). No Android openssl in any configuration now,
 # retiring the flakiest part of the mobile wheel matrix.
 
+# v47.4.0 (CIRISPersist#805) — the test-anchor block minter, test-anchor-gated:
+# `cargo run --example mint_test_anchor --features test-anchor`.
+[[example]]
+name = "mint_test_anchor"
+required-features = ["test-anchor"]
+
 [dev-dependencies]
 # v21.4.0 (CIRISPersist#513 / CIRISVerify#219) — the custody-attestation
 # MOCK fabrication surface (`MockYubicoCa`), test builds only: mint

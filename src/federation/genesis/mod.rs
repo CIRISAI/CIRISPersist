@@ -26,10 +26,15 @@
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
 pub mod bundle;
+/// v47.4.0 (CIRISPersist#805) — the `CIRIS_TEST_TRUST_ROOT*` block minter.
+#[cfg(feature = "test-anchor")]
+pub mod test_anchor_block;
 pub use bundle::{
     bake_assembled_genesis, parse_genesis_bundle, verify_bundle_quorum, BakeItemOutcome,
     GenesisAuthorization, GenesisBakeReport, GenesisBundle,
 };
+#[cfg(feature = "test-anchor")]
+pub use test_anchor_block::*;
 
 pub mod posture;
 pub use posture::{
@@ -193,6 +198,22 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
     }
 
     let keys = ciris_verify_core::test_anchor::test_trust_root_override()?;
+    // v47.4.0 (CIRISPersist#805, FSD §3.2) — the ADVISORY tag: a block that
+    // names the pair it was minted by is checked against the running pair;
+    // an untagged block (every one that predates the tag) is not scolded.
+    if let Ok(tag) = std::env::var("CIRIS_TEST_TRUST_ROOT_MINTED_BY") {
+        let tag = tag.trim();
+        if !tag.is_empty() && tag != test_anchor_minted_by() {
+            tracing::warn!(
+                target: TEST_ANCHOR_LOG_TARGET,
+                block_minted_by = tag,
+                running_pair = test_anchor_minted_by(),
+                "CIRIS_TEST_TRUST_ROOT_MINTED_BY names a different persist/verify pair than \
+                 the one running — the scrubs may not verify; re-mint: \
+                 cargo run --example mint_test_anchor --features test-anchor"
+            );
+        }
+    }
     let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
         .parse()
         .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
@@ -218,6 +239,33 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
         );
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
             .expect("canonicalize test-anchor envelope");
+        // v47.4.0 (CIRISPersist#805, FSD §3.2) — the STRUCTURAL check: a
+        // supplied scrub either verifies over persist's canonical envelope
+        // under the running persist/verify pair, or the boot log says so in
+        // words that name the fix. The record is still seeded — the rooting
+        // walk is the gate; the seeder reports.
+        if let Some(sig) = scrub_ed.as_deref() {
+            if let Err(e) = crate::verify::hybrid::verify_hybrid(
+                &canonical,
+                sig,
+                scrub_pqc.as_deref(),
+                &pubkey_ed25519_base64,
+                pqc_pubkey.as_deref(),
+                crate::verify::hybrid::HybridPolicy::Strict,
+                None,
+            ) {
+                tracing::warn!(
+                    target: TEST_ANCHOR_LOG_TARGET,
+                    key_id = %key_id,
+                    detail = %e,
+                    running_pair = test_anchor_minted_by(),
+                    "CIRIS_TEST_TRUST_ROOT block: the scrub for this slot does not verify \
+                     under this persist/verify pair — the block was minted against another \
+                     pair (or against a hand-rolled envelope) and will not root. Re-mint it: \
+                     cargo run --example mint_test_anchor --features test-anchor"
+                );
+            }
+        }
         out.push(SignedKeyRecord {
             record: crate::federation::KeyRecord {
                 key_id: key_id.clone(),

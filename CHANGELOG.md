@@ -7,6 +7,12 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.4.0] - 2026-09-24
+
+### Added — the test-anchor block minter lives in persist (CIRISPersist#805; FSD `TEST_ANCHOR_BLOCK_MINTER.md`)
+
+(section written at ship time)
+
 ## [47.3.0] - 2026-09-24
 
 ### Added — a valid root is as attested as its holders: the holder-hardware leg of `trust_root_valid` (CIRISPersist#901; FSD `TRUST_ROOT_HOLDER_HARDWARE.md`)

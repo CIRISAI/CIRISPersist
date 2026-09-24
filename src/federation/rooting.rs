@@ -543,6 +543,10 @@ where
 // root_binding — the cold-start binding-rooting primitive
 // ─────────────────────────────────────────────────────────────────────
 
+/// v47.4.0 (CIRISPersist#805) — the tracing target a rooting rejection is
+/// reported on where the verdict is produced.
+pub const ROOTING_LOG_TARGET: &str = "ciris_persist::rooting";
+
 /// Cold-start binding-rooting primitive (CIRISPersist#94).
 ///
 /// On first contact with a federation peer, confirm the claimed
@@ -620,6 +624,39 @@ where
     root_binding_anchored(directory, key_id, claimed_pubkey_ed25519_base64, &anchor).await
 }
 
+/// v47.4.0 (CIRISPersist#805, FSD §3.3) — the one place a rooting rejection
+/// is REPORTED: every caller (announce-admit, the FFI, a consumer's
+/// regression pin) gets the failing link and verify's text on
+/// [`ROOTING_LOG_TARGET`] without touching their code. The verdict itself
+/// is unchanged — see `root_binding_anchored_inner` for the walk.
+pub async fn root_binding_anchored<F>(
+    directory: &F,
+    key_id: &str,
+    claimed_pubkey_ed25519_base64: &str,
+    trusted_anchor: &[[u8; 32]],
+) -> RootingVerdict
+where
+    F: FederationDirectory + ?Sized,
+{
+    let verdict = root_binding_anchored_inner(
+        directory,
+        key_id,
+        claimed_pubkey_ed25519_base64,
+        trusted_anchor,
+    )
+    .await;
+    if let RootingVerdict::Rejected { rejection } = &verdict {
+        tracing::warn!(
+            target: ROOTING_LOG_TARGET,
+            key_id = %key_id,
+            kind = rejection.kind(),
+            detail = ?rejection,
+            "root_binding rejected"
+        );
+    }
+    verdict
+}
+
 /// [`root_binding`] with an explicit trusted-terminus **anchor** — the core
 /// primitive. The terminus's Ed25519 pubkey must appear in `trusted_anchor`
 /// (a slice of raw 32-byte keys) or the binding is rejected with
@@ -629,7 +666,7 @@ where
 ///
 /// See [`root_binding`] for the full step-by-step contract; this adds **step
 /// 5**: terminus-pubkey ∈ `trusted_anchor`.
-pub async fn root_binding_anchored<F>(
+async fn root_binding_anchored_inner<F>(
     directory: &F,
     key_id: &str,
     claimed_pubkey_ed25519_base64: &str,
