@@ -54,7 +54,27 @@ Because a member can be re-added, a member can be removed twice. `(community_key
 Mutants planned: the FK re-point reverted (I163); `add_community_member` back to mutating the record (I164: fork on B); the fold ignoring widenings / ignoring the later revocation / tie broken toward the widening (I165); each raw reader left raw (I166 ×9); the repeat-revocation no-op dropped (I165: three rotations); the resume id without `effective_at` (I167).
 
 ## 5. Verification
-(§5.1 mutation table recorded at build time.)
+
+### 5.1 Mutation round (v48.0.0, wt-860 at 92de5b05; lane = I163–I169 + the #861 repeat witness, memory + sqlite + postgres; each mutant reverted before the next)
+
+| # | Mutant | Verdict | Killed by |
+|---|--------|---------|-----------|
+| M1 | fold ignores widenings | KILLED | memory_dyn::i164 memory_dyn::i165 memory_dyn::i166 postgres_dyn::i164 postgres_dyn::i165 postgres_dyn::i166 sqlite_dyn::i164 sqlite_dyn::i165 sqlite_dyn::i166 |
+| M2 | fold tie: the widening wins | KILLED | memory_dyn::i165 postgres_dyn::i165 sqlite_dyn::i165 |
+| M3 | fold ignores as_of | KILLED | memory_dyn::i165 postgres_dyn::i165 sqlite_dyn::i165 |
+| M4 | add_community_member reports every put as new | KILLED | memory_dyn::i164 postgres_dyn::i164 sqlite_dyn::i164 |
+| M5 | memory: the exact revocation repeat is not a no-op | KILLED | revocation_repeat_is_a_noop_memory_861 |
+| M6 | effective_roster reads the record raw | KILLED | memory_dyn::i166 postgres_dyn::i166 sqlite_dyn::i166 |
+| M7 | the predicate drops the steward arm | KILLED | memory::i169 postgres::i169 run::i168_the_sweep_promotes_an_owned_agents_rows sqlite::i169 |
+| M8 | the loader drops the by-for union | KILLED | memory::i169 postgres::i169 run::i168_the_sweep_promotes_an_owned_agents_rows sqlite::i169 |
+| M9 | the predicate ignores for_key_id | SURVIVED round 1 → KILLED round 2 (witness gap: the reader and the predicate were each other's alibi) | memory::i169 postgres::i169 sqlite::i169 |
+| M10 | memory: list_live_consent_grants_for ignores for_key_id | SURVIVED round 1 → KILLED round 2 (witness gap: the reader and the predicate were each other's alibi) | memory::i169 |
+| M12 | the widening admission gate is bypassed | KILLED | memory_dyn::i164 postgres_dyn::i164 sqlite_dyn::i164 |
+| M13 | the crossing accepts any grant as covering the sender | KILLED | memory::i169 postgres::i169 sqlite::i169 |
+| M14 | revocation materialize ignores the instant | KILLED | memory_dyn::i167 postgres_dyn::i167 sqlite_dyn::i167 |
+| M15 | widening materialize returns nothing | KILLED | memory_dyn::i167 postgres_dyn::i167 sqlite_dyn::i167 |
+
+14 mutants (M11 was a migration, not a code mutant — I163 covers the shipped state). Round 1: 9 killed, 2 survived — M9 (the predicate ignoring `for_key_id`) and M10 (memory's `list_live_consent_grants_for` ignoring `for_key_id`) hid behind each other on the loader path, where the read filters by machine and the predicate checks the same field; each is load-bearing elsewhere (the read when called directly, the predicate on the crossing's replicated-apply path). I169 now asks both directly and drives the crossing's negative arm; round 2 killed both, and the three new arms (M13 the crossing accepting any grant; M14 the revocation's by-hash materialize ignoring the instant; M15 the widening's materialize returning nothing) with them.
 
 ## 6. Not in scope
 - A `community` identity type (a room is not a person, and not a key — the FK re-point is the answer edge preferred).

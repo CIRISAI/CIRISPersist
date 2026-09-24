@@ -10,8 +10,90 @@ threat-model citations because this crate's audit story is the point.
 ## [48.0.0] - 2026-09-24
 
 ### Changed — a room's roster converges both ways (CIRISPersist#860; FSD `ROOM_ROSTER_PLANES.md`)
+Two findings from CIRISEdge#608/#613 with one root: *the community record is
+not a principal*. A room admitted the way `put_community` allows — with no
+key row of its own — could never be revoked from (the revocation table's
+group FK named `federation_keys`), and a roster grown through
+`add_community_member` rewrote the community RECORD in place, which is a
+fork at every peer (`CommunityRosterFork`). Every pair room edge ever made
+was in this state; it showed on the first room that widened.
 
-(section written at ship time)
+- **V151.** Both membership-revocation tables reference their GROUP table
+  (`federation_families`, `federation_communities`) — a family and a room
+  are keyless identifiers, by doctrine. The community revocation PK gains
+  `effective_at`: a re-added member can be removed again; an exact retry is
+  still the #861 no-op. Rows that named a group with no group row (unreachable
+  by every fold) are dropped by the copy. Memory mirrors the group FK.
+- **The widening plane** — `federation_community_membership_widenings`, the
+  structural mirror of the revocation table:
+  `CommunityMembershipWidening { community_key_id, member_key_id, joined_at,
+  effective_at, role }`, `Signed…`/`Served…` wrappers,
+  `put_community_membership_widening`, `list_community_membership_widenings_for`,
+  `list_signed_community_membership_widenings_since` (three-part resume id) on
+  sqlite / postgres / memory; `EnvelopeKind::CommunityMembershipWidening`
+  (the 17th kind, E4 policy); the FFI capsule op. A widening does **not**
+  rotate the DEK epoch — the minter wraps the member at its next seal.
+- **`add_community_member` is the local door onto the plane** (BREAKING):
+  `spec` is the authority's hybrid scrub over the WIDENING row
+  `{member.key_id, member.joined_at, effective_at = member.joined_at,
+  member.role}`, not over the grown record. The record is never rewritten to
+  grow. Edge's v47 producer (a scrub over the grown record) is refused with
+  the signature reason.
+- **One fold.** `active_roster_at(record, widenings, revocations, as_of)`:
+  the latest event per member decides, a removal wins a tie; every read-time
+  gate that read `community.members` raw — the key-grant walk, the DEK wrap
+  set, the moderator gate, `appointed_moderators_of`, the room's authority
+  set, the supersede projection — goes through it (`effective_roster` /
+  `is_active_community_member`). `put_community`'s own checks still read the
+  incoming record.
+- The revocation since-read's resume id is the three-part compound; the
+  `CONSENT_GRAMMAR_HASH` is **re-pinned** (`30786161…`): the kind list is part
+  of the hash.
+
+### Fixed — the promotion sweep sees a claimed machine's consent (CIRISPersist#905; FSD `CONSENT_SWEEP_BY_PRINCIPALS.md`)
+Measured on CIRISServer's production-shaped ladder: a split, owned, claimed
+agent whose owner authored `consent:replication:v1` toward the canonical,
+Rooted, send-set resolved — and its sealed traces stayed `(self, local)`
+forever, `offerable=0`, no refusal, no line. Since v44.6.0 the grants that
+cover a claimed machine are authored by its HUMAN and name it in
+`for_key_id`; `Engine::load_active_egress_grants` read only self-authored
+grants and saw zero on every claimed node. One gate deeper the mesh
+crossing's `check_grant_covers` refused a grant whose author was not the
+sender — the same assumption.
+
+- **One predicate:** `consent_by_humans::grant_is_authored_for(dir, grant,
+  machine)` — the machine's own grant, or a bound steward's grant naming it.
+  The sweep's loader (`live_egress_grants_by_principals`, over the new
+  `list_live_consent_grants_for` read on all three backends) and the
+  crossing's covering check both ask it; `repair_stranded_scope_backlog`
+  shares the loader.
+- **V152.** `consent_peer_set` is keyed `(node_key_id, for_key_id,
+  peer_key_id)` (a self-grant keyed on its author): a human bound to two
+  machine keys keeps both per-key grants live in the attester-keyed readers,
+  and withdrawing one no longer drops the other's peer row.
+- `FederationDirectory::as_dyn_directory()` — the trait object from a
+  default method (`Self: ?Sized`), so the crossing can reach the steward fold.
+
+**Witnesses:** I163 (keyless room and keyless family can revoke; the §15
+rotation reachable), I164 (a widening converges across two directories; the
+record is byte-identical on both; the v47 spec shape is refused), I165 (four
+events in three orders on three directories fold to one roster; the repeat
+is a no-op; a tie removes), I166 (every read-time gate follows a widening
+and a revocation), I167 (the since-read resumes across the three-part id),
+I168 (an owned agent's sealed trace is promoted by its human's consent, on an
+`Engine`; the witness prints what the sweep logged), I169 (two per-key
+grants both live; by principals each machine sees its own; an unbound
+author's grant is nobody's; withdrawal keeps the sibling grant). Mutation
+round: **14 mutants, 14 killed** (two needed a second round after a witness fix — the table says which and why) (`FSD/ROOM_ROSTER_PLANES.md` §5.1).
+
+**For adopters.** Edge: sign `add_community_member`'s spec over the widening
+row (`ts::widening_admit_spec` shows the shape); apply
+`CommunityMembershipWidening` rows from
+`list_signed_community_membership_widenings_since` as you apply revocations;
+`a_room_that_is_not_a_registered_key_cannot_revoke_yet` goes red — that is
+the signal; re-pin `CONSENT_GRAMMAR_HASH`. Server: the production-shaped
+ladder should now show `offerable>0` for the owned agent with no Server
+change; `live_consent_grants_for_machine` keeps both per-key grants.
 
 ## [47.4.0] - 2026-09-24
 
