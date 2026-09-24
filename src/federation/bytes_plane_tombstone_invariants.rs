@@ -264,23 +264,35 @@ pub mod bodies {
         }
         let (sha, author) = seal_blob(b, &format!("i150-author-{s}"), b"out of order").await;
         let row = format!("i150-row-{s}");
-        // OUT OF ORDER: both withdraws land BEFORE their target, so the write
-        // door admits each with rule = None (the target is not local yet).
-        let w_third = format!("i150-w-third-{s}");
+        // OUT OF ORDER, twice: each withdraws lands BEFORE its target, so the
+        // write door admits it with rule = None. The two rows differ only in
+        // who signed the deferred withdraws — a SUBJECT (entitled) on row A,
+        // a THIRD PARTY (not) on row B. The stored column is `None` on both;
+        // only the authority re-derived against the landed target differs.
+        let sha_b = seal_blob(b, &format!("i150-author-b-{s}"), b"out of order, too")
+            .await
+            .0;
+        let row_b = format!("i150-row-b-{s}");
         let w_subject = format!("i150-w-subject-{s}");
-        withdraw(b, &w_third, &third, &row)
+        let w_third = format!("i150-w-third-{s}");
+        withdraw(b, &w_subject, &subject, &row)
             .await
             .expect("I150: deferred admission (target absent)");
-        assert_eq!(
-            b.get_attestation(&w_third)
-                .await
-                .unwrap()
-                .unwrap()
-                .withdraws_admission_rule,
-            None,
-            "I150: precondition — the unentitled withdraws is stored with rule None"
-        );
-        // Now the target lands.
+        withdraw(b, &w_third, &third, &row_b)
+            .await
+            .expect("I150: deferred admission (target absent)");
+        for w in [&w_subject, &w_third] {
+            assert_eq!(
+                b.get_attestation(w)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .withdraws_admission_rule,
+                None,
+                "I150: precondition — a withdraws admitted ahead of its target stores rule None"
+            );
+        }
+        // Now both targets land, and only NOW can authority be derived.
         bind_row(
             b,
             &row,
@@ -290,44 +302,37 @@ pub mod bodies {
             true,
         )
         .await;
-        // The THIRD PARTY's withdraws (stored None, unentitled) retires nothing.
+        bind_row(
+            b,
+            &row_b,
+            &author,
+            &[&author, &subject],
+            &hex::encode(sha_b),
+            true,
+        )
+        .await;
         assert_eq!(
-            binding_state(b as &dyn FederationDirectory, &sha)
-                .await
-                .unwrap(),
-            BindingState::Live,
-            "I150: an unentitled deferred withdraws does not retire the bytes"
-        );
-        assert_eq!(
-            kind_of(&engine.read_blob_as(&sha, &author, None).await),
-            "ok",
-            "I150: still readable"
-        );
-        // The SUBJECT's withdraws also arrives deferred: stored None, but
-        // entitled when re-derived against the target this node now holds.
-        withdraw(b, &w_subject, &subject, &row)
-            .await
-            .expect("I150: admitted");
-        // (put it out of order too: same stored value as the third party's)
-        let stored = b
-            .get_attestation(&w_subject)
-            .await
-            .unwrap()
-            .unwrap()
-            .withdraws_admission_rule;
-        assert_eq!(
-            binding_state(b as &dyn FederationDirectory, &sha)
-                .await
-                .unwrap(),
+            binding_state(b as &dyn FederationDirectory, &sha).await.unwrap(),
             BindingState::Withdrawn {
                 attestation_id: row.clone(),
                 withdraws_id: w_subject.clone()
             },
-            "I150: the entitled withdraws retires the bytes (stored rule was {stored:?})"
+            "I150/A: the SUBJECT's deferred withdraws (stored None) retires the bytes — a fold that \
+             trusts the stored rule cannot produce this"
         );
         assert_eq!(
             kind_of(&engine.read_blob_as(&sha, &author, None).await),
             "blob_withdrawn"
+        );
+        assert_eq!(
+            binding_state(b as &dyn FederationDirectory, &sha_b).await.unwrap(),
+            BindingState::Live,
+            "I150/B: the THIRD PARTY's deferred withdraws (also stored None) retires nothing — a fold \
+             that reads None as retired makes replication a remote-delete primitive"
+        );
+        assert_eq!(
+            kind_of(&engine.read_blob_as(&sha_b, &author, None).await),
+            "ok"
         );
     }
 
@@ -477,6 +482,43 @@ pub mod bodies {
             !b.list_local_holders(&sha).await.unwrap().contains(&node),
             "I153: this node no longer lists itself as a holder"
         );
+        // A REFUSED retraction ABORTS (I18's contract for one sha): announce a
+        // second blob, then evict it with a `now` far outside the admission
+        // skew, so the withdraws cannot be admitted. The bytes and the claim
+        // must survive, and the error must surface — a door that deleted
+        // first would report a retraction that never happened.
+        let body2 = format!("held by this node, second {s}").into_bytes();
+        let sha2 = *blake_free_sha(&body2);
+        b.put_blob_signing_at(
+            crate::federation::types::cohort_scope::FEDERATION,
+            crate::federation::StorageFloor::resolved(
+                crate::federation::types::cohort_scope::CryptoTier::Plaintext,
+            ),
+            &sha2,
+            crate::federation::BlobBody::Inline(body2),
+            None,
+            &node,
+            &signer,
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("I153: announce the second blob");
+        let far_future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let res = engine.evict_blob(&sha2, far_future).await;
+        assert!(
+            res.is_err(),
+            "I153: a retraction that cannot be admitted must ABORT the eviction, got {res:?}"
+        );
+        assert!(
+            b.has_blob(&sha2).await.unwrap(),
+            "I153: the bytes were DELETED although the retraction failed"
+        );
+        assert!(
+            b.list_local_holders(&sha2).await.unwrap().contains(&node),
+            "I153: the claim survives a failed eviction"
+        );
+
         // Retry after success: no second retraction, nothing held.
         let again = engine.evict_blob(&sha, chrono::Utc::now()).await.unwrap();
         assert_eq!(
