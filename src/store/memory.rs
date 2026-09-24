@@ -2596,13 +2596,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // the same gate as the scalar. v22.0.0 (#543): the memory backend
         // never ran this gate at all, so an evidence-less accord_holder that
         // sqlite/postgres REJECT was silently admitted here.
-        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
-            self.hardware_attestation_policy().check(
-                &row.key_id,
-                row.attestation_evidence.as_ref(),
-                chrono::Utc::now(),
-            )?;
-        }
+        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
+        // runs structure + freshness; any other evidence-carrying row runs
+        // structure alone (a replicated body is checked where it lands).
+        self.hardware_attestation_policy()
+            .admit_key_record(&row, chrono::Utc::now())?;
 
         // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
         // admission gate + 'unregistered'⇔None normalization as the SQL

@@ -7,6 +7,10 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.3.0] - 2026-09-24
+
+(section written at ship time)
+
 ## [47.2.0] - 2026-09-24
 
 ### Added — CC 2.3 at the bytes plane: a withdrawn reference stops the bytes (CIRISPersist#853, #862)

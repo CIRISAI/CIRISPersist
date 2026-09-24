@@ -192,6 +192,13 @@ pub struct HardwareAttestationPolicy {
     /// inherit an unbounded unverified string. Deployments tighten or
     /// widen by mutating the set.
     pub accepted_custody_tiers: HashSet<String>,
+    /// v47.3.0 (CIRISPersist#901) — the Yubico attestation root Layer B walks a
+    /// YubiKey PIV chain to. Default: the production pin
+    /// (`admission::YUBICO_ATTESTATION_ROOT_1_DER`). Tests inject a
+    /// `MockYubicoCa::root_der()` here through the backend's
+    /// `set_hardware_attestation_policy`; production never reads a
+    /// caller-supplied root at admission (Registry-of-Record).
+    pub yubico_root_der: std::borrow::Cow<'static, [u8]>,
 }
 
 impl Default for HardwareAttestationPolicy {
@@ -228,6 +235,12 @@ impl Default for HardwareAttestationPolicy {
             ]
             .into_iter()
             .collect(),
+            // v47.3.0 (CIRISPersist#901) — the Yubico root the holder-hardware
+            // leg walks YubiKey PIV chains against (Layer B). The real pinned
+            // root by default; a witness swaps in a mock CA's root.
+            yubico_root_der: std::borrow::Cow::Borrowed(
+                crate::federation::admission::YUBICO_ATTESTATION_ROOT_1_DER,
+            ),
         }
     }
 }
@@ -427,12 +440,22 @@ impl HardwareAttestationPolicy {
     ///
     /// `now` is supplied as a parameter for testability; production
     /// callers pass `Utc::now()`.
-    pub fn check(
+    /// v47.3.0 (CIRISPersist#901, `FSD/TRUST_ROOT_HOLDER_HARDWARE.md` §3.1) —
+    /// **Layer A**: evidence present, canonical shape, class accepted,
+    /// required fields present. NO clock: nonce freshness is an admission
+    /// property (replay protection at registration), not one a root's
+    /// validity can depend on — re-checking it at validity time would expire
+    /// every real root a day after its holders registered. [`Self::check`]
+    /// is this plus the freshness leg, so the two cannot drift.
+    ///
+    /// Returns the derived class for a `Hardware` body; `None` for the
+    /// nonce-free shapes (`GenerationCustody`, the test marker) that carry
+    /// their own admissibility.
+    pub fn check_structure(
         &self,
         key_id: &str,
         evidence_value: Option<&serde_json::Value>,
-        now: DateTime<Utc>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<HardwareType>, Error> {
         // 1. Presence + non-null.
         let value = match evidence_value {
             None => {
@@ -478,7 +501,7 @@ impl HardwareAttestationPolicy {
                     });
                 }
                 if crate::federation::genesis::test_anchor_override_active() {
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(Error::AccordHolderRequiresAttestationEvidence {
                     key_id: key_id.to_owned(),
@@ -490,7 +513,8 @@ impl HardwareAttestationPolicy {
             }
             // v23.1.0 (CIRISPersist#554) — the attestation-at-generation arm.
             AttestationEvidence::GenerationCustody(att) => {
-                return self.check_generation_custody(key_id, &att);
+                self.check_generation_custody(key_id, &att)?;
+                return Ok(None);
             }
             AttestationEvidence::Hardware(hw) => *hw,
         };
@@ -522,6 +546,56 @@ impl HardwareAttestationPolicy {
         }
 
         // 6. Freshness.
+        Ok(Some(hw_type))
+    }
+
+    /// v47.3.0 (CIRISPersist#901, FSD §3.5) — the ONE predicate every key
+    /// admission door runs (`put_public_key`, `adopt_scrub_upgrade`,
+    /// `supersede_canonical_record`, every backend): an `accord_holder`
+    /// runs the full [`Self::check`] (structure + freshness — replay
+    /// protection at registration, unchanged); any OTHER row that carries
+    /// evidence runs [`Self::check_structure`] (a record arriving by
+    /// replication was fresh where it registered, days ago — but a
+    /// malformed body is refused where it lands, so the holder-hardware leg
+    /// of `trust_root_valid` never judges a record nobody checked); a row
+    /// with no evidence is admitted, never downgraded.
+    pub fn admit_key_record(
+        &self,
+        row: &crate::federation::types::KeyRecord,
+        now: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
+            return self.check(&row.key_id, row.attestation_evidence.as_ref(), now);
+        }
+        if row.attestation_evidence.is_some() {
+            self.check_structure(&row.key_id, row.attestation_evidence.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Apply the policy at ADMISSION: [`Self::check_structure`] plus the
+    /// capture-nonce freshness leg (`now - nonce_captured_at <=
+    /// max_nonce_age`) for a `Hardware` body. Behaviour unchanged since
+    /// v2.5.0; the split is v47.3.0 (#901).
+    pub fn check(
+        &self,
+        key_id: &str,
+        evidence_value: Option<&serde_json::Value>,
+        now: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let Some(_hw_type) = self.check_structure(key_id, evidence_value)? else {
+            return Ok(());
+        };
+        // Structure passed and the body is `Hardware`: re-parse for the nonce
+        // (the parse cannot fail — `check_structure` just did it).
+        let value = evidence_value.expect("check_structure admitted a present value");
+        let AttestationEvidence::Hardware(hw) =
+            serde_json::from_value::<AttestationEvidence>(value.clone())
+                .expect("check_structure admitted a canonical body")
+        else {
+            return Ok(());
+        };
+        let evidence = *hw;
         let age = now
             .signed_duration_since(evidence.nonce_captured_at)
             .to_std()

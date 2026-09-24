@@ -967,6 +967,35 @@ pub mod test_support {
     ) -> (String, String, Option<String>) {
         let ed = ed_signer(signing_key_id);
         let mldsa = mldsa_signer(signing_key_id);
+        sign_envelope_with(&ed, &mldsa, envelope)
+    }
+
+    /// v47.3.0 (CIRISPersist#901) — the signers `MockYubicoCa::attest_member`
+    /// derives for a member from its Ed25519 seed (the mock's ML-DSA seed is
+    /// `SHA-256("ciris-mock-mldsa-seed-v1" ‖ ed_seed)`), so a fixture can
+    /// scrub a row AS that member: the row then verifies against the pubkeys
+    /// the member's custody chain names.
+    pub fn mock_member_signers(ed_seed: &[u8; 32]) -> (Ed25519Signer, Box<MlDsa65Signer>) {
+        let mldsa_seed: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(b"ciris-mock-mldsa-seed-v1");
+            h.update(ed_seed);
+            h.finalize().into()
+        };
+        (
+            Ed25519Signer::from_seed(ed_seed).expect("mock ed seed"),
+            Box::new(MlDsa65Signer::from_seed(&mldsa_seed).expect("mock mldsa seed")),
+        )
+    }
+
+    /// [`sign_envelope`] with explicit signers: the hybrid scrub shape every
+    /// federation-tier row carries (Ed25519 over the canonical bytes, ML-DSA
+    /// over canonical ‖ ed_sig).
+    pub fn sign_envelope_with(
+        ed: &Ed25519Signer,
+        mldsa: &MlDsa65Signer,
+        envelope: &serde_json::Value,
+    ) -> (String, String, Option<String>) {
         let canonical = ceg_produce_canonicalize(envelope).expect("canonicalize");
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
         let ed_sig = ed.sign(&canonical).expect("ed sign");
