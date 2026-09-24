@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790209070185,
+  "lastUpdate": 1790226041588,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -96689,6 +96689,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 191,
             "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "801cd62b618581ba9198bf5ece25b92123907c2d",
+          "message": "merge(#902): v47.2.0 - CC 2.3 at the bytes plane: a withdrawn reference stops the bytes (#853, #862)\n\nCC 2.3 at the bytes plane (#853 + #862): the read and serve doors consult the referencing row's tombstone, re-deriving authority against the local target — never the stored rule; a typed `Withdrawn` so edge's `MissReason::Withdrawn` is reachable; the resolver sees `BlobPointer` rows; `Engine::evict_blob` retracts before it deletes. No migration, no breaking change.\n\n### Added — CC 2.3 at the bytes plane: a withdrawn reference stops the bytes (CIRISPersist#853, #862)\nCC 2.3 held at the row plane and not at the bytes plane. A subject's\n`withdraws` tombstoned the referencing attestation and readers of the row saw\nit retracted, but `read_blob_as`, `read_blob_range_as` and `serve_blob_to_peer`\nnever asked whether the row referencing a blob was withdrawn. The bytes stayed\nreadable on the author node and every holder, indefinitely — through the FFI,\nPython, CIRISServer's `resolve_content`, and the swarm serve door. Edge's half\n(CIRISEdge#614) could refuse and delete on its own `BlobChunkSource`; a direct\npersist read on the holder returned bytes until edge had deleted them.\n\n- **The fold** (`blob_tombstone::binding_state`): a blob's bytes are readable\n  iff at least one row binding them is live. Per binding row, the composers\n  naming it are found **by reference** (new\n  `FederationDirectory::list_attestations_referencing`, on all three backends,\n  discriminated by the three structural composer ops), each retraction's\n  authority is **re-derived now** through `check_withdraws_admission` against\n  the target this node holds, and §6.1 precedence (`retired_ids`, the one\n  fold since #686) decides. The stored `withdraws_admission_rule` is **never\n  read**: per the operator's constraint on #853, a `withdraws` admitted out\n  of order carries `None`, and a fold that trusted it, or read `None` as\n  retired, would make replication a remote-delete primitive. One live\n  binding keeps the bytes — CC 2.3 is a subject's right to pull *their* row.\n- **The doors**: `refuse_if_withdrawn` sits after authorization on the\n  whole-blob and range viewer reads (a stranger is still `NotGranted` and\n  learns nothing) and as the third gate of the serve disposition.\n  **`BlobError::Withdrawn { sha256_hex, attestation_id, withdraws_id }`**,\n  kind `blob_withdrawn`, Python `RuntimeError(\"blob_withdrawn: <sha>\")` — never\n  `NotHeld`, which means \"ask another holder\" and walked the fetcher around\n  the mesh. Edge's `MissReason::Withdrawn` / `ChunkSourceRefusal::Withdrawn`\n  are now reachable from persist's serve door.\n- **The resolver sees both reference shapes** (#862 part 2):\n  `envelope_binds_content` matches `evidence_refs` **or** a typed `BlobPointer`\n  member (`blob_pointer::pointer_for`) — the chat shape, which never carried\n  an `evidence_ref` and so was invisible to any fold that started from the\n  sha. An unreadable pointer member at that sha counts as binding.\n- **`Engine::evict_blob(sha)`** (#862 part 1): the sweep's own order for one\n  sha — retract this node's live `holds_bytes` claims (a hybrid-signed\n  federation-tier `withdraws` each; a refused retraction **aborts**, bytes\n  and binding stay, I18), then delete. A retry finds the claims retired and\n  does nothing. It does not decide *whether* to evict; a caller that wants\n  \"evict because withdrawn\" asks `binding_state` first.\n\n**Witnesses** (sqlite + postgres; memory has no blob storage): **I149** — a\n*subject's* withdraws (rule 2, not the author: the case CC 2.3 exists for)\nstops every door, on a commons blob and on a sealed community blob where a\nstranger is `NotGranted` first; **I150** — the same stored value (`None`,\nadmitted out of order) yields opposite verdicts depending only on the\nauthority re-derived now; **I151** — one live binding keeps the bytes;\n**I152** — the resolver returns the pointer shape, the `evidence_refs` shape,\nand an unreadable pointer; **I153** — `evict_blob` retracts before it deletes,\na retry is a no-op. Mutation round: **11 mutants — 9 killed, M1 killed on the third round after a code correction (the redundant rule-1/2 pre-filter that hid it is gone), M2 equivalent** (`FSD/BYTES_PLANE_TOMBSTONE.md` §5.1).\n\n\n## Gates\n\n- `scripts/certify.sh full` on `088678b1`: **EVERY CI LEG GREEN BY EXIT CODE** — 34 legs (core 3275, cirisaudit 3382, secrets 3336, cirisnode 3436, cirisgraph 3306, telemetry 3340, rest 3892, test-anchor 2645, default 1637, python 54; clippy/fmt/pyi/featmatrix/wheelfeat/docver/pyo3sqlite/dirdouble/floortoken + 15 no-backend axis checks), wall 2462s at 3 lanes × 10 threads.\n- Every no-backend axis compiles clean; the connection-model, parity and discriminator gates green (each caught something the first time: the new directory read had to be classified, was wrongly registered as a door call, and had to bind its composer discriminator from the op constants).\n\n## Beyond the ask\n\n- `FederationDirectory::list_attestations_referencing(target_id)` — the read a tombstone fold needs and nothing had: a subject's `withdraws` is attested to the issuer, so neither the target's by- nor for-slice reaches it. On sqlite, postgres and memory; `Unsupported` across the FFI capsule like its siblings.\n\nCloses #853\nCloses #862\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01GjMiFzKruBc19HPdHozst9",
+          "timestamp": "2026-09-23T23:21:08-05:00",
+          "tree_id": "8bb0b97cd626d822661b35ae242528c3b7e995e0",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/801cd62b618581ba9198bf5ece25b92123907c2d"
+        },
+        "date": 1790226039160,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40438475,
+            "range": "± 27887",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1771725,
+            "range": "± 247139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 12205,
+            "range": "± 159",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 19054,
+            "range": "± 183",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 31703,
+            "range": "± 270",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 90293,
+            "range": "± 248",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 37,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 214,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 523,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 598,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2066,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 80,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 246,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1112,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 34627,
+            "range": "± 1849",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 77586,
+            "range": "± 3016",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 245430,
+            "range": "± 2418",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 12079,
+            "range": "± 1006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 13202,
+            "range": "± 856",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 20098,
+            "range": "± 1511",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 38835,
+            "range": "± 2375",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 8036295,
+            "range": "± 17364",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 8819320,
+            "range": "± 142196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 606559,
+            "range": "± 34453",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1721357,
+            "range": "± 77784",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 87160152,
+            "range": "± 416545",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2502391,
+            "range": "± 77052",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 13802631,
+            "range": "± 451379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 218645162,
+            "range": "± 1214110",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 6774826,
+            "range": "± 735391",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 38062925,
+            "range": "± 857095",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 8065,
+            "range": "± 142",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 239083,
+            "range": "± 13834",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 279797,
+            "range": "± 11316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 17358,
+            "range": "± 251",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 277546,
+            "range": "± 11514",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 415653,
+            "range": "± 14746",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 55003,
+            "range": "± 1401",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 400031,
+            "range": "± 10243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 1005118,
+            "range": "± 18373",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 78864,
+            "range": "± 948",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 324457,
+            "range": "± 1179",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1749070,
+            "range": "± 13907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 2138673,
+            "range": "± 10882",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 197,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 68,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 234515,
+            "range": "± 19043",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 186524,
+            "range": "± 24104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 12635,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 80108,
+            "range": "± 493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 750997,
+            "range": "± 2926",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 686,
+            "range": "± 68",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 123,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 288,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 191,
+            "range": "± 1",
             "unit": "ns/iter"
           },
           {
