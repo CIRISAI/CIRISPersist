@@ -98,14 +98,16 @@ async fn retiring_composer(
                 Err(Error::WithdrawsNotAdmitted { .. }) => None,
                 Err(e) => return Err(e),
             };
-            let entitled_now = rederived.is_some()
-                || g.attesting_key_id == row.attesting_key_id
-                || row.subject_key_ids.contains(&g.attesting_key_id);
-            if !entitled_now {
+            // The re-derivation is the ONLY authority here. Rules 1 and 2
+            // (the target's own attester / a subject) are among what
+            // `check_withdraws_admission` derives, so re-spelling them from
+            // the row's fields beside it would be a second predicate — and
+            // one that hid the stored-rule mutant from the witness.
+            let Some(rule) = rederived else {
                 continue;
-            }
+            };
             let mut g = g;
-            g.withdraws_admission_rule = rederived.or(Some(0));
+            g.withdraws_admission_rule = Some(rule);
             refs.push(g);
         } else {
             refs.push(g);
