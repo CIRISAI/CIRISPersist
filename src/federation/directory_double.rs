@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 93 delegations, generated. Every one: fault first, then delegate.
+// 96 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -142,19 +142,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.accord_nonce_issued(family_key_id, nonce).await
-    }
-    async fn add_community_member(
-        &self,
-        community_key_id: &str,
-        member: types::CommunityMember,
-        spec: &cohort::AdmitSpec,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("add_community_member") {
-            return Err(e);
-        }
-        self.inner
-            .add_community_member(community_key_id, member, spec)
-            .await
     }
     async fn add_family_member(
         &self,
@@ -177,6 +164,9 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.apply_replicated_accord_evidence(evidence).await
+    }
+    fn as_dyn_directory(&self) -> &dyn FederationDirectory {
+        self
     }
     async fn attach_attestation_pqc_signature(
         &self,
@@ -455,6 +445,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_community_membership_revocations_for(community_key_id)
             .await
     }
+    async fn list_community_membership_widenings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipWidening>, Error> {
+        if let Some(e) = self.faulted("list_community_membership_widenings_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_community_membership_widenings_for(community_key_id)
+            .await
+    }
     async fn list_derived_hex(
         &self,
         original_sha256_hex: &str,
@@ -698,6 +699,18 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_signed_community_membership_revocations_since(since, limit)
             .await
     }
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error> {
+        if let Some(e) = self.faulted("list_signed_community_membership_widenings_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_community_membership_widenings_since(since, limit)
+            .await
+    }
     async fn list_signed_families_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -924,6 +937,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .put_community_membership_revocation(revocation)
             .await
+    }
+    async fn put_community_membership_widening(
+        &self,
+        widening: SignedCommunityMembershipWidening,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_community_membership_widening") {
+            return Err(e);
+        }
+        self.inner.put_community_membership_widening(widening).await
     }
     async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_family") {

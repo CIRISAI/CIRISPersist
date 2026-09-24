@@ -206,6 +206,7 @@ pub fn consent_transferability(
         | K::IdentityOccurrenceRevocation
         | K::FamilyMembershipRevocation
         | K::CommunityMembershipRevocation
+        | K::CommunityMembershipWidening
         | K::LocationProof
         | K::Organization
         | K::OrgMembership
@@ -574,8 +575,14 @@ pub fn consent_grammar_sha256() -> String {
 /// a member added to the closed grammar moves this hash. Previous value:
 /// `79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac`
 /// (v44.3.0 – v44.5.0).
+/// v48.0.0 (CIRISPersist#860) — RE-PINNED: `EnvelopeKind::CommunityMembershipWidening`
+/// joined the kind list the grammar hashes over. Adopters carrying the v47
+/// hash re-pin; the grammar itself (directions, principles, prefixes) is
+/// unchanged. Previous value:
+/// `ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482`
+/// (v44.6.0 – v47.4.0).
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482";
+    "07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

@@ -101,6 +101,25 @@ pub const COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS: i64 = 60;
 /// beyond [`COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS`] is
 /// [`Error::InvalidArgument`](crate::federation::Error::InvalidArgument)
 /// BEFORE any write, on every backend.
+pub fn reject_future_dated_community_widening(
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::federation::Error> {
+    // v48.0.0 (CIRISPersist#860) — the same skew bound as a removal: a
+    // widening is a roster event the fold orders by instant, and a
+    // far-future instant would let a row sit unadmitted-in-effect for as long
+    // as its signer chose.
+    let now = chrono::Utc::now();
+    let max_allowed = now + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
+    if effective_at > max_allowed {
+        return Err(crate::federation::Error::InvalidArgument(format!(
+            "community membership widening effective_at {effective_at} is future-dated \
+             (> now + {COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS}s)"
+        )));
+    }
+    Ok(())
+}
+
+/// SecReview F4 — a community removal is immediate for forward-secrecy.
 pub fn reject_future_dated_community_revocation(
     effective_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
@@ -310,6 +329,20 @@ pub mod orchestrate {
     /// #848 (§15) — the second value is the latest `effective_at` among the
     /// removals that are effective now: the instant a minter's current epoch
     /// must be newer than, or rotate.
+    /// v48.0.0 (CIRISPersist#860) — the key ids the next seal wraps for:
+    /// the ONE roster fold, exposed so a witness can prove the wrap set
+    /// follows a widening and a revocation.
+    pub async fn active_member_key_ids<B>(
+        backend: &B,
+        community: &crate::federation::types::Community,
+    ) -> Result<Vec<String>, BlobError>
+    where
+        B: FederationDirectory + Sync + ?Sized,
+    {
+        let (members, _) = active_member_occurrences(backend, community).await?;
+        Ok(members.into_iter().map(|m| m.0).collect())
+    }
+
     async fn active_member_occurrences<B>(
         backend: &B,
         community: &crate::federation::types::Community,
@@ -321,18 +354,21 @@ pub mod orchestrate {
         BlobError,
     >
     where
-        B: FederationDirectory + Sync,
+        B: FederationDirectory + Sync + ?Sized,
     {
         let now = chrono::Utc::now();
         let revs = backend
             .list_community_membership_revocations_for(&community.community_key_id)
             .await
             .map_err(map_dir_err)?;
-        let removed = crate::federation::removed_key_ids_at(
-            revs.iter()
-                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
-            now,
-        );
+        // v48.0.0 (CIRISPersist#860) — the wrap set is the one fold: a widened
+        // member is wrapped at the next seal; a removed one is not.
+        let widenings = backend
+            .list_community_membership_widenings_for(&community.community_key_id)
+            .await
+            .map_err(map_dir_err)?;
+        let roster =
+            crate::federation::active_roster_at(&community.members, &widenings, &revs, now);
         // The removal's EFFECTIVE instant, not the instant it was recorded:
         // a removal admitted with a (skew-window) future `effective_at` lets
         // a seal in between mint an epoch newer than `removed_at` that still
@@ -345,10 +381,7 @@ pub mod orchestrate {
             .max();
 
         let mut out = Vec::new();
-        for member in &community.members {
-            if removed.contains(member.key_id.as_str()) {
-                continue;
-            }
+        for member in &roster {
             let occ = backend
                 .list_identity_occurrences_active(&member.key_id)
                 .await
@@ -1733,40 +1766,51 @@ pub mod lifecycle_support {
     /// community revocation is rejected at write time (SecReview F4), and
     /// `removed_key_ids_at` deliberately excludes future-dated rows from the
     /// removed set.
-    pub async fn revoke_member<B>(backend: &B, community_key_id: &str, removed_identity: &str)
-    where
-        B: BlobStorage + FederationDirectory + Sync,
-    {
-        revoke_member_result(backend, community_key_id, removed_identity)
-            .await
-            .unwrap_or_else(|e| panic!("revoke {removed_identity} from {community_key_id}: {e}"));
-    }
-
-    /// [`revoke_member`], handing back the door's verdict — the #861 repeat
-    /// witness needs the `Result`, not a panic.
-    pub async fn revoke_member_result<B>(
+    /// Hands back the signed row it put, so a caller can RETRY it byte-for-byte
+    /// (the #861 repeat is the same row; v48.0.0 (#860) keys the plane on
+    /// `(community, member, effective_at)`, so a removal stamped at another
+    /// instant is a second event that rotates again — see
+    /// `FSD/ROOM_ROSTER_PLANES.md` §3.3).
+    pub async fn revoke_member<B>(
         backend: &B,
         community_key_id: &str,
         removed_identity: &str,
-    ) -> Result<(), crate::federation::Error>
+    ) -> crate::federation::types::SignedCommunityMembershipRevocation
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
         use crate::federation::tier_ingest::test_support as ts;
         let now = chrono::Utc::now();
+        let signed = ts::sign_community_membership_revocation(
+            community_key_id,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: community_key_id.to_owned(),
+                removed_identity_key_id: removed_identity.to_owned(),
+                removed_at: now,
+                effective_at: now,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
         backend
-            .put_community_membership_revocation(ts::sign_community_membership_revocation(
-                community_key_id,
-                crate::federation::types::CommunityMembershipRevocation {
-                    community_key_id: community_key_id.to_owned(),
-                    removed_identity_key_id: removed_identity.to_owned(),
-                    removed_at: now,
-                    effective_at: now,
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            ))
+            .put_community_membership_revocation(signed.clone())
+            .await
+            .unwrap_or_else(|e| panic!("revoke {removed_identity} from {community_key_id}: {e}"));
+        signed
+    }
+
+    /// The #861 retry: the SAME signed row again, handing back the door's
+    /// verdict — the repeat witness needs the `Result`, not a panic.
+    pub async fn repeat_revocation_result<B>(
+        backend: &B,
+        signed: &crate::federation::types::SignedCommunityMembershipRevocation,
+    ) -> Result<(), crate::federation::Error>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        backend
+            .put_community_membership_revocation(signed.clone())
             .await
     }
 }
@@ -1969,14 +2013,16 @@ pub mod lifecycle_harness {
         }
 
         // ── 4. ROTATE — revoking bob bumps the epoch transactionally ─────
-        super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
+        let removal = super::lifecycle_support::revoke_member(backend, &comm, &bob).await;
 
         // ── 4b. REPEAT — v47.1.0 (CIRISPersist#861) ─────────────────────
         // The door documents itself idempotent on its PK, and a consumer
-        // retrying after a partial failure relies on that. A repeat is a
-        // no-op: Ok, and NO second rotation (checked at step 5: exactly one
-        // epoch advance).
-        super::lifecycle_support::revoke_member_result(backend, &comm, &bob)
+        // retrying after a partial failure relies on that. A retry is the
+        // SAME signed row (v48.0.0/#860: the PK carries `effective_at`, so a
+        // removal at another instant is a second event, not a retry). A
+        // repeat is a no-op: Ok, and NO second rotation (checked at step 5:
+        // exactly one epoch advance).
+        super::lifecycle_support::repeat_revocation_result(backend, &removal)
             .await
             .unwrap_or_else(|e| {
                 panic!("{tag}: #861 — revoking an already-revoked member must be a no-op, got {e}")

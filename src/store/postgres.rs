@@ -4053,6 +4053,10 @@ impl PostgresBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
+    fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
+        self
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }
@@ -6170,6 +6174,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect())
     }
 
+    // v48.0.0 (CIRISPersist#905) — the V147 projection's live sources for this
+    // machine; the mirror of `list_live_consent_grants_by` keyed by `for_key_id`.
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
+                    fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
+                    fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
+                    fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, \
+                    fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
+                    fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
+                    fa.promoted_at, fa.additional_scrubs \
+                 FROM cirislens.federation_attestations fa \
+                 WHERE 1 = 1 \
+                   AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set_for cps \
+                               WHERE cps.source_attestation_id = fa.attestation_id::text \
+                                 AND cps.for_key_id = $1) \
+                 ORDER BY fa.asserted_at DESC",
+                &[&for_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+            })?;
+        let candidates: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<_, _>>()?;
+        Ok(candidates
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+            })
+            .collect())
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
     /// sweep's page source. Structural mirror of the sqlite impl:
     /// ascending-`attestation_id` keyset cursor over `local`-tier rows.
@@ -7530,76 +7578,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(true)
     }
 
-    // ── #249 Cut B ── incremental community-roster grow (mirror of
-    //    add_family_member). Same read-modify-write under the
-    //    `WHERE persist_row_hash = $4` lost-update guard.
-    async fn add_community_member(
-        &self,
-        community_key_id: &str,
-        member: crate::federation::types::CommunityMember,
-        spec: &crate::federation::cohort::AdmitSpec,
-    ) -> Result<bool, crate::federation::Error> {
-        let community = self
-            .lookup_community(community_key_id)
-            .await?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "add_community_member names unknown community_key_id {community_key_id:?}"
-                ))
-            })?;
-        if community.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op, nothing to authorize
-        }
-        let prior_hash = community.persist_row_hash.clone();
-        // v31.0.0 (CIRISPersist#654) — the authorship gate; see the family twin.
-        let community =
-            crate::federation::cohort::authorize_community_growth(self, &community, member, spec)
-                .await?;
-        let members_value = serde_json::to_value(&community.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
-        // bytes; the serve position moves with them.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_communities")
-            .await?;
-        let affected = client
-            .execute(
-                "UPDATE cirislens.federation_communities \
-                    SET members = $2, persist_row_hash = $3, authority_key_id = $5, \
-                        scrub_signature_classical = $6, scrub_signature_pqc = $7, \
-                        admitted_at = $8 \
-                  WHERE community_key_id = $1 AND persist_row_hash = $4",
-                &[
-                    &community_key_id,
-                    &members_value,
-                    &community.persist_row_hash,
-                    &prior_hash,
-                    &spec.authority_key_id,
-                    &spec.scrub_signature_classical,
-                    &spec.scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("add_community_member: {e}")))?;
-        if affected == 0 {
-            return Err(crate::federation::Error::Backend(format!(
-                "add_community_member on {community_key_id:?} lost a concurrent update (roster changed under the read); retry"
-            )));
-        }
-        // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
-        self.index_stored_record(
-            "Community",
-            &crate::federation::wire_index::record_key(&[("community_key_id", community_key_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
     // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
     async fn supersede_group_row(
         &self,
@@ -8909,7 +8887,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                 admitted_at\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (community_key_id, removed_identity_key_id) DO NOTHING",
+             ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                 &[
                     &row.community_key_id,
                     &row.removed_identity_key_id,
@@ -8945,9 +8923,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // is repairable; an entry committed atomically with the WRONG hash is
         // permanent and silent, because nothing downstream can tell a stale
         // hash from a correct one.
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("community_key_id", &row.community_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
+            // v48.0.0 (#860) — a re-added member can be removed again: the
+            // instant is part of the row's identity.
+            ("effective_at", &effective_at_rfc3339),
         ]);
         // Idempotent on event_id.
         tx.execute(
@@ -9026,6 +9008,84 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         drop(client);
         self.index_stored_record("CommunityMembershipRevocation", &wire_index_key)
             .await?;
+        Ok(())
+    }
+
+    async fn put_community_membership_widening(
+        &self,
+        widening: crate::federation::SignedCommunityMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
+        // door; see the sqlite twin for the legs.
+        crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
+        let mut row = widening.community_membership_widening;
+        crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
+        let community = self
+            .lookup_community(&row.community_key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    row.community_key_id
+                ))
+            })?;
+        let probe = crate::federation::types::Community {
+            members: vec![row.member()],
+            ..community
+        };
+        crate::federation::admission::check_community_membership_steward_binding(self, &probe)
+            .await?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let authority_key_id = widening.authority_key_id;
+        let scrub_signature_classical = widening.scrub_signature_classical;
+        let scrub_signature_pqc = widening.scrub_signature_pqc;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_community_membership_widenings")
+            .await?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_widenings (\
+                community_key_id, member_key_id, joined_at, effective_at, role, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.member_key_id,
+                    &row.joined_at,
+                    &row.effective_at,
+                    &row.role,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_widening"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        if inserted == 1 {
+            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("community_key_id", &row.community_key_id),
+                ("member_key_id", &row.member_key_id),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
+                .await?;
+        }
         Ok(())
     }
 
@@ -9144,6 +9204,33 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?;
         rows.into_iter()
             .map(pg_row_to_community_membership_revocation)
+            .collect()
+    }
+
+    async fn list_community_membership_widenings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipWidening>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT community_key_id, member_key_id, joined_at, effective_at, role, \
+                    persist_row_hash \
+                 FROM cirislens.federation_community_membership_widenings \
+                 WHERE community_key_id = $1 ORDER BY member_key_id ASC, effective_at ASC",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_community_membership_widenings_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_community_membership_widening)
             .collect()
     }
 
@@ -10877,22 +10964,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
-        let (since_a, since_b) = match since.as_ref() {
+        // v48.0.0 (#860) — the resume id is the three-part PK.
+        let (since_a, since_b, since_c) = match since.as_ref() {
             Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
+                (Some(a.to_owned()), Some(b.to_owned()), c)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         let rows = client
             .query(
                 "SELECT * FROM cirislens.federation_community_membership_revocations \
                  WHERE ($1::timestamptz IS NULL OR \
-                        (admitted_at, community_key_id, removed_identity_key_id) > ($1, $2, $3)) \
+                        (admitted_at, community_key_id, removed_identity_key_id, effective_at) \
+                          > ($1, $2, $3, $4::timestamptz)) \
                    AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY admitted_at ASC, community_key_id ASC, removed_identity_key_id ASC \
-                 LIMIT $4",
-                &[&since_at, &since_a, &since_b, &limit],
+                 ORDER BY admitted_at ASC, community_key_id ASC, removed_identity_key_id ASC, \
+                          effective_at ASC \
+                 LIMIT $5",
+                &[&since_at, &since_a, &since_b, &since_c, &limit],
             )
             .await
             .map_err(|e| {
@@ -10906,6 +10997,56 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
                 Ok(crate::federation::ServedCommunityMembershipRevocation {
                     revocation: pg_row_to_signed_community_membership_revocation(row)?,
+                    admitted_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipWidening>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let (since_a, since_b, since_c) = match since.as_ref() {
+            Some((_, id)) => {
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
+                (Some(a.to_owned()), Some(b.to_owned()), c)
+            }
+            None => (None, None, None),
+        };
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_community_membership_widenings \
+                 WHERE ($1::timestamptz IS NULL OR \
+                        (admitted_at, community_key_id, member_key_id, effective_at) \
+                          > ($1, $2, $3, $4::timestamptz)) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY admitted_at ASC, community_key_id ASC, member_key_id ASC, \
+                          effective_at ASC \
+                 LIMIT $5",
+                &[&since_at, &since_a, &since_b, &since_c, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_community_membership_widenings_since: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                let admitted_at =
+                    row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
+                Ok(crate::federation::ServedCommunityMembershipWidening {
+                    widening: pg_row_to_signed_community_membership_widening(row)?,
                     admitted_at,
                 })
             })
@@ -19760,13 +19901,14 @@ where
         client
             .execute(
                 "INSERT INTO cirislens.consent_peer_set \
-                    (node_key_id, peer_key_id, source_attestation_id, asserted_at) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (node_key_id, peer_key_id) DO UPDATE SET \
+                    (node_key_id, for_key_id, peer_key_id, source_attestation_id, asserted_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (node_key_id, for_key_id, peer_key_id) DO UPDATE SET \
                     source_attestation_id = EXCLUDED.source_attestation_id, \
                     asserted_at = EXCLUDED.asserted_at",
                 &[
                     &row.attesting_key_id,
+                    &for_key.unwrap_or(row.attesting_key_id.as_str()),
                     peer,
                     &row.attestation_id,
                     &row.asserted_at,
@@ -20523,6 +20665,37 @@ fn pg_row_to_signed_community_membership_revocation(
     let community_membership_revocation = pg_row_to_community_membership_revocation(row)?;
     Ok(crate::federation::SignedCommunityMembershipRevocation {
         community_membership_revocation,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+fn pg_row_to_community_membership_widening(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::CommunityMembershipWidening, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::CommunityMembershipWidening {
+        community_key_id: row.safe_get_with("community_key_id", mk_err)?,
+        member_key_id: row.safe_get_with("member_key_id", mk_err)?,
+        joined_at: row.safe_get_with("joined_at", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        role: row.safe_get_with("role", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_signed_community_membership_widening(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedCommunityMembershipWidening, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let community_membership_widening = pg_row_to_community_membership_widening(row)?;
+    Ok(crate::federation::SignedCommunityMembershipWidening {
+        community_membership_widening,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
@@ -32618,6 +32791,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+        backend
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    &comm,
+                    crate::federation::types::Community {
+                        community_key_id: comm.to_owned(),
+                        community_name: "fixture room".into(),
+                        members: vec![],
+                        founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("v48.0.0 (#860): the room row the revocation FK references");
         let rev = |effective: chrono::DateTime<chrono::Utc>| {
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
                 &comm,
@@ -32830,6 +33021,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+        backend
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    &comm,
+                    crate::federation::types::Community {
+                        community_key_id: comm.to_owned(),
+                        community_name: "fixture room".into(),
+                        members: vec![],
+                        founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("v48.0.0 (#860): the room row the revocation FK references");
         // Pre-seed the epoch at i64::MAX so the in-transaction `epoch + 1`
         // overflows bigint (deterministic bump failure). #848 — the counter
         // the revocation bumps is THIS node's own, so the node key is set.
@@ -45384,6 +45593,8 @@ mod tests {
             .add_community_member(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
+        // v48.0.0 (#860): the RECORD never grows — u2 rides the widening
+        // plane; the fold above is the roster.
         assert_eq!(
             backend
                 .lookup_community(&comm)
@@ -45392,7 +45603,15 @@ mod tests {
                 .unwrap()
                 .members
                 .len(),
-            3
+            2
+        );
+        assert_eq!(
+            backend
+                .list_community_membership_widenings_for(&comm)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         // revoke u1 effective now → 2 active, full roster intact.
         backend
@@ -45423,7 +45642,8 @@ mod tests {
                 .unwrap()
                 .members
                 .len(),
-            3
+            2,
+            "the record is untouched by a revocation too"
         );
 
         // ── moderators_of ── founder-rooted community + moderate delegate.
@@ -46188,6 +46408,19 @@ mod tests {
                 .await
                 .unwrap();
         }
+        backend
+            .put_family_local(crate::federation::types::Family {
+                family_key_id: fam.to_owned(),
+                family_name: "fixture family".into(),
+                members: vec![],
+                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                    .to_owned(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .expect("v48.0.0 (#860): the family row the revocation FK references");
         let removed_at = chrono::Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
         let signed =
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
@@ -46280,6 +46513,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+        backend
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    &comm,
+                    crate::federation::types::Community {
+                        community_key_id: comm.to_owned(),
+                        community_name: "fixture room".into(),
+                        members: vec![],
+                        founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("v48.0.0 (#860): the room row the revocation FK references");
         let removed_at = chrono::Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
         let signed =
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(

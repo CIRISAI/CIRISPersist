@@ -770,6 +770,16 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
+    /// v48.0.0 (CIRISPersist#860) —
+    /// [`FederationDirectory::list_signed_community_membership_widenings_since`],
+    /// the mirror of [`DirectoryOp::ListSignedCommunityMembershipRevocationsSince`].
+    /// Result rides `SignedCommunityMembershipWidenings`. APPEND-ONLY.
+    ListSignedCommunityMembershipWideningsSince {
+        /// Cursor (None ⇒ from start).
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        /// Page cap.
+        limit: u32,
+    },
     /// [`FederationDirectory::list_signed_key_records_since`] (v21.1.0,
     /// CIRISPersist#507c) — bulk-list `SignedKeyRecord` wrappers since a
     /// cursor, for the edge advertise/serve responder. Result rides
@@ -1124,6 +1134,9 @@ pub enum DirectoryOpResult {
     SignedCommunityMembershipRevocations(
         Vec<crate::federation::ServedCommunityMembershipRevocation>,
     ),
+    /// v48.0.0 (CIRISPersist#860) — `list_signed_community_membership_widenings_since`.
+    /// APPEND-ONLY.
+    SignedCommunityMembershipWidenings(Vec<crate::federation::ServedCommunityMembershipWidening>),
     /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
     SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
@@ -1776,6 +1789,15 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit } => {
+            match dir
+                .list_signed_community_membership_widenings_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedCommunityMembershipWidenings(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::ListSignedKeyRecordsSince { since, limit } => {
             match dir.list_signed_key_records_since(since, limit).await {
                 Ok(v) => DirectoryOpResult::SignedKeyRecords(v),
@@ -2334,6 +2356,10 @@ pub fn build_ops_directory(
 #[allow(unused_variables)]
 #[async_trait::async_trait]
 impl FederationDirectory for OpsDirectory {
+    fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
+        self
+    }
+
     // ── covered: routed through DirectoryOp ────────────────────────
 
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
@@ -3166,6 +3192,15 @@ impl FederationDirectory for OpsDirectory {
             method: "put_community_membership_revocation",
         })
     }
+    async fn put_community_membership_widening(
+        &self,
+        widening: crate::federation::SignedCommunityMembershipWidening,
+    ) -> Result<(), Error> {
+        let _ = widening;
+        Err(Error::Unsupported {
+            method: "put_community_membership_widening",
+        })
+    }
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -3440,6 +3475,24 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedCommunityMembershipRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v48.0.0 (CIRISPersist#860) — the widening mirror of the above.
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipWidening>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunityMembershipWidenings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3784,6 +3837,15 @@ impl FederationDirectory for OpsDirectory {
     ) -> Result<Vec<CommunityMembershipRevocation>, Error> {
         Err(Error::Unsupported {
             method: "list_community_membership_revocations_for",
+        })
+    }
+    async fn list_community_membership_widenings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipWidening>, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "list_community_membership_widenings_for",
         })
     }
     async fn list_location_proofs_for(
@@ -4556,7 +4618,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "90db5c0448cca437c3f3045dd43e4cbcc2340ec655549d8ad942151bb86cd033",
+            "e36a7660dc27121c56fb33c580cbcd9a3c2fbc5359775931ab812fa39d87e2dc",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4589,7 +4651,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "783094ff32226392c6719a93188bbedd6b2f41ab350c683139e9cce4f78aa34c",
+            "5199d54a6f8a1ef0ad0c22d0984d29aeff071664e7a9ff1b8bb02020c3306cde",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
