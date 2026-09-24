@@ -46,7 +46,7 @@ pub enum BindingState {
 }
 ```
 
-Per binding row `r` (from 3.1): gather `list_attestations_for(r.attested_key_id)` (the same slice every `retired_ids` caller folds over), keep the structural composers naming `r.attestation_id`, and for each `withdraws`/`recants` among them **replace** the stored entitlement with the re-derived one — `check_withdraws_admission(directory, g)` must be `Ok(Some(_))`, else the composer is dropped before precedence. Then `retired_ids` decides `r`'s fate under §6.1 precedence. `Unbound` is deliberately distinct from `Live` so a witness can tell "no row" from "a live row"; both read.
+Per binding row `r` (from 3.1): gather the structural composers naming `r.attestation_id` **by reference** — the new `FederationDirectory::list_attestations_referencing(target_id)` on all three backends, discriminated by the three composer ops. (The first cut used `list_attestations_for(r.attested_key_id)`, the slice every `retired_ids` caller folds over; a subject's `withdraws` is attested to the *issuer*, so that slice never reached it — I149 caught it.) For each `withdraws`/`recants` among them **replace** the stored entitlement with the re-derived one — `check_withdraws_admission(directory, g)` must be `Ok(Some(_))`, else the composer is dropped before precedence; the re-derivation is the fold's *only* authority (a rule-1/2 pre-filter beside it was a second predicate and hid the stored-rule mutant, §5.1). Then `retired_ids` decides `r`'s fate under §6.1 precedence. `Unbound` is deliberately distinct from `Live` so a witness can tell "no row" from "a live row"; both read.
 
 ### 3.3 Where it sits on the read paths
 
