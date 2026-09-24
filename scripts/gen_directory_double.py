@@ -344,6 +344,14 @@ def render(methods) -> str:
         arglist = ", ".join(["&self"] + params)
         call = ", ".join(names)
         is_result = ret.startswith("Result<")
+        if name == "as_dyn_directory":
+            # v48.0.0 (#905) — the one SYNC accessor: the double IS the trait
+            # object it hands out, so faults injected here still apply to the
+            # folds reached through it.
+            A("    fn as_dyn_directory(&self) -> &dyn FederationDirectory {")
+            A("        self")
+            A("    }")
+            continue
         A(f"    async fn {name}({arglist}) -> {ret} {{")
         if is_result:
             A(f'        if let Some(e) = self.faulted("{name}") {{')

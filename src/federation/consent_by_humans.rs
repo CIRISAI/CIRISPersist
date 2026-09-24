@@ -105,6 +105,50 @@ pub async fn consent_peers_by_principals(
     Ok(out)
 }
 
+/// v48.0.0 (CIRISPersist#905) — **the grants that cover `k`'s egress, by
+/// principals**: `k`'s own live grants ∪ the live grants each of `k`'s
+/// stewards authored naming `k` in `for_key_id`. The same set
+/// [`consent_peers_by_principals`] spells for peers, spelled once more for
+/// GRANTS because the promotion sweep needs the rows (their grammar, their
+/// audience), not the peer names. Deduped by `attestation_id`, newest first.
+/// A steward's grant for a sibling machine contributes nothing.
+pub async fn live_egress_grants_by_principals(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<Vec<super::Attestation>, Error> {
+    let mut out = directory.list_live_consent_grants_by(k).await?;
+    let mut seen: std::collections::HashSet<String> =
+        out.iter().map(|a| a.attestation_id.clone()).collect();
+    for g in directory.list_live_consent_grants_for(k).await? {
+        if grant_is_authored_for(directory, &g, k).await? && seen.insert(g.attestation_id.clone()) {
+            out.push(g);
+        }
+    }
+    out.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+    Ok(out)
+}
+
+/// v48.0.0 (CIRISPersist#905) — **is `grant` a consent grant FOR `machine`,
+/// by principals?** True when the machine authored it itself, or when a
+/// steward bound to the machine authored it naming the machine in
+/// `for_key_id`. The ONE predicate the promotion sweep's loader and the
+/// mesh crossing's `check_grant_covers` both ask — spelled once so "whose
+/// consent covers this producer" cannot drift between the two doors.
+pub async fn grant_is_authored_for(
+    directory: &dyn super::FederationDirectory,
+    grant: &super::Attestation,
+    machine: &str,
+) -> Result<bool, Error> {
+    if grant.attesting_key_id == machine {
+        return Ok(true);
+    }
+    if for_key_id_of(&grant.attestation_envelope) != Some(machine) {
+        return Ok(false);
+    }
+    let stewards = super::admission::steward_bindings_of(directory, machine).await?;
+    Ok(stewards.iter().any(|s| s == &grant.attesting_key_id))
+}
+
 /// `k`'s own stance (the existing fold, unchanged) and, for each steward `p`,
 /// the fold over `p`'s rows that name `k` — combined by
 /// [`combine_principal_stances`]. A steward's row naming another key, or

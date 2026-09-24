@@ -886,9 +886,19 @@ where
     if grant.tier != attestation_tier::FEDERATION {
         return Err(refuse("the grant is not federation-tier".to_owned()));
     }
-    if grant.attesting_key_id != row.attesting_key_id {
+    // v48.0.0 (CIRISPersist#905) — by principals: the sender's own grant, or
+    // a grant its steward authored naming it (consent by humans, #857). The
+    // same predicate the promotion sweep loads by.
+    if !super::consent_by_humans::grant_is_authored_for(
+        dir.as_dyn_directory(),
+        &grant,
+        &row.attesting_key_id,
+    )
+    .await?
+    {
         return Err(refuse(format!(
-            "the grant is authored by {}, not the sender",
+            "the grant is authored by {}, who is neither the sender nor a steward of the \
+             sender naming it",
             grant.attesting_key_id
         )));
     }

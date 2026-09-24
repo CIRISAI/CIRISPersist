@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 95 delegations, generated. Every one: fault first, then delegate.
+// 96 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -164,6 +164,9 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.apply_replicated_accord_evidence(evidence).await
+    }
+    fn as_dyn_directory(&self) -> &dyn FederationDirectory {
+        self
     }
     async fn attach_attestation_pqc_signature(
         &self,

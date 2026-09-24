@@ -3547,6 +3547,10 @@ impl SqliteBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for SqliteBackend {
+    fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
+        self
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }
@@ -5507,6 +5511,47 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                        AND EXISTS (SELECT 1 FROM consent_peer_set \
                                    WHERE source_attestation_id = \
                                          federation_attestations.attestation_id) \
+                     ORDER BY asserted_at DESC",
+                )?;
+                    let rows = stmt.query_map([&node], sqlite_row_to_attestation)?;
+                    rows.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+            })?;
+        Ok(candidates
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+            })
+            .collect())
+    }
+
+    // v48.0.0 (CIRISPersist#905) — the V147 projection's live sources for this
+    // machine; the mirror of `list_live_consent_grants_by` keyed by `for_key_id`.
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let node = for_key_id.to_owned();
+        let candidates = self
+            .read(
+                move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                        promoted_at, additional_scrubs \
+                     FROM federation_attestations \
+                     WHERE 1 = 1 \
+                       AND EXISTS (SELECT 1 FROM consent_peer_set_for \
+                                   WHERE source_attestation_id = \
+                                         federation_attestations.attestation_id AND for_key_id = ?1) \
                      ORDER BY asserted_at DESC",
                 )?;
                     let rows = stmt.query_map([&node], sqlite_row_to_attestation)?;
@@ -19387,12 +19432,16 @@ fn sqlite_project_consent_peer_set(
     }
     let for_key = crate::federation::consent_by_humans::for_key_id_of(&row.attestation_envelope);
     for peer in &row.subject_key_ids {
+        // v48.0.0 (CIRISPersist#905, V152) — keyed by the machine the grant is
+        // FOR (a self-grant: its author), so a human's two per-key grants
+        // toward one peer are both live.
         conn.execute(
             "INSERT OR REPLACE INTO consent_peer_set \
-                (node_key_id, peer_key_id, source_attestation_id, asserted_at) \
-             VALUES (?1, ?2, ?3, ?4)",
+                (node_key_id, for_key_id, peer_key_id, source_attestation_id, asserted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
                 row.attesting_key_id,
+                for_key.unwrap_or(row.attesting_key_id.as_str()),
                 peer,
                 row.attestation_id,
                 row.asserted_at.to_rfc3339(),

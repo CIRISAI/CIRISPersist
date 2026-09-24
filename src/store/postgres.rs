@@ -4053,6 +4053,10 @@ impl PostgresBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
+    fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
+        self
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }
@@ -6152,6 +6156,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                                WHERE cps.source_attestation_id = fa.attestation_id::text) \
                  ORDER BY fa.asserted_at DESC",
                 &[&node_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+            })?;
+        let candidates: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<_, _>>()?;
+        Ok(candidates
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+            })
+            .collect())
+    }
+
+    // v48.0.0 (CIRISPersist#905) — the V147 projection's live sources for this
+    // machine; the mirror of `list_live_consent_grants_by` keyed by `for_key_id`.
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
+                    fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
+                    fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
+                    fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, \
+                    fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
+                    fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
+                    fa.promoted_at, fa.additional_scrubs \
+                 FROM cirislens.federation_attestations fa \
+                 WHERE 1 = 1 \
+                   AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set_for cps \
+                               WHERE cps.source_attestation_id = fa.attestation_id::text \
+                                 AND cps.for_key_id = $1) \
+                 ORDER BY fa.asserted_at DESC",
+                &[&for_key_id],
             )
             .await
             .map_err(|e| {
@@ -19853,13 +19901,14 @@ where
         client
             .execute(
                 "INSERT INTO cirislens.consent_peer_set \
-                    (node_key_id, peer_key_id, source_attestation_id, asserted_at) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (node_key_id, peer_key_id) DO UPDATE SET \
+                    (node_key_id, for_key_id, peer_key_id, source_attestation_id, asserted_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (node_key_id, for_key_id, peer_key_id) DO UPDATE SET \
                     source_attestation_id = EXCLUDED.source_attestation_id, \
                     asserted_at = EXCLUDED.asserted_at",
                 &[
                     &row.attesting_key_id,
+                    &for_key.unwrap_or(row.attesting_key_id.as_str()),
                     peer,
                     &row.attestation_id,
                     &row.asserted_at,

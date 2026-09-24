@@ -110,6 +110,9 @@ pub mod blob_tombstone;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bytes_plane_tombstone_invariants;
+/// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
+#[cfg(test)]
+pub mod consent_sweep_principals_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
 #[cfg(test)]
 pub mod room_roster_invariants;
@@ -943,6 +946,13 @@ const MAX_REAP_PAGES: usize = 16;
 /// scrub-signature on receipt before writing.
 #[async_trait::async_trait]
 pub trait FederationDirectory: Send + Sync {
+    /// v48.0.0 (CIRISPersist#905) — `self` as the trait object. A default
+    /// method runs with `Self: ?Sized` and cannot coerce `&Self` to
+    /// `&dyn FederationDirectory` itself; the folds that take the trait
+    /// object (`steward_bindings_of` and everything above it) are reached
+    /// through this. Every implementor returns `self`.
+    fn as_dyn_directory(&self) -> &dyn FederationDirectory;
+
     // ── Public keys ────────────────────────────────────────────────
 
     /// Insert a new pubkey row. Idempotent on `key_id` collision with
@@ -1611,6 +1621,22 @@ pub trait FederationDirectory: Send + Sync {
         let _ = node_key_id;
         Err(Error::Unsupported {
             method: "list_live_consent_grants_by",
+        })
+    }
+    /// v48.0.0 (CIRISPersist#905) — the LIVE `consent:replication:v1` grants
+    /// that name `for_key_id` as the machine they are FOR (the V147
+    /// projection): rows that still have a `consent_peer_set_for` row sourced
+    /// from them. Who authored them is not this read's question —
+    /// [`consent_by_humans::live_egress_grants_by_principals`] keeps only the
+    /// authors bound to the machine. Default `Unsupported`; sqlite / postgres
+    /// / memory override.
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = for_key_id;
+        Err(Error::Unsupported {
+            method: "list_live_consent_grants_for",
         })
     }
 

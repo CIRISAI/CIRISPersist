@@ -4011,18 +4011,21 @@ impl Engine {
         &self,
         report: &mut crate::federation::ConsentSweepReport,
     ) -> Result<(Vec<ConsentActiveGrant>, Vec<String>), crate::federation::Error> {
-        use crate::federation::{consent_grammar, Error, FederationDirectory};
+        use crate::federation::{consent_grammar, Error};
 
         let self_key = self
             .local_derived_key_id()
             .await
             .map_err(|e| Error::Backend(format!("load_active_egress_grants derive key_id: {e}")))?;
 
-        let grants = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.list_live_consent_grants_by(&self_key).await?,
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.list_live_consent_grants_by(&self_key).await?,
+        // v48.0.0 (CIRISPersist#905) — BY PRINCIPALS: since v44.6.0 the grants
+        // that cover a claimed machine are authored by its HUMAN and name it in
+        // `for_key_id`; a sweep that read only self-authored grants saw zero
+        // on every claimed node and never promoted an owned agent's rows.
+        let grants = {
+            let dir = self.federation_directory();
+            crate::federation::consent_by_humans::live_egress_grants_by_principals(&*dir, &self_key)
+                .await?
         };
 
         let now = chrono::Utc::now();

@@ -454,6 +454,9 @@ struct ConsentPeerForRow {
 #[derive(Clone)]
 struct ConsentPeerRow {
     node_key_id: String,
+    /// v48.0.0 (#905, V152) — the machine the grant is FOR (a self-grant:
+    /// its author); part of the key.
+    for_key_id: String,
     peer_key_id: String,
     source_attestation_id: String,
     /// Kept for V109 table-shape parity with the SQL backends;
@@ -2581,6 +2584,10 @@ impl crate::federation::renditions::HeldBlobScope for MemoryBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for MemoryBackend {
+    fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
+        self
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }
@@ -3829,11 +3836,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             source_attestation_id: row.attestation_id.clone(),
                         });
                     }
+                    let keyed_for = for_key
+                        .clone()
+                        .unwrap_or_else(|| row.attesting_key_id.clone());
                     state.consent_peer_set.retain(|r| {
-                        !(r.node_key_id == row.attesting_key_id && r.peer_key_id == *peer)
+                        !(r.node_key_id == row.attesting_key_id
+                            && r.for_key_id == keyed_for
+                            && r.peer_key_id == *peer)
                     });
                     state.consent_peer_set.push(ConsentPeerRow {
                         node_key_id: row.attesting_key_id.clone(),
+                        for_key_id: keyed_for,
                         peer_key_id: peer.clone(),
                         source_attestation_id: row.attestation_id.clone(),
                         asserted_at: row.asserted_at,
@@ -4338,6 +4351,32 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
     /// sweep's page source: ascending-`attestation_id` keyset cursor over
     /// `local`-tier rows.
+    async fn list_live_consent_grants_for(
+        &self,
+        for_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v48.0.0 (#905) — the V147 projection's live sources for this machine.
+        let state = self.state.lock().expect("memory backend lock");
+        let live_ids: std::collections::HashSet<&str> = state
+            .consent_peer_set_for
+            .iter()
+            .filter(|r| r.for_key_id == for_key_id)
+            .map(|r| r.source_attestation_id.as_str())
+            .collect();
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+                    && live_ids.contains(a.attestation_id.as_str())
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(rows)
+    }
+
     async fn list_local_tier_attestations(
         &self,
         after_attestation_id: Option<&str>,
@@ -12223,6 +12262,7 @@ mod tests {
             let mut st = backend.state.lock().expect("lock");
             st.consent_peer_set.push(ConsentPeerRow {
                 node_key_id: "reap-a".into(),
+                for_key_id: "reap-a".into(),
                 peer_key_id: "reap-b".into(),
                 source_attestation_id: "reap-grant".into(),
                 asserted_at: now,

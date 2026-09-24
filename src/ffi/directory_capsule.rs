@@ -2356,6 +2356,10 @@ pub fn build_ops_directory(
 #[allow(unused_variables)]
 #[async_trait::async_trait]
 impl FederationDirectory for OpsDirectory {
+    fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
+        self
+    }
+
     // ── covered: routed through DirectoryOp ────────────────────────
 
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {

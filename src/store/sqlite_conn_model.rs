@@ -238,7 +238,6 @@ pub(crate) enum ConnClass {
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("accord_nonce_issued", ConnClass::Read),
-    ("add_community_member", ConnClass::Write),
     ("add_family_member", ConnClass::Write),
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
@@ -403,6 +402,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_keys_by_identity_type", ConnClass::Read),
     ("list_known_wire_hashes_since", ConnClass::Read),
     ("list_live_consent_grants_by", ConnClass::Read),
+    ("list_live_consent_grants_for", ConnClass::Read),
     ("list_llm_calls", ConnClass::Read),
     ("list_local_holders", ConnClass::Read),
     ("list_local_tier_attestations", ConnClass::Read),
