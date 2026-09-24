@@ -314,6 +314,7 @@ pub mod bodies {
     /// the concrete backend before handing over `&dyn`. The YubiKey holder is
     /// seat 1 (a co-scrub), signing the charter AS the attested member so its
     /// scrub verifies against the pubkeys its chain names.
+    #[cfg(test)] // the mock CA is verify-core test-only; a `test-anchor` build has no I156 body
     pub async fn i156_layer_b_binds_the_records_key(
         d: &dyn FederationDirectory,
         ca: &ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa,

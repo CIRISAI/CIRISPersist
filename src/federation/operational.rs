@@ -2333,6 +2333,9 @@ pub mod test_support {
     /// `pubkeys_from = Some(label)` (the chain names a key the record does
     /// not carry — the shape Layer B exists to refuse; the door does not walk
     /// the chain, so it admits this). A `NODE` row, through the local door.
+    // verify-core's `test_support` (the mock CA) exists only under ITS test cfg —
+    // never in a `test-anchor` build of persist.
+    #[cfg(test)]
     pub async fn register_key_record_from_mock_member(
         directory: &dyn crate::federation::FederationDirectory,
         key_id: &str,
