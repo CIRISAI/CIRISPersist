@@ -574,10 +574,16 @@ where
 /// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.4) — **the one
 /// roster fold.** For every key id that appears on the record, in a widening
 /// or in a revocation, the latest event with `effective_at <= as_of` decides:
-/// a record membership (at `joined_at`) or a widening is an add, a revocation
-/// is a remove. At the same instant a revocation wins (removal is the safer
-/// read). Every door admits every well-formed row regardless of arrival
-/// order; this is where order is imposed.
+/// a record membership or a widening is an add, a revocation is a remove.
+/// A record membership counts FROM THE RECORD, not from its signer-chosen
+/// `joined_at`: the founding roster was never instant-gated before v48 and
+/// a `joined_at` stamped later than a set's `asserted_at` (a peer seeding
+/// the room from a skewed clock) must not refuse a legitimate mint — so it
+/// sorts before every dated event and any revocation of that member wins.
+/// A widening is dated: it adds at its `effective_at`. At the same instant
+/// a revocation wins (removal is the safer read). Every door admits every
+/// well-formed row regardless of arrival order; this is where order is
+/// imposed.
 #[must_use]
 pub fn active_roster_at(
     record_members: &[types::CommunityMember],
@@ -589,7 +595,7 @@ pub fn active_roster_at(
     // removal sorts LAST and therefore decides.
     let mut events: Vec<(chrono::DateTime<chrono::Utc>, bool, types::CommunityMember)> = Vec::new();
     for m in record_members {
-        events.push((m.joined_at, true, m.clone()));
+        events.push((chrono::DateTime::<chrono::Utc>::MIN_UTC, true, m.clone()));
     }
     for w in widenings {
         events.push((w.effective_at, true, w.member()));

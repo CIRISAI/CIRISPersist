@@ -478,6 +478,33 @@ pub mod bodies {
                 !tie.iter().any(|m| &m.key_id == carol),
                 "{tag} I165: a tie removes"
             );
+            // The record's own members count FROM THE RECORD, never from
+            // their signer-chosen `joined_at`: a founding member stamped
+            // later than the instant asked about is still in (a peer that
+            // seeds the room from a skewed clock must not refuse an earlier
+            // mint — I77) — and her revocation at any instant still removes.
+            let late = crate::federation::types::CommunityMember {
+                key_id: format!("{tag}-late"),
+                joined_at: t4 + chrono::Duration::days(30),
+                role: None,
+            };
+            let mut with_late = rec.members.clone();
+            with_late.push(late.clone());
+            let before_join = crate::federation::active_roster_at(&with_late, &[], &[], t2);
+            assert!(
+                before_join.iter().any(|m| m.key_id == late.key_id),
+                "{tag} I165: a record member is in before her joined_at"
+            );
+            let removed = crate::federation::active_roster_at(
+                &with_late,
+                &[],
+                &[revocation(room, &late.key_id, t2)],
+                t3,
+            );
+            assert!(
+                !removed.iter().any(|m| m.key_id == late.key_id),
+                "{tag} I165: her revocation removes her regardless of joined_at"
+            );
         }
     }
 

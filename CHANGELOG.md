@@ -46,6 +46,10 @@ was in this state; it showed on the first room that widened.
   set, the supersede projection — goes through it (`effective_roster` /
   `is_active_community_member`). `put_community`'s own checks still read the
   incoming record.
+- The fold counts a record member **from the record**, never from the
+  signer-chosen `joined_at` (the founding roster was not instant-gated before
+  v48; a peer seeding the room from a skewed clock must not refuse an earlier
+  mint — I77 and I165 pin it). A widening is dated: it adds at `effective_at`.
 - The revocation since-read's resume id is the three-part compound. **Pins
   moved, all growth:** `REPLICATION_POLICY_HASH` `c1082c12…` →
   `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19` (the 17th
