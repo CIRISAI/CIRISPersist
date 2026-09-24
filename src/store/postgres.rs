@@ -3616,13 +3616,11 @@ impl PostgresBackend {
         // symmetry claim is a claim about two files and decays whenever either
         // moves, so it is now a tested property (the #656 three-backend
         // witness) rather than a comment.
-        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
-            self.hardware_attestation_policy().check(
-                &row.key_id,
-                row.attestation_evidence.as_ref(),
-                chrono::Utc::now(),
-            )?;
-        }
+        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
+        // runs structure + freshness; any other evidence-carrying row runs
+        // structure alone (a replicated body is checked where it lands).
+        self.hardware_attestation_policy()
+            .admit_key_record(&row, chrono::Utc::now())?;
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
@@ -3824,13 +3822,11 @@ impl PostgresBackend {
         // `capability_roles` vector, travelled unexamined. Recurrence eight-plus
         // of the parity class this substrate keeps re-learning; the difference
         // this time is that the witness runs on all three backends.
-        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
-            self.hardware_attestation_policy().check(
-                &row.key_id,
-                row.attestation_evidence.as_ref(),
-                chrono::Utc::now(),
-            )?;
-        }
+        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
+        // runs structure + freshness; any other evidence-carrying row runs
+        // structure alone (a replicated body is checked where it lands).
+        self.hardware_attestation_policy()
+            .admit_key_record(&row, chrono::Utc::now())?;
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
         crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
         crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
@@ -4506,18 +4502,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
         // admission gate for accord_holder rows. Runs BEFORE
         // persist_row_hash + INSERT so rejected rows leave no trace.
-        // Non-accord-holder rows skip the gate (the column is
-        // informational for them). #441: evaluated over identity_type ∪
+        // #441: evaluated over identity_type ∪
         // roles (claims_role) — an `accord_holder` claim in the set form
         // ("agent,accord_holder") or in the roles vector hits the same
         // gate as the scalar.
-        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
-            self.hardware_attestation_policy().check(
-                &row.key_id,
-                row.attestation_evidence.as_ref(),
-                chrono::Utc::now(),
-            )?;
-        }
+        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
+        // runs structure + freshness; any other evidence-carrying row runs
+        // structure alone (a replicated body is checked where it lands).
+        self.hardware_attestation_policy()
+            .admit_key_record(&row, chrono::Utc::now())?;
 
         // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — the consent_role token is a
         // PURE predicate over a closed vocabulary, so it leads the four
@@ -31859,7 +31852,11 @@ mod tests {
             },
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
@@ -39367,11 +39364,12 @@ mod tests {
         backend.run_migrations().await.unwrap();
         use crate::federation::FederationDirectory;
         let key_id = format!("pg-non-ah-§102-{}", uuid_like());
-        let key = pg_admission_key(
+        let mut key = pg_admission_key(
             &key_id,
             "registry",
             crate::federation::types::identity_type::STEWARD,
         );
+        key.attestation_evidence = None; // the leg under test: a software-class non-accord_holder
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record: key })
             .await
@@ -41899,7 +41897,11 @@ mod tests {
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -42188,7 +42190,11 @@ mod tests {
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -42906,7 +42912,11 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }

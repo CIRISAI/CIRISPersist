@@ -1433,7 +1433,8 @@ pub mod test_support {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 capability_roles: Vec::new(),
-                attestation_evidence: None,
+                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             }
@@ -1754,7 +1755,11 @@ pub mod test_support {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: scrub_sigs[1..].to_vec(),
         }
@@ -1876,7 +1881,11 @@ pub mod test_support {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -2117,7 +2126,7 @@ pub mod test_support {
     /// the ingest gate on every backend. The placeholder scrub columns are
     /// valid-hex / valid-base64 (unlike the pre-#534 `test-anchor`), so the
     /// KeyRecord itself round-trips through sqlite/postgres column decoding.
-    async fn register_typed_key(
+    pub async fn register_typed_key(
         directory: &dyn crate::federation::FederationDirectory,
         key_id: &str,
         identity_type: &str,
@@ -2126,14 +2135,14 @@ pub mod test_support {
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         let now = chrono::Utc::now();
         // An `accord_holder` registration hits the #513 hardware-attestation
-        // gate on sqlite/postgres (MemoryBackend skips it — the #534/#536 trap
-        // again). Supply the established mock Android-StrongBox evidence with a
-        // FRESH nonce: the gate validates shape + freshness (≤24h), not a real
-        // cert chain, so this is the accepted test path for standing up an
-        // accord_holder on every backend.
-        let attestation_evidence = (identity_type
-            == crate::federation::types::identity_type::ACCORD_HOLDER)
-            .then(|| strongbox_evidence(now));
+        // gate on every backend: the established mock Android-StrongBox
+        // evidence with a FRESH nonce passes shape + freshness (≤24h).
+        // v47.3.0 (CIRISPersist#901, FSD §3.6) — EVERY synthetic identity
+        // carries it: a valid root is defined by its holders' attested
+        // hardware, and any key this helper registers may be seated as a
+        // charter holder or stand as a Key-kind root. A fixture that wants an
+        // unattested key says so through `register_typed_key_with_evidence`.
+        let attestation_evidence = Some(strongbox_evidence(now));
         let rec = crate::federation::types::KeyRecord {
             key_id: key_id.to_owned(),
             pubkey_ed25519_base64: ed_pk,
@@ -2156,6 +2165,203 @@ pub mod test_support {
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+    }
+
+    /// v47.3.0 (CIRISPersist#901) — [`register_typed_key`] with the
+    /// evidence CHOSEN by the caller (`None` = a software-class record), through
+    /// the LOCAL door (`put_public_key`: structure + freshness at admission).
+    pub async fn register_typed_key_with_evidence(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+        identity_type: &str,
+        attestation_evidence: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        let rec = typed_key_record(key_id, identity_type, attestation_evidence);
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+    }
+
+    /// v47.3.0 (#901) — the same record arriving BY REPLICATION
+    /// (`apply_replicated_key_record`: structure only — its nonce was fresh
+    /// where it registered).
+    pub async fn apply_replicated_typed_key_with_evidence(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+        identity_type: &str,
+        attestation_evidence: Option<serde_json::Value>,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        // The replicated door verifies the registration envelope binds its
+        // subject (#659) and the hybrid signature over it; the evidence rides
+        // OUTSIDE the envelope, as it does on a real record.
+        let mut rec = crate::federation::tier_ingest::test_support::replicated_key_record(
+            key_id,
+            identity_type,
+            key_id,
+            key_id,
+            "v1",
+        );
+        rec.attestation_evidence = attestation_evidence;
+        directory
+            .apply_replicated_key_record(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+    }
+
+    /// The `KeyRecord` [`register_typed_key`] builds, with the evidence
+    /// supplied rather than derived from the role.
+    fn typed_key_record(
+        key_id: &str,
+        identity_type: &str,
+        attestation_evidence: Option<serde_json::Value>,
+    ) -> crate::federation::types::KeyRecord {
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
+        let now = chrono::Utc::now();
+        crate::federation::types::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: json!({ "id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            attestation_evidence,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// v47.3.0 (#901) — a chartered FAMILY root with `holders` seated
+    /// (`quorum:2/3`), its `trust:charter:v1` signed by holders[0] and co-scrubbed by
+    /// every other holder, and `user`'s synthetic trust edge — the shape
+    /// `exercise_foreign_retraction_cannot_sever_charter` builds, as a
+    /// fixture. The holders must already be registered (with whatever
+    /// evidence the witness intends).
+    pub async fn seed_chartered_family_root(
+        directory: &dyn crate::federation::FederationDirectory,
+        root_key_id: &str,
+        holders: &[String],
+        user_key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        seed_chartered_family_root_with_scrubs(directory, root_key_id, holders, user_key_id, &[])
+            .await
+    }
+
+    /// [`seed_chartered_family_root`] where named co-scrubs (`holders[1..]`)
+    /// sign with a chosen [`ScrubSigner`] instead of their own deterministic
+    /// pair — the shape I156 needs: a holder whose record carries a mock
+    /// YubiKey member's pubkeys must scrub the charter AS that member, or its
+    /// scrub does not verify and it is not a holder of the charter at all.
+    /// `holders[0]` always signs with its deterministic pair.
+    pub async fn seed_chartered_family_root_with_scrubs(
+        directory: &dyn crate::federation::FederationDirectory,
+        root_key_id: &str,
+        holders: &[String],
+        user_key_id: &str,
+        overrides: &[(&str, ScrubSigner<'_>)],
+    ) -> Result<(), crate::federation::Error> {
+        seed_test_family(directory, root_key_id, holders, "quorum:2/3").await?;
+        let charter_id = format!("{root_key_id}-charter");
+        let successors = vec![
+            format!("{root_key_id}-succ-a"),
+            format!("{root_key_id}-succ-b"),
+        ];
+        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("pre_rotation_commitment: {e}"))
+            })?;
+        // EVERY seated holder scrubs the charter (holders[0] signs, the rest
+        // co-scrub): the charter's verified scrub set — which is what the
+        // v47.3.0 holder-hardware leg judges — is then the whole seat set.
+        let mut charter = co_signed_trust_attestation(
+            &charter_id,
+            &holders[0],
+            root_key_id,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            json!({
+                "references_attestation_id": charter_id,
+                "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+                "scope": [
+                    crate::federation::trust_root::INFRA_ATTEST_SCOPE,
+                    crate::federation::trust_root::INFRA_SERVE_SCOPE,
+                ],
+                "pre_rotation_commitment": commitment,
+            }),
+            &[],
+        );
+        let sealed = charter.attestation_envelope.clone();
+        charter.additional_scrubs = holders[1..]
+            .iter()
+            .filter_map(|h| {
+                let signer = overrides
+                    .iter()
+                    .find(|(k, _)| *k == h.as_str())
+                    .map(|(_, s)| s);
+                match signer {
+                    Some(ScrubSigner::Absent) => None,
+                    Some(s) => Some(co_scrub(&sealed, h, s)),
+                    None => Some(co_scrub(&sealed, h, &ScrubSigner::Deterministic(h))),
+                }
+            })
+            .collect();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: charter,
+            })
+            .await?;
+        try_emit_synthetic_trust_edge(directory, user_key_id, root_key_id).await;
+        Ok(())
+    }
+
+    /// v47.3.0 (#901, I156) — register `key_id` as the YubiKey PIV member `m`
+    /// attests: its signed custody attestation as the evidence, and the
+    /// record's hybrid pubkeys either the member's own (`pubkeys_from = None`:
+    /// the chain names the record's key) or the deterministic test pair for
+    /// `pubkeys_from = Some(label)` (the chain names a key the record does
+    /// not carry — the shape Layer B exists to refuse; the door does not walk
+    /// the chain, so it admits this). A `NODE` row, through the local door.
+    // verify-core's `test_support` (the mock CA) exists only under ITS test cfg —
+    // never in a `test-anchor` build of persist.
+    #[cfg(test)]
+    pub async fn register_key_record_from_mock_member(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+        m: &ciris_verify_core::accord_custody_attestation::test_support::MockAttestedMember,
+        pubkeys_from: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        let evidence = serde_json::to_value(&m.attestation).map_err(|e| {
+            crate::federation::Error::Backend(format!("custody attestation to json: {e}"))
+        })?;
+        let mut rec = typed_key_record(
+            key_id,
+            crate::federation::types::identity_type::NODE,
+            Some(evidence),
+        );
+        match pubkeys_from {
+            None => {
+                rec.pubkey_ed25519_base64 = m.member.ed25519_public_key_base64.clone();
+                rec.pubkey_ml_dsa_65_base64 = m.member.mldsa65_public_key_base64.clone();
+            }
+            Some(label) => {
+                let (ed_pk, mldsa_pk) =
+                    crate::federation::tier_ingest::test_support::hybrid_pubkeys(label);
+                rec.pubkey_ed25519_base64 = ed_pk;
+                rec.pubkey_ml_dsa_65_base64 = mldsa_pk;
+            }
+        }
         directory
             .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
             .await
@@ -3043,7 +3249,17 @@ pub mod test_support {
         use crate::federation::types::{attestation_type, identity_type};
 
         // The helper-controlled synthetic actors: the root and its accord witness.
-        register_typed_key(directory, root_key_id, identity_type::NODE).await?;
+        // v47.3.0 (CIRISPersist#901, FSD §3.6) — a Key-kind root is its own
+        // charter holder, and a valid root is defined by its holders' attested
+        // hardware: the root carries Layer-A-valid evidence, as every seated
+        // family holder does through `register_typed_key(ACCORD_HOLDER)`.
+        register_typed_key_with_evidence(
+            directory,
+            root_key_id,
+            identity_type::NODE,
+            Some(strongbox_evidence(chrono::Utc::now())),
+        )
+        .await?;
         let la = format!("{root_key_id}-la");
         register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
 
@@ -3319,18 +3535,49 @@ pub mod test_support {
         let envelope = row.attestation_envelope.clone();
         row.additional_scrubs = cosigners
             .iter()
-            .map(|k| {
-                let (_, classical, pqc) =
-                    crate::federation::tier_ingest::test_support::sign_envelope(k, &envelope);
-                crate::federation::types::ScrubSig {
-                    cosigned_at: None,
-                    scrub_key_id: (*k).to_owned(),
-                    scrub_signature_classical: classical,
-                    scrub_signature_pqc: pqc,
-                }
-            })
+            .map(|k| co_scrub(&envelope, k, &ScrubSigner::Deterministic(k)))
             .collect();
         row
+    }
+
+    /// v47.3.0 (CIRISPersist#901) — who signs a co-scrub: the deterministic
+    /// test pair for a label (the default — the label is normally the scrub's
+    /// own key id), or the signers `MockYubicoCa::attest_member` derived for
+    /// a member from its Ed25519 seed (so the scrub verifies against the
+    /// pubkeys that member's custody chain names).
+    pub enum ScrubSigner<'a> {
+        /// The deterministic test pair for this label.
+        Deterministic(&'a str),
+        /// The mock YubiKey member attested from this Ed25519 seed.
+        MockMember([u8; 32]),
+        /// No scrub at all: a SEATED holder who did not sign this charter
+        /// (quorum may still be met by the others; this seat is then not a
+        /// holder OF THIS CHARTER — the v47.3.0 leg must not judge it).
+        Absent,
+    }
+
+    /// One co-scrub over the sealed envelope, `scrub_key_id = key_id`, signed
+    /// by `signer`.
+    fn co_scrub(
+        envelope: &serde_json::Value,
+        key_id: &str,
+        signer: &ScrubSigner<'_>,
+    ) -> crate::federation::types::ScrubSig {
+        use crate::federation::tier_ingest::test_support as ts;
+        let (_, classical, pqc) = match signer {
+            ScrubSigner::Deterministic(label) => ts::sign_envelope(label, envelope),
+            ScrubSigner::MockMember(seed) => {
+                let (ed, mldsa) = ts::mock_member_signers(seed);
+                ts::sign_envelope_with(&ed, &mldsa, envelope)
+            }
+            ScrubSigner::Absent => unreachable!("an absent scrub is filtered before signing"),
+        };
+        crate::federation::types::ScrubSig {
+            cosigned_at: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
     }
 
     /// v24.0.0 (CIRISPersist#557) — seed a KEYLESS constitutional family with

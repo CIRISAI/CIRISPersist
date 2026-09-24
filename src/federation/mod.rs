@@ -115,6 +115,9 @@ pub mod bytes_plane_tombstone_invariants;
 pub mod scope_classifier_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+/// v47.3.0 (CIRISPersist#901) — I154–I158: a root is as attested as its holders.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod trust_root_hardware_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.

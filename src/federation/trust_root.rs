@@ -364,6 +364,185 @@ impl CharterQuorum {
     }
 }
 
+/// v47.3.0 (CIRISPersist#901, FSD `TRUST_ROOT_HOLDER_HARDWARE.md` §3.2) —
+/// one charter holder's hardware standing, as [`trust_root_valid`] judged it
+/// from THIS node's key record for that holder. Per holder, so a consumer
+/// sees WHICH holder and WHICH layer failed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HolderHardware {
+    /// The holder's key id (a verified charter scrub on a FAMILY root; the
+    /// self-charter's signer on a KEY root).
+    pub key_id: String,
+    /// The hardware class Layer A derived: `None` when the record carries no
+    /// evidence, the body does not parse, or the class is not one the policy
+    /// accepts. A YubiKey PIV custody attestation reports
+    /// [`HardwareType::ExternalSecureElement`].
+    pub class: Option<ciris_keyring::HardwareType>,
+    /// **Layer A** — evidence present, canonical, class accepted, fields
+    /// present ([`HardwareAttestationPolicy::check_structure`]: no clock).
+    pub layer_a: bool,
+    /// **Layer B** — the chain walk against a root this node pins:
+    /// `Some(true)` the chain names the record's own Ed25519 key;
+    /// `Some(false)` it does not (or does not verify); `None` no root is
+    /// pinned for this class (Layer-A-only), never a refusal.
+    pub layer_b: Option<bool>,
+    /// The policy's / chain walk's own detail when a layer refused.
+    pub refusal: Option<String>,
+}
+
+impl HolderHardware {
+    /// The leg this holder contributes to [`TrustRootVerdict::valid`].
+    pub fn attested(&self) -> bool {
+        self.layer_a && self.layer_b != Some(false)
+    }
+}
+
+/// v47.3.0 (#901, FSD §3.4) — memo of the pure function
+/// `(key record bytes, policy) → HolderHardware`, keyed by the holder's key
+/// id and a fingerprint over exactly the inputs the verdict depends on (the
+/// record's pubkeys and evidence, the policy). Invalidated by the record
+/// changing — never by time: hardware evidence does not expire on a clock.
+/// Bounded: cleared when it outgrows [`HOLDER_HARDWARE_CACHE_CAP`].
+type HolderHardwareMemo =
+    std::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), HolderHardware>>;
+static HOLDER_HARDWARE_CACHE: std::sync::OnceLock<HolderHardwareMemo> = std::sync::OnceLock::new();
+const HOLDER_HARDWARE_CACHE_CAP: usize = 4096;
+
+#[cfg(any(test, feature = "test-anchor"))]
+static HOLDER_HARDWARE_VERIFICATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+/// v47.3.0 (#901, I158) — how many times the holder-hardware leg has
+/// EVALUATED `key_id` (a cache miss) in this process. Per key id, so a
+/// witness measures its own holders under a parallel suite.
+#[cfg(any(test, feature = "test-anchor"))]
+pub fn holder_hardware_verifications_for(key_id: &str) -> u64 {
+    HOLDER_HARDWARE_VERIFICATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn holder_fingerprint(
+    rec: &super::types::KeyRecord,
+    policy: &super::hardware_attestation::HardwareAttestationPolicy,
+) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for part in [
+        rec.pubkey_ed25519_base64.as_str(),
+        rec.pubkey_ml_dsa_65_base64.as_deref().unwrap_or(""),
+        &rec.attestation_evidence
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        &format!("{policy:?}"),
+    ] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    h.finalize().into()
+}
+
+/// The pure evaluation (FSD §2): Layer A through the policy's structural
+/// legs; Layer B through the ONE chain walk persist already has
+/// ([`super::admission::verify_member_fips_custody_against`], the pinned
+/// root taken from the policy) for a YubiKey PIV custody attestation.
+fn evaluate_holder_hardware(
+    rec: &super::types::KeyRecord,
+    policy: &super::hardware_attestation::HardwareAttestationPolicy,
+) -> HolderHardware {
+    use super::hardware_attestation::AttestationEvidence;
+    use ciris_keyring::HardwareType;
+    let class = match policy.check_structure(&rec.key_id, rec.attestation_evidence.as_ref()) {
+        Err(e) => {
+            return HolderHardware {
+                key_id: rec.key_id.clone(),
+                class: None,
+                layer_a: false,
+                layer_b: None,
+                refusal: Some(e.to_string()),
+            };
+        }
+        Ok(class) => class,
+    };
+    let is_custody = rec
+        .attestation_evidence
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
+        .is_some_and(|e| matches!(e, AttestationEvidence::GenerationCustody(_)));
+    if !is_custody {
+        return HolderHardware {
+            key_id: rec.key_id.clone(),
+            class,
+            layer_a: true,
+            layer_b: None,
+            refusal: None,
+        };
+    }
+    let (layer_b, refusal) =
+        match super::admission::verify_member_fips_custody_against(rec, &policy.yubico_root_der) {
+            Ok(_) => (Some(true), None),
+            Err(why) => (Some(false), Some(why)),
+        };
+    HolderHardware {
+        key_id: rec.key_id.clone(),
+        class: Some(HardwareType::ExternalSecureElement),
+        layer_a: true,
+        layer_b,
+        refusal,
+    }
+}
+
+/// One holder, from THIS node's record for it, through the memo.
+async fn holder_hardware<F>(
+    directory: &F,
+    policy: &super::hardware_attestation::HardwareAttestationPolicy,
+    key_id: &str,
+) -> Result<HolderHardware, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(rec) = directory.lookup_public_key(key_id).await? else {
+        return Ok(HolderHardware {
+            key_id: key_id.to_owned(),
+            class: None,
+            layer_a: false,
+            layer_b: None,
+            refusal: Some("no key record for this holder".into()),
+        });
+    };
+    let fp = holder_fingerprint(&rec, policy);
+    let cache = HOLDER_HARDWARE_CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(key_id.to_owned(), fp))
+    {
+        return Ok(hit.clone());
+    }
+    #[cfg(any(test, feature = "test-anchor"))]
+    {
+        *HOLDER_HARDWARE_VERIFICATIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key_id.to_owned())
+            .or_insert(0) += 1;
+    }
+    let verdict = evaluate_holder_hardware(&rec, policy);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= HOLDER_HARDWARE_CACHE_CAP {
+        guard.clear();
+    }
+    guard.insert((key_id.to_owned(), fp), verdict.clone());
+    Ok(verdict)
+}
+
 /// The typed, per-check verdict of [`trust_root_valid`].
 ///
 /// Open accounting, not a bare bool (the derivation-trace discipline): a
@@ -418,6 +597,18 @@ pub struct TrustRootVerdict {
     /// is why [`Self::root_self_declares`] is false beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charter_quorum: Option<CharterQuorum>,
+    /// v47.3.0 (CIRISPersist#901) — every charter holder's hardware
+    /// standing, one entry per holder, sorted by key id. Empty when no
+    /// charter reached the bar (then [`Self::root_self_declares`] is already
+    /// false). `#[serde(default)]`: a pre-v47.3 payload deserializes with
+    /// nothing judged and [`Self::holders_hardware_attested`] false.
+    #[serde(default)]
+    pub holders_hardware: Vec<HolderHardware>,
+    /// v47.3.0 (CIRISPersist#901) — the leg: every entry of
+    /// [`Self::holders_hardware`] passes Layer A and no entry fails Layer B.
+    /// Folded into [`Self::valid`]. A root is as attested as its holders.
+    #[serde(default)]
+    pub holders_hardware_attested: bool,
     /// v24.1.0 (CIRISPersist#561) — **the instant this verdict can first stop
     /// holding on time alone**, or `None` when nothing it counted is
     /// time-bounded.
@@ -702,6 +893,23 @@ pub(crate) async fn family_quorum_over<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    family_quorum_holders_over(directory, row, family)
+        .await
+        .map(|(q, _)| q)
+}
+
+/// v47.3.0 (CIRISPersist#901) — [`family_quorum_over`] with the counted SET
+/// beside the count: the distinct seated holders whose scrub verified, which
+/// is exactly the holder set the hardware leg of [`trust_root_valid`] judges.
+/// One fold decides both "quorate" and "who" (rule #9 — one predicate).
+pub(crate) async fn family_quorum_holders_over<F>(
+    directory: &F,
+    row: &Attestation,
+    family: &super::types::Family,
+) -> Result<(CharterQuorum, std::collections::BTreeSet<String>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     // The roster is the REVOCATION-FOLDED active seat set, not the raw member
     // list: a holder removed from the family stops counting toward its quorum
     // immediately, and a charter that once reached the threshold stops reaching
@@ -727,11 +935,12 @@ where
         &roster,
     )
     .await;
-    Ok(CharterQuorum {
+    let quorum = CharterQuorum {
         distinct_holders: counted.len(),
         required,
         roster_size: roster.len(),
-    })
+    };
+    Ok((quorum, counted))
 }
 
 /// v18.2.0 (CIRISPersist#481) — the trust-root graph predicate.
@@ -803,6 +1012,8 @@ where
             valid: false,
             root_kind: RootKind::Key,
             charter_quorum: None,
+            holders_hardware: Vec::new(),
+            holders_hardware_attested: false,
             bounded_until: None,
         });
     }
@@ -882,51 +1093,61 @@ where
             && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
     };
 
-    let (live_charters, charter_quorum): (Vec<&Attestation>, Option<CharterQuorum>) =
-        match family.as_ref() {
-            None => (
-                by_root
-                    .iter()
-                    .filter(|a| charter_shaped(a, &root_dead) && a.attesting_key_id == root_ref)
-                    .collect(),
-                None,
-            ),
-            Some(fam) => {
-                let mut quorate: Vec<&Attestation> = Vec::new();
-                // Reported even when nothing reaches the bar: the SHORTFALL is
-                // the finding a human acts on ("1 of 2 required distinct
-                // holders"), so the best candidate's count is carried out.
-                let mut best: Option<CharterQuorum> = None;
-                for candidate in about_root.iter().filter(|a| charter_shaped(a, &about_dead)) {
-                    let q = family_quorum_over(directory, candidate, fam).await?;
-                    if q.met() {
-                        quorate.push(candidate);
-                    }
-                    if best.is_none_or(|b| q.distinct_holders > b.distinct_holders) {
-                        best = Some(q);
+    // v47.3.0 (CIRISPersist#901) — the charter HOLDERS ride out of the same
+    // fold that decides the charter leg: on the key arm the self-charter's
+    // signer; on the family arm the union of the verified seated scrubs of
+    // every quorate charter (the #557 count's own set, not the roster and not
+    // the `about_root` attesters — a co-signature that did not count is not a
+    // holder).
+    let mut charter_holders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let (live_charters, charter_quorum): (Vec<&Attestation>, Option<CharterQuorum>) = match family
+        .as_ref()
+    {
+        None => {
+            let self_charters: Vec<&Attestation> = by_root
+                .iter()
+                .filter(|a| charter_shaped(a, &root_dead) && a.attesting_key_id == root_ref)
+                .collect();
+            charter_holders.extend(self_charters.iter().map(|a| a.attesting_key_id.clone()));
+            (self_charters, None)
+        }
+        Some(fam) => {
+            let mut quorate: Vec<&Attestation> = Vec::new();
+            // Reported even when nothing reaches the bar: the SHORTFALL is
+            // the finding a human acts on ("1 of 2 required distinct
+            // holders"), so the best candidate's count is carried out.
+            let mut best: Option<CharterQuorum> = None;
+            for candidate in about_root.iter().filter(|a| charter_shaped(a, &about_dead)) {
+                let (q, signers) = family_quorum_holders_over(directory, candidate, fam).await?;
+                if q.met() {
+                    quorate.push(candidate);
+                    charter_holders.extend(signers);
+                }
+                if best.is_none_or(|b| q.distinct_holders > b.distinct_holders) {
+                    best = Some(q);
+                }
+            }
+            // No charter-shaped row at all still deserves an honest number:
+            // 0 of whatever this node requires.
+            let reported = match best {
+                Some(q) => q,
+                None => {
+                    let roster_size =
+                        match directory.active_family_members(&fam.family_key_id).await {
+                            Ok(m) => m.len(),
+                            Err(Error::Unsupported { .. }) => 0,
+                            Err(e) => return Err(e),
+                        };
+                    CharterQuorum {
+                        distinct_holders: 0,
+                        required: family_charter_threshold(fam, roster_size),
+                        roster_size,
                     }
                 }
-                // No charter-shaped row at all still deserves an honest number:
-                // 0 of whatever this node requires.
-                let reported = match best {
-                    Some(q) => q,
-                    None => {
-                        let roster_size =
-                            match directory.active_family_members(&fam.family_key_id).await {
-                                Ok(m) => m.len(),
-                                Err(Error::Unsupported { .. }) => 0,
-                                Err(e) => return Err(e),
-                            };
-                        CharterQuorum {
-                            distinct_holders: 0,
-                            required: family_charter_threshold(fam, roster_size),
-                            roster_size,
-                        }
-                    }
-                };
-                (quorate, Some(reported))
-            }
-        };
+            };
+            (quorate, Some(reported))
+        }
+    };
     let root_self_declares = !live_charters.is_empty();
     // v24.1.0 (CIRISPersist#561) — the recovery-carrying subset, collected for
     // the same reason `live_edges` is: `valid` needs BOTH charter legs, so the
@@ -938,6 +1159,19 @@ where
         .filter(|a| charter_commitment_well_formed(&a.attestation_envelope))
         .collect();
     let charter_has_recovery = !recovery_charters.is_empty();
+
+    // 2b. v47.3.0 (CIRISPersist#901) — a root is as attested as its holders:
+    // every charter holder's key record, as THIS node holds it, through the
+    // policy's structural legs (Layer A, no clock) and the chain walk for any
+    // class this node pins a root for (Layer B). Evaluated where the root is
+    // judged, from the node's own records — never from a payload the caller
+    // carried.
+    let policy = directory.hardware_attestation_policy();
+    let mut holders_hardware: Vec<HolderHardware> = Vec::with_capacity(charter_holders.len());
+    for holder in &charter_holders {
+        holders_hardware.push(holder_hardware(directory, &policy, holder).await?);
+    }
+    let holders_hardware_attested = holders_hardware.iter().all(HolderHardware::attested);
 
     // 3. Drill SIGNAL (v23.0.0, #551 item 4 — no longer a gate): the NEWEST
     // live drill about the root, reported with its age banded. No freshness
@@ -985,8 +1219,12 @@ where
     // root act": a consensual edge, a real charter, a recovery commitment,
     // and no halt latched. The drill answers "is anyone still minding it",
     // which is reported beside the verdict, not enforced inside it.
-    let valid =
-        edge_exists && root_self_declares && charter_has_recovery && halt_latched != Some(true);
+    // v47.3.0 (#901) — and every holder attested (FSD §2).
+    let valid = edge_exists
+        && root_self_declares
+        && charter_has_recovery
+        && halt_latched != Some(true)
+        && holders_hardware_attested;
 
     // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
     // Each leg survives while ANY of its rows is live (latest expiry wins,
@@ -1011,6 +1249,8 @@ where
         valid,
         root_kind,
         charter_quorum,
+        holders_hardware,
+        holders_hardware_attested,
         bounded_until: bounded_until.flatten(),
     })
 }

@@ -7,6 +7,94 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.3.0] - 2026-09-24
+
+### Added — a valid root is as attested as its holders: the holder-hardware leg of `trust_root_valid` (CIRISPersist#901; FSD `TRUST_ROOT_HOLDER_HARDWARE.md`)
+The ruling on CIRISEdge#659: *a valid root is defined by its holders' attested
+hardware property, evaluated where the root is judged.* `trust_root_valid`
+folded four legs — a consensual edge, a self-declaring charter, a recovery
+commitment, no halt — and never looked at a single holder's key record. A
+family chartered by three software-only keys was as valid as the accord's
+three YubiKeys. Edge composes the mutual-root walk from persist's legs and
+re-derives nothing, so this is the one thing it needed from persist.
+
+- **The leg.** Every charter holder — the self-charter's signer on a KEY root;
+  the union of the *verified seated scrubs* of every quorate charter on a
+  FAMILY root (`family_quorum_holders_over`: the #557 count's own set, carried
+  out beside the count, so "quorate" and "who" come from one fold; not the
+  roster, not the `about_root` attesters) — is judged from THIS node's key
+  record for it. **Layer A** = the policy's structural legs with **no clock**
+  (`HardwareAttestationPolicy::check_structure`: present, canonical, class
+  accepted, fields present; `check` = `check_structure` + the nonce-freshness
+  leg, one function calling the other so the two cannot drift — freshness is
+  replay protection at registration, and re-checking it at validity time
+  would expire every real root a day after its holders registered).
+  **Layer B** = the chain walk for a class this node pins a root for: a
+  YubiKey PIV custody attestation through
+  `admission::verify_member_fips_custody_against` — the one walk persist
+  already has — with the root from the policy's new `yubico_root_der`
+  (default: the production pin). Classes with no pinned root are
+  Layer-A-only: `layer_b = None`, never a refusal.
+- **The verdict.** `TrustRootVerdict.holders_hardware: Vec<HolderHardware>`
+  (`key_id`, `class`, `layer_a`, `layer_b`, `refusal`; one per holder, sorted
+  by key id — a consumer sees WHICH holder and WHICH layer failed) and
+  `holders_hardware_attested: bool`, **folded into `valid`**. `bounded_until`
+  is unchanged: hardware evidence does not expire on a clock. Both fields are
+  `#[serde(default)]`, so a pre-v47.3 payload deserializes with nothing judged
+  and the leg false.
+- **Evaluated where the root is judged, memoised by its inputs.** A memo keyed
+  by the holder's key id and a fingerprint over exactly what the verdict
+  depends on — the record's pubkeys and evidence, and the policy. Three
+  holders, verified once per record version and per policy; never by time.
+  A node that tightens its `accepted_hardware_types` invalidates, at the
+  next read, every root held by the class it dropped (I154).
+- **Replicated key records are checked where they land** (§3.5). One door
+  predicate, `HardwareAttestationPolicy::admit_key_record`, on all seven
+  admission sites (`put_public_key`, `adopt_scrub_upgrade`,
+  `supersede_canonical_record` on sqlite and postgres; `put_public_key` on
+  memory): an `accord_holder` runs structure **and** freshness (unchanged);
+  any other row that **carries** evidence runs structure alone (its nonce was
+  fresh where it registered); a row with none is admitted, never downgraded.
+  Before this a peer's malformed evidence rode replication into the directory
+  unexamined, and the leg above would have judged records nobody checked.
+
+**Witnesses** (memory + sqlite + postgres through one `&dyn FederationDirectory`):
+**I154** — three attested holders with month-old nonces: valid; one holder
+registered with no evidence: invalid, named, the other legs unchanged; a seated
+holder who did not sign is not a holder of that charter; the node's policy
+dropping the class invalidates the same records and restoring it restores the
+verdict byte-for-byte. **I155** — `check` refuses the stale nonce,
+`check_structure` accepts it; the local `accord_holder` door still refuses,
+a `NODE` row with the same evidence is admitted. **I156** — a YubiKey PIV
+holder (mock CA, root swapped on the policy) whose record carries the attested
+key: `layer_b = Some(true)`; the same chain on a record with other pubkeys:
+`Some(false)`, invalid, named. **I157** — malformed evidence on a `NODE`
+record through `apply_replicated_key_record` is refused for the evidence and
+leaves no row; no evidence and stale-valid evidence are admitted. **I158** —
+memoised by inputs: three evaluations across two reads; a policy swap
+re-evaluates each holder once. Mutation round: **11 mutants, 11 killed, every kill on all three backends**
+(`FSD/TRUST_ROOT_HOLDER_HARDWARE.md` §5.1).
+
+**The fixture consequence (§3.6).** Every test-support key builder now
+attaches Layer-A-valid mock StrongBox evidence (nonce quantized to the hour,
+so a re-put is byte-identical): under the ruling every Key-kind root the
+fixtures stood up had an unattested holder. A test that wants a
+software-class row says so — `register_typed_key_with_evidence(…, None)`,
+or `attestation_evidence = None` on the record — and the legs that test
+"unattested is refused" do. `attach_accord_holder_evidence` →
+`attach_hardware_evidence` (every row). `operational::test_support` gains
+`seed_chartered_family_root[_with_scrubs]`, `ScrubSigner` (deterministic /
+mock YubiKey member / absent), `register_key_record_from_mock_member`;
+`tier_ingest::test_support` gains `sign_envelope_with` and
+`mock_member_signers`.
+
+**For adopters.** `TrustRootVerdict` gained two fields (additive). A
+Key-kind root whose key record carries no hardware evidence is **no longer
+valid** — that is the ruling, not a regression; attach evidence to the
+holder records or charter a family whose holders carry it. Edge: the leg
+CIRISEdge#659 composes over. Server: re-run the replication ladder against
+the canonical's evidence-carrying records before pinning.
+
 ## [47.2.0] - 2026-09-24
 
 ### Added — CC 2.3 at the bytes plane: a withdrawn reference stops the bytes (CIRISPersist#853, #862)
