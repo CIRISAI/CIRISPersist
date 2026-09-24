@@ -7,6 +7,60 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.2.0] - 2026-09-24
+
+### Added — CC 2.3 at the bytes plane: a withdrawn reference stops the bytes (CIRISPersist#853, #862)
+CC 2.3 held at the row plane and not at the bytes plane. A subject's
+`withdraws` tombstoned the referencing attestation and readers of the row saw
+it retracted, but `read_blob_as`, `read_blob_range_as` and `serve_blob_to_peer`
+never asked whether the row referencing a blob was withdrawn. The bytes stayed
+readable on the author node and every holder, indefinitely — through the FFI,
+Python, CIRISServer's `resolve_content`, and the swarm serve door. Edge's half
+(CIRISEdge#614) could refuse and delete on its own `BlobChunkSource`; a direct
+persist read on the holder returned bytes until edge had deleted them.
+
+- **The fold** (`blob_tombstone::binding_state`): a blob's bytes are readable
+  iff at least one row binding them is live. Per binding row, the composers
+  naming it are found **by reference** (new
+  `FederationDirectory::list_attestations_referencing`, on all three backends,
+  discriminated by the three structural composer ops), each retraction's
+  authority is **re-derived now** through `check_withdraws_admission` against
+  the target this node holds, and §6.1 precedence (`retired_ids`, the one
+  fold since #686) decides. The stored `withdraws_admission_rule` is **never
+  read**: per the operator's constraint on #853, a `withdraws` admitted out
+  of order carries `None`, and a fold that trusted it, or read `None` as
+  retired, would make replication a remote-delete primitive. One live
+  binding keeps the bytes — CC 2.3 is a subject's right to pull *their* row.
+- **The doors**: `refuse_if_withdrawn` sits after authorization on the
+  whole-blob and range viewer reads (a stranger is still `NotGranted` and
+  learns nothing) and as the third gate of the serve disposition.
+  **`BlobError::Withdrawn { sha256_hex, attestation_id, withdraws_id }`**,
+  kind `blob_withdrawn`, Python `RuntimeError("blob_withdrawn: <sha>")` — never
+  `NotHeld`, which means "ask another holder" and walked the fetcher around
+  the mesh. Edge's `MissReason::Withdrawn` / `ChunkSourceRefusal::Withdrawn`
+  are now reachable from persist's serve door.
+- **The resolver sees both reference shapes** (#862 part 2):
+  `envelope_binds_content` matches `evidence_refs` **or** a typed `BlobPointer`
+  member (`blob_pointer::pointer_for`) — the chat shape, which never carried
+  an `evidence_ref` and so was invisible to any fold that started from the
+  sha. An unreadable pointer member at that sha counts as binding.
+- **`Engine::evict_blob(sha)`** (#862 part 1): the sweep's own order for one
+  sha — retract this node's live `holds_bytes` claims (a hybrid-signed
+  federation-tier `withdraws` each; a refused retraction **aborts**, bytes
+  and binding stay, I18), then delete. A retry finds the claims retired and
+  does nothing. It does not decide *whether* to evict; a caller that wants
+  "evict because withdrawn" asks `binding_state` first.
+
+**Witnesses** (sqlite + postgres; memory has no blob storage): **I149** — a
+*subject's* withdraws (rule 2, not the author: the case CC 2.3 exists for)
+stops every door, on a commons blob and on a sealed community blob where a
+stranger is `NotGranted` first; **I150** — the same stored value (`None`,
+admitted out of order) yields opposite verdicts depending only on the
+authority re-derived now; **I151** — one live binding keeps the bytes;
+**I152** — the resolver returns the pointer shape, the `evidence_refs` shape,
+and an unreadable pointer; **I153** — `evict_blob` retracts before it deletes,
+a retry is a no-op. Mutation round: **11 mutants — 9 killed, M1 killed on the third round after a code correction (the redundant rule-1/2 pre-filter that hid it is gone), M2 equivalent** (`FSD/BYTES_PLANE_TOMBSTONE.md` §5.1).
+
 ## [47.1.0] - 2026-09-23
 
 ### Fixed — both membership-removal doors are idempotent on their PK, on every backend (CIRISPersist#861)

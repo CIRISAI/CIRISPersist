@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 92 delegations, generated. Every one: fault first, then delegate.
+// 93 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -411,6 +411,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_attestations_for(attested_key_id).await
+    }
+    async fn list_attestations_referencing(
+        &self,
+        target_attestation_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        if let Some(e) = self.faulted("list_attestations_referencing") {
+            return Err(e);
+        }
+        self.inner
+            .list_attestations_referencing(target_attestation_id)
+            .await
     }
     async fn list_attestations_since(
         &self,

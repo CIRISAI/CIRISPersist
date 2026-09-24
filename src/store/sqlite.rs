@@ -5381,6 +5381,44 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_for: {e}")))
     }
 
+    async fn list_attestations_referencing(
+        &self,
+        target_attestation_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v47.2.0 (#853) — keyed on the envelope's `references_attestation_id`
+        // (the V141-preserved `federation_attestations_composer_ref` index
+        // carries that extraction).
+        let target = target_attestation_id.to_owned();
+        // The DISCRIMINATOR rides beside the reference (CC 4.5.1.1 op-separation):
+        // only the three structural composers, named by the emitting ops.
+        use crate::federation::types::attestation_type;
+        let composers = [
+            attestation_type::WITHDRAWS,
+            attestation_type::RECANTS,
+            attestation_type::SUPERSEDES,
+        ];
+        self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                            weight, asserted_at, expires_at, attestation_envelope, \
+                            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                 FROM federation_attestations \
+                 WHERE tier = 'federation' \
+                   AND attestation_type IN (?2, ?3, ?4) \
+                   AND json_extract(attestation_envelope, '$.references_attestation_id') = ?1 \
+                 ORDER BY asserted_at DESC",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![target, composers[0], composers[1], composers[2]],
+                sqlite_row_to_attestation,
+            )?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_referencing: {e}")))
+    }
+
     async fn list_attestations_by(
         &self,
         attesting_key_id: &str,

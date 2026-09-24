@@ -783,6 +783,8 @@ pub mod orchestrate {
         };
         // 2. AUTHORIZE BY TIER, BEFORE TOUCHING ANY BODY (§11.3 / I4).
         authorize_viewer_by_tier(backend, sha256, head.crypto_tier, viewer_key_id).await?;
+        // 2½. CC 2.3 at the bytes plane (v47.2.0, #853) — after authorization.
+        crate::federation::at_rest_cascade::refuse_if_withdrawn(backend, sha256).await?;
         // 3. Dispatch on the columns.
         match (head.storage_kind.as_str(), head.crypto_tier) {
             ("s3" | "external_url", _) => Err(BlobError::InvalidArgument(format!(

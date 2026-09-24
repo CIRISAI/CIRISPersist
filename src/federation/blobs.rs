@@ -2827,6 +2827,15 @@ pub trait BlobStorage: Send + Sync {
     ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 }
 
+/// v47.2.0 (CIRISPersist#862) — what [`Engine::evict_blob`](crate::Engine::evict_blob) did for one sha.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictBlobReport {
+    /// This node's `holds_bytes` claims retracted (a `withdraws` each).
+    pub withdraws_emitted: usize,
+    /// Whether a blob row was deleted (false: nothing was held).
+    pub blob_deleted: bool,
+}
+
 /// v3.5.0 (CIRISPersist#125) — outcome of
 /// [`BlobStorage::evict_actor`].
 ///
@@ -3387,6 +3396,27 @@ pub enum BlobError {
         /// The at-rest SHA-256 of the blob that did not open.
         sha256_hex: String,
     },
+    /// v47.2.0 (CIRISPersist#853, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.5) — CC
+    /// 2.3 at the bytes plane: EVERY row binding these bytes is retired by a
+    /// `withdraws` whose authority this node re-derived at read time against
+    /// the target it holds now (never the stored `withdraws_admission_rule`).
+    /// Distinct from [`Self::NotHeld`] ("ask another holder"): trying another
+    /// peer will not help, which is what edge's `MissReason::Withdrawn` says.
+    /// Reachable only AFTER authorization on the viewer doors (a stranger is
+    /// `NotGranted`); the serve door has no viewer and names only what a peer
+    /// holding the rows already sees.
+    #[error(
+        "blob {sha256_hex} is withdrawn: its binding row {attestation_id} was retired by \
+         {withdraws_id} (CC 2.3 at the bytes plane)"
+    )]
+    Withdrawn {
+        /// Hex-encoded at-rest SHA-256 the read targeted.
+        sha256_hex: String,
+        /// The last live binding row, now retired.
+        attestation_id: String,
+        /// The `withdraws` (or `recants`) that retired it, re-derived now.
+        withdraws_id: String,
+    },
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -3413,6 +3443,7 @@ impl BlobError {
             BlobError::Evicted { .. } => "blob_evicted",
             BlobError::NotPartyTo { .. } => "blob_not_party_to",
             BlobError::SealDidNotOpen { .. } => "blob_seal_did_not_open",
+            BlobError::Withdrawn { .. } => "blob_withdrawn",
             BlobError::Backend(_) => "blob_backend",
         }
     }

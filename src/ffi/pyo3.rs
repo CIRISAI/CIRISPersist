@@ -32575,6 +32575,11 @@ async fn reverse_quorum_by_action_id(
 /// Shape: `"{kind}: {token} (retry_after_seconds={n})"`. `kind` and `token` are
 /// both program constants; the parentheses and the word order are not, and no
 /// consumer should parse them positionally.
+/// v47.2.0 (CIRISPersist#853) — `"blob_withdrawn: <sha>"`.
+fn withdrawn_message(kind: &str, sha256_hex: &str) -> String {
+    format!("{kind}: {sha256_hex}")
+}
+
 /// v47.1.0 (CIRISPersist#842) — `"blob_seal_did_not_open: <sha>"`: the host
 /// keys on the leading token (never the prose) and learns WHICH blob did not
 /// open, so it can look at that row's associated data.
@@ -33184,6 +33189,12 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // `match="blob_backend"` pin is the one thing that breaks — by design.
         crate::federation::BlobError::SealDidNotOpen { ref sha256_hex } => {
             PyRuntimeError::new_err(seal_did_not_open_message(kind, sha256_hex))
+        }
+        // v47.2.0 (CIRISPersist#853) — a refusal after authorization keeps
+        // RuntimeError (the SealDidNotOpen precedent); the token is what a host
+        // keys on, the sha says which blob.
+        crate::federation::BlobError::Withdrawn { ref sha256_hex, .. } => {
+            PyRuntimeError::new_err(withdrawn_message(kind, sha256_hex))
         }
         // v43.0.0 (I17) — a rotation landed mid-write; the cascade re-seals,
         // so a caller sees this only if every retry lost the race.
@@ -34816,6 +34827,20 @@ mod tests {
     /// distinctness assertion is what makes that real — 16 messages that all
     /// carry *a* token but not a *distinguishing* one would satisfy a
     /// per-variant `contains` check and still leave the caller guessing.
+    /// v47.2.0 (CIRISPersist#853) — the withdrawn token and the blob reach the host.
+    #[test]
+    fn withdrawn_message_names_the_token_and_the_blob_853() {
+        let e = crate::federation::BlobError::Withdrawn {
+            sha256_hex: "cd".repeat(32),
+            attestation_id: "row".into(),
+            withdraws_id: "w".into(),
+        };
+        assert_eq!(
+            withdrawn_message(e.kind(), &"cd".repeat(32)),
+            format!("blob_withdrawn: {}", "cd".repeat(32))
+        );
+    }
+
     /// v47.1.0 (CIRISPersist#842) — the seal-did-not-open token and the blob it
     /// names reach the host.
     #[test]

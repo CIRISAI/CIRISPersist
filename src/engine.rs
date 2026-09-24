@@ -7163,6 +7163,12 @@ impl Engine {
                 });
             }
         }
+        // 3. CC 2.3 AT THE BYTES PLANE (v47.2.0, #853, FSD §3.4) — every row
+        //    binding these bytes retired by a re-derived withdraws ⇒
+        //    `Withdrawn`, which edge's `MissReason::Withdrawn` carries and the
+        //    swarm aborts on. NEVER `NotHeld` — that means "ask another
+        //    holder" and walks the fetcher around the mesh.
+        crate::federation::at_rest_cascade::refuse_if_withdrawn(directory.as_ref(), sha256).await?;
         Ok(())
     }
 
@@ -7308,6 +7314,48 @@ impl Engine {
             BackendDispatch::Postgres(arc) => arc.list_held_by(attesting_key_id).await,
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => arc.list_held_by(attesting_key_id).await,
+        }
+    }
+
+    /// v47.2.0 (CIRISPersist#862, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.6) — evict
+    /// ONE sha in the sweep's order: retract this node's live `holds_bytes`
+    /// claims (a hybrid-signed federation-tier `withdraws` each), THEN delete
+    /// the bytes. I18's contract verbatim: a retraction that cannot be admitted
+    /// ABORTS — bytes and binding stay, the error propagates; a retry after a
+    /// partial failure never double-retracts (the directory's retraction fold at
+    /// write, #502 E7). A sha this node never announced has nothing to retract
+    /// and is deleted directly; the report says which happened.
+    ///
+    /// This door does not decide WHETHER to evict — that is the caller's (edge's
+    /// converger on `Revoked`, an operator, the retention sweep); a caller that
+    /// wants "evict because withdrawn" asks
+    /// [`blob_tombstone::binding_state`](crate::federation::blob_tombstone::binding_state)
+    /// first.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_blob(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError> {
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "evict_blob requires a LocalSigner to hybrid-sign federation-tier withdraws \
+                 (CC 5.3.2.4.3.1); this Engine has none (constructed via from_shared)"
+                    .to_string(),
+            )
+        })?;
+        let node = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("evict_blob signer: {e}"))
+        })?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                evict_blob_on(arc.as_ref(), &node, signer, sha256, now).await
+            }
         }
     }
 
@@ -20951,4 +20999,63 @@ mod register_self_canonicalizer_parity {
              fixture, or the assertion above is vacuous"
         );
     }
+}
+
+/// The body of [`Engine::evict_blob`], generic over the backend.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn evict_blob_on<B>(
+    backend: &B,
+    node: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    use crate::federation::{BlobError, EvictBlobReport};
+    let sha_hex = hex::encode(sha256);
+    let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+    let mine = backend
+        .list_attestations_by(node)
+        .await
+        .map_err(|e| BlobError::Backend(format!("evict_blob: list claims: {e}")))?;
+    // A retry after a partial failure must find nothing to retract: the
+    // node's own earlier withdraws is in `mine`, so fold it (the same
+    // `retired_ids` every retraction reader uses) and skip retired claims.
+    let retired = {
+        let refs: Vec<&crate::federation::Attestation> = mine.iter().collect();
+        crate::federation::precedence::retired_ids(&refs)
+    };
+    let claims: Vec<_> = mine
+        .into_iter()
+        .filter(|a| {
+            !retired.contains(&a.attestation_id)
+                && a.attestation_type.starts_with(prefix)
+                && a.attestation_envelope
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    == Some(sha_hex.as_str())
+        })
+        .collect();
+    let mut report = EvictBlobReport::default();
+    for prior in &claims {
+        // RETRACT FIRST. A refused retraction aborts: bytes and binding stay.
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            prior, node, signer, backend, now,
+        )
+        .await
+        .map_err(|e| {
+            BlobError::Backend(format!(
+                "evict_blob: the withdraws for {} was not admitted — eviction ABORTED, the \
+                     bytes stay (I18): {e}",
+                prior.attestation_id
+            ))
+        })?;
+        report.withdraws_emitted += 1;
+    }
+    report.blob_deleted = backend.delete_blob(sha256).await?;
+    Ok(report)
 }
