@@ -31852,7 +31852,11 @@ mod tests {
             },
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
@@ -39360,11 +39364,12 @@ mod tests {
         backend.run_migrations().await.unwrap();
         use crate::federation::FederationDirectory;
         let key_id = format!("pg-non-ah-§102-{}", uuid_like());
-        let key = pg_admission_key(
+        let mut key = pg_admission_key(
             &key_id,
             "registry",
             crate::federation::types::identity_type::STEWARD,
         );
+        key.attestation_evidence = None; // the leg under test: a software-class non-accord_holder
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record: key })
             .await
@@ -41892,7 +41897,11 @@ mod tests {
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -42181,7 +42190,11 @@ mod tests {
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -42899,7 +42912,11 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }

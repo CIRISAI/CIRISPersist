@@ -10135,7 +10135,11 @@ pub mod pqc_attach_test_support {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -18205,7 +18209,11 @@ mod canonical_gate_tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
@@ -19079,6 +19087,7 @@ mod canonical_gate_tests {
         ] {
             let mut rec = record(kid, &ident, kid);
             rec.capability_roles = roles;
+            rec.attestation_evidence = None; // the leg under test: an unattested accord_holder claim
             let err = backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await
@@ -19470,7 +19479,11 @@ mod canonical_withdrawal_tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
@@ -20631,7 +20644,8 @@ pub(crate) mod r2_test_support {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 capability_roles: Vec::new(),
-                attestation_evidence: None,
+                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             },
@@ -22302,7 +22316,8 @@ pub(crate) mod steward_liveness_test_support {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 capability_roles: Vec::new(),
-                attestation_evidence: None,
+                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             },
@@ -24293,7 +24308,8 @@ pub(crate) mod ungated_doors_test_support {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 capability_roles: Vec::new(),
-                attestation_evidence: None,
+                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             },
@@ -25142,7 +25158,8 @@ pub(crate) mod ungated_doors_test_support {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 capability_roles: Vec::new(),
-                attestation_evidence: None,
+                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             }

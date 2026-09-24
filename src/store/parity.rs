@@ -129,6 +129,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("acquire_migration_lock", Class::Delegates),
     ("add", Class::Plumbing),
     ("admission_gate", Class::Plumbing),
+    // v47.3.0 (#901) — the one key-admission door predicate (structure for
+    // every evidence-carrying row, + freshness for an accord_holder).
+    ("admit_key_record", Class::Gate),
     ("admit_witness", Class::Gate),
     ("aggregation_record_from_row", Class::Delegates),
     ("all_kind_hash_keys", Class::Plumbing),

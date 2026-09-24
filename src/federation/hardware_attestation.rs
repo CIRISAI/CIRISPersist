@@ -994,6 +994,7 @@ pub mod test_support {
     /// `max_nonce_age`. Tests exercising the stale arm build their own value
     /// with a back-dated `nonce_captured_at`.
     pub fn fresh_accord_holder_evidence() -> serde_json::Value {
+        use chrono::Timelike as _;
         serde_json::json!({
             "platform_attestation": {
                 "Android": {
@@ -1005,7 +1006,16 @@ pub mod test_support {
                     "strongbox_backed": true,
                 }
             },
-            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+            // v47.3.0 (CIRISPersist#901) — the instant is quantized to the
+            // hour: still fresh (≤24h), and byte-stable within a test, so a
+            // fixture that registers the same synthetic identity twice puts
+            // the SAME record (a re-put with a fresher nonce is a Conflict).
+            "nonce_captured_at": chrono::Utc::now()
+                .with_minute(0)
+                .and_then(|t| t.with_second(0))
+                .and_then(|t| t.with_nanosecond(0))
+                .expect("a whole hour is a valid instant")
+                .to_rfc3339(),
         })
     }
 
@@ -1013,10 +1023,11 @@ pub mod test_support {
     /// claims `accord_holder` (on either role surface — scalar set form or
     /// the `roles` vector, i.e. `KeyRecord::claims_role`). A no-op for every
     /// other row, so a fixture builder can call it unconditionally.
-    pub fn attach_accord_holder_evidence(row: &mut crate::federation::types::KeyRecord) {
-        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
-            row.attestation_evidence = Some(fresh_accord_holder_evidence());
-        }
+    pub fn attach_hardware_evidence(row: &mut crate::federation::types::KeyRecord) {
+        // v47.3.0 (CIRISPersist#901, FSD §3.6) — every row, not only an
+        // accord_holder: a valid root is as attested as its holders, and any
+        // fixture key may be seated or stand as a Key-kind root.
+        row.attestation_evidence = Some(fresh_accord_holder_evidence());
     }
 }
 

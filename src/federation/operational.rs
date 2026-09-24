@@ -1433,7 +1433,8 @@ pub mod test_support {
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 capability_roles: Vec::new(),
-                attestation_evidence: None,
+                // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+                attestation_evidence: Some(crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence()),
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             }
@@ -1754,7 +1755,11 @@ pub mod test_support {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: scrub_sigs[1..].to_vec(),
         }
@@ -1876,7 +1881,11 @@ pub mod test_support {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         };
@@ -2126,14 +2135,14 @@ pub mod test_support {
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         let now = chrono::Utc::now();
         // An `accord_holder` registration hits the #513 hardware-attestation
-        // gate on sqlite/postgres (MemoryBackend skips it — the #534/#536 trap
-        // again). Supply the established mock Android-StrongBox evidence with a
-        // FRESH nonce: the gate validates shape + freshness (≤24h), not a real
-        // cert chain, so this is the accepted test path for standing up an
-        // accord_holder on every backend.
-        let attestation_evidence = (identity_type
-            == crate::federation::types::identity_type::ACCORD_HOLDER)
-            .then(|| strongbox_evidence(now));
+        // gate on every backend: the established mock Android-StrongBox
+        // evidence with a FRESH nonce passes shape + freshness (≤24h).
+        // v47.3.0 (CIRISPersist#901, FSD §3.6) — EVERY synthetic identity
+        // carries it: a valid root is defined by its holders' attested
+        // hardware, and any key this helper registers may be seated as a
+        // charter holder or stand as a Key-kind root. A fixture that wants an
+        // unattested key says so through `register_typed_key_with_evidence`.
+        let attestation_evidence = Some(strongbox_evidence(now));
         let rec = crate::federation::types::KeyRecord {
             key_id: key_id.to_owned(),
             pubkey_ed25519_base64: ed_pk,

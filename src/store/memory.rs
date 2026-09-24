@@ -11090,7 +11090,11 @@ mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // v47.3.0 (#901, FSD §3.6) — every synthetic identity is hardware-attested.
+            attestation_evidence: Some(
+                crate::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(
+                ),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
@@ -13232,6 +13236,7 @@ mod tests {
         // (a) scalar `identity_type = accord_holder`, NO evidence → REJECT.
         let mut k = fix_key("mem-ah-no-ev", "humanity-accord-x", "mem-ah-no-ev");
         k.identity_type = ACCORD_HOLDER.into();
+        k.attestation_evidence = None; // the leg under test: an unattested accord_holder
         let err = backend
             .put_public_key(SignedKeyRecord { record: k })
             .await
@@ -13254,6 +13259,7 @@ mod tests {
         //     scalar — `claims_role`, not string equality.
         let mut k = fix_key("mem-ah-setform", "humanity-accord-x", "mem-ah-setform");
         k.identity_type = format!("agent,{ACCORD_HOLDER}");
+        k.attestation_evidence = None; // the set-form claim, still unattested
         let err = backend
             .put_public_key(SignedKeyRecord { record: k })
             .await
@@ -13267,6 +13273,7 @@ mod tests {
         // (c) #441 ROLES-vector form hits it too.
         let mut k = fix_key("mem-ah-roles", "humanity-accord-x", "mem-ah-roles");
         k.capability_roles = vec![ACCORD_HOLDER.to_string()];
+        k.attestation_evidence = None; // the roles-vector claim, still unattested
         let err = backend
             .put_public_key(SignedKeyRecord { record: k })
             .await
@@ -14788,7 +14795,7 @@ mod tests {
             // same `accord_holder` hardware gate sqlite/postgres do, so an
             // `accord_holder` fixture must carry real evidence. No-op for
             // every other identity_type.
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
@@ -14923,7 +14930,7 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
@@ -15065,7 +15072,7 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
@@ -15483,7 +15490,7 @@ mod tests {
             // same `accord_holder` hardware gate sqlite/postgres do, so an
             // `accord_holder` fixture must carry real evidence. No-op for
             // every other identity_type.
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
@@ -15565,7 +15572,7 @@ mod tests {
             // same `accord_holder` hardware gate sqlite/postgres do, so an
             // `accord_holder` fixture must carry real evidence. No-op for
             // every other identity_type.
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
@@ -15788,7 +15795,7 @@ mod tests {
             // same `accord_holder` hardware gate sqlite/postgres do, so an
             // `accord_holder` fixture must carry real evidence. No-op for
             // every other identity_type.
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
@@ -20740,7 +20747,7 @@ mod tests {
             // same `accord_holder` hardware gate sqlite/postgres do, so an
             // `accord_holder` fixture must carry real evidence. No-op for
             // every other identity_type.
-            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            crate::federation::hardware_attestation::test_support::attach_hardware_evidence(
                 &mut rec,
             );
             backend
