@@ -81,7 +81,31 @@ The sweep's own sequence for one sha, public: for each of **this node's** live `
 - **I152 — the resolver sees the pointer shape.** `attestations_binding_content(sha)` returns a row whose only reference is a `BlobPointer` member (no `evidence_refs`), on all three backends, and still returns the `evidence_refs` shape; an unreadable pointer member at that sha counts as binding.
 - **I153 — `evict_blob` retracts before it deletes, and aborts on a refused retraction.** After `evict_blob`: exactly one `withdraws` by this node naming its `holds_bytes` row, the bytes gone, `list_holders` no longer naming this node. With the withdraws made inadmissible (the I18 shape): bytes and binding stay, `Err`. A second `evict_blob` after success: no second withdraws, `Ok`, report says nothing was held.
 
-Mutants planned: the fold reads the stored rule instead of re-deriving (I150 red); `Unbound` treated as `Withdrawn` (every pre-#853 read red); the serve door answers `NotHeld` (I149 serve leg red); `evict_blob` deletes before the withdraws (I153's abort leg red); the resolver drops the pointer shape (I152 red, and I149 cannot find its row); an unreadable pointer counts as not binding (I152 red); the read-path check moved before authorization (I149's stranger leg red: `Withdrawn` leaks to a stranger).
+Mutants planned (outcomes in §5.1): the fold reads the stored rule instead of re-deriving (I150 red); `Unbound` treated as `Withdrawn` (every pre-#853 read red); the serve door answers `NotHeld` (I149 serve leg red); `evict_blob` deletes before the withdraws (I153's abort leg red); the resolver drops the pointer shape (I152 red, and I149 cannot find its row); an unreadable pointer counts as not binding (I152 red); the read-path check moved before authorization (I149's stranger leg red: `Withdrawn` leaks to a stranger).
+
+### 5.1 Mutation round — 11 mutants: 9 killed, 1 killed on the third round after a code correction, 1 equivalent
+
+Run under `scripts/pg_test_db.sh`.
+
+| # | Mutant | Verdict |
+|---|--------|---------|
+| M1 | the fold trusts the STORED `withdraws_admission_rule` | **survived rounds one and two**, then KILLED — see below |
+| M2 | a re-derived `Ok(None)` is treated as retiring | **equivalent** — see below |
+| M3 | `Unbound` is treated as `Withdrawn` (every pre-#853 read refused) | KILLED — I149, I40, I42 |
+| M4 | one withdrawn binding retires the bytes (`Live` requires all live) | KILLED — I149, I150, I151 |
+| M5 | the serve door answers `NotHeld` for withdrawn bytes | KILLED — I149 |
+| M6 | the tombstone is checked BEFORE authorization | KILLED — I149 (a stranger saw `Withdrawn`) |
+| M7 | the resolver drops the pointer shape | KILLED — I150, I152 |
+| M8 | an unreadable pointer counts as not binding | KILLED — I152 |
+| M9 | `evict_blob` deletes before it retracts | **survived round one**, then KILLED — I153's abort leg |
+| M10 | `evict_blob` retracts retired claims again on a retry | KILLED — I153 |
+| M11 | the Python message drops the blob | KILLED — the boundary pin |
+
+**M1** survived twice, and the second survival was the useful one. Round one: I150's entitled withdraws had landed *after* its target, so it was stored with rule 2 and the stored-rule fold agreed with the real one; the witness was corrected to land both withdraws before their targets (stored `None`). Round two: it still survived, because the fold's pre-filter re-spelled rules 1 and 2 from the target's own fields *beside* the re-derivation, so a subject's withdraws was entitled either way and the stored rule was never asked. That pre-filter was a second predicate for the same fact — the class #893 and #897 were about — and it was hiding the mutant. It is gone: `check_withdraws_admission` is the fold's only authority. Round three killed M1′ through I150/A.
+
+**M2** is equivalent: it changes the `Ok(None)` arm of the re-derivation, but at read time the binding row *is* the target, so the target is local by construction and never a `holds_bytes` row — the re-derivation returns `Ok(Some(_))` or `Err(WithdrawsNotAdmitted)`, never `Ok(None)`. The hazard the mutant was written for (a deferred `None` read as retired) is what I150/B measures, through the `Err` arm. Recorded rather than chased.
+
+**M9** survived round one because I153 had no refused-retraction leg; it now evicts with a `now` outside the admission skew (I18(b)'s shape) and asserts `Err`, bytes kept, claim kept.
 
 ## 5. Not in scope
 
