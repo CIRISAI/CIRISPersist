@@ -3972,9 +3972,104 @@ impl ServedCommunityMembershipRevocation {
     #[must_use]
     pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
         let r = &self.revocation.community_membership_revocation;
+        // v48.0.0 (#860) — the PK (and so the resume id) carries the instant:
+        // a re-added member can be removed again.
         (
             self.admitted_at,
-            compound_resume_id(&[&r.community_key_id, &r.removed_identity_key_id]),
+            compound_resume_id(&[
+                &r.community_key_id,
+                &r.removed_identity_key_id,
+                &r.effective_at.to_rfc3339(),
+            ]),
+        )
+    }
+}
+
+/// v48.0.0 (CIRISPersist#860, `FSD/ROOM_ROSTER_PLANES.md` §3.2) — one
+/// community-membership ADDITION: the append-plane mirror of
+/// [`CommunityMembershipRevocation`]. A room's roster is the fold of its
+/// record plus these two planes, by `effective_at`; the record itself is
+/// never rewritten to grow (a rewritten record is a fork at every peer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityMembershipWidening {
+    /// The room (`federation_communities.community_key_id` — a keyless id).
+    pub community_key_id: String,
+    /// The member being added — a `federation_keys.key_id`.
+    pub member_key_id: String,
+    /// The member's `joined_at` as it will read on the roster.
+    pub joined_at: DateTime<Utc>,
+    /// When the addition takes effect in the fold (`effective_at <= now`).
+    pub effective_at: DateTime<Utc>,
+    /// The member's role on the roster, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+impl CommunityMembershipWidening {
+    /// The signed preimage: the row minus `persist_row_hash` (the
+    /// revocation's discipline).
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v =
+            serde_json::to_value(self).expect("CommunityMembershipWidening always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+
+    /// The roster entry this widening admits.
+    #[must_use]
+    pub fn member(&self) -> CommunityMember {
+        CommunityMember {
+            key_id: self.member_key_id.clone(),
+            joined_at: self.joined_at,
+            role: self.role.clone(),
+        }
+    }
+}
+
+/// A SIGNED [`CommunityMembershipWidening`] — the mirror of
+/// [`SignedCommunityMembershipRevocation`]: the hybrid scrub under
+/// `authority_key_id` over the canonical [`CommunityMembershipWidening::signing_envelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedCommunityMembershipWidening {
+    /// The addition itself.
+    pub community_membership_widening: CommunityMembershipWidening,
+    /// The signer — a registered key the E4 policy binds to the room.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 over the canonical envelope.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 over canonical ‖ ed_sig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
+}
+
+/// A served [`SignedCommunityMembershipWidening`] with THIS node's serve
+/// position — the mirror of [`ServedCommunityMembershipRevocation`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedCommunityMembershipWidening {
+    /// The signed row, unchanged.
+    pub widening: SignedCommunityMembershipWidening,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedCommunityMembershipWidening {
+    /// The `(admitted_at, compound id)` pair a caller resumes from.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let w = &self.widening.community_membership_widening;
+        (
+            self.admitted_at,
+            compound_resume_id(&[
+                &w.community_key_id,
+                &w.member_key_id,
+                &w.effective_at.to_rfc3339(),
+            ]),
         )
     }
 }

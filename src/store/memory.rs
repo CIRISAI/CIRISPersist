@@ -263,8 +263,12 @@ struct State {
     >,
     federation_family_membership_revocations:
         HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
-    federation_community_membership_revocations:
-        HashMap<(String, String), crate::federation::CommunityMembershipRevocation>,
+    /// v48.0.0 (#860) — keyed on the three-part PK `(room, member,
+    /// effective_at)`: a re-added member can be removed again.
+    federation_community_membership_revocations: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::CommunityMembershipRevocation,
+    >,
     /// v9.0.0 G5 (CC 4.4.3.2.2) — the community DEK rotation epoch
     /// counter, `community_key_id -> current epoch`. The DEK crypto itself
     /// (V087 grants) lives only on the at-rest BlobStorage backends
@@ -402,7 +406,7 @@ struct State {
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_community_membership_revocations`.
     federation_community_membership_revocation_authority_sigs:
-        HashMap<(String, String), AuthoritySig>,
+        HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_location_proofs`.
     federation_location_proof_authority_sigs:
@@ -6558,12 +6562,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         );
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
-            for k in [&row.family_key_id, &row.removed_identity_key_id] {
-                if !state.federation_keys.contains_key(k) {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "{k} does not exist in federation_keys"
-                    )));
-                }
+            // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
+            // GROUP table: a family / a room is a keyless identifier. The
+            // member is a key.
+            if !state.federation_families.contains_key(&row.family_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_families",
+                    row.family_key_id
+                )));
+            }
+            if !state
+                .federation_keys
+                .contains_key(&row.removed_identity_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.removed_identity_key_id
+                )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             let revocation_key = (
@@ -6656,12 +6671,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         )?;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
-            for k in [&row.community_key_id, &row.removed_identity_key_id] {
-                if !state.federation_keys.contains_key(k) {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "{k} does not exist in federation_keys"
-                    )));
-                }
+            // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
+            // GROUP table: a family / a room is a keyless identifier. The
+            // member is a key.
+            if !state
+                .federation_communities
+                .contains_key(&row.community_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    row.community_key_id
+                )));
+            }
+            if !state
+                .federation_keys
+                .contains_key(&row.removed_identity_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.removed_identity_key_id
+                )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             // Parity with pg/sqlite: the revocation table PK is
@@ -6671,9 +6700,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // with a unique-violation, against the trait's documented
             // idempotence — CIRISPersist#861; now all three accept it as a
             // no-op.)
+            // v48.0.0 (CIRISPersist#860) — the PK carries the instant: an exact
+            // repeat is still the #861 no-op; a removal at another instant is
+            // another event (a re-added member can be removed again).
             let revocation_key = (
                 row.community_key_id.clone(),
                 row.removed_identity_key_id.clone(),
+                row.effective_at,
             );
             // v47.1.0 (CIRISPersist#861) — pg/sqlite now honour the
             // documented idempotence (the unique index decides, a repeat
@@ -6710,9 +6743,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .or_insert(0) += 1;
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `revocation.*`.
+            let effective_at_rfc3339 = revocation_key.2.to_rfc3339();
             let wire_index_key = crate::federation::wire_index::record_key(&[
                 ("community_key_id", &revocation_key.0),
                 ("removed_identity_key_id", &revocation_key.1),
+                ("effective_at", &effective_at_rfc3339),
             ]);
             // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
             // signature the gate above already verified (was verified-then-
@@ -6736,6 +6771,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let resume = crate::federation::types::compound_resume_id(&[
                 &revocation_key.0,
                 &revocation_key.1,
+                &effective_at_rfc3339,
             ]);
             state
                 .federation_community_membership_revocations
@@ -6830,7 +6866,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .filter(|r| r.community_key_id == community_key_id)
             .cloned()
             .collect();
-        rows.sort_by(|a, b| a.removed_identity_key_id.cmp(&b.removed_identity_key_id));
+        rows.sort_by(|a, b| {
+            a.removed_identity_key_id
+                .cmp(&b.removed_identity_key_id)
+                .then_with(|| a.effective_at.cmp(&b.effective_at))
+        });
         Ok(rows)
     }
 
@@ -7749,6 +7789,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::federation::types::compound_resume_id(&[
                 &r.community_key_id,
                 &r.removed_identity_key_id,
+                &r.effective_at.to_rfc3339(),
             ])
         };
         let position = |r: &crate::federation::types::CommunityMembershipRevocation| {
@@ -7760,25 +7801,27 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )
         };
         let since_parts = since.as_ref().map(|(s_at, s_id)| {
-            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
-            (*s_at, a.to_owned(), b.to_owned())
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
         });
         let mut rows: Vec<_> = state
             .federation_community_membership_revocations
             .values()
             .filter(|r| {
-                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
                     (
                         position(r),
                         r.community_key_id.as_str(),
                         r.removed_identity_key_id.as_str(),
-                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                        r.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
                 })
             })
             .filter_map(|r| {
                 let key = (
                     r.community_key_id.clone(),
                     r.removed_identity_key_id.clone(),
+                    r.effective_at,
                 );
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_community_membership_revocation_authority_sigs
@@ -7802,6 +7845,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .cmp(&b.admitted_at)
                 .then_with(|| ar.community_key_id.cmp(&br.community_key_id))
                 .then_with(|| ar.removed_identity_key_id.cmp(&br.removed_identity_key_id))
+                .then_with(|| ar.effective_at.cmp(&br.effective_at))
         });
         rows.truncate(limit as usize);
         Ok(rows)

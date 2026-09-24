@@ -8909,7 +8909,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                 admitted_at\
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (community_key_id, removed_identity_key_id) DO NOTHING",
+             ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                 &[
                     &row.community_key_id,
                     &row.removed_identity_key_id,
@@ -8945,9 +8945,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // is repairable; an entry committed atomically with the WRONG hash is
         // permanent and silent, because nothing downstream can tell a stale
         // hash from a correct one.
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("community_key_id", &row.community_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
+            // v48.0.0 (#860) — a re-added member can be removed again: the
+            // instant is part of the row's identity.
+            ("effective_at", &effective_at_rfc3339),
         ]);
         // Idempotent on event_id.
         tx.execute(
@@ -10877,22 +10881,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
-        let (since_a, since_b) = match since.as_ref() {
+        // v48.0.0 (#860) — the resume id is the three-part PK.
+        let (since_a, since_b, since_c) = match since.as_ref() {
             Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
+                (Some(a.to_owned()), Some(b.to_owned()), c)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         let rows = client
             .query(
                 "SELECT * FROM cirislens.federation_community_membership_revocations \
                  WHERE ($1::timestamptz IS NULL OR \
-                        (admitted_at, community_key_id, removed_identity_key_id) > ($1, $2, $3)) \
+                        (admitted_at, community_key_id, removed_identity_key_id, effective_at) \
+                          > ($1, $2, $3, $4::timestamptz)) \
                    AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY admitted_at ASC, community_key_id ASC, removed_identity_key_id ASC \
-                 LIMIT $4",
-                &[&since_at, &since_a, &since_b, &limit],
+                 ORDER BY admitted_at ASC, community_key_id ASC, removed_identity_key_id ASC, \
+                          effective_at ASC \
+                 LIMIT $5",
+                &[&since_at, &since_a, &since_b, &since_c, &limit],
             )
             .await
             .map_err(|e| {

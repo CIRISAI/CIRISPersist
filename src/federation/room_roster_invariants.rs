@@ -88,10 +88,17 @@ pub mod bodies {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let (room, alice, bob) = keyless_room(b, tag).await;
-        let epoch_before = b
-            .community_dek_current_epoch(&room, &alice)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: epoch read: {e}"));
+        // The rotation is observed the way the lifecycle witnesses observe it:
+        // the minter's next seal lands at the next epoch.
+        let before = crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
+            b,
+            &room,
+            b"before",
+            None,
+            Some(&alice),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: seal before: {e}"));
         b.put_community_membership_revocation(ts::sign_community_membership_revocation(
             &alice,
             revocation(&room, &bob, at("2026-02-01T00:00:00Z")),
@@ -108,11 +115,24 @@ pub mod bodies {
             .map(|m| m.key_id)
             .collect();
         assert_eq!(active, vec![alice.clone()], "{tag} I163: bob is gone");
-        let epoch_after = b.community_dek_current_epoch(&room, &alice).await.unwrap();
+        let after = crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
+            b,
+            &room,
+            b"after",
+            None,
+            Some(&alice),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: seal after: {e}"));
         assert_eq!(
-            epoch_after,
-            epoch_before + 1,
+            after.epoch,
+            before.epoch + 1,
             "{tag} I163: the §15 rotation is reachable for a keyless room"
+        );
+        assert!(
+            !after.granted.iter().any(|g| g.contains(&bob)),
+            "{tag} I163: the rotated epoch is not wrapped for the removed member: {:?}",
+            after.granted
         );
 
         // The family twin: a keyless family (the doctrine) can revoke a seat.

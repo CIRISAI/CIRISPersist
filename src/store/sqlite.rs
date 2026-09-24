@@ -8309,9 +8309,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let node_key: Option<String> = self.node_key_id.read().expect("node_key_id lock").clone();
         // v21.1.0 (CIRISPersist#507b) — computed before the transaction
         // closure moves everything.
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("community_key_id", &row.community_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
+            // v48.0.0 (#860) — a re-added member can be removed again: the
+            // instant is part of the row's identity.
+            ("effective_at", &effective_at_rfc3339),
         ]);
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction
         // under a single lock acquisition: a bump failure after the INSERT
@@ -8343,7 +8347,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT (community_key_id, removed_identity_key_id) DO NOTHING",
+                 ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                     rusqlite::params![
                         row.community_key_id,
                         row.removed_identity_key_id,
@@ -10164,26 +10168,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::ServedCommunityMembershipRevocation>, crate::federation::Error>
     {
         let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let (since_a, since_b) = match since.as_ref() {
+        // v48.0.0 (#860) — the resume id is the three-part PK.
+        let (since_a, since_b, since_c) = match since.as_ref() {
             Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                (Some(a.to_owned()), Some(b.to_owned()), Some(c.to_owned()))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
             let mut stmt = conn.prepare(&format!(
                 "SELECT *, {pos} AS _pos FROM federation_community_membership_revocations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND \
                         (community_key_id > ?2 OR (community_key_id = ?2 \
-                         AND removed_identity_key_id > ?3)))) \
+                         AND (removed_identity_key_id > ?3 OR (removed_identity_key_id = ?3 \
+                         AND effective_at > ?4)))))) \
                    AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY {pos} ASC, community_key_id ASC, removed_identity_key_id ASC \
-                 LIMIT ?4",
+                 ORDER BY {pos} ASC, community_key_id ASC, removed_identity_key_id ASC, effective_at ASC \
+                 LIMIT ?5",
                 pos = POS_REMOVED,
             ))?;
             let rows = stmt.query_map(
-                rusqlite::params![since_at, since_a, since_b, limit],
+                rusqlite::params![since_at, since_a, since_b, since_c, limit],
                 |row| {
                     let pos: String = row.get("_pos")?;
                     Ok(crate::federation::ServedCommunityMembershipRevocation {
