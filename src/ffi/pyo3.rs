@@ -7320,7 +7320,10 @@ impl PyEngine {
                     }
                 };
                 let chain = result.map_err(|rej| {
-                    PyErr::new::<LensQueryError, _>(format!("provenance_chain: {}", rej.kind()))
+                    PyErr::new::<LensQueryError, _>(format!(
+                        "provenance_chain: {}: {rej:?}",
+                        rej.kind()
+                    ))
                 })?;
                 serde_json::to_string(&chain).map_err(|e| {
                     PyRuntimeError::new_err(format!("ProvenanceChain JSON encode: {e}"))

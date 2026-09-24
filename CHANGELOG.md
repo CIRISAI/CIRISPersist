@@ -7,6 +7,72 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.4.0] - 2026-09-24
+
+### Added — the test-anchor block minter lives in persist (CIRISPersist#805; FSD `TEST_ANCHOR_BLOCK_MINTER.md`)
+Three consumers each rolled a minter for the six-value `CIRIS_TEST_TRUST_ROOT*`
+block; one signed a two-key literal that had **never** rooted, and nothing at
+boot could tell — the failure surfaced months later, on adoption day, as
+`rooting_unsigned_provenance_link` with the detail produced and dropped.
+There is exactly one correct block per persist+verify pair (the envelope shape
+and the canonicalization are persist's; the primitives are the pinned
+verify's), and persist is the only party that knows it.
+
+- **The minter** (`federation::genesis`, `test-anchor`-gated):
+  `mint_test_anchor_block(&[ed_seed; N]) → TestAnchorBlock { holders, minted_by }`,
+  `TestAnchorBlock::env_pairs()` / `compose_lines()`, `test_anchor_mldsa_seed`
+  (persist now owns the `ciris-test-trust-root/mldsa/v1` domain both
+  consumers derived with), `decode_seed_b64`, `TEST_ANCHOR_SHARED_SEED_B64`
+  (the seed every harness carries). Pure: Ed25519 from the seed, ML-DSA-65
+  from the derived seed, persist's own `test_anchor_registration_envelope`,
+  `ceg_produce_canonicalize`, `ed.sign(canonical)`,
+  `mldsa.sign(canonical ‖ ed_sig)`. **I159 pins it to the block in
+  CIRISServer's `harness/mesh-repro/docker-compose.yml` byte-for-byte** on
+  the Ed25519 side (pubkey and scrub) and by SHA-256 on the ML-DSA pubkey —
+  one answer per pair, and it is the one the harnesses already run.
+- **`cargo run --example mint_test_anchor --features test-anchor [seed_b64…]`**
+  prints the compose block; no argument mints the shared seed.
+- **The seventh value:** `CIRIS_TEST_TRUST_ROOT_MINTED_BY: "persist vX / verify vY"`,
+  from `test_anchor_minted_by()` — persist's `CARGO_PKG_VERSION` and the
+  `ciris-verify-core` tag parsed from persist's own `Cargo.toml` at first use,
+  never a typed string (I162 proves a literal is caught at the next bump).
+- **What the seeder says at boot** (`test_anchor_genesis_records`, target
+  `ciris_persist::test_anchor`): a supplied scrub is hybrid-verified over
+  persist's canonical envelope under the running pair (`Strict` — the policy
+  the rooting walk holds, so the boot line predicts the walk); when it does
+  not verify, one `warn!` names the slot, verify's detail, the running pair
+  and the re-mint command. The record is still seeded — the walk is the gate,
+  the seeder reports. A `_MINTED_BY` that differs from the running pair earns
+  one advisory `warn!` naming both; an untagged block (every one that predates
+  the tag) is not scolded.
+- **The rejection detail is logged where the verdict is produced:**
+  `root_binding_anchored` now emits one `warn!` on `ciris_persist::rooting`
+  with `key_id`, `kind` and the full rejection (the failing link and verify's
+  text) whenever it returns `Rejected` — every caller (announce-admit, the
+  FFI, a consumer's pin) gets the line for free. The Python
+  `provenance_chain` error keeps its `provenance_chain: <kind>` prefix and
+  appends the rejection.
+
+**Witnesses:** I159 (in-crate, pure) — the minter reproduces the consumers'
+block; two holders → comma-joined slots; seven compose lines in order.
+I160–I162 (`tests/test_anchor_block_805.rs`, its own process per the #738
+rule) — a minted block seeds one record that verifies, says nothing at boot,
+and `root_binding` is `Confirmed` with no rooting line; the SAME keys over
+CIRISServer's old two-key literal (Ed25519 is deterministic — that IS the
+stale block) earn one boot line with `key_id`, `detail` and the fix, and
+`root_binding` is `Rejected { UnsignedProvenanceLink { detail: "… did not
+verify" } }` with one line on the rooting target carrying kind and detail; the
+minted-by tag is silent when equal or absent and names both pairs when
+different. Mutation round: **10 mutants, 10 killed** (`FSD/TEST_ANCHOR_BLOCK_MINTER.md`
+§5.1).
+
+**For adopters.** Delete your minter (CIRISEdge `tests/anchor_block_generate.rs`;
+CIRISServer's remnants) and re-mint with the example; keep CIRISServer's
+`tests/anchor_block_verifies.rs` pin — it now also gets the rejection line.
+Add the seventh line to your compose blocks. Nothing else moves: the six
+existing values for the shared seed are unchanged under persist v47.4.0 /
+verify v16.1.0.
+
 ## [47.3.0] - 2026-09-24
 
 ### Added — a valid root is as attested as its holders: the holder-hardware leg of `trust_root_valid` (CIRISPersist#901; FSD `TRUST_ROOT_HOLDER_HARDWARE.md`)
