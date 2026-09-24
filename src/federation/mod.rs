@@ -110,6 +110,9 @@ pub mod blob_tombstone;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bytes_plane_tombstone_invariants;
+/// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
+#[cfg(test)]
+pub mod room_roster_invariants;
 /// v47.0.0 (CIRISPersist#897, #796, #797) — one scope, one question, every
 /// gate: I145 / I147 (`FSD/SCOPE_CLASSIFIER.md` §5).
 pub mod scope_classifier_invariants;

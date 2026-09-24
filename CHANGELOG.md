@@ -7,6 +7,12 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [48.0.0] - 2026-09-24
+
+### Changed — a room's roster converges both ways (CIRISPersist#860; FSD `ROOM_ROSTER_PLANES.md`)
+
+(section written at ship time)
+
 ## [47.4.0] - 2026-09-24
 
 ### Added — the test-anchor block minter lives in persist (CIRISPersist#805; FSD `TEST_ANCHOR_BLOCK_MINTER.md`)
