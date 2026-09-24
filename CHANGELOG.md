@@ -7,6 +7,11 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [47.2.0] - 2026-09-24
+
+### Added — CC 2.3 at the bytes plane (CIRISPersist#853, #862)
+In progress — see `FSD/BYTES_PLANE_TOMBSTONE.md`.
+
 ## [47.1.0] - 2026-09-23
 
 ### Fixed — both membership-removal doors are idempotent on their PK, on every backend (CIRISPersist#861)

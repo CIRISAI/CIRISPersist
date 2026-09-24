@@ -105,6 +105,11 @@ pub mod epoch_minter_invariants;
 pub mod self_collective;
 // CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
 // delivered, not discovered — the send set, the re-grant doors, the minter read.
+/// v47.2.0 (CIRISPersist#853) — CC 2.3 at the bytes plane: the binding fold.
+pub mod blob_tombstone;
+/// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod bytes_plane_tombstone_invariants;
 /// v47.0.0 (CIRISPersist#897, #796, #797) — one scope, one question, every
 /// gate: I145 / I147 (`FSD/SCOPE_CLASSIFIER.md` §5).
 pub mod scope_classifier_invariants;
@@ -391,11 +396,12 @@ pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
     BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow, BlobRange, BlobStorage,
-    ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport, ExternalRef,
-    GrantWrap, GroupDekRef, ManifestRowSpec, MemberGrant, PreparedHoldsBytes, PutBlobAttestation,
-    PutBlobScopedResult, RosterPartition, ScopeBlobSymbol, StorageFloor, StreamChunkRef,
-    StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
-    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport,
+    EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestRowSpec, MemberGrant,
+    PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
+    StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION,
+    CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX,
+    HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;

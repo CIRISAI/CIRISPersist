@@ -7311,6 +7311,21 @@ impl Engine {
         }
     }
 
+    /// v47.2.0 (CIRISPersist#862, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.6) — evict
+    /// ONE sha in the sweep's order: retract this node's `holds_bytes` claim,
+    /// THEN delete the bytes. RED-CHECKPOINT SKELETON: refuses.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_blob(
+        &self,
+        sha256: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError> {
+        let _ = (sha256, now);
+        Err(crate::federation::BlobError::Backend(
+            "evict_blob: not implemented (v47.2.0 RED checkpoint)".into(),
+        ))
+    }
+
     /// v3.5.0 (CIRISPersist#125) — Engine-facade for
     /// [`BlobStorage::evict_actor`](crate::federation::BlobStorage::evict_actor).
     /// Sources the signer from `self.signer()` and delegates to the
