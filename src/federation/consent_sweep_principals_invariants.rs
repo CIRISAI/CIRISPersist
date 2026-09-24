@@ -456,7 +456,9 @@ mod run {
     }
 }
 
-#[cfg(test)]
+// Only I168 (sqlite) drives the engine through this; keep the server-only
+// axis (`-D warnings`) free of a dead helper.
+#[cfg(all(test, feature = "sqlite"))]
 async fn bodies_put(
     d: &dyn crate::federation::FederationDirectory,
     a: crate::federation::Attestation,
