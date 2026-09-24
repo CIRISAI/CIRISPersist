@@ -1663,10 +1663,22 @@ pub fn is_owner_binding_envelope(envelope: &serde_json::Value) -> bool {
 /// [`FederationDirectory::attestations_binding_content`]: super::FederationDirectory::attestations_binding_content
 #[must_use]
 pub fn envelope_binds_content(envelope: &serde_json::Value, content_sha256: &str) -> bool {
-    envelope
+    let by_evidence = envelope
         .get("evidence_refs")
         .and_then(|v| v.as_array())
-        .is_some_and(|arr| arr.iter().any(|r| r.as_str() == Some(content_sha256)))
+        .is_some_and(|arr| arr.iter().any(|r| r.as_str() == Some(content_sha256)));
+    // v47.2.0 (CIRISPersist#862 part 2, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.1)
+    // — the OTHER reference shape: a typed `BlobPointer` member (edge's chat
+    // rows, every v46.1.0+ producer) names the sha and never carries an
+    // `evidence_ref`. A pointer-shaped member at these bytes that is
+    // UNREADABLE (`Err`) counts as binding: the row plainly references the
+    // blob, and a malformed key-plane member must not make it invisible to
+    // the tombstone fold (fail closed for the subject).
+    let by_pointer = match crate::federation::blob_pointer::pointer_for(envelope, content_sha256) {
+        Ok(Some(_)) | Err(_) => true,
+        Ok(None) => false,
+    };
+    by_evidence || by_pointer
 }
 
 /// v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — admission-gate

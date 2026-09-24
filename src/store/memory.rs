@@ -4173,6 +4173,31 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         self.memory_write_local_attestation(input, false).await
     }
 
+    async fn list_attestations_referencing(
+        &self,
+        target_attestation_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::types::attestation_type as at;
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && matches!(
+                        a.attestation_type.as_str(),
+                        at::WITHDRAWS | at::RECANTS | at::SUPERSEDES
+                    )
+                    && crate::federation::precedence::references_attestation_id_from_envelope(
+                        &a.attestation_envelope,
+                    ) == Some(target_attestation_id)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(rows)
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,

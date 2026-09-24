@@ -5971,6 +5971,47 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self.pg_write_local_attestation(input, false).await
     }
 
+    async fn list_attestations_referencing(
+        &self,
+        target_attestation_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // The DISCRIMINATOR rides beside the reference (CC 4.5.1.1 op-separation):
+        // only the three structural composers, named by the emitting ops.
+        use crate::federation::types::attestation_type;
+        let composers = [
+            attestation_type::WITHDRAWS,
+            attestation_type::RECANTS,
+            attestation_type::SUPERSEDES,
+        ];
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                // weight::float8 AS weight — tokio-postgres has no
+                // built-in NUMERIC<->f64 deserializer, so the read
+                // path mirrors the write-path `$5::float8::numeric`
+                // cast. NUMERIC→FLOAT8 is the inverse hop;
+                // pg_row_to_attestation reads weight as Option<f64>.
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
+                 FROM cirislens.federation_attestations \
+                 WHERE tier = 'federation' \
+                    AND attestation_type IN ($2, $3, $4) \
+                    AND (attestation_envelope::jsonb ->> 'references_attestation_id') = $1 \
+                 ORDER BY asserted_at DESC",
+                &[&target_attestation_id, &composers[0], &composers[1], &composers[2]],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_attestations_referencing: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
     async fn list_attestations_for(
         &self,
         attested_key_id: &str,
@@ -6746,6 +6787,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // v47.2.0 (#862) — the pointer shape has no evidence_ref: prefilter on any mention.
+        let like = format!("%{content_sha256}%");
         let needle =
             serde_json::Value::Array(vec![serde_json::Value::String(content_sha256.to_owned())]);
         let rows = client
@@ -6757,9 +6800,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE attestation_type = 'scores' AND tier = 'federation' \
-                    AND attestation_envelope::jsonb -> 'evidence_refs' @> $1 \
+                     AND (attestation_envelope::jsonb -> 'evidence_refs' @> $1 \
+                          OR attestation_envelope::text LIKE $2) \
                  ORDER BY asserted_at DESC",
-                &[&needle],
+                &[&needle, &like],
             )
             .await
             .map_err(|e| {

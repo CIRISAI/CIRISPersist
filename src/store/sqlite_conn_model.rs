@@ -356,6 +356,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_attestations", ConnClass::Read),
     ("list_attestations_by", ConnClass::Read),
     ("list_attestations_for", ConnClass::Read),
+    // v47.2.0 (#853) — composers naming a target, by `references_attestation_id`.
+    ("list_attestations_referencing", ConnClass::Read),
     ("list_attestations_for_migration", ConnClass::Read),
     ("list_attestations_since", ConnClass::Read),
     ("list_canonical_servers", ConnClass::Read),

@@ -1433,6 +1433,18 @@ pub trait FederationDirectory: Send + Sync {
         Ok(ids)
     }
 
+    /// v47.2.0 (CIRISPersist#853, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.2) — every
+    /// federation-tier STRUCTURAL COMPOSER naming `target_attestation_id` in
+    /// its envelope's `references_attestation_id` (`withdraws` / `recants` /
+    /// `supersedes`), regardless of who attested it or whom it is about. The
+    /// read a tombstone fold needs: a subject's `withdraws` is attested to the
+    /// ISSUER, so neither the by- nor the for-slice of the target's keys
+    /// reaches it. Ordered by `asserted_at` DESC.
+    async fn list_attestations_referencing(
+        &self,
+        target_attestation_id: &str,
+    ) -> Result<Vec<Attestation>, Error>;
+
     /// All attestations targeting `attested_key_id` (consumer asks
     /// "who vouches for K?"). Ordered by `asserted_at` DESC.
     async fn list_attestations_for(&self, attested_key_id: &str)

@@ -131,7 +131,9 @@ pub mod bodies {
 
         // Before: bound and live, and every door reads.
         assert_eq!(
-            binding_state(b, &sha).await.unwrap(),
+            binding_state(b as &dyn FederationDirectory, &sha)
+                .await
+                .unwrap(),
             BindingState::Live,
             "I149: live before"
         );
@@ -153,7 +155,9 @@ pub mod bodies {
 
         // After: every door refuses with the typed arm, naming the blob.
         assert_eq!(
-            binding_state(b, &sha).await.unwrap(),
+            binding_state(b as &dyn FederationDirectory, &sha)
+                .await
+                .unwrap(),
             BindingState::Withdrawn {
                 attestation_id: row.clone(),
                 withdraws_id: w.clone()
@@ -177,11 +181,72 @@ pub mod bodies {
             "I149: the SERVE door answers Withdrawn — never NotHeld, which walks the fetcher \
              around the mesh: {r:?}"
         );
-        // A stranger still learns nothing: NotGranted, before the fold.
+        // A commons-tier blob authorizes ANY viewer, so a "stranger" is an
+        // authorized viewer here and correctly sees `Withdrawn` (the refusal
+        // names only what a holder of the rows already sees on the wire).
         let r = engine.read_blob_as(&sha, &stranger, None).await;
         assert!(
+            matches!(&r, Err(BlobError::Withdrawn { .. })),
+            "I149: on a commons blob every viewer is authorized: {r:?}"
+        );
+
+        // The ORDER claim — authorization before the fold, so a stranger learns
+        // nothing — is made on a SEALED tier: a community blob a keyed member
+        // occurrence can read (the cohort-lifecycle fixture), bound and
+        // withdrawn the same way. The member sees `Withdrawn`; a stranger is
+        // `NotGranted` and never sees the tombstone.
+        let comm = format!("i149-comm-{s}");
+        let alice = format!("i149-alice-{s}");
+        let alice_occ = format!("i149-alice-occ-{s}");
+        crate::federation::community_dek::lifecycle_support::seed_community(
+            b,
+            &comm,
+            &[(&alice, &alice_occ)],
+        )
+        .await;
+        let minter = crate::federation::at_rest_cascade::blob_invariants::node_signer(
+            b,
+            &format!("i149-minter-{s}"),
+        )
+        .await
+        .derived_key_id();
+        let sealed = crate::federation::community_dek::orchestrate::encrypt_and_cascade_community(
+            b,
+            &comm,
+            b"sealed: the subject appears here too",
+            None,
+            Some(&minter),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I149: seal at the community tier: {e}"))
+        .at_rest_sha256;
+        assert_eq!(
+            kind_of(&engine.read_blob_as(&sealed, &alice_occ, None).await),
+            "ok",
+            "I149: the member occurrence reads the sealed blob before"
+        );
+        let sealed_row = format!("i149-sealed-row-{s}");
+        bind_row(
+            b,
+            &sealed_row,
+            &alice,
+            &[&alice, &subject],
+            &hex::encode(sealed),
+            true,
+        )
+        .await;
+        withdraw(b, &format!("i149-sealed-w-{s}"), &subject, &sealed_row)
+            .await
+            .expect("I149: the subject withdraws the sealed row");
+        let r = engine.read_blob_as(&sealed, &alice_occ, None).await;
+        assert!(
+            matches!(&r, Err(BlobError::Withdrawn { .. })),
+            "I149: the member sees Withdrawn on the sealed, withdrawn blob: {r:?}"
+        );
+        let r = engine.read_blob_as(&sealed, &stranger, None).await;
+        assert!(
             matches!(&r, Err(BlobError::NotGranted { .. })),
-            "I149: a stranger is NotGranted first and never sees Withdrawn: {r:?}"
+            "I149: a stranger is NotGranted FIRST on a sealed blob and never sees the tombstone: {r:?}"
         );
     }
 
@@ -227,7 +292,9 @@ pub mod bodies {
         .await;
         // The THIRD PARTY's withdraws (stored None, unentitled) retires nothing.
         assert_eq!(
-            binding_state(b, &sha).await.unwrap(),
+            binding_state(b as &dyn FederationDirectory, &sha)
+                .await
+                .unwrap(),
             BindingState::Live,
             "I150: an unentitled deferred withdraws does not retire the bytes"
         );
@@ -249,7 +316,9 @@ pub mod bodies {
             .unwrap()
             .withdraws_admission_rule;
         assert_eq!(
-            binding_state(b, &sha).await.unwrap(),
+            binding_state(b as &dyn FederationDirectory, &sha)
+                .await
+                .unwrap(),
             BindingState::Withdrawn {
                 attestation_id: row.clone(),
                 withdraws_id: w_subject.clone()
@@ -276,7 +345,9 @@ pub mod bodies {
         bind_row(b, &r2, &c, &[&c], &hx, false).await; // the other reference shape
         withdraw(b, &format!("i151-w1-{s}"), &a, &r1).await.unwrap();
         assert_eq!(
-            binding_state(b, &sha).await.unwrap(),
+            binding_state(b as &dyn FederationDirectory, &sha)
+                .await
+                .unwrap(),
             BindingState::Live,
             "I151: one binding withdrawn, one live — the bytes stay"
         );
@@ -284,7 +355,9 @@ pub mod bodies {
         withdraw(b, &format!("i151-w2-{s}"), &c, &r2).await.unwrap();
         assert!(
             matches!(
-                binding_state(b, &sha).await.unwrap(),
+                binding_state(b as &dyn FederationDirectory, &sha)
+                    .await
+                    .unwrap(),
                 BindingState::Withdrawn { .. }
             ),
             "I151: both withdrawn"

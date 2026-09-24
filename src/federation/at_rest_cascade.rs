@@ -717,6 +717,31 @@ pub fn open_aad(
     )
 }
 
+/// v47.2.0 (CIRISPersist#853, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.3) — the ONE
+/// place the read doors ask the tombstone fold. Sits AFTER authorization on
+/// every viewer door (whole-blob, range, and the serve door has no viewer),
+/// so the refusal is told only to a viewer who could have read the bytes.
+pub(crate) async fn refuse_if_withdrawn(
+    directory: &dyn crate::federation::FederationDirectory,
+    at_rest_sha256: &[u8; 32],
+) -> Result<(), crate::federation::BlobError> {
+    use crate::federation::blob_tombstone::{binding_state, BindingState};
+    match binding_state(directory, at_rest_sha256)
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("tombstone fold: {e}")))?
+    {
+        BindingState::Unbound | BindingState::Live => Ok(()),
+        BindingState::Withdrawn {
+            attestation_id,
+            withdraws_id,
+        } => Err(crate::federation::BlobError::Withdrawn {
+            sha256_hex: hex::encode(at_rest_sha256),
+            attestation_id,
+            withdraws_id,
+        }),
+    }
+}
+
 /// v47.1.0 (CIRISPersist#842) — the ONE mapping from a body-open failure to
 /// [`BlobError::SealDidNotOpen`](crate::federation::BlobError::SealDidNotOpen),
 /// used at every read site that opens a blob body. Every other
@@ -1907,6 +1932,9 @@ pub mod orchestrate {
         //    decision lives above the dispatch so a new tier cannot skip it.
         //    A refusal names only the sha and the viewer.
         authorize_viewer_by_tier(backend, at_rest_sha256, tier, viewer_key_id).await?;
+        // 2½. CC 2.3 AT THE BYTES PLANE (v47.2.0, #853): after authorization
+        //    (a stranger is NotGranted and learns nothing), before the body.
+        refuse_if_withdrawn(backend, at_rest_sha256).await?;
         // §11.3 (5) / I40 — associated data presented against a row that was
         // never sealed: refused, as at the write door (after authorization,
         // so a stranger learns nothing from the refusal class).

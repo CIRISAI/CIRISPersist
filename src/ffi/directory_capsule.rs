@@ -2953,6 +2953,15 @@ impl FederationDirectory for OpsDirectory {
             method: "list_attestations_for",
         })
     }
+    async fn list_attestations_referencing(
+        &self,
+        target_attestation_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        // v47.2.0 (#853) — as its siblings: not proxied across the capsule.
+        Err(Error::Unsupported {
+            method: "list_attestations_referencing",
+        })
+    }
     async fn list_attestations_by(
         &self,
         attesting_key_id: &str,
