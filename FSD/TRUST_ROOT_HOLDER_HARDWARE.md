@@ -75,7 +75,27 @@ A key record's evidence is **immutable for its key id**: the doors admit, upgrad
 
 Mutants planned (§5.1 records the round): freshness re-added to `check_structure` (I154/I155 red); Layer B result ignored (I156 red); the holder set taken from the roster or the `about_root` attesters instead of the quorate charters' verified scrubs (I154 red through a non-signing seat); the `accord_holder` condition kept at the door for the structural check (I157 red); the memo keyed by key id alone (I158 red on the policy swap); `holders_hardware_attested` dropped from the `valid` fold (I154 red).
 
-## 5. Not in scope
+## 5. Verification
+
+### 5.1 Mutation round (v47.3.0, wt-901 at 083b33a4; lane = I154–I158 on memory + sqlite + postgres, each mutant reverted before the next)
+
+| # | Mutant | Verdict | Killed by |
+|---|--------|---------|-----------|
+| M1 | validity re-checks nonce freshness (Layer A + age) | KILLED | I154, I156, I158 × 3 backends |
+| M2 | `attested()` ignores Layer B | KILLED | I156 × 3 |
+| M3a | holder set = every attester about the root | KILLED | I154, I156, I158 × 3 (the unattested user) |
+| M3b | holder set = the seated roster, not the verified scrubs | KILLED | I154 × 3 (the seated non-signer) |
+| M4 | door keeps the accord_holder-only condition | KILLED | I157 × 3 |
+| M5 | memo fingerprint ignores the policy | KILLED | I154, I158 × 3 |
+| M6 | `holders_hardware_attested` dropped from the `valid` fold | KILLED | I154, I156 × 3 |
+| M7 | a Layer A refusal reports `layer_a = true` | KILLED | I154 × 3 |
+| M9 | Layer B never runs (`is_custody` forced false) | KILLED | I156 × 3 |
+| M10 | holders reported in reverse order | KILLED | I154 × 3 |
+| M11 | door drops freshness for a local accord_holder | KILLED | I155, I157 × 3 |
+
+11 of 11 killed, every kill on all three backends. Not mutated: the "no key record for this holder" arm (`holder_hardware`'s `None` branch) — unreachable at read time, since a charter scrub only counts once it verified against a stored pubkey, so no witness can put a record-less holder into the set; it is kept as the honest answer should that ever change. M8 in the plan was this arm and is recorded as equivalent-by-construction.
+
+## 6. Not in scope
 
 - Pinning roots for TPM / Secure Enclave / StrongBox (each is a root-pinning decision with its own provenance; the hook takes them without a code path).
 - Edge's composition of the mutual-root walk (CIRISEdge#659) and Server's replication ladder re-run against the canonical's evidence-carrying records before pinning v47.3.0.
