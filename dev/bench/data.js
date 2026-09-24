@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790226041588,
+  "lastUpdate": 1790233912420,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -97103,6 +97103,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 191,
             "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e3517f83dbf06ee29b4a48d5d856d12824939957",
+          "message": "merge(#903): v47.3.0 - a root is as attested as its holders: the holder-hardware leg of trust_root_valid (#901)\n\nThe ruling on CIRISEdge#659, as persist's leg: **a valid root is as attested as its holders.** `trust_root_valid` judges every charter holder's key record from THIS node — Layer A (the policy's structural legs, no clock) and Layer B (the YubiKey PIV chain walk persist already has, root from the policy) — reports each on the verdict, and folds the result into `valid`. Replicated key records that carry evidence are structurally checked where they land. Additive verdict fields; MINOR.\n\n### Added — a valid root is as attested as its holders: the holder-hardware leg of `trust_root_valid` (CIRISPersist#901; FSD `TRUST_ROOT_HOLDER_HARDWARE.md`)\nThe ruling on CIRISEdge#659: *a valid root is defined by its holders' attested\nhardware property, evaluated where the root is judged.* `trust_root_valid`\nfolded four legs — a consensual edge, a self-declaring charter, a recovery\ncommitment, no halt — and never looked at a single holder's key record. A\nfamily chartered by three software-only keys was as valid as the accord's\nthree YubiKeys. Edge composes the mutual-root walk from persist's legs and\nre-derives nothing, so this is the one thing it needed from persist.\n\n- **The leg.** Every charter holder — the self-charter's signer on a KEY root;\n  the union of the *verified seated scrubs* of every quorate charter on a\n  FAMILY root (`family_quorum_holders_over`: the #557 count's own set, carried\n  out beside the count, so \"quorate\" and \"who\" come from one fold; not the\n  roster, not the `about_root` attesters) — is judged from THIS node's key\n  record for it. **Layer A** = the policy's structural legs with **no clock**\n  (`HardwareAttestationPolicy::check_structure`: present, canonical, class\n  accepted, fields present; `check` = `check_structure` + the nonce-freshness\n  leg, one function calling the other so the two cannot drift — freshness is\n  replay protection at registration, and re-checking it at validity time\n  would expire every real root a day after its holders registered).\n  **Layer B** = the chain walk for a class this node pins a root for: a\n  YubiKey PIV custody attestation through\n  `admission::verify_member_fips_custody_against` — the one walk persist\n  already has — with the root from the policy's new `yubico_root_der`\n  (default: the production pin). Classes with no pinned root are\n  Layer-A-only: `layer_b = None`, never a refusal.\n- **The verdict.** `TrustRootVerdict.holders_hardware: Vec<HolderHardware>`\n  (`key_id`, `class`, `layer_a`, `layer_b`, `refusal`; one per holder, sorted\n  by key id — a consumer sees WHICH holder and WHICH layer failed) and\n  `holders_hardware_attested: bool`, **folded into `valid`**. `bounded_until`\n  is unchanged: hardware evidence does not expire on a clock. Both fields are\n  `#[serde(default)]`, so a pre-v47.3 payload deserializes with nothing judged\n  and the leg false.\n- **Evaluated where the root is judged, memoised by its inputs.** A memo keyed\n  by the holder's key id and a fingerprint over exactly what the verdict\n  depends on — the record's pubkeys and evidence, and the policy. Three\n  holders, verified once per record version and per policy; never by time.\n  A node that tightens its `accepted_hardware_types` invalidates, at the\n  next read, every root held by the class it dropped (I154).\n- **Replicated key records are checked where they land** (§3.5). One door\n  predicate, `HardwareAttestationPolicy::admit_key_record`, on all seven\n  admission sites (`put_public_key`, `adopt_scrub_upgrade`,\n  `supersede_canonical_record` on sqlite and postgres; `put_public_key` on\n  memory): an `accord_holder` runs structure **and** freshness (unchanged);\n  any other row that **carries** evidence runs structure alone (its nonce was\n  fresh where it registered); a row with none is admitted, never downgraded.\n  Before this a peer's malformed evidence rode replication into the directory\n  unexamined, and the leg above would have judged records nobody checked.\n\n**Witnesses** (memory + sqlite + postgres through one `&dyn FederationDirectory`):\n**I154** — three attested holders with month-old nonces: valid; one holder\nregistered with no evidence: invalid, named, the other legs unchanged; a seated\nholder who did not sign is not a holder of that charter; the node's policy\ndropping the class invalidates the same records and restoring it restores the\nverdict byte-for-byte. **I155** — `check` refuses the stale nonce,\n`check_structure` accepts it; the local `accord_holder` door still refuses,\na `NODE` row with the same evidence is admitted. **I156** — a YubiKey PIV\nholder (mock CA, root swapped on the policy) whose record carries the attested\nkey: `layer_b = Some(true)`; the same chain on a record with other pubkeys:\n`Some(false)`, invalid, named. **I157** — malformed evidence on a `NODE`\nrecord through `apply_replicated_key_record` is refused for the evidence and\nleaves no row; no evidence and stale-valid evidence are admitted. **I158** —\nmemoised by inputs: three evaluations across two reads; a policy swap\nre-evaluates each holder once. Mutation round: **11 mutants, 11 killed, every kill on all three backends**\n(`FSD/TRUST_ROOT_HOLDER_HARDWARE.md` §5.1).\n\n**The fixture consequence (§3.6).** Every test-support key builder now\nattaches Layer-A-valid mock StrongBox evidence (nonce quantized to the hour,\nso a re-put is byte-identical): under the ruling every Key-kind root the\nfixtures stood up had an unattested holder. A test that wants a\nsoftware-class row says so — `register_typed_key_with_evidence(…, None)`,\nor `attestation_evidence = None` on the record — and the legs that test\n\"unattested is refused\" do. `attach_accord_holder_evidence` →\n`attach_hardware_evidence` (every row). `operational::test_support` gains\n`seed_chartered_family_root[_with_scrubs]`, `ScrubSigner` (deterministic /\nmock YubiKey member / absent), `register_key_record_from_mock_member`;\n`tier_ingest::test_support` gains `sign_envelope_with` and\n`mock_member_signers`.\n\n**For adopters.** `TrustRootVerdict` gained two fields (additive). A\nKey-kind root whose key record carries no hardware evidence is **no longer\nvalid** — that is the ruling, not a regression; attach evidence to the\nholder records or charter a family whose holders carry it. Edge: the leg\nCIRISEdge#659 composes over. Server: re-run the replication ladder against\nthe canonical's evidence-carrying records before pinning.\n\n## Gates\n\n- `scripts/certify.sh full` on `6ac87a3f`: **EVERY CI LEG GREEN BY EXIT CODE** — 34 legs (core 3290, cirisaudit 3397, secrets 3351, cirisnode 3451, cirisgraph 3321, telemetry 3355, rest 3907, test-anchor 2655, default 1642, python 54; clippy/fmt/pyi/featmatrix/wheelfeat/docver/pyo3sqlite/dirdouble/floortoken + 15 no-backend axis checks), wall 2094s at 3 lanes × 10 threads. PR CI 24/24.\n- Full sqlite+postgres suite green at every step of the fixture sweep (69 → 55 → 8 → 1 → 0 reds, each a fixture standing up an unattested holder or a test that meant \"no evidence\" and now says so).\n\n## Beyond the ask\n\n- `HardwareAttestationPolicy::check_structure` / `admit_key_record` / `yubico_root_der`; `family_quorum_holders_over`; the test-support additions listed in the CHANGELOG.\n\nCloses #901\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01GjMiFzKruBc19HPdHozst9",
+          "timestamp": "2026-09-24T01:31:36-05:00",
+          "tree_id": "8951bbc0397858f86b5ec78ba5898697085851d9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/e3517f83dbf06ee29b4a48d5d856d12824939957"
+        },
+        "date": 1790233909222,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40418769,
+            "range": "± 20027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2047557,
+            "range": "± 118117",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 12414,
+            "range": "± 106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 19192,
+            "range": "± 101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 32024,
+            "range": "± 149",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 90500,
+            "range": "± 5224",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 37,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 215,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 523,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2066,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 81,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 252,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1109,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 34367,
+            "range": "± 3746",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 77919,
+            "range": "± 3822",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 246172,
+            "range": "± 3204",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 11186,
+            "range": "± 700",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 12494,
+            "range": "± 648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 18638,
+            "range": "± 1187",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 35647,
+            "range": "± 2122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 7943784,
+            "range": "± 17226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 7890300,
+            "range": "± 95903",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 503645,
+            "range": "± 54840",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1314885,
+            "range": "± 46154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 74973252,
+            "range": "± 386779",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2292902,
+            "range": "± 117465",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 11954335,
+            "range": "± 273275",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 189443216,
+            "range": "± 1924657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 6100081,
+            "range": "± 493611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 33029177,
+            "range": "± 461157",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 7883,
+            "range": "± 196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 231255,
+            "range": "± 7930",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 268746,
+            "range": "± 11078",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 16649,
+            "range": "± 243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 263741,
+            "range": "± 12293",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 395575,
+            "range": "± 10775",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 53609,
+            "range": "± 1340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 379319,
+            "range": "± 8982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 988844,
+            "range": "± 20073",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 77802,
+            "range": "± 836",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 323831,
+            "range": "± 913",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1735554,
+            "range": "± 20913",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 2096345,
+            "range": "± 16169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 68,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 68,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 164001,
+            "range": "± 12972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 187622,
+            "range": "± 13043",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 10654,
+            "range": "± 65",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 67658,
+            "range": "± 316",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 642342,
+            "range": "± 2370",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 663,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 120,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 291,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 191,
+            "range": "± 0",
             "unit": "ns/iter"
           },
           {
