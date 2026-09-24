@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790262315334,
+  "lastUpdate": 1790283500166,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -97931,6 +97931,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 192,
             "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "59283e3e4cb54bc90f92eb110d81246be8e9ee64",
+          "message": "merge(#906): v48.0.0 - a room's roster converges both ways (#860); the sweep sees a claimed machine's consent (#905)\n\nTwo adopter-blocking findings, one release (MAJOR): **#860** — a room (and a family) is a keyless identifier, so the membership planes reference the group table and growth rides an append plane (`CommunityMembershipWidening`, the 17th kind) that converges the way removals do; `add_community_member`'s signed preimage becomes the widening row; one fold at every read-time gate. **#905** — the promotion sweep and the mesh crossing ask one predicate for whose consent covers a producer (the machine's own grant, or its bound steward's grant naming it), so an owned agent's sealed traces are promoted by its human's consent; `consent_peer_set` keyed by `for_key_id` (V152). `CONSENT_GRAMMAR_HASH` re-pinned.\n\n### Changed — a room's roster converges both ways (CIRISPersist#860; FSD `ROOM_ROSTER_PLANES.md`)\nTwo findings from CIRISEdge#608/#613 with one root: *the community record is\nnot a principal*. A room admitted the way `put_community` allows — with no\nkey row of its own — could never be revoked from (the revocation table's\ngroup FK named `federation_keys`), and a roster grown through\n`add_community_member` rewrote the community RECORD in place, which is a\nfork at every peer (`CommunityRosterFork`). Every pair room edge ever made\nwas in this state; it showed on the first room that widened.\n\n- **V151.** Both membership-revocation tables reference their GROUP table\n  (`federation_families`, `federation_communities`) — a family and a room\n  are keyless identifiers, by doctrine. The community revocation PK gains\n  `effective_at`: a re-added member can be removed again; an exact retry is\n  still the #861 no-op. Rows that named a group with no group row (unreachable\n  by every fold) are dropped by the copy. Memory mirrors the group FK.\n- **The widening plane** — `federation_community_membership_widenings`, the\n  structural mirror of the revocation table:\n  `CommunityMembershipWidening { community_key_id, member_key_id, joined_at,\n  effective_at, role }`, `Signed…`/`Served…` wrappers,\n  `put_community_membership_widening`, `list_community_membership_widenings_for`,\n  `list_signed_community_membership_widenings_since` (three-part resume id) on\n  sqlite / postgres / memory; `EnvelopeKind::CommunityMembershipWidening`\n  (the 17th kind, E4 policy); the FFI capsule op. A widening does **not**\n  rotate the DEK epoch — the minter wraps the member at its next seal.\n- **`add_community_member` is the local door onto the plane** (BREAKING):\n  `spec` is the authority's hybrid scrub over the WIDENING row\n  `{member.key_id, member.joined_at, effective_at = member.joined_at,\n  member.role}`, not over the grown record. The record is never rewritten to\n  grow. Edge's v47 producer (a scrub over the grown record) is refused with\n  the signature reason.\n- **One fold.** `active_roster_at(record, widenings, revocations, as_of)`:\n  the latest event per member decides, a removal wins a tie; every read-time\n  gate that read `community.members` raw — the key-grant walk, the DEK wrap\n  set, the moderator gate, `appointed_moderators_of`, the room's authority\n  set, the supersede projection — goes through it (`effective_roster` /\n  `is_active_community_member`). `put_community`'s own checks still read the\n  incoming record.\n- `add_community_member` keeps its pre-v48 idempotency on the plane: a re-add\n  of a member already active at `effective_at` (by the fold — on the record or\n  widened) returns `Ok(false)` and writes no row; only a genuine change writes.\n- The fold counts a record member **from the record**, never from the\n  signer-chosen `joined_at` (the founding roster was not instant-gated before\n  v48; a peer seeding the room from a skewed clock must not refuse an earlier\n  mint — I77 and I165 pin it). A widening is dated: it adds at `effective_at`.\n- The revocation since-read's resume id is the three-part compound. **Pins\n  moved, all growth:** `REPLICATION_POLICY_HASH` `c1082c12…` →\n  `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19` (the 17th\n  kind is APPENDED after `KeyGrant` — the order is hashed and CIRISEdge's\n  `EnvelopeKind` mirrors it by position; CIRISServer pins the hash);\n  `CONSENT_GRAMMAR_HASH` `ed2b0f2c…` →\n  `07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9` (the kind\n  list is part of the hash; the grammar itself is unchanged); both directory\n  capsule wire digests re-pinned for the appended `ListSignedCommunityMembershipWideningsSince`\n  / `SignedCommunityMembershipWidenings` variants — nothing existing touched,\n  `DIRECTORY_ABI_VERSION` stays **5**; `evidence/migration_checksums.tsv` gains\n  V151/V152 on both dialects.\n\n### Fixed — the promotion sweep sees a claimed machine's consent (CIRISPersist#905; FSD `CONSENT_SWEEP_BY_PRINCIPALS.md`)\nMeasured on CIRISServer's production-shaped ladder: a split, owned, claimed\nagent whose owner authored `consent:replication:v1` toward the canonical,\nRooted, send-set resolved — and its sealed traces stayed `(self, local)`\nforever, `offerable=0`, no refusal, no line. Since v44.6.0 the grants that\ncover a claimed machine are authored by its HUMAN and name it in\n`for_key_id`; `Engine::load_active_egress_grants` read only self-authored\ngrants and saw zero on every claimed node. One gate deeper the mesh\ncrossing's `check_grant_covers` refused a grant whose author was not the\nsender — the same assumption.\n\n- **One predicate:** `consent_by_humans::grant_is_authored_for(dir, grant,\n  machine)` — the machine's own grant, or a bound steward's grant naming it.\n  The sweep's loader (`live_egress_grants_by_principals`, over the new\n  `list_live_consent_grants_for` read on all three backends) and the\n  crossing's covering check both ask it; `repair_stranded_scope_backlog`\n  shares the loader.\n- **V152.** `consent_peer_set` is keyed `(node_key_id, for_key_id,\n  peer_key_id)` (a self-grant keyed on its author): a human bound to two\n  machine keys keeps both per-key grants live in the attester-keyed readers,\n  and withdrawing one no longer drops the other's peer row.\n- `FederationDirectory::as_dyn_directory()` — the trait object from a\n  default method (`Self: ?Sized`), so the crossing can reach the steward fold.\n\n**Witnesses:** I163 (keyless room and keyless family can revoke; the §15\nrotation reachable), I164 (a widening converges across two directories; the\nrecord is byte-identical on both; the v47 spec shape is refused), I165 (four\nevents in three orders on three directories fold to one roster; the repeat\nis a no-op; a tie removes), I166 (every read-time gate follows a widening\nand a revocation), I167 (the since-read resumes across the three-part id),\nI168 (an owned agent's sealed trace is promoted by its human's consent, on an\n`Engine`; the witness prints what the sweep logged), I169 (two per-key\ngrants both live; by principals each machine sees its own; an unbound\nauthor's grant is nobody's; withdrawal keeps the sibling grant). Mutation\nround: **14 mutants, 14 killed** (two needed a second round after a witness fix — the table says which and why) (`FSD/ROOM_ROSTER_PLANES.md` §5.1).\n\n**For adopters.** Edge: sign `add_community_member`'s spec over the widening\nrow (`ts::widening_admit_spec` shows the shape); apply\n`CommunityMembershipWidening` rows from\n`list_signed_community_membership_widenings_since` as you apply revocations;\n`a_room_that_is_not_a_registered_key_cannot_revoke_yet` goes red — that is\nthe signal; re-pin `CONSENT_GRAMMAR_HASH`. Server: the production-shaped\nladder should now show `offerable>0` for the owned agent with no Server\nchange; `live_consent_grants_for_machine` keeps both per-key grants.\n\n## Gates\n\n- `scripts/certify.sh full`: **34/34 green on cd5fdccf** (9 expensive legs 3308/3415/3369/3469/3339/3373/3925/2672/1647 passed; python 54; fmt, clippy, pyi, featmatrix, wheelfeat, docver, pyo3sqlite, dirdouble, floortoken; 15 axis checks) — wall 2371s. Full pg lane 3235/3235 and pyo3,sqlite lane 3304/3304 beside it; CI settled with no failures on the same head.\n- Every from-disk gate green (connection model, parity, directory double — now 96 delegations incl. the one sync accessor, discriminator, schema parity across V151/V152).\n\n## Beyond the ask\n\n- `FederationDirectory::as_dyn_directory()`; `active_roster_at` / `effective_roster` / `is_active_community_member` as public folds; `ts::widening_admit_spec` / `ScrubSigner` test support for adopters' fixtures.\n\nCloses #860\nCloses #905\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01GjMiFzKruBc19HPdHozst9",
+          "timestamp": "2026-09-24T15:23:59-05:00",
+          "tree_id": "18bd0d5ed718dcc1d4fa653b9eafb5120a41ac10",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/59283e3e4cb54bc90f92eb110d81246be8e9ee64"
+        },
+        "date": 1790283497172,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 37224608,
+            "range": "± 1955056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1131983,
+            "range": "± 10982",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 8799,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 14198,
+            "range": "± 659",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 24380,
+            "range": "± 1259",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 69883,
+            "range": "± 2239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 22,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 150,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 387,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 406,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1477,
+            "range": "± 81",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 65,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 231,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 933,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 46613,
+            "range": "± 50802",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 84995,
+            "range": "± 155971",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 216071,
+            "range": "± 185608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 15583,
+            "range": "± 1705",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 13891,
+            "range": "± 2907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 18108,
+            "range": "± 3526",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 30028,
+            "range": "± 3788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 6367212,
+            "range": "± 5824",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 8750704,
+            "range": "± 56924",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 646174,
+            "range": "± 64608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1602458,
+            "range": "± 50838",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 85245746,
+            "range": "± 4835009",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2320868,
+            "range": "± 285880",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 12304939,
+            "range": "± 754589",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 213844351,
+            "range": "± 8883420",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5672579,
+            "range": "± 347203",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 31912141,
+            "range": "± 1391788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 5185,
+            "range": "± 425",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 199377,
+            "range": "± 17358",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 219953,
+            "range": "± 14937",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 11540,
+            "range": "± 487",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 216315,
+            "range": "± 13262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 310885,
+            "range": "± 13082",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 43837,
+            "range": "± 431",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 318743,
+            "range": "± 15616",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 676280,
+            "range": "± 8311",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 58486,
+            "range": "± 2177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 231943,
+            "range": "± 731",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1288671,
+            "range": "± 3572",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1507578,
+            "range": "± 5824",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 58,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 43,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 297583,
+            "range": "± 34633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 297233,
+            "range": "± 26806",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 11442,
+            "range": "± 856",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 73629,
+            "range": "± 326",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 681202,
+            "range": "± 4614",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 697,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 69,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 167,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 89,
+            "range": "± 0",
             "unit": "ns/iter"
           },
           {
