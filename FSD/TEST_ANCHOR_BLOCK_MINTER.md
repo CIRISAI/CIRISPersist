@@ -55,7 +55,23 @@ Holder `i` is `test-accord-holder-{i}` (the seeder's naming). `mint` is pure (no
 Mutants planned: the ML-DSA domain string changed (I159: PQC pubkey pin); ML-DSA signed over `canonical` alone (I159/I160: verify fails); the seeder's structural check dropped (I161 no warn); the check reading the placeholder as a verifying scrub (I160 warns); the rooting warn dropped (I161); `minted_by` from a literal (I162 after a version bump — recorded as the reason it is derived); `apply_to_env` skipping `CIRIS_TESTING_MODE` (I160 seeds nothing).
 
 ## 5. Verification
-(§5.1 mutation table recorded at build time.)
+
+### 5.1 Mutation round (v47.4.0, wt-805 at 8d76c411; lane = I159/I162 in-crate + `test_anchor_block_805` (own process), features `test-anchor,sqlite`; each mutant reverted before the next)
+
+| # | Mutant | Verdict | Killed by |
+|---|--------|---------|-----------|
+| M1 | ML-DSA seed domain changed | KILLED | i159_the_minter_reproduces_the_consumers_block |
+| M2 | ML-DSA signed over canonical alone (not canonical ‖ ed_sig) | KILLED | i159_the_minter_reproduces_the_consumers_block i160_a_minted_block_roots i162_the_minted_by_tag_is_checked_at_boot |
+| M3 | seeder structural check dropped | KILLED | i161_a_stale_block_is_named_at_boot_and_the_rejection_carries_detail |
+| M4 | rooting warn loses the detail | KILLED | i161_a_stale_block_is_named_at_boot_and_the_rejection_carries_detail |
+| M5 | rooting warn loses the kind | KILLED | i161_a_stale_block_is_named_at_boot_and_the_rejection_carries_detail |
+| M6 | minted_by from a literal | KILLED | i162_minted_by_is_the_compiled_pair |
+| M7 | minted-by check dropped | KILLED | i162_the_minted_by_tag_is_checked_at_boot |
+| M8 | env_pairs arms CIRIS_TESTING_MODE=false | KILLED | i160_a_minted_block_roots i161_a_stale_block_is_named_at_boot_and_the_rejection_carries_detail i162_the_minted_by_tag_is_checked_at_boot |
+| M9 | holder naming off by one | KILLED | i159_the_minter_reproduces_the_consumers_block i160_a_minted_block_roots i162_the_minted_by_tag_is_checked_at_boot |
+| M10 | envelope minted without the PQC pubkey | KILLED | i159_the_minter_reproduces_the_consumers_block i160_a_minted_block_roots i162_the_minted_by_tag_is_checked_at_boot |
+
+10 of 10 killed. Not mutated: the placeholder scrub (`test-anchor-placeholder`, written when no `_SCRUB` is supplied) is not verified and never was — a block without scrubs is the pre-#545 shape and is left to the walk; the structural check runs only for a SUPPLIED scrub.
 
 ## 6. Not in scope
 - Removing the consumers' copies (CIRISEdge#…, CIRISServer#… — filed at ship).
