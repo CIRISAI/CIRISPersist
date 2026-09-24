@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790233912420,
+  "lastUpdate": 1790262315334,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -97517,6 +97517,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 191,
             "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7e13bc5af121eb9588943b690524600b0b354bd0",
+          "message": "merge(#904): v47.4.0 - the test-anchor block minter lives in persist: one block per pair, said so at boot, the rejection logged where it is produced (#805)\n\nThe `CIRIS_TEST_TRUST_ROOT*` block minter moves into persist (#805): `mint_test_anchor_block` + `cargo run --example mint_test_anchor --features test-anchor`, pinned byte-for-byte to the block the harnesses already run; a seventh `_MINTED_BY` value; the seeder hybrid-verifies a supplied scrub at boot and says, in words that name the fix, when it does not verify under the running pair; every rooting rejection is logged where it is produced. Test-anchor-gated additive surface; MINOR.\n\n### Added — the test-anchor block minter lives in persist (CIRISPersist#805; FSD `TEST_ANCHOR_BLOCK_MINTER.md`)\nThree consumers each rolled a minter for the six-value `CIRIS_TEST_TRUST_ROOT*`\nblock; one signed a two-key literal that had **never** rooted, and nothing at\nboot could tell — the failure surfaced months later, on adoption day, as\n`rooting_unsigned_provenance_link` with the detail produced and dropped.\nThere is exactly one correct block per persist+verify pair (the envelope shape\nand the canonicalization are persist's; the primitives are the pinned\nverify's), and persist is the only party that knows it.\n\n- **The minter** (`federation::genesis`, `test-anchor`-gated):\n  `mint_test_anchor_block(&[ed_seed; N]) → TestAnchorBlock { holders, minted_by }`,\n  `TestAnchorBlock::env_pairs()` / `compose_lines()`, `test_anchor_mldsa_seed`\n  (persist now owns the `ciris-test-trust-root/mldsa/v1` domain both\n  consumers derived with), `decode_seed_b64`, `TEST_ANCHOR_SHARED_SEED_B64`\n  (the seed every harness carries). Pure: Ed25519 from the seed, ML-DSA-65\n  from the derived seed, persist's own `test_anchor_registration_envelope`,\n  `ceg_produce_canonicalize`, `ed.sign(canonical)`,\n  `mldsa.sign(canonical ‖ ed_sig)`. **I159 pins it to the block in\n  CIRISServer's `harness/mesh-repro/docker-compose.yml` byte-for-byte** on\n  the Ed25519 side (pubkey and scrub) and by SHA-256 on the ML-DSA pubkey —\n  one answer per pair, and it is the one the harnesses already run.\n- **`cargo run --example mint_test_anchor --features test-anchor [seed_b64…]`**\n  prints the compose block; no argument mints the shared seed.\n- **The seventh value:** `CIRIS_TEST_TRUST_ROOT_MINTED_BY: \"persist vX / verify vY\"`,\n  from `test_anchor_minted_by()` — persist's `CARGO_PKG_VERSION` and the\n  `ciris-verify-core` tag parsed from persist's own `Cargo.toml` at first use,\n  never a typed string (I162 proves a literal is caught at the next bump).\n- **What the seeder says at boot** (`test_anchor_genesis_records`, target\n  `ciris_persist::test_anchor`): a supplied scrub is hybrid-verified over\n  persist's canonical envelope under the running pair (`Strict` — the policy\n  the rooting walk holds, so the boot line predicts the walk); when it does\n  not verify, one `warn!` names the slot, verify's detail, the running pair\n  and the re-mint command. The record is still seeded — the walk is the gate,\n  the seeder reports. A `_MINTED_BY` that differs from the running pair earns\n  one advisory `warn!` naming both; an untagged block (every one that predates\n  the tag) is not scolded.\n- **The rejection detail is logged where the verdict is produced:**\n  `root_binding_anchored` now emits one `warn!` on `ciris_persist::rooting`\n  with `key_id`, `kind` and the full rejection (the failing link and verify's\n  text) whenever it returns `Rejected` — every caller (announce-admit, the\n  FFI, a consumer's pin) gets the line for free. The Python\n  `provenance_chain` error keeps its `provenance_chain: <kind>` prefix and\n  appends the rejection.\n\n**Witnesses:** I159 (in-crate, pure) — the minter reproduces the consumers'\nblock; two holders → comma-joined slots; seven compose lines in order.\nI160–I162 (`tests/test_anchor_block_805.rs`, its own process per the #738\nrule) — a minted block seeds one record that verifies, says nothing at boot,\nand `root_binding` is `Confirmed` with no rooting line; the SAME keys over\nCIRISServer's old two-key literal (Ed25519 is deterministic — that IS the\nstale block) earn one boot line with `key_id`, `detail` and the fix, and\n`root_binding` is `Rejected { UnsignedProvenanceLink { detail: \"… did not\nverify\" } }` with one line on the rooting target carrying kind and detail; the\nminted-by tag is silent when equal or absent and names both pairs when\ndifferent. Mutation round: **10 mutants, 10 killed** (`FSD/TEST_ANCHOR_BLOCK_MINTER.md`\n§5.1).\n\n**For adopters.** Delete your minter (CIRISEdge `tests/anchor_block_generate.rs`;\nCIRISServer's remnants) and re-mint with the example; keep CIRISServer's\n`tests/anchor_block_verifies.rs` pin — it now also gets the rejection line.\nAdd the seventh line to your compose blocks. Nothing else moves: the six\nexisting values for the shared seed are unchanged under persist v47.4.0 /\nverify v16.1.0.\n\n## Gates\n\n- `scripts/certify.sh full` on `8bdcd6b8`: **EVERY CI LEG GREEN BY EXIT CODE** — 34 legs (core 3290, cirisaudit 3397, secrets 3351, cirisnode 3451, cirisgraph 3321, telemetry 3355, rest 3907, test-anchor 2660, default 1642, python 54; clippy/fmt/pyi/featmatrix/wheelfeat/docver/pyo3sqlite/dirdouble/floortoken + 15 no-backend axis checks), wall 2168s at 3 lanes × 10 threads. PR CI 24/24.\n- The `#738` hygiene gate holds: no `src/` code mutates the anchor environment — the env-armed witnesses live in `tests/test_anchor_block_805.rs`, their own process.\n\n## Beyond the ask\n\n- `ROOTING_LOG_TARGET` / `TEST_ANCHOR_LOG_TARGET` as public constants so a consumer's pin (or a witness) can capture exactly these lines.\n\nCloses #805\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01GjMiFzKruBc19HPdHozst9",
+          "timestamp": "2026-09-24T09:27:01-05:00",
+          "tree_id": "6a3fadd29f15b973154e7ef39972e5aa64f85ad7",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7e13bc5af121eb9588943b690524600b0b354bd0"
+        },
+        "date": 1790262311879,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 35431889,
+            "range": "± 26055",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2141884,
+            "range": "± 50240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 11440,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 17966,
+            "range": "± 174",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 29952,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 84509,
+            "range": "± 416",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 33,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 194,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 507,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 581,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1995,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 72,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 226,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 979,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 34688,
+            "range": "± 48390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 75567,
+            "range": "± 27616",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 235831,
+            "range": "± 182337",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9329,
+            "range": "± 385",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10261,
+            "range": "± 470",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 15036,
+            "range": "± 740",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 25663,
+            "range": "± 1235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 7058847,
+            "range": "± 8154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5651667,
+            "range": "± 49707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 397585,
+            "range": "± 13043",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1001661,
+            "range": "± 13988",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 56354518,
+            "range": "± 560570",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1802527,
+            "range": "± 40784",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8183899,
+            "range": "± 218558",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 142228344,
+            "range": "± 877865",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4868007,
+            "range": "± 221137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 23670829,
+            "range": "± 548388",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 6479,
+            "range": "± 106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 174253,
+            "range": "± 6892",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 207584,
+            "range": "± 8594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 14061,
+            "range": "± 192",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 203360,
+            "range": "± 2936",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 332266,
+            "range": "± 7844",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 48860,
+            "range": "± 406",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 317113,
+            "range": "± 2730",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 848914,
+            "range": "± 5232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 69897,
+            "range": "± 252",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 295371,
+            "range": "± 3239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1631904,
+            "range": "± 4797",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1982756,
+            "range": "± 18372",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 66,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 63,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 134203,
+            "range": "± 5456",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 120912,
+            "range": "± 5312",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7603,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 50496,
+            "range": "± 188",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 469221,
+            "range": "± 2235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 536,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 95,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 215,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 192,
+            "range": "± 2",
             "unit": "ns/iter"
           },
           {
