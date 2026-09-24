@@ -143,7 +143,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Driver plumbing; it cannot refuse anything about the caller's input.
     ("start", Class::Plumbing),
     ("assemble_fountain_content", Class::Delegates),
-    ("authorize_community_growth", Class::Gate),
     ("authorize_family_growth", Class::Gate),
     ("backfill_trace_dedup_shard_keys", Class::Delegates),
     ("bytes", Class::Plumbing),
@@ -474,6 +473,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "pg_row_to_signed_community_membership_revocation",
         Class::Delegates,
     ),
+    ("pg_row_to_community_membership_widening", Class::Delegates),
+    (
+        "pg_row_to_signed_community_membership_widening",
+        Class::Delegates,
+    ),
     ("pg_row_to_signed_family", Class::Delegates),
     (
         "pg_row_to_signed_family_membership_revocation",
@@ -581,6 +585,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "sqlite_row_to_signed_community_membership_revocation",
         Class::Delegates,
     ),
+    (
+        "sqlite_row_to_community_membership_widening",
+        Class::Delegates,
+    ),
+    (
+        "sqlite_row_to_signed_community_membership_widening",
+        Class::Delegates,
+    ),
     ("sqlite_row_to_signed_family", Class::Delegates),
     (
         "sqlite_row_to_signed_family_membership_revocation",
@@ -641,6 +653,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "verify_community_membership_revocation_admission",
         Class::Gate,
     ),
+    (
+        "verify_community_membership_widening_admission",
+        Class::Gate,
+    ),
+    ("reject_future_dated_community_widening", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),

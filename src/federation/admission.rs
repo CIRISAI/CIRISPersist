@@ -11982,7 +11982,9 @@ pub async fn check_no_moderator_federate_admission(
     // founders always; every member too under a non-`founder_only` protocol).
     let founder_only =
         community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
-    for m in &community.members {
+    // v48.0.0 (CIRISPersist#860) — the roster is the fold (a widened founder
+    // is a moderator; a revoked one is not).
+    for m in &crate::federation::effective_roster(directory, community).await? {
         let is_authority = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER) || !founder_only;
         if is_authority && is_steward_bound(directory, &m.key_id).await? {
             // ≥1 steward-bound authority root ⇒ a live (zero-hop) named
@@ -12443,7 +12445,8 @@ pub async fn appointed_moderators_of(
         return Ok(Vec::new());
     };
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for member in &community.members {
+    // v48.0.0 (CIRISPersist#860) — the fold, not the record.
+    for member in &crate::federation::effective_roster(directory, &community).await? {
         if member.role.as_deref() != Some(MEMBER_ROLE_FOUNDER) {
             continue;
         }
@@ -12494,10 +12497,20 @@ async fn community_authority_set(
     let Some(community) = directory.lookup_community(community_id).await? else {
         return Ok(std::collections::HashSet::new());
     };
+    community_authority_set_for(directory, &community).await
+}
+
+/// v48.0.0 (CIRISPersist#860) — who may sign on the room's behalf, from the
+/// ONE fold: every active member, or the active founders under
+/// `founder_only`. Public so a witness can prove the fold reaches it.
+pub async fn community_authority_set_for(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<std::collections::HashSet<String>, Error> {
     let founder_only =
         community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
     let mut out = std::collections::HashSet::new();
-    for m in &community.members {
+    for m in &crate::federation::effective_roster(directory, community).await? {
         let is_founder = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER);
         if is_founder || !founder_only {
             out.insert(m.key_id.clone());

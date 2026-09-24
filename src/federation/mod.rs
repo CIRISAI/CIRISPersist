@@ -510,9 +510,10 @@ pub use stream_sth::{
 pub(crate) use tier_ingest::{attestation_reput_verdict, community_reput_verdict};
 pub use tier_ingest::{
     verify_community_admission, verify_community_membership_revocation_admission,
-    verify_envelope_hybrid_signature, verify_family_admission,
-    verify_family_membership_revocation_admission, verify_federation_tier_ingest,
-    verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
+    verify_community_membership_widening_admission, verify_envelope_hybrid_signature,
+    verify_family_admission, verify_family_membership_revocation_admission,
+    verify_federation_tier_ingest, verify_location_proof_admission, verify_revocation_admission,
+    verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
@@ -522,18 +523,19 @@ pub use topology::{
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
-    EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation,
-    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord,
-    KnownHashEviction, KnownWireHash, LocationProof, PeerMetadataRow, PeerPolicyBlob, Revocation,
-    ServedAttestation, ServedCommunity, ServedCommunityMembershipRevocation, ServedFamily,
-    ServedFamilyMembershipRevocation, ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation,
-    ServedKeyRecord, ServedLocationProof, ServedOrgMembership, ServedOrganization,
-    ServedPartnerRecord, ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination,
-    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation, SignedFamily,
-    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
-    SignedKeyRecord, SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
-    SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
-    TrustRow, TrustType,
+    CommunityMembershipWidening, EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember,
+    FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation,
+    KeyRecord, KnownHashEviction, KnownWireHash, LocationProof, PeerMetadataRow, PeerPolicyBlob,
+    Revocation, ServedAttestation, ServedCommunity, ServedCommunityMembershipRevocation,
+    ServedCommunityMembershipWidening, ServedFamily, ServedFamilyMembershipRevocation,
+    ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation, ServedKeyRecord,
+    ServedLocationProof, ServedOrgMembership, ServedOrganization, ServedPartnerRecord,
+    ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
+    SignedCommunity, SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening,
+    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
+    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
+    SignedTouchClaim, SignedTrustGrant, SignedTrustRevocation, SignerForm, TrustClass, TrustFilter,
+    TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
@@ -564,6 +566,102 @@ where
         .filter(|(_, effective_at)| *effective_at <= as_of)
         .map(|(key_id, _)| key_id)
         .collect()
+}
+
+/// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.4) — **the one
+/// roster fold.** For every key id that appears on the record, in a widening
+/// or in a revocation, the latest event with `effective_at <= as_of` decides:
+/// a record membership (at `joined_at`) or a widening is an add, a revocation
+/// is a remove. At the same instant a revocation wins (removal is the safer
+/// read). Every door admits every well-formed row regardless of arrival
+/// order; this is where order is imposed.
+#[must_use]
+pub fn active_roster_at(
+    record_members: &[types::CommunityMember],
+    widenings: &[types::CommunityMembershipWidening],
+    revocations: &[types::CommunityMembershipRevocation],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Vec<types::CommunityMember> {
+    // (instant, is_add, member) — sorted so that at equal instants the
+    // removal sorts LAST and therefore decides.
+    let mut events: Vec<(chrono::DateTime<chrono::Utc>, bool, types::CommunityMember)> = Vec::new();
+    for m in record_members {
+        events.push((m.joined_at, true, m.clone()));
+    }
+    for w in widenings {
+        events.push((w.effective_at, true, w.member()));
+    }
+    for r in revocations {
+        events.push((
+            r.effective_at,
+            false,
+            types::CommunityMember {
+                key_id: r.removed_identity_key_id.clone(),
+                joined_at: r.effective_at,
+                role: None,
+            },
+        ));
+    }
+    events.retain(|(at, _, _)| *at <= as_of);
+    events.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let mut latest: std::collections::BTreeMap<String, (bool, types::CommunityMember)> =
+        std::collections::BTreeMap::new();
+    for (_, is_add, member) in events {
+        latest.insert(member.key_id.clone(), (is_add, member));
+    }
+    // Record order first (the roster as founded), then widened members by
+    // key id — a stable, deterministic projection.
+    let mut out: Vec<types::CommunityMember> = Vec::new();
+    for m in record_members {
+        if let Some((true, member)) = latest.get(&m.key_id) {
+            out.push(member.clone());
+        }
+    }
+    for (key_id, (is_add, member)) in &latest {
+        if *is_add && !record_members.iter().any(|m| &m.key_id == key_id) {
+            out.push(member.clone());
+        }
+    }
+    out
+}
+
+/// v48.0.0 (CIRISPersist#860) — the roster a READ-TIME gate judges: the one
+/// fold when the room is stored, the record's own members when it is not
+/// yet (a put-time check on an incoming record has nothing else to fold).
+pub async fn effective_roster<F>(
+    directory: &F,
+    community: &types::Community,
+) -> Result<Vec<types::CommunityMember>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match directory
+        .active_community_members(&community.community_key_id)
+        .await
+    {
+        Ok(v) => Ok(v),
+        Err(Error::InvalidArgument(_)) => Ok(community.members.clone()),
+        Err(e) => Err(e),
+    }
+}
+
+/// v48.0.0 (CIRISPersist#860) — is `key_id` on `community_key_id`'s roster
+/// NOW, by the one fold? The single-member question every gate that used to
+/// read `community.members` asks instead (a raw read misses the widening
+/// plane and is a wrong read).
+pub async fn is_active_community_member<F>(
+    directory: &F,
+    community_key_id: &str,
+    key_id: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(directory
+        .active_community_members(community_key_id)
+        .await?
+        .iter()
+        .any(|m| m.key_id == key_id))
 }
 
 /// #249 Cut G3.5 — the verify-A-store-B guard for quorum-gated supersede: the
@@ -2825,6 +2923,17 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         revocation: SignedCommunityMembershipRevocation,
     ) -> Result<(), Error>;
+    /// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.2) — record a
+    /// community-membership ADDITION on its own append plane: the structural
+    /// mirror of [`Self::put_community_membership_revocation`]. Admits every
+    /// well-formed signed row regardless of arrival order (the fold decides);
+    /// idempotent on the `(community_key_id, member_key_id, effective_at)` PK;
+    /// does NOT rotate the DEK epoch (the minter wraps the member into the
+    /// current epoch at its next seal — the wrap set is the fold).
+    async fn put_community_membership_widening(
+        &self,
+        widening: SignedCommunityMembershipWidening,
+    ) -> Result<(), Error>;
 
     /// v4.8.0 — all identity-occurrence revocations for `identity_key_id`
     /// (no `effective_at` filter — full history). Keyed by the table's
@@ -2846,6 +2955,12 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipRevocation>, Error>;
+    /// v48.0.0 (CIRISPersist#860) — all community-membership widenings for
+    /// `community_key_id` (full history; the fold orders them).
+    async fn list_community_membership_widenings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipWidening>, Error>;
 
     /// v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — record a
     /// `location_proof`. Runs the §0.8 H3 canonicalization gate +
@@ -3080,6 +3195,16 @@ pub trait FederationDirectory: Send + Sync {
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedCommunityMembershipRevocation>, Error>;
+    /// v48.0.0 (CIRISPersist#860) — bulk-list the signed
+    /// [`SignedCommunityMembershipWidening`] wrappers since a cursor: the
+    /// structural mirror of
+    /// [`Self::list_signed_community_membership_revocations_since`]; resume
+    /// id = the compound of `(community_key_id, member_key_id, effective_at)`.
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipWidening>, Error>;
 
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes (edge advertise/serve bridge; extends the
@@ -3682,19 +3807,21 @@ pub trait FederationDirectory: Send + Sync {
                     "active_community_members names unknown community_key_id {community_key_id:?}"
                 ))
             })?;
+        // v48.0.0 (CIRISPersist#860, FSD §3.4) — ONE fold: the record's
+        // members plus the widening plane minus the revocation plane, by
+        // effective instant.
+        let widenings = self
+            .list_community_membership_widenings_for(community_key_id)
+            .await?;
         let revs = self
             .list_community_membership_revocations_for(community_key_id)
             .await?;
-        let removed = removed_key_ids_at(
-            revs.iter()
-                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
+        Ok(active_roster_at(
+            &community.members,
+            &widenings,
+            &revs,
             chrono::Utc::now(),
-        );
-        Ok(community
-            .members
-            .into_iter()
-            .filter(|m| !removed.contains(m.key_id.as_str()))
-            .collect())
+        ))
     }
 
     /// #249 Cut B — incremental **community-roster grow**. The exact mirror
@@ -3710,12 +3837,52 @@ pub trait FederationDirectory: Send + Sync {
     /// v31.0.0 (CIRISPersist#654) — carries the same authority signature its
     /// family twin does, verified through [`verify_community_admission`]; see
     /// [`Self::add_family_member`] for why an addition needs one.
+    ///
+    /// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.2) — **the
+    /// local door onto the widening plane.** The record is never rewritten
+    /// to grow (a rewritten record is a fork at every peer); the addition is
+    /// a signed [`types::CommunityMembershipWidening`] row —
+    /// `{member.key_id, member.joined_at, effective_at = member.joined_at,
+    /// member.role}` — and `spec` is the authority's hybrid scrub over THAT
+    /// row's envelope, not over the grown record. Returns `Ok(true)` when the
+    /// row is new, `Ok(false)` when the byte-identical row was already held.
     async fn add_community_member(
         &self,
         community_key_id: &str,
         member: types::CommunityMember,
         spec: &cohort::AdmitSpec,
-    ) -> Result<bool, Error>;
+    ) -> Result<bool, Error> {
+        // The community must exist (the contract since #249 Cut B): refused
+        // before any signature is looked at.
+        if self.lookup_community(community_key_id).await?.is_none() {
+            return Err(Error::InvalidArgument(format!(
+                "add_community_member names unknown community_key_id {community_key_id:?}"
+            )));
+        }
+        let widening = types::CommunityMembershipWidening {
+            community_key_id: community_key_id.to_owned(),
+            member_key_id: member.key_id,
+            joined_at: member.joined_at,
+            effective_at: member.joined_at,
+            role: member.role,
+            persist_row_hash: String::new(),
+        };
+        let already = self
+            .list_community_membership_widenings_for(community_key_id)
+            .await?
+            .into_iter()
+            .any(|w| {
+                w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
+            });
+        self.put_community_membership_widening(SignedCommunityMembershipWidening {
+            community_membership_widening: widening,
+            authority_key_id: spec.authority_key_id.clone(),
+            scrub_signature_classical: spec.scrub_signature_classical.clone(),
+            scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
+        })
+        .await?;
+        Ok(!already)
+    }
 
     // ── #249 Cut G1 ── the uniform rostered-group surface ──────────────
     //
@@ -4475,8 +4642,14 @@ pub trait FederationDirectory: Send + Sync {
                 Ok(serde_json::json!({
                     "family_key_id": c.community_key_id,
                     "family_name": c.community_name,
+                    // v48.0.0 (#860) — the roster the quorum sees is the fold,
+                    // not the record's founding members.
                     "members": members_json(
-                        c.members.into_iter().map(|m| (m.key_id, m.role)).collect()
+                        effective_roster(self, &c)
+                            .await?
+                            .into_iter()
+                            .map(|m| (m.key_id, m.role))
+                            .collect()
                     ),
                     "consensus_protocol": c.consensus_protocol,
                     "consensus_protocol_entrenched": false,

@@ -121,15 +121,14 @@ pub mod test_support {
         community: &types::Community,
         member: &types::CommunityMember,
     ) -> AdmitSpec {
-        let mut grown = community.clone();
-        grown.members.push(member.clone());
-        let signed =
-            crate::federation::tier_ingest::test_support::sign_community(authority_key_id, grown);
-        AdmitSpec {
-            authority_key_id: signed.authority_key_id,
-            scrub_signature_classical: signed.scrub_signature_classical,
-            scrub_signature_pqc: signed.scrub_signature_pqc,
-        }
+        // v48.0.0 (CIRISPersist#860) — the spec is the authority's scrub over
+        // the WIDENING row, never the grown record (a grown record is a fork
+        // at every peer; growth rides the plane).
+        crate::federation::tier_ingest::test_support::widening_admit_spec(
+            authority_key_id,
+            &community.community_key_id,
+            member,
+        )
     }
 
     /// Look the group up through `directory` and produce the [`AdmitSpec`] for
@@ -399,7 +398,15 @@ pub mod test_support {
             .find(|c| c.community.community.community_key_id == comm)
             .expect("the grown community is served on the signed read surface")
             .community;
-        assert_eq!(signed_comm.community.members.len(), 2, "({tag})");
+        // v48.0.0 (CIRISPersist#860) — the served RECORD is the founding one
+        // (growth rides the widening plane; a grown record would be a fork at
+        // every peer); the FOLD has both.
+        assert_eq!(signed_comm.community.members.len(), 1, "({tag})");
+        assert_eq!(
+            directory.active_community_members(&comm).await?.len(),
+            2,
+            "({tag}) the widening is on the roster"
+        );
         crate::federation::verify_community_admission(directory, &signed_comm)
             .await
             .unwrap_or_else(|e| {
@@ -428,32 +435,6 @@ pub mod test_support {
             .expect("community exists");
         admit_community(authority_key_id, &community, member)
     }
-}
-
-/// v31.0.0 (CIRISPersist#654) — the community mirror of
-/// [`authorize_family_growth`]. Verifies through
-/// [`verify_community_admission`](super::verify_community_admission).
-pub async fn authorize_community_growth<F>(
-    directory: &F,
-    community: &types::Community,
-    member: types::CommunityMember,
-    spec: &AdmitSpec,
-) -> Result<types::Community, super::Error>
-where
-    F: super::FederationDirectory + ?Sized,
-{
-    let mut grown = community.clone();
-    grown.members.push(member);
-    let signed = super::SignedCommunity {
-        community: grown,
-        authority_key_id: spec.authority_key_id.clone(),
-        scrub_signature_classical: spec.scrub_signature_classical.clone(),
-        scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
-    };
-    super::verify_community_admission(directory, &signed).await?;
-    let mut grown = signed.community;
-    grown.persist_row_hash = types::compute_persist_row_hash(&grown)?;
-    Ok(grown)
 }
 
 /// One of the four rostered-group kinds. Serializes to the wire scope token

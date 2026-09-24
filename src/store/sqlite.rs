@@ -6906,70 +6906,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(true)
     }
 
-    // ── #249 Cut B ── incremental community-roster grow (mirror of
-    //    add_family_member). Read-modify-write under the connection lock.
-    async fn add_community_member(
-        &self,
-        community_key_id: &str,
-        member: crate::federation::types::CommunityMember,
-        spec: &crate::federation::cohort::AdmitSpec,
-    ) -> Result<bool, crate::federation::Error> {
-        let community = self
-            .lookup_community(community_key_id)
-            .await?
-            .ok_or_else(|| {
-                crate::federation::Error::InvalidArgument(format!(
-                    "add_community_member names unknown community_key_id {community_key_id:?}"
-                ))
-            })?;
-        if community.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op, nothing to authorize
-        }
-        // v31.0.0 (CIRISPersist#654) — the authorship gate; see the family twin.
-        let community =
-            crate::federation::cohort::authorize_community_growth(self, &community, member, spec)
-                .await?;
-        let members_json = serde_json::to_string(&community.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        let key = community_key_id.to_owned();
-        let hash = community.persist_row_hash.clone();
-        let authority_key_id = spec.authority_key_id.clone();
-        let sig_classical = spec.scrub_signature_classical.clone();
-        let sig_pqc = spec.scrub_signature_pqc.clone();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
-            // bytes; the serve position moves with them.
-            let admitted_at =
-                sqlite_next_plane_position(conn, "federation_communities", POS_FOUNDED)?;
-            conn.execute(
-                "UPDATE federation_communities \
-                    SET members = ?2, persist_row_hash = ?3, authority_key_id = ?4, \
-                        scrub_signature_classical = ?5, scrub_signature_pqc = ?6, \
-                        admitted_at = ?7 \
-                  WHERE community_key_id = ?1",
-                rusqlite::params![
-                    key,
-                    members_json,
-                    hash,
-                    authority_key_id,
-                    sig_classical,
-                    sig_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("add_community_member: {e}")))?;
-        // v31.0.0 (CIRISPersist#654) — re-index; see the family twin.
-        self.index_stored_record(
-            "Community",
-            &crate::federation::wire_index::record_key(&[("community_key_id", community_key_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
     // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
     async fn supersede_group_row(
         &self,
@@ -8439,6 +8375,92 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    async fn put_community_membership_widening(
+        &self,
+        widening: crate::federation::SignedCommunityMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
+        // door: signature under the authority, no future-dating, the member
+        // steward-bound as `put_community` requires of a roster, the room and
+        // the member existing (the V151 FKs), idempotent on the three-part
+        // PK. No DEK rotation: the minter wraps the member at its next seal.
+        crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
+        let mut row = widening.community_membership_widening;
+        crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
+        let community = self
+            .lookup_community(&row.community_key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    row.community_key_id
+                ))
+            })?;
+        let probe = crate::federation::types::Community {
+            members: vec![row.member()],
+            ..community
+        };
+        crate::federation::admission::check_community_membership_steward_binding(self, &probe)
+            .await?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let authority_key_id = widening.authority_key_id;
+        let scrub_signature_classical = widening.scrub_signature_classical;
+        let scrub_signature_pqc = widening.scrub_signature_pqc;
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("community_key_id", &row.community_key_id),
+            ("member_key_id", &row.member_key_id),
+            ("effective_at", &effective_at_rfc3339),
+        ]);
+        let inserted = self
+            .write(move |conn| -> Result<bool, rusqlite::Error> {
+                let admitted_at = sqlite_next_plane_position(
+                    conn,
+                    "federation_community_membership_widenings",
+                    POS_JOINED,
+                )?;
+                let n = conn.execute(
+                    "INSERT INTO federation_community_membership_widenings (\
+                    community_key_id, member_key_id, joined_at, effective_at, role, \
+                    persist_row_hash, authority_key_id, scrub_signature_classical, \
+                    scrub_signature_pqc, admitted_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
+                    rusqlite::params![
+                        row.community_key_id,
+                        row.member_key_id,
+                        row.joined_at.to_rfc3339(),
+                        row.effective_at.to_rfc3339(),
+                        row.role,
+                        row.persist_row_hash,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        admitted_at.to_rfc3339(),
+                    ],
+                )?;
+                Ok(n == 1)
+            })
+            .await
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(ref f, _)
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on community_membership_widening insert: {e}"
+                    ))
+                }
+                other => crate::federation::Error::Backend(format!(
+                    "insert community_membership_widening: {other}"
+                )),
+            })?;
+        if inserted {
+            self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -8538,6 +8560,30 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_community_membership_revocations_for: {e}"
+            ))
+        })
+    }
+
+    async fn list_community_membership_widenings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipWidening>, crate::federation::Error> {
+        let key = community_key_id.to_owned();
+        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT community_key_id, member_key_id, joined_at, effective_at, role, \
+                        persist_row_hash \
+                     FROM federation_community_membership_widenings \
+                     WHERE community_key_id = ?1 \
+                     ORDER BY member_key_id ASC, effective_at ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_community_membership_widening)?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_community_membership_widenings_for: {e}"
             ))
         })
     }
@@ -10204,6 +10250,52 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_signed_community_membership_revocations_since: {e}"
+            ))
+        })
+    }
+
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipWidening>, crate::federation::Error>
+    {
+        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
+        let (since_a, since_b, since_c) = match since.as_ref() {
+            Some((_, id)) => {
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                (Some(a.to_owned()), Some(b.to_owned()), Some(c.to_owned()))
+            }
+            None => (None, None, None),
+        };
+        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT *, {pos} AS _pos FROM federation_community_membership_widenings \
+                 WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND \
+                        (community_key_id > ?2 OR (community_key_id = ?2 \
+                         AND (member_key_id > ?3 OR (member_key_id = ?3 \
+                         AND effective_at > ?4)))))) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY {pos} ASC, community_key_id ASC, member_key_id ASC, effective_at ASC \
+                 LIMIT ?5",
+                pos = POS_JOINED,
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params![since_at, since_a, since_b, since_c, limit],
+                |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok(crate::federation::ServedCommunityMembershipWidening {
+                        widening: sqlite_row_to_signed_community_membership_widening(row)?,
+                        admitted_at: parse_rfc3339(&pos),
+                    })
+                },
+            )?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_community_membership_widenings_since: {e}"
             ))
         })
     }
@@ -18442,6 +18534,8 @@ const POS_ASSERTED: &str = "COALESCE(admitted_at, asserted_at)";
 const POS_FOUNDED: &str = "COALESCE(admitted_at, founded_at)";
 /// Membership-revocation planes.
 const POS_REMOVED: &str = "COALESCE(admitted_at, removed_at)";
+/// v48.0.0 (#860) — the widening plane pages on its `joined_at`.
+const POS_JOINED: &str = "COALESCE(admitted_at, joined_at)";
 /// Occurrence-revocation plane.
 const POS_REVOKED: &str = "COALESCE(admitted_at, revoked_at)";
 /// Attestation plane — the legacy cursor was already half local
@@ -20233,6 +20327,36 @@ fn sqlite_row_to_signed_community_membership_revocation(
     let community_membership_revocation = sqlite_row_to_community_membership_revocation(row)?;
     Ok(crate::federation::SignedCommunityMembershipRevocation {
         community_membership_revocation,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+fn sqlite_row_to_community_membership_widening(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::CommunityMembershipWidening> {
+    let joined_at: String = row.get("joined_at")?;
+    let effective_at: String = row.get("effective_at")?;
+    Ok(crate::federation::CommunityMembershipWidening {
+        community_key_id: row.get("community_key_id")?,
+        member_key_id: row.get("member_key_id")?,
+        joined_at: parse_rfc3339(&joined_at),
+        effective_at: parse_rfc3339(&effective_at),
+        role: row.get("role")?,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_signed_community_membership_widening(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedCommunityMembershipWidening> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let community_membership_widening = sqlite_row_to_community_membership_widening(row)?;
+    Ok(crate::federation::SignedCommunityMembershipWidening {
+        community_membership_widening,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
@@ -34986,6 +35110,19 @@ mod tests {
                 .await
                 .unwrap();
         }
+        backend
+            .put_family_local(crate::federation::types::Family {
+                family_key_id: "fmr504-fam".to_owned(),
+                family_name: "fixture family".into(),
+                members: vec![],
+                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                    .to_owned(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .expect("v48.0.0 (#860): the family row the revocation FK references");
         let signed =
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
                 "fmr504-fam",
@@ -35063,6 +35200,24 @@ mod tests {
                 .await
                 .unwrap();
         }
+        backend
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    "cmr504-comm",
+                    crate::federation::types::Community {
+                        community_key_id: "cmr504-comm".to_owned(),
+                        community_name: "fixture room".into(),
+                        members: vec![],
+                        founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.to_owned(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("v48.0.0 (#860): the room row the revocation FK references");
         let signed =
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
                 "cmr504-comm",
@@ -49026,7 +49181,8 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         let keys: std::collections::HashSet<&str> =
             active.iter().map(|m| m.key_id.as_str()).collect();
         assert!(keys.contains("addc-0") && keys.contains("addc-1"));
-        assert!(backend
+        // v48.0.0 (#860) — the RECORD does not grow; the fold does.
+        assert!(!backend
             .lookup_community("addc-comm")
             .await
             .unwrap()
@@ -49042,11 +49198,9 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             .unwrap());
         assert_eq!(
             backend
-                .lookup_community("addc-comm")
+                .active_community_members("addc-comm")
                 .await
                 .unwrap()
-                .unwrap()
-                .members
                 .iter()
                 .filter(|m| m.key_id == "addc-1")
                 .count(),

@@ -539,6 +539,28 @@ where
     .map(|_| ())
 }
 
+/// v48.0.0 (CIRISPersist#860) — the hybrid-signature gate for a community
+/// membership WIDENING: the exact mirror of
+/// [`verify_community_membership_revocation_admission`], over
+/// [`super::types::CommunityMembershipWidening::signing_envelope`].
+pub async fn verify_community_membership_widening_admission<F>(
+    directory: &F,
+    signed: &super::SignedCommunityMembershipWidening,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.community_membership_widening.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"this node
 /// holds no `delegates_to(subject → authority)` at all"* (v37.0.0,
 /// CIRISPersist#734).
@@ -2740,6 +2762,46 @@ pub mod test_support {
             sign_envelope(authority_key_id, &revocation.signing_envelope());
         crate::federation::SignedCommunityMembershipRevocation {
             community_membership_revocation: revocation,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v48.0.0 (CIRISPersist#860) — the widening mirror of
+    /// [`sign_community_membership_revocation`].
+    pub fn sign_community_membership_widening(
+        authority_key_id: &str,
+        widening: crate::federation::types::CommunityMembershipWidening,
+    ) -> crate::federation::SignedCommunityMembershipWidening {
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &widening.signing_envelope());
+        crate::federation::SignedCommunityMembershipWidening {
+            community_membership_widening: widening,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v48.0.0 (CIRISPersist#860) — an [`AdmitSpec`] for
+    /// `add_community_member`: the authority's scrub over the WIDENING row
+    /// `{member, joined_at, effective_at = joined_at, role}` (not the grown
+    /// record — that is the v47 shape, and it no longer verifies).
+    pub fn widening_admit_spec(
+        authority_key_id: &str,
+        community_key_id: &str,
+        member: &crate::federation::types::CommunityMember,
+    ) -> crate::federation::cohort::AdmitSpec {
+        let widening = crate::federation::types::CommunityMembershipWidening {
+            community_key_id: community_key_id.to_owned(),
+            member_key_id: member.key_id.clone(),
+            joined_at: member.joined_at,
+            effective_at: member.joined_at,
+            role: member.role.clone(),
+            persist_row_hash: String::new(),
+        };
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &widening.signing_envelope());
+        crate::federation::cohort::AdmitSpec {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,

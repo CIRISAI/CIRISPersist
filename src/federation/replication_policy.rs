@@ -72,6 +72,10 @@ pub enum EnvelopeKind {
     /// `federation_community_membership_revocations` — insert rotates the
     /// DEK epoch, so a forged removal is a forward-secrecy DoS (E4).
     CommunityMembershipRevocation,
+    /// v48.0.0 (CIRISPersist#860) — `federation_community_membership_widenings`:
+    /// the addition plane, the mirror of the revocation (E4). A forged
+    /// widening is an unauthorized reader at the minter's next seal.
+    CommunityMembershipWidening,
     /// `federation_location_proofs` (E4).
     LocationProof,
     /// `organizations` — role-authority quorum (E9).
@@ -126,7 +130,7 @@ pub enum EnvelopeKind {
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.
-    pub const ALL: [EnvelopeKind; 16] = [
+    pub const ALL: [EnvelopeKind; 17] = [
         EnvelopeKind::Key,
         EnvelopeKind::Attestation,
         EnvelopeKind::Revocation,
@@ -136,6 +140,7 @@ impl EnvelopeKind {
         EnvelopeKind::IdentityOccurrenceRevocation,
         EnvelopeKind::FamilyMembershipRevocation,
         EnvelopeKind::CommunityMembershipRevocation,
+        EnvelopeKind::CommunityMembershipWidening,
         EnvelopeKind::LocationProof,
         EnvelopeKind::Organization,
         EnvelopeKind::OrgMembership,
@@ -158,6 +163,7 @@ impl EnvelopeKind {
             EnvelopeKind::IdentityOccurrenceRevocation => "IdentityOccurrenceRevocation",
             EnvelopeKind::FamilyMembershipRevocation => "FamilyMembershipRevocation",
             EnvelopeKind::CommunityMembershipRevocation => "CommunityMembershipRevocation",
+            EnvelopeKind::CommunityMembershipWidening => "CommunityMembershipWidening",
             EnvelopeKind::LocationProof => "LocationProof",
             EnvelopeKind::Organization => "Organization",
             EnvelopeKind::OrgMembership => "OrgMembership",
@@ -330,7 +336,9 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
             PopOnInsert::NotApplicable,
             &[],
         ),
-        K::FamilyMembershipRevocation | K::CommunityMembershipRevocation => (
+        K::FamilyMembershipRevocation
+        | K::CommunityMembershipRevocation
+        | K::CommunityMembershipWidening => (
             S::RegisteredSigner,
             B::OwnerOf,
             PopOnInsert::NotApplicable,
@@ -442,6 +450,10 @@ mod tests {
             // E5: NO wire kind may admit at local tier.
             assert_eq!(p.tier, WireTier::FederationOnly);
         }
-        assert_eq!(EnvelopeKind::ALL.len(), 16, "the wire-kind count is pinned");
+        assert_eq!(
+            EnvelopeKind::ALL.len(),
+            17,
+            "the wire-kind count is pinned (v48.0.0: +CommunityMembershipWidening)"
+        );
     }
 }

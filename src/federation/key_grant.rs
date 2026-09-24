@@ -928,11 +928,12 @@ where
     let revs = directory
         .list_community_membership_revocations_for(community_key_id)
         .await?;
-    let removed = crate::federation::removed_key_ids_at(
-        revs.iter()
-            .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
-        as_of,
-    );
+    // v48.0.0 (CIRISPersist#860) — the roster AS OF `as_of` is the one fold
+    // (record + widenings − revocations), never the record alone.
+    let widenings = directory
+        .list_community_membership_widenings_for(community_key_id)
+        .await?;
+    let roster = crate::federation::active_roster_at(&community.members, &widenings, &revs, as_of);
     // A NODE minter has exactly ONE principal — its live owner — and no
     // fallback: not the key itself, not a stale row under a former owner,
     // not the member-occurrence walk below (PR #852 review, round five: an
@@ -941,8 +942,7 @@ where
         return Ok(
             match crate::federation::admission::owner_of(directory, signer).await? {
                 Some(owner) if !revoked_under.contains(&owner) => {
-                    !removed.contains(owner.as_str())
-                        && community.members.iter().any(|m| m.key_id == owner)
+                    roster.iter().any(|m| m.key_id == owner)
                 }
                 _ => false,
             },
@@ -954,10 +954,7 @@ where
             principals.push(o.identity_key_id.clone());
         }
     }
-    for member in &community.members {
-        if removed.contains(member.key_id.as_str()) {
-            continue;
-        }
+    for member in &roster {
         if principals.contains(&member.key_id) {
             return Ok(true);
         }

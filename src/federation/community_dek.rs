@@ -101,6 +101,25 @@ pub const COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS: i64 = 60;
 /// beyond [`COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS`] is
 /// [`Error::InvalidArgument`](crate::federation::Error::InvalidArgument)
 /// BEFORE any write, on every backend.
+pub fn reject_future_dated_community_widening(
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::federation::Error> {
+    // v48.0.0 (CIRISPersist#860) — the same skew bound as a removal: a
+    // widening is a roster event the fold orders by instant, and a
+    // far-future instant would let a row sit unadmitted-in-effect for as long
+    // as its signer chose.
+    let now = chrono::Utc::now();
+    let max_allowed = now + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
+    if effective_at > max_allowed {
+        return Err(crate::federation::Error::InvalidArgument(format!(
+            "community membership widening effective_at {effective_at} is future-dated \
+             (> now + {COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS}s)"
+        )));
+    }
+    Ok(())
+}
+
+/// SecReview F4 — a community removal is immediate for forward-secrecy.
 pub fn reject_future_dated_community_revocation(
     effective_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
@@ -310,6 +329,20 @@ pub mod orchestrate {
     /// #848 (§15) — the second value is the latest `effective_at` among the
     /// removals that are effective now: the instant a minter's current epoch
     /// must be newer than, or rotate.
+    /// v48.0.0 (CIRISPersist#860) — the key ids the next seal wraps for:
+    /// the ONE roster fold, exposed so a witness can prove the wrap set
+    /// follows a widening and a revocation.
+    pub async fn active_member_key_ids<B>(
+        backend: &B,
+        community: &crate::federation::types::Community,
+    ) -> Result<Vec<String>, BlobError>
+    where
+        B: FederationDirectory + Sync + ?Sized,
+    {
+        let (members, _) = active_member_occurrences(backend, community).await?;
+        Ok(members.into_iter().map(|m| m.0).collect())
+    }
+
     async fn active_member_occurrences<B>(
         backend: &B,
         community: &crate::federation::types::Community,
@@ -321,18 +354,21 @@ pub mod orchestrate {
         BlobError,
     >
     where
-        B: FederationDirectory + Sync,
+        B: FederationDirectory + Sync + ?Sized,
     {
         let now = chrono::Utc::now();
         let revs = backend
             .list_community_membership_revocations_for(&community.community_key_id)
             .await
             .map_err(map_dir_err)?;
-        let removed = crate::federation::removed_key_ids_at(
-            revs.iter()
-                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
-            now,
-        );
+        // v48.0.0 (CIRISPersist#860) — the wrap set is the one fold: a widened
+        // member is wrapped at the next seal; a removed one is not.
+        let widenings = backend
+            .list_community_membership_widenings_for(&community.community_key_id)
+            .await
+            .map_err(map_dir_err)?;
+        let roster =
+            crate::federation::active_roster_at(&community.members, &widenings, &revs, now);
         // The removal's EFFECTIVE instant, not the instant it was recorded:
         // a removal admitted with a (skew-window) future `effective_at` lets
         // a seal in between mint an epoch newer than `removed_at` that still
@@ -345,10 +381,7 @@ pub mod orchestrate {
             .max();
 
         let mut out = Vec::new();
-        for member in &community.members {
-            if removed.contains(member.key_id.as_str()) {
-                continue;
-            }
+        for member in &roster {
             let occ = backend
                 .list_identity_occurrences_active(&member.key_id)
                 .await

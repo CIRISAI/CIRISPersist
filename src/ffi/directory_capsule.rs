@@ -770,6 +770,16 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
+    /// v48.0.0 (CIRISPersist#860) —
+    /// [`FederationDirectory::list_signed_community_membership_widenings_since`],
+    /// the mirror of [`DirectoryOp::ListSignedCommunityMembershipRevocationsSince`].
+    /// Result rides `SignedCommunityMembershipWidenings`. APPEND-ONLY.
+    ListSignedCommunityMembershipWideningsSince {
+        /// Cursor (None ⇒ from start).
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        /// Page cap.
+        limit: u32,
+    },
     /// [`FederationDirectory::list_signed_key_records_since`] (v21.1.0,
     /// CIRISPersist#507c) — bulk-list `SignedKeyRecord` wrappers since a
     /// cursor, for the edge advertise/serve responder. Result rides
@@ -1124,6 +1134,9 @@ pub enum DirectoryOpResult {
     SignedCommunityMembershipRevocations(
         Vec<crate::federation::ServedCommunityMembershipRevocation>,
     ),
+    /// v48.0.0 (CIRISPersist#860) — `list_signed_community_membership_widenings_since`.
+    /// APPEND-ONLY.
+    SignedCommunityMembershipWidenings(Vec<crate::federation::ServedCommunityMembershipWidening>),
     /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
     /// APPEND-ONLY.
     SignedKeyRecords(Vec<crate::federation::ServedKeyRecord>),
@@ -1773,6 +1786,15 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedCommunityMembershipRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit } => {
+            match dir
+                .list_signed_community_membership_widenings_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedCommunityMembershipWidenings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3166,6 +3188,15 @@ impl FederationDirectory for OpsDirectory {
             method: "put_community_membership_revocation",
         })
     }
+    async fn put_community_membership_widening(
+        &self,
+        widening: crate::federation::SignedCommunityMembershipWidening,
+    ) -> Result<(), Error> {
+        let _ = widening;
+        Err(Error::Unsupported {
+            method: "put_community_membership_widening",
+        })
+    }
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -3440,6 +3471,24 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedCommunityMembershipRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v48.0.0 (CIRISPersist#860) — the widening mirror of the above.
+    async fn list_signed_community_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipWidening>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedCommunityMembershipWideningsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunityMembershipWidenings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3784,6 +3833,15 @@ impl FederationDirectory for OpsDirectory {
     ) -> Result<Vec<CommunityMembershipRevocation>, Error> {
         Err(Error::Unsupported {
             method: "list_community_membership_revocations_for",
+        })
+    }
+    async fn list_community_membership_widenings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipWidening>, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "list_community_membership_widenings_for",
         })
     }
     async fn list_location_proofs_for(
