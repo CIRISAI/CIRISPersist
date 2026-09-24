@@ -859,7 +859,9 @@ where
 /// grammar as a live egress grant over `Attestation`, cover `dimension`, and —
 /// when `audience` is given (a widening) — name exactly that audience. Same
 /// predicate the consent sweep applies — spelled once, here.
-async fn check_grant_covers<D>(
+/// v48.0.0 (#905) — `pub(crate)` so a witness can drive the negative arm
+/// (a steward's grant for a SIBLING machine) directly.
+pub(crate) async fn check_grant_covers<D>(
     dir: &D,
     row: &Attestation,
     grant_id: &str,

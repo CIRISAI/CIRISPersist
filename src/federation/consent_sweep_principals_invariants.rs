@@ -158,6 +158,70 @@ pub mod bodies {
             .map(|a| a.attestation_id)
             .collect();
         assert_eq!(for_actor, vec![g_actor.clone()]);
+        // The READ alone is keyed by the machine (the V147 projection): the
+        // actor's grant is not a candidate for the node even before the
+        // predicate looks (a reader that ignored `for_key_id` would hide
+        // behind the predicate, and the predicate behind the reader).
+        let read_for_node: Vec<String> = d
+            .list_live_consent_grants_for(&node)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(
+            read_for_node,
+            vec![g_node.clone()],
+            "I169: the read is keyed by for_key_id"
+        );
+        // The PREDICATE alone: alice is bound to BOTH machines, so only
+        // `for_key_id` tells the node's grant from the actor's.
+        let g_node_row = d.get_attestation(&g_node).await.unwrap().unwrap();
+        let g_actor_row = d.get_attestation(&g_actor).await.unwrap().unwrap();
+        assert!(cbh::grant_is_authored_for(d, &g_node_row, &node)
+            .await
+            .unwrap());
+        assert!(
+            !cbh::grant_is_authored_for(d, &g_actor_row, &node)
+                .await
+                .unwrap(),
+            "I169: a bound steward's grant for a SIBLING machine is not the node's"
+        );
+        // And the crossing's covering check — the door a replicated row
+        // reaches — refuses the sibling's grant and accepts the node's.
+        let sent_by_node = row(
+            &format!("i169-row-{s}"),
+            &node,
+            &node,
+            serde_json::json!({"dimension": "trace:demo:v1", "trace": {}}),
+            vec![node.clone()],
+            chrono::Utc::now(),
+        );
+        let now = chrono::Utc::now();
+        crate::federation::crossing::check_grant_covers(
+            d,
+            &sent_by_node,
+            &g_node,
+            "trace:demo:v1",
+            None,
+            now,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I169: the node's own steward-authored grant covers it: {e}"));
+        let err = crate::federation::crossing::check_grant_covers(
+            d,
+            &sent_by_node,
+            &g_actor,
+            "trace:demo:v1",
+            None,
+            now,
+        )
+        .await
+        .expect_err("I169: the steward's grant for the sibling does not cover the node");
+        assert!(
+            err.to_string().contains("neither the sender nor a steward"),
+            "I169: refused for the principal, not something else: {err}"
+        );
         // A stranger's grant naming the node is NOT the node's (no binding).
         let mallory = format!("i169-mallory-{s}");
         ts::register_identity_key(d, &mallory, USER).await;

@@ -651,6 +651,42 @@ pub mod bodies {
             !roster(d, &room).await.contains(&bob),
             "{tag} I167: bob is out after t3"
         );
+        // Both removals are content-hash addressable and distinct: the
+        // wire-index key names WHICH removal (the three-part PK).
+        let mut seen = std::collections::BTreeSet::new();
+        for s in &mine {
+            let hash = crate::federation::wire_index::content_hash_of(&s.revocation).unwrap();
+            let bytes = d
+                .lookup_signed_record_by_content_hash("CommunityMembershipRevocation", &hash)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{tag} I167: revocation {hash} is addressable by hash"));
+            let back: crate::federation::SignedCommunityMembershipRevocation =
+                serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                seen.insert(back.community_membership_revocation.effective_at),
+                "{tag} I167: each hash resolves to its own removal"
+            );
+        }
+        assert_eq!(seen.len(), 2);
+        // The widening is addressable the same way.
+        let served_w = d
+            .list_signed_community_membership_widenings_since(None, 100)
+            .await
+            .unwrap();
+        let w = served_w
+            .iter()
+            .find(|w| w.widening.community_membership_widening.community_key_id == room)
+            .expect("the widening is served");
+        let whash = crate::federation::wire_index::content_hash_of(&w.widening).unwrap();
+        let wbytes = d
+            .lookup_signed_record_by_content_hash("CommunityMembershipWidening", &whash)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{tag} I167: the widening is addressable by hash"));
+        let wback: crate::federation::SignedCommunityMembershipWidening =
+            serde_json::from_slice(&wbytes).unwrap();
+        assert_eq!(wback, w.widening, "{tag} I167: byte-exact by hash");
     }
 }
 
