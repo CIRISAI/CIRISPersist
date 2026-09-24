@@ -45593,6 +45593,8 @@ mod tests {
             .add_community_member(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
+        // v48.0.0 (#860): the RECORD never grows — u2 rides the widening
+        // plane; the fold above is the roster.
         assert_eq!(
             backend
                 .lookup_community(&comm)
@@ -45601,7 +45603,15 @@ mod tests {
                 .unwrap()
                 .members
                 .len(),
-            3
+            2
+        );
+        assert_eq!(
+            backend
+                .list_community_membership_widenings_for(&comm)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         // revoke u1 effective now → 2 active, full roster intact.
         backend
@@ -45632,7 +45642,8 @@ mod tests {
                 .unwrap()
                 .members
                 .len(),
-            3
+            2,
+            "the record is untouched by a revocation too"
         );
 
         // ── moderators_of ── founder-rooted community + moderate delegate.

@@ -3877,7 +3877,13 @@ pub trait FederationDirectory: Send + Sync {
     /// `{member.key_id, member.joined_at, effective_at = member.joined_at,
     /// member.role}` — and `spec` is the authority's hybrid scrub over THAT
     /// row's envelope, not over the grown record. Returns `Ok(true)` when the
-    /// row is new, `Ok(false)` when the byte-identical row was already held.
+    /// row is new and changes the fold, `Ok(false)` — nothing written — when
+    /// the member is already active at `effective_at` by the one fold (the
+    /// pre-v48 idempotency: a re-add with a fresh `joined_at` is a no-op, not
+    /// a second event; the fold is identical with or without the row) or the
+    /// byte-identical row is already held. The REPLICATED door
+    /// (`put_community_membership_widening`) never consults the fold — order
+    /// independence — this local one may: it is the node's own authority.
     async fn add_community_member(
         &self,
         community_key_id: &str,
@@ -3899,13 +3905,35 @@ pub trait FederationDirectory: Send + Sync {
             role: member.role,
             persist_row_hash: String::new(),
         };
-        let already = self
+        let widenings = self
             .list_community_membership_widenings_for(community_key_id)
-            .await?
-            .into_iter()
-            .any(|w| {
-                w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
-            });
+            .await?;
+        let already = widenings.iter().any(|w| {
+            w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
+        });
+        if !already {
+            // Already active at that instant: the row would not move the fold.
+            let record = self
+                .lookup_community(community_key_id)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "add_community_member names unknown community_key_id {community_key_id:?}"
+                    ))
+                })?;
+            let revocations = self
+                .list_community_membership_revocations_for(community_key_id)
+                .await?;
+            let active = active_roster_at(
+                &record.members,
+                &widenings,
+                &revocations,
+                widening.effective_at,
+            );
+            if active.iter().any(|m| m.key_id == widening.member_key_id) {
+                return Ok(false);
+            }
+        }
         self.put_community_membership_widening(SignedCommunityMembershipWidening {
             community_membership_widening: widening,
             authority_key_id: spec.authority_key_id.clone(),

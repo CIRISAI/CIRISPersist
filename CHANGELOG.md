@@ -46,6 +46,9 @@ was in this state; it showed on the first room that widened.
   set, the supersede projection — goes through it (`effective_roster` /
   `is_active_community_member`). `put_community`'s own checks still read the
   incoming record.
+- `add_community_member` keeps its pre-v48 idempotency on the plane: a re-add
+  of a member already active at `effective_at` (by the fold — on the record or
+  widened) returns `Ok(false)` and writes no row; only a genuine change writes.
 - The fold counts a record member **from the record**, never from the
   signer-chosen `joined_at` (the founding roster was not instant-gated before
   v48; a peer seeding the room from a skewed clock must not refuse an earlier

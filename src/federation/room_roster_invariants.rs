@@ -310,6 +310,49 @@ pub mod bodies {
                 .unwrap(),
             "{tag} I164: the byte-identical row is a no-op"
         );
+        // The pre-v48 idempotency holds on the plane: a re-add of an ACTIVE
+        // member with a fresh `joined_at` is a no-op that writes no row (the
+        // fold is identical with or without it) — pg's Cut B graph DX test
+        // pins the same on the record's own members.
+        let later = CommunityMember {
+            key_id: carol.clone(),
+            joined_at: at("2026-03-05T00:00:00Z"),
+            role: None,
+        };
+        assert!(
+            !a.add_community_member(
+                &room,
+                later.clone(),
+                &ts::widening_admit_spec(&alice, &room, &later)
+            )
+            .await
+            .unwrap(),
+            "{tag} I164: re-adding an active member at a later instant is a no-op"
+        );
+        assert_eq!(
+            a.list_community_membership_widenings_for(&room)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "{tag} I164: the no-op wrote no row"
+        );
+        // Bob is on the RECORD: the same no-op, for the same reason.
+        let bob_again = CommunityMember {
+            key_id: bob.clone(),
+            joined_at: at("2026-03-05T00:00:00Z"),
+            role: None,
+        };
+        assert!(
+            !a.add_community_member(
+                &room,
+                bob_again.clone(),
+                &ts::widening_admit_spec(&alice, &room, &bob_again)
+            )
+            .await
+            .unwrap(),
+            "{tag} I164: re-adding a record member is a no-op"
+        );
         assert_eq!(
             a.lookup_community(&room).await.unwrap().unwrap(),
             record_before_a,
