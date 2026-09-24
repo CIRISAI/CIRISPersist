@@ -26,8 +26,9 @@ pub fn mint_test_anchor_block(ed_seeds: &[[u8; 32]]) -> Result<TestAnchorBlock, 
 impl TestAnchorBlock {
     pub fn env_pairs(&self) -> Vec<(&'static str, String)>;  // the SEVEN vars, slots comma-joined
     pub fn compose_lines(&self) -> String;                   // `  KEY: "value"` per var, compose-ready
-    pub fn apply_to_env(&self);                              // set_var each (harness / test use)
 }
+// (no `apply_to_env`: the #738 hygiene gate forbids src/ code that mutates the anchor
+//  environment; a harness sets the seven `env_pairs()` itself, in its own process)
 pub fn test_anchor_minted_by() -> &'static str;              // "persist vX.Y.Z / verify vA.B.C"
 ```
 Holder `i` is `test-accord-holder-{i}` (the seeder's naming). `mint` is pure (no directory, no clock): Ed25519 from the seed, ML-DSA-65 from `test_anchor_mldsa_seed`, the envelope from `test_anchor_registration_envelope`, `ceg_produce_canonicalize`, `ed.sign(canonical)`, `mldsa.sign(canonical ‖ ed_sig)`. For one holder and the seed `AQID…HyA=` this reproduces CIRISEdge's minter and the block in CIRISServer's `harness/mesh-repro/docker-compose.yml` byte-for-byte on the Ed25519 side (I159 pins it); the ML-DSA signature is randomized and is pinned by verification, not equality.
