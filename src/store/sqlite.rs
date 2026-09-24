@@ -7307,6 +7307,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
+        // v48.1.0 (CIRISPersist#907) — containment in the room's HISTORY:
+        // on the record, or named by a widening. Still raw (a removed member
+        // is listed); the `_active` readers fold.
         // sqlite full-scan with members membership check via json_each.
         // EXISTS subquery against json_each unrolls the array and matches
         // any entry whose key_id == the target.
@@ -7488,6 +7491,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                      WHERE EXISTS ( \
                          SELECT 1 FROM json_each(federation_communities.members) \
                          WHERE json_extract(value, '$.key_id') = ?1 \
+                     ) OR community_key_id IN ( \
+                         SELECT community_key_id \
+                         FROM federation_community_membership_widenings \
+                         WHERE member_key_id = ?1 \
                      ) \
                      ORDER BY community_key_id ASC",
                 )?;
@@ -8265,6 +8272,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
+        // v48.1.0 (CIRISPersist#908) — standing, before the epoch rotates:
+        // a stranger's valid signature no longer removes a member.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &revocation.authority_key_id,
+            true,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        )
+        .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::to_string(&row.witness_set)
             .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
@@ -8432,6 +8450,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
+        // v48.1.0 (CIRISPersist#908) — whose signature, not just whether:
+        // the signer must have standing in the room at the row's instant.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &widening.authority_key_id,
+            false,
+            &row.member_key_id,
+            row.effective_at,
+        )
+        .await?;
         let community = self
             .lookup_community(&row.community_key_id)
             .await?
@@ -8629,6 +8658,72 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_community_membership_widenings_for: {e}"
+            ))
+        })
+    }
+
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let key = community_key_id.to_owned();
+        let out = self
+            .read(
+                move |conn| -> Result<
+                    Option<crate::federation::CommunityRosterSigners>,
+                    rusqlite::Error,
+                > {
+                    use rusqlite::OptionalExtension;
+                    let Some(record_authority_key_id) = conn
+                        .query_row(
+                            "SELECT authority_key_id FROM federation_communities \
+                             WHERE community_key_id = ?1",
+                            [&key],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                    else {
+                        return Ok(None);
+                    };
+                    let events = |sql: &str| -> Result<
+                        Vec<crate::federation::RosterEventSigner>,
+                        rusqlite::Error,
+                    > {
+                        let mut stmt = conn.prepare(sql)?;
+                        let rows = stmt.query_map([&key], |r| {
+                            let at: String = r.get(1)?;
+                            Ok(crate::federation::RosterEventSigner {
+                                member_key_id: r.get(0)?,
+                                effective_at: parse_rfc3339(&at),
+                                authority_key_id: r.get(2)?,
+                            })
+                        })?;
+                        rows.collect()
+                    };
+                    let widening_signers = events(
+                        "SELECT member_key_id, effective_at, authority_key_id \
+                         FROM federation_community_membership_widenings \
+                         WHERE community_key_id = ?1",
+                    )?;
+                    let revocation_signers = events(
+                        "SELECT removed_identity_key_id, effective_at, authority_key_id \
+                         FROM federation_community_membership_revocations \
+                         WHERE community_key_id = ?1",
+                    )?;
+                    Ok(Some(crate::federation::CommunityRosterSigners {
+                        record_authority_key_id,
+                        widening_signers,
+                        revocation_signers,
+                    }))
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("community_roster_signers: {e}"))
+            })?;
+        out.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "community_roster_signers names unknown community_key_id {community_key_id:?}"
             ))
         })
     }

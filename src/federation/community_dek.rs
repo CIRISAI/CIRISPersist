@@ -363,12 +363,10 @@ pub mod orchestrate {
             .map_err(map_dir_err)?;
         // v48.0.0 (CIRISPersist#860) — the wrap set is the one fold: a widened
         // member is wrapped at the next seal; a removed one is not.
-        let widenings = backend
-            .list_community_membership_widenings_for(&community.community_key_id)
+        // v48.1.0 (#908): only events whose signer has standing count.
+        let roster = crate::federation::authorized_community_roster_at(backend, community, now)
             .await
             .map_err(map_dir_err)?;
-        let roster =
-            crate::federation::active_roster_at(&community.members, &widenings, &revs, now);
         // The removal's EFFECTIVE instant, not the instant it was recorded:
         // a removal admitted with a (skew-window) future `effective_at` lets
         // a seal in between mint an epoch newer than `removed_at` that still

@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 96 delegations, generated. Every one: fault first, then delegate.
+// 97 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -251,6 +251,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.communities_containing(cell_id).await
+    }
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<CommunityRosterSigners, Error> {
+        if let Some(e) = self.faulted("community_roster_signers") {
+            return Err(e);
+        }
+        self.inner.community_roster_signers(community_key_id).await
     }
     async fn enter_mesh(
         &self,

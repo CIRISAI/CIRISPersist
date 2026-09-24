@@ -3426,6 +3426,31 @@ pub mod test_support {
         }
     }
 
+    /// v48.1.0 (#908) — a LIVE `delegates_to(granter → grantee)` scoped to
+    /// the `moderate` duty, federation-tier hybrid-signed by `granter`'s
+    /// deterministic keys: the appointment the roster fold's moderator rule
+    /// walks. Register both keys first.
+    pub fn moderate_delegation_attestation(
+        id: &str,
+        granter: &str,
+        grantee: &str,
+    ) -> crate::federation::Attestation {
+        let mut a = owner_binding_attestation(id, granter, grantee);
+        let envelope = serde_json::json!({
+            "id": id,
+            "kind": "delegates_to",
+            "scope": [crate::federation::admission::DELEGATION_SCOPE_MODERATE],
+            "sub_delegation": false,
+        });
+        let (och, classical, pqc) = sign_envelope(granter, &envelope);
+        a.attestation_envelope = envelope;
+        a.original_content_hash = och;
+        a.scrub_signature_classical = classical;
+        a.scrub_signature_pqc = pqc;
+        a.persist_row_hash = String::new();
+        seal_row(granter, a)
+    }
+
     /// #371 — build a LIVE **owner-binding** `delegates_to(owner → node)`
     /// (the CC 1.13.3.3 / CC 3.2 ownership dimension the v12.6.0
     /// single-owner gate + `owner_of` key on), federation-tier

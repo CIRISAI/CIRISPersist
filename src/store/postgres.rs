@@ -8078,6 +8078,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
+        // v48.1.0 (CIRISPersist#907) — containment in the room's HISTORY:
+        // on the record, or named by a widening. Still raw.
         // Uses the V060 GIN index — the `@>` containment operator is the
         // matching shape (members @> [{"key_id": "X"}]).
         let client = self
@@ -8091,8 +8093,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     consensus_protocol, policy_blob, persist_row_hash \
                  FROM cirislens.federation_communities \
                  WHERE members @> $1 \
+                    OR community_key_id IN ( \
+                        SELECT community_key_id \
+                        FROM cirislens.federation_community_membership_widenings \
+                        WHERE member_key_id = $2) \
                  ORDER BY community_key_id ASC",
-                &[&containment],
+                &[&containment, &member_identity_key_id],
             )
             .await
             .map_err(|e| {
@@ -8840,6 +8846,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
+        // v48.1.0 (CIRISPersist#908) — standing, before the epoch rotates.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &revocation.authority_key_id,
+            true,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        )
+        .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::json!(row.witness_set);
         // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
@@ -9020,6 +9036,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
+        // v48.1.0 (CIRISPersist#908) — the signer must have standing.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &widening.authority_key_id,
+            false,
+            &row.member_key_id,
+            row.effective_at,
+        )
+        .await?;
         let community = self
             .lookup_community(&row.community_key_id)
             .await?
@@ -9232,6 +9258,77 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter()
             .map(pg_row_to_community_membership_widening)
             .collect()
+    }
+
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("community_roster_signers: {e}"))
+        };
+        let Some(record) = client
+            .query_opt(
+                "SELECT authority_key_id FROM cirislens.federation_communities \
+                 WHERE community_key_id = $1",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(be)?
+        else {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "community_roster_signers names unknown community_key_id {community_key_id:?}"
+            )));
+        };
+        let mk_err = crate::federation::Error::Backend;
+        let record_authority_key_id: Option<String> =
+            record.safe_get_with("authority_key_id", mk_err)?;
+        let events = |rows: Vec<tokio_postgres::Row>| -> Result<
+            Vec<crate::federation::RosterEventSigner>,
+            crate::federation::Error,
+        > {
+            rows.into_iter()
+                .map(|r| {
+                    Ok(crate::federation::RosterEventSigner {
+                        member_key_id: r.safe_get_with("member_key_id", mk_err)?,
+                        effective_at: r.safe_get_with("effective_at", mk_err)?,
+                        authority_key_id: r.safe_get_with("authority_key_id", mk_err)?,
+                    })
+                })
+                .collect()
+        };
+        let widening_signers = events(
+            client
+                .query(
+                    "SELECT member_key_id, effective_at, authority_key_id \
+                     FROM cirislens.federation_community_membership_widenings \
+                     WHERE community_key_id = $1",
+                    &[&community_key_id],
+                )
+                .await
+                .map_err(be)?,
+        )?;
+        let revocation_signers = events(
+            client
+                .query(
+                    "SELECT removed_identity_key_id AS member_key_id, effective_at, \
+                        authority_key_id \
+                     FROM cirislens.federation_community_membership_revocations \
+                     WHERE community_key_id = $1",
+                    &[&community_key_id],
+                )
+                .await
+                .map_err(be)?,
+        )?;
+        Ok(crate::federation::CommunityRosterSigners {
+            record_authority_key_id,
+            widening_signers,
+            revocation_signers,
+        })
     }
 
     // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.

@@ -6055,7 +6055,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_communities
             .values()
-            .filter(|c| c.members.iter().any(|m| m.key_id == member_identity_key_id))
+            // v48.1.0 (CIRISPersist#907) — containment in the room's
+            // HISTORY: on the record, or named by a widening. Still raw.
+            .filter(|c| {
+                c.members.iter().any(|m| m.key_id == member_identity_key_id)
+                    || state
+                        .federation_community_membership_widenings
+                        .values()
+                        .any(|w| {
+                            w.community_key_id == c.community_key_id
+                                && w.member_key_id == member_identity_key_id
+                        })
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
@@ -6678,6 +6689,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
+        // v48.1.0 (CIRISPersist#908) — standing, before the epoch rotates.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &revocation.authority_key_id,
+            true,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        )
+        .await?;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
@@ -6807,6 +6828,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
+        // v48.1.0 (CIRISPersist#908) — the signer must have standing.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &widening.authority_key_id,
+            false,
+            &row.member_key_id,
+            row.effective_at,
+        )
+        .await?;
         let community = self
             .lookup_community(&row.community_key_id)
             .await?
@@ -6986,6 +7017,60 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .then_with(|| a.effective_at.cmp(&b.effective_at))
         });
         Ok(rows)
+    }
+
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        if !state.federation_communities.contains_key(community_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "community_roster_signers names unknown community_key_id {community_key_id:?}"
+            )));
+        }
+        let record_authority_key_id = state
+            .federation_community_authority_sigs
+            .get(community_key_id)
+            .map(|s| s.0.clone());
+        let signer = |key: &(String, String, chrono::DateTime<chrono::Utc>),
+                      sigs: &HashMap<
+            (String, String, chrono::DateTime<chrono::Utc>),
+            AuthoritySig,
+        >| {
+            crate::federation::RosterEventSigner {
+                member_key_id: key.1.clone(),
+                effective_at: key.2,
+                authority_key_id: sigs.get(key).map(|s| s.0.clone()),
+            }
+        };
+        let widening_signers = state
+            .federation_community_membership_widenings
+            .keys()
+            .filter(|k| k.0 == community_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_community_membership_widening_authority_sigs,
+                )
+            })
+            .collect();
+        let revocation_signers = state
+            .federation_community_membership_revocations
+            .keys()
+            .filter(|k| k.0 == community_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_community_membership_revocation_authority_sigs,
+                )
+            })
+            .collect();
+        Ok(crate::federation::CommunityRosterSigners {
+            record_authority_key_id,
+            widening_signers,
+            revocation_signers,
+        })
     }
 
     // ─── v6.7.0 (CIRISPersist#146 Ask 3 / #161 Ask 5) — hard_case:* surface.

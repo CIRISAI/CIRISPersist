@@ -12402,6 +12402,26 @@ pub async fn moderators_of(
     Ok(out)
 }
 
+/// v48.1.0 (CIRISPersist#908) — every key `root` reaches under the
+/// `moderate`-duty walk: the SAME walk [`appointed_moderators_of`] runs,
+/// exposed to the authorized roster fold, which supplies its own static roots
+/// (it must never ask the fold for them).
+pub(crate) async fn moderation_reach_of(
+    directory: &dyn super::FederationDirectory,
+    root: &str,
+) -> Result<Vec<String>, Error> {
+    Ok(enumerate_scoped_delegation_reach(
+        directory,
+        root,
+        DELEGATION_SCOPE_MODERATE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await?
+    .into_iter()
+    .collect())
+}
+
 /// CIRISPersist#591 — the **APPOINTED** moderator set of community
 /// `community_id` for `duty`: the steward-bound **founders** and every key they
 /// reach under the same §11.10 `duty`-scoped `delegates_to` walk.

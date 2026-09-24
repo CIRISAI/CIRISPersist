@@ -6977,3 +6977,31 @@ pub struct KnownHashEviction {
     /// tension — not that the pass failed.
     pub over_bound_by: u64,
 }
+
+/// v48.1.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — who signed
+/// one roster event. `authority_key_id` is `None` only for a row admitted
+/// before V110 stored the signer: such a row COUNTS in the authorized fold
+/// (it was admitted under the rules of its day).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterEventSigner {
+    /// The member the event adds or removes.
+    pub member_key_id: String,
+    /// The event's effective instant (with `member_key_id`, the row's key).
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+    /// The signer stored with the row; `None` for a legacy row.
+    pub authority_key_id: Option<String>,
+}
+
+/// v48.1.0 (CIRISPersist#908) — every signer the authorized roster fold needs
+/// for one room: the record's signer (the key that founded it; `None` for a
+/// trusted-local or legacy record) and one [`RosterEventSigner`] per stored
+/// widening and revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CommunityRosterSigners {
+    /// The `authority_key_id` stored with the room's own row.
+    pub record_authority_key_id: Option<String>,
+    /// One per stored `CommunityMembershipWidening`.
+    pub widening_signers: Vec<RosterEventSigner>,
+    /// One per stored `CommunityMembershipRevocation`.
+    pub revocation_signers: Vec<RosterEventSigner>,
+}

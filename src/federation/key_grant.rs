@@ -925,15 +925,11 @@ where
         k.identity_type == crate::federation::types::identity_type::NODE
             || k.claims_role(crate::federation::types::identity_type::NODE)
     });
-    let revs = directory
-        .list_community_membership_revocations_for(community_key_id)
-        .await?;
     // v48.0.0 (CIRISPersist#860) — the roster AS OF `as_of` is the one fold
     // (record + widenings − revocations), never the record alone.
-    let widenings = directory
-        .list_community_membership_widenings_for(community_key_id)
-        .await?;
-    let roster = crate::federation::active_roster_at(&community.members, &widenings, &revs, as_of);
+    // v48.1.0 (#908): only events whose signer has standing count.
+    let roster =
+        crate::federation::authorized_community_roster_at(directory, &community, as_of).await?;
     // A NODE minter has exactly ONE principal — its live owner — and no
     // fallback: not the key itself, not a stale row under a former owner,
     // not the member-occurrence walk below (PR #852 review, round five: an
