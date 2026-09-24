@@ -128,6 +128,35 @@ CIRISServer pins the hash). Fifteen kinds shipped through v44.2.1; v44.3.0
 
 `FSD/BLOB_REPLICATION.md` Part II (§11–§19) is the design.
 
+## Replicated `EnvelopeKind`s — the seventeenth kind, `CommunityMembershipWidening` (v48.0.0, #860)
+
+Sixteen kinds shipped through v47.4.0; v48.0.0 **appends** the seventeenth
+after `KeyGrant` — never inserts, the order is hashed:
+
+| # | `EnvelopeKind` | carries | signer | binding | projections |
+|---|---|---|---|---|---|
+| 17 | `CommunityMembershipWidening` | one row of `federation_community_membership_widenings`: `(community_key_id, member_key_id, effective_at)` + `joined_at`, `role` — the addition plane, the mirror of `CommunityMembershipRevocation` | `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
+
+- **Wire shape.** A `SignedCommunityMembershipWidening` is the widening row
+  plus the room authority's hybrid scrub over its canonical (JCS) envelope
+  with `persist_row_hash` stripped — the same signing shape as the
+  revocation. It rides `list_signed_community_membership_widenings_since`
+  (pair cursor; resume id = the three-part compound of the PK).
+- **Admission** (`tier_ingest::verify_community_membership_widening_admission`):
+  unknown room → `InvalidArgument` first; the signer must be in the room's
+  authority set at `effective_at`; future-dated rows are refused
+  (`community_dek::reject_future_dated_community_widening`).
+- **Fold.** `active_roster_at(record, widenings, revocations, as_of)`: the
+  latest event per member wins; a removal wins a tie. Every read-time gate
+  goes through `effective_roster` / `is_active_community_member`. The DEK
+  epoch does NOT rotate on a widening.
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `c1082c12…389d` → `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19`;
+  `CONSENT_GRAMMAR_HASH` (`CommunityMembershipWidening` is `StructuralPlane`)
+  `ed2b0f2c…482` → `07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9`.
+
+`FSD/ROOM_ROSTER_PLANES.md` is the design.
+
 ---
 
 ## Why persist exposes no `send_trace_batch` wrapper

@@ -582,7 +582,7 @@ pub fn consent_grammar_sha256() -> String {
 /// `ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482`
 /// (v44.6.0 – v47.4.0).
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "30786161c7d3be465abd8c38b791aabd425878187d34017abc82c45e39cfa342";
+    "07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

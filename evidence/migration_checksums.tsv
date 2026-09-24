@@ -287,3 +287,7 @@ sqlite	149	blob_renditions	17356472952008256851
 postgres	149	blob_renditions	10144278107610230793
 sqlite	150	cohort_target_generated_column	1428640193462281817
 postgres	150	cohort_target_generated_column	1864075029709579296
+sqlite	151	room_roster_planes	329385068719013777
+sqlite	152	consent_peer_set_for_key	2333239359292406818
+postgres	151	room_roster_planes	17256240880646898922
+postgres	152	consent_peer_set_for_key	17869501614558642481

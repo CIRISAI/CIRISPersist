@@ -46,9 +46,18 @@ was in this state; it showed on the first room that widened.
   set, the supersede projection — goes through it (`effective_roster` /
   `is_active_community_member`). `put_community`'s own checks still read the
   incoming record.
-- The revocation since-read's resume id is the three-part compound; the
-  `CONSENT_GRAMMAR_HASH` is **re-pinned** (`30786161…`): the kind list is part
-  of the hash.
+- The revocation since-read's resume id is the three-part compound. **Pins
+  moved, all growth:** `REPLICATION_POLICY_HASH` `c1082c12…` →
+  `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19` (the 17th
+  kind is APPENDED after `KeyGrant` — the order is hashed and CIRISEdge's
+  `EnvelopeKind` mirrors it by position; CIRISServer pins the hash);
+  `CONSENT_GRAMMAR_HASH` `ed2b0f2c…` →
+  `07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9` (the kind
+  list is part of the hash; the grammar itself is unchanged); both directory
+  capsule wire digests re-pinned for the appended `ListSignedCommunityMembershipWideningsSince`
+  / `SignedCommunityMembershipWidenings` variants — nothing existing touched,
+  `DIRECTORY_ABI_VERSION` stays **5**; `evidence/migration_checksums.tsv` gains
+  V151/V152 on both dialects.
 
 ### Fixed — the promotion sweep sees a claimed machine's consent (CIRISPersist#905; FSD `CONSENT_SWEEP_BY_PRINCIPALS.md`)
 Measured on CIRISServer's production-shaped ladder: a split, owned, claimed
