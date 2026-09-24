@@ -2305,14 +2305,15 @@ pub mod test_support {
         let sealed = charter.attestation_envelope.clone();
         charter.additional_scrubs = holders[1..]
             .iter()
-            .map(|h| {
+            .filter_map(|h| {
                 let signer = overrides
                     .iter()
                     .find(|(k, _)| *k == h.as_str())
                     .map(|(_, s)| s);
                 match signer {
-                    Some(s) => co_scrub(&sealed, h, s),
-                    None => co_scrub(&sealed, h, &ScrubSigner::Deterministic(h)),
+                    Some(ScrubSigner::Absent) => None,
+                    Some(s) => Some(co_scrub(&sealed, h, s)),
+                    None => Some(co_scrub(&sealed, h, &ScrubSigner::Deterministic(h))),
                 }
             })
             .collect();
@@ -3546,6 +3547,10 @@ pub mod test_support {
         Deterministic(&'a str),
         /// The mock YubiKey member attested from this Ed25519 seed.
         MockMember([u8; 32]),
+        /// No scrub at all: a SEATED holder who did not sign this charter
+        /// (quorum may still be met by the others; this seat is then not a
+        /// holder OF THIS CHARTER — the v47.3.0 leg must not judge it).
+        Absent,
     }
 
     /// One co-scrub over the sealed envelope, `scrub_key_id = key_id`, signed
@@ -3562,6 +3567,7 @@ pub mod test_support {
                 let (ed, mldsa) = ts::mock_member_signers(seed);
                 ts::sign_envelope_with(&ed, &mldsa, envelope)
             }
+            ScrubSigner::Absent => unreachable!("an absent scrub is filtered before signing"),
         };
         crate::federation::types::ScrubSig {
             cosigned_at: None,

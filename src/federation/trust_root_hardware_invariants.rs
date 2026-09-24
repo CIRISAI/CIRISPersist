@@ -65,7 +65,10 @@ pub mod bodies {
         let user = format!("{tag}-user");
         let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
         let root = format!("{tag}-root");
-        ops::register_typed_key(d, &user, identity_type::NODE)
+        // The user is NOT a holder: it attests the trust edge about the root
+        // and carries no evidence. A leg that judged every attester about
+        // the root (instead of the charter's verified scrubs) would refuse it.
+        ops::register_typed_key_with_evidence(d, &user, identity_type::NODE, None)
             .await
             .unwrap();
         for (h, ev) in holders.iter().zip(evidence) {
@@ -190,6 +193,39 @@ pub mod bodies {
         assert!(
             w.bounded_until.is_none(),
             "{tag} I154: a refusal carries no TTL: {w:?}"
+        );
+
+        // Root C: three seats, only h0 and h1 scrub the charter (quorum 2/3
+        // met); h2 is seated, unattested, and did NOT sign. A seated holder
+        // who did not sign is not a holder OF THIS CHARTER: valid, two
+        // entries, h2 absent from the verdict.
+        let tc = format!("{tag}-c");
+        let h2c = format!("{tc}-h2");
+        let (user_c, root_c, holders_c) = family_root_with_scrubs(
+            d,
+            &tc,
+            [Some(stale_strongbox()), Some(stale_strongbox()), None],
+            &[(&h2c, ops::ScrubSigner::Absent)],
+        )
+        .await;
+        let c = trust_root_valid(d, &user_c, &root_c).await.unwrap();
+        assert!(
+            c.valid && c.holders_hardware_attested,
+            "{tag} I154: a seated non-signer is not judged: {c:?}"
+        );
+        assert_eq!(
+            c.holders_hardware
+                .iter()
+                .map(|h| h.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![holders_c[0].as_str(), holders_c[1].as_str()],
+            "{tag} I154: the verdict names the charter's verified scrubs and no one else"
+        );
+        assert_eq!(
+            c.charter_quorum
+                .map(|q| (q.distinct_holders, q.roster_size)),
+            Some((2, 3)),
+            "{tag} I154: the quorum accounting still sees the whole roster"
         );
 
         // The node's policy stops accepting the holders' class: the SAME
