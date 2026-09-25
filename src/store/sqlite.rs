@@ -6916,9 +6916,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // Map a "group does not exist" sentinel back to a typed error.
         let not_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let nf = not_found.clone();
-        // v49.0.0 (#910.5) — `(named, held)` when a proof names a prior version
-        // this node does not hold.
-        type StaleSlot = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
+        // v49.0.0 (#910.5) — the stale-proof refusal, carried out of the
+        // write closure (whose error type is rusqlite's).
+        type StaleSlot = std::sync::Arc<std::sync::Mutex<Option<Error>>>;
         let stale: StaleSlot = Default::default();
         // CC 4.4.3.2.8 / #308: `affiliations` records its version history under
         // its own `cohort.as_str()` discriminator while sharing the
@@ -6952,7 +6952,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-                let proof_prior = supersede_proof.map(|p| p.prior_persist_row_hash);
                 let stale = stale.clone();
                 new_fam.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_fam)?;
@@ -6979,12 +6978,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     };
                     // v49.0.0 (#910.5) — a proof names the version it replaces;
                     // checked inside the transaction that replaces it.
-                    if let Some(named) = &proof_prior {
-                        if *named != prior_fam.persist_row_hash {
-                            *stale.lock().expect("stale slot") =
-                                Some((named.clone(), prior_fam.persist_row_hash.clone()));
-                            return Err(rusqlite::Error::QueryReturnedNoRows);
-                        }
+                    if let Some(p) = &supersede_proof {
+                        crate::federation::group_amendment::check_proof_names_prior(
+                            cohort_str,
+                            &new_fam.family_key_id,
+                            p,
+                            &prior_fam.persist_row_hash,
+                        )
+                        .map_err(|e| {
+                            *stale.lock().expect("stale slot") = Some(e);
+                            rusqlite::Error::QueryReturnedNoRows
+                        })?;
                     }
                     let snapshot = serde_json::to_string(&prior_fam)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -7055,7 +7059,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
                 })?;
                 let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
-                let proof_prior = supersede_proof.map(|p| p.prior_persist_row_hash);
                 let stale = stale.clone();
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
@@ -7087,12 +7090,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         }
                     };
                     // v49.0.0 (#910.5) — see the family arm.
-                    if let Some(named) = &proof_prior {
-                        if *named != prior_comm.persist_row_hash {
-                            *stale.lock().expect("stale slot") =
-                                Some((named.clone(), prior_comm.persist_row_hash.clone()));
-                            return Err(rusqlite::Error::QueryReturnedNoRows);
-                        }
+                    if let Some(p) = &supersede_proof {
+                        crate::federation::group_amendment::check_proof_names_prior(
+                            cohort_str,
+                            &new_comm.community_key_id,
+                            p,
+                            &prior_comm.persist_row_hash,
+                        )
+                        .map_err(|e| {
+                            *stale.lock().expect("stale slot") = Some(e);
+                            rusqlite::Error::QueryReturnedNoRows
+                        })?;
                     }
                     let snapshot = serde_json::to_string(&prior_comm)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -7150,13 +7158,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             Cohort::SelfId => unreachable!("guarded above"),
         }
         .map_err(|e| {
-            if let Some((named, held)) = stale.lock().expect("stale slot").take() {
-                crate::federation::group_amendment::stale_proof(
-                    cohort_str,
-                    &group_key_id,
-                    &named,
-                    &held,
-                )
+            if let Some(stale) = stale.lock().expect("stale slot").take() {
+                stale
             } else if not_found.load(std::sync::atomic::Ordering::SeqCst) {
                 Error::InvalidArgument(format!(
                     "supersede: unknown {cohort_str} group (nothing to supersede)"

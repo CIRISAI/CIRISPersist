@@ -233,7 +233,7 @@ pub(crate) fn check_proof_names_prior(
 
 /// The STALE refusal, spelled once for the pre-check and the in-transaction
 /// check.
-pub(crate) fn stale_proof(kind: &str, group_key_id: &str, named: &str, held: &str) -> Error {
+fn stale_proof(kind: &str, group_key_id: &str, named: &str, held: &str) -> Error {
     Error::Conflict(format!(
         "{kind} {group_key_id}: stale supersede_proof — it replaces persist_row_hash \
          {named}, but this node holds {held}; retryable: the intermediate version may not \

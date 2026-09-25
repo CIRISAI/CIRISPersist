@@ -398,6 +398,28 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // stored signers onto `RosterEventSigner`. Plumbing — a read door that
     // refuses nothing; it fails only on a driver error or a corrupt column.
     ("roster_event_signers", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#910.5) — the V155 `supersede_proof` column codecs.
+    // Plumbing — they fail only on the substrate's own stored JSON (or on
+    // serializing a proof already decoded); the proof itself is judged by
+    // the route below, never by its codec.
+    ("pg_supersede_proof", Class::Plumbing),
+    ("pg_supersede_proof_value", Class::Plumbing),
+    ("sqlite_supersede_proof", Class::Plumbing),
+    ("sqlite_supersede_proof_json", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#910.5) — sqlite's supersede carries a stale-proof
+    // verdict out of its write closure through a mutex slot; taking the lock
+    // refuses nothing (it fails only on a poisoned mutex).
+    ("lock", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#910.5) — the occupied-id route of the replicated
+    // group doors: an identical re-put settles, a differing record is refused
+    // unless its supersede proof names this node's prior version and passes
+    // the group's own quorum. Gate — it refuses the caller's record.
+    ("route_occupied_community", Class::Gate),
+    ("route_occupied_family", Class::Gate),
+    // v49.0.0 (CIRISPersist#910.5) — inside every backend's supersede
+    // transaction: a proof over a version this node does not hold is refused
+    // as stale. Gate.
+    ("check_proof_names_prior", Class::Gate),
     // v39.0.0 — the whole crossing decision: custody verification, every
     // inherited co-scrub, `check_promotion_admission`, and the nine
     // contextual-integrity axes. Delegates, not Gate: it is the door's helper
