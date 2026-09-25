@@ -55,6 +55,7 @@ pub mod bootstrap_admission;
 pub mod canonical_at_rest;
 pub mod capacity;
 pub mod cohort;
+pub mod consensus;
 // CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
 // content under the envelope: the per-chunk seal, the sealed manifest, the
 // decrypting range read and the live-stream chunk listing.
@@ -576,7 +577,7 @@ where
 }
 
 /// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.4) — **the
-/// unsigned roster fold.** v48.1.0 (#908): it does not judge who signed an
+/// unsigned roster fold.** v49.0.0 (#908): it does not judge who signed an
 /// event; every directory read uses [`authorized_community_roster_at`], which
 /// replays in this same order and applies only events whose signer has
 /// standing. For every key id that appears on the record, in a widening
@@ -641,24 +642,24 @@ pub fn active_roster_at(
     out
 }
 
-/// v48.1.0 (CIRISPersist#908) — the RETRYABLE [`Error::RosterAuthorityUnauthorized`]
+/// v49.0.0 (CIRISPersist#908) — the RETRYABLE [`Error::RosterAuthorityUnauthorized`]
 /// rule: the signer has no event in the room at all. Rows arrive out of order;
 /// the event that gives the signer standing may not be here yet, and persist
 /// holds no deferral queue — the caller re-submits.
 pub const ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED: &str = "roster_authority_not_established";
-/// v48.1.0 (CIRISPersist#908) — substantive: the signer's latest event in the
+/// v49.0.0 (CIRISPersist#908) — substantive: the signer's latest event in the
 /// room at the row's instant is a removal.
 pub const ROSTER_AUTHORITY_RULE_REMOVED: &str = "roster_authority_removed";
-/// v48.1.0 (CIRISPersist#908) — substantive: the signer is an active member of
+/// v49.0.0 (CIRISPersist#908) — substantive: the signer is an active member of
 /// a `founder_only` room but neither a founder nor a named moderator.
 pub const ROSTER_AUTHORITY_RULE_INSUFFICIENT: &str = "roster_authority_insufficient";
 
-/// v48.1.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §2) — the room
+/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §2) — the room
 /// state a standing question is asked against: each key that has appeared, and
 /// whether its latest counted event left it active.
 pub type RosterState = std::collections::BTreeMap<String, (bool, types::CommunityMember)>;
 
-/// v48.1.0 (CIRISPersist#908, FSD §2) — does `signer` have standing for one
+/// v49.0.0 (CIRISPersist#908, FSD §2) — does `signer` have standing for one
 /// roster event, against `state` (the authorized roster immediately before the
 /// event)? `Ok(())` or the refusing `ROSTER_AUTHORITY_RULE_*` token.
 ///
@@ -707,7 +708,7 @@ pub fn roster_standing(
     }
 }
 
-/// v48.1.0 (CIRISPersist#908, FSD §3) — **the authorized roster fold.** The
+/// v49.0.0 (CIRISPersist#908, FSD §3) — **the authorized roster fold.** The
 /// v48 replay order ([`active_roster_at`]: record members first, then dated
 /// events by `effective_at`, a removal last at a tie, then member key), but an
 /// event is APPLIED only if its signer has [`roster_standing`] in the state
@@ -795,7 +796,7 @@ pub fn authorized_roster_state_at(
     state
 }
 
-/// v48.1.0 (CIRISPersist#908, FSD §3) — the active members of
+/// v49.0.0 (CIRISPersist#908, FSD §3) — the active members of
 /// [`authorized_roster_state_at`], record order first, then widened members by
 /// key id (the same projection as [`active_roster_at`]).
 #[must_use]
@@ -841,7 +842,7 @@ fn project_roster_state(
     out
 }
 
-/// v48.1.0 (CIRISPersist#908, FSD §2 rule 4) — the named moderators of a room
+/// v49.0.0 (CIRISPersist#908, FSD §2 rule 4) — the named moderators of a room
 /// for duty `moderate`, walked from its STATIC roots (the record signer and
 /// the record's founders, each steward-bound). Never from the fold: the fold
 /// asks this, so this must not ask the fold. Delegation liveness is read-time
@@ -876,7 +877,7 @@ where
     Ok(out)
 }
 
-/// v48.1.0 (CIRISPersist#908) — everything the authorized fold reads for one
+/// v49.0.0 (CIRISPersist#908) — everything the authorized fold reads for one
 /// stored room, in one place.
 async fn roster_inputs<F>(
     directory: &F,
@@ -910,7 +911,7 @@ where
     Ok((signers, moderators, widenings, revocations))
 }
 
-/// v48.1.0 (CIRISPersist#908, FSD §3) — the authorized roster of a STORED room
+/// v49.0.0 (CIRISPersist#908, FSD §3) — the authorized roster of a STORED room
 /// at `as_of`: the one fold every directory read uses.
 pub async fn authorized_community_roster_at<F>(
     directory: &F,
@@ -933,7 +934,7 @@ where
     ))
 }
 
-/// v48.1.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
+/// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
 /// incoming widening or revocation, against the room's authorized state at the
 /// row's `effective_at`. An unknown room is not this check's refusal (the
 /// door's own room check / FK refuses it as before), so it returns `Ok(())`.
@@ -3341,7 +3342,7 @@ pub trait FederationDirectory: Send + Sync {
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipWidening>, Error>;
 
-    /// v48.1.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
+    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
     /// signer of the room's record and of every stored widening and
     /// revocation: what [`authorized_roster_at`] needs to judge standing.
     /// [`Error::InvalidArgument`] for an unknown room. Default `Unsupported`,
@@ -3982,7 +3983,7 @@ pub trait FederationDirectory: Send + Sync {
         let communities = self
             .list_communities_for_member(member_identity_key_id)
             .await?;
-        // v48.1.0 (CIRISPersist#907) — the candidates are every room the
+        // v49.0.0 (CIRISPersist#907) — the candidates are every room the
         // member appears in (record OR widening), and each is kept iff the
         // member is on its AUTHORIZED roster now: a widened member is in, a
         // removed-then-re-added member is in, a removed one is out. The
@@ -4203,7 +4204,7 @@ pub trait FederationDirectory: Send + Sync {
             })?;
         // v48.0.0 (CIRISPersist#860, FSD §3.4) — ONE fold: the record's
         // members plus the widening plane minus the revocation plane, by
-        // effective instant. v48.1.0 (#908): only events whose signer has
+        // effective instant. v49.0.0 (#908): only events whose signer has
         // standing count.
         authorized_community_roster_at(self, &community, chrono::Utc::now()).await
     }
@@ -7477,7 +7478,7 @@ pub enum Error {
         rule: &'static str,
     },
 
-    /// v48.1.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §4) — a
+    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §4) — a
     /// community-membership widening or revocation whose signature verified,
     /// but whose `authority_key_id` has no STANDING in the room at the row's
     /// `effective_at`: not the room's record signer, not an active founder,

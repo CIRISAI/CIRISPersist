@@ -12402,7 +12402,7 @@ pub async fn moderators_of(
     Ok(out)
 }
 
-/// v48.1.0 (CIRISPersist#908) — every key `root` reaches under the
+/// v49.0.0 (CIRISPersist#908) — every key `root` reaches under the
 /// `moderate`-duty walk: the SAME walk [`appointed_moderators_of`] runs,
 /// exposed to the authorized roster fold, which supplies its own static roots
 /// (it must never ask the fold for them).

@@ -292,7 +292,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("community_dek_retain_past_epochs", ConnClass::Read),
     ("community_dek_set_key_state", ConnClass::Write),
     ("community_dek_set_retain_past_epochs", ConnClass::Write),
-    // v48.1.0 (#908) — the signers the authorized roster fold judges.
+    // v49.0.0 (#908) — the signers the authorized roster fold judges.
     ("community_roster_signers", ConnClass::Read),
     ("conn_handle", ConnClass::Door),
     ("conscience_override_rates", ConnClass::Read),

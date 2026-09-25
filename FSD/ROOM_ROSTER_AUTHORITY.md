@@ -1,7 +1,7 @@
 # FSD — A roster change needs standing; admission reads the same roster
 
 **Issues:** CIRISPersist#907, CIRISPersist#908 (both filed against v48.0.0 `59283e3e` while CIRISServer scoped community roster CRUD).
-**Release:** v49.0.0 (MAJOR). Roster rows gain co-signatures, `AdmitSpec` gains a field, a new typed refusal, a new directory read, and roster changes that a single signature used to carry are now refused unless the room's `consensus_protocol` is met. First built as a v48.1.0 minor with single-signer standing; checked against the CC and ruled by the operator (2026-09-24): **full CC now, as a MAJOR** — see §2.
+**Release:** v49.0.0 (MAJOR). Roster rows gain co-signatures, `AdmitSpec` gains a field, a new typed refusal, a new directory read, and roster changes that a single signature used to carry are now refused unless the room's `consensus_protocol` is met. First built as a v49.0.0 minor with single-signer standing; checked against the CC and ruled by the operator (2026-09-24): **full CC now, as a MAJOR** — see §2.
 **Predecessor:** `FSD/ROOM_ROSTER_PLANES.md` (v48.0.0, #860).
 
 ## 0. Understanding, and what already exists
@@ -21,9 +21,20 @@
 - **CIRISServer `FSD/MESH_GOVERNANCE_AND_ADMIN_OPS.md`** — moderation, takedown and reverse quorum on content; nothing on roster standing.
 - **Persist** `FSD/ROOM_ROSTER_PLANES.md` (v48.0.0, #860) is the predecessor; `FSD/SELF_FAMILY_DEK_CASCADE.md` and `FSD/V4_0_DATA_ACCESS_SURFACE.md` mention `consensus_protocol` only as a record field.
 
-**Open, for the operator:**
-1. **Last founder.** Should persist refuse a self-leave that removes the last active founder while other members remain (the server's rule)? Without it, a `founder_only` room can be left with no one able to change it. Proposed: yes, as `roster_last_founder` (substantive), since it is a property of the roster and every host would otherwise re-implement it.
-2. **`supersede_*_with_quorum`** checks strict majority whatever the protocol. Proposed: route it through the same protocol evaluator in a follow-up.
+**Decentralized moderation, as the CC builds it** (read for this document):
+- **Two layers (CC 4.5.5).** *Open labeling*: anyone files a `scores` row against anything; readers compose hide / blur / down-rank filters as consumer policy. *Authoritative action*: a takedown, a moderation event, an appeal ruling requires a delegated duty (`moderate`, `takedown`, `review`, `slash`), exercised as-self or through a `delegates_to` chain whose every edge bears the scope, which attenuates and never expands, is depth ≤ 5, is revocable at any link, and roots in a steward-bound human. The principal is discovered by walking the chain, never read from a payload field — *takedown isn't a coup*.
+- **No unmoderated space (CC 4.5.4).** A community federates only while ≥ 1 live `moderate` holder exists. A moderator is an **appointment** — `delegates_to(authority → K, scope ⊇ {moderate}, community_id: C)` with the root in C's authority set (founders, or keys C's `consensus_protocol` authorizes) and steward-bound. Lapse ⇒ merit auto-promotion (highest `moderation_track_record`) ⇒ else 48 h recovery ⇒ else fail-secure.
+- **Presence is authority (CC 4.5.13, generalising the accord live quorum of CC 4.2.6).** A moderator or community steward acts by a single signature; on their absence within 48 h a live-majority of whoever shows up decides; a harm report defaults to removal; keeping and viewing are signed acts. *Past actions validly decided by the then-live set stand* (CC 4.2.6) — the non-retroactivity this document's fold implements.
+- **Persist's reverse quorum (#574, v24.3.0; #591 escalation)** is the commons brake on that pattern: an action lands on arrival; any one member may object; `m` in-window objectors reverse it; dismissing an objection needs ≥ a strict majority. **Forward quorum** — evaluating `consensus_protocol` — was always the missing half (CIRISServer `MESH_GOVERNANCE_AND_ADMIN_OPS.md`: "consensus_protocol is a stored label", CIRISServer#111). This document builds it, in persist.
+
+**The constraint that shapes every answer.** The roster fold runs on every node, so **every evaluator must be a pure function of replicated, signed state**. A host-registered callback would let two nodes fold the same rows to different rosters. Operator rubrics and custom predicates are therefore **declared data in the signed room record** (`policy_blob`), evaluated by persist's one evaluator — never plugged-in code.
+
+**Resolved (2026-09-24, operator: "all of them implemented now and usable, with persist providing DRY evaluators"):**
+1. **All forms are evaluated**, by one module (`federation::consensus`) that every path calls — roster rows, `verify_membership_quorum` / `supersede_*_with_quorum`, and the family doors. See §2.1.
+2. **Last founder.** Persist refuses a change that leaves a room or family with other active members and **no active founder** (`roster_last_founder`, substantive) — the CC 4.5.4 "never a vacuum" rule applied to governance, and the Server's `last_founder` rule moved to where every host gets it. Removing the last member entirely is allowed (the room dissolves).
+3. **`supersede_*_with_quorum`** evaluates the room's own protocol through the same module instead of a fixed strict majority.
+4. **Trust-root charters keep their #557 floor** (strict majority of the node's own roster, applied on top of the evaluator's answer) — deliberate hardening for roots, now layered over the one evaluator rather than a second reading of the vocabulary.
+5. **Families** use the same evaluator on their membership-revocation door and `add_family_member` — the #908 shape closed on both planes.
 
 ## 1. The two defects
 
@@ -49,9 +60,15 @@ CC 4.4.3.2.3 (community) and 4.4.3.4.2 (family, the rule it mirrors) admit a mem
 | `unanimous` | every active member signed (the roster is non-empty) |
 | `majority` | more than half of the active members signed |
 | `quorum:M/N` | at least `M` active members signed — `M` absolute, `N` documentary (CC 4.4.3.4.2.1) |
-| `weighted:{rubric}`, `custom:{id}` | **refused** `roster_consensus_unevaluable`: an operator rubric persist cannot evaluate |
+| `weighted:{rubric}` | Σ weight(signer) ≥ threshold, with `rubric` resolved from the room record's `policy_blob.rubrics.{rubric}` = `{ "weights": {key_or_role → w}, "default_weight": w, "threshold": x }`; the CC's own worked case (`weights` all 1, `threshold = ceil(roster/2)`) is the built-in rubric `uniform_half`. An undeclared rubric ⇒ `roster_consensus_unevaluable` |
+| `custom:{id}` | the room record's `policy_blob.custom.{id}` — a declared expression over the primitives: `{"any_of": [...]}`, `{"all_of": [...]}`, `{"founder": {}}`, `{"quorum": M}`, `{"majority": {}}`, `{"unanimous": {}}`, `{"role": {"name": r, "min": M}}`, `{"weighted": "rubric"}`. Role-based and multi-stage protocols (the CC's examples) compose from these. An undeclared id or an unknown node ⇒ `roster_consensus_unevaluable` |
+| `reverse_quorum:M/N:{window}[+escalate:…]` | **act-unless-objected, classified by direction** (the accord-ops invariant: *1-of-N to protect, m-of-n to undo, never a 1-of-N capability grant*): a **removal** (protective — it withdraws the room key going forward) lands on any one active member's signature and is **reversed** — the member counts again — if `M` distinct active members file in-window objections through the #574 fold; an **addition** (a capability grant — it wraps the room key) needs the #574 dismissal threshold forward (`M` floored at a strict majority). The `+escalate:` steward tier applies to the objection fold unchanged |
 
-For `cohort_subkind: infrastructure` the protocol is evaluated over the **founders** only (CC 4.4.3.2.4.1(a)). A change is judged **once, at its own instant**: the roster, the founders and the protocol arms are read from the authorized state at `effective_at`. Delegations are judged the same way (a delegation's liveness is measured at the act's `asserted_at`, CC 4.2), and a later retraction does not reach back (CC 2.4.1 `withdraws-isn't-retroactive`). In the operator's framing: **a change belongs to the epoch it was admitted in.**
+For `cohort_subkind: infrastructure` the protocol is evaluated over the **founders** only (CC 4.4.3.2.4.1(a)). `quorum:M/N` reads `M` as absolute (CC 4.4.3.4.2.1 is normative over the older vocabulary table's "n is the current roster size").
+
+### 2.1 One evaluator
+
+`federation::consensus::evaluate(protocol, subkind, policy_blob, roster_at_t, signers, direction) -> Verdict { Admit | Insufficient { needed, have } | Unevaluable(reason) }` is pure and total over the vocabulary. Every caller passes the roster it already folded; none re-reads the protocol string. `required_signatures(protocol, roster)` exposes the count for callers that tally elsewhere (the trust-root charter, which then applies its #557 floor). A change is judged **once, at its own instant**: the roster, the founders and the protocol arms are read from the authorized state at `effective_at`. Delegations are judged the same way (a delegation's liveness is measured at the act's `asserted_at`, CC 4.2), and a later retraction does not reach back (CC 2.4.1 `withdraws-isn't-retroactive`). In the operator's framing: **a change belongs to the epoch it was admitted in.**
 
 **Operator rulings beyond the CC text:**
 - **Leaving needs no one's permission.** A revocation signed by the member it removes is admitted on that signature alone. The CC names no leave rule; this is persist's reading of its silence, a consent floor.
@@ -76,7 +93,8 @@ A stored row with **no recorded signer** (a revocation admitted before V110 stor
 
 - `roster_authority_not_established` — **retryable**: the protocol is not met and at least one signer has no event in the room yet. Rows arrive out of order; persist has no deferral queue (the #734 property), so the caller re-submits.
 - `roster_consensus_insufficient` — **substantive**: every signer is known and the protocol is not met.
-- `roster_consensus_unevaluable` — **substantive**: `weighted:` / `custom:` protocol.
+- `roster_consensus_unevaluable` — **substantive**: a `weighted:` rubric or `custom:` id the room record does not declare, or a malformed declaration.
+- `roster_last_founder` — **substantive**: the change would leave other active members and no active founder.
 
 ## 5. #907 — admission reads the fold
 
@@ -105,4 +123,4 @@ A stored row with **no recorded signer** (a revocation admitted before V110 stor
 
 ## 9. How the design got here
 
-The first build (v48.1.0, single-signer standing) passed its witnesses; the full lanes then found that keyed rooms sign removals as the room key, and a check against the CC showed the whole single-signer model was weaker than CC 4.4.3.2.3 for every protocol but `founder_only`. The operator chose full CC as v49.0.0 and ruled on the three extensions (§2). Families remain signature-only — the same shape as #908, out of scope, recorded on the issue.
+The first build (v49.0.0, single-signer standing) passed its witnesses; the full lanes then found that keyed rooms sign removals as the room key, and a check against the CC showed the whole single-signer model was weaker than CC 4.4.3.2.3 for every protocol but `founder_only`. The operator chose full CC as v49.0.0 and ruled on the three extensions (§2). Families remain signature-only — the same shape as #908, out of scope, recorded on the issue.

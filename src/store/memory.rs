@@ -6055,7 +6055,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_communities
             .values()
-            // v48.1.0 (CIRISPersist#907) — containment in the room's
+            // v49.0.0 (CIRISPersist#907) — containment in the room's
             // HISTORY: on the record, or named by a widening. Still raw.
             .filter(|c| {
                 c.members.iter().any(|m| m.key_id == member_identity_key_id)
@@ -6689,7 +6689,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
-        // v48.1.0 (CIRISPersist#908) — standing, before the epoch rotates.
+        // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates.
         crate::federation::check_community_roster_authority(
             self,
             &row.community_key_id,
@@ -6828,7 +6828,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
-        // v48.1.0 (CIRISPersist#908) — the signer must have standing.
+        // v49.0.0 (CIRISPersist#908) — the signer must have standing.
         crate::federation::check_community_roster_authority(
             self,
             &row.community_key_id,
@@ -17976,7 +17976,7 @@ mod tests {
             joined_at: chrono::Utc::now(),
             role: Some("member".into()),
         };
-        // v48.1.0 (#908) — the group signs its growth; ob-owner is a plain
+        // v49.0.0 (#908) — the group signs its growth; ob-owner is a plain
         // member of a founder_only group and has no standing to grow it.
         let admit = crate::federation::cohort::test_support::admit_roster_member_via(
             &backend,
@@ -19280,7 +19280,7 @@ mod tests {
         // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
         let admit = crate::federation::cohort::test_support::admit_community_via(
             &backend,
-            "addc-comm", // v48.1.0 (#908): the room signs its growth
+            "addc-comm", // v49.0.0 (#908): the room signs its growth
             "addc-comm",
             &member("addc-1"),
         )
@@ -23430,7 +23430,7 @@ mod tests {
         }
         backend
             .put_community(
-                // v48.1.0 (#908) — the real authority is the room's record
+                // v49.0.0 (#908) — the real authority is the room's record
                 // signer, so its honest removal has standing.
                 crate::federation::tier_ingest::test_support::sign_community(
                     "e4-cmr-authority",

@@ -7307,7 +7307,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
-        // v48.1.0 (CIRISPersist#907) — containment in the room's HISTORY:
+        // v49.0.0 (CIRISPersist#907) — containment in the room's HISTORY:
         // on the record, or named by a widening. Still raw (a removed member
         // is listed); the `_active` readers fold.
         // sqlite full-scan with members membership check via json_each.
@@ -8272,7 +8272,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
-        // v48.1.0 (CIRISPersist#908) — standing, before the epoch rotates:
+        // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates:
         // a stranger's valid signature no longer removes a member.
         crate::federation::check_community_roster_authority(
             self,
@@ -8450,7 +8450,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
-        // v48.1.0 (CIRISPersist#908) — whose signature, not just whether:
+        // v49.0.0 (CIRISPersist#908) — whose signature, not just whether:
         // the signer must have standing in the room at the row's instant.
         crate::federation::check_community_roster_authority(
             self,
@@ -22588,7 +22588,7 @@ impl crate::read::ReadEngine for SqliteBackend {
             parts.push(frag);
             binds.extend(sbinds);
         }
-        // v48.1.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
+        // v49.0.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
         // documented default and hides rows retracted by a still-hiding
         // composer from the same attester; this read took the filter and
         // dropped the axis, so every drive listing showed withdrawn and
@@ -37816,7 +37816,7 @@ mod tests {
         assert_eq!(ids, vec!["gone", "live"]);
     }
 
-    /// v48.1.0 (CIRISPersist#909) — **I174: `list_attestations` honours the
+    /// v49.0.0 (CIRISPersist#909) — **I174: `list_attestations` honours the
     /// lifecycle view** the way `list_scores` (above) does. The read took the
     /// filter and dropped the axis, so every drive listing showed withdrawn and
     /// replaced files.

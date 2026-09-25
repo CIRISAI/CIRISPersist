@@ -8078,7 +8078,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<crate::federation::Community>, crate::federation::Error> {
-        // v48.1.0 (CIRISPersist#907) — containment in the room's HISTORY:
+        // v49.0.0 (CIRISPersist#907) — containment in the room's HISTORY:
         // on the record, or named by a widening. Still raw.
         // Uses the V060 GIN index — the `@>` containment operator is the
         // matching shape (members @> [{"key_id": "X"}]).
@@ -8846,7 +8846,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
-        // v48.1.0 (CIRISPersist#908) — standing, before the epoch rotates.
+        // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates.
         crate::federation::check_community_roster_authority(
             self,
             &row.community_key_id,
@@ -9036,7 +9036,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
-        // v48.1.0 (CIRISPersist#908) — the signer must have standing.
+        // v49.0.0 (CIRISPersist#908) — the signer must have standing.
         crate::federation::check_community_roster_authority(
             self,
             &row.community_key_id,
@@ -22947,7 +22947,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             where_parts.push(frag);
             params.extend(sparams);
         }
-        // v48.1.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
+        // v49.0.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
         // twin): `Live` hides rows retracted by a still-hiding composer.
         {
             use crate::read::LifecycleView;
@@ -37691,7 +37691,7 @@ mod tests {
         );
     }
 
-    /// v48.1.0 (CIRISPersist#909) — I174 on postgres: `list_attestations`
+    /// v49.0.0 (CIRISPersist#909) — I174 on postgres: `list_attestations`
     /// honours the lifecycle view (see the sqlite twin).
     #[tokio::test]
     async fn pg_list_attestations_lifecycle_i174_909() {

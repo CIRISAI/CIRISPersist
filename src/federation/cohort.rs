@@ -331,7 +331,7 @@ pub mod test_support {
                 )
             });
 
-        // v48.1.0 (#908) — the community half signs as the ROOM: a seated plain
+        // v49.0.0 (#908) — the community half signs as the ROOM: a seated plain
         // member of a founder_only room has no standing to grow it, and
         // #654 measures authorship (what is signed), not standing.
         // ── community plane (the exact mirror) ───────────────────────────

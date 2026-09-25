@@ -1,4 +1,4 @@
-//! v48.1.0 (CIRISPersist#907, #908; `FSD/ROOM_ROSTER_AUTHORITY.md` §6) — **a
+//! v49.0.0 (CIRISPersist#907, #908; `FSD/ROOM_ROSTER_AUTHORITY.md` §6) — **a
 //! roster change needs standing, and admission reads the same roster.**
 //!
 //! I170 — admission is the roster (widened ⇒ admitted; removed ⇒ refused;

@@ -927,7 +927,7 @@ where
     });
     // v48.0.0 (CIRISPersist#860) — the roster AS OF `as_of` is the one fold
     // (record + widenings − revocations), never the record alone.
-    // v48.1.0 (#908): only events whose signer has standing count.
+    // v49.0.0 (#908): only events whose signer has standing count.
     let roster =
         crate::federation::authorized_community_roster_at(directory, &community, as_of).await?;
     // A NODE minter has exactly ONE principal — its live owner — and no

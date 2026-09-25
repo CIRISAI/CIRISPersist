@@ -4218,7 +4218,7 @@ pub(crate) mod test_support {
                 joined_at: Utc::now(),
                 role: Some("member".to_owned()),
             };
-            // v48.1.0 (#908) — the commons' founder signs its growth; a
+            // v49.0.0 (#908) — the commons' founder signs its growth; a
             // newcomer has no standing to admit itself.
             let spec = crate::federation::cohort::test_support::admit_community_via(
                 dir, &alice, &community, &member,

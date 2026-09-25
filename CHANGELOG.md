@@ -7,9 +7,9 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [48.1.0] - 2026-09-24
+## [49.0.0] - 2026-09-24
 
-### Fixed — a roster change needs standing; admission reads the same roster (CIRISPersist#907, #908; FSD `ROOM_ROSTER_AUTHORITY.md`)
+### Changed — roster standing is the room's consensus protocol; admission reads the same roster (CIRISPersist#907, #908, #909; FSD `ROOM_ROSTER_AUTHORITY.md`)
 
 (section written at ship time)
 

@@ -6978,7 +6978,7 @@ pub struct KnownHashEviction {
     pub over_bound_by: u64,
 }
 
-/// v48.1.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — who signed
+/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — who signed
 /// one roster event. `authority_key_id` is `None` only for a row admitted
 /// before V110 stored the signer: such a row COUNTS in the authorized fold
 /// (it was admitted under the rules of its day).
@@ -6992,7 +6992,7 @@ pub struct RosterEventSigner {
     pub authority_key_id: Option<String>,
 }
 
-/// v48.1.0 (CIRISPersist#908) — every signer the authorized roster fold needs
+/// v49.0.0 (CIRISPersist#908) — every signer the authorized roster fold needs
 /// for one room: the record's signer (the key that founded it; `None` for a
 /// trusted-local or legacy record) and one [`RosterEventSigner`] per stored
 /// widening and revocation.

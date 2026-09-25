@@ -363,7 +363,7 @@ pub mod orchestrate {
             .map_err(map_dir_err)?;
         // v48.0.0 (CIRISPersist#860) — the wrap set is the one fold: a widened
         // member is wrapped at the next seal; a removed one is not.
-        // v48.1.0 (#908): only events whose signer has standing count.
+        // v49.0.0 (#908): only events whose signer has standing count.
         let roster = crate::federation::authorized_community_roster_at(backend, community, now)
             .await
             .map_err(map_dir_err)?;

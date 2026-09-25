@@ -3426,7 +3426,7 @@ pub mod test_support {
         }
     }
 
-    /// v48.1.0 (#908) — a LIVE `delegates_to(granter → grantee)` scoped to
+    /// v49.0.0 (#908) — a LIVE `delegates_to(granter → grantee)` scoped to
     /// the `moderate` duty, federation-tier hybrid-signed by `granter`'s
     /// deterministic keys: the appointment the roster fold's moderator rule
     /// walks. Register both keys first.

@@ -658,7 +658,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Gate,
     ),
     ("reject_future_dated_community_widening", Class::Gate),
-    // v48.1.0 (#908) — the standing gate both membership doors run.
+    // v49.0.0 (#908) — the standing gate both membership doors run.
     ("check_community_roster_authority", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
