@@ -6966,6 +6966,13 @@ async fn scoped_delegation_reach(
     .await
 }
 
+/// v49.0.0 (#908) — a half-open `[start, end)` span during which a key held
+/// authority in a group (`end: None` = still holds it).
+pub(crate) type AuthorityInterval = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
 /// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §3 "Walk") — how
 /// ONE walk is read: at an instant, and/or within one community. The default
 /// lens (`as_of: None`, `community_id: None`) is the walk exactly as it was
@@ -7005,12 +7012,29 @@ struct DelegationWalkLens<'a> {
     ///
     /// `None`: no community filter (the pre-v49 walk).
     community_id: Option<&'a str>,
+    /// v49.0.0 (#908, operator ruling 2026-09-25) — `Some(intervals)`: the
+    /// ROOT's own first-hop edges count only if issued while the root held
+    /// authority (inside one of these half-open `[start, end)` intervals). An
+    /// appointment belongs to the epoch it was issued in: a founder who later
+    /// leaves does not lapse it, and a key that was not a founder when it
+    /// appointed never conferred the duty. Deeper edges are judged by the
+    /// ordinary gates. `None`: no epoch filter (every pre-existing caller).
+    root_authority: Option<&'a [AuthorityInterval]>,
 }
 
 impl DelegationWalkLens<'_> {
     /// Was a row asserted at or before the lens instant? Always true unset.
     fn asserted_by(&self, row: &super::Attestation) -> bool {
         self.as_of.is_none_or(|t| row.asserted_at <= t)
+    }
+
+    /// Was the ROOT's first-hop `edge` issued while the root held authority?
+    /// Always true when no epoch filter is set.
+    fn admits_root_edge(&self, edge: &super::Attestation) -> bool {
+        self.root_authority.is_none_or(|iv| {
+            iv.iter()
+                .any(|(s, e)| edge.asserted_at >= *s && e.is_none_or(|e| edge.asserted_at < e))
+        })
     }
 
     /// Is `edge` a live edge under this lens (time and community)?
@@ -7133,6 +7157,9 @@ async fn scoped_delegation_reach_at(
             // v49.0.0 (#908) — the lens: not yet asserted / expired at the
             // instant, or scoped to another room. Unset lens admits all.
             if !lens.admits_edge(&r) {
+                continue;
+            }
+            if is_issuer && !lens.admits_root_edge(&r) {
                 continue;
             }
             if is_issuer {
@@ -12507,6 +12534,39 @@ pub async fn moderators_of(
     Ok(out)
 }
 
+/// v49.0.0 (#908, operator ruling 2026-09-25) — [`moderation_reach_of_at`]
+/// with the root's authority INTERVALS: only first-hop appointments the root
+/// issued while it held authority count (an appointment belongs to its epoch;
+/// the root need not still hold authority at `as_of`).
+pub(crate) async fn moderation_reach_of_at_within(
+    directory: &dyn super::FederationDirectory,
+    root: &str,
+    community_id: &str,
+    as_of: chrono::DateTime<chrono::Utc>,
+    root_authority: &[(
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )],
+) -> Result<Vec<String>, Error> {
+    Ok(scoped_delegation_reach_at(
+        directory,
+        root,
+        &std::collections::HashSet::new(),
+        DELEGATION_SCOPE_MODERATE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+        DelegationWalkLens {
+            as_of: Some(as_of),
+            community_id: Some(community_id),
+            root_authority: Some(root_authority),
+        },
+    )
+    .await?
+    .reached
+    .into_iter()
+    .collect())
+}
+
 /// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §2 "Named
 /// moderators keep standing, judged at the change's instant") — every key
 /// `root` reaches under the `moderate`-duty walk **as of `as_of`, within
@@ -12550,6 +12610,7 @@ pub(crate) async fn moderation_reach_of_at(
         DelegationWalkLens {
             as_of: Some(as_of),
             community_id: Some(community_id),
+            root_authority: None,
         },
     )
     .await?

@@ -778,10 +778,12 @@ pub fn roster_event_standing(
     let is_active_founder = |k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER));
     // Standing without the protocol: a legacy row (admitted before signers
     // were stored); a member leaving on their own signature; a named
-    // moderator whose appointment was live at this event's instant.
+    // moderator whose appointment was live at this event's instant and was
+    // issued while its root held authority (operator ruling 2026-09-25: no
+    // ending is retroactive, and the root need not still be a member).
     let standing_without_protocol = e.signers.is_empty()
         || (!e.is_add && e.signers.contains(&e.member.key_id))
-        || e.moderator_roots.iter().any(|r| is_active_founder(r));
+        || !e.moderator_roots.is_empty();
     let admitted = if standing_without_protocol {
         Ok(())
     } else {
@@ -942,10 +944,80 @@ fn founder_candidates(
 
 /// Which of `roots` reach any of `signers` by a `moderate` chain scoped to the
 /// room and live at `at` (CC 4.5.4; judged at the change's instant, CC 4.2).
+/// The instants each candidate root held authority (was an active founder),
+/// as half-open `[start, end)` intervals.
+type RootAuthorityIntervals = std::collections::BTreeMap<
+    String,
+    Vec<(
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+>;
+
+/// v49.0.0 (#908, operator ruling 2026-09-25) — when did each of `roots` hold
+/// authority in the group? Replays `events` (whose moderator standing is NOT
+/// yet known, so none is used — an appointment's authority cannot depend on
+/// the appointments it confers) and records each root's active-founder
+/// intervals. A founder on the record holds authority from the beginning.
+fn root_authority_intervals(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    roots: &std::collections::BTreeSet<String>,
+) -> RootAuthorityIntervals {
+    let founder = Some(admission::MEMBER_ROLE_FOUNDER);
+    let is_f = |state: &RosterState, k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == founder);
+    let mut ordered: Vec<RosterEvent> = events
+        .iter()
+        .map(|e| RosterEvent {
+            moderator_roots: Default::default(),
+            ..e.clone()
+        })
+        .collect();
+    sort_roster_events(&mut ordered);
+    let mut state: RosterState = record_members
+        .iter()
+        .map(|m| (m.key_id.clone(), (true, m.clone())))
+        .collect();
+    let mut out: RootAuthorityIntervals = RootAuthorityIntervals::new();
+    let mut open: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> = roots
+        .iter()
+        .filter(|r| is_f(&state, r))
+        .map(|r| (r.clone(), chrono::DateTime::<chrono::Utc>::MIN_UTC))
+        .collect();
+    for e in ordered {
+        if e.reversed || roster_event_standing(rules, &state, &e).is_err() {
+            continue;
+        }
+        state.insert(e.member.key_id.clone(), (e.is_add, e.member.clone()));
+        let k = &e.member.key_id;
+        if !roots.contains(k) {
+            continue;
+        }
+        match (open.contains_key(k), is_f(&state, k)) {
+            (false, true) => {
+                open.insert(k.clone(), e.effective_at);
+            }
+            (true, false) => {
+                let start = open.remove(k).expect("open");
+                out.entry(k.clone())
+                    .or_default()
+                    .push((start, Some(e.effective_at)));
+            }
+            _ => {}
+        }
+    }
+    for (k, start) in open {
+        out.entry(k).or_default().push((start, None));
+    }
+    out
+}
+
 async fn moderator_roots_at<F>(
     directory: &F,
     community_key_id: &str,
     roots: &std::collections::BTreeSet<String>,
+    intervals: &RootAuthorityIntervals,
     signers: &std::collections::BTreeSet<String>,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::BTreeSet<String>, Error>
@@ -958,11 +1030,15 @@ where
         if signers.contains(root) || !Box::pin(admission::is_steward_bound(dir, root)).await? {
             continue;
         }
-        let reach = Box::pin(admission::moderation_reach_of_at(
+        let Some(iv) = intervals.get(root).filter(|iv| !iv.is_empty()) else {
+            continue;
+        };
+        let reach = Box::pin(admission::moderation_reach_of_at_within(
             dir,
             root,
             community_key_id,
             at,
+            iv,
         ))
         .await?;
         if reach.iter().any(|k| signers.contains(k)) {
@@ -1033,19 +1109,9 @@ where
         };
         let row_signer = find(list, &ev.member.key_id, ev.effective_at);
         let s = row_signer.map(signer_set).unwrap_or_default();
-        let moderator_roots = match moderation_roots {
-            Some(roots) => {
-                Box::pin(moderator_roots_at(
-                    directory,
-                    id,
-                    roots,
-                    &s,
-                    ev.effective_at,
-                ))
-                .await?
-            }
-            None => std::collections::BTreeSet::new(),
-        };
+        // Moderator standing is filled in a second pass (below): it needs
+        // each root's authority intervals, which come from these events.
+        let moderator_roots = std::collections::BTreeSet::new();
         if !ev.is_add && reverse {
             if let Some(actor) = row_signer.and_then(|x| x.authority_key_id.clone()) {
                 reverse_candidates.push((events.len(), actor, ev.row_hash.clone()));
@@ -1059,6 +1125,23 @@ where
             moderator_roots,
             reversed: false,
         });
+    }
+    if let Some(roots) = moderation_roots {
+        let intervals = root_authority_intervals(record_members, rules, &events, roots);
+        for ev in events.iter_mut() {
+            if ev.signers.is_empty() {
+                continue;
+            }
+            ev.moderator_roots = Box::pin(moderator_roots_at(
+                directory,
+                id,
+                roots,
+                &intervals,
+                &ev.signers,
+                ev.effective_at,
+            ))
+            .await?;
+        }
     }
     if reverse_candidates.is_empty() {
         return Ok(events);
@@ -1306,6 +1389,7 @@ where
                 directory,
                 group_key_id,
                 &roots,
+                &root_authority_intervals(record_members, rules, &events, &roots),
                 signers,
                 effective_at,
             ))

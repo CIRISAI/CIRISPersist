@@ -372,6 +372,126 @@ pub mod bodies {
             "[{tag}] I175: {roster:?}"
         );
     }
+
+    /// **I175b — an appointment belongs to the epoch it was issued in**
+    /// (operator ruling 2026-09-25; CC 4.2.6 "past actions validly decided
+    /// stand", CC 4.5.4 lapse = withdrawal or inactivity only). (1) Founder
+    /// alice appoints mo and then LEAVES the room: mo is still a moderator —
+    /// removal is not a slash. (2) carol appoints mo2 while a plain member and
+    /// is only later made a founder: mo2 never held the duty — the appointer
+    /// had no authority when appointing.
+    pub async fn exercise_an_appointment_belongs_to_its_epoch(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support::{
+            sign_community_membership_revocation, sign_community_membership_widening,
+        };
+        use crate::federation::types::{
+            CommunityMembershipRevocation, CommunityMembershipWidening,
+        };
+        let [alice, bob, carol] = ["alice", "bob", "carol"].map(|k| format!("{tag}-{k}"));
+        let [mo, mo2] = ["mo", "mo2"].map(|k| format!("{tag}-{k}"));
+        let [hank, ivy] = ["hank", "ivy"].map(|k| format!("{tag}-{k}"));
+        for k in [&alice, &bob, &carol, &hank, &ivy] {
+            register(dir, k, &[identity_type::USER]).await;
+        }
+        for k in [&mo, &mo2] {
+            register(dir, k, &[identity_type::PRIMITIVE]).await;
+        }
+        let here = format!("{tag}-room");
+        let now = Utc::now();
+        let seat = |k: &str, founder: bool| CommunityMember {
+            key_id: k.to_owned(),
+            joined_at: now,
+            role: founder.then(|| MEMBER_ROLE_FOUNDER.to_owned()),
+        };
+        dir.put_community(sign_community(
+            &alice,
+            Community {
+                community_key_id: here.clone(),
+                community_name: format!("epoch room {here}"),
+                members: vec![seat(&alice, true), seat(&bob, true), seat(&carol, false)],
+                founded_at: now,
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("room: {e}"));
+        let widen = |signer: &str, member: &str, role: Option<&str>| {
+            let at = Utc::now();
+            sign_community_membership_widening(
+                signer,
+                CommunityMembershipWidening {
+                    community_key_id: here.clone(),
+                    member_key_id: member.to_owned(),
+                    joined_at: at,
+                    effective_at: at,
+                    role: role.map(str::to_owned),
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        // (1) alice appoints mo, then leaves.
+        put(
+            dir,
+            &appointment(&alice, &mo, Some(&here), None),
+            "appoint mo",
+        )
+        .await;
+        tick().await;
+        let at = Utc::now();
+        dir.put_community_membership_revocation(sign_community_membership_revocation(
+            &alice,
+            CommunityMembershipRevocation {
+                community_key_id: here.clone(),
+                removed_identity_key_id: alice.clone(),
+                removed_at: at,
+                effective_at: at,
+                reason: Some("left".into()),
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] alice leaves (bob remains a founder): {e}"));
+        tick().await;
+        dir.put_community_membership_widening(widen(&mo, &hank, None))
+            .await
+            .unwrap_or_else(|e| {
+                panic!("[{tag}] I175b: alice left, mo's appointment stands — mo widens hank: {e}")
+            });
+        // (2) carol appoints mo2 BEFORE she is a founder; bob then makes her one.
+        put(
+            dir,
+            &appointment(&carol, &mo2, Some(&here), None),
+            "carol appoints mo2",
+        )
+        .await;
+        tick().await;
+        dir.put_community_membership_widening(widen(&bob, &carol, Some(MEMBER_ROLE_FOUNDER)))
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] bob makes carol a founder: {e}"));
+        tick().await;
+        dir.put_community_membership_widening(widen(&mo2, &ivy, None))
+            .await
+            .expect_err(
+                "an appointment issued while carol had no authority never conferred the duty",
+            );
+        let roster: Vec<String> = dir
+            .active_community_members(&here)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(
+            roster.contains(&hank) && !roster.contains(&ivy),
+            "[{tag}] I175b: {roster:?}"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -450,6 +570,49 @@ mod run {
         super::bodies::exercise_moderator_change_belongs_to_its_instant(
             &b,
             &format!("i175-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_appointment_belongs_to_its_epoch_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        super::bodies::exercise_an_appointment_belongs_to_its_epoch(
+            &d,
+            &format!("i175b-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn an_appointment_belongs_to_its_epoch_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_an_appointment_belongs_to_its_epoch(
+            &b,
+            &format!("i175b-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn an_appointment_belongs_to_its_epoch_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_an_appointment_belongs_to_its_epoch(
+            &b,
+            &format!("i175b-{}", suffix()),
         )
         .await;
     }

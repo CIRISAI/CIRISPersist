@@ -576,10 +576,25 @@ pub mod bodies {
             crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
             "{tag} I182 weighted: {e}"
         );
+        {
+            // One weight short: the founder alone carries 3 of 4.
+            let e = widen_by(
+                d,
+                &[&k[0]],
+                widening(&r, &x, at("2026-03-02T00:00:00Z"), None),
+            )
+            .await
+            .expect_err("3 of 4 weight");
+            assert_eq!(
+                rule_of(&e),
+                crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+                "{tag} I182 weighted: {e}"
+            );
+        }
         widen_by(
             d,
             &[&k[0], &k[1]],
-            widening(&r, &x, at("2026-03-02T00:00:00Z"), None),
+            widening(&r, &x, at("2026-03-03T00:00:00Z"), None),
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I182 weighted: 4 of 4: {e}"));

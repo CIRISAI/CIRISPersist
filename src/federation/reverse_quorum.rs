@@ -4044,6 +4044,37 @@ pub(crate) mod test_support {
                 .collect::<Vec<_>>()
         };
         let at = Utc::now() - Duration::hours(1);
+        // A stranger's removal is refused — the protective direction is cheap
+        // for MEMBERS, never for anyone at all (no eligible signer admits
+        // nothing, even under reverse_quorum).
+        let stranger = format!("rqr-stranger-{suffix}");
+        register_user_key(dir, &stranger).await;
+        let e = dir
+            .put_community_membership_revocation(ts::sign_community_membership_revocation(
+                &stranger,
+                CommunityMembershipRevocation {
+                    community_key_id: community.clone(),
+                    removed_identity_key_id: carol.clone(),
+                    removed_at: at,
+                    effective_at: at,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect_err("a stranger cannot remove a member of a reverse_quorum room");
+        assert!(
+            matches!(&e, Error::RosterAuthorityUnauthorized { rule, .. } if *rule == crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED),
+            "({suffix}) I181: {e}"
+        );
+        assert!(
+            dir.list_community_membership_revocations_for(&community)
+                .await
+                .expect("revocations")
+                .is_empty(),
+            "({suffix}) I181: nothing stored"
+        );
         dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
             &bob,
             CommunityMembershipRevocation {
