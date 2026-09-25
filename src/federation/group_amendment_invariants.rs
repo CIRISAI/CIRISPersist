@@ -53,6 +53,20 @@ pub mod bodies {
                 Signed::Community(c) => c.supersede_proof.as_ref(),
             }
         }
+        /// Does `d`'s content-hash point-read resolve this exact record? (The
+        /// wire index must follow a supersede, or a peer that fetches by hash
+        /// never sees the new version.)
+        async fn resolves_by_hash(&self, d: &dyn FederationDirectory) -> bool {
+            let (kind, bytes) = match self {
+                Signed::Family(f) => ("Family", serde_json::to_vec(f).unwrap()),
+                Signed::Community(c) => ("Community", serde_json::to_vec(c).unwrap()),
+            };
+            let hash = crate::federation::wire_index::content_hash_of_bytes(&bytes);
+            d.lookup_signed_record_by_content_hash(kind, &hash)
+                .await
+                .unwrap()
+                == Some(bytes)
+        }
         fn proof_mut(&mut self) -> &mut Option<GroupSupersedeProof> {
             match self {
                 Signed::Family(f) => &mut f.supersede_proof,
@@ -300,6 +314,10 @@ pub mod bodies {
             "{tag} I178: the proof names the version it replaced"
         );
         let a_v2 = kind.stored(a, &id).await;
+        assert!(
+            served_v2.resolves_by_hash(a).await,
+            "{tag} I178: A's supersede re-indexed the wire record"
+        );
 
         // (2) A forged proof — one signature, below the protocol — is refused,
         //     and B keeps its record.
@@ -323,6 +341,28 @@ pub mod bodies {
             v1_hash,
             "{tag} I178: B keeps its record"
         );
+
+        // (2b) A genuine proof attached to a record it does not describe
+        //      (verify-A-store-B): the quorum signed `unanimous`, the record
+        //      says `founder_only`. Refused, and B keeps its record.
+        let mut mismatched = kind.record(
+            &id,
+            &keys,
+            &Content {
+                name: v2.name,
+                protocol: consensus_protocol::FOUNDER_ONLY,
+            },
+        );
+        *mismatched.proof_mut() = served_v2.proof().cloned();
+        let e = kind
+            .put(b, mismatched)
+            .await
+            .expect_err("a proof must describe the record it rides on");
+        assert!(
+            e.to_string().contains("change_envelope consensus_protocol"),
+            "{tag} I178: refused by the envelope/record guard: {e}"
+        );
+        assert_eq!(kind.stored(b, &id).await.2, v1_hash, "{tag} I178");
 
         // (3) The same record without a proof is refused (#758 unchanged for
         //     a community; the same refusal for a family).
@@ -403,6 +443,10 @@ pub mod bodies {
             kind.served(b, &id).await.proof(),
             served_v2.proof(),
             "{tag} I178: B serves the proof on, so the next peer can apply it"
+        );
+        assert!(
+            served_v2.resolves_by_hash(b).await,
+            "{tag} I178: B's applied amendment is in its wire index"
         );
         // The same record again is the idempotent no-op.
         kind.put(b, served_v2)

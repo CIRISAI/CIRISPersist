@@ -332,3 +332,52 @@ pub(crate) fn snapshot_group_key_id(cohort: Cohort, snapshot: &serde_json::Value
         .unwrap_or_default()
         .to_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(entrenched: bool) -> serde_json::Value {
+        serde_json::json!({ "consensus_protocol_entrenched": entrenched })
+    }
+
+    /// v49.0.0 (#910.5) — an entrenched family refuses an amendment that
+    /// lifts entrenchment, and the record's entrenchment must be the one the
+    /// quorum signed, in both directions.
+    #[test]
+    fn entrenchment_is_kept_and_bound_to_the_envelope() {
+        assert!(check_family_entrenchment(false, false, &envelope(false)).is_ok());
+        assert!(check_family_entrenchment(true, true, &envelope(true)).is_ok());
+        let lifted = check_family_entrenchment(true, false, &envelope(false))
+            .expect_err("an entrenched family stays entrenched");
+        assert!(
+            lifted.to_string().contains("entrenched family refuses"),
+            "{lifted}"
+        );
+        for (record, signed) in [(true, false), (false, true)] {
+            let e = check_family_entrenchment(false, record, &envelope(signed))
+                .expect_err("the record's entrenchment is the one the quorum signed");
+            assert!(e.to_string().contains("change_envelope"), "{e}");
+        }
+    }
+
+    /// The stale refusal is a retryable Conflict naming both hashes.
+    #[test]
+    fn a_proof_over_another_version_is_stale() {
+        let proof = GroupSupersedeProof {
+            prior_persist_row_hash: "aa".into(),
+            change_envelope: serde_json::Value::Null,
+            quorum_signatures: vec![],
+        };
+        assert!(check_proof_names_prior("family", "f", &proof, "aa").is_ok());
+        match check_proof_names_prior("family", "f", &proof, "bb") {
+            Err(Error::Conflict(m)) => {
+                assert!(
+                    m.contains("stale") && m.contains("aa") && m.contains("bb"),
+                    "{m}"
+                )
+            }
+            other => panic!("expected a stale Conflict, got {other:?}"),
+        }
+    }
+}
