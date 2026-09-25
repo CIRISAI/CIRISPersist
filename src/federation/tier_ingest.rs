@@ -1524,6 +1524,7 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            supersede_proof: None,
         }
     }
 
@@ -1541,6 +1542,7 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            supersede_proof: None,
         }
     }
 

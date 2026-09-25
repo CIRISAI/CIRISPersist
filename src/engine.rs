@@ -3346,6 +3346,7 @@ impl Engine {
             authority_key_id,
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            supersede_proof: None,
         };
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -3383,6 +3384,7 @@ impl Engine {
             authority_key_id,
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+            supersede_proof: None,
         };
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -10136,6 +10138,7 @@ mod tests {
             authority_key_id: "rogue-1".into(),
             scrub_signature_classical: "AA==".into(),
             scrub_signature_pqc: None,
+            supersede_proof: None,
         };
         let err = dir
             .put_family(squat)

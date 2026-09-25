@@ -415,6 +415,13 @@ struct State {
     /// mirror of `federation_family_authority_sigs`, keyed by
     /// `community_key_id`.
     federation_community_authority_sigs: HashMap<String, AuthoritySig>,
+    /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the `supersede_proof` a
+    /// family's current version carries, keyed by `family_key_id`. Absent for
+    /// a founding record or one superseded without a quorum.
+    federation_family_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
+    /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the community twin of
+    /// `federation_family_supersede_proofs`, keyed by `community_key_id`.
+    federation_community_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_family_membership_revocations`.
     federation_family_membership_revocation_authority_sigs:
@@ -913,6 +920,8 @@ impl Default for MemoryBackend {
                 consent_peer_set_for: Vec::new(),
                 federation_family_authority_sigs: HashMap::new(),
                 federation_community_authority_sigs: HashMap::new(),
+                federation_family_supersede_proofs: HashMap::new(),
+                federation_community_supersede_proofs: HashMap::new(),
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
                 federation_family_membership_widening_authority_sigs: HashMap::new(),
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
@@ -5668,11 +5677,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // locks itself). Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused.
+        // (Memory used to OVERWRITE here — `put_family_local` is a map insert.)
+        if crate::federation::group_amendment::route_occupied_family(self, &family).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
         let crate::federation::SignedFamily {
             family: row,
             authority_key_id,
             scrub_signature_classical,
             scrub_signature_pqc,
+            supersede_proof,
         } = family;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
@@ -5693,6 +5712,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     scrub_signature_pqc.clone(),
                 ),
             );
+            // v49.0.0 (#910.5) — a first copy of an amended version keeps its
+            // proof, so the next peer can apply it.
+            match supersede_proof {
+                Some(p) => {
+                    state
+                        .federation_family_supersede_proofs
+                        .insert(family_key_id.clone(), p);
+                }
+                None => {
+                    state
+                        .federation_family_supersede_proofs
+                        .remove(&family_key_id);
+                }
+            }
             // v36.0.0 (#668) — attaching the authority signature is what makes
             // the row visible to the signed serve cursor; re-stamp the serve
             // position here (V130 mirror).
@@ -5774,134 +5807,197 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
         };
         let now = chrono::Utc::now();
-        let mut state = self.state.lock().expect("memory backend lock");
-        match cohort {
-            Cohort::Family => {
-                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
-                // wrapper. Decoding the bare record here is what silently
-                // stranded the caller's signature while every field
-                // `signing_envelope()` covers was replaced below.
-                let crate::federation::SignedFamily {
-                    family: mut new_fam,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
-                })?;
-                new_fam.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
-                let key = new_fam.family_key_id.clone();
-                let prior = state
-                    .federation_families
-                    .get(&key)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!(
-                            "supersede: unknown family group {key:?} (nothing to supersede)"
-                        ))
-                    })?;
-                let cur_ver = *state
-                    .federation_group_current_version
-                    .get(&(cohort_str.clone(), key.clone()))
-                    .unwrap_or(&1);
-                let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
-                state
-                    .federation_group_versions
-                    .entry((cohort_str.clone(), key.clone()))
-                    .or_default()
-                    .push(GroupVersion {
-                        cohort,
-                        group_key_id: key.clone(),
-                        version: cur_ver,
-                        snapshot,
-                        authorization,
-                        superseded_at: Some(now),
-                        is_current: false,
-                    });
-                state.federation_families.insert(key.clone(), new_fam);
-                // v31.0.0 (CIRISPersist#651) — the signature moves with the
-                // record it authorizes, in the same critical section.
-                state.federation_family_authority_sigs.insert(
-                    key.clone(),
-                    (
+        let group_key_id =
+            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
+        // The lock is scoped to this block so it is released before the
+        // re-index below awaits.
+        let next = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            match cohort {
+                Cohort::Family => {
+                    // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
+                    // wrapper. Decoding the bare record here is what silently
+                    // stranded the caller's signature while every field
+                    // `signing_envelope()` covers was replaced below.
+                    let crate::federation::SignedFamily {
+                        family: mut new_fam,
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
-                    ),
-                );
-                // v36.0.0 (#668/#707-class) — a supersede rewrites the served
-                // bytes; the serve position moves with them.
-                let rows = family_rows(&state);
-                allocate_and_stamp(&mut state, PLANE_FAMILY, key.clone(), rows);
-                let next = cur_ver + 1;
-                state
-                    .federation_group_current_version
-                    .insert((cohort_str, key), next);
-                Ok(next)
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
-                // family arm above.
-                let crate::federation::SignedCommunity {
-                    community: mut new_comm,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                })?;
-                new_comm.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
-                let key = new_comm.community_key_id.clone();
-                let prior = state
-                    .federation_communities
-                    .get(&key)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!(
+                        supersede_proof,
+                    } = serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
+                    })?;
+                    new_fam.persist_row_hash =
+                        crate::federation::types::compute_persist_row_hash(&new_fam)?;
+                    let key = new_fam.family_key_id.clone();
+                    let prior = state
+                        .federation_families
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::InvalidArgument(format!(
+                                "supersede: unknown family group {key:?} (nothing to supersede)"
+                            ))
+                        })?;
+                    // v49.0.0 (#910.5) — a proof names the version it replaces;
+                    // checked under the same lock that replaces it.
+                    if let Some(p) = &supersede_proof {
+                        crate::federation::group_amendment::check_proof_names_prior(
+                            &cohort_str,
+                            &key,
+                            p,
+                            &prior.persist_row_hash,
+                        )?;
+                    }
+                    let cur_ver = *state
+                        .federation_group_current_version
+                        .get(&(cohort_str.clone(), key.clone()))
+                        .unwrap_or(&1);
+                    let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
+                    state
+                        .federation_group_versions
+                        .entry((cohort_str.clone(), key.clone()))
+                        .or_default()
+                        .push(GroupVersion {
+                            cohort,
+                            group_key_id: key.clone(),
+                            version: cur_ver,
+                            snapshot,
+                            authorization,
+                            superseded_at: Some(now),
+                            is_current: false,
+                        });
+                    state.federation_families.insert(key.clone(), new_fam);
+                    // v31.0.0 (CIRISPersist#651) — the signature moves with the
+                    // record it authorizes, in the same critical section.
+                    state.federation_family_authority_sigs.insert(
+                        key.clone(),
+                        (
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                        ),
+                    );
+                    // v49.0.0 (#910.5) — the proof moves with the version it
+                    // authorized; a supersede without one clears the last one.
+                    match supersede_proof {
+                        Some(p) => {
+                            state
+                                .federation_family_supersede_proofs
+                                .insert(key.clone(), p);
+                        }
+                        None => {
+                            state.federation_family_supersede_proofs.remove(&key);
+                        }
+                    }
+                    // v36.0.0 (#668/#707-class) — a supersede rewrites the served
+                    // bytes; the serve position moves with them.
+                    let rows = family_rows(&state);
+                    allocate_and_stamp(&mut state, PLANE_FAMILY, key.clone(), rows);
+                    let next = cur_ver + 1;
+                    state
+                        .federation_group_current_version
+                        .insert((cohort_str, key), next);
+                    next
+                }
+                Cohort::Community | Cohort::Affiliations => {
+                    // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
+                    // family arm above.
+                    let crate::federation::SignedCommunity {
+                        community: mut new_comm,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        supersede_proof,
+                    } = serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                    })?;
+                    new_comm.persist_row_hash =
+                        crate::federation::types::compute_persist_row_hash(&new_comm)?;
+                    let key = new_comm.community_key_id.clone();
+                    let prior =
+                        state
+                            .federation_communities
+                            .get(&key)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::InvalidArgument(format!(
                             "supersede: unknown community group {key:?} (nothing to supersede)"
                         ))
-                    })?;
-                let cur_ver = *state
-                    .federation_group_current_version
-                    .get(&(cohort_str.clone(), key.clone()))
-                    .unwrap_or(&1);
-                let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
-                state
-                    .federation_group_versions
-                    .entry((cohort_str.clone(), key.clone()))
-                    .or_default()
-                    .push(GroupVersion {
-                        cohort,
-                        group_key_id: key.clone(),
-                        version: cur_ver,
-                        snapshot,
-                        authorization,
-                        superseded_at: Some(now),
-                        is_current: false,
-                    });
-                state.federation_communities.insert(key.clone(), new_comm);
-                // v31.0.0 (CIRISPersist#651) — see the family arm.
-                state.federation_community_authority_sigs.insert(
-                    key.clone(),
-                    (
-                        authority_key_id,
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                    ),
-                );
-                // v36.0.0 (#668/#707-class) — see the family arm.
-                let rows = community_rows(&state);
-                allocate_and_stamp(&mut state, PLANE_COMMUNITY, key.clone(), rows);
-                let next = cur_ver + 1;
-                state
-                    .federation_group_current_version
-                    .insert((cohort_str, key), next);
-                Ok(next)
+                            })?;
+                    // v49.0.0 (#910.5) — see the family arm.
+                    if let Some(p) = &supersede_proof {
+                        crate::federation::group_amendment::check_proof_names_prior(
+                            &cohort_str,
+                            &key,
+                            p,
+                            &prior.persist_row_hash,
+                        )?;
+                    }
+                    let cur_ver = *state
+                        .federation_group_current_version
+                        .get(&(cohort_str.clone(), key.clone()))
+                        .unwrap_or(&1);
+                    let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
+                    state
+                        .federation_group_versions
+                        .entry((cohort_str.clone(), key.clone()))
+                        .or_default()
+                        .push(GroupVersion {
+                            cohort,
+                            group_key_id: key.clone(),
+                            version: cur_ver,
+                            snapshot,
+                            authorization,
+                            superseded_at: Some(now),
+                            is_current: false,
+                        });
+                    state.federation_communities.insert(key.clone(), new_comm);
+                    // v31.0.0 (CIRISPersist#651) — see the family arm.
+                    state.federation_community_authority_sigs.insert(
+                        key.clone(),
+                        (
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                        ),
+                    );
+                    // v49.0.0 (#910.5) — see the family arm.
+                    match supersede_proof {
+                        Some(p) => {
+                            state
+                                .federation_community_supersede_proofs
+                                .insert(key.clone(), p);
+                        }
+                        None => {
+                            state.federation_community_supersede_proofs.remove(&key);
+                        }
+                    }
+                    // v36.0.0 (#668/#707-class) — see the family arm.
+                    let rows = community_rows(&state);
+                    allocate_and_stamp(&mut state, PLANE_COMMUNITY, key.clone(), rows);
+                    let next = cur_ver + 1;
+                    state
+                        .federation_group_current_version
+                        .insert((cohort_str, key), next);
+                    next
+                }
+                Cohort::SelfId => unreachable!("guarded above"),
             }
-            Cohort::SelfId => unreachable!("guarded above"),
-        }
+        };
+        // v49.0.0 (#910.5) — a supersede changes the served record; re-index
+        // it, or a peer's content-hash lookup never sees the new version.
+        let (kind, key_field) = match cohort {
+            Cohort::Family => ("Family", "family_key_id"),
+            _ => ("Community", "community_key_id"),
+        };
+        self.index_stored_record(
+            kind,
+            &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        )
+        .await?;
+        Ok(next)
     }
 
     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
@@ -5990,7 +6086,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // other admission step (mirrors put_family). Hybrid-Strict vs the
         // authority's registered pubkeys.
         crate::federation::verify_community_admission(self, &community).await?;
-        let mut row = community.community;
+        let row = community.community;
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
@@ -6012,6 +6108,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // for rosters with no node/agent members.
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused (the
+        // #758 verdict below still settles a concurrent insert). Before the
+        // state lock: it reads through the directory.
+        let offered = crate::federation::SignedCommunity {
+            community: row,
+            authority_key_id: community.authority_key_id,
+            scrub_signature_classical: community.scrub_signature_classical,
+            scrub_signature_pqc: community.scrub_signature_pqc,
+            supersede_proof: community.supersede_proof,
+        };
+        if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
+        let community = offered;
+        let mut row = community.community;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v48.0.0 (CIRISPersist#860) — a room is a KEYLESS identifier (as
@@ -6048,6 +6163,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     community.scrub_signature_pqc,
                 ),
             );
+            // v49.0.0 (#910.5) — a first copy of an amended version keeps its
+            // proof, so the next peer can apply it.
+            if let Some(p) = community.supersede_proof {
+                state
+                    .federation_community_supersede_proofs
+                    .insert(row.community_key_id.clone(), p);
+            }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at =
                 next_plane_position(&state, PLANE_COMMUNITY, community_rows(&state).into_iter());
@@ -8039,6 +8161,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        supersede_proof: state
+                            .federation_family_supersede_proofs
+                            .get(&f.family_key_id)
+                            .cloned(),
                     },
                 })
             })
@@ -8084,6 +8210,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        supersede_proof: state
+                            .federation_community_supersede_proofs
+                            .get(&c.community_key_id)
+                            .cloned(),
                     },
                 })
             })

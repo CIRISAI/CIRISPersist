@@ -3136,6 +3136,38 @@ pub struct SignedFamily {
     /// (PQC-mandatory, CC 5.3.2.4.3.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#910.5) — the quorum proof that authorized THIS
+    /// version to replace the one before it, or `None` for a founding record
+    /// (or one superseded without a quorum). NOT part of
+    /// [`Family::signing_envelope`]: the scrub above signs the record, the
+    /// proof authorizes the transition. Omitted on the wire when absent, so a
+    /// record that never carried one keeps its bytes and content hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersede_proof: Option<GroupSupersedeProof>,
+}
+
+/// v49.0.0 (CIRISPersist#910.5, `FSD/ROOM_ROSTER_AUTHORITY.md` §10 item 5) —
+/// what a peer needs to apply a group amendment it did not witness: the
+/// version it replaces, the membership-change envelope the prior roster
+/// signed, and those signatures.
+///
+/// A receiving node applies an offered [`SignedFamily`] / [`SignedCommunity`]
+/// that differs from its stored record only when `prior_persist_row_hash` is
+/// ITS OWN stored `persist_row_hash` (a proof over another version is stale)
+/// and [`verify_membership_quorum`](crate::federation::FederationDirectory::verify_membership_quorum)
+/// admits `change_envelope` + `quorum_signatures` against ITS OWN prior roster
+/// and the group's own protocol. The proof carries no authority of its own —
+/// every check re-derives from the receiver's verified state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupSupersedeProof {
+    /// The `persist_row_hash` of the version this one replaces.
+    pub prior_persist_row_hash: String,
+    /// The canonical membership-change envelope
+    /// ([`build_membership_change_envelope`](crate::federation::FederationDirectory::build_membership_change_envelope))
+    /// the prior roster co-signed.
+    pub change_envelope: serde_json::Value,
+    /// The prior roster's hybrid signatures over `change_envelope`'s JCS bytes.
+    pub quorum_signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
 }
 
 /// One member of a [`Community`] — an IDENTITY key plus when they
@@ -3235,6 +3267,10 @@ pub struct SignedCommunity {
     /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#910.5) — the quorum proof for this version; see
+    /// [`SignedFamily::supersede_proof`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersede_proof: Option<GroupSupersedeProof>,
 }
 
 // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-secrecy

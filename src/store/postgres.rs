@@ -7396,12 +7396,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused.
+        if crate::federation::group_amendment::route_occupied_family(self, &family).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
         let crate::federation::SignedFamily {
             family: row,
             authority_key_id,
             scrub_signature_classical,
             scrub_signature_pqc,
+            supersede_proof,
         } = family;
+        let supersede_proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
@@ -7426,7 +7436,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.federation_families \
                     SET authority_key_id = $2, scrub_signature_classical = $3, \
-                        scrub_signature_pqc = $4, admitted_at = $5 \
+                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6 \
                   WHERE family_key_id = $1",
                 &[
                     &family_key_id,
@@ -7434,6 +7444,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &scrub_signature_classical,
                     &scrub_signature_pqc,
                     &admitted_at,
+                    // v49.0.0 (#910.5) — a first copy of an amended version
+                    // keeps its proof, so the next peer can apply it.
+                    &supersede_proof_value,
                 ],
             )
             .await
@@ -7531,6 +7544,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // share the `federation_communities` live row.
         let cohort_discriminator = cohort.as_str();
         let now = chrono::Utc::now();
+        let group_key_id =
+            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
         let mut client = self
             .get_client()
             .await
@@ -7546,9 +7561,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    supersede_proof,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
+                let proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
                 new_fam.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_fam)?;
                 let members_value = serde_json::to_value(&new_fam.members)
@@ -7561,7 +7578,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     .query_opt(
                         "SELECT version, family_key_id, family_name, members, founded_at, \
                                 consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
-                         FROM cirislens.federation_families WHERE family_key_id = $1",
+                         FROM cirislens.federation_families WHERE family_key_id = $1 \
+                         FOR UPDATE",
                         &[&new_fam.family_key_id],
                     )
                     .await
@@ -7574,6 +7592,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     })?;
                 let prior_version: i32 = prior.get("version");
                 let prior_fam = pg_row_to_family(prior)?;
+                // v49.0.0 (#910.5) — a proof names the version it replaces;
+                // checked inside the transaction that replaces it, on a row
+                // read FOR UPDATE (v49.0.0 — so two concurrent supersedes
+                // cannot both pass the check against the same prior).
+                if let Some(p) = &supersede_proof {
+                    crate::federation::group_amendment::check_proof_names_prior(
+                        cohort_discriminator,
+                        &new_fam.family_key_id,
+                        p,
+                        &prior_fam.persist_row_hash,
+                    )?;
+                }
                 let snapshot = serde_json::to_value(&prior_fam)
                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
                 tx.execute(
@@ -7603,7 +7633,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         consensus_protocol = $5, consensus_protocol_entrenched = $6, \
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
-                        scrub_signature_pqc = $11, admitted_at = $12 \
+                        scrub_signature_pqc = $11, admitted_at = $12, \
+                        supersede_proof = $13 \
                      WHERE family_key_id = $1",
                     &[
                         &new_fam.family_key_id,
@@ -7622,6 +7653,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &scrub_signature_classical,
                         &scrub_signature_pqc,
                         &admitted_at,
+                        &proof_value,
                     ],
                 )
                 .await
@@ -7639,9 +7671,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    supersede_proof,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
                 })?;
+                let proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let members_value = serde_json::to_value(&new_comm.members)
@@ -7654,7 +7688,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     .query_opt(
                         "SELECT version, community_key_id, community_name, members, founded_at, \
                                 consensus_protocol, policy_blob, persist_row_hash \
-                         FROM cirislens.federation_communities WHERE community_key_id = $1",
+                         FROM cirislens.federation_communities WHERE community_key_id = $1 \
+                         FOR UPDATE",
                         &[&new_comm.community_key_id],
                     )
                     .await
@@ -7667,6 +7702,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     })?;
                 let prior_version: i32 = prior.get("version");
                 let prior_comm = pg_row_to_community(prior)?;
+                // v49.0.0 (#910.5) — see the family arm.
+                if let Some(p) = &supersede_proof {
+                    crate::federation::group_amendment::check_proof_names_prior(
+                        cohort_discriminator,
+                        &new_comm.community_key_id,
+                        p,
+                        &prior_comm.persist_row_hash,
+                    )?;
+                }
                 let snapshot = serde_json::to_value(&prior_comm)
                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
                 tx.execute(
@@ -7697,7 +7741,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         consensus_protocol = $5, policy_blob = $6, \
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
-                        scrub_signature_pqc = $11, admitted_at = $12 \
+                        scrub_signature_pqc = $11, admitted_at = $12, \
+                        supersede_proof = $13 \
                      WHERE community_key_id = $1",
                     &[
                         &new_comm.community_key_id,
@@ -7713,6 +7758,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &scrub_signature_classical,
                         &scrub_signature_pqc,
                         &admitted_at,
+                        &proof_value,
                     ],
                 )
                 .await
@@ -7724,6 +7770,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             }
             Cohort::SelfId => unreachable!("guarded above"),
         };
+        drop(client);
+        // v49.0.0 (#910.5) — a supersede changes the served record; re-index
+        // it, or a peer's content-hash lookup never sees the new version.
+        let (kind, key_field) = match cohort {
+            Cohort::Family => ("Family", "family_key_id"),
+            _ => ("Community", "community_key_id"),
+        };
+        self.index_stored_record(
+            kind,
+            &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        )
+        .await?;
         Ok(next as u32)
     }
 
@@ -7885,7 +7943,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family).
         crate::federation::verify_community_admission(self, &community).await?;
-        let mut row = community.community;
+        let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission.
         crate::federation::location::check_geographic_community_admission(
@@ -7900,6 +7958,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // members.
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused (the
+        // #758 verdict below still settles a concurrent insert).
+        let offered = crate::federation::SignedCommunity {
+            community: row,
+            authority_key_id: community.authority_key_id,
+            scrub_signature_classical: community.scrub_signature_classical,
+            scrub_signature_pqc: community.scrub_signature_pqc,
+            supersede_proof: community.supersede_proof,
+        };
+        if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
+        let community = offered;
+        let mut row = community.community;
+        let supersede_proof_value = pg_supersede_proof_value(community.supersede_proof.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_value = serde_json::to_value(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -7931,8 +8008,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                    admitted_at, supersede_proof\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
                  ON CONFLICT DO NOTHING",
                 &[
                     &row.community_key_id,
@@ -7946,6 +8023,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &scrub_signature_classical,
                     &scrub_signature_pqc,
                     &admitted_at,
+                    // v49.0.0 (#910.5) — a first copy of an amended version
+                    // keeps its proof, so the next peer can apply it.
+                    &supersede_proof_value,
                 ],
             )
             .await
@@ -20919,12 +20999,14 @@ fn pg_row_to_signed_family(
     let scrub_signature_classical: String =
         row.safe_get_with("scrub_signature_classical", mk_err)?;
     let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let supersede_proof = pg_supersede_proof(&row)?;
     let family = pg_row_to_family(row)?;
     Ok(crate::federation::SignedFamily {
         family,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        supersede_proof,
     })
 }
 
@@ -20938,13 +21020,45 @@ fn pg_row_to_signed_community(
     let scrub_signature_classical: String =
         row.safe_get_with("scrub_signature_classical", mk_err)?;
     let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let supersede_proof = pg_supersede_proof(&row)?;
     let community = pg_row_to_community(row)?;
     Ok(crate::federation::SignedCommunity {
         community,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        supersede_proof,
     })
+}
+
+/// v49.0.0 (CIRISPersist#910.5, V155) — the nullable `supersede_proof` JSONB
+/// column → the typed proof the signed since-read serves.
+fn pg_supersede_proof(
+    row: &tokio_postgres::Row,
+) -> Result<Option<crate::federation::GroupSupersedeProof>, crate::federation::Error> {
+    let value: Option<serde_json::Value> =
+        row.safe_get_with("supersede_proof", crate::federation::Error::Backend)?;
+    value
+        .map(|v| {
+            serde_json::from_value(v).map_err(|e| {
+                crate::federation::Error::Backend(format!("supersede_proof decode: {e}"))
+            })
+        })
+        .transpose()
+}
+
+/// v49.0.0 (CIRISPersist#910.5, V155) — the typed proof → the column's JSONB
+/// value (`None` stays NULL).
+fn pg_supersede_proof_value(
+    proof: Option<&crate::federation::GroupSupersedeProof>,
+) -> Result<Option<serde_json::Value>, crate::federation::Error> {
+    proof
+        .map(|p| {
+            serde_json::to_value(p).map_err(|e| {
+                crate::federation::Error::Backend(format!("supersede_proof serialize: {e}"))
+            })
+        })
+        .transpose()
 }
 
 /// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedLocationProof`. Structural

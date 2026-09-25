@@ -11431,6 +11431,7 @@ impl PyEngine {
                                 authority_key_id,
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
+                                supersede_proof: None,
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -11500,6 +11501,7 @@ impl PyEngine {
                                 authority_key_id,
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
+                                supersede_proof: None,
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -23724,6 +23726,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -23736,6 +23739,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -24018,6 +24022,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -24029,6 +24034,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };

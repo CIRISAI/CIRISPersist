@@ -148,6 +148,7 @@ pub mod emit;
 pub mod family_rules;
 pub mod genesis;
 pub mod goal;
+pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
@@ -553,7 +554,7 @@ pub use types::{
 pub use types::{
     FamilyMembershipWidening, ServedFamilyMembershipWidening, SignedFamilyMembershipWidening,
 };
-pub use types::{RosterCosignature, RosterEventSigner};
+pub use types::{GroupSupersedeProof, RosterCosignature, RosterEventSigner};
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
 /// revocations** fold, shared by every "currently-active membership"
@@ -1487,7 +1488,7 @@ where
 /// authorized in `change_envelope` (`group_key_id` + member `key_id` set +
 /// `consensus_protocol` all match). Defends against verifying one membership
 /// change and storing another.
-fn assert_change_envelope_matches(
+pub(crate) fn assert_change_envelope_matches(
     group_key_id: &str,
     new_member_key_ids: &std::collections::BTreeSet<&str>,
     new_consensus_protocol: &str,
@@ -5344,48 +5345,33 @@ pub trait FederationDirectory: Send + Sync {
     /// justification recorded on the superseded prior version.
     async fn supersede_family(
         &self,
-        new: types::SignedFamily,
+        mut new: types::SignedFamily,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        check_consensus_protocol_form(&new.family.consensus_protocol)?;
-        // v31.0.0 (CIRISPersist#651) — THE AUTHORSHIP GATE. `put_family` has
-        // run this since v21.0.0 (#502 E4); supersede ran NOTHING, so
-        // `federation_families` had a SECOND write door that admitted a
-        // re-baselined roster, a new `consensus_protocol` and a new
-        // `family_name` on FK-existence alone. Superseding is not a lesser act
-        // than creating — it is the act that REPLACES what creation
-        // established — so it is gated identically, and before any write.
-        crate::federation::verify_family_admission(self, &new).await?;
-        // The snapshot is the SIGNED WRAPPER, not the bare record. Serializing
-        // `.family` alone is what dropped the caller's freshly-minted
-        // signature on the floor: `signing_envelope()` covers `members`,
-        // `family_name`, `founded_at` and `consensus_protocol`, so a supersede
-        // that carries the record without its signature leaves the stored
-        // `authority_key_id` / `scrub_signature_*` describing a roster that is
-        // no longer there. Same discipline as #649's `AttestationReseal`: the
-        // record and the signature that authorizes it travel together, because
-        // the way they go stale is by being able to move apart.
-        let snapshot = serde_json::to_value(&new)
-            .map_err(|e| Error::Backend(format!("supersede_family snapshot serialize: {e}")))?;
-        self.supersede_group_row(cohort::Cohort::Family, snapshot, authorization)
-            .await
+        // v49.0.0 (#910.5) — a supersede proof is attached only by
+        // `supersede_family_with_quorum`, after it verified the quorum. One
+        // handed in here was verified by no one, so it is not stored (a peer
+        // would refuse it anyway; this node must not serve it as its own).
+        new.supersede_proof = None;
+        group_amendment::supersede_family_signed(self, new, authorization).await
     }
 
     /// #249 Cut G2 (§3) — supersede a community with new content as a new
     /// version. Mirror of [`Self::supersede_family`].
     async fn supersede_community(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        // v31.0.0 (CIRISPersist#651) — the authorship gate + the signed
-        // wrapper as the snapshot. See [`Self::supersede_family`] for why both.
-        crate::federation::verify_community_admission(self, &new).await?;
-        let snapshot = serde_json::to_value(&new)
-            .map_err(|e| Error::Backend(format!("supersede_community snapshot serialize: {e}")))?;
-        self.supersede_group_row(cohort::Cohort::Community, snapshot, authorization)
-            .await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family`].
+        new.supersede_proof = None;
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Community,
+            new,
+            authorization,
+        )
+        .await
     }
 
     /// CC 4.4.3.2.8 / #308 — supersede an `affiliations` group. Identical to
@@ -5395,23 +5381,18 @@ pub trait FederationDirectory: Send + Sync {
     /// stays separable per tier.
     async fn supersede_affiliations(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        // v31.0.0 (CIRISPersist#651) — gated and signature-carrying for the
-        // same reason as its two siblings. #651 named the family and community
-        // arms; this THIRD arm shares `SignedCommunity` and the
-        // `federation_communities` storage with the community arm, so fixing
-        // the two named doors and leaving this one open would have left the
-        // identical hole reachable under a different discriminator — which is
-        // exactly the by-name evadability #598 refused for the instant gate.
-        crate::federation::verify_community_admission(self, &new).await?;
-        let snapshot = serde_json::to_value(&new).map_err(|e| {
-            Error::Backend(format!("supersede_affiliations snapshot serialize: {e}"))
-        })?;
-        self.supersede_group_row(cohort::Cohort::Affiliations, snapshot, authorization)
-            .await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family`].
+        new.supersede_proof = None;
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Affiliations,
+            new,
+            authorization,
+        )
+        .await
     }
 
     /// #249 Cut G2 (§8) — alias for [`Self::list_group_versions`]: the
@@ -5834,7 +5815,7 @@ pub trait FederationDirectory: Send + Sync {
     /// against the PRIOR group — the current holders authorize the change.
     async fn supersede_family_with_quorum(
         &self,
-        new: types::SignedFamily,
+        mut new: types::SignedFamily,
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
@@ -5853,6 +5834,23 @@ pub trait FederationDirectory: Send + Sync {
             &new.family.consensus_protocol,
             &change_envelope,
         )?;
+        let prior = self
+            .lookup_family(&new.family.family_key_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "supersede: unknown family group {:?} (nothing to supersede)",
+                    new.family.family_key_id
+                ))
+            })?;
+        // v49.0.0 (#910.5) — the entrenchment the record stores is the one the
+        // quorum signed, and an entrenched family stays entrenched (the same
+        // check a peer runs before applying this version).
+        group_amendment::check_family_entrenchment(
+            prior.consensus_protocol_entrenched,
+            new.family.consensus_protocol_entrenched,
+            &change_envelope,
+        )?;
         self.verify_membership_quorum(
             cohort::Cohort::Family,
             &new.family.family_key_id,
@@ -5864,14 +5862,21 @@ pub trait FederationDirectory: Send + Sync {
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
         });
-        self.supersede_family(new, Some(authorization)).await
+        // v49.0.0 (#910.5) — the record carries what authorized it, so a
+        // peer can apply it against ITS OWN prior version and roster.
+        new.supersede_proof = Some(types::GroupSupersedeProof {
+            prior_persist_row_hash: prior.persist_row_hash,
+            change_envelope,
+            quorum_signatures: signatures,
+        });
+        group_amendment::supersede_family_signed(self, new, Some(authorization)).await
     }
 
     /// #249 Cut G3 — quorum-gated community supersede. Mirror of
     /// [`Self::supersede_family_with_quorum`].
     async fn supersede_community_with_quorum(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
@@ -5898,7 +5903,23 @@ pub trait FederationDirectory: Send + Sync {
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
         });
-        self.supersede_community(new, Some(authorization)).await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
+        new.supersede_proof = Some(types::GroupSupersedeProof {
+            prior_persist_row_hash: self
+                .lookup_community(&new.community.community_key_id)
+                .await?
+                .map(|c| c.persist_row_hash)
+                .unwrap_or_default(),
+            change_envelope,
+            quorum_signatures: signatures,
+        });
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Community,
+            new,
+            Some(authorization),
+        )
+        .await
     }
 
     /// CC 4.4.3.2.8 / #308 — quorum-gated `affiliations` supersede. Mirror of
@@ -5907,7 +5928,7 @@ pub trait FederationDirectory: Send + Sync {
     /// `affiliations` discriminator via [`Self::supersede_affiliations`].
     async fn supersede_affiliations_with_quorum(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
@@ -5934,7 +5955,23 @@ pub trait FederationDirectory: Send + Sync {
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
         });
-        self.supersede_affiliations(new, Some(authorization)).await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
+        new.supersede_proof = Some(types::GroupSupersedeProof {
+            prior_persist_row_hash: self
+                .lookup_community(&new.community.community_key_id)
+                .await?
+                .map(|c| c.persist_row_hash)
+                .unwrap_or_default(),
+            change_envelope,
+            quorum_signatures: signatures,
+        });
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Affiliations,
+            new,
+            Some(authorization),
+        )
+        .await
     }
 
     /// #249 Cut B — the INBOUND delegation walk: every key that holds a

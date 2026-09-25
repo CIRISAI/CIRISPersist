@@ -295,3 +295,5 @@ sqlite	153	roster_cosignatures	9727742498907418519
 postgres	153	roster_cosignatures	3696600832814033950
 sqlite	154	family_roster_plane	14032523887790980996
 postgres	154	family_roster_plane	15506396495817234548
+sqlite	155	group_supersede_proof	6245808473797147341
+postgres	155	group_supersede_proof	1139871493860484940

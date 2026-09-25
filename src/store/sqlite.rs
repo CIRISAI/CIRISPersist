@@ -6777,12 +6777,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused.
+        if crate::federation::group_amendment::route_occupied_family(self, &family).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
         let crate::federation::SignedFamily {
             family: row,
             authority_key_id,
             scrub_signature_classical,
             scrub_signature_pqc,
+            supersede_proof,
         } = family;
+        let supersede_proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
@@ -6805,7 +6815,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             conn.execute(
                 "UPDATE federation_families \
                     SET authority_key_id = ?2, scrub_signature_classical = ?3, \
-                        scrub_signature_pqc = ?4, admitted_at = ?5 \
+                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6 \
                   WHERE family_key_id = ?1",
                 rusqlite::params![
                     family_key_id_for_db,
@@ -6813,6 +6823,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_classical_for_db,
                     scrub_signature_pqc_for_db,
                     admitted_at.to_rfc3339(),
+                    // v49.0.0 (#910.5) — a first copy of an amended version
+                    // keeps its proof, so the next peer can apply it.
+                    supersede_proof_json,
                 ],
             )?;
             Ok(())
@@ -6903,6 +6916,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // Map a "group does not exist" sentinel back to a typed error.
         let not_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let nf = not_found.clone();
+        // v49.0.0 (#910.5) — `(named, held)` when a proof names a prior version
+        // this node does not hold.
+        type StaleSlot = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
+        let stale: StaleSlot = Default::default();
         // CC 4.4.3.2.8 / #308: `affiliations` records its version history under
         // its own `cohort.as_str()` discriminator while sharing the
         // `federation_communities` storage path below.
@@ -6917,6 +6934,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             Cohort::Family | Cohort::Community | Cohort::Affiliations => cohort.as_str(),
         };
 
+        let group_key_id =
+            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
         let new_version = match cohort {
             Cohort::Family => {
                 // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
@@ -6928,9 +6947,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    supersede_proof,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
+                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                let proof_prior = supersede_proof.map(|p| p.prior_persist_row_hash);
+                let stale = stale.clone();
                 new_fam.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_fam)?;
                 let members_json = serde_json::to_string(&new_fam.members)
@@ -6954,6 +6977,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             return Err(rusqlite::Error::QueryReturnedNoRows);
                         }
                     };
+                    // v49.0.0 (#910.5) — a proof names the version it replaces;
+                    // checked inside the transaction that replaces it.
+                    if let Some(named) = &proof_prior {
+                        if *named != prior_fam.persist_row_hash {
+                            *stale.lock().expect("stale slot") =
+                                Some((named.clone(), prior_fam.persist_row_hash.clone()));
+                            return Err(rusqlite::Error::QueryReturnedNoRows);
+                        }
+                    }
                     let snapshot = serde_json::to_string(&prior_fam)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     tx.execute(
@@ -6982,7 +7014,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
-                            scrub_signature_pqc = ?11, admitted_at = ?12 \
+                            scrub_signature_pqc = ?11, admitted_at = ?12, \
+                            supersede_proof = ?13 \
                          WHERE family_key_id = ?1",
                         rusqlite::params![
                             new_fam.family_key_id,
@@ -7001,6 +7034,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             scrub_signature_classical,
                             scrub_signature_pqc,
                             admitted_at.to_rfc3339(),
+                            proof_json,
                         ],
                     )?;
                     tx.commit()?;
@@ -7016,9 +7050,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    supersede_proof,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
                 })?;
+                let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                let proof_prior = supersede_proof.map(|p| p.prior_persist_row_hash);
+                let stale = stale.clone();
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let members_json = serde_json::to_string(&new_comm.members)
@@ -7048,6 +7086,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             return Err(rusqlite::Error::QueryReturnedNoRows);
                         }
                     };
+                    // v49.0.0 (#910.5) — see the family arm.
+                    if let Some(named) = &proof_prior {
+                        if *named != prior_comm.persist_row_hash {
+                            *stale.lock().expect("stale slot") =
+                                Some((named.clone(), prior_comm.persist_row_hash.clone()));
+                            return Err(rusqlite::Error::QueryReturnedNoRows);
+                        }
+                    }
                     let snapshot = serde_json::to_string(&prior_comm)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     tx.execute(
@@ -7076,7 +7122,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             consensus_protocol = ?5, policy_blob = ?6, \
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
-                            scrub_signature_pqc = ?11, admitted_at = ?12 \
+                            scrub_signature_pqc = ?11, admitted_at = ?12, \
+                            supersede_proof = ?13 \
                          WHERE community_key_id = ?1",
                         rusqlite::params![
                             new_comm.community_key_id,
@@ -7092,6 +7139,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             scrub_signature_classical,
                             scrub_signature_pqc,
                             admitted_at.to_rfc3339(),
+                            proof_json,
                         ],
                     )?;
                     tx.commit()?;
@@ -7102,7 +7150,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             Cohort::SelfId => unreachable!("guarded above"),
         }
         .map_err(|e| {
-            if not_found.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some((named, held)) = stale.lock().expect("stale slot").take() {
+                crate::federation::group_amendment::stale_proof(
+                    cohort_str,
+                    &group_key_id,
+                    &named,
+                    &held,
+                )
+            } else if not_found.load(std::sync::atomic::Ordering::SeqCst) {
                 Error::InvalidArgument(format!(
                     "supersede: unknown {cohort_str} group (nothing to supersede)"
                 ))
@@ -7110,6 +7165,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 Error::Backend(format!("supersede {cohort_str}: {e}"))
             }
         })?;
+        // v49.0.0 (#910.5) — a supersede changes the served record; re-index
+        // it, or a peer's content-hash lookup never sees the new version.
+        let (kind, key_field) = match cohort {
+            Cohort::Family => ("Family", "family_key_id"),
+            _ => ("Community", "community_key_id"),
+        };
+        self.index_stored_record(
+            kind,
+            &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        )
+        .await?;
         Ok(new_version)
     }
 
@@ -7277,7 +7343,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family).
         crate::federation::verify_community_admission(self, &community).await?;
-        let mut row = community.community;
+        let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every
         // member must hold an in-force contained location_proof. Reads run
@@ -7294,6 +7360,26 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // communities and for rosters with no node/agent members.
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused (the
+        // #758 verdict below still settles a concurrent insert).
+        let supersede_proof = community.supersede_proof;
+        let offered = crate::federation::SignedCommunity {
+            community: row,
+            authority_key_id: community.authority_key_id,
+            scrub_signature_classical: community.scrub_signature_classical,
+            scrub_signature_pqc: community.scrub_signature_pqc,
+            supersede_proof,
+        };
+        if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
+        let community = offered;
+        let mut row = community.community;
+        let supersede_proof_json = sqlite_supersede_proof_json(community.supersede_proof.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_json = serde_json::to_string(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -7331,8 +7417,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    admitted_at, supersede_proof\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         community_key_id,
                         row.community_name,
@@ -7345,6 +7431,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         admitted_at.to_rfc3339(),
+                        // v49.0.0 (#910.5) — a first copy of an amended
+                        // version keeps its proof, so the next peer can apply it.
+                        supersede_proof_json,
                     ],
                 )?;
                 if inserted == 1 {
@@ -20638,12 +20727,14 @@ fn sqlite_row_to_signed_family(
     let authority_key_id: String = row.get("authority_key_id")?;
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let supersede_proof = sqlite_supersede_proof(row)?;
     let family = sqlite_row_to_family(row)?;
     Ok(crate::federation::SignedFamily {
         family,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        supersede_proof,
     })
 }
 
@@ -20655,13 +20746,47 @@ fn sqlite_row_to_signed_community(
     let authority_key_id: String = row.get("authority_key_id")?;
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let supersede_proof = sqlite_supersede_proof(row)?;
     let community = sqlite_row_to_community(row)?;
     Ok(crate::federation::SignedCommunity {
         community,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        supersede_proof,
     })
+}
+
+/// v49.0.0 (CIRISPersist#910.5, V155) — the nullable `supersede_proof` JSON
+/// column → the typed proof the signed since-read serves.
+fn sqlite_supersede_proof(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Option<crate::federation::GroupSupersedeProof>> {
+    let text: Option<String> = row.get("supersede_proof")?;
+    text.map(|t| {
+        serde_json::from_str(&t).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })
+    })
+    .transpose()
+}
+
+/// v49.0.0 (CIRISPersist#910.5, V155) — the typed proof → the column's JSON
+/// text (`None` stays NULL).
+fn sqlite_supersede_proof_json(
+    proof: Option<&crate::federation::GroupSupersedeProof>,
+) -> Result<Option<String>, crate::federation::Error> {
+    proof
+        .map(|p| {
+            serde_json::to_string(p).map_err(|e| {
+                crate::federation::Error::Backend(format!("supersede_proof serialize: {e}"))
+            })
+        })
+        .transpose()
 }
 
 /// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedLocationProof`. Structural
