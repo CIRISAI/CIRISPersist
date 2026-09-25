@@ -410,6 +410,7 @@ pub mod bodies {
             authority_key_id: alice.clone(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         };
         let err = a
             .add_community_member(&room, dave_member, &stale_spec)

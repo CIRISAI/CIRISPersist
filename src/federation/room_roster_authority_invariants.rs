@@ -5,7 +5,8 @@
 //! re-added ⇒ admitted). I171 — a stranger cannot move the roster, and every
 //! kind of standing can. I172 — two nodes that received the same rows in
 //! different orders fold to the same roster. I173 — a revocation with no
-//! recorded signer (the pre-V110 shape) still removes.
+//! recorded signer (the pre-V110 shape) still removes. I176 — co-signatures
+//! are verified at the door and served byte-exact.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
 #[cfg(test)]
@@ -384,6 +385,253 @@ pub mod bodies {
         assert!(!admitted(a, &carol, &room_id).await);
     }
 
+    /// The co-signer of `e` a refusal names, when it is a failed hybrid
+    /// verify (the same refusal a bad primary signature earns).
+    fn unverified_signer(e: &Error) -> &str {
+        match e {
+            Error::FederationTierUnverified {
+                attesting_key_id, ..
+            } => attesting_key_id,
+            other => panic!("expected FederationTierUnverified, got {other}"),
+        }
+    }
+
+    fn assert_invalid(e: &Error, needle: &str, what: &str) {
+        assert!(
+            matches!(e, Error::InvalidArgument(m) if m.contains(needle)),
+            "{what}: expected InvalidArgument naming {needle:?}, got {e}"
+        );
+    }
+
+    /// **I176 — co-signatures are verified.** A co-signature over a different
+    /// envelope, a duplicate co-signer, and a co-signer equal to the primary
+    /// are each refused, before any write; a co-signed row round-trips its
+    /// co-signatures byte-exact through the signed since-read, and a
+    /// byte-identical re-put is the #861 no-op. Widening and community
+    /// revocation both; the family revocation's verify gate too.
+    pub async fn i176_cosignatures_are_verified(d: &dyn FederationDirectory, tag: &str) {
+        let (room, alice, bob) = make_room(d, tag, consensus_protocol::MAJORITY).await;
+        let carol = format!("{tag}-carol");
+        let dave = format!("{tag}-dave");
+        user(d, &carol).await;
+        user(d, &dave).await;
+        let t1 = at("2026-03-01T00:00:00Z");
+        let t2 = at("2026-03-02T00:00:00Z");
+
+        // ── widening: the refusals, none of which stores a row ──────────
+        let other = ts::sign_community_membership_widening(
+            &alice,
+            widening(&room, &dave, at("2026-02-01T00:00:00Z"), None),
+        );
+        let mut foreign = other.clone();
+        ts::cosign_community_membership_widening(&mut foreign, &bob);
+        let mut wrong_env =
+            ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
+        wrong_env.cosignatures = foreign.cosignatures.clone();
+        let e = d
+            .put_community_membership_widening(wrong_env)
+            .await
+            .expect_err("I176: a co-signature over another envelope");
+        assert_eq!(
+            unverified_signer(&e),
+            bob,
+            "{tag} I176: names the co-signer"
+        );
+
+        let mut dup =
+            ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
+        ts::cosign_community_membership_widening(&mut dup, &bob);
+        ts::cosign_community_membership_widening(&mut dup, &bob);
+        let e = d
+            .put_community_membership_widening(dup)
+            .await
+            .expect_err("I176: a duplicate co-signer");
+        assert_invalid(&e, "duplicate co-signer", "widening duplicate");
+
+        let mut selfco =
+            ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
+        ts::cosign_community_membership_widening(&mut selfco, &alice);
+        let e = d
+            .put_community_membership_widening(selfco)
+            .await
+            .expect_err("I176: the primary as its own co-signer");
+        assert_invalid(&e, "is the primary signer", "widening self co-sign");
+        assert!(
+            !active(d, &room).await.contains(&dave),
+            "{tag} I176: no refused widening stored a row"
+        );
+
+        // ── widening: the co-signed row round-trips byte-exact ──────────
+        let mut good =
+            ts::sign_community_membership_widening(&alice, widening(&room, &carol, t1, None));
+        ts::cosign_community_membership_widening(&mut good, &bob);
+        d.put_community_membership_widening(good.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I176: a co-signed widening: {e}"));
+        // #861 — the byte-identical re-put is a no-op, not a refusal.
+        d.put_community_membership_widening(good.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I176: an identical re-put: {e}"));
+        let served: Vec<_> = d
+            .list_signed_community_membership_widenings_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|w| {
+                w.widening.community_membership_widening.community_key_id == room
+                    && w.widening.community_membership_widening.member_key_id == carol
+            })
+            .collect();
+        assert_eq!(served.len(), 1, "{tag} I176: one widening row");
+        let mut expect = good.clone();
+        expect.community_membership_widening.persist_row_hash = served[0]
+            .widening
+            .community_membership_widening
+            .persist_row_hash
+            .clone();
+        assert_eq!(
+            serde_json::to_vec(&served[0].widening).unwrap(),
+            serde_json::to_vec(&expect).unwrap(),
+            "{tag} I176: the widening serves its co-signatures byte-exact"
+        );
+        assert_eq!(served[0].widening.cosignatures.len(), 1);
+        crate::federation::verify_community_membership_widening_admission(d, &served[0].widening)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I176: the served widening re-verifies: {e}"));
+        let signers = d.community_roster_signers(&room).await.unwrap();
+        let w = signers
+            .widening_signers
+            .iter()
+            .find(|s| s.member_key_id == carol)
+            .expect("carol's widening signer");
+        assert_eq!(w.authority_key_id.as_deref(), Some(alice.as_str()));
+        assert_eq!(
+            w.cosigner_key_ids,
+            vec![bob.clone()],
+            "{tag} I176: co-signers"
+        );
+
+        // ── community revocation: the same four legs ───────────────────
+        let mut foreign =
+            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t1));
+        ts::cosign_community_membership_revocation(&mut foreign, &bob);
+        let mut wrong_env =
+            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
+        wrong_env.cosignatures = foreign.cosignatures.clone();
+        let e = d
+            .put_community_membership_revocation(wrong_env)
+            .await
+            .expect_err("I176: a revocation co-signature over another envelope");
+        assert_eq!(unverified_signer(&e), bob);
+
+        let mut dup =
+            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
+        ts::cosign_community_membership_revocation(&mut dup, &bob);
+        ts::cosign_community_membership_revocation(&mut dup, &bob);
+        let e = d
+            .put_community_membership_revocation(dup)
+            .await
+            .expect_err("I176: a duplicate revocation co-signer");
+        assert_invalid(&e, "duplicate co-signer", "revocation duplicate");
+
+        let mut selfco =
+            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
+        ts::cosign_community_membership_revocation(&mut selfco, &alice);
+        let e = d
+            .put_community_membership_revocation(selfco)
+            .await
+            .expect_err("I176: the primary as its own revocation co-signer");
+        assert_invalid(&e, "is the primary signer", "revocation self co-sign");
+        assert!(
+            active(d, &room).await.contains(&carol),
+            "{tag} I176: no refused revocation stored a row"
+        );
+
+        let mut good_rev =
+            ts::sign_community_membership_revocation(&alice, revocation(&room, &carol, t2));
+        ts::cosign_community_membership_revocation(&mut good_rev, &bob);
+        d.put_community_membership_revocation(good_rev.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I176: a co-signed revocation: {e}"));
+        d.put_community_membership_revocation(good_rev.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I176: an identical revocation re-put: {e}"));
+        let served: Vec<_> = d
+            .list_signed_community_membership_revocations_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.revocation
+                    .community_membership_revocation
+                    .community_key_id
+                    == room
+                    && r.revocation
+                        .community_membership_revocation
+                        .removed_identity_key_id
+                        == carol
+            })
+            .collect();
+        assert_eq!(served.len(), 1, "{tag} I176: one revocation row");
+        let mut expect = good_rev.clone();
+        expect.community_membership_revocation.persist_row_hash = served[0]
+            .revocation
+            .community_membership_revocation
+            .persist_row_hash
+            .clone();
+        assert_eq!(
+            serde_json::to_vec(&served[0].revocation).unwrap(),
+            serde_json::to_vec(&expect).unwrap(),
+            "{tag} I176: the revocation serves its co-signatures byte-exact"
+        );
+        let signers = d.community_roster_signers(&room).await.unwrap();
+        let r = signers
+            .revocation_signers
+            .iter()
+            .find(|s| s.member_key_id == carol)
+            .expect("carol's revocation signer");
+        assert_eq!(r.cosigner_key_ids, vec![bob.clone()]);
+        assert!(!active(d, &room).await.contains(&carol));
+
+        // ── family revocation: the verify gate (no family needed) ──────
+        let fam_rev = || crate::federation::types::FamilyMembershipRevocation {
+            family_key_id: format!("{tag}-fam"),
+            removed_identity_key_id: carol.clone(),
+            removed_at: t2,
+            effective_at: t2,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        };
+        let mut ok = ts::sign_family_membership_revocation(&alice, fam_rev());
+        ts::cosign_family_membership_revocation(&mut ok, &bob);
+        crate::federation::verify_family_membership_revocation_admission(d, &ok)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I176: a co-signed family revocation: {e}"));
+        let mut dup = ok.clone();
+        ts::cosign_family_membership_revocation(&mut dup, &bob);
+        let e = crate::federation::verify_family_membership_revocation_admission(d, &dup)
+            .await
+            .expect_err("I176: a duplicate family co-signer");
+        assert_invalid(&e, "duplicate co-signer", "family duplicate");
+        let mut selfco = ts::sign_family_membership_revocation(&alice, fam_rev());
+        ts::cosign_family_membership_revocation(&mut selfco, &alice);
+        let e = crate::federation::verify_family_membership_revocation_admission(d, &selfco)
+            .await
+            .expect_err("I176: the family primary as its own co-signer");
+        assert_invalid(&e, "is the primary signer", "family self co-sign");
+        let mut wrong_env = ts::sign_family_membership_revocation(&alice, fam_rev());
+        let mut moved = fam_rev();
+        moved.effective_at = t1;
+        let mut foreign = ts::sign_family_membership_revocation(&alice, moved);
+        ts::cosign_family_membership_revocation(&mut foreign, &bob);
+        wrong_env.cosignatures = foreign.cosignatures;
+        let e = crate::federation::verify_family_membership_revocation_admission(d, &wrong_env)
+            .await
+            .expect_err("I176: a family co-signature over another envelope");
+        assert_eq!(unverified_signer(&e), bob);
+    }
+
     /// **I173 (fold half) — a revocation with no recorded signer counts.**
     pub fn i173_a_legacy_revocation_counts() {
         let t0 = at("2026-01-01T00:00:00Z");
@@ -407,6 +655,7 @@ pub mod bodies {
                 member_key_id: "b".into(),
                 effective_at: t1,
                 authority_key_id: None,
+                cosigner_key_ids: Vec::new(),
             }],
         };
         let roster = crate::federation::authorized_roster_at(
@@ -487,6 +736,15 @@ mod run {
                     super::super::bodies::i171_a_stranger_cannot_move_the_roster(
                         &d as &dyn FederationDirectory,
                         &format!("i171-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i176() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i176_cosignatures_are_verified(
+                        &d as &dyn FederationDirectory,
+                        &format!("i176-{}", super::suffix()),
                     )
                     .await
                 }

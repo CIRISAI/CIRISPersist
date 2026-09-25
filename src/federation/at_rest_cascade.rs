@@ -1776,6 +1776,7 @@ pub mod orchestrate {
                     authority_key_id: authority_key_id.to_string(),
                     scrub_signature_classical: scrub_signature_classical.to_string(),
                     scrub_signature_pqc: scrub_signature_pqc.map(str::to_string),
+                    cosignatures: Vec::new(),
                 },
             )
             .await

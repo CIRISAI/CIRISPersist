@@ -388,6 +388,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // the mappers' own decode helpers. Plumbing — they fail only on the
     // substrate's own stored bytes (a corrupt column), never on caller input.
     ("decode_witness_set", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#908) — the V153 `cosignatures` column decoders,
+    // siblings of `decode_witness_set` / `pg_witness_set`. Plumbing — they
+    // fail only on the substrate's own stored JSON, never on caller input;
+    // the co-signatures themselves were verified at the put door.
+    ("pg_roster_cosignatures", Class::Plumbing),
+    ("sqlite_roster_cosignatures", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#908) — `community_roster_signers`' local row
+    // mapper (a closure, one per backend): it maps this door's own SELECT of
+    // stored signers onto `RosterEventSigner`. Plumbing — a read door that
+    // refuses nothing; it fails only on a driver error or a corrupt column.
+    ("roster_event_signers", Class::Plumbing),
     // v39.0.0 — the whole crossing decision: custody verification, every
     // inherited co-scrub, `check_promotion_admission`, and the nine
     // contextual-integrity axes. Delegates, not Gate: it is the door's helper

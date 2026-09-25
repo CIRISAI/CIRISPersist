@@ -529,7 +529,6 @@ pub use topology::{
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
-pub use types::RosterEventSigner;
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
@@ -548,6 +547,7 @@ pub use types::{
     SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
     TrustRow, TrustType,
 };
+pub use types::{RosterCosignature, RosterEventSigner};
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
 /// revocations** fold, shared by every "currently-active membership"
@@ -4288,6 +4288,7 @@ pub trait FederationDirectory: Send + Sync {
             authority_key_id: spec.authority_key_id.clone(),
             scrub_signature_classical: spec.scrub_signature_classical.clone(),
             scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
+            cosignatures: spec.cosignatures.clone(),
         })
         .await?;
         Ok(!already)
@@ -4649,6 +4650,7 @@ pub trait FederationDirectory: Send + Sync {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    cosignatures: Vec::new(),
                 })
                 .await?;
             }
@@ -4673,6 +4675,7 @@ pub trait FederationDirectory: Send + Sync {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures: Vec::new(),
                     },
                 )
                 .await?;

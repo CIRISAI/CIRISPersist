@@ -3376,6 +3376,24 @@ impl FamilyMembershipRevocation {
     }
 }
 
+/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — one
+/// co-signature on a membership row: a hybrid scrub by a second signer over
+/// the SAME `signing_envelope()` the primary signature covers. The CC admits
+/// a membership change by the group's `consensus_protocol` over the change's
+/// signatures; a `majority` / `unanimous` / `quorum:M/N` room needs several.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RosterCosignature {
+    /// The co-signer — a `federation_keys.key_id` whose REGISTERED pubkeys
+    /// the scrub signature below must verify against.
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over `JCS(signing_envelope())`.
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
+}
+
 /// Wraps a [`FamilyMembershipRevocation`] for write submission.
 ///
 /// v21.0.0 (CIRISPersist#502 E4) — authority-signature fields, structural
@@ -3401,6 +3419,13 @@ pub struct SignedFamilyMembershipRevocation {
     /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
+    /// co-signatures a multi-signature `consensus_protocol` counts. Each is
+    /// a hybrid scrub over the SAME `signing_envelope()` as the primary,
+    /// verified at the door. Empty is omitted, so a single-signed row's bytes
+    /// and content hash are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
 }
 
 /// Removes one identity from a V060 community roster. Structural mirror
@@ -3469,6 +3494,13 @@ pub struct SignedCommunityMembershipRevocation {
     /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
+    /// co-signatures a multi-signature `consensus_protocol` counts. Each is
+    /// a hybrid scrub over the SAME `signing_envelope()` as the primary,
+    /// verified at the door. Empty is omitted, so a single-signed row's bytes
+    /// and content hash are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
 }
 
 /// v4.10.0 (CIRISPersist#154, CEG 0.8 §5.6.8.11 / §0.8.1) — a subject's
@@ -4046,6 +4078,13 @@ pub struct SignedCommunityMembershipWidening {
     /// ML-DSA-65 over canonical ‖ ed_sig.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
+    /// co-signatures a multi-signature `consensus_protocol` counts. Each is
+    /// a hybrid scrub over the SAME `signing_envelope()` as the primary,
+    /// verified at the door. Empty is omitted, so a single-signed row's bytes
+    /// and content hash are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
 }
 
 /// A served [`SignedCommunityMembershipWidening`] with THIS node's serve
@@ -6990,6 +7029,10 @@ pub struct RosterEventSigner {
     pub effective_at: chrono::DateTime<chrono::Utc>,
     /// The signer stored with the row; `None` for a legacy row.
     pub authority_key_id: Option<String>,
+    /// v49.0.0 (CIRISPersist#908) — the row's co-signers, in stored order
+    /// (empty for a single-signed or legacy row).
+    #[serde(default)]
+    pub cosigner_key_ids: Vec<String>,
 }
 
 /// v49.0.0 (CIRISPersist#908) — every signer the authorized roster fold needs

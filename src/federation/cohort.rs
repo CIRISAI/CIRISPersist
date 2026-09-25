@@ -112,6 +112,7 @@ pub mod test_support {
             authority_key_id: signed.authority_key_id,
             scrub_signature_classical: signed.scrub_signature_classical,
             scrub_signature_pqc: signed.scrub_signature_pqc,
+            cosignatures: Vec::new(),
         }
     }
 
@@ -197,6 +198,7 @@ pub mod test_support {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                cosignatures: Vec::new(),
             },
         }
     }
@@ -250,6 +252,7 @@ pub mod test_support {
             authority_key_id: String::new(),
             scrub_signature_classical: String::new(),
             scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
         };
 
         // ── family plane ────────────────────────────────────────────────
@@ -616,6 +619,11 @@ pub struct AdmitSpec {
     /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#908) — co-signatures over the SAME widening
+    /// envelope, carried onto the widening `add_community_member` builds so a
+    /// multi-signature `consensus_protocol` can be met.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<crate::federation::types::RosterCosignature>,
 }
 
 /// The knobs of a roster removal / swap-out (#249 Cut G1 §1/§6), uniform

@@ -8183,6 +8183,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = revocation.authority_key_id;
         let scrub_signature_classical = revocation.scrub_signature_classical;
         let scrub_signature_pqc = revocation.scrub_signature_pqc;
+        // v49.0.0 (CIRISPersist#908, V153) — the co-signatures the gate above
+        // verified, stored so the since-read serves the row byte-exact.
+        let cosignatures = serde_json::to_string(&revocation.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         // v21.1.0 (CIRISPersist#507b) — computed before the INSERT closure
         // moves everything.
         let wire_index_key = crate::federation::wire_index::record_key(&[
@@ -8215,8 +8219,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                    admitted_at, cosignatures\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT (family_key_id, removed_identity_key_id) DO UPDATE SET \
                     removed_at = excluded.removed_at, effective_at = excluded.effective_at, \
                     reason = excluded.reason, witness_set = excluded.witness_set, \
@@ -8224,7 +8228,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     authority_key_id = excluded.authority_key_id, \
                     scrub_signature_classical = excluded.scrub_signature_classical, \
                     scrub_signature_pqc = excluded.scrub_signature_pqc, \
-                    admitted_at = excluded.admitted_at \
+                    admitted_at = excluded.admitted_at, \
+                    cosignatures = excluded.cosignatures \
                  WHERE excluded.effective_at < federation_family_membership_revocations.effective_at",
                     rusqlite::params![
                         row.family_key_id,
@@ -8238,6 +8243,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         admitted_at.to_rfc3339(),
+                        cosignatures,
                     ],
                 )?;
                 if n == 0 {
@@ -8303,6 +8309,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = revocation.authority_key_id;
         let scrub_signature_classical = revocation.scrub_signature_classical;
         let scrub_signature_pqc = revocation.scrub_signature_pqc;
+        // v49.0.0 (CIRISPersist#908, V153) — the co-signatures the gate above
+        // verified, stored so the since-read serves the row byte-exact.
+        let cosignatures = serde_json::to_string(&revocation.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         // #848 (§15) — the counter the rotation-on-removal bump advances is
         // THIS node's own; the Engine tells the backend who it is at boot.
         let node_key: Option<String> = self.node_key_id.read().expect("node_key_id lock").clone();
@@ -8344,8 +8354,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                    admitted_at, cosignatures\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT (community_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                     rusqlite::params![
                         row.community_key_id,
@@ -8359,6 +8369,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         admitted_at.to_rfc3339(),
+                        cosignatures,
                     ],
                 )?;
                 if n == 0 {
@@ -8480,6 +8491,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = widening.authority_key_id;
         let scrub_signature_classical = widening.scrub_signature_classical;
         let scrub_signature_pqc = widening.scrub_signature_pqc;
+        // v49.0.0 (CIRISPersist#908, V153) — the co-signatures the gate above
+        // verified, stored so the since-read serves the row byte-exact.
+        let cosignatures = serde_json::to_string(&widening.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         let effective_at_rfc3339 = row.effective_at.to_rfc3339();
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("community_key_id", &row.community_key_id),
@@ -8497,8 +8512,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "INSERT INTO federation_community_membership_widenings (\
                     community_key_id, member_key_id, joined_at, effective_at, role, \
                     persist_row_hash, authority_key_id, scrub_signature_classical, \
-                    scrub_signature_pqc, admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                    scrub_signature_pqc, admitted_at, cosignatures\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
                     rusqlite::params![
                         row.community_key_id,
@@ -8511,6 +8526,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         admitted_at.to_rfc3339(),
+                        cosignatures,
                     ],
                 )?;
                 Ok(n == 1)
@@ -8685,7 +8701,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     else {
                         return Ok(None);
                     };
-                    let events = |sql: &str| -> Result<
+                    let roster_event_signers = |sql: &str| -> Result<
                         Vec<crate::federation::RosterEventSigner>,
                         rusqlite::Error,
                     > {
@@ -8696,17 +8712,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                                 member_key_id: r.get(0)?,
                                 effective_at: parse_rfc3339(&at),
                                 authority_key_id: r.get(2)?,
+                                cosigner_key_ids: sqlite_roster_cosignatures(r)?
+                                    .into_iter()
+                                    .map(|c| c.authority_key_id)
+                                    .collect(),
                             })
                         })?;
                         rows.collect()
                     };
-                    let widening_signers = events(
-                        "SELECT member_key_id, effective_at, authority_key_id \
+                    let widening_signers = roster_event_signers(
+                        "SELECT member_key_id, effective_at, authority_key_id, cosignatures \
                          FROM federation_community_membership_widenings \
                          WHERE community_key_id = ?1",
                     )?;
-                    let revocation_signers = events(
-                        "SELECT removed_identity_key_id, effective_at, authority_key_id \
+                    let revocation_signers = roster_event_signers(
+                        "SELECT removed_identity_key_id, effective_at, authority_key_id, \
+                            cosignatures \
                          FROM federation_community_membership_revocations \
                          WHERE community_key_id = ?1",
                     )?;
@@ -20128,6 +20149,22 @@ fn map_revocation_sqlite_err(
     }
 }
 
+/// v49.0.0 (CIRISPersist#908) — a membership row's V153 `cosignatures`
+/// column (a JSON array, `'[]'` for a single-signed row), decoded to the wire
+/// type. Malformed text is a conversion failure, never an empty list.
+fn sqlite_roster_cosignatures(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Vec<crate::federation::RosterCosignature>> {
+    let text: String = row.get("cosignatures")?;
+    serde_json::from_str(&text).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })
+}
+
 /// Decode a JSON-TEXT `witness_set` array column (col index `idx` for
 /// the error report).
 fn decode_witness_set(text: &str, idx: usize) -> rusqlite::Result<Vec<String>> {
@@ -20450,12 +20487,14 @@ fn sqlite_row_to_signed_family_membership_revocation(
     let authority_key_id: String = row.get("authority_key_id")?;
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let cosignatures = sqlite_roster_cosignatures(row)?;
     let family_membership_revocation = sqlite_row_to_family_membership_revocation(row)?;
     Ok(crate::federation::SignedFamilyMembershipRevocation {
         family_membership_revocation,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        cosignatures,
     })
 }
 
@@ -20468,12 +20507,14 @@ fn sqlite_row_to_signed_community_membership_revocation(
     let authority_key_id: String = row.get("authority_key_id")?;
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let cosignatures = sqlite_roster_cosignatures(row)?;
     let community_membership_revocation = sqlite_row_to_community_membership_revocation(row)?;
     Ok(crate::federation::SignedCommunityMembershipRevocation {
         community_membership_revocation,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        cosignatures,
     })
 }
 
@@ -20498,12 +20539,14 @@ fn sqlite_row_to_signed_community_membership_widening(
     let authority_key_id: String = row.get("authority_key_id")?;
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let cosignatures = sqlite_roster_cosignatures(row)?;
     let community_membership_widening = sqlite_row_to_community_membership_widening(row)?;
     Ok(crate::federation::SignedCommunityMembershipWidening {
         community_membership_widening,
         authority_key_id,
         scrub_signature_classical,
         scrub_signature_pqc,
+        cosignatures,
     })
 }
 
@@ -33846,6 +33889,7 @@ mod tests {
             authority_key_id: String::new(),
             scrub_signature_classical: String::new(),
             scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
         };
         let err = backend
             .add_family_member("fam", bob_row.clone(), &unsigned)

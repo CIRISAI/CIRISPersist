@@ -415,6 +415,23 @@ struct State {
     /// v48.0.0 (#860) — keyed like `federation_community_membership_widenings`.
     federation_community_membership_widening_authority_sigs:
         HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
+    /// v49.0.0 (CIRISPersist#908, V153 mirror) — the co-signatures the door
+    /// verified, keyed like `federation_family_membership_revocations`.
+    /// Absent ⇒ none (a single-signed row).
+    federation_family_membership_revocation_cosignatures:
+        HashMap<(String, String), Vec<crate::federation::RosterCosignature>>,
+    /// v49.0.0 (CIRISPersist#908, V153 mirror) — keyed like
+    /// `federation_community_membership_revocations`.
+    federation_community_membership_revocation_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
+    /// v49.0.0 (CIRISPersist#908, V153 mirror) — keyed like
+    /// `federation_community_membership_widenings`.
+    federation_community_membership_widening_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_location_proofs`.
     federation_location_proof_authority_sigs:
@@ -859,6 +876,9 @@ impl Default for MemoryBackend {
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
                 federation_community_membership_widening_authority_sigs: HashMap::new(),
+                federation_family_membership_revocation_cosignatures: HashMap::new(),
+                federation_community_membership_revocation_cosignatures: HashMap::new(),
+                federation_community_membership_widening_cosignatures: HashMap::new(),
                 federation_location_proof_authority_sigs: HashMap::new(),
                 signed_wire_index: HashMap::new(),
                 known_wire_hashes: HashMap::new(),
@@ -6637,6 +6657,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
+            // v49.0.0 (CIRISPersist#908, V153 mirror) — an accelerating repeat
+            // replaces the row, so it replaces the co-signatures too.
+            state
+                .federation_family_membership_revocation_cosignatures
+                .insert(revocation_key.clone(), revocation.cosignatures);
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
                 &state,
@@ -6792,6 +6817,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_community_membership_revocation_cosignatures
+                .insert(revocation_key.clone(), revocation.cosignatures);
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
                 &state,
@@ -6889,6 +6918,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         widening.scrub_signature_pqc,
                     ),
                 );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_community_membership_widening_cosignatures
+                .insert(key.clone(), widening.cosignatures);
             let admitted_at = next_plane_position(
                 &state,
                 PLANE_COMMUNITY_MEMBERSHIP_WIDENING,
@@ -7033,17 +7066,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_community_authority_sigs
             .get(community_key_id)
             .map(|s| s.0.clone());
-        let signer = |key: &(String, String, chrono::DateTime<chrono::Utc>),
-                      sigs: &HashMap<
-            (String, String, chrono::DateTime<chrono::Utc>),
-            AuthoritySig,
-        >| {
-            crate::federation::RosterEventSigner {
-                member_key_id: key.1.clone(),
-                effective_at: key.2,
-                authority_key_id: sigs.get(key).map(|s| s.0.clone()),
-            }
-        };
+        type EventKey = (String, String, chrono::DateTime<chrono::Utc>);
+        let signer =
+            |key: &EventKey,
+             sigs: &HashMap<EventKey, AuthoritySig>,
+             cosigs: &HashMap<EventKey, Vec<crate::federation::RosterCosignature>>| {
+                crate::federation::RosterEventSigner {
+                    member_key_id: key.1.clone(),
+                    effective_at: key.2,
+                    authority_key_id: sigs.get(key).map(|s| s.0.clone()),
+                    cosigner_key_ids: cosigs
+                        .get(key)
+                        .map(|c| c.iter().map(|c| c.authority_key_id.clone()).collect())
+                        .unwrap_or_default(),
+                }
+            };
         let widening_signers = state
             .federation_community_membership_widenings
             .keys()
@@ -7052,6 +7089,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 signer(
                     k,
                     &state.federation_community_membership_widening_authority_sigs,
+                    &state.federation_community_membership_widening_cosignatures,
                 )
             })
             .collect();
@@ -7063,6 +7101,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 signer(
                     k,
                     &state.federation_community_membership_revocation_authority_sigs,
+                    &state.federation_community_membership_revocation_cosignatures,
                 )
             })
             .collect();
@@ -7954,6 +7993,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .federation_family_membership_revocation_authority_sigs
                     .get(&key)?
                     .clone();
+                let cosignatures = state
+                    .federation_family_membership_revocation_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(crate::federation::ServedFamilyMembershipRevocation {
                     admitted_at: position(r),
                     revocation: crate::federation::SignedFamilyMembershipRevocation {
@@ -7961,6 +8005,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures,
                     },
                 })
             })
@@ -8026,6 +8071,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .federation_community_membership_revocation_authority_sigs
                     .get(&key)?
                     .clone();
+                let cosignatures = state
+                    .federation_community_membership_revocation_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(crate::federation::ServedCommunityMembershipRevocation {
                     admitted_at: position(r),
                     revocation: crate::federation::SignedCommunityMembershipRevocation {
@@ -8033,6 +8083,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures,
                     },
                 })
             })
@@ -8099,6 +8150,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .federation_community_membership_widening_authority_sigs
                     .get(&key)?
                     .clone();
+                let cosignatures = state
+                    .federation_community_membership_widening_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(crate::federation::ServedCommunityMembershipWidening {
                     admitted_at: position(w),
                     widening: crate::federation::SignedCommunityMembershipWidening {
@@ -8106,6 +8162,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures,
                     },
                 })
             })

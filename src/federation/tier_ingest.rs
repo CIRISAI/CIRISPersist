@@ -492,6 +492,54 @@ where
     .map(|_| ())
 }
 
+/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — verify a
+/// membership row's co-signatures, AFTER its primary signature has verified.
+///
+/// Every co-signature is a hybrid scrub over the SAME `envelope` the primary
+/// signed, verified by [`verify_envelope_hybrid_signature`] exactly as the
+/// primary is — so a co-signature that does not verify fails exactly as a bad
+/// primary does. A co-signer equal to `primary_key_id`, or one that appears
+/// twice, is refused with [`Error::InvalidArgument`] before any co-signature
+/// is verified: a signature counted twice would let one signer meet a
+/// multi-signature `consensus_protocol` alone.
+async fn verify_roster_cosignatures<F>(
+    directory: &F,
+    row_kind: &str,
+    primary_key_id: &str,
+    envelope: &serde_json::Value,
+    cosignatures: &[super::types::RosterCosignature],
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut seen = std::collections::HashSet::with_capacity(cosignatures.len());
+    for c in cosignatures {
+        if c.authority_key_id == primary_key_id {
+            return Err(Error::InvalidArgument(format!(
+                "{row_kind}: co-signer {:?} is the primary signer — a signature is counted once",
+                c.authority_key_id
+            )));
+        }
+        if !seen.insert(c.authority_key_id.as_str()) {
+            return Err(Error::InvalidArgument(format!(
+                "{row_kind}: duplicate co-signer {:?} — a signature is counted once",
+                c.authority_key_id
+            )));
+        }
+    }
+    for c in cosignatures {
+        verify_envelope_hybrid_signature(
+            directory,
+            &c.authority_key_id,
+            envelope,
+            &c.scrub_signature_classical,
+            c.scrub_signature_pqc.as_deref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
 /// [`SignedFamilyMembershipRevocation`](super::SignedFamilyMembershipRevocation).
 /// Structural mirror of [`verify_family_admission`]; verifies over
@@ -503,15 +551,24 @@ pub async fn verify_family_membership_revocation_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let envelope = signed.family_membership_revocation.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.family_membership_revocation.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v49.0.0 (CIRISPersist#908) — every co-signature, over the same envelope.
+    verify_roster_cosignatures(
+        directory,
+        "SignedFamilyMembershipRevocation",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
@@ -528,15 +585,24 @@ pub async fn verify_community_membership_revocation_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let envelope = signed.community_membership_revocation.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.community_membership_revocation.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v49.0.0 (CIRISPersist#908) — every co-signature, over the same envelope.
+    verify_roster_cosignatures(
+        directory,
+        "SignedCommunityMembershipRevocation",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// v48.0.0 (CIRISPersist#860) — the hybrid-signature gate for a community
@@ -550,15 +616,24 @@ pub async fn verify_community_membership_widening_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let envelope = signed.community_membership_widening.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.community_membership_widening.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v49.0.0 (CIRISPersist#908) — every co-signature, over the same envelope.
+    verify_roster_cosignatures(
+        directory,
+        "SignedCommunityMembershipWidening",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"this node
@@ -2748,7 +2823,28 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         }
+    }
+
+    /// v49.0.0 (CIRISPersist#908) — add `cosigner`'s co-signature to an
+    /// already-signed row: a hybrid scrub over the SAME `signing_envelope()`
+    /// the primary covers. The companion of [`sign_family_membership_revocation`].
+    pub fn cosign_family_membership_revocation(
+        signed: &mut crate::federation::SignedFamilyMembershipRevocation,
+        cosigner: &str,
+    ) {
+        let (_hash, classical, pqc) = sign_envelope(
+            cosigner,
+            &signed.family_membership_revocation.signing_envelope(),
+        );
+        signed
+            .cosignatures
+            .push(crate::federation::types::RosterCosignature {
+                authority_key_id: cosigner.to_owned(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
     }
 
     /// v21.0.0 (CIRISPersist#502 E4) — sign a
@@ -2765,7 +2861,28 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         }
+    }
+
+    /// v49.0.0 (CIRISPersist#908) — add `cosigner`'s co-signature to an
+    /// already-signed row: a hybrid scrub over the SAME `signing_envelope()`
+    /// the primary covers. The companion of [`sign_community_membership_revocation`].
+    pub fn cosign_community_membership_revocation(
+        signed: &mut crate::federation::SignedCommunityMembershipRevocation,
+        cosigner: &str,
+    ) {
+        let (_hash, classical, pqc) = sign_envelope(
+            cosigner,
+            &signed.community_membership_revocation.signing_envelope(),
+        );
+        signed
+            .cosignatures
+            .push(crate::federation::types::RosterCosignature {
+                authority_key_id: cosigner.to_owned(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
     }
 
     /// v48.0.0 (CIRISPersist#860) — the widening mirror of
@@ -2780,7 +2897,28 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         }
+    }
+
+    /// v49.0.0 (CIRISPersist#908) — add `cosigner`'s co-signature to an
+    /// already-signed row: a hybrid scrub over the SAME `signing_envelope()`
+    /// the primary covers. The companion of [`sign_community_membership_widening`].
+    pub fn cosign_community_membership_widening(
+        signed: &mut crate::federation::SignedCommunityMembershipWidening,
+        cosigner: &str,
+    ) {
+        let (_hash, classical, pqc) = sign_envelope(
+            cosigner,
+            &signed.community_membership_widening.signing_envelope(),
+        );
+        signed
+            .cosignatures
+            .push(crate::federation::types::RosterCosignature {
+                authority_key_id: cosigner.to_owned(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
     }
 
     /// v48.0.0 (CIRISPersist#860) — an [`AdmitSpec`] for
@@ -2805,6 +2943,7 @@ pub mod test_support {
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         }
     }
 

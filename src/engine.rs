@@ -18100,6 +18100,7 @@ mod tests {
                     authority_key_id: String::new(),
                     scrub_signature_classical: String::new(),
                     scrub_signature_pqc: None,
+                    cosignatures: Vec::new(),
                 },
             )
             .await
