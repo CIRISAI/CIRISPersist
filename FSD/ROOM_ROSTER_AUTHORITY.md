@@ -108,8 +108,41 @@ A stored row with **no recorded signer** (a revocation admitted before V110 stor
 - **I171 — standing is the protocol.** One arm per protocol, each with its refusal and its admission: `founder_only` (a plain member refused `roster_consensus_insufficient`, a founder admitted); `majority` of three (one signature refused, two admitted via a co-signature); `unanimous` (all but one refused, all admitted); `quorum:2/5` (one refused, two admitted); `custom:x` (refused `roster_consensus_unevaluable`); `infrastructure` subkind (a majority of plain members refused, the founders admitted). A stranger refused `roster_authority_not_established`. A member leaving admitted alone. The room's own key and the record signer, alone, refused. A refused revocation stores no row (the rotation shares its transaction).
 - **I172 — the fold judges the history, not the arrival.** Two nodes receive the same rows in opposite orders; after both arrive their rosters agree.
 - **I173 — a legacy revocation still counts** (fold and store halves).
-- **I175 — a moderator's change belongs to its instant.** Founder alice appoints mo (`moderate`); mo widens hank at `t1`; alice withdraws the appointment at `t2`. hank stays on the roster; a widening by mo dated after `t2` is refused. Control: a widening by mo dated before the appointment is refused.
+- **I175 / I175b — a moderator's change belongs to its instant, and an appointment to its epoch.** Founder alice appoints mo (`moderate`); mo widens hank at `t1`; alice withdraws the appointment at `t2`. hank stays on the roster; a widening by mo dated after `t2` is refused. Control: a widening by mo dated before the appointment is refused.
 - **I176 — co-signatures are verified.** A co-signature over a different envelope, a duplicate co-signer, and a co-signer equal to the primary are each refused; the stored row serves its co-signatures byte-exact on the since-read.
+
+### 6.1 Mutation round (v49.0.0; lane = every roster / moderation / reverse-quorum / consensus / family / supersede / amendment / #909 test, sqlite + postgres under `pg_test_db.sh`; each mutant reverted before the next)
+
+| # | Mutant | Verdict | Killed by |
+|---|--------|---------|-----------|
+| M1 | legacy (signer-less) rows no longer count | KILLED | i173_fold i173_postgres i173_sqlite |
+| M2 | a member leaving needs the protocol | KILLED | active_community_members_subtracts_effective_revocation active_community_members_subtracts_effective_revocation_sqlite forged_community_membership_revocation_wrong_signer_rejected_502e4 i179 i180 i77_owned_node_minter_admitted_by_principal_postgres |
+| M3 | named moderators have no standing | KILLED | moderator_change_belongs_to_its_instant_memory moderator_change_belongs_to_its_instant_postgres moderator_change_belongs_to_its_instant_sqlite |
+| M4 | a moderator root need not be an active founder | SURVIVED round 1 — the RULE was wrong (a founder's departure lapsed their appointments); replaced per the 2026-09-25 ruling, see M4b/M4c | — |
+| M5 | retryable/substantive classification collapsed | KILLED | i171 i179 |
+| M6 | last-founder rule dropped | KILLED | i179 i180 |
+| M7 | last-founder demotion arm dropped | KILLED | i180 |
+| M8 | the fold applies every event | KILLED | i172 |
+| M9 | the fold ignores reverse-quorum reversals | KILLED | reverse_quorum_roster_removal_memory reverse_quorum_roster_removal_postgres reverse_quorum_roster_removal_sqlite |
+| M10 | the door judges a row WITH itself | KILLED | add_community_member_grows_roster_idempotent_sqlite |
+| M11 | moderator standing judged NOW, not at the change | KILLED | moderator_change_belongs_to_its_instant_memory moderator_change_belongs_to_its_instant_postgres moderator_change_belongs_to_its_instant_sqlite |
+| M12 | majority admits exactly half | KILLED | i172 i179 infrastructure_counts_founders_only quorum_supersede_protocol_decides_memory quorum_supersede_protocol_decides_postgres quorum_supersede_protocol_decides_sqlite |
+| M13 | unanimous admits all-but-one | KILLED | every_arm_admits_and_refuses i171 i179 quorum_supersede_protocol_decides_memory quorum_supersede_protocol_decides_postgres quorum_supersede_protocol_decides_sqlite |
+| M14 | quorum needs M-1 | KILLED | every_arm_admits_and_refuses i171 |
+| M15 | founder_only admits any member | KILLED | every_arm_admits_and_refuses i171 i179 i182 quorum_supersede_protocol_decides_memory quorum_supersede_protocol_decides_postgres |
+| M16 | infrastructure counts everyone | KILLED (unit-level only — see limits) | infrastructure_counts_founders_only |
+| M17 | reverse_quorum addition at 1-of-N | KILLED | quorum_supersede_protocol_decides_memory quorum_supersede_protocol_decides_postgres quorum_supersede_protocol_decides_sqlite reverse_quorum_protects_cheaply_and_grants_expensively reverse_quorum_roster_removal_memory reverse_quorum_roster_removal_postgres |
+| M18 | no eligible signer still evaluates | SURVIVED round 1 → KILLED round 2 (witness added) | reverse_quorum_roster_removal_memory reverse_quorum_roster_removal_postgres reverse_quorum_roster_removal_sqlite |
+| M19 | weighted threshold off by one weight | SURVIVED round 1 → KILLED round 2 (witness added) | i182 weighted_uniform_half_and_declared |
+| M20 | a protocol-only rewrite is a protective Remove | KILLED | quorum_supersede_protocol_decides_memory quorum_supersede_protocol_decides_postgres quorum_supersede_protocol_decides_sqlite |
+| M21 | sqlite list_attestations ignores lifecycle (#909) | KILLED | sqlite_list_attestations_lifecycle_i174_909 |
+| M22 | postgres list_attestations ignores lifecycle (#909) | KILLED | pg_list_attestations_lifecycle_i174_909 |
+| M4b | the epoch filter dropped (any appointment counts) | KILLED | an_appointment_belongs_to_its_epoch_memory an_appointment_belongs_to_its_epoch_postgres an_appointment_belongs_to_its_epoch_sqlite |
+| M4c | the root must still be an active founder at t (the old rule) | KILLED | an_appointment_belongs_to_its_epoch_memory an_appointment_belongs_to_its_epoch_postgres an_appointment_belongs_to_its_epoch_sqlite |
+
+**24 mutants, 24 killed** after two rounds. Round 1 left two survivors, and they meant different things. **M18** was a missing witness: under `reverse_quorum` a removal admits on any signer, so the only thing stopping a stranger's removal is the "no eligible signer admits nothing" guard — I181 now tries it. **M4** was a wrong RULE: the draft required a moderator's appointing founder to still be an active founder at the change's instant, so a founder's departure silently lapsed every appointment they made — a removal acting like a slash. The operator's ruling (2026-09-25): **no ending is retroactive** — removal, `withdraws`, `recants` and slashing all leave past decisions intact, and the recourse is re-adjudication; an appointment belongs to the epoch it was issued in (the root must have held authority when appointing, and need not hold it later). M4b and M4c pin both halves (I175b).
+
+**Limits, stated.** M16 (the `infrastructure` subkind counts founders only) and M19's first kill are unit-level (`consensus::tests`); M19 now also dies on I182. An infrastructure-labelled room needs an authorized infrastructure key to be stored (SecReview F2), so no backend leg reaches that arm through a door — the arm is enforced, its reachability is unwitnessed. The mixed-change `Remove` pass in `verify_membership_quorum` is an EQUIVALENT mutant today (the evaluator reads direction only for `reverse_quorum`, where a removal always admits) and is documented in the code rather than witnessed.
 
 ## 7. Not in scope
 - `supersede_community_with_quorum` checks a strict majority regardless of the room's protocol (a separate CC gap on the record-rewrite path); recorded on #908.
