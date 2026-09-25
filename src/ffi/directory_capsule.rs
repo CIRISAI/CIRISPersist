@@ -4677,7 +4677,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "e36a7660dc27121c56fb33c580cbcd9a3c2fbc5359775931ab812fa39d87e2dc",
+            "03fb3ee2db0ddf0bbe079706bae849c5b8686843c93e8d32e8744af0709c6e4a",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4710,7 +4710,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "5199d54a6f8a1ef0ad0c22d0984d29aeff071664e7a9ff1b8bb02020c3306cde",
+            "c9a280976ffafd6ed659c69e21ac3daa774412c36e0d57f39326dbaef0b25ff1",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

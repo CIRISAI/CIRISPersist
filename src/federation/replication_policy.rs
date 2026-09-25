@@ -430,8 +430,16 @@ pub fn replication_policy_sha256() -> String {
 /// `3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef`
 /// (v31.1.0 – v44.2.1, the 15-kind era). CIRISServer re-pins; CIRISEdge adds
 /// the wire kind (its protocol enum mirrors the sixteen names in order).
+/// v48.0.0 (CIRISPersist#860) — re-pinned for the 17th kind
+/// ([`EnvelopeKind::CommunityMembershipWidening`]). Previous value:
+/// `c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d`.
+/// v49.0.0 (CIRISPersist#910) — re-pinned for the 18th kind
+/// ([`EnvelopeKind::FamilyMembershipWidening`], APPENDED; policy tuple
+/// identical to the community widening's). Previous value:
+/// `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19`
+/// (v48.0.0). CIRISEdge appends the 18th name to its protocol enum.
 pub const REPLICATION_POLICY_HASH: &str =
-    "9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19";
+    "7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae";
 
 #[cfg(test)]
 mod tests {

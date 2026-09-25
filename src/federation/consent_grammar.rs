@@ -582,8 +582,13 @@ pub fn consent_grammar_sha256() -> String {
 /// unchanged. Previous value:
 /// `ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482`
 /// (v44.6.0 – v47.4.0).
+/// v49.0.0 (CIRISPersist#910) — RE-PINNED: `EnvelopeKind::FamilyMembershipWidening`
+/// (classified `StructuralPlane`) joined the kind list the grammar hashes
+/// over. The grammar itself is unchanged. Previous value:
+/// `07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9`
+/// (v48.0.0).
 pub const CONSENT_GRAMMAR_HASH: &str =
-    "07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9";
+    "62de16961aa7e631d999611b30bdcf9dc42c683e9e69a0c142b710609f9e133c";
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {

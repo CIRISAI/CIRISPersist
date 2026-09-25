@@ -293,3 +293,5 @@ postgres	151	room_roster_planes	17256240880646898922
 postgres	152	consent_peer_set_for_key	17869501614558642481
 sqlite	153	roster_cosignatures	9727742498907418519
 postgres	153	roster_cosignatures	3696600832814033950
+sqlite	154	family_roster_plane	14032523887790980996
+postgres	154	family_roster_plane	15506396495817234548

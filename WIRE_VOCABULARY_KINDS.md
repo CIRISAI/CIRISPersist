@@ -157,6 +157,45 @@ after `KeyGrant` — never inserts, the order is hashed:
 
 `FSD/ROOM_ROSTER_PLANES.md` is the design.
 
+## Replicated `EnvelopeKind`s — the eighteenth kind, `FamilyMembershipWidening` (v49.0.0, #910)
+
+Seventeen kinds shipped through v48.0.0; v49.0.0 **appends** the eighteenth
+after `CommunityMembershipWidening` — never inserts, the order is hashed:
+
+| # | `EnvelopeKind` | carries | signer | binding | projections |
+|---|---|---|---|---|---|
+| 18 | `FamilyMembershipWidening` | one row of `federation_family_membership_widenings`: `(family_key_id, member_key_id, effective_at)` + `joined_at`, `role`, `cosignatures` — the family addition plane, the twin of `CommunityMembershipWidening` | `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
+
+- **Wire shape.** A `SignedFamilyMembershipWidening` is the widening row plus
+  the primary signer's hybrid scrub over its canonical (JCS) envelope with
+  `persist_row_hash` stripped, and any `cosignatures` over the same envelope
+  (omitted when empty). It rides `list_signed_family_membership_widenings_since`
+  (pair cursor; resume id = the three-part compound of the PK).
+- **Admission** (`tier_ingest::verify_family_membership_widening_admission`,
+  then `check_family_roster_authority`): the primary and every co-signature
+  verify; a future-dated row is refused
+  (`reject_future_dated_family_widening`); the signer set must meet the
+  family's own `consensus_protocol` at `effective_at` (the same
+  `roster_event_standing` rooms use; a family has no moderation plane); the
+  family must exist and the member must be a registered key; idempotent on the
+  three-part PK.
+- **Fold.** `authorized_family_roster_at`: the record's members, then the
+  family widening and revocation planes by `effective_at` (a removal wins a
+  tie), applying only events with standing. `active_family_members`,
+  `list_families_for_member_active`, the admission readers, the at-rest family
+  fan-out and `verify_membership_quorum`'s prior roster all read it.
+  `add_family_member` is the local door onto the plane; no door rewrites a
+  family record to grow it.
+- **The family revocation key** gains `effective_at` (V154): a re-added
+  member can be removed again; the since-read's resume id and the wire-index
+  record key are the three-part compound.
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `9d62d3a8…8a19` → `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae`;
+  `CONSENT_GRAMMAR_HASH` (`FamilyMembershipWidening` is `StructuralPlane`)
+  `07a677bb…64a9` → `62de16961aa7e631d999611b30bdcf9dc42c683e9e69a0c142b710609f9e133c`.
+
+`FSD/ROOM_ROSTER_AUTHORITY.md` §10 is the design.
+
 ---
 
 ## Why persist exposes no `send_trace_batch` wrapper
