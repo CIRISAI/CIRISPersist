@@ -353,14 +353,21 @@ fn verify_ed25519_only_with_policy(
     policy: HybridPolicy,
     row_age: Option<Duration>,
 ) -> Result<VerifyOutcome, VerifyError> {
-    use ciris_crypto::ClassicalVerifier;
-
     // Run the Ed25519 verification first regardless of policy — a
     // forged Ed25519 signature should reject as Crypto, not
     // HybridPendingRejected. (Policy gates ACCEPTANCE, not rejection.)
+    //
+    // v49.0.0 (CIRISPersist#913) — STRICT, and stated. CIRISVerify v17.0.0
+    // made `ClassicalVerifier::verify` strict for Ed25519, but this call site
+    // names the rule rather than inheriting it: permissive (cofactorless)
+    // verification accepts a small-order `A`/`R`, so `(R = identity, s = 0)`
+    // verifies any message against the identity key with no private key in
+    // existence. The ML-DSA-65 half under `HybridPolicy::Strict` already
+    // contained that on the federation tier; this closes it on the classical
+    // half itself, the same rule the trace floor (`verify/ed25519.rs`) uses.
     let ed25519_verifier = Ed25519Verifier;
     let ok = ed25519_verifier
-        .verify(ed25519_pubkey, canonical_bytes, ed25519_sig)
+        .verify_strict(ed25519_pubkey, canonical_bytes, ed25519_sig)
         .map_err(|e| VerifyError::Crypto(format!("ed25519: {e}")))?;
     if !ok {
         return Err(VerifyError::Crypto(
