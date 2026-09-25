@@ -18518,6 +18518,341 @@ mod tests {
         quorum_supersede_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
+    /// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §0 item 3) —
+    /// **the group's own `consensus_protocol` decides a quorum supersede**, not a
+    /// fixed strict majority. Before v49.0.0 every leg below that says
+    /// "admitted" with fewer than a strict majority was refused (and a
+    /// `founder_only` / `unanimous` / `majority` group could not supersede at
+    /// all: verify refused any prior protocol that was not `quorum:M/N`), and
+    /// the `unanimous` refusal was admitted on a majority. Each refusal leaves
+    /// the live record untouched.
+    async fn quorum_supersede_protocol_decides_body(
+        d: &dyn crate::federation::FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{self, identity_type};
+
+        let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        let k = |tag: &str, i: usize| format!("pd-{tag}-k{i}-{s}");
+
+        // A room: `members[0]` signs the record; `founders` carry role founder.
+        let community = |room: &str, members: &[String], founders: usize, cp: &str| {
+            ts::sign_community(
+                &members[0],
+                types::Community {
+                    community_key_id: room.to_owned(),
+                    community_name: "protocol room".into(),
+                    members: members
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| types::CommunityMember {
+                            key_id: m.clone(),
+                            joined_at: joined,
+                            role: (i < founders).then(|| "founder".to_owned()),
+                        })
+                        .collect(),
+                    founded_at: joined,
+                    consensus_protocol: cp.into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        let setup =
+            |tag: &'static str, n: usize, extra: usize, founders: usize, cp: &'static str| {
+                let room = format!("pd-{tag}-room-{s}");
+                let keys: Vec<String> = (0..n + extra).map(|i| k(tag, i)).collect();
+                async move {
+                    for key in &keys {
+                        ts::register_hybrid_key_as(d, key, key, identity_type::USER).await;
+                    }
+                    d.put_community(community(&room, &keys[..n], founders, cp))
+                        .await
+                        .unwrap_or_else(|e| panic!("{tag}: put_community: {e}"));
+                    (room, keys)
+                }
+            };
+        // Attempt `prior → new_members` signed by `signers`; the record keeps
+        // the room's protocol.
+        let attempt = |room: String,
+                       new_members: Vec<String>,
+                       founders: usize,
+                       cp: &'static str,
+                       signers: Vec<String>| async move {
+            let change = d
+                .build_membership_change_envelope(
+                    Cohort::Community,
+                    &room,
+                    &new_members,
+                    false,
+                    Some(cp),
+                )
+                .await
+                .expect("build change envelope");
+            let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+            let sigs = signers
+                .iter()
+                .map(|m| ts::threshold_sign(m, &bytes))
+                .collect();
+            d.supersede_community_with_quorum(
+                community(&room, &new_members, founders, cp),
+                change,
+                sigs,
+            )
+            .await
+        };
+        let live_len = |room: String| async move {
+            d.lookup_community(&room)
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len()
+        };
+        let refused = |r: Result<u32, crate::federation::Error>, what: &str| {
+            let e = r.expect_err(what);
+            assert_eq!(e.kind(), "federation_invalid_argument", "{what}: {e}");
+            e.to_string()
+        };
+
+        // founder_only, 3 members (1 founder): a plain member alone is refused;
+        // ONE founder signature admits (a strict majority would need 2).
+        let (room, ks) = setup("fo", 3, 1, 1, "founder_only").await;
+        let grown = ks[..4].to_vec();
+        let msg = refused(
+            attempt(
+                room.clone(),
+                grown.clone(),
+                1,
+                "founder_only",
+                vec![ks[1].clone()],
+            )
+            .await,
+            "founder_only: a plain member alone",
+        );
+        assert!(msg.contains("founder_only"), "{msg}");
+        assert_eq!(live_len(room.clone()).await, 3);
+        attempt(room.clone(), grown, 1, "founder_only", vec![ks[0].clone()])
+            .await
+            .expect("founder_only: one founder admits");
+        assert_eq!(live_len(room).await, 4);
+
+        // unanimous, 3: two of three refused (a strict majority would admit);
+        // all three admit.
+        let (room, ks) = setup("un", 3, 1, 0, "unanimous").await;
+        let grown = ks[..4].to_vec();
+        let msg = refused(
+            attempt(
+                room.clone(),
+                grown.clone(),
+                0,
+                "unanimous",
+                ks[..2].to_vec(),
+            )
+            .await,
+            "unanimous: 2 of 3",
+        );
+        assert!(msg.contains("unanimous: 2 of 3"), "{msg}");
+        assert_eq!(live_len(room.clone()).await, 3);
+        attempt(room.clone(), grown, 0, "unanimous", ks[..3].to_vec())
+            .await
+            .expect("unanimous: 3 of 3 admits");
+        assert_eq!(live_len(room).await, 4);
+
+        // quorum:1/3 — M is absolute: one signature admits.
+        let (room, ks) = setup("q13", 3, 1, 0, "quorum:1/3").await;
+        attempt(
+            room.clone(),
+            ks[..4].to_vec(),
+            0,
+            "quorum:1/3",
+            vec![ks[2].clone()],
+        )
+        .await
+        .expect("quorum:1/3: one signature admits");
+        assert_eq!(live_len(room).await, 4);
+
+        // majority, 4: two refused (half is not more than half); three admit.
+        let (room, ks) = setup("mj", 4, 1, 0, "majority").await;
+        let grown = ks[..5].to_vec();
+        let msg = refused(
+            attempt(room.clone(), grown.clone(), 0, "majority", ks[..2].to_vec()).await,
+            "majority: 2 of 4",
+        );
+        assert!(msg.contains("majority: 2 of 4"), "{msg}");
+        assert_eq!(live_len(room.clone()).await, 4);
+        attempt(room.clone(), grown, 0, "majority", ks[1..4].to_vec())
+            .await
+            .expect("majority: 3 of 4 admits");
+        assert_eq!(live_len(room).await, 5);
+
+        // A signer outside the prior roster never counts, even under the
+        // cheapest protocol (the incoming key cannot admit itself).
+        let (room, ks) = setup("self", 3, 1, 0, "quorum:1/3").await;
+        refused(
+            attempt(
+                room.clone(),
+                ks[..4].to_vec(),
+                0,
+                "quorum:1/3",
+                vec![ks[3].clone()],
+            )
+            .await,
+            "quorum:1/3: the incoming key alone",
+        );
+        assert_eq!(live_len(room).await, 3);
+
+        // Direction (reverse_quorum:2/5): a pure removal is protective and
+        // lands on one signature; a MIXED change is judged both ways, so the
+        // addition half needs the forward threshold (max(2, strict majority
+        // of 4) = 3).
+        let rq = "reverse_quorum:2/5:86400";
+        let (room, ks) = setup("rq", 5, 1, 0, rq).await;
+        attempt(room.clone(), ks[..4].to_vec(), 0, rq, vec![ks[0].clone()])
+            .await
+            .expect("reverse_quorum: a removal lands on one signature");
+        assert_eq!(live_len(room.clone()).await, 4);
+        let mixed = vec![ks[0].clone(), ks[1].clone(), ks[2].clone(), ks[5].clone()];
+        let msg = refused(
+            attempt(room.clone(), mixed.clone(), 0, rq, vec![ks[0].clone()]).await,
+            "reverse_quorum: mixed change on one signature",
+        );
+        assert!(msg.contains("Add"), "the addition half refused: {msg}");
+        assert_eq!(live_len(room.clone()).await, 4);
+        attempt(room.clone(), mixed, 0, rq, ks[..3].to_vec())
+            .await
+            .expect("reverse_quorum: mixed change on 3 of 4");
+        let live: std::collections::BTreeSet<String> = d
+            .lookup_community(&room)
+            .await
+            .unwrap()
+            .unwrap()
+            .members
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(live.contains(&ks[5]) && !live.contains(&ks[3]));
+
+        // An undeclared custom protocol cannot be evaluated: refused, whoever signs.
+        let (room, ks) = setup("cu", 2, 1, 1, "custom:council").await;
+        let msg = refused(
+            attempt(
+                room.clone(),
+                ks[..3].to_vec(),
+                1,
+                "custom:council",
+                ks[..2].to_vec(),
+            )
+            .await,
+            "custom:council undeclared",
+        );
+        assert!(msg.contains("cannot be evaluated"), "{msg}");
+        assert_eq!(live_len(room).await, 2);
+
+        // The family arm reads the same evaluator: a non-entrenched
+        // founder_only family admits one founder's signature, refuses a
+        // plain member's.
+        let fam = format!("pd-fam-{s}");
+        let fk: Vec<String> = (0..3).map(|i| k("fam", i)).collect();
+        ts::register_hybrid_key(d, &fam).await;
+        for key in &fk {
+            ts::register_hybrid_key(d, key).await;
+        }
+        let family = |members: &[String]| {
+            ts::sign_family(
+                &fam,
+                types::Family {
+                    family_key_id: fam.clone(),
+                    family_name: "household".into(),
+                    members: members
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| types::FamilyMember {
+                            key_id: m.clone(),
+                            joined_at: joined,
+                            role: Some(if i == 0 { "founder" } else { "member" }.into()),
+                        })
+                        .collect(),
+                    founded_at: joined,
+                    consensus_protocol: "founder_only".into(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        d.put_family(family(&fk[..2])).await.expect("put_family");
+        let change = d
+            .build_membership_change_envelope(
+                Cohort::Family,
+                &fam,
+                &fk,
+                false,
+                Some("founder_only"),
+            )
+            .await
+            .unwrap();
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        refused(
+            d.supersede_family_with_quorum(
+                family(&fk),
+                change.clone(),
+                vec![ts::threshold_sign(&fk[1], &bytes)],
+            )
+            .await,
+            "founder_only family: a plain member alone",
+        );
+        assert_eq!(
+            d.lookup_family(&fam).await.unwrap().unwrap().members.len(),
+            2
+        );
+        d.supersede_family_with_quorum(
+            family(&fk),
+            change,
+            vec![ts::threshold_sign(&fk[0], &bytes)],
+        )
+        .await
+        .expect("founder_only family: one founder admits");
+        assert_eq!(
+            d.lookup_family(&fam).await.unwrap().unwrap().members.len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_supersede_protocol_decides_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        quorum_supersede_protocol_decides_body(&d, "mem").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn quorum_supersede_protocol_decides_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        quorum_supersede_protocol_decides_body(&b, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn quorum_supersede_protocol_decides_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        quorum_supersede_protocol_decides_body(&b, &uuid::Uuid::new_v4().simple().to_string())
+            .await;
+    }
+
     /// #249 Cut G4 — forward-secrecy rekey-on-revoke (§7) + change-event hook
     /// (§9). Community removal bumps the DEK epoch (so the next cascade excludes
     /// the departed member) and emits a `community_membership_change` removed

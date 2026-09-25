@@ -23932,9 +23932,10 @@ impl PyEngine {
     }
 
     /// #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is
-    /// authorized by the group's current strict-majority quorum (composes
-    /// verify v6.9.0's `verify_membership_change`: distinct + strict-majority +
-    /// one-seat + entrenchment + anti-replay + prior-quorum). `change_envelope_json`
+    /// authorized by the group's current roster under the group's OWN
+    /// `consensus_protocol` (v49.0.0, #908: verify checks structure, one-seat,
+    /// anti-replay and every signature; persist's one evaluator decides the
+    /// threshold). `change_envelope_json`
     /// is the `cohort_build_membership_change_envelope` output the members
     /// cosigned; `signatures_json` is a JSON array of
     /// [`ciris_verify_core::threshold::ThresholdSignature`]. Returns `None` on
