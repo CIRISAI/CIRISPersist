@@ -18704,6 +18704,34 @@ mod tests {
         );
         assert_eq!(live_len(room).await, 3);
 
+        // A protocol-only rewrite (no member moves) is judged as an ADDITION,
+        // never as a protective removal: under reverse_quorum one signature
+        // must not rewrite the room's rules (the mutant that classes an
+        // unchanged roster as Remove dies here).
+        let rqp = "reverse_quorum:2/5:86400";
+        let (room, ks) = setup("rqp", 5, 0, 0, rqp).await;
+        let msg = refused(
+            attempt(
+                room.clone(),
+                ks[..5].to_vec(),
+                0,
+                "quorum:1/5",
+                vec![ks[0].clone()],
+            )
+            .await,
+            "reverse_quorum: a protocol-only rewrite on one signature",
+        );
+        assert!(msg.contains("Add"), "judged as an addition: {msg}");
+        assert_eq!(
+            d.lookup_community(&room)
+                .await
+                .unwrap()
+                .unwrap()
+                .consensus_protocol,
+            rqp,
+            "the room keeps its rules"
+        );
+
         // Direction (reverse_quorum:2/5): a pure removal is protective and
         // lands on one signature; a MIXED change is judged both ways, so the
         // addition half needs the forward threshold (max(2, strict majority

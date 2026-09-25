@@ -5340,6 +5340,13 @@ pub trait FederationDirectory: Send + Sync {
             new_roster.iter().map(|m| m.member_id.as_str()).collect();
         let gains = new_ids.difference(&prior_ids).next().is_some();
         let loses = prior_ids.difference(&new_ids).next().is_some();
+        // A mixed change is judged both ways. Today the Remove pass can never
+        // refuse what the Add pass admitted (the evaluator reads direction only
+        // for reverse_quorum, where a removal always admits), so dropping it is
+        // an EQUIVALENT mutant — kept as the defensive half for any future
+        // protocol that makes removal the stricter direction. A change that
+        // moves no one (a protocol-only rewrite) is an Add: the cheap
+        // protective direction must never rewrite the room's rules.
         let directions: &[consensus::Direction] = match (gains, loses) {
             (true, true) => &[consensus::Direction::Add, consensus::Direction::Remove],
             (false, true) => &[consensus::Direction::Remove],
