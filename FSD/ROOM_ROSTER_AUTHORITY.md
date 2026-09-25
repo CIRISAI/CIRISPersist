@@ -1,6 +1,6 @@
 # FSD — A roster change needs standing; admission reads the same roster
 
-**Issues:** CIRISPersist#907, CIRISPersist#908 (both filed against v48.0.0 `59283e3e` while CIRISServer scoped community roster CRUD).
+**Issues:** CIRISPersist#907, CIRISPersist#908, CIRISPersist#909, CIRISPersist#910 (#907/#908 filed against v48.0.0 `59283e3e` while CIRISServer scoped community roster CRUD).
 **Release:** v49.0.0 (MAJOR). Roster rows gain co-signatures, `AdmitSpec` gains a field, a new typed refusal, a new directory read, and roster changes that a single signature used to carry are now refused unless the room's `consensus_protocol` is met. First built as a v49.0.0 minor with single-signer standing; checked against the CC and ruled by the operator (2026-09-24): **full CC now, as a MAJOR** — see §2.
 **Predecessor:** `FSD/ROOM_ROSTER_PLANES.md` (v48.0.0, #860).
 
@@ -124,3 +124,16 @@ A stored row with **no recorded signer** (a revocation admitted before V110 stor
 ## 9. How the design got here
 
 The first build (v49.0.0, single-signer standing) passed its witnesses; the full lanes then found that keyed rooms sign removals as the room key, and a check against the CC showed the whole single-signer model was weaker than CC 4.4.3.2.3 for every protocol but `founder_only`. The operator chose full CC as v49.0.0 and ruled on the three extensions (§2). Families remain signature-only — the same shape as #908, out of scope, recorded on the issue.
+
+## 10. #910 — families get the room treatment, and a group amendment replicates
+
+**Filed 2026-09-25 by CIRISServer** (household CRUD on v48.0.0 / edge v31.0.0); **folded into v49.0.0 by the operator** so adopters re-pin once. Verified on the tree: a supersede UPDATEs the group row and appends `federation_group_versions`, but never re-indexes the wire record; the replicated `put_family` is a plain INSERT (a peer keeps its first copy) and `put_community` refuses a differing record under an occupied id (#758). So every record-level change — family growth, role changes, `consensus_protocol` amendments, renames — reaches no peer, **on both group kinds**. Rooms only looked fine because v48 moved their growth onto the widening plane.
+
+1. **A family widening plane** — the #860 design applied to families: `federation_family_membership_widenings` (same shape and three-part key as the community table, co-signatures included), `EnvelopeKind::FamilyMembershipWidening` **appended as the 18th kind**, doors / per-group read / signed since-read on sqlite, postgres, memory, the capsule, the double and the connection model; `add_family_member` becomes the local door onto it (the record is never rewritten to grow). `REPLICATION_POLICY_HASH` and `CONSENT_GRAMMAR_HASH` re-pin.
+2. **Re-admission** — the family revocation key gains `effective_at` (a table rebuild, as V151 did for rooms); an exact retry stays the #861 no-op.
+3. **One fold at every family gate** — the same authorized replay (§3) and evaluator (§2) as rooms, over the family's own protocol; `active_family_members`, `list_families_for_member_active`, the admission readers and `verify_membership_quorum`'s prior roster all read it.
+4. **Role changes ride the plane, for both kinds.** A widening that names an active member with a different role is a role change, judged by the protocol like any other change; the same role stays the idempotent no-op. Membership and role then never need a record rewrite.
+5. **A group amendment replicates.** What is left on the record — name, `consensus_protocol`, `policy_blob`, entrenchment — changes by `supersede_*_with_quorum`. The signed group record gains an optional `supersede_proof { prior_persist_row_hash, change_envelope, quorum_signatures }`; supersede re-indexes the wire record; a replicated put of a differing record under an occupied id is applied **only** when the proof names the receiving node's own stored `persist_row_hash` and passes `verify_membership_quorum` against the receiving node's own prior roster (authority re-derived from its own verified state). Anything else keeps the #758 refusal. Entrenched families still refuse amendments.
+
+**Invariants.** I177 — family widening converges across two nodes (the I164 shape) and a removed family member is re-admitted (#910.1). I178 — a family role change and a `consensus_protocol` amendment each reach a peer; a forged or stale proof (wrong prior hash, insufficient quorum) is refused and the peer keeps its record. I179 — family standing is the family's protocol (I171's arms on the family plane), and `verify_membership_quorum`'s prior roster is the fold, not the raw record (#910.2).
+
