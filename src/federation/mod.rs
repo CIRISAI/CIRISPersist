@@ -1320,7 +1320,7 @@ where
     roster_event_standing(rules, &state, &e).map_err(|(rule, detail)| {
         tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
         Error::RosterAuthorityUnauthorized {
-            community_key_id: group_key_id.to_owned(),
+            group_key_id: group_key_id.to_owned(),
             offered_authority_key_id: primary.to_owned(),
             rule,
         }
@@ -8205,30 +8205,31 @@ pub enum Error {
         rule: &'static str,
     },
 
-    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §4) — a
-    /// community-membership widening or revocation whose signature verified,
-    /// but whose `authority_key_id` has no STANDING in the room at the row's
-    /// `effective_at`: not the room's record signer, not an active founder,
-    /// not an active member of an open room, not a named moderator, and (for a
-    /// revocation) not the member leaving. The row is not stored and a
-    /// revocation does not rotate the epoch. Stable `kind()` token
-    /// `federation_roster_authority_unauthorized`.
+    /// v49.0.0 (CIRISPersist#908, #910; FSD `ROOM_ROSTER_AUTHORITY.md` §2, §4) —
+    /// a membership widening or revocation (a community's or a family's) whose
+    /// signatures verified, but whose signer set does not give it STANDING in
+    /// the group at the row's `effective_at`: the group's `consensus_protocol`
+    /// is not met by the signers who are active members (CC 4.4.3.2.3), the
+    /// row is not a member leaving on their own signature, no signer is a
+    /// named moderator live at that instant, or the change would leave members
+    /// with no founder. The row is not stored and a revocation does not rotate
+    /// the epoch. Stable `kind()` token `federation_roster_authority_unauthorized`.
     ///
-    /// `rule` is one of the `ROSTER_AUTHORITY_RULE_*` tokens.
-    /// [`ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED`] is the RETRYABLE one: the
-    /// event that gives the signer standing may not have arrived yet.
+    /// `rule` is one of [`ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED`] (RETRYABLE: a
+    /// signer has no event in the group yet — rows arrive out of order),
+    /// [`ROSTER_CONSENSUS_INSUFFICIENT`], [`ROSTER_CONSENSUS_UNEVALUABLE`] or
+    /// [`ROSTER_LAST_FOUNDER`].
     #[error(
-        "roster change in community {community_key_id:?} signed by \
-         {offered_authority_key_id:?}, which has no standing in the room ({rule}): a \
-         valid signature proves who signed, not that they may change the roster \
-         (CIRISPersist#908)"
+        "roster change in group {group_key_id:?} signed by {offered_authority_key_id:?} \
+         has no standing ({rule}): a valid signature proves who signed, not that the \
+         group's consensus_protocol is met (CIRISPersist#908)"
     )]
     RosterAuthorityUnauthorized {
-        /// The room whose roster the row would change.
-        community_key_id: String,
-        /// The signer whose signature DID verify.
+        /// The community or family whose roster the row would change.
+        group_key_id: String,
+        /// The primary signer (every signature, co-signers included, verified).
         offered_authority_key_id: String,
-        /// Which clause refused; one of the `ROSTER_AUTHORITY_RULE_*` tokens.
+        /// Which clause refused; one of the rule tokens above.
         rule: &'static str,
     },
 
