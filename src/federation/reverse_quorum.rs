@@ -1210,6 +1210,47 @@ pub struct ReverseQuorumFold {
     pub escalated_dismissed_objection_ids: Vec<String>,
 }
 
+/// v49.0.0 — **what the fold reads from an action**, and nothing else.
+///
+/// The fold has always read exactly three things from the action under
+/// objection: who did it ([`Self::actor_key_id`] — objections are filed
+/// against, and found through, that key, and the steward tier recuses it), what
+/// it is called ([`Self::action_id`] — matched byte-for-byte against the
+/// objection envelope's [`field::OBJECTS_TO`]), and when it happened
+/// ([`Self::asserted_at`] — the window opens there). Naming that as a type lets
+/// an action that is NOT an [`Attestation`] be folded by the same code: a
+/// roster row in a `reverse_quorum:*` room is identified by its
+/// [`content_hash_of`](super::wire_index::content_hash_of) hex, and its actor
+/// is the member whose signature it landed on.
+///
+/// Borrowed rather than owned: it is `Copy`, it is built at the call site from
+/// a row the caller already holds, and it lives no longer than one fold. An
+/// owned twin would buy nothing but a clone per read.
+///
+/// The envelope field is still spelled `objects_to_attestation_id` on the wire
+/// — renaming it would re-cut every held objection's signed bytes — and for a
+/// non-attestation action it carries that action's id all the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionRef<'a> {
+    /// The key whose single signature the action landed on — the actor.
+    pub actor_key_id: &'a str,
+    /// The action's identifier, exactly as objections name it in
+    /// [`field::OBJECTS_TO`].
+    pub action_id: &'a str,
+    /// The action's own instant — the objection window opens here.
+    pub asserted_at: DateTime<Utc>,
+}
+
+impl<'a> From<&'a Attestation> for ActionRef<'a> {
+    fn from(a: &'a Attestation) -> Self {
+        Self {
+            actor_key_id: a.attesting_key_id.as_str(),
+            action_id: a.attestation_id.as_str(),
+            asserted_at: a.asserted_at,
+        }
+    }
+}
+
 /// CIRISPersist#591 — **the fold's whole input**, as a type.
 ///
 /// #574's invariant, made structural: the standing of an action is a pure
@@ -1224,8 +1265,9 @@ pub struct ReverseQuorumFold {
 /// signal it belongs in a different layer.
 #[derive(Debug, Clone, Copy)]
 pub struct ReverseQuorumInputs<'a> {
-    /// The commons action under objection.
-    pub action: &'a Attestation,
+    /// The commons action under objection (v49.0.0: an [`ActionRef`], so an
+    /// action that is not an attestation folds by the same rules).
+    pub action: ActionRef<'a>,
     /// Every objection row this node holds against it.
     pub objections: &'a [Attestation],
     /// **Already quorum-verified** dismissals — see
@@ -1297,7 +1339,7 @@ pub fn fold_reverse_quorum(
     now: DateTime<Utc>,
 ) -> ReverseQuorumFold {
     fold_reverse_quorum_over(&ReverseQuorumInputs {
-        action,
+        action: action.into(),
         objections,
         dismissals,
         ballots: &[],
@@ -1408,7 +1450,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
         if envelope_str(o, "dimension") != Some(DIMENSION_OBJECTION) {
             continue;
         }
-        if envelope_str(o, field::OBJECTS_TO) != Some(action.attestation_id.as_str()) {
+        if envelope_str(o, field::OBJECTS_TO) != Some(action.action_id) {
             continue;
         }
         if !roster.iter().any(|k| k == &o.attesting_key_id) {
@@ -1474,7 +1516,7 @@ pub fn fold_reverse_quorum_over(inputs: &ReverseQuorumInputs<'_>) -> ReverseQuor
 /// relative to both the action and `now`?
 fn is_ballot_on(
     row: &Attestation,
-    action: &Attestation,
+    action: ActionRef<'_>,
     objection: &Attestation,
     now: DateTime<Utc>,
 ) -> bool {
@@ -1482,7 +1524,7 @@ fn is_ballot_on(
         envelope_str(row, "dimension"),
         Some(DIMENSION_UPHELD | DIMENSION_OVERRULED)
     ) && envelope_str(row, field::BALLOT_ON) == Some(objection.attestation_id.as_str())
-        && envelope_str(row, field::OBJECTS_TO) == Some(action.attestation_id.as_str())
+        && envelope_str(row, field::OBJECTS_TO) == Some(action.action_id)
         && row.asserted_at >= action.asserted_at
         && row.asserted_at <= now
 }
@@ -1539,7 +1581,7 @@ fn tally(governing: &std::collections::BTreeMap<&str, &Attestation>) -> (usize, 
 /// The steward-tier and escalation record for ONE objection — see
 /// [`fold_reverse_quorum_over`] for the ordering and the reasoning.
 fn escalate_objection(
-    action: &Attestation,
+    action: ActionRef<'_>,
     objection: &Attestation,
     ballots: &[Attestation],
     roster: &[String],
@@ -1556,7 +1598,7 @@ fn escalate_objection(
     //    objector has one on their own objection. A recusal removes the seat
     //    from BOTH sides of the fraction, which is what makes it a recusal and
     //    not a veto.
-    let actor = action.attesting_key_id.as_str();
+    let actor = action.actor_key_id;
     let objector = objection.attesting_key_id.as_str();
     let seated_duty: Vec<String> = duty_holders
         .iter()
@@ -1851,6 +1893,46 @@ pub async fn record_objection<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    admit_objection(directory, objection, None).await
+}
+
+/// v49.0.0 — [`record_objection`] against an action that is NOT a held
+/// [`Attestation`] (e.g. a roster row, identified by its
+/// [`content_hash_of`](super::wire_index::content_hash_of) hex). Every gate of
+/// [`record_objection`] applies unchanged; the only difference is where the
+/// objected-to action comes from — the caller supplies its [`ActionRef`]
+/// instead of this door reading it by id.
+///
+/// The objection's own [`field::OBJECTS_TO`] must name `action.action_id`
+/// byte-for-byte, or the row is refused with
+/// [`ObjectionRefusalReason::TargetActionUnknown`]: the one action this door
+/// was told about is not the one the objection names. The objection must be
+/// filed against `action.actor_key_id`
+/// ([`ObjectionRefusalReason::NotFiledAgainstActor`] otherwise), which is where
+/// [`resolve_reverse_quorum_for`] looks for it.
+pub async fn record_objection_against<F>(
+    directory: &F,
+    objection: &Attestation,
+    action: ActionRef<'_>,
+) -> Result<ObjectionOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    admit_objection(directory, objection, Some(action)).await
+}
+
+/// The one objection door: `supplied = None` reads the action by the id the
+/// objection names ([`record_objection`]); `Some` takes the caller's
+/// [`ActionRef`] and checks the objection names it
+/// ([`record_objection_against`]).
+async fn admit_objection<F>(
+    directory: &F,
+    objection: &Attestation,
+    supplied: Option<ActionRef<'_>>,
+) -> Result<ObjectionOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let refused = |reason: ObjectionRefusalReason| Ok(ObjectionOutcome::Refused { reason });
 
     if envelope_str(objection, "dimension") != Some(DIMENSION_OBJECTION) {
@@ -1878,14 +1960,24 @@ where
         return refused(ObjectionRefusalReason::NotACohortMember);
     }
 
-    // The objected-to row must be held here, or the objection names nothing
-    // this node can fold.
-    let Some(action) = directory.get_attestation(&action_id).await? else {
-        return refused(ObjectionRefusalReason::TargetActionUnknown);
+    // The objected-to row must be held here (or, on the `_against` door, be
+    // the action the caller named), or the objection names nothing this node
+    // can fold.
+    let held;
+    let action: ActionRef<'_> = match supplied {
+        Some(a) if a.action_id == action_id => a,
+        Some(_) => return refused(ObjectionRefusalReason::TargetActionUnknown),
+        None => {
+            let Some(row) = directory.get_attestation(&action_id).await? else {
+                return refused(ObjectionRefusalReason::TargetActionUnknown);
+            };
+            held = row;
+            ActionRef::from(&held)
+        }
     };
     // The row must be FILED where the fold looks for it (see
     // `objections_against`), or it would be stored and never counted.
-    if objection.attested_key_id != action.attesting_key_id {
+    if objection.attested_key_id != action.actor_key_id {
         return refused(ObjectionRefusalReason::NotFiledAgainstActor);
     }
 
@@ -1913,10 +2005,10 @@ where
     // i.e. it would silently take the brake away from a member for having once
     // helped lift it. That is the wrong direction on the one axis this module
     // may not get wrong.
-    for held in objections_against(directory, &action).await? {
-        if envelope_str(&held, "dimension") == Some(DIMENSION_OBJECTION)
-            && held.attesting_key_id == objection.attesting_key_id
-            && held.attestation_id != objection.attestation_id
+    for prior in objections_against(directory, action).await? {
+        if envelope_str(&prior, "dimension") == Some(DIMENSION_OBJECTION)
+            && prior.attesting_key_id == objection.attesting_key_id
+            && prior.attestation_id != objection.attestation_id
         {
             return refused(ObjectionRefusalReason::DuplicateObjection);
         }
@@ -2096,6 +2188,36 @@ pub async fn record_objection_ballot<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    admit_ballot(directory, ballot, None).await
+}
+
+/// v49.0.0 — [`record_objection_ballot`] on an objection to an action that is
+/// NOT a held [`Attestation`]; the twin of [`record_objection_against`], with
+/// the same rule: the ballot's [`field::OBJECTS_TO`] must name
+/// `action.action_id` byte-for-byte or it is refused with
+/// [`ObjectionRefusalReason::TargetActionUnknown`]. Every other gate —
+/// membership, filing, recusal, dating, signature, the named objection — is
+/// [`record_objection_ballot`]'s, unchanged.
+pub async fn record_objection_ballot_against<F>(
+    directory: &F,
+    ballot: &Attestation,
+    action: ActionRef<'_>,
+) -> Result<ObjectionOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    admit_ballot(directory, ballot, Some(action)).await
+}
+
+/// The one ballot door — see [`admit_objection`] for the `supplied` contract.
+async fn admit_ballot<F>(
+    directory: &F,
+    ballot: &Attestation,
+    supplied: Option<ActionRef<'_>>,
+) -> Result<ObjectionOutcome, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let refused = |reason: ObjectionRefusalReason| Ok(ObjectionOutcome::Refused { reason });
 
     if !matches!(
@@ -2149,18 +2271,27 @@ where
         return refused(ObjectionRefusalReason::NotACohortMember);
     }
 
-    let Some(action) = directory.get_attestation(&action_id).await? else {
-        return refused(ObjectionRefusalReason::TargetActionUnknown);
+    let held;
+    let action: ActionRef<'_> = match supplied {
+        Some(a) if a.action_id == action_id => a,
+        Some(_) => return refused(ObjectionRefusalReason::TargetActionUnknown),
+        None => {
+            let Some(row) = directory.get_attestation(&action_id).await? else {
+                return refused(ObjectionRefusalReason::TargetActionUnknown);
+            };
+            held = row;
+            ActionRef::from(&held)
+        }
     };
     // Filed where the fold looks (see `objections_against`), or stored and
     // never counted.
-    if ballot.attested_key_id != action.attesting_key_id {
+    if ballot.attested_key_id != action.actor_key_id {
         return refused(ObjectionRefusalReason::NotFiledAgainstActor);
     }
     // RECUSAL, at the door: the actor does not vote on the objection to their
     // own act. Refused rather than silently dropped by the fold, so a producer
     // learns it instead of believing it participated.
-    if ballot.attesting_key_id == action.attesting_key_id {
+    if ballot.attesting_key_id == action.actor_key_id {
         return refused(ObjectionRefusalReason::ActorRecused);
     }
     if ballot.asserted_at < action.asserted_at {
@@ -2218,15 +2349,12 @@ where
 /// anything, which is the failure mode that looks most like success.
 async fn objections_against<F>(
     directory: &F,
-    action: &Attestation,
+    action: ActionRef<'_>,
 ) -> Result<Vec<Attestation>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let rows = match directory
-        .list_attestations_for(&action.attesting_key_id)
-        .await
-    {
+    let rows = match directory.list_attestations_for(action.actor_key_id).await {
         Ok(rows) => rows,
         Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
@@ -2242,7 +2370,7 @@ where
                         | DIMENSION_UPHELD
                         | DIMENSION_OVERRULED
                 )
-            ) && envelope_str(r, field::OBJECTS_TO) == Some(action.attestation_id.as_str())
+            ) && envelope_str(r, field::OBJECTS_TO) == Some(action.action_id)
         })
         .collect())
 }
@@ -2287,6 +2415,28 @@ pub async fn resolve_reverse_quorum(
     cohort: Cohort,
     cohort_key_id: &str,
     action: &Attestation,
+    now: DateTime<Utc>,
+) -> Result<ReverseQuorumFold, Error> {
+    resolve_reverse_quorum_for(directory, cohort, cohort_key_id, action.into(), now).await
+}
+
+/// v49.0.0 — [`resolve_reverse_quorum`] over an [`ActionRef`]: the same
+/// read-time answer for an action that is not an [`Attestation`] (a roster row
+/// identified by its [`content_hash_of`](super::wire_index::content_hash_of)
+/// hex, whose actor is the one member whose signature it landed on).
+///
+/// ONE implementation: [`resolve_reverse_quorum`] is a thin wrapper over this,
+/// so the two cannot disagree about a single counting rule. The caller vouches
+/// for nothing but the action's identity — the roster, the policy, the
+/// duty-holders and every dismissal's m-of-n are re-derived here from this
+/// node's own verified state, exactly as for an attestation. A caller that
+/// names the wrong actor or instant only mis-locates the objections filed
+/// against the action; it cannot mint one.
+pub async fn resolve_reverse_quorum_for(
+    directory: &dyn FederationDirectory,
+    cohort: Cohort,
+    cohort_key_id: &str,
+    action: ActionRef<'_>,
     now: DateTime<Utc>,
 ) -> Result<ReverseQuorumFold, Error> {
     let (roster, policy) = cohort_state(directory, cohort, cohort_key_id)
@@ -3017,7 +3167,7 @@ mod tests {
     ) -> ReverseQuorumFold {
         let roster = names(9);
         fold_reverse_quorum_over(&ReverseQuorumInputs {
-            action,
+            action: action.into(),
             objections,
             dismissals: &[],
             ballots,
@@ -3568,7 +3718,7 @@ mod tests {
         );
         let roster = names(9);
         let f = fold_reverse_quorum_over(&ReverseQuorumInputs {
-            action: &action,
+            action: (&action).into(),
             objections: &[objection("o1", "m4", t0())],
             dismissals: &[dismissal],
             ballots: &[],
@@ -3766,6 +3916,39 @@ pub(crate) mod test_support {
         action_id: &str,
         protocol: &str,
     ) -> Attestation {
+        seed_community(dir, community_key_id, members, protocol).await;
+        let now = Utc::now();
+
+        // The commons action: a plain federation-tier row by the actor. It
+        // takes effect on arrival — there is no approve-to-act gate, which is
+        // the whole premise reverse quorum is the answer to.
+        let action = signed_row(
+            action_id,
+            actor,
+            actor,
+            serde_json::json!({
+                "dimension": "testimonial_witness:commons_act:v1",
+                "payload": {"action": "the commons act under objection"},
+            }),
+            now,
+            &[],
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: action.clone(),
+        })
+        .await
+        .expect("the commons action lands immediately — act-unless-objected");
+        action
+    }
+
+    /// Seed a community over `members` (founder = `members[0]`) declaring
+    /// `protocol`, and nothing else.
+    async fn seed_community<D: FederationDirectory + ?Sized>(
+        dir: &D,
+        community_key_id: &str,
+        members: &[String],
+        protocol: &str,
+    ) {
         let now = Utc::now();
         let community = Community {
             community_key_id: community_key_id.to_owned(),
@@ -3789,27 +3972,199 @@ pub(crate) mod test_support {
         )
         .await
         .expect("put_community");
+    }
 
-        // The commons action: a plain federation-tier row by the actor. It
-        // takes effect on arrival — there is no approve-to-act gate, which is
-        // the whole premise reverse quorum is the answer to.
-        let action = signed_row(
-            action_id,
-            actor,
-            actor,
-            serde_json::json!({
-                "dimension": "testimonial_witness:commons_act:v1",
-                "payload": {"action": "the commons act under objection"},
-            }),
-            now,
-            &[],
+    /// v49.0.0 — the [`ActionRef`] witness: the fold reverses an action that
+    /// is NOT an attestation.
+    ///
+    /// A `reverse_quorum:2/5:86400` community of five; the action is named
+    /// only by an [`ActionRef`] whose `action_id` is a content-hash-shaped hex
+    /// string no attestation carries (the shape a roster row's
+    /// [`content_hash_of`](crate::federation::wire_index::content_hash_of)
+    /// takes), and whose actor is a member. Then:
+    ///
+    /// 1. the attestation door refuses an objection naming it —
+    ///    `TargetActionUnknown`, because no held row has that id (which is why
+    ///    [`record_objection_against`] exists);
+    /// 2. the `_against` door refuses an objection naming a DIFFERENT id;
+    /// 3. one member's in-window objection is admitted and counted — the
+    ///    action is not reversed;
+    /// 4. an objection asserted BEFORE the action's instant is stored (store
+    ///    everything) but does not count;
+    /// 5. a second distinct member's in-window objection reverses it, and the
+    ///    fold names exactly the two counted objections.
+    pub(crate) async fn exercise_reverse_quorum_action_ref(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let alice = format!("rqa-alice-{suffix}");
+        let bob = format!("rqa-bob-{suffix}");
+        let carol = format!("rqa-carol-{suffix}");
+        let dave = format!("rqa-dave-{suffix}");
+        let actor = format!("rqa-erin-{suffix}");
+        let community = format!("rqa-commons-{suffix}");
+        for k in [&alice, &bob, &carol, &dave, &actor, &community] {
+            register_user_key(dir, k).await;
+        }
+        let roster = vec![
+            alice.clone(),
+            bob.clone(),
+            carol.clone(),
+            dave.clone(),
+            actor.clone(),
+        ];
+        seed_community(dir, &community, &roster, "reverse_quorum:2/5:86400").await;
+
+        // An id no attestation carries — 64 hex chars, the content-hash shape.
+        let action_id = crate::federation::wire_index::content_hash_of_bytes(
+            format!("roster-row-under-objection-{suffix}").as_bytes(),
         );
-        dir.put_attestation(SignedAttestation {
-            attestation: action.clone(),
-        })
-        .await
-        .expect("the commons action lands immediately — act-unless-objected");
-        action
+        assert!(
+            dir.get_attestation(&action_id)
+                .await
+                .expect("read")
+                .is_none(),
+            "({suffix}) the witness is only a witness if no attestation has this id"
+        );
+        let action_at = Utc::now() - Duration::hours(2);
+        let action = ActionRef {
+            actor_key_id: &actor,
+            action_id: &action_id,
+            asserted_at: action_at,
+        };
+        let fold = || async {
+            resolve_reverse_quorum_for(dir, Cohort::Community, &community, action, Utc::now())
+                .await
+                .expect("resolve")
+        };
+        let object = |id: &str, author: &str, names: &str, at: DateTime<Utc>| {
+            signed_row(
+                id,
+                author,
+                &actor,
+                objection_envelope(Cohort::Community, &community, names, "undo this"),
+                at,
+                &[],
+            )
+        };
+
+        let f0 = fold().await;
+        assert_eq!(f0.standing, ReverseQuorumStanding::WindowOpen, "({suffix})");
+        assert_eq!((f0.roster_size, f0.required), (5, 2), "({suffix})");
+        assert_eq!(
+            f0.window_opens_at, action_at,
+            "({suffix}) the window opens at the ActionRef's instant"
+        );
+
+        // ── (1) The attestation door cannot see this action.
+        let o_alice_id = uuid::Uuid::new_v4().to_string();
+        let o_alice = object(
+            &o_alice_id,
+            &alice,
+            &action_id,
+            action_at + Duration::minutes(5),
+        );
+        assert_eq!(
+            record_objection(dir, &o_alice)
+                .await
+                .expect("record")
+                .refusal(),
+            Some(ObjectionRefusalReason::TargetActionUnknown),
+            "({suffix}) no held attestation carries a roster row's id"
+        );
+
+        // ── (2) The `_against` door refuses an objection naming another action.
+        let elsewhere = object(
+            &uuid::Uuid::new_v4().to_string(),
+            &bob,
+            "some-other-action",
+            action_at + Duration::minutes(5),
+        );
+        assert_eq!(
+            record_objection_against(dir, &elsewhere, action)
+                .await
+                .expect("record")
+                .refusal(),
+            Some(ObjectionRefusalReason::TargetActionUnknown),
+            "({suffix}) the objection must name the action the door was told about"
+        );
+
+        // ── (3) One member objects: counted, not reversed.
+        assert_eq!(
+            record_objection_against(dir, &o_alice, action)
+                .await
+                .expect("record"),
+            ObjectionOutcome::Admitted,
+            "({suffix})"
+        );
+        let f1 = fold().await;
+        assert_eq!(f1.distinct_objectors, 1, "({suffix})");
+        assert_eq!(
+            f1.counted_objection_ids,
+            vec![o_alice_id.clone()],
+            "({suffix})"
+        );
+        assert_ne!(
+            f1.standing,
+            ReverseQuorumStanding::Reversed,
+            "({suffix}) one of two is not a reversal"
+        );
+        assert_eq!(f1.standing, ReverseQuorumStanding::WindowOpen, "({suffix})");
+
+        // ── (4) An objection dated BEFORE the action is stored, never counted.
+        let o_early_id = uuid::Uuid::new_v4().to_string();
+        let o_early = object(
+            &o_early_id,
+            &carol,
+            &action_id,
+            action_at - Duration::minutes(1),
+        );
+        assert_eq!(
+            record_objection_against(dir, &o_early, action)
+                .await
+                .expect("record"),
+            ObjectionOutcome::Admitted,
+            "({suffix}) store everything, count carefully"
+        );
+        let f2 = fold().await;
+        assert_eq!(
+            f2.distinct_objectors, 1,
+            "({suffix}) a pre-action objection is outside the window"
+        );
+        assert!(
+            !f2.counted_objection_ids.contains(&o_early_id),
+            "({suffix})"
+        );
+        assert_ne!(f2.standing, ReverseQuorumStanding::Reversed, "({suffix})");
+
+        // ── (5) A second distinct member, in window: reversed.
+        let o_bob_id = uuid::Uuid::new_v4().to_string();
+        let o_bob = object(
+            &o_bob_id,
+            &bob,
+            &action_id,
+            action_at + Duration::minutes(30),
+        );
+        assert_eq!(
+            record_objection_against(dir, &o_bob, action)
+                .await
+                .expect("record"),
+            ObjectionOutcome::Admitted,
+            "({suffix})"
+        );
+        let f3 = fold().await;
+        assert_eq!(
+            f3.standing,
+            ReverseQuorumStanding::Reversed,
+            "({suffix}) M=2 distinct members reverse it"
+        );
+        assert_eq!(f3.distinct_objectors, 2, "({suffix})");
+        let mut expected = vec![o_alice_id, o_bob_id];
+        expected.sort();
+        assert_eq!(
+            f3.counted_objection_ids, expected,
+            "({suffix}) the fold names its evidence"
+        );
     }
 
     /// The #574 witness:

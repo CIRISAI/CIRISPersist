@@ -20670,6 +20670,21 @@ mod tests {
         .await;
     }
 
+    /// v49.0.0 — the MEMORY leg of the shared `ActionRef` witness: the
+    /// reverse-quorum fold reverses an action named only by an id no
+    /// attestation carries (the roster-row shape).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_action_ref_parity_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
+            &backend,
+            "memory-rqa",
+        )
+        .await;
+    }
+
     /// CIRISPersist#591 — the MEMORY leg of the shared
     /// escalation-on-silence witness. Memory tolerates what sqlite and postgres
     /// reject, so this leg is where a divergence in the steward tier's

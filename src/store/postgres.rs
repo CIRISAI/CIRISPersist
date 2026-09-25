@@ -28233,6 +28233,24 @@ mod tests {
             .await;
     }
 
+    /// v49.0.0 — the POSTGRES leg of the shared `ActionRef` witness (see the
+    /// memory + sqlite legs).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_action_ref_parity_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// CIRISPersist#591 — the POSTGRES leg of the shared
     /// escalation-on-silence witness (see the sqlite + memory legs); all three
     /// call the SAME `exercise_escalation_on_silence` body.

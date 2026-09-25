@@ -26943,6 +26943,19 @@ mod tests {
         .await;
     }
 
+    /// v49.0.0 — the sqlite leg of the shared `ActionRef` witness (see the
+    /// memory + postgres legs).
+    #[tokio::test]
+    async fn reverse_quorum_action_ref_parity_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
+            &backend,
+            "sqlite-rqa",
+        )
+        .await;
+    }
+
     /// CIRISPersist#591 — the sqlite leg of the shared
     /// escalation-on-silence witness (see the postgres + memory legs); all three
     /// call the SAME `exercise_escalation_on_silence` body.
