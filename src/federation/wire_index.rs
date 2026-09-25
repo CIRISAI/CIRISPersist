@@ -472,6 +472,27 @@ pub async fn reload_record_bytes(
                 None => None,
             }
         }
+        "CommunityMembershipListing" => {
+            // v49.0.0 (#912) — the listing plane, keyed like the widening.
+            let community_key_id = record_key_field(record_key_json, "community_key_id")?;
+            let member_key_id = record_key_field(record_key_json, "member_key_id")?;
+            let effective_at = record_key_field(record_key_json, "effective_at")?;
+            let rows = dir
+                .list_signed_community_membership_listings_since(None, u32::MAX)
+                .await?;
+            match rows.into_iter().find(|l| {
+                let row = &l.listing.community_membership_listing;
+                row.community_key_id == community_key_id
+                    && row.member_key_id == member_key_id
+                    && row.effective_at.to_rfc3339() == effective_at
+            }) {
+                Some(l) => Some(
+                    serde_json::to_vec(&l.listing)
+                        .map_err(|e| to_bytes(e, "CommunityMembershipListing"))?,
+                ),
+                None => None,
+            }
+        }
         "Organization" => {
             let attestation_id = record_key_field(record_key_json, "attestation_id")?;
             let rows = dir.list_organizations_since(None, u32::MAX).await?;
@@ -878,6 +899,20 @@ pub async fn all_kind_hash_keys(
             ("effective_at", &effective_at),
         ]);
         out.push(("FamilyMembershipWidening", content_hash_of(v)?, rk));
+    }
+    for r in dir
+        .list_signed_community_membership_listings_since(None, u32::MAX)
+        .await?
+    {
+        let v = &r.listing;
+        let row = &v.community_membership_listing;
+        let effective_at = row.effective_at.to_rfc3339();
+        let rk = record_key(&[
+            ("community_key_id", &row.community_key_id),
+            ("member_key_id", &row.member_key_id),
+            ("effective_at", &effective_at),
+        ]);
+        out.push(("CommunityMembershipListing", content_hash_of(v)?, rk));
     }
     for r in dir.list_organizations_since(None, u32::MAX).await? {
         let rk = record_key(&[("attestation_id", &r.organization.attestation_id)]);

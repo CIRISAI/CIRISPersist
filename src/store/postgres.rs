@@ -9261,6 +9261,67 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn put_community_membership_listing(
+        &self,
+        listing: crate::federation::SignedCommunityMembershipListing,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
+        // insert; see the sqlite twin.
+        crate::federation::listing::check_community_membership_listing(self, &listing).await?;
+        let mut row = listing.community_membership_listing;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let authority_key_id = listing.authority_key_id;
+        let scrub_signature_classical = listing.scrub_signature_classical;
+        let scrub_signature_pqc = listing.scrub_signature_pqc;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_community_membership_listings")
+            .await?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_listings (\
+                community_key_id, member_key_id, effective_at, listed, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (community_key_id, member_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.community_key_id,
+                    &row.member_key_id,
+                    &row.effective_at,
+                    &row.listed,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("community_membership_listing"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        if inserted == 1 {
+            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("community_key_id", &row.community_key_id),
+                ("member_key_id", &row.member_key_id),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            self.index_stored_record("CommunityMembershipListing", &wire_index_key)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -9430,6 +9491,33 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?;
         rows.into_iter()
             .map(pg_row_to_community_membership_widening)
+            .collect()
+    }
+
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT community_key_id, member_key_id, effective_at, listed, \
+                    persist_row_hash \
+                 FROM cirislens.federation_community_membership_listings \
+                 WHERE community_key_id = $1 ORDER BY member_key_id ASC, effective_at ASC",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_community_membership_listings_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_community_membership_listing)
             .collect()
     }
 
@@ -11450,6 +11538,56 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
                 Ok(crate::federation::ServedFamilyMembershipWidening {
                     widening: pg_row_to_signed_family_membership_widening(row)?,
+                    admitted_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let (since_a, since_b, since_c) = match since.as_ref() {
+            Some((_, id)) => {
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
+                (Some(a.to_owned()), Some(b.to_owned()), c)
+            }
+            None => (None, None, None),
+        };
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_community_membership_listings \
+                 WHERE ($1::timestamptz IS NULL OR \
+                        (admitted_at, community_key_id, member_key_id, effective_at) \
+                          > ($1, $2, $3, $4::timestamptz)) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY admitted_at ASC, community_key_id ASC, member_key_id ASC, \
+                          effective_at ASC \
+                 LIMIT $5",
+                &[&since_at, &since_a, &since_b, &since_c, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_community_membership_listings_since: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                let admitted_at =
+                    row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
+                Ok(crate::federation::ServedCommunityMembershipListing {
+                    listing: pg_row_to_signed_community_membership_listing(row)?,
                     admitted_at,
                 })
             })
@@ -21134,6 +21272,36 @@ fn pg_row_to_community_membership_widening(
         effective_at: row.safe_get_with("effective_at", mk_err)?,
         role: row.safe_get_with("role", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_community_membership_listing(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::CommunityMembershipListing, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::CommunityMembershipListing {
+        community_key_id: row.safe_get_with("community_key_id", mk_err)?,
+        member_key_id: row.safe_get_with("member_key_id", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        listed: row.safe_get_with("listed", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_signed_community_membership_listing(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedCommunityMembershipListing, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let community_membership_listing = pg_row_to_community_membership_listing(row)?;
+    Ok(crate::federation::SignedCommunityMembershipListing {
+        community_membership_listing,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
     })
 }
 

@@ -267,6 +267,12 @@ struct State {
         (String, String, chrono::DateTime<chrono::Utc>),
         crate::federation::FamilyMembershipRevocation,
     >,
+    /// v49.0.0 (#912, V156 mirror) — the listing plane: the signed row (its
+    /// `persist_row_hash` stamped), keyed on the three-part PK.
+    federation_community_membership_listings: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::SignedCommunityMembershipListing,
+    >,
     /// v49.0.0 (#910, V154 mirror) — the family widening plane, keyed on its
     /// three-part PK.
     federation_family_membership_widenings: HashMap<
@@ -584,6 +590,7 @@ const PLANE_FAMILY_MEMBERSHIP_REVOCATION: &str = "FamilyMembershipRevocation";
 const PLANE_COMMUNITY_MEMBERSHIP_REVOCATION: &str = "CommunityMembershipRevocation";
 const PLANE_COMMUNITY_MEMBERSHIP_WIDENING: &str = "CommunityMembershipWidening";
 const PLANE_FAMILY_MEMBERSHIP_WIDENING: &str = "FamilyMembershipWidening";
+const PLANE_COMMUNITY_MEMBERSHIP_LISTING: &str = "CommunityMembershipListing";
 const PLANE_IDENTITY_OCCURRENCE: &str = "IdentityOccurrence";
 const PLANE_IDENTITY_OCCURRENCE_REVOCATION: &str = "IdentityOccurrenceRevocation";
 const PLANE_TRANSPORT_DESTINATION: &str = "TransportDestination";
@@ -719,6 +726,27 @@ fn family_membership_revocation_rows(
                     &r.effective_at.to_rfc3339(),
                 ]),
                 r.removed_at,
+            )
+        })
+        .collect()
+}
+/// v49.0.0 (#912) — every listing row is stamped at admission; the fallback
+/// (its `effective_at`) is never read.
+fn community_membership_listing_rows(
+    state: &State,
+) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_community_membership_listings
+        .values()
+        .map(|l| {
+            let l = &l.community_membership_listing;
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &l.community_key_id,
+                    &l.member_key_id,
+                    &l.effective_at.to_rfc3339(),
+                ]),
+                l.effective_at,
             )
         })
         .collect()
@@ -889,6 +917,7 @@ impl Default for MemoryBackend {
                 federation_identity_occurrence_revocation_sigs: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_family_membership_widenings: HashMap::new(),
+                federation_community_membership_listings: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
                 federation_community_membership_widenings: HashMap::new(),
                 federation_community_dek_epoch: HashMap::new(),
@@ -7208,6 +7237,71 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    async fn put_community_membership_listing(
+        &self,
+        listing: crate::federation::SignedCommunityMembershipListing,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
+        // mirror; see the sqlite twin.
+        crate::federation::listing::check_community_membership_listing(self, &listing).await?;
+        let mut listing = listing;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // The V156 FKs: the room (the door checked it) and the member.
+            if !state
+                .federation_communities
+                .contains_key(&listing.community_membership_listing.community_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    listing.community_membership_listing.community_key_id
+                )));
+            }
+            if !state
+                .federation_keys
+                .contains_key(&listing.community_membership_listing.member_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    listing.community_membership_listing.member_key_id
+                )));
+            }
+            let row = &mut listing.community_membership_listing;
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&*row)?;
+            let key = (
+                row.community_key_id.clone(),
+                row.member_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_community_membership_listings
+                .contains_key(&key)
+            {
+                return Ok(());
+            }
+            let effective_at_rfc3339 = key.2.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("community_key_id", &key.0),
+                ("member_key_id", &key.1),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            let resume = crate::federation::types::compound_resume_id(&[
+                &key.0,
+                &key.1,
+                &effective_at_rfc3339,
+            ]);
+            let rows = community_membership_listing_rows(&state);
+            allocate_and_stamp(&mut state, PLANE_COMMUNITY_MEMBERSHIP_LISTING, resume, rows);
+            state
+                .federation_community_membership_listings
+                .insert(key, listing);
+            wire_index_key
+        };
+        self.index_stored_record("CommunityMembershipListing", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -7302,6 +7396,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_community_membership_widenings
             .values()
             .filter(|w| w.community_key_id == community_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.member_key_id
+                .cmp(&b.member_key_id)
+                .then_with(|| a.effective_at.cmp(&b.effective_at))
+        });
+        Ok(rows)
+    }
+
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_community_membership_listings
+            .values()
+            .map(|l| &l.community_membership_listing)
+            .filter(|l| l.community_key_id == community_key_id)
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
@@ -8529,6 +8643,62 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .then_with(|| aw.community_key_id.cmp(&bw.community_key_id))
                 .then_with(|| aw.member_key_id.cmp(&bw.member_key_id))
                 .then_with(|| aw.effective_at.cmp(&bw.effective_at))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let position = |l: &crate::federation::types::CommunityMembershipListing| {
+            plane_position(
+                &state,
+                PLANE_COMMUNITY_MEMBERSHIP_LISTING,
+                &crate::federation::types::compound_resume_id(&[
+                    &l.community_key_id,
+                    &l.member_key_id,
+                    &l.effective_at.to_rfc3339(),
+                ]),
+                l.effective_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
+        });
+        let mut rows: Vec<_> = state
+            .federation_community_membership_listings
+            .values()
+            .filter(|s| !s.authority_key_id.is_empty())
+            .filter(|s| {
+                let l = &s.community_membership_listing;
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
+                    (
+                        position(l),
+                        l.community_key_id.as_str(),
+                        l.member_key_id.as_str(),
+                        l.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
+                })
+            })
+            .map(|s| crate::federation::ServedCommunityMembershipListing {
+                admitted_at: position(&s.community_membership_listing),
+                listing: s.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let al = &a.listing.community_membership_listing;
+            let bl = &b.listing.community_membership_listing;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| al.community_key_id.cmp(&bl.community_key_id))
+                .then_with(|| al.member_key_id.cmp(&bl.member_key_id))
+                .then_with(|| al.effective_at.cmp(&bl.effective_at))
         });
         rows.truncate(limit as usize);
         Ok(rows)

@@ -1003,6 +1003,16 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
+    /// v49.0.0 (CIRISPersist#912) —
+    /// [`FederationDirectory::list_signed_community_membership_listings_since`],
+    /// the 19th kind's serve read. Result rides
+    /// `SignedCommunityMembershipListings`. APPEND-ONLY (Growth).
+    ListSignedCommunityMembershipListingsSince {
+        /// Cursor (None ⇒ from start).
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        /// Page cap.
+        limit: u32,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1236,6 +1246,9 @@ pub enum DirectoryOpResult {
     /// v49.0.0 (CIRISPersist#910) — `list_signed_family_membership_widenings_since`.
     /// APPEND-ONLY (Growth).
     SignedFamilyMembershipWidenings(Vec<crate::federation::ServedFamilyMembershipWidening>),
+    /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
+    /// APPEND-ONLY (Growth).
+    SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1920,6 +1933,15 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedFamilyMembershipWidenings(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit } => {
+            match dir
+                .list_signed_community_membership_listings_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedCommunityMembershipListings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3232,6 +3254,15 @@ impl FederationDirectory for OpsDirectory {
             method: "put_family_membership_widening",
         })
     }
+    async fn put_community_membership_listing(
+        &self,
+        listing: crate::federation::SignedCommunityMembershipListing,
+    ) -> Result<(), Error> {
+        let _ = listing;
+        Err(Error::Unsupported {
+            method: "put_community_membership_listing",
+        })
+    }
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -3543,6 +3574,25 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedFamilyMembershipWidenings(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#912) — the listing since-read, proxied like the
+    /// widening planes': a capsule consumer converges the 19th kind from it.
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunityMembershipListings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3905,6 +3955,15 @@ impl FederationDirectory for OpsDirectory {
         let _ = family_key_id;
         Err(Error::Unsupported {
             method: "list_family_membership_widenings_for",
+        })
+    }
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "list_community_membership_listings_for",
         })
     }
     async fn list_location_proofs_for(

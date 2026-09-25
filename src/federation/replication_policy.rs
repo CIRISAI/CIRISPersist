@@ -130,12 +130,18 @@ pub enum EnvelopeKind {
     /// (E4); the 18th kind, APPENDED. A forged widening is an unauthorized
     /// reader of every family-scoped write after it.
     FamilyMembershipWidening,
+    /// v49.0.0 (CIRISPersist#912) — `federation_community_membership_listings`:
+    /// one member's CC 2 `listed` choice in one room; the 19th kind, APPENDED.
+    /// Self-owned ([`SignerBinding::SelfOwn`]): the only admissible signer is
+    /// the membership's subject. A forged listing would disclose a member who
+    /// did not choose it.
+    CommunityMembershipListing,
 }
 
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.
-    pub const ALL: [EnvelopeKind; 18] = [
+    pub const ALL: [EnvelopeKind; 19] = [
         EnvelopeKind::Key,
         EnvelopeKind::Attestation,
         EnvelopeKind::Revocation,
@@ -154,6 +160,7 @@ impl EnvelopeKind {
         EnvelopeKind::KeyGrant,
         EnvelopeKind::CommunityMembershipWidening,
         EnvelopeKind::FamilyMembershipWidening,
+        EnvelopeKind::CommunityMembershipListing,
     ];
 
     /// The stable wire token (must match edge's `as_str`; pinned by hash).
@@ -178,6 +185,7 @@ impl EnvelopeKind {
             EnvelopeKind::KeyGrant => "KeyGrant",
             EnvelopeKind::CommunityMembershipWidening => "CommunityMembershipWidening",
             EnvelopeKind::FamilyMembershipWidening => "FamilyMembershipWidening",
+            EnvelopeKind::CommunityMembershipListing => "CommunityMembershipListing",
         }
     }
 }
@@ -352,6 +360,17 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
             PopOnInsert::NotApplicable,
             &[],
         ),
+        // v49.0.0 (#912): a listing is the MEMBER's own disclosure. The
+        // binding is `SelfOwn` — "the signer IS the subject" — not the roster
+        // planes' `OwnerOf`: no founder, moderator or consensus signs a
+        // member into public view (CC 2: the substrate does not solicit). The
+        // door enforces it as `envelope_listed_not_self_asserted`.
+        K::CommunityMembershipListing => (
+            S::RegisteredSigner,
+            B::SelfOwn,
+            PopOnInsert::NotApplicable,
+            &[],
+        ),
         // E9: operational planes — quorum roster from OUR directory.
         K::Organization | K::OrgMembership | K::PartnerRecord => (
             S::QuorumFromOwnDirectory,
@@ -468,13 +487,19 @@ mod tests {
         }
         assert_eq!(
             EnvelopeKind::ALL.len(),
-            18,
-            "the wire-kind count is pinned (v49.0.0: +FamilyMembershipWidening)"
+            19,
+            "the wire-kind count is pinned (v49.0.0: +FamilyMembershipWidening, \
+             +CommunityMembershipListing)"
         );
         assert_eq!(
             EnvelopeKind::ALL[17],
             EnvelopeKind::FamilyMembershipWidening,
             "the 18th kind is APPENDED after CommunityMembershipWidening (the order is hashed)"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[18],
+            EnvelopeKind::CommunityMembershipListing,
+            "the 19th kind is APPENDED after FamilyMembershipWidening (the order is hashed)"
         );
     }
 }

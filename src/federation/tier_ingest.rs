@@ -667,6 +667,29 @@ where
     .await
 }
 
+/// v49.0.0 (CIRISPersist#912) — the hybrid-signature gate for a membership
+/// LISTING, over [`super::types::CommunityMembershipListing::signing_envelope`].
+/// A listing has no co-signatures: the only signer the door admits is the
+/// member (see [`super::listing::check_community_membership_listing`], which
+/// runs this first).
+pub async fn verify_community_membership_listing_admission<F>(
+    directory: &F,
+    signed: &super::SignedCommunityMembershipListing,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.community_membership_listing.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await?;
+    Ok(())
+}
+
 /// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"this node
 /// holds no `delegates_to(subject → authority)` at all"* (v37.0.0,
 /// CIRISPersist#734).
@@ -2982,6 +3005,23 @@ pub mod test_support {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             cosignatures: Vec::new(),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#912) — sign a
+    /// [`CommunityMembershipListing`](crate::federation::types::CommunityMembershipListing)
+    /// under `authority_key_id` (the door admits it only when that is the
+    /// member).
+    pub fn sign_community_membership_listing(
+        authority_key_id: &str,
+        listing: crate::federation::types::CommunityMembershipListing,
+    ) -> crate::federation::SignedCommunityMembershipListing {
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &listing.signing_envelope());
+        crate::federation::SignedCommunityMembershipListing {
+            community_membership_listing: listing,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
         }
     }
 
