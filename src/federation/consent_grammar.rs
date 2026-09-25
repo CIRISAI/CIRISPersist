@@ -207,6 +207,7 @@ pub fn consent_transferability(
         | K::FamilyMembershipRevocation
         | K::CommunityMembershipRevocation
         | K::CommunityMembershipWidening
+        | K::FamilyMembershipWidening
         | K::LocationProof
         | K::Organization
         | K::OrgMembership

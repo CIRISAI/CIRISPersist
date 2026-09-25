@@ -261,8 +261,18 @@ struct State {
             ciris_verify_core::transport_binding::TransportBindingSignature,
         ),
     >,
-    federation_family_membership_revocations:
-        HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
+    /// v49.0.0 (#910.1, V154 mirror) — keyed on the three-part PK
+    /// `(family, member, effective_at)`: a re-added member can be removed again.
+    federation_family_membership_revocations: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::FamilyMembershipRevocation,
+    >,
+    /// v49.0.0 (#910, V154 mirror) — the family widening plane, keyed on its
+    /// three-part PK.
+    federation_family_membership_widenings: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::FamilyMembershipWidening,
+    >,
     /// v48.0.0 (#860) — keyed on the three-part PK `(room, member,
     /// effective_at)`: a re-added member can be removed again.
     federation_community_membership_revocations: HashMap<
@@ -407,7 +417,11 @@ struct State {
     federation_community_authority_sigs: HashMap<String, AuthoritySig>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_family_membership_revocations`.
-    federation_family_membership_revocation_authority_sigs: HashMap<(String, String), AuthoritySig>,
+    federation_family_membership_revocation_authority_sigs:
+        HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
+    /// v49.0.0 (#910) — keyed like `federation_family_membership_widenings`.
+    federation_family_membership_widening_authority_sigs:
+        HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_community_membership_revocations`.
     federation_community_membership_revocation_authority_sigs:
@@ -418,8 +432,15 @@ struct State {
     /// v49.0.0 (CIRISPersist#908, V153 mirror) — the co-signatures the door
     /// verified, keyed like `federation_family_membership_revocations`.
     /// Absent ⇒ none (a single-signed row).
-    federation_family_membership_revocation_cosignatures:
-        HashMap<(String, String), Vec<crate::federation::RosterCosignature>>,
+    federation_family_membership_revocation_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
+    /// v49.0.0 (#910) — keyed like `federation_family_membership_widenings`.
+    federation_family_membership_widening_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
     /// v49.0.0 (CIRISPersist#908, V153 mirror) — keyed like
     /// `federation_community_membership_revocations`.
     federation_community_membership_revocation_cosignatures: HashMap<
@@ -555,6 +576,7 @@ const PLANE_LOCATION_PROOF: &str = "LocationProof";
 const PLANE_FAMILY_MEMBERSHIP_REVOCATION: &str = "FamilyMembershipRevocation";
 const PLANE_COMMUNITY_MEMBERSHIP_REVOCATION: &str = "CommunityMembershipRevocation";
 const PLANE_COMMUNITY_MEMBERSHIP_WIDENING: &str = "CommunityMembershipWidening";
+const PLANE_FAMILY_MEMBERSHIP_WIDENING: &str = "FamilyMembershipWidening";
 const PLANE_IDENTITY_OCCURRENCE: &str = "IdentityOccurrence";
 const PLANE_IDENTITY_OCCURRENCE_REVOCATION: &str = "IdentityOccurrenceRevocation";
 const PLANE_TRANSPORT_DESTINATION: &str = "TransportDestination";
@@ -687,8 +709,25 @@ fn family_membership_revocation_rows(
                 crate::federation::types::compound_resume_id(&[
                     &r.family_key_id,
                     &r.removed_identity_key_id,
+                    &r.effective_at.to_rfc3339(),
                 ]),
                 r.removed_at,
+            )
+        })
+        .collect()
+}
+fn family_membership_widening_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_family_membership_widenings
+        .values()
+        .map(|w| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &w.family_key_id,
+                    &w.member_key_id,
+                    &w.effective_at.to_rfc3339(),
+                ]),
+                w.joined_at,
             )
         })
         .collect()
@@ -842,6 +881,7 @@ impl Default for MemoryBackend {
                 federation_identity_occurrence_revocations: HashMap::new(),
                 federation_identity_occurrence_revocation_sigs: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
+                federation_family_membership_widenings: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
                 federation_community_membership_widenings: HashMap::new(),
                 federation_community_dek_epoch: HashMap::new(),
@@ -874,9 +914,11 @@ impl Default for MemoryBackend {
                 federation_family_authority_sigs: HashMap::new(),
                 federation_community_authority_sigs: HashMap::new(),
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
+                federation_family_membership_widening_authority_sigs: HashMap::new(),
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
                 federation_community_membership_widening_authority_sigs: HashMap::new(),
                 federation_family_membership_revocation_cosignatures: HashMap::new(),
+                federation_family_membership_widening_cosignatures: HashMap::new(),
                 federation_community_membership_revocation_cosignatures: HashMap::new(),
                 federation_community_membership_widening_cosignatures: HashMap::new(),
                 federation_location_proof_authority_sigs: HashMap::new(),
@@ -5702,55 +5744,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
-    async fn add_family_member(
-        &self,
-        family_key_id: &str,
-        member: crate::federation::types::FamilyMember,
-        spec: &crate::federation::cohort::AdmitSpec,
-    ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
-        // mutation; see the sqlite twin. It MUST run before `self.state.lock()`
-        // (the verify resolves keys through the directory, which takes the same
-        // lock) — the ordering `put_family` on this backend already documents.
-        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "add_family_member names unknown family_key_id {family_key_id:?}"
-            ))
-        })?;
-        if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op, nothing to authorize
-        }
-        let grown =
-            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
-        {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // v31.0.0 (CIRISPersist#654/#651) — the roster and the signature
-            // that authorizes it are written together, under one guard.
-            state
-                .federation_families
-                .insert(family_key_id.to_owned(), grown);
-            state.federation_family_authority_sigs.insert(
-                family_key_id.to_owned(),
-                (
-                    spec.authority_key_id.clone(),
-                    spec.scrub_signature_classical.clone(),
-                    spec.scrub_signature_pqc.clone(),
-                ),
-            );
-            // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
-            // bytes; the serve position moves with them.
-            let rows = family_rows(&state);
-            allocate_and_stamp(&mut state, PLANE_FAMILY, family_key_id.to_owned(), rows);
-        }
-        // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
-        self.index_stored_record(
-            "Family",
-            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
     async fn lookup_family(
         &self,
         family_key_id: &str,
@@ -5971,7 +5964,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_families
             .values()
-            .filter(|f| f.members.iter().any(|m| m.key_id == member_identity_key_id))
+            // v49.0.0 (CIRISPersist#910) — containment in the family's
+            // HISTORY: on the record, or named by a widening. Still raw.
+            .filter(|f| {
+                f.members.iter().any(|m| m.key_id == member_identity_key_id)
+                    || state
+                        .federation_family_membership_widenings
+                        .values()
+                        .any(|w| {
+                            w.family_key_id == f.family_key_id
+                                && w.member_key_id == member_identity_key_id
+                        })
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.family_key_id.cmp(&b.family_key_id));
@@ -6590,6 +6594,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // indistinguishable from a real one.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
+        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
+        // `consensus_protocol` at the row's instant (the #908 family half).
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &revocation.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &revocation.authority_key_id,
+                &revocation.cosignatures,
+            ),
+            crate::federation::types::FamilyMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
+            true,
+            row.effective_at,
+        )
+        .await?;
         // CEG §7.7 (CIRISPersist#161 Ask 5) — the removal-direction
         // membership-change hard_case (`change_kind: "removed"`), keyed on the
         // re-key epoch (`effective_at`). Built before the lock; RECORDED after
@@ -6624,25 +6647,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let revocation_key = (
                 row.family_key_id.clone(),
                 row.removed_identity_key_id.clone(),
+                row.effective_at,
             );
-            // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as on
-            // sqlite / postgres: a repeat is a no-op UNLESS it moves the
-            // removal earlier, which replaces the stored row (fail-secure; see
-            // the sqlite door). Before this memory overwrote on EVERY repeat,
-            // and the SQL backends refused every repeat.
-            if let Some(stored) = state
+            // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0
+            // (#910.1, V154): the PK carries `effective_at`, so an exact retry
+            // is the no-op and a removal at another instant is another event
+            // (a re-removal after a re-add, or an earlier removal the fold
+            // honours first).
+            if state
                 .federation_family_membership_revocations
-                .get(&revocation_key)
+                .contains_key(&revocation_key)
             {
-                if row.effective_at >= stored.effective_at {
-                    return Ok(());
-                }
+                return Ok(());
             }
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `revocation.*`.
+            let effective_at_rfc3339 = revocation_key.2.to_rfc3339();
             let wire_index_key = crate::federation::wire_index::record_key(&[
                 ("family_key_id", &revocation_key.0),
                 ("removed_identity_key_id", &revocation_key.1),
+                ("effective_at", &effective_at_rfc3339),
             ]);
             // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
             // signature the gate above already verified (was verified-then-
@@ -6657,8 +6681,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
-            // v49.0.0 (CIRISPersist#908, V153 mirror) — an accelerating repeat
-            // replaces the row, so it replaces the co-signatures too.
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
             state
                 .federation_family_membership_revocation_cosignatures
                 .insert(revocation_key.clone(), revocation.cosignatures);
@@ -6671,6 +6694,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let resume = crate::federation::types::compound_resume_id(&[
                 &revocation_key.0,
                 &revocation_key.1,
+                &effective_at_rfc3339,
             ]);
             state
                 .federation_family_membership_revocations
@@ -6968,6 +6992,100 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    async fn put_family_membership_widening(
+        &self,
+        widening: crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) —
+        // the family twin of the room's widening door; see the sqlite twin.
+        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
+        let mut row = widening.family_membership_widening;
+        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &widening.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &widening.authority_key_id,
+                &widening.cosignatures,
+            ),
+            row.member(),
+            false,
+            row.effective_at,
+        )
+        .await?;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // The V154 FKs: the family (a keyless group) and the member (a key).
+            if !state.federation_families.contains_key(&row.family_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_families",
+                    row.family_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.member_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.member_key_id
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let key = (
+                row.family_key_id.clone(),
+                row.member_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_family_membership_widenings
+                .contains_key(&key)
+            {
+                return Ok(());
+            }
+            let effective_at_rfc3339 = key.2.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("family_key_id", &key.0),
+                ("member_key_id", &key.1),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            state
+                .federation_family_membership_widening_authority_sigs
+                .insert(
+                    key.clone(),
+                    (
+                        widening.authority_key_id,
+                        widening.scrub_signature_classical,
+                        widening.scrub_signature_pqc,
+                    ),
+                );
+            state
+                .federation_family_membership_widening_cosignatures
+                .insert(key.clone(), widening.cosignatures);
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_FAMILY_MEMBERSHIP_WIDENING,
+                family_membership_widening_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &key.0,
+                &key.1,
+                &effective_at_rfc3339,
+            ]);
+            state
+                .federation_family_membership_widenings
+                .insert(key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_FAMILY_MEMBERSHIP_WIDENING,
+                resume,
+                admitted_at,
+            );
+            wire_index_key
+        };
+        self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -7122,6 +7240,85 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     k,
                     &state.federation_community_membership_revocation_authority_sigs,
                     &state.federation_community_membership_revocation_cosignatures,
+                )
+            })
+            .collect();
+        Ok(crate::federation::CommunityRosterSigners {
+            record_authority_key_id,
+            widening_signers,
+            revocation_signers,
+        })
+    }
+
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipWidening>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_family_membership_widenings
+            .values()
+            .filter(|w| w.family_key_id == family_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.member_key_id
+                .cmp(&b.member_key_id)
+                .then_with(|| a.effective_at.cmp(&b.effective_at))
+        });
+        Ok(rows)
+    }
+
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        if !state.federation_families.contains_key(family_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "family_roster_signers names unknown family_key_id {family_key_id:?}"
+            )));
+        }
+        let record_authority_key_id = state
+            .federation_family_authority_sigs
+            .get(family_key_id)
+            .map(|s| s.0.clone());
+        type EventKey = (String, String, chrono::DateTime<chrono::Utc>);
+        let signer =
+            |key: &EventKey,
+             sigs: &HashMap<EventKey, AuthoritySig>,
+             cosigs: &HashMap<EventKey, Vec<crate::federation::RosterCosignature>>| {
+                crate::federation::RosterEventSigner {
+                    member_key_id: key.1.clone(),
+                    effective_at: key.2,
+                    authority_key_id: sigs.get(key).map(|s| s.0.clone()),
+                    cosigner_key_ids: cosigs
+                        .get(key)
+                        .map(|c| c.iter().map(|c| c.authority_key_id.clone()).collect())
+                        .unwrap_or_default(),
+                }
+            };
+        let widening_signers = state
+            .federation_family_membership_widenings
+            .keys()
+            .filter(|k| k.0 == family_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_family_membership_widening_authority_sigs,
+                    &state.federation_family_membership_widening_cosignatures,
+                )
+            })
+            .collect();
+        let revocation_signers = state
+            .federation_family_membership_revocations
+            .keys()
+            .filter(|k| k.0 == family_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_family_membership_revocation_authority_sigs,
+                    &state.federation_family_membership_revocation_cosignatures,
                 )
             })
             .collect();
@@ -7981,6 +8178,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::federation::types::compound_resume_id(&[
                 &r.family_key_id,
                 &r.removed_identity_key_id,
+                &r.effective_at.to_rfc3339(),
             ])
         };
         let position = |r: &crate::federation::types::FamilyMembershipRevocation| {
@@ -7992,23 +8190,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )
         };
         let since_parts = since.as_ref().map(|(s_at, s_id)| {
-            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
-            (*s_at, a.to_owned(), b.to_owned())
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
         });
         let mut rows: Vec<_> = state
             .federation_family_membership_revocations
             .values()
             .filter(|r| {
-                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
                     (
                         position(r),
                         r.family_key_id.as_str(),
                         r.removed_identity_key_id.as_str(),
-                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                        r.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
                 })
             })
             .filter_map(|r| {
-                let key = (r.family_key_id.clone(), r.removed_identity_key_id.clone());
+                let key = (
+                    r.family_key_id.clone(),
+                    r.removed_identity_key_id.clone(),
+                    r.effective_at,
+                );
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_family_membership_revocation_authority_sigs
                     .get(&key)?
@@ -8037,6 +8240,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .cmp(&b.admitted_at)
                 .then_with(|| ar.family_key_id.cmp(&br.family_key_id))
                 .then_with(|| ar.removed_identity_key_id.cmp(&br.removed_identity_key_id))
+                .then_with(|| ar.effective_at.cmp(&br.effective_at))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -8193,6 +8397,85 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             a.admitted_at
                 .cmp(&b.admitted_at)
                 .then_with(|| aw.community_key_id.cmp(&bw.community_key_id))
+                .then_with(|| aw.member_key_id.cmp(&bw.member_key_id))
+                .then_with(|| aw.effective_at.cmp(&bw.effective_at))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |w: &crate::federation::types::FamilyMembershipWidening| {
+            crate::federation::types::compound_resume_id(&[
+                &w.family_key_id,
+                &w.member_key_id,
+                &w.effective_at.to_rfc3339(),
+            ])
+        };
+        let position = |w: &crate::federation::types::FamilyMembershipWidening| {
+            plane_position(
+                &state,
+                PLANE_FAMILY_MEMBERSHIP_WIDENING,
+                &resume_id(w),
+                w.joined_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
+        });
+        let mut rows: Vec<_> = state
+            .federation_family_membership_widenings
+            .values()
+            .filter(|w| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
+                    (
+                        position(w),
+                        w.family_key_id.as_str(),
+                        w.member_key_id.as_str(),
+                        w.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
+                })
+            })
+            .filter_map(|w| {
+                let key = (
+                    w.family_key_id.clone(),
+                    w.member_key_id.clone(),
+                    w.effective_at,
+                );
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_family_membership_widening_authority_sigs
+                    .get(&key)?
+                    .clone();
+                let cosignatures = state
+                    .federation_family_membership_widening_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                Some(crate::federation::ServedFamilyMembershipWidening {
+                    admitted_at: position(w),
+                    widening: crate::federation::SignedFamilyMembershipWidening {
+                        family_membership_widening: w.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        cosignatures,
+                    },
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let aw = &a.widening.family_membership_widening;
+            let bw = &b.widening.family_membership_widening;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| aw.family_key_id.cmp(&bw.family_key_id))
                 .then_with(|| aw.member_key_id.cmp(&bw.member_key_id))
                 .then_with(|| aw.effective_at.cmp(&bw.effective_at))
         });

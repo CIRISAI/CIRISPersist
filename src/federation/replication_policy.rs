@@ -125,12 +125,17 @@ pub enum EnvelopeKind {
     /// the addition plane, the mirror of the revocation (E4); the 17th kind, APPENDED. A forged
     /// widening is an unauthorized reader at the minter's next seal.
     CommunityMembershipWidening,
+    /// v49.0.0 (CIRISPersist#910) — `federation_family_membership_widenings`:
+    /// the family addition plane, the twin of [`Self::CommunityMembershipWidening`]
+    /// (E4); the 18th kind, APPENDED. A forged widening is an unauthorized
+    /// reader of every family-scoped write after it.
+    FamilyMembershipWidening,
 }
 
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.
-    pub const ALL: [EnvelopeKind; 17] = [
+    pub const ALL: [EnvelopeKind; 18] = [
         EnvelopeKind::Key,
         EnvelopeKind::Attestation,
         EnvelopeKind::Revocation,
@@ -148,6 +153,7 @@ impl EnvelopeKind {
         EnvelopeKind::AccordQuorumEvidence,
         EnvelopeKind::KeyGrant,
         EnvelopeKind::CommunityMembershipWidening,
+        EnvelopeKind::FamilyMembershipWidening,
     ];
 
     /// The stable wire token (must match edge's `as_str`; pinned by hash).
@@ -171,6 +177,7 @@ impl EnvelopeKind {
             EnvelopeKind::AccordQuorumEvidence => "AccordQuorumEvidence",
             EnvelopeKind::KeyGrant => "KeyGrant",
             EnvelopeKind::CommunityMembershipWidening => "CommunityMembershipWidening",
+            EnvelopeKind::FamilyMembershipWidening => "FamilyMembershipWidening",
         }
     }
 }
@@ -338,7 +345,8 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
         ),
         K::FamilyMembershipRevocation
         | K::CommunityMembershipRevocation
-        | K::CommunityMembershipWidening => (
+        | K::CommunityMembershipWidening
+        | K::FamilyMembershipWidening => (
             S::RegisteredSigner,
             B::OwnerOf,
             PopOnInsert::NotApplicable,
@@ -452,8 +460,13 @@ mod tests {
         }
         assert_eq!(
             EnvelopeKind::ALL.len(),
-            17,
-            "the wire-kind count is pinned (v48.0.0: +CommunityMembershipWidening)"
+            18,
+            "the wire-kind count is pinned (v49.0.0: +FamilyMembershipWidening)"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[17],
+            EnvelopeKind::FamilyMembershipWidening,
+            "the 18th kind is APPENDED after CommunityMembershipWidening (the order is hashed)"
         );
     }
 }

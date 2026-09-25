@@ -3967,7 +3967,8 @@ impl ServedLocationProof {
 
 /// One `federation_family_membership_revocations` row as the serve cursor
 /// returns it (#668). Rows are identified by `(family_key_id,
-/// removed_identity_key_id)`, so the resume id is a [`compound_resume_id`].
+/// removed_identity_key_id, effective_at)` (v49.0.0, #910 — V154), so the
+/// resume id is a three-part [`compound_resume_id`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServedFamilyMembershipRevocation {
     /// The signed membership revocation itself, unchanged.
@@ -3981,9 +3982,15 @@ impl ServedFamilyMembershipRevocation {
     #[must_use]
     pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
         let r = &self.revocation.family_membership_revocation;
+        // v49.0.0 (#910.1, V154) — the PK (and so the resume id) carries the
+        // instant: a re-added family member can be removed again.
         (
             self.admitted_at,
-            compound_resume_id(&[&r.family_key_id, &r.removed_identity_key_id]),
+            compound_resume_id(&[
+                &r.family_key_id,
+                &r.removed_identity_key_id,
+                &r.effective_at.to_rfc3339(),
+            ]),
         )
     }
 }
@@ -7017,6 +7024,101 @@ pub struct KnownHashEviction {
     pub over_bound_by: u64,
 }
 
+/// v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) — one
+/// family-membership ADDITION: the family twin of
+/// [`CommunityMembershipWidening`]. A family's roster is the fold of its record
+/// plus this plane and the revocation plane, by `effective_at`; the record is
+/// never rewritten to grow (a rewritten record reaches no peer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyMembershipWidening {
+    /// The family (`federation_families.family_key_id` — a keyless id).
+    pub family_key_id: String,
+    /// The member being added — a `federation_keys.key_id`.
+    pub member_key_id: String,
+    /// The member's `joined_at` as it will read on the roster.
+    pub joined_at: DateTime<Utc>,
+    /// When the addition takes effect in the fold (`effective_at <= now`).
+    pub effective_at: DateTime<Utc>,
+    /// The member's role on the roster, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+impl FamilyMembershipWidening {
+    /// The signed preimage: the row minus `persist_row_hash` (the
+    /// revocation's discipline).
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("FamilyMembershipWidening always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+
+    /// The roster entry this widening admits.
+    #[must_use]
+    pub fn member(&self) -> FamilyMember {
+        FamilyMember {
+            key_id: self.member_key_id.clone(),
+            joined_at: self.joined_at,
+            role: self.role.clone(),
+        }
+    }
+}
+
+/// A SIGNED [`FamilyMembershipWidening`] — the family twin of
+/// [`SignedCommunityMembershipWidening`]: the hybrid scrub under
+/// `authority_key_id` (and every co-signer) over the canonical
+/// [`FamilyMembershipWidening::signing_envelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedFamilyMembershipWidening {
+    /// The addition itself.
+    pub family_membership_widening: FamilyMembershipWidening,
+    /// The primary signer — a registered key with standing in the family.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 over the canonical envelope.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 over canonical ‖ ed_sig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
+    /// The co-signatures a multi-signature `consensus_protocol` counts, each a
+    /// hybrid scrub over the SAME `signing_envelope()` as the primary. Empty is
+    /// omitted, so a single-signed row's bytes and content hash carry none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
+}
+
+/// A served [`SignedFamilyMembershipWidening`] with THIS node's serve position
+/// — the mirror of [`ServedCommunityMembershipWidening`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedFamilyMembershipWidening {
+    /// The signed row, unchanged.
+    pub widening: SignedFamilyMembershipWidening,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedFamilyMembershipWidening {
+    /// The `(admitted_at, compound id)` pair a caller resumes from: the
+    /// three-part PK `(family_key_id, member_key_id, effective_at)`.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let w = &self.widening.family_membership_widening;
+        (
+            self.admitted_at,
+            compound_resume_id(&[
+                &w.family_key_id,
+                &w.member_key_id,
+                &w.effective_at.to_rfc3339(),
+            ]),
+        )
+    }
+}
+
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — who signed
 /// one roster event. `authority_key_id` is `None` only for a row admitted
 /// before V110 stored the signer: such a row COUNTS in the authorized fold
@@ -7039,6 +7141,10 @@ pub struct RosterEventSigner {
 /// for one room: the record's signer (the key that founded it; `None` for a
 /// trusted-local or legacy record) and one [`RosterEventSigner`] per stored
 /// widening and revocation.
+///
+/// v49.0.0 (CIRISPersist#910) — the SAME type answers for a family
+/// (`FederationDirectory::family_roster_signers`): the two groups' roster
+/// planes have one shape, so their signers do too — there is no family twin.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CommunityRosterSigners {
     /// The `authority_key_id` stored with the room's own row.

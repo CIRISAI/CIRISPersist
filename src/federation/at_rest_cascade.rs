@@ -1102,7 +1102,16 @@ pub mod orchestrate {
                 )])
             }
             FAMILY => {
-                let family = backend
+                // Producer-side stop-wrapping (CIRISPersist#161 Ask 4,
+                // CEG §11.7.1): a removed member is dropped from the fan-out
+                // BEFORE we wrap. v49.0.0 (CIRISPersist#910.3) — the fan-out is
+                // the family's ONE authorized fold (record + widenings −
+                // revocations, by instant, signers with standing): a member
+                // widened onto the plane earns grants, a removed one stops.
+                // (The per-member `list_identity_occurrences_active` further
+                // drops revoked *occurrences*.) An unknown family is refused
+                // first, with this path's own message.
+                backend
                     .lookup_family(owner_or_family_key_id)
                     .await
                     .map_err(map_dir_err)?
@@ -1111,30 +1120,12 @@ pub mod orchestrate {
                             "cohort_scope:family write names unknown family_key_id {owner_or_family_key_id:?}"
                         ))
                     })?;
-                // Producer-side stop-wrapping (CIRISPersist#161 Ask 4,
-                // CEG §11.7.1): a member removed via V067 is dropped from
-                // the fan-out BEFORE we wrap — future writes simply exclude
-                // them (forward secrecy under the per-write fresh DEK). The
-                // `family.members` roster is the full admit history; compose
-                // it with the family-membership revocation table so an
-                // effective removal stops earning grants. (The per-member
-                // `list_identity_occurrences_active` further drops revoked
-                // *occurrences*; this drops revoked *memberships*.)
-                let revs = backend
-                    .list_family_membership_revocations_for(owner_or_family_key_id)
+                let active = backend
+                    .active_family_members(owner_or_family_key_id)
                     .await
                     .map_err(map_dir_err)?;
-                let now = chrono::Utc::now();
-                let removed: std::collections::HashSet<&str> = revs
-                    .iter()
-                    .filter(|r| r.effective_at <= now)
-                    .map(|r| r.removed_identity_key_id.as_str())
-                    .collect();
                 let mut out = Vec::new();
-                for member in &family.members {
-                    if removed.contains(member.key_id.as_str()) {
-                        continue;
-                    }
+                for member in &active {
                     let occ = backend
                         .list_identity_occurrences_active(&member.key_id)
                         .await
@@ -1613,7 +1604,7 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        let family = backend
+        backend
             .lookup_family(family_key_id)
             .await
             .map_err(map_dir_err)?
@@ -1659,9 +1650,10 @@ pub mod orchestrate {
             })
             .collect();
 
-        // Existing cohort = every OTHER current member's active occurrences.
+        // Existing cohort = every OTHER current member's active occurrences —
+        // the authorized fold (v49.0.0, #910.3), not the raw record.
         let mut existing: Vec<String> = Vec::new();
-        for m in &family.members {
+        for m in &active {
             if m.key_id == new_member_identity_key_id {
                 continue;
             }

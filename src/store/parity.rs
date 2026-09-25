@@ -143,7 +143,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Driver plumbing; it cannot refuse anything about the caller's input.
     ("start", Class::Plumbing),
     ("assemble_fountain_content", Class::Delegates),
-    ("authorize_family_growth", Class::Gate),
     ("backfill_trace_dedup_shard_keys", Class::Delegates),
     ("bytes", Class::Plumbing),
     ("caller_scope_from_directory", Class::Gate),
@@ -485,6 +484,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Delegates,
     ),
     ("pg_row_to_community_membership_widening", Class::Delegates),
+    // v49.0.0 (#910) — the family widening plane's row mappers.
+    ("pg_row_to_family_membership_widening", Class::Delegates),
+    (
+        "pg_row_to_signed_family_membership_widening",
+        Class::Delegates,
+    ),
     (
         "pg_row_to_signed_community_membership_widening",
         Class::Delegates,
@@ -600,6 +605,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "sqlite_row_to_community_membership_widening",
         Class::Delegates,
     ),
+    ("sqlite_row_to_family_membership_widening", Class::Delegates),
+    (
+        "sqlite_row_to_signed_family_membership_widening",
+        Class::Delegates,
+    ),
     (
         "sqlite_row_to_signed_community_membership_widening",
         Class::Delegates,
@@ -671,6 +681,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("reject_future_dated_community_widening", Class::Gate),
     // v49.0.0 (#908) — the standing gate both membership doors run.
     ("check_community_roster_authority", Class::Gate),
+    // v49.0.0 (#910) — the family doors' standing gate, signature gate and
+    // future-dating gate (the family twins of the three room gates above).
+    ("check_family_roster_authority", Class::Gate),
+    ("verify_family_membership_widening_admission", Class::Gate),
+    ("reject_future_dated_family_widening", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),

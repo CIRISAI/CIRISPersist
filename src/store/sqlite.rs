@@ -6883,74 +6883,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
-    async fn add_family_member(
-        &self,
-        family_key_id: &str,
-        member: crate::federation::types::FamilyMember,
-        spec: &crate::federation::cohort::AdmitSpec,
-    ) -> Result<bool, crate::federation::Error> {
-        // Read-modify-write under the connection lock so a concurrent add
-        // can't lose a member to a stale roster. Idempotent on key_id.
-        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "add_family_member names unknown family_key_id {family_key_id:?}"
-            ))
-        })?;
-        if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op, nothing to authorize
-        }
-        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
-        // mutation. `members` is inside `Family::signing_envelope()`, so an
-        // unsigned grow stored a roster no authority had signed while the
-        // row's own `authority_key_id` / `scrub_signature_*` kept describing
-        // the roster that used to be there.
-        let family =
-            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
-        let members_json = serde_json::to_string(&family.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        let key = family_key_id.to_owned();
-        let hash = family.persist_row_hash.clone();
-        let authority_key_id = spec.authority_key_id.clone();
-        let sig_classical = spec.scrub_signature_classical.clone();
-        let sig_pqc = spec.scrub_signature_pqc.clone();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
-            // bytes; the serve position moves with them.
-            let admitted_at = sqlite_next_plane_position(conn, "federation_families", POS_FOUNDED)?;
-            conn.execute(
-                // v31.0.0 (CIRISPersist#654/#651) — the signature moves with the
-                // roster it authorizes, in the SAME statement, so a future edit
-                // cannot rewrite `members` and forget the authorship.
-                "UPDATE federation_families \
-                    SET members = ?2, persist_row_hash = ?3, authority_key_id = ?4, \
-                        scrub_signature_classical = ?5, scrub_signature_pqc = ?6, \
-                        admitted_at = ?7 \
-                  WHERE family_key_id = ?1",
-                rusqlite::params![
-                    key,
-                    members_json,
-                    hash,
-                    authority_key_id,
-                    sig_classical,
-                    sig_pqc,
-                    admitted_at.to_rfc3339(),
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::federation::Error::Backend(format!("add_family_member: {e}")))?;
-        // v31.0.0 (CIRISPersist#654) — a roster grow moves every column
-        // `list_signed_families_since` re-serializes, so it moves the wire
-        // content hash. The third site of the #547/#640 stale-index class.
-        self.index_stored_record(
-            "Family",
-            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
     // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
     async fn supersede_group_row(
         &self,
@@ -7307,7 +7239,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
-        // v49.0.0 (CIRISPersist#907) — containment in the room's HISTORY:
+        // v49.0.0 (CIRISPersist#910) — containment in the family's HISTORY:
         // on the record, or named by a widening. Still raw (a removed member
         // is listed); the `_active` readers fold.
         // sqlite full-scan with members membership check via json_each.
@@ -7323,6 +7255,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                      WHERE EXISTS ( \
                          SELECT 1 FROM json_each(federation_families.members) \
                          WHERE json_extract(value, '$.key_id') = ?1 \
+                     ) OR family_key_id IN ( \
+                         SELECT family_key_id \
+                         FROM federation_family_membership_widenings \
+                         WHERE member_key_id = ?1 \
                      ) \
                      ORDER BY family_key_id ASC",
                 )?;
@@ -8164,6 +8100,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // other admission step.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
+        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
+        // `consensus_protocol` at the row's instant (the #908 family half).
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &revocation.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &revocation.authority_key_id,
+                &revocation.cosignatures,
+            ),
+            crate::federation::types::FamilyMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
+            true,
+            row.effective_at,
+        )
+        .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::to_string(&row.witness_set)
             .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
@@ -8189,9 +8144,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         // v21.1.0 (CIRISPersist#507b) — computed before the INSERT closure
         // moves everything.
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("family_key_id", &row.family_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
+            // v49.0.0 (#910.1) — a re-added member can be removed again: the
+            // instant is part of the row's identity.
+            ("effective_at", &effective_at_rfc3339),
         ]);
         let inserted = self
             .write(move |conn| -> Result<bool, rusqlite::Error> {
@@ -8204,16 +8163,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "federation_family_membership_revocations",
                     POS_REMOVED,
                 )?;
-                // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
-                // documents, with ONE exception that is fail-secure: a repeat that
-                // moves the removal EARLIER (a scheduled family removal a guardian
-                // now needs immediately) replaces the stored revocation. Any other
-                // repeat — the retry-after-partial-failure #861 is about — changes
-                // nothing, and the tx is dropped un-committed. Refusing the
-                // acceleration was the pre-v47.1 SQL behaviour (a UNIQUE error);
-                // turning that error into a silent `Ok` that did NOT accelerate
-                // would tell the caller the member was removed while they kept
-                // access. The unique index arbitrates, so this is race-safe.
+                // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0
+                // (#910.1, V154): the PK carries `effective_at`, so an exact
+                // retry is the no-op (the tx is dropped un-committed, the serve
+                // position with it) and a removal at another instant is another
+                // event — a re-removal after a re-add, or an earlier removal the
+                // fold honours first. The unique index arbitrates (race-safe).
                 let n = tx.execute(
                     "INSERT INTO federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
@@ -8221,16 +8176,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at, cosignatures\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
-                 ON CONFLICT (family_key_id, removed_identity_key_id) DO UPDATE SET \
-                    removed_at = excluded.removed_at, effective_at = excluded.effective_at, \
-                    reason = excluded.reason, witness_set = excluded.witness_set, \
-                    persist_row_hash = excluded.persist_row_hash, \
-                    authority_key_id = excluded.authority_key_id, \
-                    scrub_signature_classical = excluded.scrub_signature_classical, \
-                    scrub_signature_pqc = excluded.scrub_signature_pqc, \
-                    admitted_at = excluded.admitted_at, \
-                    cosignatures = excluded.cosignatures \
-                 WHERE excluded.effective_at < federation_family_membership_revocations.effective_at",
+                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                     rusqlite::params![
                         row.family_key_id,
                         row.removed_identity_key_id,
@@ -8571,6 +8517,99 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    async fn put_family_membership_widening(
+        &self,
+        widening: crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) —
+        // the family twin of the room's widening door: the primary and every
+        // co-signature, no future-dating, standing by the family's own
+        // `consensus_protocol` at the row's instant, the family and the member
+        // existing (the V154 FKs), idempotent on the three-part PK.
+        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
+        let mut row = widening.family_membership_widening;
+        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &widening.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &widening.authority_key_id,
+                &widening.cosignatures,
+            ),
+            row.member(),
+            false,
+            row.effective_at,
+        )
+        .await?;
+        if self.lookup_family(&row.family_key_id).await?.is_none() {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "{} does not exist in federation_families",
+                row.family_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let authority_key_id = widening.authority_key_id;
+        let scrub_signature_classical = widening.scrub_signature_classical;
+        let scrub_signature_pqc = widening.scrub_signature_pqc;
+        let cosignatures = serde_json::to_string(&widening.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("family_key_id", &row.family_key_id),
+            ("member_key_id", &row.member_key_id),
+            ("effective_at", &effective_at_rfc3339),
+        ]);
+        let inserted = self
+            .write(move |conn| -> Result<bool, rusqlite::Error> {
+                let admitted_at = sqlite_next_plane_position(
+                    conn,
+                    "federation_family_membership_widenings",
+                    POS_JOINED,
+                )?;
+                let n = conn.execute(
+                    "INSERT INTO federation_family_membership_widenings (\
+                    family_key_id, member_key_id, joined_at, effective_at, role, \
+                    persist_row_hash, authority_key_id, scrub_signature_classical, \
+                    scrub_signature_pqc, admitted_at, cosignatures\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
+                    rusqlite::params![
+                        row.family_key_id,
+                        row.member_key_id,
+                        row.joined_at.to_rfc3339(),
+                        row.effective_at.to_rfc3339(),
+                        row.role,
+                        row.persist_row_hash,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        admitted_at.to_rfc3339(),
+                        cosignatures,
+                    ],
+                )?;
+                Ok(n == 1)
+            })
+            .await
+            .map_err(|e| match e {
+                rusqlite::Error::SqliteFailure(ref f, _)
+                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    crate::federation::Error::InvalidArgument(format!(
+                        "FK constraint violated on family_membership_widening insert: {e}"
+                    ))
+                }
+                other => crate::federation::Error::Backend(format!(
+                    "insert family_membership_widening: {other}"
+                )),
+            })?;
+        if inserted {
+            self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -8674,6 +8713,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipWidening>, crate::federation::Error> {
+        let key = family_key_id.to_owned();
+        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT family_key_id, member_key_id, joined_at, effective_at, role, \
+                        persist_row_hash \
+                     FROM federation_family_membership_widenings \
+                     WHERE family_key_id = ?1 \
+                     ORDER BY member_key_id ASC, effective_at ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_family_membership_widening)?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_family_membership_widenings_for: {e}"))
+        })
+    }
+
     async fn list_community_membership_widenings_for(
         &self,
         community_key_id: &str,
@@ -8765,6 +8826,79 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         out.ok_or_else(|| {
             crate::federation::Error::InvalidArgument(format!(
                 "community_roster_signers names unknown community_key_id {community_key_id:?}"
+            ))
+        })
+    }
+
+    // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
+
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let key = family_key_id.to_owned();
+        let out = self
+            .read(
+                move |conn| -> Result<
+                    Option<crate::federation::CommunityRosterSigners>,
+                    rusqlite::Error,
+                > {
+                    use rusqlite::OptionalExtension;
+                    let Some(record_authority_key_id) = conn
+                        .query_row(
+                            "SELECT authority_key_id FROM federation_families \
+                             WHERE family_key_id = ?1",
+                            [&key],
+                            |r| r.get::<_, Option<String>>(0),
+                        )
+                        .optional()?
+                    else {
+                        return Ok(None);
+                    };
+                    let roster_event_signers = |sql: &str| -> Result<
+                        Vec<crate::federation::RosterEventSigner>,
+                        rusqlite::Error,
+                    > {
+                        let mut stmt = conn.prepare(sql)?;
+                        let rows = stmt.query_map([&key], |r| {
+                            let at: String = r.get(1)?;
+                            Ok(crate::federation::RosterEventSigner {
+                                member_key_id: r.get(0)?,
+                                effective_at: parse_rfc3339(&at),
+                                authority_key_id: r.get(2)?,
+                                cosigner_key_ids: sqlite_roster_cosignatures(r)?
+                                    .into_iter()
+                                    .map(|c| c.authority_key_id)
+                                    .collect(),
+                            })
+                        })?;
+                        rows.collect()
+                    };
+                    let widening_signers = roster_event_signers(
+                        "SELECT member_key_id, effective_at, authority_key_id, cosignatures \
+                         FROM federation_family_membership_widenings \
+                         WHERE family_key_id = ?1",
+                    )?;
+                    let revocation_signers = roster_event_signers(
+                        "SELECT removed_identity_key_id, effective_at, authority_key_id, \
+                            cosignatures \
+                         FROM federation_family_membership_revocations \
+                         WHERE family_key_id = ?1",
+                    )?;
+                    Ok(Some(crate::federation::CommunityRosterSigners {
+                        record_authority_key_id,
+                        widening_signers,
+                        revocation_signers,
+                    }))
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("family_roster_signers: {e}"))
+            })?;
+        out.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "family_roster_signers names unknown family_key_id {family_key_id:?}"
             ))
         })
     }
@@ -10350,26 +10484,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::ServedFamilyMembershipRevocation>, crate::federation::Error>
     {
         let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
-        let (since_a, since_b) = match since.as_ref() {
+        // v49.0.0 (#910.1) — the resume id is the three-part PK.
+        let (since_a, since_b, since_c) = match since.as_ref() {
             Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                (Some(a.to_owned()), Some(b.to_owned()), Some(c.to_owned()))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
             let mut stmt = conn.prepare(&format!(
                 "SELECT *, {pos} AS _pos FROM federation_family_membership_revocations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND \
                         (family_key_id > ?2 OR (family_key_id = ?2 \
-                         AND removed_identity_key_id > ?3)))) \
+                         AND (removed_identity_key_id > ?3 OR (removed_identity_key_id = ?3 \
+                         AND effective_at > ?4)))))) \
                    AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY {pos} ASC, family_key_id ASC, removed_identity_key_id ASC \
-                 LIMIT ?4",
+                 ORDER BY {pos} ASC, family_key_id ASC, removed_identity_key_id ASC, effective_at ASC \
+                 LIMIT ?5",
                 pos = POS_REMOVED,
             ))?;
             let rows = stmt.query_map(
-                rusqlite::params![since_at, since_a, since_b, limit],
+                rusqlite::params![since_at, since_a, since_b, since_c, limit],
                 |row| {
                     let pos: String = row.get("_pos")?;
                     Ok(crate::federation::ServedFamilyMembershipRevocation {
@@ -10477,6 +10613,52 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "list_signed_community_membership_widenings_since: {e}"
+            ))
+        })
+    }
+
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, crate::federation::Error>
+    {
+        let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
+        let (since_a, since_b, since_c) = match since.as_ref() {
+            Some((_, id)) => {
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                (Some(a.to_owned()), Some(b.to_owned()), Some(c.to_owned()))
+            }
+            None => (None, None, None),
+        };
+        self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT *, {pos} AS _pos FROM federation_family_membership_widenings \
+                 WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND \
+                        (family_key_id > ?2 OR (family_key_id = ?2 \
+                         AND (member_key_id > ?3 OR (member_key_id = ?3 \
+                         AND effective_at > ?4)))))) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY {pos} ASC, family_key_id ASC, member_key_id ASC, effective_at ASC \
+                 LIMIT ?5",
+                pos = POS_JOINED,
+            ))?;
+            let rows = stmt.query_map(
+                rusqlite::params![since_at, since_a, since_b, since_c, limit],
+                |row| {
+                    let pos: String = row.get("_pos")?;
+                    Ok(crate::federation::ServedFamilyMembershipWidening {
+                        widening: sqlite_row_to_signed_family_membership_widening(row)?,
+                        admitted_at: parse_rfc3339(&pos),
+                    })
+                },
+            )?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_family_membership_widenings_since: {e}"
             ))
         })
     }
@@ -20550,6 +20732,38 @@ fn sqlite_row_to_community_membership_widening(
         effective_at: parse_rfc3339(&effective_at),
         role: row.get("role")?,
         persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_family_membership_widening(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::FamilyMembershipWidening> {
+    let joined_at: String = row.get("joined_at")?;
+    let effective_at: String = row.get("effective_at")?;
+    Ok(crate::federation::FamilyMembershipWidening {
+        family_key_id: row.get("family_key_id")?,
+        member_key_id: row.get("member_key_id")?,
+        joined_at: parse_rfc3339(&joined_at),
+        effective_at: parse_rfc3339(&effective_at),
+        role: row.get("role")?,
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_signed_family_membership_widening(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedFamilyMembershipWidening> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let cosignatures = sqlite_roster_cosignatures(row)?;
+    let family_membership_widening = sqlite_row_to_family_membership_widening(row)?;
+    Ok(crate::federation::SignedFamilyMembershipWidening {
+        family_membership_widening,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+        cosignatures,
     })
 }
 

@@ -387,15 +387,17 @@ pub async fn reload_record_bytes(
             let family_key_id = record_key_field(record_key_json, "family_key_id")?;
             let removed_identity_key_id =
                 record_key_field(record_key_json, "removed_identity_key_id")?;
+            // v49.0.0 (#910.1, V154) — the PK carries the instant: a re-added
+            // family member can be removed again.
+            let effective_at = record_key_field(record_key_json, "effective_at")?;
             let rows = dir
                 .list_signed_family_membership_revocations_since(None, u32::MAX)
                 .await?;
             match rows.into_iter().find(|r| {
-                r.revocation.family_membership_revocation.family_key_id == family_key_id
-                    && r.revocation
-                        .family_membership_revocation
-                        .removed_identity_key_id
-                        == removed_identity_key_id
+                let rev = &r.revocation.family_membership_revocation;
+                rev.family_key_id == family_key_id
+                    && rev.removed_identity_key_id == removed_identity_key_id
+                    && rev.effective_at.to_rfc3339() == effective_at
             }) {
                 Some(r) => Some(
                     serde_json::to_vec(&r.revocation)
@@ -444,6 +446,28 @@ pub async fn reload_record_bytes(
                 Some(w) => Some(
                     serde_json::to_vec(&w.widening)
                         .map_err(|e| to_bytes(e, "CommunityMembershipWidening"))?,
+                ),
+                None => None,
+            }
+        }
+        "FamilyMembershipWidening" => {
+            // v49.0.0 (#910) — the family addition plane, keyed like the
+            // room's.
+            let family_key_id = record_key_field(record_key_json, "family_key_id")?;
+            let member_key_id = record_key_field(record_key_json, "member_key_id")?;
+            let effective_at = record_key_field(record_key_json, "effective_at")?;
+            let rows = dir
+                .list_signed_family_membership_widenings_since(None, u32::MAX)
+                .await?;
+            match rows.into_iter().find(|w| {
+                let row = &w.widening.family_membership_widening;
+                row.family_key_id == family_key_id
+                    && row.member_key_id == member_key_id
+                    && row.effective_at.to_rfc3339() == effective_at
+            }) {
+                Some(w) => Some(
+                    serde_json::to_vec(&w.widening)
+                        .map_err(|e| to_bytes(e, "FamilyMembershipWidening"))?,
                 ),
                 None => None,
             }
@@ -790,6 +814,7 @@ pub async fn all_kind_hash_keys(
         .await?
     {
         let v = &r.revocation;
+        let effective_at = v.family_membership_revocation.effective_at.to_rfc3339();
         let rk = record_key(&[
             (
                 "family_key_id",
@@ -799,6 +824,7 @@ pub async fn all_kind_hash_keys(
                 "removed_identity_key_id",
                 &v.family_membership_revocation.removed_identity_key_id,
             ),
+            ("effective_at", &effective_at),
         ]);
         out.push(("FamilyMembershipRevocation", content_hash_of(v)?, rk));
     }
@@ -839,6 +865,19 @@ pub async fn all_kind_hash_keys(
             ("effective_at", &effective_at),
         ]);
         out.push(("CommunityMembershipWidening", content_hash_of(v)?, rk));
+    }
+    for r in dir
+        .list_signed_family_membership_widenings_since(None, u32::MAX)
+        .await?
+    {
+        let v = &r.widening;
+        let effective_at = v.family_membership_widening.effective_at.to_rfc3339();
+        let rk = record_key(&[
+            ("family_key_id", &v.family_membership_widening.family_key_id),
+            ("member_key_id", &v.family_membership_widening.member_key_id),
+            ("effective_at", &effective_at),
+        ]);
+        out.push(("FamilyMembershipWidening", content_hash_of(v)?, rk));
     }
     for r in dir.list_organizations_since(None, u32::MAX).await? {
         let rk = record_key(&[("attestation_id", &r.organization.attestation_id)]);

@@ -238,7 +238,6 @@ pub(crate) enum ConnClass {
 #[cfg(test)]
 pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("accord_nonce_issued", ConnClass::Read),
-    ("add_family_member", ConnClass::Write),
     ("add_peer_record", ConnClass::Write),
     ("adopt_genesis_reanchor", ConnClass::Write),
     ("adopt_scrub_upgrade", ConnClass::Write),
@@ -294,6 +293,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("community_dek_set_retain_past_epochs", ConnClass::Write),
     // v49.0.0 (#908) — the signers the authorized roster fold judges.
     ("community_roster_signers", ConnClass::Read),
+    // v49.0.0 (#910) — the family twin.
+    ("family_roster_signers", ConnClass::Read),
     ("conn_handle", ConnClass::Door),
     ("conscience_override_rates", ConnClass::Read),
     ("corpus_shape", ConnClass::Read),
@@ -366,6 +367,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_communities_for_member", ConnClass::Read),
     ("list_community_membership_revocations_for", ConnClass::Read),
     ("list_community_membership_widenings_for", ConnClass::Read),
+    ("list_family_membership_widenings_for", ConnClass::Read),
     ("list_consent_peers", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
     ("list_consent_peers_for", ConnClass::Read),
@@ -432,6 +434,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_signed_families_since", ConnClass::Read),
     (
         "list_signed_family_membership_revocations_since",
+        ConnClass::Read,
+    ),
+    (
+        "list_signed_family_membership_widenings_since",
         ConnClass::Read,
     ),
     (
@@ -526,6 +532,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_community", ConnClass::Write),
     ("put_community_membership_revocation", ConnClass::Write),
     ("put_community_membership_widening", ConnClass::Write),
+    ("put_family_membership_widening", ConnClass::Write),
     ("put_delivery_receipt", ConnClass::Write),
     ("put_detection_event", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),

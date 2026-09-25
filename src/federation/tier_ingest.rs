@@ -636,6 +636,37 @@ where
     .await
 }
 
+/// v49.0.0 (CIRISPersist#910) — the hybrid-signature gate for a FAMILY
+/// membership widening: the family twin of
+/// [`verify_community_membership_widening_admission`], over
+/// [`super::types::FamilyMembershipWidening::signing_envelope`] — the primary,
+/// then every co-signature over the same envelope.
+pub async fn verify_family_membership_widening_admission<F>(
+    directory: &F,
+    signed: &super::SignedFamilyMembershipWidening,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let envelope = signed.family_membership_widening.signing_envelope();
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &envelope,
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await?;
+    verify_roster_cosignatures(
+        directory,
+        "SignedFamilyMembershipWidening",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
+    .await
+}
+
 /// The [`Error::LocationAuthorityUnauthorized`] `rule` token for *"this node
 /// holds no `delegates_to(subject → authority)` at all"* (v37.0.0,
 /// CIRISPersist#734).
@@ -2952,6 +2983,79 @@ pub mod test_support {
         }
     }
 
+    /// v49.0.0 (CIRISPersist#910) — the family twin of
+    /// [`sign_community_membership_widening`].
+    pub fn sign_family_membership_widening(
+        authority_key_id: &str,
+        widening: crate::federation::types::FamilyMembershipWidening,
+    ) -> crate::federation::SignedFamilyMembershipWidening {
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &widening.signing_envelope());
+        crate::federation::SignedFamilyMembershipWidening {
+            family_membership_widening: widening,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#910) — the family twin of
+    /// [`cosign_community_membership_widening`].
+    pub fn cosign_family_membership_widening(
+        signed: &mut crate::federation::SignedFamilyMembershipWidening,
+        cosigner: &str,
+    ) {
+        let (_hash, classical, pqc) = sign_envelope(
+            cosigner,
+            &signed.family_membership_widening.signing_envelope(),
+        );
+        signed
+            .cosignatures
+            .push(crate::federation::types::RosterCosignature {
+                authority_key_id: cosigner.to_owned(),
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
+            });
+    }
+
+    /// v49.0.0 (CIRISPersist#910) — the family widening row
+    /// `add_family_member(family, member, spec)` builds:
+    /// `{member, joined_at, effective_at = joined_at, role}`.
+    #[must_use]
+    pub fn family_widening_row(
+        family_key_id: &str,
+        member: &crate::federation::types::FamilyMember,
+    ) -> crate::federation::types::FamilyMembershipWidening {
+        crate::federation::types::FamilyMembershipWidening {
+            family_key_id: family_key_id.to_owned(),
+            member_key_id: member.key_id.clone(),
+            joined_at: member.joined_at,
+            effective_at: member.joined_at,
+            role: member.role.clone(),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#910) — an [`AdmitSpec`] for `add_family_member`
+    /// signed by `authority_key_id` alone over the family WIDENING row (not
+    /// the grown record — the pre-v49 shape, which no longer verifies).
+    pub fn family_widening_admit_spec(
+        authority_key_id: &str,
+        family_key_id: &str,
+        member: &crate::federation::types::FamilyMember,
+    ) -> crate::federation::cohort::AdmitSpec {
+        let s = sign_family_membership_widening(
+            authority_key_id,
+            family_widening_row(family_key_id, member),
+        );
+        crate::federation::cohort::AdmitSpec {
+            authority_key_id: s.authority_key_id,
+            scrub_signature_classical: s.scrub_signature_classical,
+            scrub_signature_pqc: s.scrub_signature_pqc,
+            cosignatures: Vec::new(),
+        }
+    }
+
     /// v21.0.0 (CIRISPersist#502 E4) — sign a
     /// [`LocationProof`](crate::federation::types::LocationProof) for
     /// submission. Mirrors [`sign_family`].
@@ -3690,6 +3794,131 @@ pub mod test_support {
             persist_row_hash: String::new(),
         };
         let s = sign_widening_by_consensus(directory, w).await;
+        crate::federation::cohort::AdmitSpec {
+            authority_key_id: s.authority_key_id,
+            scrub_signature_classical: s.scrub_signature_classical,
+            scrub_signature_pqc: s.scrub_signature_pqc,
+            cosignatures: s.cosignatures,
+        }
+    }
+
+    /// v49.0.0 (#910) — the family twin of [`roster_consensus_signers`]: the
+    /// members whose signatures meet `family`'s `consensus_protocol` at `at`,
+    /// from the family's AUTHORIZED roster.
+    pub async fn family_roster_consensus_signers<D>(
+        directory: &D,
+        family_key_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String>
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::types::consensus_protocol as cp;
+        let f = directory
+            .lookup_family(family_key_id)
+            .await
+            .expect("lookup_family")
+            .unwrap_or_else(|| panic!("fixture: no family {family_key_id}"));
+        let mut roster = crate::federation::authorized_family_roster_at(directory, &f, at)
+            .await
+            .expect("authorized family roster");
+        roster.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        let founders: Vec<String> = roster
+            .iter()
+            .filter(|m| {
+                m.role.as_deref() == Some(crate::federation::admission::MEMBER_ROLE_FOUNDER)
+            })
+            .map(|m| m.key_id.clone())
+            .collect();
+        let all: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
+        let p = f.consensus_protocol.as_str();
+        let take = |n: usize| all.iter().take(n.max(1)).cloned().collect::<Vec<_>>();
+        if p == cp::FOUNDER_ONLY {
+            return founders.into_iter().take(1).collect();
+        }
+        if p == cp::MAJORITY {
+            return take(all.len() / 2 + 1);
+        }
+        if let Some(need) = crate::federation::consensus::required_signatures(p, all.len()) {
+            return take(need);
+        }
+        all
+    }
+
+    /// v49.0.0 (#910) — a family widening signed by
+    /// [`family_roster_consensus_signers`] at its `effective_at` (primary =
+    /// the first, the rest co-sign).
+    pub async fn sign_family_widening_by_consensus<D>(
+        directory: &D,
+        widening: crate::federation::types::FamilyMembershipWidening,
+    ) -> crate::federation::SignedFamilyMembershipWidening
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let signers = family_roster_consensus_signers(
+            directory,
+            &widening.family_key_id,
+            widening.effective_at,
+        )
+        .await;
+        let primary = signers.first().unwrap_or_else(|| {
+            panic!(
+                "fixture: no member can meet {}'s protocol",
+                widening.family_key_id
+            )
+        });
+        let mut s = sign_family_membership_widening(primary, widening);
+        for c in &signers[1..] {
+            cosign_family_membership_widening(&mut s, c);
+        }
+        s
+    }
+
+    /// v49.0.0 (#910) — a family revocation signed by
+    /// [`family_roster_consensus_signers`] at its `effective_at`.
+    pub async fn sign_family_revocation_by_consensus<D>(
+        directory: &D,
+        revocation: crate::federation::types::FamilyMembershipRevocation,
+    ) -> crate::federation::SignedFamilyMembershipRevocation
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let signers = family_roster_consensus_signers(
+            directory,
+            &revocation.family_key_id,
+            revocation.effective_at,
+        )
+        .await;
+        let primary = signers.first().unwrap_or_else(|| {
+            panic!(
+                "fixture: no member can meet {}'s protocol",
+                revocation.family_key_id
+            )
+        });
+        let mut s = sign_family_membership_revocation(primary, revocation);
+        for c in &signers[1..] {
+            cosign_family_membership_revocation(&mut s, c);
+        }
+        s
+    }
+
+    /// v49.0.0 (#910) — the [`AdmitSpec`](crate::federation::cohort::AdmitSpec)
+    /// for `add_family_member(family, member, spec)`, signed by
+    /// [`family_roster_consensus_signers`] over the widening row the door
+    /// builds.
+    pub async fn family_widening_admit_spec_by_consensus<D>(
+        directory: &D,
+        family_key_id: &str,
+        member: &crate::federation::types::FamilyMember,
+    ) -> crate::federation::cohort::AdmitSpec
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let s = sign_family_widening_by_consensus(
+            directory,
+            family_widening_row(family_key_id, member),
+        )
+        .await;
         crate::federation::cohort::AdmitSpec {
             authority_key_id: s.authority_key_id,
             scrub_signature_classical: s.scrub_signature_classical,

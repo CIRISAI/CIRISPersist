@@ -7507,78 +7507,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
-    async fn add_family_member(
-        &self,
-        family_key_id: &str,
-        member: crate::federation::types::FamilyMember,
-        spec: &crate::federation::cohort::AdmitSpec,
-    ) -> Result<bool, crate::federation::Error> {
-        // Idempotent roster-grow. The read-modify-write races a concurrent
-        // add only if two members are admitted at the same instant; the
-        // `WHERE persist_row_hash = $4` guard makes the UPDATE a no-op on a
-        // stale read (0 rows affected → retry signalled), so we never lose
-        // a member to a lost update.
-        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "add_family_member names unknown family_key_id {family_key_id:?}"
-            ))
-        })?;
-        if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op, nothing to authorize
-        }
-        let prior_hash = family.persist_row_hash.clone();
-        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
-        // mutation; see the sqlite twin.
-        let family =
-            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
-        let members_value = serde_json::to_value(&family.members)
-            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
-        // bytes; the serve position moves with them.
-        let admitted_at = self
-            .next_plane_position(&client, "federation_families")
-            .await?;
-        let affected = client
-            .execute(
-                // v31.0.0 (CIRISPersist#654/#651) — the signature moves with the
-                // roster it authorizes, in the SAME statement.
-                "UPDATE cirislens.federation_families \
-                    SET members = $2, persist_row_hash = $3, authority_key_id = $5, \
-                        scrub_signature_classical = $6, scrub_signature_pqc = $7, \
-                        admitted_at = $8 \
-                  WHERE family_key_id = $1 AND persist_row_hash = $4",
-                &[
-                    &family_key_id,
-                    &members_value,
-                    &family.persist_row_hash,
-                    &prior_hash,
-                    &spec.authority_key_id,
-                    &spec.scrub_signature_classical,
-                    &spec.scrub_signature_pqc,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| crate::federation::Error::Backend(format!("add_family_member: {e}")))?;
-        if affected == 0 {
-            return Err(crate::federation::Error::Backend(format!(
-                "add_family_member on {family_key_id:?} lost a concurrent update (roster changed under the read); retry"
-            )));
-        }
-        // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
-        self.index_stored_record(
-            "Family",
-            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
-    // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
     async fn supersede_group_row(
         &self,
         cohort: crate::federation::cohort::Cohort,
@@ -7920,6 +7848,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         member_identity_key_id: &str,
     ) -> Result<Vec<crate::federation::Family>, crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#910) — containment in the family's HISTORY:
+        // on the record, or named by a widening. Still raw.
         // Uses the V059 GIN jsonb_path_ops index — the `@>` containment
         // operator is the matching shape (members @> [{"key_id": "X"}]).
         let client = self
@@ -7933,8 +7863,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
                  FROM cirislens.federation_families \
                  WHERE members @> $1 \
+                    OR family_key_id IN ( \
+                        SELECT family_key_id \
+                        FROM cirislens.federation_family_membership_widenings \
+                        WHERE member_key_id = $2) \
                  ORDER BY family_key_id ASC",
-                &[&containment],
+                &[&containment, &member_identity_key_id],
             )
             .await
             .map_err(|e| {
@@ -8748,6 +8682,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // other admission step.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
+        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
+        // `consensus_protocol` at the row's instant (the #908 family half).
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &revocation.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &revocation.authority_key_id,
+                &revocation.cosignatures,
+            ),
+            crate::federation::types::FamilyMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
+            true,
+            row.effective_at,
+        )
+        .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::json!(row.witness_set);
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
@@ -8768,12 +8721,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_family_membership_revocations")
             .await?;
-        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as the trait
-        // documents, except that a repeat moving the removal EARLIER replaces
-        // the stored revocation (fail-secure; see the sqlite door). Any other
-        // repeat returns before the index entry and the hard_case event, so
-        // one removal is recorded — and announced — once. The unique index
-        // arbitrates (race-safe). The serve position is computed from
+        // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0 (#910.1,
+        // V154): the PK carries `effective_at`, so an exact retry is the no-op
+        // and returns before the index entry and the hard_case event (one
+        // removal is recorded — and announced — once), while a removal at
+        // another instant is another event. The unique index arbitrates
+        // (race-safe). The serve position is computed from
         // `MAX(admitted_at)`, not allocated, so a skipped write leaves nothing.
         let inserted = client
             .execute(
@@ -8783,17 +8736,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
                     admitted_at, cosignatures\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-                 ON CONFLICT (family_key_id, removed_identity_key_id) DO UPDATE SET \
-                    removed_at = EXCLUDED.removed_at, effective_at = EXCLUDED.effective_at, \
-                    reason = EXCLUDED.reason, witness_set = EXCLUDED.witness_set, \
-                    persist_row_hash = EXCLUDED.persist_row_hash, \
-                    authority_key_id = EXCLUDED.authority_key_id, \
-                    scrub_signature_classical = EXCLUDED.scrub_signature_classical, \
-                    scrub_signature_pqc = EXCLUDED.scrub_signature_pqc, \
-                    admitted_at = EXCLUDED.admitted_at, \
-                    cosignatures = EXCLUDED.cosignatures \
-                 WHERE EXCLUDED.effective_at \
-                     < cirislens.federation_family_membership_revocations.effective_at",
+                 ON CONFLICT (family_key_id, removed_identity_key_id, effective_at) DO NOTHING",
                 &[
                     &row.family_key_id,
                     &row.removed_identity_key_id,
@@ -8816,9 +8759,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         }
         // v21.1.0 (CIRISPersist#507b) — computed after the INSERT succeeds
         // (`row` still owns its final `persist_row_hash`).
+        let effective_at_rfc3339 = row.effective_at.to_rfc3339();
         let wire_index_key = crate::federation::wire_index::record_key(&[
             ("family_key_id", &row.family_key_id),
             ("removed_identity_key_id", &row.removed_identity_key_id),
+            ("effective_at", &effective_at_rfc3339),
         ]);
         drop(client);
         self.index_stored_record("FamilyMembershipRevocation", &wire_index_key)
@@ -9150,6 +9095,91 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn put_family_membership_widening(
+        &self,
+        widening: crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#910) — the family twin of the room's widening
+        // door; see the sqlite twin for the legs.
+        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
+        let mut row = widening.family_membership_widening;
+        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &widening.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &widening.authority_key_id,
+                &widening.cosignatures,
+            ),
+            row.member(),
+            false,
+            row.effective_at,
+        )
+        .await?;
+        if self.lookup_family(&row.family_key_id).await?.is_none() {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "{} does not exist in federation_families",
+                row.family_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let authority_key_id = widening.authority_key_id;
+        let scrub_signature_classical = widening.scrub_signature_classical;
+        let scrub_signature_pqc = widening.scrub_signature_pqc;
+        let cosignatures = serde_json::to_value(&widening.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures: {e}")))?;
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin tx: {e}")))?;
+        let admitted_at = self
+            .next_plane_position(&tx, "federation_family_membership_widenings")
+            .await?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO cirislens.federation_family_membership_widenings (\
+                family_key_id, member_key_id, joined_at, effective_at, role, \
+                persist_row_hash, authority_key_id, scrub_signature_classical, \
+                scrub_signature_pqc, admitted_at, cosignatures\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (family_key_id, member_key_id, effective_at) DO NOTHING",
+                &[
+                    &row.family_key_id,
+                    &row.member_key_id,
+                    &row.joined_at,
+                    &row.effective_at,
+                    &row.role,
+                    &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                    &admitted_at,
+                    &cosignatures,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("family_membership_widening"))?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit tx: {e}")))?;
+        if inserted == 1 {
+            let effective_at_rfc3339 = row.effective_at.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("family_key_id", &row.family_key_id),
+                ("member_key_id", &row.member_key_id),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -9268,6 +9298,33 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipWidening>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT family_key_id, member_key_id, joined_at, effective_at, role, \
+                    persist_row_hash \
+                 FROM cirislens.federation_family_membership_widenings \
+                 WHERE family_key_id = $1 ORDER BY member_key_id ASC, effective_at ASC",
+                &[&family_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_family_membership_widenings_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_family_membership_widening)
+            .collect()
+    }
+
     async fn list_community_membership_widenings_for(
         &self,
         community_key_id: &str,
@@ -9359,6 +9416,81 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                      FROM cirislens.federation_community_membership_revocations \
                      WHERE community_key_id = $1",
                     &[&community_key_id],
+                )
+                .await
+                .map_err(be)?,
+        )?;
+        Ok(crate::federation::CommunityRosterSigners {
+            record_authority_key_id,
+            widening_signers,
+            revocation_signers,
+        })
+    }
+
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::Error::Backend(format!("family_roster_signers: {e}"))
+        };
+        let Some(record) = client
+            .query_opt(
+                "SELECT authority_key_id FROM cirislens.federation_families \
+                 WHERE family_key_id = $1",
+                &[&family_key_id],
+            )
+            .await
+            .map_err(be)?
+        else {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "family_roster_signers names unknown family_key_id {family_key_id:?}"
+            )));
+        };
+        let mk_err = crate::federation::Error::Backend;
+        let record_authority_key_id: Option<String> =
+            record.safe_get_with("authority_key_id", mk_err)?;
+        let roster_event_signers = |rows: Vec<tokio_postgres::Row>| -> Result<
+            Vec<crate::federation::RosterEventSigner>,
+            crate::federation::Error,
+        > {
+            rows.into_iter()
+                .map(|r| {
+                    Ok(crate::federation::RosterEventSigner {
+                        member_key_id: r.safe_get_with("member_key_id", mk_err)?,
+                        effective_at: r.safe_get_with("effective_at", mk_err)?,
+                        authority_key_id: r.safe_get_with("authority_key_id", mk_err)?,
+                        cosigner_key_ids: pg_roster_cosignatures(&r)?
+                            .into_iter()
+                            .map(|c| c.authority_key_id)
+                            .collect(),
+                    })
+                })
+                .collect()
+        };
+        let widening_signers = roster_event_signers(
+            client
+                .query(
+                    "SELECT member_key_id, effective_at, authority_key_id, cosignatures \
+                     FROM cirislens.federation_family_membership_widenings \
+                     WHERE family_key_id = $1",
+                    &[&family_key_id],
+                )
+                .await
+                .map_err(be)?,
+        )?;
+        let revocation_signers = roster_event_signers(
+            client
+                .query(
+                    "SELECT removed_identity_key_id AS member_key_id, effective_at, \
+                        authority_key_id, cosignatures \
+                     FROM cirislens.federation_family_membership_revocations \
+                     WHERE family_key_id = $1",
+                    &[&family_key_id],
                 )
                 .await
                 .map_err(be)?,
@@ -11053,22 +11185,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let limit = i64::from(limit);
         let since_at = since.as_ref().map(|(t, _)| *t);
-        let (since_a, since_b) = match since.as_ref() {
+        // v49.0.0 (#910.1) — the resume id is the three-part PK.
+        let (since_a, since_b, since_c) = match since.as_ref() {
             Some((_, id)) => {
-                let [a, b] = crate::federation::types::split_resume_id::<2>(id);
-                (Some(a.to_owned()), Some(b.to_owned()))
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
+                (Some(a.to_owned()), Some(b.to_owned()), c)
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         let rows = client
             .query(
                 "SELECT * FROM cirislens.federation_family_membership_revocations \
                  WHERE ($1::timestamptz IS NULL OR \
-                        (admitted_at, family_key_id, removed_identity_key_id) > ($1, $2, $3)) \
+                        (admitted_at, family_key_id, removed_identity_key_id, effective_at) \
+                          > ($1, $2, $3, $4::timestamptz)) \
                    AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
-                 ORDER BY admitted_at ASC, family_key_id ASC, removed_identity_key_id ASC \
-                 LIMIT $4",
-                &[&since_at, &since_a, &since_b, &limit],
+                 ORDER BY admitted_at ASC, family_key_id ASC, removed_identity_key_id ASC, \
+                          effective_at ASC \
+                 LIMIT $5",
+                &[&since_at, &since_a, &since_b, &since_c, &limit],
             )
             .await
             .map_err(|e| {
@@ -11183,6 +11319,56 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
                 Ok(crate::federation::ServedCommunityMembershipWidening {
                     widening: pg_row_to_signed_community_membership_widening(row)?,
+                    admitted_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let since_at = since.as_ref().map(|(t, _)| *t);
+        let (since_a, since_b, since_c) = match since.as_ref() {
+            Some((_, id)) => {
+                let [a, b, c] = crate::federation::types::split_resume_id::<3>(id);
+                let c: Option<chrono::DateTime<chrono::Utc>> = c.parse().ok();
+                (Some(a.to_owned()), Some(b.to_owned()), c)
+            }
+            None => (None, None, None),
+        };
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_family_membership_widenings \
+                 WHERE ($1::timestamptz IS NULL OR \
+                        (admitted_at, family_key_id, member_key_id, effective_at) \
+                          > ($1, $2, $3, $4::timestamptz)) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY admitted_at ASC, family_key_id ASC, member_key_id ASC, \
+                          effective_at ASC \
+                 LIMIT $5",
+                &[&since_at, &since_a, &since_b, &since_c, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_family_membership_widenings_since: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                let admitted_at =
+                    row.safe_get_with("admitted_at", crate::federation::Error::Backend)?;
+                Ok(crate::federation::ServedFamilyMembershipWidening {
+                    widening: pg_row_to_signed_family_membership_widening(row)?,
                     admitted_at,
                 })
             })
@@ -20833,6 +21019,39 @@ fn pg_row_to_community_membership_widening(
         effective_at: row.safe_get_with("effective_at", mk_err)?,
         role: row.safe_get_with("role", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_family_membership_widening(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::FamilyMembershipWidening, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::FamilyMembershipWidening {
+        family_key_id: row.safe_get_with("family_key_id", mk_err)?,
+        member_key_id: row.safe_get_with("member_key_id", mk_err)?,
+        joined_at: row.safe_get_with("joined_at", mk_err)?,
+        effective_at: row.safe_get_with("effective_at", mk_err)?,
+        role: row.safe_get_with("role", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+fn pg_row_to_signed_family_membership_widening(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedFamilyMembershipWidening, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let cosignatures = pg_roster_cosignatures(&row)?;
+    let family_membership_widening = pg_row_to_family_membership_widening(row)?;
+    Ok(crate::federation::SignedFamilyMembershipWidening {
+        family_membership_widening,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+        cosignatures,
     })
 }
 
