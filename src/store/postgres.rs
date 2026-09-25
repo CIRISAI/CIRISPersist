@@ -7507,6 +7507,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
     async fn supersede_group_row(
         &self,
         cohort: crate::federation::cohort::Cohort,
