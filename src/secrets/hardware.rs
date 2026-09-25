@@ -249,7 +249,12 @@ mod seed_policy_tests {
                 .unwrap()
                 .get(key_id)
                 .cloned()
-                .ok_or(ciris_keyring::KeyringError::NoPlatformSupport)
+                // CIRISVerify v16.2.1 (#288/#289): an absent key MUST be
+                // `KeyNotFound` on every `SecureBlobStorage` — the double
+                // honours the contract it stands in for.
+                .ok_or_else(|| ciris_keyring::KeyringError::KeyNotFound {
+                    alias: key_id.to_owned(),
+                })
         }
         fn exists(&self, key_id: &str) -> bool {
             self.blobs.lock().unwrap().contains_key(key_id)

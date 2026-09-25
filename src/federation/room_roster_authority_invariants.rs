@@ -410,6 +410,7 @@ pub mod bodies {
             }],
         };
         let roster = crate::federation::authorized_roster_at(
+            "r",
             &record,
             &signers,
             false,

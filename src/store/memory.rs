@@ -17976,9 +17976,11 @@ mod tests {
             joined_at: chrono::Utc::now(),
             role: Some("member".into()),
         };
+        // v48.1.0 (#908) — the group signs its growth; ob-owner is a plain
+        // member of a founder_only group and has no standing to grow it.
         let admit = crate::federation::cohort::test_support::admit_roster_member_via(
             &backend,
-            "ob-owner",
+            group,
             Cohort::Affiliations,
             group,
             &joiner_row,
@@ -19278,7 +19280,7 @@ mod tests {
         // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
         let admit = crate::federation::cohort::test_support::admit_community_via(
             &backend,
-            &ids[0],
+            "addc-comm", // v48.1.0 (#908): the room signs its growth
             "addc-comm",
             &member("addc-1"),
         )
@@ -23428,8 +23430,10 @@ mod tests {
         }
         backend
             .put_community(
+                // v48.1.0 (#908) — the real authority is the room's record
+                // signer, so its honest removal has standing.
                 crate::federation::tier_ingest::test_support::sign_community(
-                    "e4-cmr-comm",
+                    "e4-cmr-authority",
                     crate::federation::types::Community {
                         community_key_id: "e4-cmr-comm".into(),
                         community_name: "E4 CMR Co-op".into(),

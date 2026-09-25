@@ -22947,6 +22947,34 @@ impl crate::read::ReadEngine for PostgresBackend {
             where_parts.push(frag);
             params.extend(sparams);
         }
+        // v48.1.0 (CIRISPersist#909) — the lifecycle view (see the sqlite
+        // twin): `Live` hides rows retracted by a still-hiding composer.
+        {
+            use crate::read::LifecycleView;
+            let hide: &[&str] = match filter.lifecycle {
+                LifecycleView::Live => &["supersedes", "withdraws", "recants"],
+                LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
+                LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
+                LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
+                LifecycleView::All => &[],
+            };
+            if !hide.is_empty() {
+                let mut ph: Vec<String> = Vec::new();
+                for ty in hide {
+                    params.push(Box::new((*ty).to_string()));
+                    ph.push(format!("${}", params.len()));
+                }
+                where_parts.push(format!(
+                    "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
+                       WHERE c.attesting_key_id = federation_attestations.attesting_key_id \
+                         AND c.attestation_type IN ({}) \
+                         AND c.attestation_envelope::jsonb->>'{}' = \
+                             federation_attestations.attestation_id::text)",
+                    ph.join(","),
+                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
+                ));
+            }
+        }
         if let Some(c) = &cursor {
             if c.version != "v1" {
                 return Err(crate::read::Error::InvalidCursor(format!(
@@ -37660,6 +37688,82 @@ mod tests {
             .len(),
             3,
             "`tier: Federation` keeps them"
+        );
+    }
+
+    /// v48.1.0 (CIRISPersist#909) — I174 on postgres: `list_attestations`
+    /// honours the lifecycle view (see the sqlite twin).
+    #[tokio::test]
+    async fn pg_list_attestations_lifecycle_i174_909() {
+        use crate::read::{LifecycleView, ReadEngine};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let subj = format!("subj909-{}", uuid_like());
+        let dim = "trust:demo:v1";
+        let live = pg_put_score(&be, "k1", &subj, dim, 0.5, base, 10).await;
+        let gone = pg_put_score(&be, "k2", &subj, dim, 0.5, base, 20).await;
+        pg_put_composer(
+            &be,
+            "k2",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &gone,
+            base,
+            30,
+        )
+        .await;
+        let old = pg_put_score(&be, "k3", &subj, dim, 0.5, base, 40).await;
+        let new = pg_put_score(&be, "k3", &subj, dim, 0.6, base, 50).await;
+        pg_put_composer(&be, "k3", "supersedes", &old, base, 50).await;
+        let ids = |lifecycle: LifecycleView| {
+            let be = &be;
+            let subj = subj.clone();
+            async move {
+                let mut v: Vec<String> = be
+                    .list_attestations(
+                        crate::read::AttestationFilter {
+                            subject_key_id: Some(subj),
+                            lifecycle,
+                            ..Default::default()
+                        },
+                        None,
+                        100,
+                        crate::scope::CallerScope::Unauthenticated,
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        let sorted = |mut v: Vec<&String>| {
+            v.sort();
+            v.into_iter().cloned().collect::<Vec<String>>()
+        };
+        assert_eq!(
+            ids(LifecycleView::Live).await,
+            sorted(vec![&live, &new]),
+            "I174: Live hides withdrawn and superseded"
+        );
+        assert_eq!(
+            ids(LifecycleView::IncludeWithdrawn).await,
+            sorted(vec![&live, &gone, &new])
+        );
+        assert_eq!(
+            ids(LifecycleView::IncludeSuperseded).await,
+            sorted(vec![&live, &old, &new])
+        );
+        assert_eq!(
+            ids(LifecycleView::All).await,
+            sorted(vec![&live, &gone, &old, &new])
         );
     }
 

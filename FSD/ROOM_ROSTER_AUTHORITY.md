@@ -22,6 +22,7 @@ So a widened member is refused by every §4.3 gate while the wrap set holds the 
 
 A signer `s` has **standing** for a roster event at instant `t` in room `C` iff, against the room's authorized roster immediately before the event (§3):
 
+0. `s` **is the room's own key** — the room id is a registered key and `s` is it (a keyed room signs for itself; the #757 chat rooms and every E4-era producer sign removals this way); or
 1. `s` is the room's **record signer** (the `authority_key_id` stored with `C`'s row — the key that founded it) and `s` is not currently removed from `C`; or
 2. `s` is an active member of `C` whose role is `founder`; or
 3. `C.consensus_protocol` is not `founder_only` and `s` is an active member of `C` (the existing `community_authority_set_for` rule: the whole roster governs an open room); or
@@ -69,3 +70,13 @@ Mutants planned: the door's standing check skipped (I171); the revocation door c
 - A quorum `membership_policy` for roster changes (#908 mentions one; no such policy field exists on `Community`, and inventing one is a grammar change).
 - A family widening plane (§5).
 - An instant-aware delegation walk (§2 rule 4).
+
+## 8. Bundled: #909 and the verify re-pin
+
+**#909 — `list_attestations` ignored `AttestationFilter::lifecycle`.** `Live` is the documented serde default and means "hide rows retracted by a still-hiding composer" (`supersedes` / `withdraws` / `recants` from the same attester). `list_scores` applied it on all three backends; `list_attestations` took the filter and dropped the axis on sqlite and postgres (memory does not implement the read), so every drive listing that reads through `Engine::list_attestations` showed withdrawn and replaced files. The same predicate now runs in both queries. Replication reads the since-cursor, not this read, so nothing that replicates changes. **I174** (sqlite, postgres): one live row, one withdrawn, one superseded pair; `Live` shows live + head, and each `Include*` view and `All` add back exactly their class.
+
+**CIRISVerify v16.1.0 → v16.2.1.** v16.2.0 added a golden vector and corrected a doc claim; v16.2.1 makes every `SecureBlobStorage` report an absent key as `KeyNotFound` (CIRISVerify#288/#289). Persist decides seed absence with `exists()`, never from `load`'s error, so production is unaffected; the `FakeHardwareStorage` test double answered `NoPlatformSupport` and now honours the contract it stands in for. Seven Cargo pins and the wheel's `ciris-verify>=16.2.1,<17` move together.
+
+## 9. Standing rule 0, found by the full lanes
+
+The first full lanes (14 reds across memory, sqlite, postgres) found that a **keyed room signs for itself**: the #757 chat rooms, the #861 witness and E4-era producers sign removals as the room's own key, which is neither the record signer nor a member. §2 rule 0 admits it. The rest were fixtures that picked an arbitrary signer because any signature used to pass (#654's community half, the idempotent-add and affiliations fixtures, the E4 honest authority, the reverse-quorum commons growth); each now signs as a party with standing. Families remain signature-only — the same shape as #908, out of scope, recorded on the issue.

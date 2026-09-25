@@ -22588,6 +22588,37 @@ impl crate::read::ReadEngine for SqliteBackend {
             parts.push(frag);
             binds.extend(sbinds);
         }
+        // v48.1.0 (CIRISPersist#909) — the lifecycle view. `Live` is the
+        // documented default and hides rows retracted by a still-hiding
+        // composer from the same attester; this read took the filter and
+        // dropped the axis, so every drive listing showed withdrawn and
+        // replaced files. The same fold `list_scores` applies.
+        {
+            use crate::read::LifecycleView;
+            let hide: &[&str] = match filter.lifecycle {
+                LifecycleView::Live => &["supersedes", "withdraws", "recants"],
+                LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
+                LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
+                LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
+                LifecycleView::All => &[],
+            };
+            if !hide.is_empty() {
+                let mut ph: Vec<String> = Vec::new();
+                for ty in hide {
+                    binds.push(SqlValue::Text((*ty).to_string()));
+                    ph.push(format!("?{}", binds.len()));
+                }
+                parts.push(format!(
+                    "NOT EXISTS (SELECT 1 FROM federation_attestations c \
+                       WHERE c.attesting_key_id = federation_attestations.attesting_key_id \
+                         AND c.attestation_type IN ({}) \
+                         AND json_extract(c.attestation_envelope, '$.{}') = \
+                             federation_attestations.attestation_id)",
+                    ph.join(","),
+                    crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
+                ));
+            }
+        }
         if let Some(c) = &cursor {
             if c.version != "v1" {
                 return Err(crate::read::Error::InvalidCursor(format!(
@@ -37783,6 +37814,64 @@ mod tests {
         let mut ids = list_ids(&be, f).await;
         ids.sort();
         assert_eq!(ids, vec!["gone", "live"]);
+    }
+
+    /// v48.1.0 (CIRISPersist#909) — **I174: `list_attestations` honours the
+    /// lifecycle view** the way `list_scores` (above) does. The read took the
+    /// filter and dropped the axis, so every drive listing showed withdrawn and
+    /// replaced files.
+    #[tokio::test]
+    async fn sqlite_list_attestations_lifecycle_i174_909() {
+        use crate::read::{LifecycleView, ReadEngine};
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        put_score(&be, "live", "k1", "subj909", "trust:demo:v1", 0.5, 1.0, 10).await;
+        put_score(&be, "gone", "k2", "subj909", "trust:demo:v1", 0.5, 1.0, 20).await;
+        put_composer(&be, "w", "k2", WITHDRAWS, "gone", 30).await;
+        put_score(&be, "old", "k3", "subj909", "trust:demo:v1", 0.5, 1.0, 40).await;
+        put_score(&be, "new", "k3", "subj909", "trust:demo:v1", 0.6, 1.0, 50).await;
+        put_composer(&be, "s", "k3", "supersedes", "old", 50).await;
+        let ids = |lifecycle: LifecycleView| {
+            let be = &be;
+            async move {
+                let mut v: Vec<String> = be
+                    .list_attestations(
+                        AttestationFilter {
+                            subject_key_id: Some("subj909".into()),
+                            lifecycle,
+                            ..Default::default()
+                        },
+                        None,
+                        100,
+                        crate::scope::CallerScope::Unauthenticated,
+                    )
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        assert_eq!(
+            ids(LifecycleView::Live).await,
+            vec!["live", "new"],
+            "I174: Live (the default) hides withdrawn and superseded"
+        );
+        assert_eq!(
+            ids(LifecycleView::IncludeWithdrawn).await,
+            vec!["gone", "live", "new"]
+        );
+        assert_eq!(
+            ids(LifecycleView::IncludeSuperseded).await,
+            vec!["live", "new", "old"]
+        );
+        assert_eq!(
+            ids(LifecycleView::All).await,
+            vec!["gone", "live", "new", "old"]
+        );
     }
 
     #[tokio::test]

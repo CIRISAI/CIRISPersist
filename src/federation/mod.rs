@@ -662,10 +662,16 @@ pub type RosterState = std::collections::BTreeMap<String, (bool, types::Communit
 /// roster event, against `state` (the authorized roster immediately before the
 /// event)? `Ok(())` or the refusing `ROSTER_AUTHORITY_RULE_*` token.
 ///
+/// Standing (FSD §2): the room's own key (rule 0), the record signer, an active
+/// founder, an active member of an open room, a named moderator, or — for a
+/// revocation — the member leaving.
+///
 /// `signer == None` is a legacy row (admitted before V110 stored signers): it
 /// counts. A removed signer has no standing of any kind — not as record signer,
 /// not as moderator — except to leave, which it already has.
+#[allow(clippy::too_many_arguments)]
 pub fn roster_standing(
+    community_key_id: &str,
     state: &RosterState,
     record_signer: Option<&str>,
     founder_only: bool,
@@ -684,7 +690,9 @@ pub fn roster_standing(
     if matches!(entry, Some((false, _))) {
         return Err(ROSTER_AUTHORITY_RULE_REMOVED);
     }
-    if record_signer == Some(s) || moderators.contains(s) {
+    // Rule 0: a keyed room signs for itself — when the room id is a
+    // registered key, that key IS the room.
+    if s == community_key_id || record_signer == Some(s) || moderators.contains(s) {
         return Ok(());
     }
     match entry {
@@ -712,6 +720,7 @@ pub fn roster_standing(
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn authorized_roster_state_at(
+    community_key_id: &str,
     record_members: &[types::CommunityMember],
     signers: &CommunityRosterSigners,
     founder_only: bool,
@@ -769,6 +778,7 @@ pub fn authorized_roster_state_at(
     let record_signer = signers.record_authority_key_id.as_deref();
     for (_, is_add, member, signer) in events {
         if roster_standing(
+            community_key_id,
             &state,
             record_signer,
             founder_only,
@@ -791,6 +801,7 @@ pub fn authorized_roster_state_at(
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn authorized_roster_at(
+    community_key_id: &str,
     record_members: &[types::CommunityMember],
     signers: &CommunityRosterSigners,
     founder_only: bool,
@@ -800,6 +811,7 @@ pub fn authorized_roster_at(
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> Vec<types::CommunityMember> {
     let state = authorized_roster_state_at(
+        community_key_id,
         record_members,
         signers,
         founder_only,
@@ -910,6 +922,7 @@ where
 {
     let (signers, moderators, widenings, revocations) = roster_inputs(directory, community).await?;
     Ok(authorized_roster_at(
+        &community.community_key_id,
         &community.members,
         &signers,
         community.consensus_protocol == types::consensus_protocol::FOUNDER_ONLY,
@@ -942,6 +955,7 @@ where
         roster_inputs(directory, &community).await?;
     let founder_only = community.consensus_protocol == types::consensus_protocol::FOUNDER_ONLY;
     let state = authorized_roster_state_at(
+        community_key_id,
         &community.members,
         &signers,
         founder_only,
@@ -951,6 +965,7 @@ where
         effective_at,
     );
     roster_standing(
+        community_key_id,
         &state,
         signers.record_authority_key_id.as_deref(),
         founder_only,
