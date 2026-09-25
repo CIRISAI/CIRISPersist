@@ -36645,7 +36645,8 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    &comm_no,
+                    // v49.0.0 (#908): the member leaves on their own signature.
+                    &founder_prim,
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: comm_no.clone(),
                         removed_identity_key_id: founder_prim.clone(),
@@ -45847,7 +45848,9 @@ mod tests {
                     crate::federation::Community {
                         community_key_id: comm.clone(),
                         community_name: "cb".into(),
-                        members: vec![member(&u0, None), member(&u1, None)],
+                        // v49.0.0 (#908): u0 founds the room, so its signature is the
+                        // founder_only protocol.
+                        members: vec![member(&u0, Some(MEMBER_ROLE_FOUNDER)), member(&u1, None)],
                         founded_at: now,
                         consensus_protocol:
                             crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
@@ -45864,13 +45867,13 @@ mod tests {
         );
         // add u2 → roster grows, reader sees it.
         // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
-        let admit_u2 = crate::federation::cohort::test_support::admit_community_via(
-            &backend,
-            &comm,
-            &comm,
-            &member(&u2, None),
-        )
-        .await;
+        let admit_u2 =
+            crate::federation::tier_ingest::test_support::widening_admit_spec_by_consensus(
+                &backend,
+                &comm,
+                &member(&u2, None),
+            )
+            .await;
         assert!(backend
             .add_community_member(&comm, member(&u2, None), &admit_u2)
             .await
@@ -45909,7 +45912,7 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    &comm,
+                    &u1, // v49.0.0 (#908): u1 leaves on their own signature
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: comm.clone(),
                         removed_identity_key_id: u1.clone(),
@@ -46825,8 +46828,9 @@ mod tests {
             .expect("v48.0.0 (#860): the room row the revocation FK references");
         let removed_at = chrono::Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
         let signed =
+            // v49.0.0 (#908): the member leaves on their own signature.
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                &comm,
+                &removed,
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: comm.clone(),
                     removed_identity_key_id: removed.clone(),
