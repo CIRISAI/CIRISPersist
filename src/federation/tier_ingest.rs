@@ -1667,18 +1667,23 @@ pub mod test_support {
         // Opening the door (#757) made the fold choice load-bearing: with the
         // raw fold, a REMOVED member keeps writing into the community's plane
         // forever, the exact failure the removal primitive exists to prevent.
-        dir.put_community_membership_revocation(sign_community_membership_revocation(
-            &cid,
-            crate::federation::types::CommunityMembershipRevocation {
-                community_key_id: cid.clone(),
-                removed_identity_key_id: author.clone(),
-                removed_at: chrono::Utc::now(),
-                effective_at: chrono::Utc::now(),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        ))
+        // v49.0.0 (#908): signed as the room's protocol requires — the room
+        // key alone no longer has standing.
+        dir.put_community_membership_revocation(
+            sign_revocation_by_consensus(
+                dir,
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: cid.clone(),
+                    removed_identity_key_id: author.clone(),
+                    removed_at: chrono::Utc::now(),
+                    effective_at: chrono::Utc::now(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await,
+        )
         .await
         .unwrap_or_else(|e| panic!("({suffix}) revoke author's membership: {e}"));
         assert!(
@@ -3562,6 +3567,134 @@ pub mod test_support {
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// v49.0.0 (#908) — the members whose signatures meet `community`'s
+    /// `consensus_protocol` at `at`, from the AUTHORIZED roster: the first
+    /// active founder (`founder_only`), everyone (`unanimous`, `weighted:`,
+    /// `custom:`), a strict majority (`majority`), `M` (`quorum:M/N`), the
+    /// #574 dismissal threshold (`reverse_quorum`). Deterministic (key order).
+    /// A fixture that signs a roster change "as the room" uses this instead of
+    /// hard-coding a signer, so it states the protocol rather than a person.
+    pub async fn roster_consensus_signers<D>(
+        directory: &D,
+        community_key_id: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String>
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::types::consensus_protocol as cp;
+        let c = directory
+            .lookup_community(community_key_id)
+            .await
+            .expect("lookup_community")
+            .unwrap_or_else(|| panic!("fixture: no community {community_key_id}"));
+        let mut roster = crate::federation::authorized_community_roster_at(directory, &c, at)
+            .await
+            .expect("authorized roster");
+        roster.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        let founders: Vec<String> = roster
+            .iter()
+            .filter(|m| {
+                m.role.as_deref() == Some(crate::federation::admission::MEMBER_ROLE_FOUNDER)
+            })
+            .map(|m| m.key_id.clone())
+            .collect();
+        let all: Vec<String> = roster.iter().map(|m| m.key_id.clone()).collect();
+        let p = c.consensus_protocol.as_str();
+        let take = |n: usize| all.iter().take(n.max(1)).cloned().collect::<Vec<_>>();
+        if p == cp::FOUNDER_ONLY {
+            return founders.into_iter().take(1).collect();
+        }
+        if p == cp::MAJORITY {
+            return take(all.len() / 2 + 1);
+        }
+        if let Some(need) = crate::federation::consensus::required_signatures(p, all.len()) {
+            return take(need);
+        }
+        all
+    }
+
+    /// v49.0.0 (#908) — a widening signed by [`roster_consensus_signers`] at
+    /// its `effective_at` (primary = the first, the rest co-sign).
+    pub async fn sign_widening_by_consensus<D>(
+        directory: &D,
+        widening: crate::federation::types::CommunityMembershipWidening,
+    ) -> crate::federation::SignedCommunityMembershipWidening
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let signers =
+            roster_consensus_signers(directory, &widening.community_key_id, widening.effective_at)
+                .await;
+        let primary = signers.first().unwrap_or_else(|| {
+            panic!(
+                "fixture: no member can meet {}'s protocol",
+                widening.community_key_id
+            )
+        });
+        let mut s = sign_community_membership_widening(primary, widening);
+        for c in &signers[1..] {
+            cosign_community_membership_widening(&mut s, c);
+        }
+        s
+    }
+
+    /// v49.0.0 (#908) — a revocation signed by [`roster_consensus_signers`]
+    /// at its `effective_at`.
+    pub async fn sign_revocation_by_consensus<D>(
+        directory: &D,
+        revocation: crate::federation::types::CommunityMembershipRevocation,
+    ) -> crate::federation::SignedCommunityMembershipRevocation
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let signers = roster_consensus_signers(
+            directory,
+            &revocation.community_key_id,
+            revocation.effective_at,
+        )
+        .await;
+        let primary = signers.first().unwrap_or_else(|| {
+            panic!(
+                "fixture: no member can meet {}'s protocol",
+                revocation.community_key_id
+            )
+        });
+        let mut s = sign_community_membership_revocation(primary, revocation);
+        for c in &signers[1..] {
+            cosign_community_membership_revocation(&mut s, c);
+        }
+        s
+    }
+
+    /// v49.0.0 (#908) — the [`AdmitSpec`](crate::federation::cohort::AdmitSpec)
+    /// for `add_community_member(community, member, spec)`, signed by
+    /// [`roster_consensus_signers`] over the widening row the door builds.
+    pub async fn widening_admit_spec_by_consensus<D>(
+        directory: &D,
+        community_key_id: &str,
+        member: &crate::federation::types::CommunityMember,
+    ) -> crate::federation::cohort::AdmitSpec
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        let w = crate::federation::types::CommunityMembershipWidening {
+            community_key_id: community_key_id.to_owned(),
+            member_key_id: member.key_id.clone(),
+            joined_at: member.joined_at,
+            effective_at: member.joined_at,
+            role: member.role.clone(),
+            persist_row_hash: String::new(),
+        };
+        let s = sign_widening_by_consensus(directory, w).await;
+        crate::federation::cohort::AdmitSpec {
+            authority_key_id: s.authority_key_id,
+            scrub_signature_classical: s.scrub_signature_classical,
+            scrub_signature_pqc: s.scrub_signature_pqc,
+            cosignatures: s.cosignatures,
         }
     }
 

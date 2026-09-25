@@ -296,6 +296,82 @@ pub mod bodies {
             "[{tag}] the unset walk follows every room, as before: {all:?}"
         );
     }
+
+    /// **I175 — a moderator's roster change belongs to its instant** (FSD §2,
+    /// operator ruling; CC 4.2 liveness at the act, CC 2.4.1 not retroactive).
+    /// Founder alice appoints mo (`moderate`, this room); mo widens hank while
+    /// the appointment is live; alice withdraws it; hank STAYS; a widening by
+    /// mo after the withdrawal, or dated before the appointment, is refused.
+    pub async fn exercise_moderator_change_belongs_to_its_instant(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support::sign_community_membership_widening;
+        use crate::federation::types::CommunityMembershipWidening;
+        let alice = format!("{tag}-alice");
+        let here = format!("{tag}-room");
+        register(dir, &alice, &[identity_type::USER]).await;
+        let mo = format!("{tag}-mo");
+        register(dir, &mo, &[identity_type::PRIMITIVE]).await;
+        let [hank, ivy, jay] = ["hank", "ivy", "jay"].map(|k| format!("{tag}-{k}"));
+        for k in [&hank, &ivy, &jay] {
+            register(dir, k, &[identity_type::USER]).await;
+        }
+        room(dir, &here, &alice).await;
+        let widen = |member: &str, at: DateTime<Utc>| {
+            sign_community_membership_widening(
+                &mo,
+                CommunityMembershipWidening {
+                    community_key_id: here.clone(),
+                    member_key_id: member.to_owned(),
+                    joined_at: at,
+                    effective_at: at,
+                    role: None,
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        let e = put(
+            dir,
+            &appointment(&alice, &mo, Some(&here), None),
+            "appoint mo",
+        )
+        .await;
+        let t0 = e.asserted_at;
+        tick().await;
+        dir.put_community_membership_widening(widen(&hank, Utc::now()))
+            .await
+            .unwrap_or_else(|err| panic!("[{tag}] I175: mo widens hank while appointed: {err}"));
+        dir.put_community_membership_widening(widen(&jay, t0 - Duration::seconds(5)))
+            .await
+            .expect_err("a widening dated before the appointment has no moderator standing");
+        tick().await;
+        put(
+            dir,
+            &bare_edge_retraction(&alice, &mo),
+            "alice withdraws mo",
+        )
+        .await;
+        tick().await;
+        dir.put_community_membership_widening(widen(&ivy, Utc::now()))
+            .await
+            .expect_err("after the withdrawal mo has no standing");
+        let roster: Vec<String> = dir
+            .active_community_members(&here)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(
+            roster.contains(&hank),
+            "[{tag}] I175: hank, widened while mo was appointed, stays after the withdrawal"
+        );
+        assert!(
+            !roster.contains(&ivy) && !roster.contains(&jay),
+            "[{tag}] I175: {roster:?}"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -333,5 +409,48 @@ mod run {
             .unwrap();
         b.run_migrations().await.unwrap();
         super::bodies::exercise_moderation_walk_as_of(&b, &format!("mao-{}", suffix())).await;
+    }
+
+    #[tokio::test]
+    async fn moderator_change_belongs_to_its_instant_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        super::bodies::exercise_moderator_change_belongs_to_its_instant(
+            &d,
+            &format!("i175-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn moderator_change_belongs_to_its_instant_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_moderator_change_belongs_to_its_instant(
+            &b,
+            &format!("i175-{}", suffix()),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn moderator_change_belongs_to_its_instant_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::exercise_moderator_change_belongs_to_its_instant(
+            &b,
+            &format!("i175-{}", suffix()),
+        )
+        .await;
     }
 }

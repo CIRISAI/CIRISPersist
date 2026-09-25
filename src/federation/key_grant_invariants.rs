@@ -1384,8 +1384,9 @@ pub mod two_node {
         );
         // (3) alice removed, effective before a later set's asserted_at: the
         // principal is no longer a member — refused.
+        // v49.0.0 (#908): alice leaves on her own signature.
         let rev = ts::sign_community_membership_revocation(
-            &comm,
+            &alice,
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: alice.clone(),

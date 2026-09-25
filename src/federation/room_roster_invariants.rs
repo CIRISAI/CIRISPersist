@@ -46,7 +46,10 @@ pub mod bodies {
             .map(|k| CommunityMember {
                 key_id: k.clone(),
                 joined_at: at("2026-01-01T00:00:00Z"),
-                role: None,
+                // v49.0.0 (#908): alice founds the room — under founder_only
+                // her signature alone is the protocol (CC 4.4.3.4.2).
+                role: (*k == alice)
+                    .then(|| crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
             })
             .collect();
         b.put_community(ts::sign_community(
@@ -56,7 +59,7 @@ pub mod bodies {
                 community_name: "keyless room".into(),
                 members: roster,
                 founded_at: at("2026-01-01T00:00:00Z"),
-                consensus_protocol: consensus_protocol::MAJORITY.to_owned(),
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
             },
@@ -198,7 +201,7 @@ pub mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) -> (String, String, String) {
-        keyless_room_dir_with(d, tag, consensus_protocol::MAJORITY).await
+        keyless_room_dir_with(d, tag, consensus_protocol::FOUNDER_ONLY).await
     }
 
     /// [`keyless_room_dir`] under a chosen consensus protocol.
@@ -218,7 +221,10 @@ pub mod bodies {
             .map(|k| CommunityMember {
                 key_id: k.clone(),
                 joined_at: at("2026-01-01T00:00:00Z"),
-                role: None,
+                // v49.0.0 (#908): alice founds the room — under founder_only
+                // her signature alone is the protocol (CC 4.4.3.4.2).
+                role: (*k == alice)
+                    .then(|| crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
             })
             .collect();
         d.put_community(ts::sign_community(
@@ -555,24 +561,47 @@ pub mod bodies {
     /// **I166 — a raw roster read is a wrong read.** After a widening every
     /// read-time gate sees the member; after her revocation none does.
     pub async fn i166_a_raw_roster_read_is_a_wrong_read(d: &dyn FederationDirectory, tag: &str) {
-        // FOUNDER_ONLY with no founder on the record: the moderator gate
-        // refuses until a founder is WIDENED in, and refuses again once she
-        // is revoked — a leg only the fold can pass.
-        let (room, alice, _bob) =
-            keyless_room_dir_with(d, tag, consensus_protocol::FOUNDER_ONLY).await;
-        let record0 = d.lookup_community(&room).await.unwrap().unwrap();
-        assert!(
-            crate::federation::admission::check_no_moderator_federate_admission(d, &record0)
-                .await
-                .is_err(),
-            "{tag} I166: control — no founder on the record, no moderator"
-        );
+        // v49.0.0 (#908) — reshaped: a founder can no longer be widened into
+        // a founderless founder_only room (no one has standing there). The
+        // point is unchanged: every gate FOLDS. Sole founder alice widens
+        // carol (a founder) in; alice leaves; carol, the last member, leaves.
+        // The record still lists alice as founder throughout — a raw read
+        // would keep finding a moderator, an authority and a wrap target.
+        use crate::federation::admission::{
+            check_no_moderator_federate_admission, community_authority_set_for, MEMBER_ROLE_FOUNDER,
+        };
+        let room = format!("{tag}-room");
+        let alice = format!("{tag}-alice");
         let carol = format!("{tag}-carol");
-        ts::register_hybrid_key_as(d, &carol, &carol, identity_type::USER).await;
+        for k in [&alice, &carol] {
+            ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+        }
+        d.put_community(ts::sign_community(
+            &alice,
+            Community {
+                community_key_id: room.clone(),
+                community_name: "i166 room".into(),
+                members: vec![CommunityMember {
+                    key_id: alice.clone(),
+                    joined_at: at("2026-01-01T00:00:00Z"),
+                    role: Some(MEMBER_ROLE_FOUNDER.into()),
+                }],
+                founded_at: at("2026-01-01T00:00:00Z"),
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+        let record = d.lookup_community(&room).await.unwrap().unwrap();
+        check_no_moderator_federate_admission(d, &record)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I166: control — founder alice moderates: {e}"));
         let member = CommunityMember {
             key_id: carol.clone(),
             joined_at: at("2026-03-01T00:00:00Z"),
-            role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+            role: Some(MEMBER_ROLE_FOUNDER.into()),
         };
         d.add_community_member(
             &room,
@@ -587,60 +616,49 @@ pub mod bodies {
             "{tag} I166: the record does not carry the widening — every gate must fold"
         );
         assert!(
-            crate::federation::is_active_community_member(d, &room, &carol)
-                .await
-                .unwrap(),
-            "{tag} I166: the fold sees carol"
-        );
-        // The gates that used to read `community.members`.
-        crate::federation::admission::check_no_moderator_federate_admission(d, &record)
-            .await
-            .unwrap_or_else(|e| panic!("{tag} I166: the widened founder is the moderator: {e}"));
-        let authority = crate::federation::admission::community_authority_set_for(d, &record)
-            .await
-            .unwrap();
-        assert!(
-            authority.contains(&carol),
-            "{tag} I166: community_authority_set folds"
-        );
-        let wrap_set =
-            crate::federation::community_dek::orchestrate::active_member_key_ids(d, &record)
-                .await
-                .unwrap();
-        assert!(
-            wrap_set.contains(&carol),
-            "{tag} I166: the DEK wrap set folds: {wrap_set:?}"
-        );
-
-        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
-            &alice,
-            revocation(&room, &carol, at("2026-04-01T00:00:00Z")),
-        ))
-        .await
-        .unwrap();
-        assert!(
-            !crate::federation::is_active_community_member(d, &room, &carol)
+            community_authority_set_for(d, &record)
                 .await
                 .unwrap()
+                .contains(&carol),
+            "{tag} I166: the authority set folds in carol"
         );
-        assert!(
-            crate::federation::admission::check_no_moderator_federate_admission(d, &record)
-                .await
-                .is_err(),
-            "{tag} I166: revoked, no moderator again"
-        );
-        let authority = crate::federation::admission::community_authority_set_for(d, &record)
+        let wrap = crate::federation::community_dek::orchestrate::active_member_key_ids(d, &record)
             .await
             .unwrap();
-        assert!(!authority.contains(&carol));
-        let wrap_set =
-            crate::federation::community_dek::orchestrate::active_member_key_ids(d, &record)
-                .await
-                .unwrap();
         assert!(
-            !wrap_set.contains(&carol),
-            "{tag} I166: not wrapped after removal"
+            wrap.contains(&carol),
+            "{tag} I166: the DEK wrap set folds in carol: {wrap:?}"
         );
+
+        // alice leaves (carol remains a founder, so the last-founder rule holds).
+        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
+            &alice,
+            revocation(&room, &alice, at("2026-04-01T00:00:00Z")),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I166: alice leaves: {e}"));
+        assert!(
+            !community_authority_set_for(d, &record)
+                .await
+                .unwrap()
+                .contains(&alice),
+            "{tag} I166: the record still lists founder alice; the authority set must not"
+        );
+        // carol, the last member, leaves: the room is empty by the fold.
+        d.put_community_membership_revocation(ts::sign_community_membership_revocation(
+            &carol,
+            revocation(&room, &carol, at("2026-04-02T00:00:00Z")),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I166: carol leaves: {e}"));
+        assert!(
+            check_no_moderator_federate_admission(d, &record).await.is_err(),
+            "{tag} I166: no member is left, so no moderator — a raw read of the record would still find founder alice"
+        );
+        let wrap = crate::federation::community_dek::orchestrate::active_member_key_ids(d, &record)
+            .await
+            .unwrap();
+        assert!(wrap.is_empty(), "{tag} I166: nobody is wrapped: {wrap:?}");
     }
 
     /// **I167 — the since-read resumes across the three-part id.**

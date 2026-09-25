@@ -334,9 +334,6 @@ pub mod test_support {
                 )
             });
 
-        // v49.0.0 (#908) — the community half signs as the ROOM: a seated plain
-        // member of a founder_only room has no standing to grow it, and
-        // #654 measures authorship (what is signed), not standing.
         // ── community plane (the exact mirror) ───────────────────────────
         directory
             .put_community(ts::sign_community(
@@ -347,7 +344,9 @@ pub mod test_support {
                     members: vec![types::CommunityMember {
                         key_id: seated.clone(),
                         joined_at: now,
-                        role: None,
+                        // v49.0.0 (#908): seated founds the room, so its signature
+                        // is the founder_only protocol.
+                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: now,
                     consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
@@ -367,7 +366,7 @@ pub mod test_support {
             .expect_err("(1) an unsigned community roster grow must be refused");
         let wrong = admit_community_via(
             directory,
-            &comm,
+            &seated,
             &comm,
             &types::CommunityMember {
                 key_id: other.clone(),
@@ -390,7 +389,7 @@ pub mod test_support {
             1,
             "({tag}) (3) verify-before-mutation: neither refusal touched the community roster"
         );
-        let admit = admit_community_via(directory, &comm, &comm, &member).await;
+        let admit = admit_community_via(directory, &seated, &comm, &member).await;
         assert!(
             directory
                 .add_community_member(&comm, member, &admit)

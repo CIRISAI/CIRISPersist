@@ -12562,6 +12562,7 @@ pub(crate) async fn moderation_reach_of_at(
 /// `moderate`-duty walk: the SAME walk [`appointed_moderators_of`] runs,
 /// exposed to the authorized roster fold, which supplies its own static roots
 /// (it must never ask the fold for them).
+#[cfg(test)]
 pub(crate) async fn moderation_reach_of(
     directory: &dyn super::FederationDirectory,
     root: &str,

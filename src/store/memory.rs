@@ -6719,8 +6719,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             self,
             &row.community_key_id,
             &revocation.authority_key_id,
+            &std::iter::once(revocation.authority_key_id.clone())
+                .chain(
+                    revocation
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            crate::federation::types::CommunityMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
             true,
-            &row.removed_identity_key_id,
             row.effective_at,
         )
         .await?;
@@ -6862,8 +6874,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             self,
             &row.community_key_id,
             &widening.authority_key_id,
+            &std::iter::once(widening.authority_key_id.clone())
+                .chain(
+                    widening
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            row.member(),
             false,
-            &row.member_key_id,
             row.effective_at,
         )
         .await?;
@@ -19232,7 +19252,8 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    "acm-comm",
+                    // v49.0.0 (#908): acm-1 leaves on their own signature.
+                    "acm-1",
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: "acm-comm".into(),
                         removed_identity_key_id: "acm-1".into(),
@@ -19330,14 +19351,16 @@ mod tests {
     async fn add_community_member_grows_roster_idempotent() {
         let backend = MemoryBackend::new();
         let ids = seed_user_keys(&backend, "addc", 3).await;
-        put_community_with(&backend, "addc-comm", vec![member(&ids[0])], None)
+        // v49.0.0 (#908): addc-0 is the founder, whose signature IS the
+        // founder_only protocol.
+        let mut founder = member(&ids[0]);
+        founder.role = Some("founder".into());
+        put_community_with(&backend, "addc-comm", vec![founder], None)
             .await
             .unwrap();
         // Genuine add → true, appears in both lookup + active reader.
-        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
-        let admit = crate::federation::cohort::test_support::admit_community_via(
+        let admit = crate::federation::tier_ingest::test_support::widening_admit_spec_by_consensus(
             &backend,
-            "addc-comm", // v49.0.0 (#908): the room signs its growth
             "addc-comm",
             &member("addc-1"),
         )
@@ -19772,7 +19795,9 @@ mod tests {
         seed(&b, "bk-no", "bk-prim", identity_type::PRIMITIVE).await;
         b.put_community_membership_revocation(
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                "bk-no",
+                // v49.0.0 (#908): the member leaves on their own signature —
+                // nobody holds standing in a moderator-less founder_only room.
+                "bk-prim",
                 crate::federation::types::CommunityMembershipRevocation {
                     community_key_id: "bk-no".into(),
                     removed_identity_key_id: "bk-prim".into(),
@@ -20738,6 +20763,19 @@ mod tests {
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
             &backend,
             "memory-rqa",
+        )
+        .await;
+    }
+
+    /// v49.0.0 — I181 on memory: a reverse-quorum roster removal.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_roster_removal_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_roster_removal(
+            &backend,
+            "memory-rqr",
         )
         .await;
     }
@@ -23542,7 +23580,8 @@ mod tests {
                 "e4-cmr-attacker",
                 forged_rev,
             );
-        forged.authority_key_id = "e4-cmr-authority".to_owned();
+        // v49.0.0 (#908): the honest authority is the member leaving.
+        forged.authority_key_id = "e4-cmr-member".to_owned();
         let err = backend
             .put_community_membership_revocation(forged)
             .await
@@ -23580,7 +23619,7 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    "e4-cmr-authority",
+                    "e4-cmr-member",
                     honest_rev,
                 ),
             )

@@ -8284,8 +8284,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             self,
             &row.community_key_id,
             &revocation.authority_key_id,
+            &std::iter::once(revocation.authority_key_id.clone())
+                .chain(
+                    revocation
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            crate::federation::types::CommunityMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
             true,
-            &row.removed_identity_key_id,
             row.effective_at,
         )
         .await?;
@@ -8467,8 +8479,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             self,
             &row.community_key_id,
             &widening.authority_key_id,
+            &std::iter::once(widening.authority_key_id.clone())
+                .chain(
+                    widening
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            row.member(),
             false,
-            &row.member_key_id,
             row.effective_at,
         )
         .await?;
@@ -26999,6 +27019,18 @@ mod tests {
         .await;
     }
 
+    /// v49.0.0 — I181 on sqlite: a reverse-quorum roster removal.
+    #[tokio::test]
+    async fn reverse_quorum_roster_removal_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_roster_removal(
+            &backend,
+            "sqlite-rqr",
+        )
+        .await;
+    }
+
     /// CIRISPersist#591 — the sqlite leg of the shared
     /// escalation-on-silence witness (see the postgres + memory legs); all three
     /// call the SAME `exercise_escalation_on_silence` body.
@@ -35452,7 +35484,8 @@ mod tests {
             .expect("v48.0.0 (#860): the room row the revocation FK references");
         let signed =
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                "cmr504-comm",
+                // v49.0.0 (#908): the member leaves ("left the co-op").
+                "cmr504-removed",
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: "cmr504-comm".into(),
                     removed_identity_key_id: "cmr504-removed".into(),
@@ -44514,7 +44547,8 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    "nm-no",
+                    // v49.0.0 (#908): the member leaves on their own signature.
+                    "nm-prim",
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: "nm-no".into(),
                         removed_identity_key_id: "nm-prim".into(),
@@ -49337,7 +49371,8 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    "acm-comm",
+                    // v49.0.0 (#908): acm-1 leaves on their own signature.
+                    "acm-1",
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: "acm-comm".into(),
                         removed_identity_key_id: "acm-1".into(),
@@ -49448,17 +49483,16 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                         "addc-comm",
                         "addc",
                         vec!["addc-0"],
-                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        // v49.0.0 (#908): a majority of one is addc-0.
+                        crate::federation::types::consensus_protocol::MAJORITY,
                         None,
                     ),
                 ),
             )
             .await
             .unwrap();
-        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
-        let admit = crate::federation::cohort::test_support::admit_community_via(
+        let admit = crate::federation::tier_ingest::test_support::widening_admit_spec_by_consensus(
             &backend,
-            "addc-comm",
             "addc-comm",
             &cm("addc-1"),
         )

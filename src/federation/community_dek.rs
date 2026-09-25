@@ -1779,8 +1779,9 @@ pub mod lifecycle_support {
     {
         use crate::federation::tier_ingest::test_support as ts;
         let now = chrono::Utc::now();
-        let signed = ts::sign_community_membership_revocation(
-            community_key_id,
+        // v49.0.0 (#908): signed as the room's protocol requires.
+        let signed = ts::sign_revocation_by_consensus(
+            backend,
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: community_key_id.to_owned(),
                 removed_identity_key_id: removed_identity.to_owned(),
@@ -1790,7 +1791,8 @@ pub mod lifecycle_support {
                 witness_set: vec![],
                 persist_row_hash: String::new(),
             },
-        );
+        )
+        .await;
         backend
             .put_community_membership_revocation(signed.clone())
             .await

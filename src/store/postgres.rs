@@ -8857,8 +8857,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self,
             &row.community_key_id,
             &revocation.authority_key_id,
+            &std::iter::once(revocation.authority_key_id.clone())
+                .chain(
+                    revocation
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            crate::federation::types::CommunityMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
             true,
-            &row.removed_identity_key_id,
             row.effective_at,
         )
         .await?;
@@ -9052,8 +9064,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self,
             &row.community_key_id,
             &widening.authority_key_id,
+            &std::iter::once(widening.authority_key_id.clone())
+                .chain(
+                    widening
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            row.member(),
             false,
-            &row.member_key_id,
             row.effective_at,
         )
         .await?;
@@ -28282,6 +28302,23 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// v49.0.0 — I181 on postgres: a reverse-quorum roster removal.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_roster_removal_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_roster_removal(
             &backend, &suffix,
         )
         .await;

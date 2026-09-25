@@ -646,198 +646,227 @@ pub fn active_roster_at(
 }
 
 /// v49.0.0 (CIRISPersist#908) — the RETRYABLE [`Error::RosterAuthorityUnauthorized`]
-/// rule: the signer has no event in the room at all. Rows arrive out of order;
-/// the event that gives the signer standing may not be here yet, and persist
-/// holds no deferral queue — the caller re-submits.
+/// rule: the protocol is not met and at least one signer has no event in the
+/// room yet. Rows arrive out of order; the event that makes the signer a member
+/// may not be here yet, and persist holds no deferral queue — the caller
+/// re-submits.
 pub const ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED: &str = "roster_authority_not_established";
-/// v49.0.0 (CIRISPersist#908) — substantive: the signer's latest event in the
-/// room at the row's instant is a removal.
-pub const ROSTER_AUTHORITY_RULE_REMOVED: &str = "roster_authority_removed";
-/// v49.0.0 (CIRISPersist#908) — substantive: the signer is an active member of
-/// a `founder_only` room but neither a founder nor a named moderator.
-pub const ROSTER_AUTHORITY_RULE_INSUFFICIENT: &str = "roster_authority_insufficient";
+/// v49.0.0 (CIRISPersist#908) — substantive: every signer is known to the room
+/// and the room's `consensus_protocol` is not met by them.
+pub const ROSTER_CONSENSUS_INSUFFICIENT: &str = "roster_consensus_insufficient";
+/// v49.0.0 (CIRISPersist#908) — substantive: the room's protocol cannot be
+/// evaluated from signed state (an undeclared `weighted:` rubric or `custom:`
+/// id, a malformed declaration, a non-canonical string).
+pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
+/// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
+/// with other active members and no active founder.
+pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
 
-/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §2) — the room
+/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
 /// state a standing question is asked against: each key that has appeared, and
-/// whether its latest counted event left it active.
+/// whether its latest applied event left it active.
 pub type RosterState = std::collections::BTreeMap<String, (bool, types::CommunityMember)>;
 
-/// v49.0.0 (CIRISPersist#908, FSD §2) — does `signer` have standing for one
-/// roster event, against `state` (the authorized roster immediately before the
-/// event)? `Ok(())` or the refusing `ROSTER_AUTHORITY_RULE_*` token.
-///
-/// Standing (FSD §2): the room's own key (rule 0), the record signer, an active
-/// founder, an active member of an open room, a named moderator, or — for a
-/// revocation — the member leaving.
-///
-/// `signer == None` is a legacy row (admitted before V110 stored signers): it
-/// counts. A removed signer has no standing of any kind — not as record signer,
-/// not as moderator — except to leave, which it already has.
-#[allow(clippy::too_many_arguments)]
-pub fn roster_standing(
-    community_key_id: &str,
-    state: &RosterState,
-    record_signer: Option<&str>,
-    founder_only: bool,
-    moderators: &std::collections::HashSet<String>,
-    signer: Option<&str>,
-    is_revocation: bool,
-    subject_key_id: &str,
-) -> Result<(), &'static str> {
-    let Some(s) = signer else {
-        return Ok(());
-    };
-    if is_revocation && s == subject_key_id {
-        return Ok(());
-    }
-    let entry = state.get(s);
-    if matches!(entry, Some((false, _))) {
-        return Err(ROSTER_AUTHORITY_RULE_REMOVED);
-    }
-    // Rule 0: a keyed room signs for itself — when the room id is a
-    // registered key, that key IS the room.
-    if s == community_key_id || record_signer == Some(s) || moderators.contains(s) {
-        return Ok(());
-    }
-    match entry {
-        Some((true, m)) => {
-            if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) || !founder_only {
-                Ok(())
-            } else {
-                Err(ROSTER_AUTHORITY_RULE_INSUFFICIENT)
-            }
+/// v49.0.0 (CIRISPersist#908) — the group-level inputs every standing question
+/// reads: the protocol string, the `cohort_subkind`, and the record's
+/// `policy_blob` (rubric and custom declarations). Borrowed from the record.
+#[derive(Debug, Clone, Copy)]
+pub struct RosterRules<'a> {
+    /// `consensus_protocol`.
+    pub protocol: &'a str,
+    /// `cohort_subkind` (`infrastructure` counts founders only).
+    pub subkind: Option<&'a str>,
+    /// The record's `policy_blob`.
+    pub policy_blob: Option<&'a serde_json::Value>,
+}
+
+impl<'a> RosterRules<'a> {
+    /// The rules a stored community declares.
+    pub fn of_community(c: &'a Community) -> Self {
+        Self {
+            protocol: &c.consensus_protocol,
+            subkind: c
+                .policy_blob
+                .as_ref()
+                .and_then(|b| b.get("cohort_subkind"))
+                .and_then(|v| v.as_str()),
+            policy_blob: c.policy_blob.as_ref(),
         }
-        _ => Err(ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED),
     }
 }
 
-/// v49.0.0 (CIRISPersist#908, FSD §3) — **the authorized roster fold.** The
-/// v48 replay order ([`active_roster_at`]: record members first, then dated
-/// events by `effective_at`, a removal last at a tie, then member key), but an
-/// event is APPLIED only if its signer has [`roster_standing`] in the state
-/// built so far. An unauthorized event is inert. Returns the state at `as_of`;
-/// [`authorized_roster_at`] projects it.
+/// v49.0.0 (CIRISPersist#908, FSD §3) — one dated roster event, prepared for
+/// the pure fold: who it adds or removes, every key whose signature over it
+/// verified (empty for a legacy row admitted before signers were stored), the
+/// founders whose `moderate` delegation reached a signer AT THIS EVENT'S
+/// INSTANT, and whether a `reverse_quorum` objection fold has reversed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterEvent {
+    /// The event's effective instant.
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+    /// A widening (`true`) or a revocation (`false`).
+    pub is_add: bool,
+    /// The member added or removed.
+    pub member: types::CommunityMember,
+    /// Primary signer ∪ co-signers; empty ⇒ a legacy row, which counts.
+    pub signers: std::collections::BTreeSet<String>,
+    /// Founders from whom a live (at `effective_at`) `moderate` chain reaches a
+    /// signer. The fold honours one only while it is an active founder.
+    pub moderator_roots: std::collections::BTreeSet<String>,
+    /// A `reverse_quorum` removal the objection fold has reversed.
+    pub reversed: bool,
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §2) — does `e` have standing against `state`
+/// (the authorized roster immediately before it)? `Ok(())` or the refusing
+/// rule token with a human-readable detail.
 ///
-/// Every node replays the same stored history the same way, so two nodes that
-/// received the rows in different orders agree — which a put-time door alone
-/// cannot guarantee.
+/// In order: a legacy row counts; a member removing themselves needs no one
+/// (operator ruling — leaving is a consent floor); a named moderator judged at
+/// the event's instant; otherwise the room's `consensus_protocol` through the
+/// ONE evaluator ([`consensus::evaluate`]). Every admitted change must also
+/// leave a founder whenever it leaves members (the last-founder rule).
+pub fn roster_event_standing(
+    rules: RosterRules<'_>,
+    state: &RosterState,
+    e: &RosterEvent,
+) -> Result<(), (&'static str, String)> {
+    let is_active_founder = |k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER));
+    // Standing without the protocol: a legacy row (admitted before signers
+    // were stored); a member leaving on their own signature; a named
+    // moderator whose appointment was live at this event's instant.
+    let standing_without_protocol = e.signers.is_empty()
+        || (!e.is_add && e.signers.contains(&e.member.key_id))
+        || e.moderator_roots.iter().any(|r| is_active_founder(r));
+    let admitted = if standing_without_protocol {
+        Ok(())
+    } else {
+        let seats: Vec<consensus::Seat> = state
+            .values()
+            .filter(|(active, _)| *active)
+            .map(|(_, m)| consensus::Seat {
+                key_id: m.key_id.clone(),
+                role: m.role.clone(),
+            })
+            .collect();
+        match consensus::evaluate(&consensus::Ballot {
+            protocol: rules.protocol,
+            subkind: rules.subkind,
+            policy_blob: rules.policy_blob,
+            roster: &seats,
+            signers: &e.signers,
+            direction: if e.is_add {
+                consensus::Direction::Add
+            } else {
+                consensus::Direction::Remove
+            },
+        }) {
+            consensus::Verdict::Admit => Ok(()),
+            consensus::Verdict::Unevaluable { reason } => {
+                Err((ROSTER_CONSENSUS_UNEVALUABLE, reason))
+            }
+            consensus::Verdict::Insufficient { detail } => {
+                if e.signers.iter().any(|s| !state.contains_key(s)) {
+                    Err((ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED, detail))
+                } else {
+                    Err((ROSTER_CONSENSUS_INSUFFICIENT, detail))
+                }
+            }
+        }
+    };
+    admitted?;
+    // The last-founder rule: a removal — or a role change that demotes — that
+    // leaves members but no founder.
+    let loses_founder = is_active_founder(&e.member.key_id)
+        && (!e.is_add || e.member.role.as_deref() != Some(admission::MEMBER_ROLE_FOUNDER));
+    if loses_founder {
+        let founders_after = state
+            .iter()
+            .filter(|(k, (active, m))| {
+                *active
+                    && k.as_str() != e.member.key_id
+                    && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
+            })
+            .count();
+        let others_after = state
+            .iter()
+            .filter(|(k, (active, _))| *active && k.as_str() != e.member.key_id)
+            .count();
+        if founders_after == 0 && others_after > 0 {
+            return Err((
+                ROSTER_LAST_FOUNDER,
+                format!(
+                    "removing or demoting {} would leave {others_after} member(s) and no founder",
+                    e.member.key_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sort_roster_events(events: &mut [RosterEvent]) {
+    events.sort_by(|a, b| {
+        a.effective_at
+            .cmp(&b.effective_at)
+            .then_with(|| b.is_add.cmp(&a.is_add))
+            .then_with(|| a.member.key_id.cmp(&b.member.key_id))
+    });
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §3) — **the authorized roster fold.** The v48
+/// replay order (record members first — counted from the record, never their
+/// `joined_at` —, then dated events by `effective_at`, a removal last at a tie,
+/// then member key), applying an event only if [`roster_event_standing`] admits
+/// it against the state built so far and it has not been reversed. An unapplied
+/// event is inert. Every node replays the same stored history the same way, so
+/// nodes that received rows in different orders agree.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn authorized_roster_state_at(
-    community_key_id: &str,
     record_members: &[types::CommunityMember],
-    signers: &CommunityRosterSigners,
-    founder_only: bool,
-    moderators: &std::collections::HashSet<String>,
-    widenings: &[types::CommunityMembershipWidening],
-    revocations: &[types::CommunityMembershipRevocation],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> RosterState {
-    let signer_of = |list: &[types::RosterEventSigner], member: &str, at| -> Option<String> {
-        list.iter()
-            .find(|e| e.member_key_id == member && e.effective_at == at)
-            .and_then(|e| e.authority_key_id.clone())
-    };
-    // (instant, is_add, member, signer)
-    let mut events: Vec<(
-        chrono::DateTime<chrono::Utc>,
-        bool,
-        types::CommunityMember,
-        Option<String>,
-    )> = Vec::new();
-    for w in widenings {
-        events.push((
-            w.effective_at,
-            true,
-            w.member(),
-            signer_of(&signers.widening_signers, &w.member_key_id, w.effective_at),
-        ));
-    }
-    for r in revocations {
-        events.push((
-            r.effective_at,
-            false,
-            types::CommunityMember {
-                key_id: r.removed_identity_key_id.clone(),
-                joined_at: r.effective_at,
-                role: None,
-            },
-            signer_of(
-                &signers.revocation_signers,
-                &r.removed_identity_key_id,
-                r.effective_at,
-            ),
-        ));
-    }
-    events.retain(|(at, _, _, _)| *at <= as_of);
-    events.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| a.2.key_id.cmp(&b.2.key_id))
-    });
+    let mut ordered: Vec<RosterEvent> = events
+        .iter()
+        .filter(|e| e.effective_at <= as_of)
+        .cloned()
+        .collect();
+    sort_roster_events(&mut ordered);
     let mut state: RosterState = record_members
         .iter()
         .map(|m| (m.key_id.clone(), (true, m.clone())))
         .collect();
-    let record_signer = signers.record_authority_key_id.as_deref();
-    for (_, is_add, member, signer) in events {
-        if roster_standing(
-            community_key_id,
-            &state,
-            record_signer,
-            founder_only,
-            moderators,
-            signer.as_deref(),
-            !is_add,
-            &member.key_id,
-        )
-        .is_ok()
-        {
-            state.insert(member.key_id.clone(), (is_add, member));
+    for e in ordered {
+        if e.reversed {
+            continue;
+        }
+        if roster_event_standing(rules, &state, &e).is_ok() {
+            state.insert(e.member.key_id.clone(), (e.is_add, e.member));
         }
     }
     state
 }
 
-/// v49.0.0 (CIRISPersist#908, FSD §3) — the active members of
+/// v49.0.0 (CIRISPersist#908) — the active members of
 /// [`authorized_roster_state_at`], record order first, then widened members by
 /// key id (the same projection as [`active_roster_at`]).
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn authorized_roster_at(
-    community_key_id: &str,
     record_members: &[types::CommunityMember],
-    signers: &CommunityRosterSigners,
-    founder_only: bool,
-    moderators: &std::collections::HashSet<String>,
-    widenings: &[types::CommunityMembershipWidening],
-    revocations: &[types::CommunityMembershipRevocation],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> Vec<types::CommunityMember> {
-    let state = authorized_roster_state_at(
-        community_key_id,
-        record_members,
-        signers,
-        founder_only,
-        moderators,
-        widenings,
-        revocations,
-        as_of,
-    );
-    project_roster_state(record_members, &state)
-}
-
-fn project_roster_state(
-    record_members: &[types::CommunityMember],
-    state: &RosterState,
-) -> Vec<types::CommunityMember> {
+    let state = authorized_roster_state_at(record_members, rules, events, as_of);
     let mut out = Vec::new();
     for m in record_members {
         if let Some((true, member)) = state.get(&m.key_id) {
             out.push(member.clone());
         }
     }
-    for (key_id, (active, member)) in state {
+    for (key_id, (active, member)) in &state {
         if *active && !record_members.iter().any(|m| &m.key_id == key_id) {
             out.push(member.clone());
         }
@@ -845,73 +874,207 @@ fn project_roster_state(
     out
 }
 
-/// v49.0.0 (CIRISPersist#908, FSD §2 rule 4) — the named moderators of a room
-/// for duty `moderate`, walked from its STATIC roots (the record signer and
-/// the record's founders, each steward-bound). Never from the fold: the fold
-/// asks this, so this must not ask the fold. Delegation liveness is read-time
-/// state (the walk evaluates it now).
-async fn static_roster_moderators<F>(
-    directory: &F,
+/// Every key that is ever a founder of the room: the record's founders and any
+/// member widened in as one. The candidate roots of a moderation chain; the
+/// fold honours a root only while it is an active founder.
+fn founder_candidates(
     community: &Community,
-    record_signer: Option<&str>,
-) -> Result<std::collections::HashSet<String>, Error>
+    widenings: &[CommunityMembershipWidening],
+) -> std::collections::BTreeSet<String> {
+    let founder = Some(admission::MEMBER_ROLE_FOUNDER);
+    community
+        .members
+        .iter()
+        .filter(|m| m.role.as_deref() == founder)
+        .map(|m| m.key_id.clone())
+        .chain(
+            widenings
+                .iter()
+                .filter(|w| w.role.as_deref() == founder)
+                .map(|w| w.member_key_id.clone()),
+        )
+        .collect()
+}
+
+/// Which of `roots` reach any of `signers` by a `moderate` chain scoped to the
+/// room and live at `at` (CC 4.5.4; judged at the change's instant, CC 4.2).
+async fn moderator_roots_at<F>(
+    directory: &F,
+    community_key_id: &str,
+    roots: &std::collections::BTreeSet<String>,
+    signers: &std::collections::BTreeSet<String>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::BTreeSet<String>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     let dir = directory.as_dyn_directory();
-    let mut roots: Vec<String> = community
-        .members
-        .iter()
-        .filter(|m| m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER))
-        .map(|m| m.key_id.clone())
-        .collect();
-    if let Some(s) = record_signer {
-        roots.push(s.to_owned());
-    }
-    roots.sort();
-    roots.dedup();
-    let mut out = std::collections::HashSet::new();
+    let mut out = std::collections::BTreeSet::new();
     for root in roots {
-        if !admission::is_steward_bound(dir, &root).await? {
+        if signers.contains(root) || !Box::pin(admission::is_steward_bound(dir, root)).await? {
             continue;
         }
-        out.extend(admission::moderation_reach_of(dir, &root).await?);
+        let reach = Box::pin(admission::moderation_reach_of_at(
+            dir,
+            root,
+            community_key_id,
+            at,
+        ))
+        .await?;
+        if reach.iter().any(|k| signers.contains(k)) {
+            out.insert(root.clone());
+        }
     }
     Ok(out)
 }
 
-/// v49.0.0 (CIRISPersist#908) — everything the authorized fold reads for one
-/// stored room, in one place.
-async fn roster_inputs<F>(
+fn signer_set(e: &types::RosterEventSigner) -> std::collections::BTreeSet<String> {
+    e.authority_key_id
+        .iter()
+        .cloned()
+        .chain(e.cosigner_key_ids.iter().cloned())
+        .collect()
+}
+
+/// v49.0.0 (CIRISPersist#908) — every stored roster event of `community`,
+/// prepared for the pure fold: signer sets, moderator roots at each event's
+/// instant, and (under `reverse_quorum`) whether the objection fold reversed a
+/// removal. The action a roster removal's objections name is the revocation's
+/// `persist_row_hash`; its actor is the primary signer; its instant is
+/// `effective_at`.
+pub async fn community_roster_events<F>(
     directory: &F,
     community: &Community,
-) -> Result<
-    (
-        CommunityRosterSigners,
-        std::collections::HashSet<String>,
-        Vec<CommunityMembershipWidening>,
-        Vec<CommunityMembershipRevocation>,
-    ),
-    Error,
->
+) -> Result<Vec<RosterEvent>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     let id = &community.community_key_id;
     let signers = directory.community_roster_signers(id).await?;
-    let moderators = static_roster_moderators(
-        directory,
-        community,
-        signers.record_authority_key_id.as_deref(),
-    )
-    .await?;
     let widenings = directory
         .list_community_membership_widenings_for(id)
         .await?;
     let revocations = directory
         .list_community_membership_revocations_for(id)
         .await?;
-    Ok((signers, moderators, widenings, revocations))
+    let roots = founder_candidates(community, &widenings);
+    let reverse = community
+        .consensus_protocol
+        .starts_with(types::consensus_protocol::REVERSE_QUORUM_PREFIX);
+    let find = |list: &[types::RosterEventSigner], member: &str, at| {
+        list.iter()
+            .find(|s| s.member_key_id == member && s.effective_at == at)
+            .map(signer_set)
+            .unwrap_or_default()
+    };
+    let mut events = Vec::with_capacity(widenings.len() + revocations.len());
+    let mut reverse_candidates: Vec<(usize, String, String)> = Vec::new();
+    for w in &widenings {
+        let s = find(&signers.widening_signers, &w.member_key_id, w.effective_at);
+        let moderator_roots = Box::pin(moderator_roots_at(
+            directory,
+            id,
+            &roots,
+            &s,
+            w.effective_at,
+        ))
+        .await?;
+        events.push(RosterEvent {
+            effective_at: w.effective_at,
+            is_add: true,
+            member: w.member(),
+            signers: s,
+            moderator_roots,
+            reversed: false,
+        });
+    }
+    for r in &revocations {
+        let s = find(
+            &signers.revocation_signers,
+            &r.removed_identity_key_id,
+            r.effective_at,
+        );
+        let moderator_roots = Box::pin(moderator_roots_at(
+            directory,
+            id,
+            &roots,
+            &s,
+            r.effective_at,
+        ))
+        .await?;
+        let actor = signers
+            .revocation_signers
+            .iter()
+            .find(|x| {
+                x.member_key_id == r.removed_identity_key_id && x.effective_at == r.effective_at
+            })
+            .and_then(|x| x.authority_key_id.clone());
+        if let (true, Some(actor)) = (reverse, actor) {
+            reverse_candidates.push((events.len(), actor, r.persist_row_hash.clone()));
+        }
+        events.push(RosterEvent {
+            effective_at: r.effective_at,
+            is_add: false,
+            member: types::CommunityMember {
+                key_id: r.removed_identity_key_id.clone(),
+                joined_at: r.effective_at,
+                role: None,
+            },
+            signers: s,
+            moderator_roots,
+            reversed: false,
+        });
+    }
+    if reverse_candidates.is_empty() {
+        return Ok(events);
+    }
+    // Reverse quorum: the objection fold counts against the roster with NO
+    // reversals applied — the members who could object — supplied here,
+    // because the fold's own roster read would re-enter this function.
+    let now = chrono::Utc::now();
+    let rules = RosterRules::of_community(community);
+    let state0 = authorized_roster_state_at(&community.members, rules, &events, now);
+    let roster0: Vec<String> = state0
+        .iter()
+        .filter(|(_, (active, _))| *active)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let policy = reverse_quorum::ReverseQuorumPolicy::parse(&community.consensus_protocol);
+    let duty_holders = if policy.and_then(|p| p.steward).is_some() {
+        let dir = directory.as_dyn_directory();
+        let mut out = std::collections::BTreeSet::new();
+        for (k, (active, m)) in &state0 {
+            if *active
+                && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
+                && Box::pin(admission::is_steward_bound(dir, k)).await?
+            {
+                out.insert(k.clone());
+                out.extend(Box::pin(admission::moderation_reach_of_at(dir, k, id, now)).await?);
+            }
+        }
+        Some(out.into_iter().collect::<Vec<_>>())
+    } else {
+        None
+    };
+    for (idx, actor, row_hash) in reverse_candidates {
+        let fold = Box::pin(reverse_quorum::resolve_reverse_quorum_with(
+            directory.as_dyn_directory(),
+            cohort::Cohort::Community,
+            id,
+            roster0.clone(),
+            policy,
+            duty_holders.clone(),
+            reverse_quorum::ActionRef {
+                actor_key_id: &actor,
+                action_id: &row_hash,
+                asserted_at: events[idx].effective_at,
+            },
+            now,
+        ))
+        .await?;
+        events[idx].reversed = fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed;
+    }
+    Ok(events)
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §3) — the authorized roster of a STORED room
@@ -924,29 +1087,29 @@ pub async fn authorized_community_roster_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let (signers, moderators, widenings, revocations) = roster_inputs(directory, community).await?;
+    // Boxed: the replay nests the moderator walk and the reverse-quorum
+    // fold; a caller's future must not inline all of it (2 MiB worker stacks).
+    let events = Box::pin(community_roster_events(directory, community)).await?;
     Ok(authorized_roster_at(
-        &community.community_key_id,
         &community.members,
-        &signers,
-        community.consensus_protocol == types::consensus_protocol::FOUNDER_ONLY,
-        &moderators,
-        &widenings,
-        &revocations,
+        RosterRules::of_community(community),
+        &events,
         as_of,
     ))
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
-/// incoming widening or revocation, against the room's authorized state at the
-/// row's `effective_at`. An unknown room is not this check's refusal (the
-/// door's own room check / FK refuses it as before), so it returns `Ok(())`.
+/// incoming widening (`is_revocation == false`) or revocation, signed by
+/// `signers` (the primary and every verified co-signer), against the room's
+/// authorized state at `effective_at`. An unknown room is not this check's
+/// refusal (the door's room check / FK refuses it), so it returns `Ok(())`.
 pub async fn check_community_roster_authority<F>(
     directory: &F,
     community_key_id: &str,
-    signer: &str,
+    primary: &str,
+    signers: &std::collections::BTreeSet<String>,
+    incoming: types::CommunityMember,
     is_revocation: bool,
-    subject_key_id: &str,
     effective_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
@@ -955,33 +1118,52 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
-    let (signers, moderators, widenings, revocations) =
-        roster_inputs(directory, &community).await?;
-    let founder_only = community.consensus_protocol == types::consensus_protocol::FOUNDER_ONLY;
-    let state = authorized_roster_state_at(
-        community_key_id,
-        &community.members,
-        &signers,
-        founder_only,
-        &moderators,
-        &widenings,
-        &revocations,
-        effective_at,
+    // The incoming row is judged against the history WITHOUT itself: an exact
+    // retry of a row already stored (the #861 no-op) must not be judged
+    // against a roster its own admission changed.
+    let events: Vec<RosterEvent> = Box::pin(community_roster_events(directory, &community))
+        .await?
+        .into_iter()
+        .filter(|e| {
+            !(e.is_add == !is_revocation
+                && e.effective_at == effective_at
+                && e.member.key_id == incoming.key_id)
+        })
+        .collect();
+    let rules = RosterRules::of_community(&community);
+    let state = authorized_roster_state_at(&community.members, rules, &events, effective_at);
+    let mut roots = founder_candidates(
+        &community,
+        &directory
+            .list_community_membership_widenings_for(community_key_id)
+            .await?,
     );
-    roster_standing(
+    if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
+        roots.remove(&incoming.key_id);
+    }
+    let moderator_roots = Box::pin(moderator_roots_at(
+        directory,
         community_key_id,
-        &state,
-        signers.record_authority_key_id.as_deref(),
-        founder_only,
-        &moderators,
-        Some(signer),
-        is_revocation,
-        subject_key_id,
-    )
-    .map_err(|rule| Error::RosterAuthorityUnauthorized {
-        community_key_id: community_key_id.to_owned(),
-        offered_authority_key_id: signer.to_owned(),
-        rule,
+        &roots,
+        signers,
+        effective_at,
+    ))
+    .await?;
+    let e = RosterEvent {
+        effective_at,
+        is_add: !is_revocation,
+        member: incoming,
+        signers: signers.clone(),
+        moderator_roots,
+        reversed: false,
+    };
+    roster_event_standing(rules, &state, &e).map_err(|(rule, detail)| {
+        tracing::debug!(community_key_id, primary, rule, detail = %detail, "roster change refused");
+        Error::RosterAuthorityUnauthorized {
+            community_key_id: community_key_id.to_owned(),
+            offered_authority_key_id: primary.to_owned(),
+            rule,
+        }
     })
 }
 
@@ -4279,7 +4461,13 @@ pub trait FederationDirectory: Send + Sync {
                 })?;
             let active =
                 authorized_community_roster_at(self, &record, widening.effective_at).await?;
-            if active.iter().any(|m| m.key_id == widening.member_key_id) {
+            // v49.0.0 (#910.4) — an active member with the SAME role is the
+            // idempotent no-op; a different role is a role change, judged by
+            // the protocol at the door like any other widening.
+            if active
+                .iter()
+                .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
+            {
                 return Ok(false);
             }
         }

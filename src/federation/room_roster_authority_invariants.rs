@@ -59,40 +59,86 @@ pub mod bodies {
         ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
     }
 
-    /// A room signed by `alice` (its record signer), members alice + bob,
-    /// neither tagged founder, under `protocol`. The room id is no key.
-    pub async fn make_room(
+    /// A room of `names` (each `{tag}-{name}`, registered user keys), the
+    /// first `founders` of them tagged `founder`, under `protocol`, signed by
+    /// `record_signer` (default: the first member) and carrying `policy_blob`.
+    /// The room id is no key. Returns the room id and the member key ids.
+    pub async fn make_group(
         d: &dyn FederationDirectory,
         tag: &str,
         protocol: &str,
-    ) -> (String, String, String) {
+        names: &[&str],
+        founders: usize,
+        policy_blob: Option<serde_json::Value>,
+        record_signer: Option<&str>,
+    ) -> (String, Vec<String>) {
         let room = format!("{tag}-room");
-        let alice = format!("{tag}-alice");
-        let bob = format!("{tag}-bob");
-        user(d, &alice).await;
-        user(d, &bob).await;
+        let keys: Vec<String> = names.iter().map(|n| format!("{tag}-{n}")).collect();
+        for k in &keys {
+            user(d, k).await;
+        }
+        let signer = record_signer
+            .map(str::to_owned)
+            .unwrap_or_else(|| keys[0].clone());
         d.put_community(ts::sign_community(
-            &alice,
+            &signer,
             Community {
                 community_key_id: room.clone(),
                 community_name: "authority room".into(),
-                members: [&alice, &bob]
-                    .into_iter()
-                    .map(|k| CommunityMember {
+                members: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| CommunityMember {
                         key_id: k.clone(),
                         joined_at: at("2026-01-01T00:00:00Z"),
-                        role: None,
+                        role: (i < founders).then(|| "founder".to_owned()),
                     })
                     .collect(),
                 founded_at: at("2026-01-01T00:00:00Z"),
                 consensus_protocol: protocol.to_owned(),
-                policy_blob: None,
+                policy_blob,
                 persist_row_hash: String::new(),
             },
         ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
-        (room, alice, bob)
+        (room, keys)
+    }
+
+    /// The common case: alice (founder) and bob, under `protocol`.
+    pub async fn make_room(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        protocol: &str,
+    ) -> (String, String, String) {
+        let (room, k) = make_group(d, tag, protocol, &["alice", "bob"], 1, None, None).await;
+        (room, k[0].clone(), k[1].clone())
+    }
+
+    /// A widening signed by `signers[0]` and co-signed by the rest.
+    async fn widen_by(
+        d: &dyn FederationDirectory,
+        signers: &[&str],
+        w: CommunityMembershipWidening,
+    ) -> Result<(), Error> {
+        let mut s = ts::sign_community_membership_widening(signers[0], w);
+        for c in &signers[1..] {
+            ts::cosign_community_membership_widening(&mut s, c);
+        }
+        d.put_community_membership_widening(s).await
+    }
+
+    /// A revocation signed by `signers[0]` and co-signed by the rest.
+    async fn revoke_by(
+        d: &dyn FederationDirectory,
+        signers: &[&str],
+        r: CommunityMembershipRevocation,
+    ) -> Result<(), Error> {
+        let mut s = ts::sign_community_membership_revocation(signers[0], r);
+        for c in &signers[1..] {
+            ts::cosign_community_membership_revocation(&mut s, c);
+        }
+        d.put_community_membership_revocation(s).await
     }
 
     async fn widen(
@@ -159,9 +205,10 @@ pub mod bodies {
         by_admission
     }
 
-    /// **I170 — admission is the roster.**
+    /// **I170 — admission is the roster.** A `founder_only` room, so the
+    /// founder's single signature is the protocol (CC 4.4.3.4.2).
     pub async fn i170_admission_is_the_roster(d: &dyn FederationDirectory, tag: &str) {
-        let (room, alice, _bob) = make_room(d, tag, consensus_protocol::MAJORITY).await;
+        let (room, alice, _bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
         let carol = format!("{tag}-carol");
         user(d, &carol).await;
         assert!(!admitted(d, &carol, &room).await, "{tag} I170: control");
@@ -185,7 +232,7 @@ pub mod bodies {
         .unwrap_or_else(|e| panic!("{tag} I170: revoke: {e}"));
         assert!(
             !admitted(d, &carol, &room).await,
-            "{tag} I170: a removed member is refused"
+            "{tag} I170: removed ⇒ refused"
         );
         widen(
             d,
@@ -198,195 +245,375 @@ pub mod bodies {
             admitted(d, &carol, &room).await,
             "{tag} I170: a removed-then-re-added member is admitted again (#907)"
         );
-        // A record member is admitted as before.
         assert!(admitted(d, &alice, &room).await);
     }
 
-    /// **I171 — a stranger cannot move the roster; every standing can.**
-    pub async fn i171_a_stranger_cannot_move_the_roster(d: &dyn FederationDirectory, tag: &str) {
+    /// **I171 — standing is the room's consensus protocol** (CC 4.4.3.2.3):
+    /// one arm per protocol, each refused and then admitted; a stranger is
+    /// retryable-refused; the record signer alone has no standing.
+    #[allow(clippy::too_many_lines)]
+    pub async fn i171_standing_is_the_protocol(d: &dyn FederationDirectory, tag: &str) {
         use crate::federation::{
-            ROSTER_AUTHORITY_RULE_INSUFFICIENT as INSUFFICIENT,
             ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED as NOT_ESTABLISHED,
-            ROSTER_AUTHORITY_RULE_REMOVED as REMOVED,
+            ROSTER_CONSENSUS_INSUFFICIENT as INSUFFICIENT,
+            ROSTER_CONSENSUS_UNEVALUABLE as UNEVALUABLE,
         };
-        let (room, alice, bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
-        let [eve, dave, frank, gina, mo, hank] =
-            ["eve", "dave", "frank", "gina", "mo", "hank"].map(|n| format!("{tag}-{n}"));
-        for k in [&eve, &dave, &frank, &gina, &mo, &hank] {
-            user(d, k).await;
+        let t = |n: u32| at(&format!("2026-03-{n:02}T00:00:00Z"));
+        let refused = |r: Result<(), Error>, want: &str, what: &str| {
+            let e = r.expect_err(what);
+            assert_eq!(rule_of(&e), want, "{tag} I171 {what}: {e}");
+        };
+        let newcomer = |n: &str| format!("{tag}-{n}");
+        for n in ["x1", "x2", "x3", "x4", "x5", "x6", "eve"] {
+            user(d, &newcomer(n)).await;
         }
-        let before = active(d, &room).await;
+        let eve = newcomer("eve");
 
-        // A stranger widens itself: retryable refusal, no row.
-        let e = widen(
+        // founder_only: a plain member refused, a founder admitted.
+        let (r, k) = make_group(
             d,
-            &eve,
-            widening(&room, &eve, at("2026-03-01T00:00:00Z"), None),
+            &format!("{tag}-fo"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["a", "b"],
+            1,
+            None,
+            None,
         )
-        .await
-        .expect_err("a stranger's widening is refused (#908)");
-        assert_eq!(rule_of(&e), NOT_ESTABLISHED, "{tag} I171: {e}");
-        // A stranger removes a member: refused, no row (the rotation shares
-        // the insert's transaction, so no epoch moved either).
-        let e = revoke(d, &eve, revocation(&room, &bob, at("2026-03-01T00:00:00Z")))
+        .await;
+        refused(
+            widen_by(d, &[&k[1]], widening(&r, &newcomer("x1"), t(1), None)).await,
+            INSUFFICIENT,
+            "founder_only: a plain member",
+        );
+        widen_by(d, &[&k[0]], widening(&r, &newcomer("x1"), t(2), None))
             .await
-            .expect_err("a stranger's revocation is refused (#908)");
-        assert_eq!(rule_of(&e), NOT_ESTABLISHED, "{tag} I171: {e}");
-        assert!(d
-            .list_community_membership_widenings_for(&room)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(d
-            .list_community_membership_revocations_for(&room)
-            .await
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            active(d, &room).await,
-            before,
-            "{tag} I171: the roster did not move"
+            .unwrap_or_else(|e| panic!("{tag} founder_only admits a founder: {e}"));
+        // A stranger: retryable, and no row is stored.
+        refused(
+            widen_by(d, &[&eve], widening(&r, &eve, t(3), None)).await,
+            NOT_ESTABLISHED,
+            "a stranger widens itself",
+        );
+        refused(
+            revoke_by(d, &[&eve], revocation(&r, &k[1], t(3))).await,
+            NOT_ESTABLISHED,
+            "a stranger removes a member",
+        );
+        assert!(
+            d.list_community_membership_revocations_for(&r)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I171: a refused removal stores no row (and rotates nothing)"
         );
 
-        // A plain member of a founder_only room: insufficient.
-        let e = widen(
+        // majority of three: one refused, two admitted.
+        let (r, k) = make_group(
             d,
-            &bob,
-            widening(&room, &dave, at("2026-03-02T00:00:00Z"), None),
+            &format!("{tag}-mj"),
+            consensus_protocol::MAJORITY,
+            &["a", "b", "c"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        refused(
+            widen_by(d, &[&k[1]], widening(&r, &newcomer("x2"), t(1), None)).await,
+            INSUFFICIENT,
+            "majority: 1 of 3",
+        );
+        widen_by(
+            d,
+            &[&k[1], &k[2]],
+            widening(&r, &newcomer("x2"), t(2), None),
         )
         .await
-        .expect_err("a plain member cannot widen a founder_only room");
-        assert_eq!(rule_of(&e), INSUFFICIENT, "{tag} I171: {e}");
+        .unwrap_or_else(|e| panic!("{tag} majority: 2 of 3: {e}"));
 
-        // Admitted: the record signer.
-        widen(
+        // unanimous of three: two refused, three admitted.
+        let (r, k) = make_group(
             d,
-            &alice,
-            widening(&room, &dave, at("2026-03-03T00:00:00Z"), None),
+            &format!("{tag}-un"),
+            consensus_protocol::UNANIMOUS,
+            &["a", "b", "c"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        refused(
+            widen_by(
+                d,
+                &[&k[0], &k[1]],
+                widening(&r, &newcomer("x3"), t(1), None),
+            )
+            .await,
+            INSUFFICIENT,
+            "unanimous: 2 of 3",
+        );
+        widen_by(
+            d,
+            &[&k[0], &k[1], &k[2]],
+            widening(&r, &newcomer("x3"), t(2), None),
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I171: the record signer widens: {e}"));
-        // Admitted: a founder (widened in as one by the record signer).
-        widen(
-            d,
-            &alice,
-            widening(&room, &frank, at("2026-03-04T00:00:00Z"), Some("founder")),
-        )
-        .await
-        .unwrap();
-        widen(
-            d,
-            &frank,
-            widening(&room, &gina, at("2026-03-05T00:00:00Z"), None),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I171: a founder widens: {e}"));
-        // Admitted: a named moderator (alice → mo, duty `moderate`), not a member.
-        d.put_attestation(crate::federation::SignedAttestation {
-            attestation: ts::moderate_delegation_attestation(&format!("{tag}-mod"), &alice, &mo),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I171: appoint mo: {e}"));
-        widen(
-            d,
-            &mo,
-            widening(&room, &hank, at("2026-03-06T00:00:00Z"), None),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I171: a named moderator widens: {e}"));
-        // Admitted: a member leaving.
-        revoke(
-            d,
-            &dave,
-            revocation(&room, &dave, at("2026-03-07T00:00:00Z")),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{tag} I171: a member leaves: {e}"));
-        // A removed member has no standing left.
-        revoke(
-            d,
-            &alice,
-            revocation(&room, &bob, at("2026-03-08T00:00:00Z")),
-        )
-        .await
-        .unwrap();
-        let e = revoke(
-            d,
-            &bob,
-            revocation(&room, &gina, at("2026-03-09T00:00:00Z")),
-        )
-        .await
-        .expect_err("a removed member cannot remove");
-        assert_eq!(rule_of(&e), REMOVED, "{tag} I171: {e}");
+        .unwrap_or_else(|e| panic!("{tag} unanimous: 3 of 3: {e}"));
 
-        let mut want = vec![alice.clone(), frank.clone(), gina.clone(), hank.clone()];
-        want.sort();
-        assert_eq!(active(d, &room).await, want, "{tag} I171: the fold");
-
-        // An open room: a plain member has standing.
-        let (open, _a2, bob2) =
-            make_room(d, &format!("{tag}-open"), consensus_protocol::MAJORITY).await;
-        let ivy = format!("{tag}-ivy");
-        user(d, &ivy).await;
-        widen(
+        // quorum:2/5 — absolute M.
+        let (r, k) = make_group(
             d,
-            &bob2,
-            widening(&open, &ivy, at("2026-03-01T00:00:00Z"), None),
+            &format!("{tag}-qu"),
+            "quorum:2/5",
+            &["a", "b", "c", "d", "e"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        refused(
+            widen_by(d, &[&k[3]], widening(&r, &newcomer("x4"), t(1), None)).await,
+            INSUFFICIENT,
+            "quorum:2/5: 1",
+        );
+        widen_by(
+            d,
+            &[&k[3], &k[4]],
+            widening(&r, &newcomer("x4"), t(2), None),
         )
         .await
-        .unwrap_or_else(|e| panic!("{tag} I171: a plain member of an open room widens: {e}"));
-        assert!(active(d, &open).await.contains(&ivy));
+        .unwrap_or_else(|e| panic!("{tag} quorum:2/5: 2: {e}"));
+
+        // custom:x undeclared — unevaluable, whoever signs.
+        let (r, k) = make_group(
+            d,
+            &format!("{tag}-cu"),
+            "custom:x",
+            &["a", "b"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        refused(
+            widen_by(
+                d,
+                &[&k[0], &k[1]],
+                widening(&r, &newcomer("x5"), t(1), None),
+            )
+            .await,
+            UNEVALUABLE,
+            "custom:x undeclared",
+        );
+
+        // The record signer alone — not a member — has no standing.
+        let rec = newcomer("rec");
+        user(d, &rec).await;
+        let (r, _k) = make_group(
+            d,
+            &format!("{tag}-rs"),
+            consensus_protocol::FOUNDER_ONLY,
+            &["a", "b"],
+            1,
+            None,
+            Some(&rec),
+        )
+        .await;
+        refused(
+            widen_by(d, &[&rec], widening(&r, &newcomer("x6"), t(1), None)).await,
+            NOT_ESTABLISHED,
+            "the record signer alone",
+        );
     }
 
-    /// **I172 — the fold judges the history, not the arrival.**
+    /// **I172 — the fold judges the history, not the arrival.** A majority
+    /// room of three; carol and alice remove bob at t1; bob and alice widen dan
+    /// at t2. A sees the widening first (2 of 3 then); B sees the removal
+    /// first and refuses the widening. After both arrive, both fold alike.
     pub async fn i172_the_fold_judges_the_history(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (room_id, alice, bob) = make_room(a, tag, consensus_protocol::MAJORITY).await;
-        let (room_b, _, _) = make_room(b, tag, consensus_protocol::MAJORITY).await;
-        assert_eq!(room_id, room_b);
-        let carol = format!("{tag}-carol");
-        user(a, &carol).await;
-        user(b, &carol).await;
-        let rev = ts::sign_community_membership_revocation(
-            &alice,
-            revocation(&room_id, &bob, at("2026-03-01T00:00:00Z")),
+        let names = ["alice", "bob", "carol"];
+        let (room, k) =
+            make_group(a, tag, consensus_protocol::MAJORITY, &names, 1, None, None).await;
+        let (room_b, _) =
+            make_group(b, tag, consensus_protocol::MAJORITY, &names, 1, None, None).await;
+        assert_eq!(room, room_b);
+        let (alice, bob, carol) = (&k[0], &k[1], &k[2]);
+        let dan = format!("{tag}-dan");
+        user(a, &dan).await;
+        user(b, &dan).await;
+        let mut rev = ts::sign_community_membership_revocation(
+            alice,
+            revocation(&room, bob, at("2026-03-01T00:00:00Z")),
         );
-        let wid = ts::sign_community_membership_widening(
-            &bob,
-            widening(&room_id, &carol, at("2026-03-02T00:00:00Z"), None),
+        ts::cosign_community_membership_revocation(&mut rev, carol);
+        let mut wid = ts::sign_community_membership_widening(
+            bob,
+            widening(&room, &dan, at("2026-03-02T00:00:00Z"), None),
         );
-        // A: the widening first — bob still has standing in A's state.
+        ts::cosign_community_membership_widening(&mut wid, alice);
         a.put_community_membership_widening(wid.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag} I172: A admits the widening first: {e}"));
         a.put_community_membership_revocation(rev.clone())
             .await
             .unwrap();
-        // B: the removal first — bob is removed by the widening's instant.
         b.put_community_membership_revocation(rev).await.unwrap();
         let e = b
             .put_community_membership_widening(wid)
             .await
-            .expect_err("B refuses a removed member's widening");
+            .expect_err("B refuses: bob was out at t2");
         assert_eq!(
             rule_of(&e),
-            crate::federation::ROSTER_AUTHORITY_RULE_REMOVED
+            crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            "{tag} I172: {e}"
         );
-        // Both folds: carol is out, bob is out — the same roster.
-        assert_eq!(
-            active(a, &room_id).await,
-            vec![alice.clone()],
-            "{tag} I172: A"
-        );
-        assert_eq!(active(b, &room_id).await, vec![alice], "{tag} I172: B");
-        assert!(!admitted(a, &carol, &room_id).await);
+        let want = {
+            let mut v = vec![alice.clone(), carol.clone()];
+            v.sort();
+            v
+        };
+        assert_eq!(active(a, &room).await, want, "{tag} I172: A");
+        assert_eq!(active(b, &room).await, want, "{tag} I172: B");
     }
 
-    /// The co-signer of `e` a refusal names, when it is a failed hybrid
-    /// verify (the same refusal a bad primary signature earns).
+    /// **I180 — the last founder, and leaving.** A member leaves on their own
+    /// signature, in any protocol; the last founder may not leave, or be
+    /// demoted, while others remain; a second founder frees them.
+    pub async fn i180_the_last_founder(d: &dyn FederationDirectory, tag: &str) {
+        let (room, k) = make_group(
+            d,
+            tag,
+            consensus_protocol::UNANIMOUS,
+            &["alice", "bob", "carol"],
+            1,
+            None,
+            None,
+        )
+        .await;
+        let (alice, bob, carol) = (&k[0], &k[1], &k[2]);
+        revoke_by(
+            d,
+            &[bob],
+            revocation(&room, bob, at("2026-03-01T00:00:00Z")),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I180: bob leaves a unanimous room alone: {e}"));
+        let e = revoke_by(
+            d,
+            &[alice],
+            revocation(&room, alice, at("2026-03-02T00:00:00Z")),
+        )
+        .await
+        .expect_err("the last founder may not leave while carol remains");
+        assert_eq!(
+            rule_of(&e),
+            crate::federation::ROSTER_LAST_FOUNDER,
+            "{tag} I180: {e}"
+        );
+        let e = widen_by(
+            d,
+            &[alice, carol],
+            widening(&room, alice, at("2026-03-02T00:00:00Z"), None),
+        )
+        .await
+        .expect_err("nor be demoted");
+        assert_eq!(
+            rule_of(&e),
+            crate::federation::ROSTER_LAST_FOUNDER,
+            "{tag} I180 demote: {e}"
+        );
+        widen_by(
+            d,
+            &[alice, carol],
+            widening(&room, carol, at("2026-03-03T00:00:00Z"), Some("founder")),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I180: carol promoted: {e}"));
+        revoke_by(
+            d,
+            &[alice],
+            revocation(&room, alice, at("2026-03-04T00:00:00Z")),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I180: alice may leave once carol is a founder: {e}"));
+        assert_eq!(active(d, &room).await, vec![carol.clone()], "{tag} I180");
+    }
+
+    /// **I182 — declared rubrics and custom protocols are evaluated.** The
+    /// room record's `policy_blob` declares them; the evaluator reads them.
+    pub async fn i182_declared_protocols(d: &dyn FederationDirectory, tag: &str) {
+        let blob = serde_json::json!({
+            "rubrics": {"votes": {"weights": {"role:founder": 3}, "default_weight": 1, "threshold": 4}},
+            "custom": {"council": {"all_of": [{"founder": {}}, {"quorum": 2}]}}
+        });
+        let x = format!("{tag}-x");
+        let y = format!("{tag}-y");
+        user(d, &x).await;
+        user(d, &y).await;
+        let (r, k) = make_group(
+            d,
+            &format!("{tag}-w"),
+            "weighted:votes",
+            &["a", "b", "c"],
+            1,
+            Some(blob.clone()),
+            None,
+        )
+        .await;
+        let e = widen_by(
+            d,
+            &[&k[1], &k[2]],
+            widening(&r, &x, at("2026-03-01T00:00:00Z"), None),
+        )
+        .await
+        .expect_err("2 of 4 weight");
+        assert_eq!(
+            rule_of(&e),
+            crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            "{tag} I182 weighted: {e}"
+        );
+        widen_by(
+            d,
+            &[&k[0], &k[1]],
+            widening(&r, &x, at("2026-03-02T00:00:00Z"), None),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I182 weighted: 4 of 4: {e}"));
+        let (r, k) = make_group(
+            d,
+            &format!("{tag}-c"),
+            "custom:council",
+            &["a", "b", "c"],
+            1,
+            Some(blob),
+            None,
+        )
+        .await;
+        let e = widen_by(
+            d,
+            &[&k[1], &k[2]],
+            widening(&r, &y, at("2026-03-01T00:00:00Z"), None),
+        )
+        .await
+        .expect_err("no founder");
+        assert_eq!(
+            rule_of(&e),
+            crate::federation::ROSTER_CONSENSUS_INSUFFICIENT,
+            "{tag} I182 custom: {e}"
+        );
+        widen_by(
+            d,
+            &[&k[0], &k[1]],
+            widening(&r, &y, at("2026-03-02T00:00:00Z"), None),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I182 custom: founder + 2: {e}"));
+    }
+
     fn unverified_signer(e: &Error) -> &str {
         match e {
             Error::FederationTierUnverified {
@@ -640,7 +867,7 @@ pub mod bodies {
             CommunityMember {
                 key_id: "a".into(),
                 joined_at: t0,
-                role: None,
+                role: Some("founder".into()),
             },
             CommunityMember {
                 key_id: "b".into(),
@@ -648,26 +875,24 @@ pub mod bodies {
                 role: None,
             },
         ];
-        let signers = crate::federation::CommunityRosterSigners {
-            record_authority_key_id: Some("a".into()),
-            widening_signers: vec![],
-            revocation_signers: vec![crate::federation::RosterEventSigner {
-                member_key_id: "b".into(),
-                effective_at: t1,
-                authority_key_id: None,
-                cosigner_key_ids: Vec::new(),
-            }],
+        let legacy = crate::federation::RosterEvent {
+            effective_at: t1,
+            is_add: false,
+            member: CommunityMember {
+                key_id: "b".into(),
+                joined_at: t1,
+                role: None,
+            },
+            signers: Default::default(),
+            moderator_roots: Default::default(),
+            reversed: false,
         };
-        let roster = crate::federation::authorized_roster_at(
-            "r",
-            &record,
-            &signers,
-            false,
-            &Default::default(),
-            &[],
-            &[revocation("r", "b", t1)],
-            t1,
-        );
+        let rules = crate::federation::RosterRules {
+            protocol: consensus_protocol::UNANIMOUS,
+            subkind: None,
+            policy_blob: None,
+        };
+        let roster = crate::federation::authorized_roster_at(&record, rules, &[legacy], t1);
         assert_eq!(
             roster.iter().map(|m| m.key_id.as_str()).collect::<Vec<_>>(),
             vec!["a"],
@@ -694,7 +919,7 @@ pub mod bodies {
 
     /// The store-half setup: a room, bob removed by alice.
     pub async fn i173_setup(d: &dyn FederationDirectory, tag: &str) -> (String, String) {
-        let (room, alice, bob) = make_room(d, tag, consensus_protocol::MAJORITY).await;
+        let (room, alice, bob) = make_room(d, tag, consensus_protocol::FOUNDER_ONLY).await;
         revoke(
             d,
             &alice,
@@ -733,9 +958,27 @@ mod run {
                 #[tokio::test]
                 async fn i171() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i171_a_stranger_cannot_move_the_roster(
+                    super::super::bodies::i171_standing_is_the_protocol(
                         &d as &dyn FederationDirectory,
                         &format!("i171-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i180() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i180_the_last_founder(
+                        &d as &dyn FederationDirectory,
+                        &format!("i180-{}", super::suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i182() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i182_declared_protocols(
+                        &d as &dyn FederationDirectory,
+                        &format!("i182-{}", super::suffix()),
                     )
                     .await
                 }

@@ -2442,6 +2442,38 @@ pub async fn resolve_reverse_quorum_for(
     let (roster, policy) = cohort_state(directory, cohort, cohort_key_id)
         .await?
         .unwrap_or_else(|| (Vec::new(), None));
+    resolve_reverse_quorum_with(
+        directory,
+        cohort,
+        cohort_key_id,
+        roster,
+        policy,
+        None,
+        action,
+        now,
+    )
+    .await
+}
+
+/// v49.0.0 (CIRISPersist#908) — [`resolve_reverse_quorum_for`] over a roster,
+/// policy and (optionally) duty-holder set the CALLER supplies. The roster
+/// fold uses it: it cannot let this fold read the roster, because that read IS
+/// the roster fold (whose reversed-removal leg is this fold) — an unbounded
+/// recursion. The caller passes the roster with no reversals applied (the
+/// members who could object) and, for a declared steward tier, the moderators
+/// that roster's founders appoint. Everything else — objections, dismissals
+/// re-counted against `roster`, ballots, escalation — is identical.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_reverse_quorum_with(
+    directory: &dyn FederationDirectory,
+    cohort: Cohort,
+    cohort_key_id: &str,
+    roster: Vec<String>,
+    policy: Option<ReverseQuorumPolicy>,
+    duty_holders: Option<Vec<String>>,
+    action: ActionRef<'_>,
+    now: DateTime<Utc>,
+) -> Result<ReverseQuorumFold, Error> {
     let rows = objections_against(directory, action).await?;
 
     let (ballot_rows, rows): (Vec<Attestation>, Vec<Attestation>) =
@@ -2472,8 +2504,9 @@ pub async fn resolve_reverse_quorum_for(
     // their own objection, and the escalated undo would be vetoable by anyone.
     // It looks like an independent reviewer set and is the objectors. See the
     // three-way table on `appointed_moderators_of`.
-    let duty_holders: Vec<String> = match (policy.and_then(|p| p.steward), cohort) {
-        (Some(_), Cohort::Community | Cohort::Affiliations) => {
+    let duty_holders: Vec<String> = match (policy.and_then(|p| p.steward), cohort, duty_holders) {
+        (_, _, Some(given)) => given,
+        (Some(_), Cohort::Community | Cohort::Affiliations, None) => {
             super::admission::appointed_moderators_of(
                 directory,
                 cohort_key_id,
@@ -3974,6 +4007,123 @@ pub(crate) mod test_support {
         .expect("put_community");
     }
 
+    /// v49.0.0 — **I181: a reverse-quorum roster removal is protective and
+    /// undoable** (FSD §2 `reverse_quorum` row). One member's signature lands
+    /// a removal; `m` distinct in-window objections against the revocation's
+    /// `persist_row_hash` reverse it and the member counts again. An addition
+    /// is a capability grant: one signature is refused, the #574 dismissal
+    /// threshold (here 3 of 5) admits it.
+    pub(crate) async fn exercise_reverse_quorum_roster_removal(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{
+            CommunityMembershipRevocation, CommunityMembershipWidening,
+        };
+        let names = ["alice", "bob", "carol", "dave", "erin", "frank"];
+        let [alice, bob, carol, dave, erin, frank] = names.map(|n| format!("rqr-{n}-{suffix}"));
+        let community = format!("rqr-commons-{suffix}");
+        for k in [&alice, &bob, &carol, &dave, &erin, &frank] {
+            register_user_key(dir, k).await;
+        }
+        let roster = vec![
+            alice.clone(),
+            bob.clone(),
+            carol.clone(),
+            dave.clone(),
+            erin.clone(),
+        ];
+        seed_community(dir, &community, &roster, "reverse_quorum:2/5:86400").await;
+        let active = || async {
+            dir.active_community_members(&community)
+                .await
+                .expect("roster")
+                .into_iter()
+                .map(|m| m.key_id)
+                .collect::<Vec<_>>()
+        };
+        let at = Utc::now() - Duration::hours(1);
+        dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
+            &bob,
+            CommunityMembershipRevocation {
+                community_key_id: community.clone(),
+                removed_identity_key_id: carol.clone(),
+                removed_at: at,
+                effective_at: at,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("({suffix}) I181: one member's removal lands: {e}"));
+        assert!(
+            !active().await.contains(&carol),
+            "({suffix}) I181: carol is out"
+        );
+        let row_hash = dir
+            .list_community_membership_revocations_for(&community)
+            .await
+            .expect("revocations")
+            .into_iter()
+            .find(|r| r.removed_identity_key_id == carol)
+            .expect("stored")
+            .persist_row_hash;
+        let action = ActionRef {
+            actor_key_id: &bob,
+            action_id: &row_hash,
+            asserted_at: at,
+        };
+        for (i, objector) in [&dave, &erin].into_iter().enumerate() {
+            let o = signed_row(
+                &uuid::Uuid::new_v4().to_string(),
+                objector,
+                &bob,
+                objection_envelope(Cohort::Community, &community, &row_hash, "she did nothing"),
+                Utc::now(),
+                &[],
+            );
+            record_objection_against(dir, &o, action)
+                .await
+                .unwrap_or_else(|e| panic!("({suffix}) I181: objection {i}: {e}"));
+            if i == 0 {
+                assert!(
+                    !active().await.contains(&carol),
+                    "({suffix}) I181: one objection does not reverse (m = 2)"
+                );
+            }
+        }
+        assert!(
+            active().await.contains(&carol),
+            "({suffix}) I181: two objections reverse the removal — carol counts again"
+        );
+        let widen = |signers: &[&str]| {
+            let mut s = ts::sign_community_membership_widening(
+                signers[0],
+                CommunityMembershipWidening {
+                    community_key_id: community.clone(),
+                    member_key_id: frank.clone(),
+                    joined_at: Utc::now(),
+                    effective_at: Utc::now(),
+                    role: None,
+                    persist_row_hash: String::new(),
+                },
+            );
+            for c in &signers[1..] {
+                ts::cosign_community_membership_widening(&mut s, c);
+            }
+            s
+        };
+        dir.put_community_membership_widening(widen(&[&bob]))
+            .await
+            .expect_err("an addition is never 1-of-N");
+        dir.put_community_membership_widening(widen(&[&bob, &dave, &erin]))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) I181: three of five admit an addition: {e}"));
+        assert!(active().await.contains(&frank), "({suffix}) I181");
+    }
+
     /// v49.0.0 — the [`ActionRef`] witness: the fold reverses an action that
     /// is NOT an attestation.
     ///
@@ -4573,12 +4723,14 @@ pub(crate) mod test_support {
                 joined_at: Utc::now(),
                 role: Some("member".to_owned()),
             };
-            // v49.0.0 (#908) — the commons' founder signs its growth; a
+            // v49.0.0 (#908) — the commons' own protocol signs its growth (an
+            // addition under reverse_quorum needs the dismissal threshold); a
             // newcomer has no standing to admit itself.
-            let spec = crate::federation::cohort::test_support::admit_community_via(
-                dir, &alice, &community, &member,
-            )
-            .await;
+            let spec =
+                crate::federation::tier_ingest::test_support::widening_admit_spec_by_consensus(
+                    dir, &community, &member,
+                )
+                .await;
             dir.add_community_member(&community, member, &spec)
                 .await
                 .expect("grow the commons");
