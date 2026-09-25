@@ -114,6 +114,9 @@ pub mod bytes_plane_tombstone_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+/// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
+#[cfg(test)]
+pub mod family_roster_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
