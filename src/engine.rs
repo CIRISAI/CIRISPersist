@@ -19016,10 +19016,12 @@ mod tests {
             types::Family {
                 family_key_id: fam.clone(),
                 family_name: "f".into(),
+                // v49.0.0 (#910): fmk[0] founds the `founder_only` family, so
+                // its signature is the protocol.
                 members: vec![types::FamilyMember {
                     key_id: fmk[0].clone(),
                     joined_at: joined,
-                    role: None,
+                    role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
                 }],
                 founded_at: joined,
                 consensus_protocol: "founder_only".into(),
@@ -19031,11 +19033,13 @@ mod tests {
         .expect("put_family");
 
         // add → §9 added event
-        // v31.0.0 (CIRISPersist#654) — signed over the GROWN family envelope.
+        // v49.0.0 (CIRISPersist#910) — signed over the family WIDENING row by
+        // the founder. The newcomer joins as a founder so the founder leaving
+        // below is not the last one (`roster_last_founder`).
         let newcomer = RosterMember {
             key_id: fmk[1].clone(),
             joined_at: joined,
-            role: None,
+            role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
         };
         let admit = crate::federation::cohort::test_support::admit_roster_member_via(
             d,
@@ -19056,7 +19060,7 @@ mod tests {
             &fmk[0],
             crate::federation::tier_ingest::test_support::sign_revoke_spec(
                 Cohort::Family,
-                &fam,
+                &fmk[0], // v49.0.0 (#910): the member leaves on their own signature
                 &fam,
                 &fmk[0],
                 chrono::Utc::now(),

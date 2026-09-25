@@ -150,18 +150,22 @@ pub mod bodies {
         ops::seed_test_family(b, &fam, &holders, "quorum:2/2")
             .await
             .unwrap();
-        b.put_family_membership_revocation(ts::sign_family_membership_revocation(
-            &holders[0],
-            FamilyMembershipRevocation {
-                family_key_id: fam.clone(),
-                removed_identity_key_id: holders[1].clone(),
-                removed_at: at("2026-02-01T00:00:00Z"),
-                effective_at: at("2026-02-01T00:00:00Z"),
-                reason: None,
-                witness_set: Vec::new(),
-                persist_row_hash: String::new(),
-            },
-        ))
+        // v49.0.0 (#910): signed by the family's own `quorum:2/2` — both seats.
+        b.put_family_membership_revocation(
+            ts::sign_family_revocation_by_consensus(
+                b,
+                FamilyMembershipRevocation {
+                    family_key_id: fam.clone(),
+                    removed_identity_key_id: holders[1].clone(),
+                    removed_at: at("2026-02-01T00:00:00Z"),
+                    effective_at: at("2026-02-01T00:00:00Z"),
+                    reason: None,
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            )
+            .await,
+        )
         .await
         .unwrap_or_else(|e| {
             panic!("{tag} I163: a keyless family must be able to revoke a seat: {e}")

@@ -28427,7 +28427,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    &fam,
+                    &member, /* v49.0.0 (#910): the member leaves on their own signature */
                     rev.clone(),
                 ),
             )
@@ -31098,7 +31098,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "fam-1",
+                    "bob-root", /* v49.0.0 (#910): the member leaves on their own signature */
                     FamilyMembershipRevocation {
                         family_key_id: "fam-1".into(),
                         removed_identity_key_id: "bob-root".into(),
@@ -34148,11 +34148,13 @@ mod tests {
             err.to_string().contains("not registered") || err.to_string().contains("signature"),
             "the refusal is about AUTHORSHIP: {err:?}"
         );
+        // v49.0.0 (#910): alice — the whole of this `unanimous` family — signs;
+        // over a DIFFERENT widening row, her signature admits nothing.
         let wrong = crate::federation::cohort::test_support::admit_family(
-            "fam",
+            "alice",
             &fam_before,
             &crate::federation::types::FamilyMember {
-                key_id: "alice".into(),
+                key_id: "carol".into(),
                 joined_at: chrono::Utc::now(),
                 role: None,
             },
@@ -34160,7 +34162,7 @@ mod tests {
         backend
             .add_family_member("fam", bob_row.clone(), &wrong)
             .await
-            .expect_err("a signature over a different grown roster must not admit this one");
+            .expect_err("a signature over a different widening must not admit this one");
         assert_eq!(
             backend
                 .lookup_family("fam")
@@ -34174,23 +34176,24 @@ mod tests {
         );
 
         let admit =
-            crate::federation::cohort::test_support::admit_family("fam", &fam_before, &bob_row);
+            crate::federation::cohort::test_support::admit_family("alice", &fam_before, &bob_row);
         assert!(backend
             .add_family_member("fam", bob_row, &admit)
             .await
             .expect("signed roster grow"));
 
-        // The STORED row verifies against the STORED signature — the roster and
-        // its authorization moved together (#654/#651).
+        // v49.0.0 (CIRISPersist#910) — the STORED record is the founding one
+        // (growth rides the family widening plane) and still verifies against
+        // its own stored signature; the fold has bob.
         let signed_fam = backend
             .list_signed_families_since(None, u32::MAX)
             .await
             .unwrap()
             .into_iter()
             .find(|f| f.family.family.family_key_id == "fam")
-            .expect("the grown family is served on the signed read surface")
+            .expect("the family is served on the signed read surface")
             .family;
-        assert_eq!(signed_fam.family.members.len(), 2);
+        assert_eq!(signed_fam.family.members.len(), 1);
         crate::federation::verify_family_admission(&backend, &signed_fam)
             .await
             .expect("the stored family must verify against its own stored signature");
@@ -34206,10 +34209,14 @@ mod tests {
                 .is_ok()
         );
 
-        // Roster grew: bob is now a member.
-        let fam = backend.lookup_family("fam").await.unwrap().unwrap();
+        // Roster grew: bob is now a member (by the one fold).
         assert!(
-            fam.members.iter().any(|m| m.key_id == "bob"),
+            backend
+                .active_family_members("fam")
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.key_id == "bob"),
             "add_family_member put bob on the roster"
         );
 
@@ -34241,9 +34248,14 @@ mod tests {
                 .unwrap(),
             "re-admitting an existing member returns false"
         );
-        let fam2 = backend.lookup_family("fam").await.unwrap().unwrap();
         assert_eq!(
-            fam2.members.iter().filter(|m| m.key_id == "bob").count(),
+            backend
+                .active_family_members("fam")
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.key_id == "bob")
+                .count(),
             1,
             "no duplicate roster entry"
         );
@@ -34300,7 +34312,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "fam",
+                    "dave", /* v49.0.0 (#910): the member leaves on their own signature */
                     crate::federation::FamilyMembershipRevocation {
                         family_key_id: "fam".into(),
                         removed_identity_key_id: "dave".into(),
@@ -35606,7 +35618,7 @@ mod tests {
             .expect("v48.0.0 (#860): the family row the revocation FK references");
         let signed =
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                "fmr504-fam",
+                "fmr504-removed", /* v49.0.0 (#910): the member leaves on their own signature */
                 crate::federation::FamilyMembershipRevocation {
                     family_key_id: "fmr504-fam".into(),
                     removed_identity_key_id: "fmr504-removed".into(),
@@ -49649,7 +49661,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             .unwrap();
         let rev = |member: &str, effective_at: chrono::DateTime<chrono::Utc>| {
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                "afm-fam",
+                member, /* v49.0.0 (#910): the member leaves on their own signature */
                 crate::federation::FamilyMembershipRevocation {
                     family_key_id: "afm-fam".into(),
                     removed_identity_key_id: member.into(),

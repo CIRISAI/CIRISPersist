@@ -18968,7 +18968,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "fam-A",
+                    "carol", /* v49.0.0 (#910): the member leaves on their own signature */
                     rev.clone(),
                 ),
             )
@@ -18997,7 +18997,8 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "fam-A", rev,
+                    "carol", /* v49.0.0 (#910): the member leaves on their own signature */
+                    rev,
                 ),
             )
             .await
@@ -19587,7 +19588,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "afm-fam",
+                    "afm-carol", /* v49.0.0 (#910): the member leaves on their own signature */
                     FamilyMembershipRevocation {
                         family_key_id: "afm-fam".into(),
                         removed_identity_key_id: "afm-carol".into(),
@@ -19613,7 +19614,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "afm-fam",
+                    "afm-carol", /* v49.0.0 (#910): the member leaves on their own signature */
                     FamilyMembershipRevocation {
                         family_key_id: "afm-fam".into(),
                         removed_identity_key_id: "afm-carol".into(),
@@ -21780,9 +21781,11 @@ mod tests {
         ts::seed_two_member_community(&b, cid, alice, bob).await;
 
         let first = now - chrono::Duration::seconds(5);
-        for at in [first, now] {
+        // v49.0.0 (CIRISPersist#910.1, V154) — the family PK carries the
+        // instant too: an EXACT repeat is the #861 no-op.
+        for at in [first, first] {
             b.put_family_membership_revocation(ts::sign_family_membership_revocation(
-                fam,
+                bob, /* v49.0.0 (#910): the member leaves on their own signature */
                 crate::federation::types::FamilyMembershipRevocation {
                     family_key_id: fam.into(),
                     removed_identity_key_id: bob.into(),
@@ -21802,6 +21805,29 @@ mod tests {
             fam_rows[0].removed_at.timestamp(),
             first.timestamp(),
             "the FIRST recorded family revocation stands — memory used to overwrite it"
+        );
+        // A removal at ANOTHER instant is another event, stored beside it.
+        b.put_family_membership_revocation(ts::sign_family_membership_revocation(
+            bob,
+            crate::federation::types::FamilyMembershipRevocation {
+                family_key_id: fam.into(),
+                removed_identity_key_id: bob.into(),
+                removed_at: now,
+                effective_at: now,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("a removal at another instant is admitted");
+        assert_eq!(
+            b.list_family_membership_revocations_for(fam)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "#910.1: a removal at another instant is another row"
         );
 
         let epoch = || {
@@ -23738,11 +23764,20 @@ mod tests {
                 crate::federation::types::Family {
                     family_key_id: "e4-fmr-fam".into(),
                     family_name: "E4 FMR Household".into(),
-                    members: vec![crate::federation::types::FamilyMember {
-                        key_id: "e4-fmr-member".into(),
-                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        role: None,
-                    }],
+                    members: vec![
+                        crate::federation::types::FamilyMember {
+                            key_id: "e4-fmr-member".into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: None,
+                        },
+                        // v49.0.0 (#910): the honest authority has standing
+                        // — it founds this `founder_only` family.
+                        crate::federation::types::FamilyMember {
+                            key_id: "e4-fmr-authority".into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+                        },
+                    ],
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,

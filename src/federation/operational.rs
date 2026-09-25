@@ -4478,17 +4478,16 @@ pub mod test_support {
         for i in 3..5 {
             let extra = format!("{tag}-h{i}");
             register_typed_key(directory, &extra, identity_type::NODE).await?;
-            // v31.0.0 (CIRISPersist#654) — the roster grow carries an authority
-            // signature over the GROWN envelope; the newcomer signs its own
-            // admission here purely because it is the key this fixture just
-            // registered.
+            // v49.0.0 (CIRISPersist#910) — the grow rides the family widening
+            // plane, signed by the accord's own protocol (the seated holders
+            // that meet it), not by the newcomer admitting itself.
             let member = crate::federation::types::FamilyMember {
                 key_id: extra.clone(),
                 joined_at: chrono::Utc::now(),
                 role: Some("founder".to_owned()),
             };
-            let spec = crate::federation::cohort::test_support::admit_family_via(
-                directory, &extra, &accord, &member,
+            let spec = crate::federation::tier_ingest::test_support::family_widening_admit_spec_by_consensus(
+                directory, &accord, &member,
             )
             .await;
             directory.add_family_member(&accord, member, &spec).await?;
@@ -5295,15 +5294,15 @@ pub mod test_support {
         for i in 3..5 {
             let extra = format!("{tag}-h{i}");
             register_typed_key(directory, &extra, identity_type::NODE).await?;
-            // v31.0.0 (CIRISPersist#654) — signed roster grow; see the twin
-            // fixture above.
+            // v49.0.0 (CIRISPersist#910) — the plane, by the accord's own
+            // protocol; see the twin fixture above.
             let member = crate::federation::types::FamilyMember {
                 key_id: extra.clone(),
                 joined_at: chrono::Utc::now(),
                 role: Some("founder".to_owned()),
             };
-            let spec = crate::federation::cohort::test_support::admit_family_via(
-                directory, &extra, &accord, &member,
+            let spec = crate::federation::tier_ingest::test_support::family_widening_admit_spec_by_consensus(
+                directory, &accord, &member,
             )
             .await;
             directory.add_family_member(&accord, member, &spec).await?;

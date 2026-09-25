@@ -33645,8 +33645,10 @@ mod tests {
             joined_at: now,
             role: None,
         };
+        // v49.0.0 (#910): alice — the whole of this `unanimous` family — signs
+        // the family widening row.
         let admit =
-            crate::federation::cohort::test_support::admit_family(&fam, &fam_before, &bob_row);
+            crate::federation::cohort::test_support::admit_family(&alice, &fam_before, &bob_row);
         assert!(backend
             .add_family_member(&fam, bob_row, &admit)
             .await
@@ -33660,9 +33662,24 @@ mod tests {
             .await
             .is_ok());
 
-        // Roster grew (the PG UPDATE path).
-        let looked = backend.lookup_family(&fam).await.unwrap().unwrap();
-        assert!(looked.members.iter().any(|m| m.key_id == bob));
+        // Roster grew — by the one fold; the record is the founding one
+        // (v49.0.0, #910: growth rides the family widening plane).
+        assert!(backend
+            .active_family_members(&fam)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.key_id == bob));
+        assert_eq!(
+            backend
+                .lookup_family(&fam)
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            1
+        );
 
         // Forward path: a NEW write reaches BOTH alice + bob.
         let blob2 =
@@ -33688,9 +33705,14 @@ mod tests {
             )
             .await
             .unwrap());
-        let looked2 = backend.lookup_family(&fam).await.unwrap().unwrap();
         assert_eq!(
-            looked2.members.iter().filter(|m| m.key_id == bob).count(),
+            backend
+                .active_family_members(&fam)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.key_id == bob)
+                .count(),
             1
         );
     }
@@ -38325,7 +38347,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    &fam,
+                    &member, /* v49.0.0 (#910): the member leaves on their own signature */
                     rev.clone(),
                 ),
             )
@@ -46940,7 +46962,7 @@ mod tests {
         let removed_at = chrono::Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
         let signed =
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                &fam,
+                &removed, /* v49.0.0 (#910): the member leaves on their own signature */
                 crate::federation::FamilyMembershipRevocation {
                     family_key_id: fam.clone(),
                     removed_identity_key_id: removed.clone(),
