@@ -100,7 +100,7 @@ A stored row with **no recorded signer** (a revocation admitted before V110 stor
 
 - `list_communities_for_member` (all backends) returns rooms the member appears in on the record **or in a widening**: containment in the room's history, still raw (a removed member is still listed). Its doc says so.
 - `list_communities_for_member_active` and `active_community_key_ids_for` keep a candidate iff `is_active_community_member(…)` by the authorized fold. The hand-rolled "any revocation wins" spelling is deleted.
-- Families have no widening plane and a two-part revocation key, so a removed family member cannot be re-added at all; `list_families_for_member_active` is unchanged and the gap is recorded on #907.
+- ~~Families have no widening plane and a two-part revocation key, so a removed family member cannot be re-added at all; `list_families_for_member_active` is unchanged and the gap is recorded on #907.~~ Closed by §10 (#910): families have the plane, the three-part key, and `list_families_for_member_active` reads `authorized_family_roster_at`.
 
 ## 6. Invariants
 
@@ -113,7 +113,7 @@ A stored row with **no recorded signer** (a revocation admitted before V110 stor
 
 ## 7. Not in scope
 - `supersede_community_with_quorum` checks a strict majority regardless of the room's protocol (a separate CC gap on the record-rewrite path); recorded on #908.
-- A family widening plane (§5).
+- ~~A family widening plane (§5).~~ In scope since §10 (#910).
 
 ## 8. Bundled: #909 and the verify re-pin
 
@@ -137,3 +137,4 @@ The first build (v49.0.0, single-signer standing) passed its witnesses; the full
 
 **Invariants.** I177 — family widening converges across two nodes (the I164 shape) and a removed family member is re-admitted (#910.1). I178 — a family role change and a `consensus_protocol` amendment each reach a peer; a forged or stale proof (wrong prior hash, insufficient quorum) is refused and the peer keeps its record. I179 — family standing is the family's protocol (I171's arms on the family plane), and `verify_membership_quorum`'s prior roster is the fold, not the raw record (#910.2).
 
+**Built (§10 items 1–4, #910.1–#910.3).** V154 (both dialects) adds `federation_family_membership_widenings` and rebuilds the family revocation table on `(family_key_id, removed_identity_key_id, effective_at)`. `EnvelopeKind::FamilyMembershipWidening` is the 18th kind, APPENDED (`REPLICATION_POLICY_HASH` `9d62d3a8…` → `7d0e97b4…`, `CONSENT_GRAMMAR_HASH` `07a677bb…` → `62de1696…`, both capsule digests re-pinned as growth). The family doors (`put_family_membership_widening`, `put_family_membership_revocation`) verify the primary and every co-signature and ask `check_family_roster_authority`, which runs the ONE standing function (`roster_event_standing`) over the family's own protocol — the community fold was generalized (`prepare_roster_events`, `check_roster_authority_over`) rather than copied; a family has no moderation plane. `family_roster_signers` returns the same `CommunityRosterSigners` shape (one shape of plane, one shape of signers). `add_family_member` is a trait default onto the plane; no backend rewrites a family record to grow it any more (`authorize_family_growth` is gone; `supersede_family*` is untouched). `active_family_members`, `list_families_for_member_active`, `group_prior_envelope` (so `verify_membership_quorum`'s prior roster) and the at-rest family fan-out read `authorized_family_roster_at`. Witnesses: I177 and I179 (`src/federation/family_roster_invariants.rs`, memory / sqlite / postgres). Item 5 (a group amendment replicates) and I178 are a separate slice.

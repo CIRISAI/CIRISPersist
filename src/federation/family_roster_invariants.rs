@@ -447,6 +447,44 @@ pub mod bodies {
             crate::federation::ROSTER_LAST_FOUNDER,
             "{tag} I179"
         );
+        // #910.4 — a role change rides the plane: the same member with a
+        // different role is a new widening, judged by the protocol; the same
+        // role again is the no-op. Promoted, bob is a founder, so alice is no
+        // longer the last one and may leave.
+        let promote = FamilyMember {
+            key_id: k[1].clone(),
+            joined_at: at("2026-02-03T00:00:00Z"),
+            role: Some("founder".to_owned()),
+        };
+        let spec = ts::family_widening_admit_spec(&k[0], &fo, &promote);
+        assert!(
+            d.add_family_member(&fo, promote.clone(), &spec)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I179: the founder promotes bob: {e}")),
+            "{tag} I179 (#910.4): a role change is a genuine change"
+        );
+        let again = FamilyMember {
+            joined_at: at("2026-02-04T00:00:00Z"),
+            ..promote
+        };
+        let spec = ts::family_widening_admit_spec(&k[0], &fo, &again);
+        assert!(
+            !d.add_family_member(&fo, again, &spec).await.unwrap(),
+            "{tag} I179 (#910.4): the same role again is the no-op"
+        );
+        assert_eq!(
+            d.lookup_family(&fo).await.unwrap().unwrap().members.len(),
+            2,
+            "{tag} I179: a role change never rewrites the record"
+        );
+        revoke_by(
+            d,
+            &[&k[0]],
+            revocation(&fo, &k[0], at("2026-02-05T00:00:00Z")),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I179: with bob a founder, alice may leave: {e}"));
+        assert!(!active(d, &fo).await.contains(&k[0]), "{tag} I179");
         // A stranger cannot remove a member either.
         let e = revoke_by(
             d,

@@ -12561,8 +12561,10 @@ pub(crate) async fn moderation_reach_of_at(
 /// v49.0.0 (CIRISPersist#908) — every key `root` reaches under the
 /// `moderate`-duty walk: the SAME walk [`appointed_moderators_of`] runs,
 /// exposed to the authorized roster fold, which supplies its own static roots
-/// (it must never ask the fold for them).
-#[cfg(test)]
+/// (it must never ask the fold for them). Its one caller is the
+/// backend-gated I175 witness, so it is gated the same way (the server-only
+/// test axis builds under `-D warnings`).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) async fn moderation_reach_of(
     directory: &dyn super::FederationDirectory,
     root: &str,
