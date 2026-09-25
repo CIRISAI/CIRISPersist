@@ -31348,8 +31348,9 @@ mod tests {
         removed: &str,
         effective: &str,
     ) -> crate::federation::SignedCommunityMembershipRevocation {
+        // v49.0.0 (#908): the member leaves on their own signature ("left").
         crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-            "comm",
+            removed,
             crate::federation::CommunityMembershipRevocation {
                 community_key_id: "comm".into(),
                 removed_identity_key_id: removed.into(),
@@ -32480,7 +32481,7 @@ mod tests {
         .await;
         let rev = |effective: chrono::DateTime<chrono::Utc>| {
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                "comm",
+                "bob", /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: "comm".into(),
                     removed_identity_key_id: "bob".into(),
@@ -32545,9 +32546,10 @@ mod tests {
             joined_at: chrono::Utc::now(),
             role: Some("member".into()),
         };
+        // v49.0.0 (#908): a majority of one is alice.
         let admit = crate::federation::cohort::test_support::admit_roster_member_via(
             &backend,
-            "comm",
+            "alice",
             Cohort::Affiliations,
             "comm",
             &carol_row,
@@ -32591,7 +32593,8 @@ mod tests {
                 "carol",
                 crate::federation::tier_ingest::test_support::sign_revoke_spec(
                     Cohort::Affiliations,
-                    "comm",
+                    "carol",
+                    // v49.0.0 (#908): the member leaves on their own signature.
                     "comm",
                     "carol",
                     chrono::Utc::now(),

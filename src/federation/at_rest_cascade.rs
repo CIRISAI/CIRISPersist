@@ -1753,6 +1753,7 @@ pub mod orchestrate {
         authority_key_id: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
+        cosignatures: &[crate::federation::types::RosterCosignature],
     ) -> Result<u64, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -1776,7 +1777,7 @@ pub mod orchestrate {
                     authority_key_id: authority_key_id.to_string(),
                     scrub_signature_classical: scrub_signature_classical.to_string(),
                     scrub_signature_pqc: scrub_signature_pqc.map(str::to_string),
-                    cosignatures: Vec::new(),
+                    cosignatures: cosignatures.to_vec(),
                 },
             )
             .await

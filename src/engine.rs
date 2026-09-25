@@ -6556,6 +6556,7 @@ impl Engine {
         authority_key_id: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
+        cosignatures: &[crate::federation::types::RosterCosignature],
     ) -> Result<u64, crate::federation::BlobError> {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
@@ -6579,6 +6580,7 @@ impl Engine {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    cosignatures,
                 )
                 .await
             }
@@ -6593,6 +6595,7 @@ impl Engine {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    cosignatures,
                 )
                 .await
             }
@@ -17980,7 +17983,9 @@ mod tests {
             let mem_c_row = RosterMember {
                 key_id: mem_c.clone(),
                 joined_at: joined,
-                role: None,
+                // v49.0.0 (#908): mem_c replaces the founder AS founder — a founder
+                // may not leave a room that still has members and no founder.
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
             };
             // v31.0.0 (CIRISPersist#654) — the add half of the swap is signed
             // over the roster as it stands when the add runs. The removal is
@@ -18585,9 +18590,11 @@ mod tests {
             witness_set: Vec::new(),
             persist_row_hash: String::new(),
         };
+        // v49.0.0 (#908): the member leaves on their own signature (the room
+        // key has no standing); no co-signers needed.
         let (_h, revoke_classical, revoke_pqc) =
             crate::federation::tier_ingest::test_support::sign_envelope(
-                &comm,
+                &cm[0],
                 &rev_rec.signing_envelope(),
             );
         let e2 = at_rest_cascade::orchestrate::rekey_community_member_revoke(
@@ -18596,9 +18603,10 @@ mod tests {
             &minter,
             &cm[0],
             revoke_at,
-            &comm,
+            &cm[0],
             &revoke_classical,
             revoke_pqc.as_deref(),
+            &[],
         )
         .await
         .expect("rekey on revoke");

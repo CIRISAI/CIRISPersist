@@ -728,7 +728,7 @@ pub mod two_node {
             "{tag} I63: the removal is newer than the mint"
         );
         let rev = ts::sign_community_membership_revocation(
-            &comm,
+            &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: xavier.clone(),
@@ -1193,7 +1193,7 @@ pub mod two_node {
         let removed_at = chrono::Utc::now();
         let effective_at = removed_at + chrono::Duration::milliseconds(400);
         let rev = ts::sign_community_membership_revocation(
-            &comm,
+            &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: xavier.clone(),

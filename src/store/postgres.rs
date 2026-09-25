@@ -32919,7 +32919,7 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    &comm,
+                    &bob, /* v49.0.0 (#908): the member leaves on their own signature */
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: comm.clone(),
                         removed_identity_key_id: bob.clone(),
@@ -33027,7 +33027,7 @@ mod tests {
             .expect("v48.0.0 (#860): the room row the revocation FK references");
         let rev = |effective: chrono::DateTime<chrono::Utc>| {
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                &comm,
+                &bob, /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: comm.clone(),
                     removed_identity_key_id: bob.clone(),
@@ -33134,9 +33134,10 @@ mod tests {
             joined_at: now,
             role: Some("member".into()),
         };
+        // v49.0.0 (#908): a majority of one is alice.
         let admit = crate::federation::cohort::test_support::admit_roster_member_via(
             &backend,
-            &coop,
+            &alice,
             Cohort::Affiliations,
             &coop,
             &carol_row,
@@ -33180,7 +33181,8 @@ mod tests {
                 &carol,
                 crate::federation::tier_ingest::test_support::sign_revoke_spec(
                     Cohort::Affiliations,
-                    &coop,
+                    &carol,
+                    // v49.0.0 (#908): the member leaves on their own signature.
                     &coop,
                     &carol,
                     chrono::Utc::now(),
@@ -33274,7 +33276,7 @@ mod tests {
         }
         let rev =
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                &comm,
+                &bob, /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: comm.clone(),
                     removed_identity_key_id: bob.clone(),

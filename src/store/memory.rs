@@ -17989,7 +17989,7 @@ mod tests {
         // future-dated check below is the actual thing under test.
         let rev = |effective_at: chrono::DateTime<chrono::Utc>| {
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                "ob-owner",
+                "ob-node", /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: "ob-owner".into(),
                     removed_identity_key_id: "ob-node".into(),
@@ -18042,7 +18042,11 @@ mod tests {
         // The affiliations group is a community row (shared storage), founded
         // by the user-role member ob-owner.
         let group = "aff-grp";
-        put_community_with(&backend, group, vec![member("ob-owner")], None)
+        // v49.0.0 (#908): ob-owner founds the group, so its signature is
+        // the founder_only protocol.
+        let mut founder = member("ob-owner");
+        founder.role = Some("founder".into());
+        put_community_with(&backend, group, vec![founder], None)
             .await
             .expect("affiliations group (community row) created");
 
@@ -18053,11 +18057,9 @@ mod tests {
             joined_at: chrono::Utc::now(),
             role: Some("member".into()),
         };
-        // v49.0.0 (#908) — the group signs its growth; ob-owner is a plain
-        // member of a founder_only group and has no standing to grow it.
         let admit = crate::federation::cohort::test_support::admit_roster_member_via(
             &backend,
-            group,
+            "ob-owner",
             Cohort::Affiliations,
             group,
             &joiner_row,
@@ -18104,7 +18106,8 @@ mod tests {
                 "ob-joiner",
                 crate::federation::tier_ingest::test_support::sign_revoke_spec(
                     Cohort::Affiliations,
-                    group,
+                    "ob-joiner",
+                    // v49.0.0 (#908): the member leaves on their own signature.
                     group,
                     "ob-joiner",
                     chrono::Utc::now(),
@@ -21533,7 +21536,7 @@ mod tests {
         // instant is another event (a re-added member can be removed again).
         for at in [first, first] {
             b.put_community_membership_revocation(ts::sign_community_membership_revocation(
-                cid,
+                bob, /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::types::CommunityMembershipRevocation {
                     community_key_id: cid.into(),
                     removed_identity_key_id: bob.into(),
