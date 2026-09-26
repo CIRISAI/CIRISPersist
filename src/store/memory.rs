@@ -4519,6 +4519,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .filter(|a| {
                 a.tier == attestation_tier::FEDERATION
                     && cohort_scope::suppresses_holds_bytes(&a.cohort_scope)
+                    // v50.0.0 (CIRISPersist#919) — stranded rows only: a row
+                    // naming a cohort target was PLACED (the SQL backends
+                    // render this same predicate).
+                    && !crate::federation::admission::envelope_names_cohort_target(
+                        &a.attestation_envelope,
+                    )
                     && match after_attestation_id {
                         Some(after) => a.attestation_id.as_str() > after,
                         None => true,
