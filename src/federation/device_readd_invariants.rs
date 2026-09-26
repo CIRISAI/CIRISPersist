@@ -1344,12 +1344,35 @@ pub(crate) mod two_node {
         FederationDirectory::apply_replicated_attestation(
             a,
             SignedAttestation {
-                attestation: binding,
+                attestation: binding.clone(),
             },
         )
         .await
         .unwrap_or_else(|e| panic!("(S) A admits bob's binding for d4: {e}"));
         anchor_local(a, &bob, &d4).await;
+        // (U) A settled row never re-wraps (#917 phase 2): the same binding
+        // re-delivered through both typed doors is `Unchanged`, and the hook,
+        // which fires on the store's `Inserted` only, does not run — so d4,
+        // now anchored, still holds nothing until the sweep.
+        let again = FederationDirectory::apply_replicated_attestation(
+            a,
+            SignedAttestation {
+                attestation: binding.clone(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("(U) re-delivery through the trait door: {e}"));
+        assert_eq!(again, ReplicatedAttestationOutcome::Unchanged, "(U)");
+        let again = FederationDirectory::put_attestation_synced(
+            a,
+            SignedAttestation {
+                attestation: binding,
+            },
+            &l.node_b,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("(U) re-delivery through the sync door: {e}"));
+        assert_eq!(again, ReplicatedAttestationOutcome::Unchanged, "(U)");
         assert_eq!(
             grants_of(d4.key.clone()).await,
             0,
