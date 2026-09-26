@@ -362,6 +362,35 @@ pub(crate) mod bodies {
             "(b') a put over an existing grant reports no insert"
         );
 
+        // (b'') — two concurrent calls for one device: between them every
+        // epoch is `granted` exactly once and `already_held` the other time,
+        // whichever pre-check ran first. Always true of a correct door; a door
+        // that reports its intent rather than its insert double-counts
+        // whenever the two pre-checks interleave.
+        for n in 0..3 {
+            let racer = format!("r{n}-{tag}");
+            device(b, &racer, Some(&bob), Some(kem().0), tag).await;
+            let (x, y) = tokio::join!(
+                door(racer.clone(), bob.clone()),
+                door(racer.clone(), bob.clone())
+            );
+            let (x, y) = (x.unwrap(), y.unwrap());
+            let mut granted = x.granted.clone();
+            granted.extend(y.granted.clone());
+            assert_eq!(
+                sorted(granted),
+                sorted(epochs.clone()),
+                "(b'') each epoch granted exactly once across two racing calls: {x:?} / {y:?}"
+            );
+            let mut held = x.already_held.clone();
+            held.extend(y.already_held.clone());
+            assert_eq!(
+                sorted(held),
+                sorted(epochs.clone()),
+                "(b'') and already-held exactly once: {x:?} / {y:?}"
+            );
+        }
+
         // (c) — a device bound to ANOTHER owner is refused by name, and
         // receives nothing — whoever claims the authority.
         for authority in [&bob, &carol] {
