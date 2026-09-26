@@ -3661,6 +3661,16 @@ impl Engine {
     /// `stamp_and_canonicalize` → sign → `assemble`, and written through
     /// [`FederationDirectory::widen_audience`], which runs the shape rule, the
     /// nine-axis cross-check and the ordinary put door.
+    ///
+    /// v50.0.0 (CIRISPersist#919) — **the one deliberate widening path.** This
+    /// verb widens whatever row it is handed, including a row that names its
+    /// cohort target: a host calling it is the member choosing to publish that
+    /// row wider, which is theirs to choose (CC 3.1.9). Nothing in persist
+    /// calls it automatically for a placed row: its only automatic caller is
+    /// the consent sweep ([`Self::promote_consented_backlog`]), whose widening
+    /// step refuses a row naming a cohort target
+    /// ([`crate::federation::admission::envelope_names_cohort_target`]) on
+    /// both passes. I186 pins both halves.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn widen_audience(
         &self,
@@ -3839,6 +3849,11 @@ impl Engine {
     ///    widening yet ([`FederationDirectory::list_widening_candidates`]) —
     ///    the sealed-before-grant case #530 found — are widened the same way.
     ///
+    /// Neither pass widens a row whose signed envelope names a cohort target
+    /// (CIRISPersist#919): its audience was placed by its emitter, and a
+    /// covering grant does not re-place it — a self file row's filename and
+    /// pointer never leave the self room this way.
+    ///
     /// The node signs only what it authored. A row by another key is entered
     /// by node co-scrub if the actor signed at write, else it WAITS
     /// (`awaiting_actor`); a widening of another key's claim always waits —
@@ -3953,6 +3968,18 @@ impl Engine {
         if cohort_scope::suppresses_holds_bytes(&placement.audience)
             || placement.audience == row.cohort_scope
         {
+            return;
+        }
+        // v50.0.0 (CIRISPersist#919) — a row naming a cohort target was PLACED
+        // by its emitter; a covering grant does not re-place it. Pass 2's page
+        // already excludes it (`list_widening_candidates`), but pass 1 widens
+        // a local row right after it enters the mesh, from the local page, so
+        // the rule is asked here too — the one place both passes widen. The
+        // row still enters the mesh at its own scope: it replicates to the
+        // room it names, and its metadata never leaves that room.
+        if crate::federation::admission::envelope_names_cohort_target(&row.attestation_envelope) {
+            tracing::debug!(attestation_id = %row.attestation_id,
+                "promote_consented_backlog: the row names its cohort target (placed); not widened");
             return;
         }
         let basis = CrossingBasis::ConsentGrant {

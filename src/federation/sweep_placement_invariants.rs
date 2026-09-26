@@ -10,12 +10,19 @@
 //! self-room KeyPackage widened to `federation` seconds after `share` placed
 //! it, and the owner's second device never joined.
 //!
-//! I186 — (a) a self-scoped row naming a self room, (b) a family-scoped row
-//! naming its family: neither is a widening candidate, and after the sweep
-//! each is unchanged with no widening; (c) a self-scoped row naming NO
-//! target under the same grant IS widened (#530's repair still runs);
-//! (d) the room-keyed fold still finds (a)'s row after the sweep; (e) memory,
+//! I186 — on CIRISServer's self-files ladder (self FILE rows and the MLS
+//! KeyPackage in the owner's self room, a family file row, a consent grant
+//! covering `file:` and `chat:` at `federation`): (a) no self-room row is a
+//! widening candidate, and after the sweep none has a widening ANYWHERE in the
+//! corpus — metadata (filename, pointer) never leaves the room; this holds for
+//! a placed row still LOCAL when the sweep runs (pass 1, which widens from the
+//! local page); (b) the same for the family row; (c) a self row naming NO
+//! target under the same grant IS widened (#530's repair still runs); (d) the
+//! second device's room read (rows naming the room, minus every row a
+//! `supersedes` stands for) lists the original rows, unsuperseded; (e) memory,
 //! sqlite and postgres return the same candidate set for the same fixture.
+//! `Engine::widen_audience`, the one deliberate path, stays callable for a
+//! placed row.
 
 /// The backend-agnostic candidate-read body; `run` instantiates it per
 /// backend and (e) compares the three.
@@ -26,12 +33,35 @@ pub mod bodies {
     use crate::federation::types::{attestation_tier, attestation_type, cohort_scope};
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
-    /// A federation-tier `scores` row by `signer` at `scope`, its envelope
-    /// carrying `extra` members (the cohort target, or none).
-    fn row(id: &str, signer: &str, scope: &str, extra: serde_json::Value) -> Attestation {
-        let mut envelope = serde_json::json!({
-            "dimension": "trust:demo:v1", "score": 1.0, "confidence": 0.9,
-        });
+    /// A self FILE row's envelope (CIRISServer's self-files ladder): the
+    /// filename and the blob pointer are the metadata that must not leave the
+    /// room; only the bytes are sealed.
+    pub fn file_envelope(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dimension": "file:doc:v1",
+            "filename": format!("{id}.txt"),
+            "blob_sha256": "ab".repeat(32),
+            "size": 42,
+        })
+    }
+
+    /// A self-room MLS handshake row (Edge's `key_package_attestation_in`).
+    pub fn chat_envelope(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dimension": "chat:key_package:v1",
+            "key_package": format!("kp-{id}"),
+        })
+    }
+
+    /// A federation-tier `scores` row by `signer` at `scope` over `envelope`,
+    /// plus `extra` members (the cohort target, or none).
+    fn row(
+        id: &str,
+        signer: &str,
+        scope: &str,
+        mut envelope: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> Attestation {
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 envelope[k] = v.clone();
@@ -112,12 +142,16 @@ pub mod bodies {
         let member = &members[0];
 
         let id = |name: &str| format!("{name}-{s}");
-        // (a) a self room: the owner's key names the room (Edge's
-        // `key_package_attestation_in` shape), under each alias.
-        for (name, alias) in [
-            ("a-room-community-key-id", "community_key_id"),
-            ("a-room-community-id", "community_id"),
-            ("a-room-cohort-key-id", "cohort_key_id"),
+        // (a) a self room: the owner's key names the room, under each alias —
+        // two self FILE rows and one MLS handshake row.
+        for (name, alias, envelope) in [
+            (
+                "a-room-community-key-id",
+                "community_key_id",
+                file_envelope as fn(&str) -> serde_json::Value,
+            ),
+            ("a-room-community-id", "community_id", chat_envelope),
+            ("a-room-cohort-key-id", "cohort_key_id", file_envelope),
         ] {
             put(
                 d,
@@ -125,6 +159,7 @@ pub mod bodies {
                     &id(name),
                     &node,
                     cohort_scope::SELF,
+                    envelope(&id(name)),
                     serde_json::json!({ alias: owner }),
                 ),
             )
@@ -137,6 +172,7 @@ pub mod bodies {
                 &id("b-family"),
                 member,
                 cohort_scope::FAMILY,
+                file_envelope(&id("b-family")),
                 serde_json::json!({ "family_key_id": fam }),
             ),
         )
@@ -149,6 +185,7 @@ pub mod bodies {
                 &id("b-self-names-family"),
                 &node,
                 cohort_scope::SELF,
+                file_envelope(&id("b-self-names-family")),
                 serde_json::json!({ "family_key_id": fam }),
             ),
         )
@@ -160,6 +197,7 @@ pub mod bodies {
                 &id("c-stranded"),
                 &node,
                 cohort_scope::SELF,
+                file_envelope(&id("c-stranded")),
                 serde_json::json!({}),
             ),
         )
@@ -170,6 +208,7 @@ pub mod bodies {
                 &id("c-empty-target"),
                 &node,
                 cohort_scope::SELF,
+                file_envelope(&id("c-empty-target")),
                 serde_json::json!({ "community_key_id": "" }),
             ),
         )
@@ -366,54 +405,103 @@ mod run {
         .await
         .expect("I186: family");
 
-        let emit = |scope: &'static str, target: serde_json::Value, tag: &str| {
-            let mut value = serde_json::json!({
-                "dimension": "trust:demo:v1", "score": 1.0, "confidence": 0.9,
-                "note": format!("{tag}-{s}"),
-            });
+        use super::bodies::{chat_envelope, file_envelope};
+        let emit = |scope: &'static str,
+                    mut envelope: serde_json::Value,
+                    target: serde_json::Value| {
             if let Some(obj) = target.as_object() {
                 for (k, v) in obj {
-                    value[k] = v.clone();
+                    envelope[k] = v.clone();
                 }
             }
-            let envelope = crate::federation::envelope::EnvelopeCore::from_value(value).unwrap();
+            let envelope = crate::federation::envelope::EnvelopeCore::from_value(envelope).unwrap();
             EmitAttestationInput::with_envelope(attestation_type::SCORES, envelope, scope)
         };
-        // (a) the self room: `community_key_id = <owner>` at `self`.
-        let room_row = engine
+        let in_room = serde_json::json!({ "community_key_id": owner });
+        // (a) the self room, as `share(.., With::MyDevices, ..)` places it: two
+        // self FILE rows and the MLS KeyPackage, `community_key_id = <owner>`.
+        let mut placed: Vec<String> = Vec::new();
+        for i in 0..2 {
+            placed.push(
+                engine
+                    .emit_attestation_self(emit(
+                        cohort_scope::SELF,
+                        file_envelope(&format!("a-file{i}-{s}")),
+                        in_room.clone(),
+                    ))
+                    .await
+                    .expect("I186: a self-room file row"),
+            );
+        }
+        let room_chat = engine
             .emit_attestation_self(emit(
                 cohort_scope::SELF,
-                serde_json::json!({ "community_key_id": owner }),
-                "a",
+                chat_envelope(&format!("a-kp-{s}")),
+                in_room.clone(),
             ))
             .await
-            .expect("I186: the self-room row");
-        // (b) the family row.
+            .expect("I186: the self-room KeyPackage");
+        placed.push(room_chat.clone());
+        // …and one placed row that is still LOCAL: the sweep's pass 1 enters
+        // it into the mesh and would widen it right after, from the local
+        // page — a trigger the candidate read never sees.
+        let mut local_env = file_envelope(&format!("a-local-{s}"));
+        local_env["community_key_id"] = serde_json::json!(owner);
+        let room_local = dir
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: node.clone(),
+                attested_key_id: None,
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    local_env,
+                )
+                .unwrap(),
+                subject_key_ids: vec![node.clone()],
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .expect("I186: the local self-room file row");
+        placed.push(room_local.clone());
+        let room_rows: Vec<String> = placed.clone();
+        // (b) a family file row.
         let family_row = engine
             .emit_attestation_self(emit(
                 cohort_scope::FAMILY,
+                file_envelope(&format!("b-file-{s}")),
                 serde_json::json!({ "family_key_id": fam }),
-                "b",
             ))
             .await
             .expect("I186: the family row");
-        // (c) the stranded row: `self`, no target.
+        placed.push(family_row.clone());
+        // (c) the stranded row: a self file row naming NO target.
         let stranded = engine
-            .emit_attestation_self(emit(cohort_scope::SELF, serde_json::json!({}), "c"))
+            .emit_attestation_self(emit(
+                cohort_scope::SELF,
+                file_envelope(&format!("c-file-{s}")),
+                serde_json::json!({}),
+            ))
             .await
             .expect("I186: the stranded row");
 
-        let before_room = dir.get_attestation(&room_row).await.unwrap().expect("a");
-        let before_family = dir.get_attestation(&family_row).await.unwrap().expect("b");
+        let mut before = Vec::new();
+        for id in &placed {
+            before.push(dir.get_attestation(id).await.unwrap().expect("placed row"));
+        }
 
-        // A federation-audience grant covering the rows' dimension. Its emit
-        // runs the sweep (the (c) hook); run it again explicitly.
+        // The ladder's consent grant: federation audience, covering `file:`
+        // and `chat:`. Its emit runs the sweep (the (c) hook); run it again
+        // explicitly, as the host tick would.
         let grant = serde_json::json!({
             "dimension": crate::federation::consent_peer_set::DIMENSION,
             "subject_key_ids": [peer],
             "payload": {
                 "grants": "replication",
-                "attestation_prefixes": ["trust:"],
+                "attestation_prefixes": ["file:", "chat:"],
                 "audience": "federation",
             },
             "subject_kind": "consent_replication",
@@ -430,9 +518,20 @@ mod run {
             .expect("I186: grant");
         engine.promote_consented_backlog().await.expect("sweep");
 
-        let by_node = dir.list_attestations_by(&node).await.unwrap();
+        // The whole corpus, every tier and scope (the one unfiltered read).
+        let mut corpus = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = dir
+                .list_attestations_for_migration(cursor.as_deref(), 512)
+                .await
+                .unwrap();
+            let Some(last) = page.last() else { break };
+            cursor = Some(last.attestation_id.clone());
+            corpus.extend(page);
+        }
         let widenings_of = |id: &str| -> Vec<String> {
-            by_node
+            corpus
                 .iter()
                 .filter(|a| {
                     a.attestation_type == attestation_type::SUPERSEDES
@@ -449,38 +548,60 @@ mod run {
             vec![cohort_scope::FEDERATION.to_owned()],
             "I186 (c): a stranded self row under a federation grant is widened (#530)"
         );
-        // (a), (b): no widening, and the row is byte-for-byte what it was.
-        for (label, before) in [
-            ("(a) self room", &before_room),
-            ("(b) family", &before_family),
-        ] {
+        // (a), (b) — METADATA NEVER LEAVES THE ROOM: no `supersedes` anywhere
+        // in the corpus stands for a placed row, no other row carries its
+        // filename, and the row itself is what it was.
+        for b in &before {
+            let id = b.attestation_id.as_str();
             assert!(
-                widenings_of(&before.attestation_id).is_empty(),
-                "I186 {label}: a row naming its cohort target was PLACED; the sweep must not \
-                 widen it (CIRISPersist#919): {:?}",
-                widenings_of(&before.attestation_id)
+                widenings_of(id).is_empty(),
+                "I186: placed row {id} ({}) was widened to {:?} — its filename and pointer left \
+                 the room it names (CIRISPersist#919)",
+                b.attestation_envelope["dimension"],
+                widenings_of(id)
             );
-            let after = dir
-                .get_attestation(&before.attestation_id)
-                .await
-                .unwrap()
-                .expect("row");
+            if let Some(name) = b.attestation_envelope.get("filename") {
+                let copies: Vec<(&str, &str)> = corpus
+                    .iter()
+                    .filter(|a| {
+                        a.attestation_id != id
+                            && a.attestation_envelope.get("filename") == Some(name)
+                    })
+                    .map(|a| (a.attestation_id.as_str(), a.cohort_scope.as_str()))
+                    .collect();
+                assert!(
+                    copies.is_empty(),
+                    "I186: the filename of {id} is carried by another row: {copies:?}"
+                );
+            }
+            let after = dir.get_attestation(id).await.unwrap().expect("row");
             assert_eq!(
-                (
-                    &after.tier,
-                    &after.cohort_scope,
-                    &after.persist_row_hash,
-                    &after.attestation_envelope
-                ),
-                (
-                    &before.tier,
-                    &before.cohort_scope,
-                    &before.persist_row_hash,
-                    &before.attestation_envelope
-                ),
-                "I186 {label}: the placed row is unchanged"
+                (&after.cohort_scope, &after.attestation_envelope),
+                (&b.cohort_scope, &b.attestation_envelope),
+                "I186: placed row {id} keeps its scope and its bytes"
             );
+            if b.tier == crate::federation::types::attestation_tier::FEDERATION {
+                assert_eq!(
+                    after.persist_row_hash, b.persist_row_hash,
+                    "I186: placed row {id} is unchanged"
+                );
+            }
         }
+        // The local placed row still ENTERED the mesh, at its own scope: it
+        // replicates to the owner's devices; only the widening is refused.
+        let local_after = dir
+            .get_attestation(&room_local)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            (local_after.tier.as_str(), local_after.cohort_scope.as_str()),
+            (
+                crate::federation::types::attestation_tier::FEDERATION,
+                cohort_scope::SELF
+            ),
+            "I186: pass 1 still enters a placed local row into the mesh at `self`"
+        );
         let candidates: Vec<String> = dir
             .list_widening_candidates(None, 512)
             .await
@@ -488,14 +609,17 @@ mod run {
             .into_iter()
             .map(|a| a.attestation_id)
             .collect();
-        assert!(
-            !candidates.contains(&room_row) && !candidates.contains(&family_row),
-            "I186: neither placed row is a candidate: {candidates:?}"
-        );
-        // (d) the room-keyed fold (Edge's `rows_in_room` shape): the node's
-        // rows naming the room, with every row a `supersedes` by the same
-        // attester stands for dropped (CC 4.4.3.3.1). It still finds (a).
-        let superseded: Vec<&str> = by_node
+        for id in &placed {
+            assert!(
+                !candidates.contains(id),
+                "I186: placed row {id} is a candidate: {candidates:?}"
+            );
+        }
+        // (d) THE SECOND DEVICE'S READ: the room-keyed fold (Edge's
+        // `rows_in_room` / `files::in_room`, `LifecycleView::Live`) — rows
+        // naming the room, minus every row a `supersedes` stands for
+        // (CC 4.4.3.3.1). It returns the ORIGINAL rows, all of them.
+        let superseded: Vec<&str> = corpus
             .iter()
             .filter(|a| a.attestation_type == attestation_type::SUPERSEDES)
             .filter_map(|a| {
@@ -504,7 +628,7 @@ mod run {
                 )
             })
             .collect();
-        let in_room: Vec<&str> = by_node
+        let mut live_in_room: Vec<String> = corpus
             .iter()
             .filter(|a| {
                 crate::federation::admission::envelope_cohort_target(&a.attestation_envelope)
@@ -513,12 +637,32 @@ mod run {
                     == Some(owner.as_str())
                     && !superseded.contains(&a.attestation_id.as_str())
             })
-            .map(|a| a.attestation_id.as_str())
+            .map(|a| a.attestation_id.clone())
             .collect();
+        live_in_room.sort();
+        let mut want = room_rows.clone();
+        want.sort();
         assert_eq!(
-            in_room,
-            vec![room_row.as_str()],
-            "I186 (d): the room's own fold still finds the placed row after the sweep"
+            live_in_room, want,
+            "I186 (d): the second device's room read lists the original rows, unsuperseded"
+        );
+
+        // The one DELIBERATE path stays callable: a host publishing a placed
+        // row wider is the member's choice (`Engine::widen_audience`).
+        let chat_row = dir.get_attestation(&room_chat).await.unwrap().expect("row");
+        let ci = crate::federation::crossing::describe(
+            &chat_row,
+            crate::federation::Audience::Federation,
+            crate::federation::CrossingBasis::ProducerAuthority,
+        )
+        .expect("describable");
+        let outcome = engine
+            .widen_audience(&room_chat, &ci, None, &[])
+            .await
+            .expect("I186: the explicit widening");
+        assert!(
+            matches!(outcome, crate::federation::MeshCrossingOutcome::Crossed(_)),
+            "I186: an explicit host widening of a placed row is not refused: {outcome:?}"
         );
     }
 
