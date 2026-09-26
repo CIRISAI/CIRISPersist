@@ -33,9 +33,29 @@ threat-model citations because this crate's audit story is the point.
 
 `AttestationFilter::lifecycle` (default `Live`) hides rows retracted by a still-hiding `supersedes` / `withdraws` / `recants` from the same attester — the fold `list_scores` already applied. Every drive listing showed withdrawn and replaced files. sqlite and postgres; replication reads the since-cursor and is unaffected. I174.
 
-### Changed — CIRISVerify v16.1.0 → v16.2.1
+### Added — the durable MLS-state store opens from persist's one hardware root (CIRISPersist#911; FSD §12)
 
-Seven Cargo pins and the wheel's `ciris-verify>=16.2.1,<17`. v16.2.1 makes every `SecureBlobStorage` report an absent key as `KeyNotFound` (CIRISVerify#288); persist decides seed absence with `exists()`, so production is unaffected, and the hardware-storage test double now honours the contract.
+`XChaChaKvStore::open_mls_state(path)` keys the openmls cold-state store from the same hardware-sealed seed as the secrets master and the content-at-rest master, under a third HKDF context, `encrypted_kv::MLS_STATE_CONTEXT = "mls-state-at-rest-v1"` (the derivation is CIRISVerify's). Hosts pass a path and nothing else. Every host used to open the store with `open_in_memory(room_id)`, whose passphrase was a public id, so a restarted device lost its group state (CIRISServer#630). Only the first open of an empty store may seal a seed; a store in use re-derives and never mints. With no hardware seed the answer is **`KVError::HardwareCustodyUnavailable`** (new variant), the named degraded posture: nothing opens, and no public or derived passphrase stands in. I184.
+
+### Added — Android custody attested at key generation (CIRISPersist#915, CIRISServer#339; FSD §12)
+
+`AttestationEvidence::AndroidGenerationCustody` is a closed body with three fields: leaf hex, intermediate chain hex, and `challenge_policy: "generation_only"`. It is walked through CIRISVerify v17's `GenerationOnly` policy (CIRISVerify#293) against `HardwareAttestationPolicy::android_root_ders` (new field). The default anchors are verify's baked Google Hardware Attestation Root and Key Attestation CA1.
+- **Enforced:** the chain, and anti-lift (the attested key IS the record's Ed25519 key).
+- **Given up:** per-enrollment binding. That is sound because the record is signed by the key it attests, and the stored body says so.
+- **The class:** the key's **measured** security level, which meets the `SoftwareOnly` floor.
+- **Unchanged:** the YubiKey `GenerationCustody` arm.
+- **API:** `HardwareAttestationPolicy::check_structure` and `::check` take the record's raw Ed25519 key as a new second argument (`hardware_attestation::record_ed25519(&record)`). An Android body with no key is refused.
+- **Trust-root leg:** reports an Android holder as a walked chain (`layer_b: Some(true)`).
+
+I185.
+
+### Security — one Ed25519 rule, chosen (CIRISPersist#913)
+
+`verify/hybrid.rs` called the permissive `ClassicalVerifier::verify` on the federation-row floor while the trace floor called `verify_strict`. A small-order key admits `(R = identity, s = 0)` against any message; `HybridPolicy::Strict`'s ML-DSA-65 half contained it. CIRISVerify v17 makes the trait method strict, and persist now calls `verify_strict` **by name** so the rule is stated at the call site. Operators holding federation rows from producers other than verify's own should re-verify them once.
+
+### Changed — CIRISVerify v16.1.0 → v17.0.0
+
+Seven Cargo pins and the wheel's `ciris-verify>=17.0.0,<18`. v16.2.1 makes every `SecureBlobStorage` report an absent key as `KeyNotFound` (CIRISVerify#288). Persist decides seed absence with `exists()`, so production is unaffected, and the hardware-storage test double now honours the contract. v17.0.0 adds strict Ed25519 (#913 above), the keyring supersede fix (CIRISVerify#292), and `AndroidChallengePolicy` (#915 above).
 
 ### Pins moved
 `REPLICATION_POLICY_HASH` `9d62d3a8…8a19` → `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae`; `CONSENT_GRAMMAR_HASH` `07a677bb…64a9` → `62de16961aa7e631d999611b30bdcf9dc42c683e9e69a0c142b710609f9e133c` (the 18th kind; the grammar itself is unchanged); both directory-capsule wire digests re-pinned for appended variants (growth — `DIRECTORY_ABI_VERSION` stays 5). Migrations V153, V154 (and V155) with manifest rows.
@@ -45,6 +65,7 @@ I170 (admission is the roster), I171 (every protocol arm), I172 (arrival order),
 
 ### Adopter notes
 - **Edge:** re-pin both hashes; append `FamilyMembershipWidening` as the 18th kind (never insert); your roster fold must apply the same standing rules (co-signers, the protocol, self-leave, moderator-at-instant, last founder) or it will diverge from persist's; producers sign roster rows by the group's protocol, collecting co-signatures; family revocation resume ids are three-part.
+- **Server:** open the MLS store with `XChaChaKvStore::open_mls_state(path)` and handle `HardwareCustodyUnavailable` explicitly (#911); Android custody now arrives as `AndroidGenerationCustody` evidence, and persist has already walked it when a record is stored, so `admit_hardware_class` can read the measured class (#915); `check` / `check_structure` callers pass `record_ed25519(&record)`.
 - **Server:** the envelope → cosign → assemble step now produces a co-signed widening/revocation row; `roster_last_founder` is enforced in persist; a family grows through `add_family_member` on the plane (no record rewrite); a room key or record signer alone no longer removes a member.
 
 ## [48.0.0] - 2026-09-24
