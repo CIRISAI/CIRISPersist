@@ -15,7 +15,7 @@
 //! and `genesis::test_anchor_env_hygiene` tripwires any env-mutating test
 //! from reappearing under src/.
 
-#![cfg(feature = "test-anchor")]
+#![cfg(all(feature = "test-anchor", feature = "sqlite"))]
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
