@@ -15666,12 +15666,12 @@ impl crate::federation::BlobStorage for SqliteBackend {
 
         // No row yet: this node has sealed nothing, so it is free to take the
         // hardware root. This is the ONLY moment that choice is free.
-        // §11.8 — TPM + filesystem I/O off the async workers (v50, #920 review).
-        let source = tokio::task::spawn_blocking(|| content_master_key(true))
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("content-master derive join: {e}"))
-            })?;
+        // §11.8 — TPM + filesystem I/O off the async workers (v50, #920
+        // review), through the module's dispatcher, NOT bare `spawn_blocking`:
+        // with no tokio runtime current (a cohabiting consumer's statically
+        // linked persist, #158) it runs inline instead of panicking.
+        let source =
+            crate::store::sqlite_conn_model::dispatch_blocking(|| content_master_key(true)).await;
         let (kind, key_b64, descriptor) = match source {
             ContentMasterSource::Hardware { descriptor, .. } => ("hardware", None, descriptor),
             ContentMasterSource::SoftwareFallback { reason } => {

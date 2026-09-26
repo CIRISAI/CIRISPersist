@@ -2141,12 +2141,7 @@ impl Engine {
     pub(crate) async fn open_mls_state_with(
         &self,
         path: impl AsRef<std::path::Path>,
-        hardware: impl FnOnce(
-                bool,
-            )
-                -> Result<(zeroize::Zeroizing<Vec<u8>>, String), crate::encrypted_kv::KVError>
-            + Send
-            + 'static,
+        hardware: impl FnOnce(bool) -> crate::encrypted_kv::HardwareRootResult + Send + 'static,
     ) -> Result<
         (
             crate::encrypted_kv::XChaChaKvStore,
@@ -2165,8 +2160,10 @@ impl Engine {
         }
         .map_err(|e| KVError::Backend(format!("content master row: {e}")))?;
         let path = path.as_ref().to_path_buf();
-        // TPM + filesystem I/O: off the async workers.
-        tokio::task::spawn_blocking(move || {
+        // TPM + filesystem I/O off the async workers — through sqlite's
+        // dispatcher (`encrypted-kv` implies `sqlite`), so it runs inline
+        // rather than panicking when no tokio runtime is current (#158).
+        crate::store::sqlite_conn_model::dispatch_blocking(move || {
             XChaChaKvStore::open_mls_state_from_row(
                 path,
                 &row.key_kind,
@@ -2176,7 +2173,6 @@ impl Engine {
             )
         })
         .await
-        .map_err(|e| KVError::Backend(format!("open_mls_state join: {e}")))?
     }
 
     /// v3.4.0 (CIRISPersist#123) — delete one blob row by SHA from

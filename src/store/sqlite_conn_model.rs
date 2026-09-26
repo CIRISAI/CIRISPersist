@@ -1219,6 +1219,33 @@ mod witnesses {
         });
     }
 
+    /// v50.0.0 (#920 review) — the content-master row init derives the root
+    /// through `dispatch_blocking`, so a first-ever row init polled with NO
+    /// tokio runtime on the thread completes rather than panicking (a bare
+    /// `spawn_blocking` panics there).
+    #[test]
+    fn the_content_master_row_init_runs_with_no_tokio_runtime_on_the_thread() {
+        use crate::federation::BlobStorage as _;
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "premise: this test must run with no runtime current"
+        );
+        let path = temp_db_path("no-runtime-content-master");
+        block_on_without_a_runtime(async {
+            let backend = SqliteBackend::open(&path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let row = backend
+                .load_or_init_content_master_row()
+                .await
+                .expect("row init with no runtime");
+            assert!(
+                row.key_kind == "software" || row.key_kind == "hardware",
+                "got {:?}",
+                row.key_kind
+            );
+        });
+    }
+
     // ── the pool's own witnesses (written with the pool; RED by absence) ──
 
     /// Hold ONE reader inside a read closure for `hold`, signalling once the

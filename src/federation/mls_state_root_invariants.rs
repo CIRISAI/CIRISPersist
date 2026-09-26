@@ -178,9 +178,13 @@ async fn a_v49_store_under_a_software_row_opens_as_legacy_hardware(engine: &Engi
     let storage = Arc::new(FakeHardwareStorage::empty());
     let over_double = |storage: Arc<FakeHardwareStorage>| {
         move |c: bool| {
-            derive_with_storage(storage.as_ref(), crate::encrypted_kv::MLS_STATE_CONTEXT, c)
-                .map(|(k, d)| (zeroize::Zeroizing::new(k), d))
-                .map_err(|e| KVError::HardwareCustodyUnavailable(e.to_string()))
+            crate::secrets::hardware::derive_with_storage_typed(
+                storage.as_ref(),
+                crate::encrypted_kv::MLS_STATE_CONTEXT,
+                c,
+            )
+            .map(|(k, d)| (zeroize::Zeroizing::new(k), d))
+            .map_err(crate::encrypted_kv::HardwareRootError::from)
         }
     };
     let dir = tempfile::tempdir().unwrap();
