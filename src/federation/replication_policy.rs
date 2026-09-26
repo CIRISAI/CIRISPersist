@@ -457,8 +457,13 @@ pub fn replication_policy_sha256() -> String {
 /// identical to the community widening's). Previous value:
 /// `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19`
 /// (v48.0.0). CIRISEdge appends the 18th name to its protocol enum.
+/// v49.0.0 (CIRISPersist#912) — re-pinned for the 19th kind
+/// ([`EnvelopeKind::CommunityMembershipListing`], APPENDED; `RegisteredSigner`
+/// and `SelfOwn` — the member's own disclosure). Previous value:
+/// `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae` (the
+/// 18-kind v49.0.0 development value). CIRISEdge appends the 19th name.
 pub const REPLICATION_POLICY_HASH: &str =
-    "7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae";
+    "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a";
 
 #[cfg(test)]
 mod tests {

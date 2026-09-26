@@ -1252,7 +1252,7 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// persist enforces today). It joins in the cut that gives it a door, with its
 /// own re-pin.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "4d7054a6e05306e7b37d30ab2d25c43625a4f382021f39191f55a2c1f833589b";
+    "a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a";
 
 #[cfg(test)]
 mod vocab_tests {

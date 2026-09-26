@@ -2339,7 +2339,7 @@ mod tests {
         );
         assert_eq!(
             REPLICATION_POLICY_HASH,
-            "7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae"
+            "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a"
         );
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("WIRE_VOCABULARY_KINDS.md"),
