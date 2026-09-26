@@ -551,6 +551,7 @@ where
         policy
             .check(
                 &holder.record.key_id,
+                crate::federation::hardware_attestation::record_ed25519(&holder.record).as_deref(),
                 holder.record.attestation_evidence.as_ref(),
                 now,
             )

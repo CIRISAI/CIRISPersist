@@ -199,6 +199,15 @@ pub struct HardwareAttestationPolicy {
     /// `set_hardware_attestation_policy`; production never reads a
     /// caller-supplied root at admission (Registry-of-Record).
     pub yubico_root_der: std::borrow::Cow<'static, [u8]>,
+    /// v49.0.0 (CIRISPersist#915) — the Google attestation anchors an
+    /// [`AttestationEvidence::AndroidGenerationCustody`] chain is walked to.
+    /// Default: verify's baked set (`trust_anchor_store::baked` — the 2022
+    /// Hardware Attestation Root and `Key Attestation CA1`; Google operates
+    /// both, so the walk tries each). An anchor that fails verify's
+    /// fingerprint check is left out, never trusted unverified — and an empty
+    /// set refuses every Android chain. Tests inject a mock CA's root here;
+    /// production never reads a caller-supplied root at admission.
+    pub android_root_ders: Vec<std::borrow::Cow<'static, [u8]>>,
 }
 
 impl Default for HardwareAttestationPolicy {
@@ -241,6 +250,19 @@ impl Default for HardwareAttestationPolicy {
             yubico_root_der: std::borrow::Cow::Borrowed(
                 crate::federation::admission::YUBICO_ATTESTATION_ROOT_1_DER,
             ),
+            // v49.0.0 (CIRISPersist#915) — verify's baked Google anchors,
+            // fingerprint-checked by verify; a failed check drops the anchor.
+            android_root_ders: {
+                use ciris_verify_core::trust_anchor_store::baked;
+                [
+                    baked::google_hardware_attestation_root(),
+                    baked::google_key_attestation_ca1(),
+                ]
+                .into_iter()
+                .filter_map(Result::ok)
+                .map(std::borrow::Cow::Owned)
+                .collect()
+            },
         }
     }
 }
@@ -299,6 +321,22 @@ pub enum AttestationEvidence {
     /// nonce and nothing to age. YubiKey PIV slot-9c today; the same shape
     /// fits any device that attests at generation rather than per nonce.
     GenerationCustody(Box<GenerationCustodyAttestation>),
+    /// v49.0.0 (CIRISPersist#915, CIRISServer#339) — **Android custody
+    /// attested at key generation.** An Android Key Attestation certificate
+    /// chain for the record's own key. Android fixes its attestation
+    /// challenge when the key is GENERATED (`setAttestationChallenge`), the
+    /// same timing as a YubiKey slot-9c attestation, and the wire carries no
+    /// challenge value, so the chain is walked under verify's
+    /// `AndroidChallengePolicy::GenerationOnly` (CIRISVerify#293). What is
+    /// enforced: the chain to a Google anchor, and anti-lift (the attested
+    /// key IS the record's key). What is given up is per-enrollment binding.
+    /// That is sound only because the record is signed by the key it
+    /// attests, so a replayer without the private key gains nothing. The
+    /// body states it: `challenge_policy` has one legal value, so a stored
+    /// record says no freshness was claimed. A sibling of
+    /// [`Self::GenerationCustody`] rather than a reshaping of it: that body
+    /// is CIRISVerify's signed YubiKey ceremony object and stays unchanged.
+    AndroidGenerationCustody(Box<AndroidGenerationCustody>),
     /// The test-anchor genesis marker (CIRISVerify#202's
     /// `accord_custody_attestation` admits the same tier under the same
     /// condition). Never admissible without a live test anchor.
@@ -399,6 +437,34 @@ pub struct GenerationCustodyEnvelope {
     pub signed_at: String,
 }
 
+/// v49.0.0 (CIRISPersist#915) — [`AttestationEvidence::AndroidGenerationCustody`]'s
+/// body. `deny_unknown_fields`: unlike the YubiKey ceremony object this shape
+/// is persist's own, so it is closed, and no other evidence body can fall
+/// through to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AndroidGenerationCustody {
+    /// The attestation leaf certificate DER, hex — the certificate whose
+    /// subject key is the record's Ed25519 key and which carries the
+    /// `KeyDescription` extension.
+    pub android_key_attestation_leaf_hex: String,
+    /// Each intermediate certificate DER, hex, leaf-first (excluding the
+    /// Google anchor).
+    pub android_key_attestation_chain_hex: Vec<String>,
+    /// How the attestation challenge was treated. One legal value:
+    /// [`AndroidChallengePolicyClaim::GenerationOnly`].
+    pub challenge_policy: AndroidChallengePolicyClaim,
+}
+
+/// The single challenge treatment [`AndroidGenerationCustody`] admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidChallengePolicyClaim {
+    /// `"generation_only"` — no per-enrollment or freshness claim; the chain
+    /// and anti-lift are enforced (verify's `challenge_checked: false`).
+    #[serde(rename = "generation_only")]
+    GenerationOnly,
+}
+
 /// Exactly `{"tier":"SoftwareOnly_TEST","test_anchor":true}` — the genesis
 /// synthesizer's marker (`src/federation/genesis/mod.rs`). `deny_unknown_fields`
 /// so no hardware-shaped body can fall through to this arm.
@@ -451,9 +517,15 @@ impl HardwareAttestationPolicy {
     /// Returns the derived class for a `Hardware` body; `None` for the
     /// nonce-free shapes (`GenerationCustody`, the test marker) that carry
     /// their own admissibility.
+    ///
+    /// v49.0.0 (CIRISPersist#915) — `attested_ed25519` is the record's own
+    /// raw 32-byte Ed25519 key: an Android generation-custody chain is walked
+    /// here and must attest exactly that key (anti-lift). Every door passes
+    /// it; `None` refuses an Android body rather than admitting it unwalked.
     pub fn check_structure(
         &self,
         key_id: &str,
+        attested_ed25519: Option<&[u8]>,
         evidence_value: Option<&serde_json::Value>,
     ) -> Result<Option<HardwareType>, Error> {
         // 1. Presence + non-null.
@@ -516,6 +588,13 @@ impl HardwareAttestationPolicy {
                 self.check_generation_custody(key_id, &att)?;
                 return Ok(None);
             }
+            // v49.0.0 (CIRISPersist#915) — walked here, at every door, so the
+            // class it returns is a MEASUREMENT of this record's key.
+            AttestationEvidence::AndroidGenerationCustody(a) => {
+                return self
+                    .check_android_generation_custody(key_id, attested_ed25519, &a)
+                    .map(Some);
+            }
             AttestationEvidence::Hardware(hw) => *hw,
         };
 
@@ -565,10 +644,19 @@ impl HardwareAttestationPolicy {
         now: DateTime<Utc>,
     ) -> Result<(), Error> {
         if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
-            return self.check(&row.key_id, row.attestation_evidence.as_ref(), now);
+            return self.check(
+                &row.key_id,
+                record_ed25519(row).as_deref(),
+                row.attestation_evidence.as_ref(),
+                now,
+            );
         }
         if row.attestation_evidence.is_some() {
-            self.check_structure(&row.key_id, row.attestation_evidence.as_ref())?;
+            self.check_structure(
+                &row.key_id,
+                record_ed25519(row).as_deref(),
+                row.attestation_evidence.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -580,10 +668,11 @@ impl HardwareAttestationPolicy {
     pub fn check(
         &self,
         key_id: &str,
+        attested_ed25519: Option<&[u8]>,
         evidence_value: Option<&serde_json::Value>,
         now: DateTime<Utc>,
     ) -> Result<(), Error> {
-        let Some(_hw_type) = self.check_structure(key_id, evidence_value)? else {
+        let Some(_hw_type) = self.check_structure(key_id, attested_ed25519, evidence_value)? else {
             return Ok(());
         };
         // Structure passed and the body is `Hardware`: re-parse for the nonce
@@ -608,6 +697,100 @@ impl HardwareAttestationPolicy {
         }
 
         Ok(())
+    }
+
+    /// v49.0.0 (CIRISPersist#915) — walk an Android generation-custody chain
+    /// and return the MEASURED class.
+    ///
+    /// Through CIRISVerify's
+    /// `verify_android_key_attestation_with_challenge_policy` under
+    /// `GenerationOnly`, against each anchor in
+    /// [`Self::android_root_ders`] (Google operates more than one): the chain
+    /// to the anchor, the `KeyDescription`, and **anti-lift** — the attested
+    /// key must be `attested_ed25519`, the record's own key. The class is the
+    /// KEY's security level as measured (StrongBox → `AndroidStrongbox`, TEE →
+    /// `AndroidKeystore`, software → `SoftwareOnly`), never the presenter's
+    /// claim, and it must be in [`Self::accepted_hardware_types`]: a
+    /// software-held key is a valid measurement that the default floor
+    /// refuses, as it refuses every `SoftwareOnly` class.
+    ///
+    /// Not covered, as verify states: Google's revocation list (network I/O).
+    fn check_android_generation_custody(
+        &self,
+        key_id: &str,
+        attested_ed25519: Option<&[u8]>,
+        a: &AndroidGenerationCustody,
+    ) -> Result<HardwareType, Error> {
+        use ciris_verify_core::device_attestation::{
+            verify_android_key_attestation_with_challenge_policy, AndroidChallengePolicy,
+            AndroidSecurityLevel,
+        };
+        let refuse = |detail: String| Error::AccordHolderRequiresAttestationEvidence {
+            key_id: key_id.to_owned(),
+            detail,
+        };
+        let key = attested_ed25519.ok_or_else(|| {
+            refuse(
+                "an Android generation-custody chain is walked against the record's own \
+                 Ed25519 key, and no key was supplied — refusing rather than admitting it \
+                 unwalked"
+                    .into(),
+            )
+        })?;
+        let leaf = hex::decode(&a.android_key_attestation_leaf_hex)
+            .map_err(|e| refuse(format!("android attestation leaf is not hex: {e}")))?;
+        let chain = a
+            .android_key_attestation_chain_hex
+            .iter()
+            .map(hex::decode)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| refuse(format!("android attestation chain is not hex: {e}")))?;
+        let chain: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+
+        let mut verdict = None;
+        let mut last = None;
+        for root in &self.android_root_ders {
+            match verify_android_key_attestation_with_challenge_policy(
+                &leaf,
+                &chain,
+                root,
+                key,
+                AndroidChallengePolicy::GenerationOnly,
+            ) {
+                Ok(v) => {
+                    verdict = Some(v);
+                    break;
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        let verdict = verdict.ok_or_else(|| match last {
+            Some(e) => refuse(format!("android key attestation refused: {e}")),
+            None => refuse(
+                "no Google attestation anchor is available to walk an Android chain to — \
+                 refusing (fail closed)"
+                    .into(),
+            ),
+        })?;
+
+        let hw = match verdict.keymint_security_level {
+            AndroidSecurityLevel::StrongBox => HardwareType::AndroidStrongbox,
+            AndroidSecurityLevel::TrustedEnvironment => HardwareType::AndroidKeystore,
+            AndroidSecurityLevel::Software => HardwareType::SoftwareOnly,
+        };
+        if !self.accepted_hardware_types.contains(&hw) {
+            let mut accepted: Vec<String> = self
+                .accepted_hardware_types
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect();
+            accepted.sort();
+            return Err(Error::HardwareTypeNotAccepted {
+                got: format!("{hw:?}"),
+                accepted,
+            });
+        }
+        Ok(hw)
     }
 
     /// v23.1.0 (CIRISPersist#554) — the admissibility decision for
@@ -1031,6 +1214,18 @@ pub mod test_support {
     }
 }
 
+/// v49.0.0 (CIRISPersist#915) — the record's raw Ed25519 key, the key an
+/// Android generation-custody chain must attest. `None` when it does not
+/// decode to 32 bytes, which refuses an Android body (never admits it
+/// unwalked); the key door refuses such a record on its own grounds.
+pub fn record_ed25519(row: &crate::federation::types::KeyRecord) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(&row.pubkey_ed25519_base64)
+        .ok()
+        .filter(|k| k.len() == 32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,7 +1358,7 @@ mod tests {
     #[test]
     fn check_rejects_missing_evidence() {
         let p = HardwareAttestationPolicy::default();
-        let err = p.check("k1", None, Utc::now()).unwrap_err();
+        let err = p.check("k1", None, None, Utc::now()).unwrap_err();
         assert!(matches!(
             err,
             Error::AccordHolderRequiresAttestationEvidence { ref detail, .. } if detail == "missing"
@@ -1178,7 +1373,7 @@ mod tests {
     fn check_rejects_null_evidence() {
         let p = HardwareAttestationPolicy::default();
         let v = serde_json::Value::Null;
-        let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k1", None, Some(&v), Utc::now()).unwrap_err();
         assert!(matches!(
             err,
             Error::AccordHolderRequiresAttestationEvidence { ref detail, .. } if detail == "null"
@@ -1204,7 +1399,9 @@ mod tests {
         );
         let p = HardwareAttestationPolicy::default();
         let v = serde_json::json!({"tier": "SoftwareOnly_TEST", "test_anchor": true});
-        let err = p.check("mesh-peer", Some(&v), Utc::now()).unwrap_err();
+        let err = p
+            .check("mesh-peer", None, Some(&v), Utc::now())
+            .unwrap_err();
         match err {
             Error::AccordHolderRequiresAttestationEvidence { ref detail, .. } => {
                 assert!(
@@ -1226,7 +1423,7 @@ mod tests {
     fn software_only_test_marker_requires_test_anchor_true_545() {
         let p = HardwareAttestationPolicy::default();
         let v = serde_json::json!({"tier": "SoftwareOnly_TEST", "test_anchor": false});
-        let err = p.check("k", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k", None, Some(&v), Utc::now()).unwrap_err();
         assert!(
             format!("{err}").contains("test_anchor:true"),
             "#545: names the missing honesty bit: {err}"
@@ -1244,7 +1441,7 @@ mod tests {
             "test_anchor": true,
             "platform_attestation": {"smuggled": true}
         });
-        let err = p.check("k", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k", None, Some(&v), Utc::now()).unwrap_err();
         assert!(
             format!("{err}").contains("malformed"),
             "#545: a padded marker must fail deserialization: {err}"
@@ -1259,7 +1456,7 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k1", None, Some(&v), Utc::now()).unwrap_err();
         match err {
             Error::HardwareTypeNotAccepted { got, .. } => {
                 assert_eq!(got, "SoftwareOnly");
@@ -1276,7 +1473,7 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k1", None, Some(&v), Utc::now()).unwrap_err();
         match err {
             Error::AttestationEvidenceIncomplete {
                 hardware_type,
@@ -1298,7 +1495,7 @@ mod tests {
             nonce_captured_at: captured,
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k1", None, Some(&v), Utc::now()).unwrap_err();
         match err {
             Error::AttestationEvidenceStale { max_age_secs, .. } => {
                 assert_eq!(max_age_secs, 86_400);
@@ -1315,7 +1512,7 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        p.check("k1", Some(&v), Utc::now()).unwrap();
+        p.check("k1", None, Some(&v), Utc::now()).unwrap();
     }
 
     #[test]
@@ -1326,7 +1523,7 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        p.check("k1", Some(&v), Utc::now()).unwrap();
+        p.check("k1", None, Some(&v), Utc::now()).unwrap();
     }
 
     #[test]
@@ -1355,7 +1552,7 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        p.check("k1", Some(&v), Utc::now()).unwrap();
+        p.check("k1", None, Some(&v), Utc::now()).unwrap();
     }
 
     #[test]
@@ -1371,7 +1568,7 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("k1", None, Some(&v), Utc::now()).unwrap_err();
         match err {
             Error::AttestationEvidenceIncomplete {
                 hardware_type,
@@ -1454,7 +1651,7 @@ mod tests {
         let v = generation_custody_value("A1", "portable_2fa");
         // Ten years on — the Hardware arm would have refused this at 24h.
         let much_later = Utc::now() + chrono::Duration::days(3650);
-        p.check("A1", Some(&v), much_later)
+        p.check("A1", None, Some(&v), much_later)
             .expect("#554: an attestation-at-generation has no nonce to age");
     }
 
@@ -1465,7 +1662,7 @@ mod tests {
         let mut p = HardwareAttestationPolicy::default();
         p.accepted_custody_tiers.clear();
         let v = generation_custody_value("A1", "portable_2fa");
-        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("A1", None, Some(&v), Utc::now()).unwrap_err();
         assert!(
             format!("{err}").contains("portable_2fa"),
             "#554: the refusal must name the tier: {err}"
@@ -1480,7 +1677,7 @@ mod tests {
         p.accepted_hardware_types
             .remove(&HardwareType::ExternalSecureElement);
         let v = generation_custody_value("A1", "portable_2fa");
-        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("A1", None, Some(&v), Utc::now()).unwrap_err();
         match err {
             Error::HardwareTypeNotAccepted { got, .. } => {
                 assert_eq!(got, "ExternalSecureElement");
@@ -1498,7 +1695,7 @@ mod tests {
         let mut v = generation_custody_value("A1", "portable_2fa");
         v["body"]["yubikey_attestation_chain_hex"] = serde_json::json!([]);
         v["body"]["signed_envelope"]["yubikey_attestation_chain_sha256"] = serde_json::json!([]);
-        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("A1", None, Some(&v), Utc::now()).unwrap_err();
         assert!(
             format!("{err}").contains("EMPTY attestation chain"),
             "#554: {err}"
@@ -1512,7 +1709,7 @@ mod tests {
         let p = HardwareAttestationPolicy::default();
         let mut v = generation_custody_value("A1", "portable_2fa");
         v["schema"] = serde_json::json!("ciris.ceg.signed-object.v99");
-        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        let err = p.check("A1", None, Some(&v), Utc::now()).unwrap_err();
         assert!(
             format!("{err}").contains("v99"),
             "#554: the refusal must name the schema it got: {err}"
@@ -1527,6 +1724,6 @@ mod tests {
             nonce_captured_at: Utc::now(),
         }));
         let v = serde_json::to_value(&ev).unwrap();
-        p.check("k1", Some(&v), Utc::now()).unwrap();
+        p.check("k1", None, Some(&v), Utc::now()).unwrap();
     }
 }

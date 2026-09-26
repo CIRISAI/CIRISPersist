@@ -876,6 +876,10 @@ hex-literal = "0.4"
 proptest = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tempfile = "3"
+# v49.0.0 (CIRISPersist#915) — mint MOCK Android Key Attestation chains for
+# the generation-custody witnesses (inert against the baked Google anchors).
+# The version verify-core's test-support already resolves; no new crate.
+rcgen = "0.13"
 # Postgres integration tests share a single test database; parallel
 # test execution races on schema setup. serial_test forces the
 # postgres-tagged tests to run one at a time without slowing the

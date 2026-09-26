@@ -458,7 +458,11 @@ fn evaluate_holder_hardware(
 ) -> HolderHardware {
     use super::hardware_attestation::AttestationEvidence;
     use ciris_keyring::HardwareType;
-    let class = match policy.check_structure(&rec.key_id, rec.attestation_evidence.as_ref()) {
+    let class = match policy.check_structure(
+        &rec.key_id,
+        super::hardware_attestation::record_ed25519(rec).as_deref(),
+        rec.attestation_evidence.as_ref(),
+    ) {
         Err(e) => {
             return HolderHardware {
                 key_id: rec.key_id.clone(),
@@ -475,12 +479,20 @@ fn evaluate_holder_hardware(
         .as_ref()
         .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
         .is_some_and(|e| matches!(e, AttestationEvidence::GenerationCustody(_)));
+    // v49.0.0 (CIRISPersist#915) — an Android generation-custody chain was
+    // walked inside `check_structure` (it needs the record's key, which is
+    // where anti-lift lives), so reaching here means the walk passed.
+    let is_android = rec
+        .attestation_evidence
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
+        .is_some_and(|e| matches!(e, AttestationEvidence::AndroidGenerationCustody(_)));
     if !is_custody {
         return HolderHardware {
             key_id: rec.key_id.clone(),
             class,
             layer_a: true,
-            layer_b: None,
+            layer_b: is_android.then_some(true),
             refusal: None,
         };
     }
