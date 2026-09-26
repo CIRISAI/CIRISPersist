@@ -730,7 +730,7 @@ class Engine:
         """(derived) deontic — #249 Cut G1 (§6) — atomically swap out_key_id for the [crate::federation::cohort::RosterMember] in in_member_json (revoke then add) in a family/com..."""
 
     def cohort_verify_membership_quorum(self, cohort: str, group_key_id: str, change_envelope_json: str, signatures_json: str) -> None:
-        """(derived) deontic — #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is authorized by the group's current strict-majority quorum (composes verify v6.9...."""
+        """(derived) deontic — #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is authorized by the group's current roster under the group's OWN consensus_protoc..."""
 
     def community_dek_set_key_state(self, community_key_id: str, epoch: int, state: str) -> None:
         """(derived) deontic — v43.0.0 (§11.6) — transition a community DEK epoch's key state: enabled / disabled / destroyed. Destroy refuses while any object on this node is st..."""
@@ -1132,6 +1132,9 @@ class Engine:
         a different key for an existing key id raises).
         """
 
+    def rekey_community_member_device_add_json(self, community_key_id: str, member_key_id: str, new_occurrence_key_id: str, authority_key_id: str) -> str:
+        """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — a member's new device receives exactly what the member holds: every retained community DEK ep..."""
+
     def rekey_family_member_add_json(self, family_key_id: str, new_member_identity_key_id: str) -> str:
         """(derived) deontic — v46.3.0 (CIRISPersist#884, §3 R3-retroactive) — the family twin of rekey_self_occurrence_add_json: every extant family blob of family_key_id is re-..."""
 
@@ -1331,6 +1334,9 @@ class Engine:
         """Revoke a trust grant per FSD §3.4 (re-issuance with
         ``expires_at = now()``, rationale = ``"revocation"``). Returns
         a JSON-encoded ``TrustGrantReceipt`` for the revocation event."""
+
+    def rewrap_own_epochs_to_member_devices_json(self, member_key_id: str | None = None, device_key_id: str | None = None) -> str:
+        """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — the minter side of the second device, on demand: re-wrap every retained epoch THIS node minte..."""
 
     def seal_stream_scoped(self, cohort_scope: str, stream_id: str, community_key_id: str | None = None, media_type: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (§12.3) — seal a live stream into a chunk_dag at cohort_scope. Refuses unless every chunk ROW is at the DAG's tier (I32); builds the manifest..."""

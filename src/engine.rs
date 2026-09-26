@@ -5874,14 +5874,46 @@ impl Engine {
         let me = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("emit_pending_key_grants: {e}"))
         })?;
+        // v50.0.0 (CIRISPersist#916) — first, re-wrap this node's own epochs
+        // to every member device whose binding or keys arrived since the last
+        // pass (an occurrence that lands after its binding is caught here).
+        // The grants it writes dirty their epochs, so the emission below
+        // carries them. A failure is logged: the dirty sets still go out.
+        {
+            use crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices;
+            let now = chrono::Utc::now();
+            let swept = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    rewrap_own_epochs_to_member_devices(b.as_ref(), &me, None, now).await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    rewrap_own_epochs_to_member_devices(b.as_ref(), &me, None, now).await
+                }
+            };
+            if let Err(e) = swept {
+                tracing::warn!(error = %e, "member-device re-wrap sweep failed (#916)");
+            }
+        }
+        self.emit_dirty_key_grants(&me).await
+    }
+
+    /// #848 §14 (V146) — the emission half of
+    /// [`emit_pending_key_grants`](Self::emit_pending_key_grants): every
+    /// dirty set `me` owes, signed and emitted — no re-wrap walk. v50.0.0
+    /// (#916 review, N2): what a receive door runs after its backend hook
+    /// already did the narrow re-wrap.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn emit_dirty_key_grants(&self, me: &str) -> Result<usize, crate::federation::BlobError> {
         let axes = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                crate::federation::key_grant::dirty_axes(b.as_ref(), &me).await
+                crate::federation::key_grant::dirty_axes(b.as_ref(), me).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                crate::federation::key_grant::dirty_axes(b.as_ref(), &me).await
+                crate::federation::key_grant::dirty_axes(b.as_ref(), me).await
             }
         }
         .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
@@ -6712,6 +6744,155 @@ impl Engine {
                 .await
             }
         }
+    }
+
+    /// v50.0.0 (CIRISPersist#916 review, N1) — an `Engine` over a shared
+    /// backend (`from_shared*`) is built synchronously and never told the
+    /// backend its key; the #916 doors tell it before they need it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn ensure_backend_node_key(&self) {
+        let known = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+            }
+        };
+        if !known {
+            if let Ok(k) = self.local_derived_key_id().await {
+                self.set_backend_node_key_id(&k);
+            }
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
+    /// new device receives exactly what the member holds**: every retained
+    /// `(community, minter, epoch)` DEK the member holds a grant on is
+    /// re-wrapped to `new_occurrence_key_id`'s content-KEM keys, with no epoch
+    /// bump, idempotently. The authority is the member's owner-binding over
+    /// the device (`authority_key_id` names who the host says is acting and
+    /// must be that owner), and the member must be active in the room now;
+    /// each refusal is a typed
+    /// [`Error::DeviceRekeyRefused`](crate::federation::Error::DeviceRekeyRefused).
+    /// See [`at_rest_cascade::orchestrate::rekey_community_member_device_add`](crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add).
+    ///
+    /// Each epoch THIS node minted that gained the device's wrap has its full
+    /// epoch-axis `KeyGrant` set emitted (§14), the same path a fresh seal
+    /// uses, so the device's own node receives the key. An epoch another node
+    /// minted is reported in `content_miss` (`minted_elsewhere`): that node
+    /// re-wraps it when the owner-binding reaches it
+    /// ([`rewrap_own_epochs_to_member_devices`](Self::rewrap_own_epochs_to_member_devices)).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rekey_community_member_device_add(
+        &self,
+        community_key_id: &str,
+        member_key_id: &str,
+        new_occurrence_key_id: &str,
+        authority_key_id: &str,
+    ) -> Result<
+        crate::federation::at_rest_cascade::orchestrate::DeviceRekeyResult,
+        crate::federation::Error,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add;
+        self.ensure_backend_node_key().await;
+        let now = chrono::Utc::now();
+        let r = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                rekey_community_member_device_add(
+                    arc.as_ref(),
+                    community_key_id,
+                    member_key_id,
+                    new_occurrence_key_id,
+                    authority_key_id,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                rekey_community_member_device_add(
+                    arc.as_ref(),
+                    community_key_id,
+                    member_key_id,
+                    new_occurrence_key_id,
+                    authority_key_id,
+                    now,
+                )
+                .await
+            }
+        }?;
+        // #848 (§14) — the set follows the new wrap. Only this node's own
+        // minter signs a set (`admit_replicated_key_grant`: signer == minter).
+        let minter = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("local derived key id: {e}")))?;
+        for (m, epoch) in r.granted.iter().filter(|(m, _)| *m == minter) {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Epoch {
+                community_key_id: community_key_id.to_owned(),
+                minter_key_id: m.clone(),
+                epoch: *epoch,
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("key_grant emission: {e}")))?;
+        }
+        Ok(r)
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the minter
+    /// side of the second device**: re-wrap every retained epoch THIS node
+    /// minted to each live-owner-bound device of an ACTIVE member that holds
+    /// no grant on it yet, and emit each changed epoch's `KeyGrant` set,
+    /// signed by this node as its minter. `only = Some((member, device))`
+    /// narrows the walk to one device; `None` sweeps every room this node
+    /// minted in. The receive doors run the walk themselves (grant rows only,
+    /// through `FederationDirectory::rewrap_own_epochs_for_device`) and
+    /// [`emit_pending_key_grants`](Self::emit_pending_key_grants) runs it
+    /// before emitting; this is the on-demand form that also emits.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rewrap_own_epochs_to_member_devices(
+        &self,
+        only: Option<(&str, &str)>,
+    ) -> Result<
+        crate::federation::at_rest_cascade::orchestrate::MinterRewrapReport,
+        crate::federation::Error,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices;
+        let minter = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("local derived key id: {e}")))?;
+        let now = chrono::Utc::now();
+        let r = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                rewrap_own_epochs_to_member_devices(arc.as_ref(), &minter, only, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                rewrap_own_epochs_to_member_devices(arc.as_ref(), &minter, only, now).await
+            }
+        }?;
+        for (community_key_id, epoch) in &r.changed {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Epoch {
+                community_key_id: community_key_id.clone(),
+                minter_key_id: minter.clone(),
+                epoch: *epoch,
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("key_grant emission: {e}")))?;
+        }
+        Ok(r)
     }
 
     /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
@@ -8133,9 +8314,38 @@ impl Engine {
         crate::federation::attestation_apply::ReplicatedAttestationOutcome,
         crate::federation::Error,
     > {
-        self.federation_directory()
+        // v50.0.0 (CIRISPersist#916) — the backend's receive door re-wraps this
+        // node's own epochs to a member's device when an owner-binding lands
+        // (grant rows, dirtying their epochs); THIS door, which holds a
+        // signer, emits the dirtied sets at once instead of at the next sweep.
+        let binding = crate::federation::owner_binding_of(&attestation.attestation);
+        if binding.is_some() {
+            self.ensure_backend_node_key().await;
+        }
+        let outcome = self
+            .federation_directory()
             .apply_replicated_attestation(attestation)
-            .await
+            .await?;
+        if let (
+            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
+            Some(_),
+        ) = (&outcome, binding)
+        {
+            let emitted = match self.local_derived_key_id().await {
+                Ok(me) => self.emit_dirty_key_grants(&me).await,
+                Err(e) => Err(crate::federation::BlobError::Backend(format!(
+                    "local derived key id: {e}"
+                ))),
+            };
+            if let Err(e) = emitted {
+                tracing::warn!(
+                    error = %e,
+                    "owner-binding admitted; the dirtied KeyGrant sets are left to the \
+                     pending sweep (#916)"
+                );
+            }
+        }
+        Ok(outcome)
     }
 
     /// v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /

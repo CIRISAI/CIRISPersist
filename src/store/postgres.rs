@@ -5081,6 +5081,36 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         row.map(pg_row_to_role_withdrawal).transpose()
     }
 
+    /// v50.0.0 (CIRISPersist#916) — the receive doors' re-wrap: this node's
+    /// own epochs (minter = the node key) to a member's device. Grant rows
+    /// only; each leaves its epoch dirty for the pending-`KeyGrant` loop.
+    async fn rewrap_own_epochs_for_device(
+        &self,
+        owner: &str,
+        device: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let Some(me) = crate::federation::FederationDirectory::node_key_id(self) else {
+            // Not silent (#916 review, N1): with no node key this backend
+            // cannot know which epochs are its own, so it re-wraps none; the
+            // host that never set it is named in the log.
+            tracing::warn!(
+                owner = %owner,
+                device = %device,
+                "no node key set on this backend: the member-device re-wrap is skipped \
+                 (set it through an Engine / PyEngine constructor) (#916)"
+            );
+            return Ok(());
+        };
+        crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+            self,
+            &me,
+            Some((owner, device)),
+            chrono::Utc::now(),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn put_attestation_with_origin(
         &self,
         attestation: crate::federation::SignedAttestation,
@@ -7085,6 +7115,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             signed_envelope,
             signature,
         } = occurrence;
+        // v50.0.0 (CIRISPersist#916) — who, through what, for the re-wrap below.
+        let rewrap_for = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -7192,6 +7224,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             drop(client);
             self.index_stored_record("IdentityOccurrence", &wire_index_key)
                 .await?;
+        }
+        // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
+        // (typically after its owner-binding): this node re-wraps its own
+        // epochs to it. The row stands whatever the re-wrap does.
+        if rewrap_for.0 != rewrap_for.1 {
+            crate::federation::rewrap_after_admission(self, &rewrap_for.0, &rewrap_for.1).await;
         }
         Ok(())
     }
@@ -15281,13 +15319,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
         member_key_id: &str,
         wrap_algorithm: &str,
         wrapped_dek: &str,
-    ) -> Result<(), crate::federation::BlobError> {
+    ) -> Result<bool, crate::federation::BlobError> {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let ep = epoch as i64;
-        client
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_community_dek_member_grants (\
                     community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
@@ -15308,7 +15346,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     "community_dek_put_member_grant: {e}"
                 ))
             })?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     async fn community_dek_put_member_grants(
@@ -16083,6 +16121,44 @@ impl crate::federation::BlobStorage for PostgresBackend {
             })?;
         rows.iter()
             .map(|r| r.safe_get_with("minter_key_id", crate::federation::BlobError::Backend))
+            .collect()
+    }
+
+    /// v50.0.0 (#916, FSD/SECOND_DEVICE.md §3) — the postgres twin: what a
+    /// member holds, DISTINCT `(minter, epoch)` ordered.
+    async fn community_dek_member_grant_epochs(
+        &self,
+        community_key_id: &str,
+        member_key_ids: &[String],
+    ) -> Result<Vec<(String, u64)>, crate::federation::BlobError> {
+        if member_key_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT minter_key_id, epoch \
+                   FROM cirislens.federation_community_dek_member_grants \
+                  WHERE community_key_id = $1 AND member_key_id = ANY($2) \
+                  ORDER BY minter_key_id ASC, epoch ASC",
+                &[&community_key_id, &member_key_ids],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_member_grant_epochs: {e}"
+                ))
+            })?;
+        rows.iter()
+            .map(|r| {
+                let minter: String =
+                    r.safe_get_with("minter_key_id", crate::federation::BlobError::Backend)?;
+                let epoch: i64 = r.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+                Ok((minter, epoch.max(0) as u64))
+            })
             .collect()
     }
 

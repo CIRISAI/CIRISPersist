@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 103 delegations, generated. Every one: fault first, then delegate.
+// 104 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -1094,6 +1094,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.revocations_for(revoked_key_id).await
+    }
+    async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
+        if let Some(e) = self.faulted("rewrap_own_epochs_for_device") {
+            return Err(e);
+        }
+        self.inner.rewrap_own_epochs_for_device(owner, device).await
     }
     async fn set_active_halt(
         &self,

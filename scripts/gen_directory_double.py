@@ -74,6 +74,9 @@ DELEGATED_DEFAULTS = (
     "community_roster_signers",
     # v49.0.0 (#910) — the family twin, same shape and same reason.
     "family_roster_signers",
+    # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
+    # receive doors' re-wrap); through the double it must reach the override.
+    "rewrap_own_epochs_for_device",
 )
 
 ROOT = Path(__file__).resolve().parent.parent

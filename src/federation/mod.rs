@@ -149,6 +149,9 @@ mod android_custody_invariants;
 // master, through `Engine::open_mls_state` on every backend that has the row.
 #[cfg(all(test, feature = "encrypted-kv"))]
 mod mls_state_root_invariants;
+// v50.0.0 (CIRISPersist#916) — I188, a member's new device gets what the member holds.
+#[cfg(test)]
+mod device_readd_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -691,6 +694,36 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 /// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
 /// with other active members and no active founder.
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
+
+/// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
+/// no live owner-binding here: nobody is responsible for it, so no member's
+/// history can be handed to it. RETRYABLE: the out-of-order case — the owner's
+/// binding may not have replicated to this node yet.
+pub const DEVICE_REKEY_RULE_UNBOUND: &str = "device_rekey_unbound";
+/// v50.0.0 (CIRISPersist#916) — the device's live owner-binding names someone
+/// other than the member: another person's machine.
+pub const DEVICE_REKEY_RULE_OWNER_MISMATCH: &str = "device_rekey_owner_mismatch";
+/// v50.0.0 (CIRISPersist#916) — the offered authority is not the device's
+/// owner: the binding speaks for the human, and only the human adds a device.
+pub const DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER: &str = "device_rekey_authority_not_owner";
+/// v50.0.0 (CIRISPersist#916 review) — the device is not an ACTIVE identity
+/// occurrence of the member: a node the member owns but does not speak through
+/// (infrastructure operated for others) is not their device and receives none
+/// of their history. RETRYABLE: the occurrence may not have replicated yet.
+pub const DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE: &str = "device_rekey_not_an_occurrence";
+/// v50.0.0 (CIRISPersist#916 review, N1) — the backend does not know this
+/// node's own key (`node_key_id()` unset: a host that never told it), so it
+/// cannot tell its own epochs from a peer's. Refused rather than misreported;
+/// RETRYABLE once the host sets the key (every `Engine` constructor and
+/// PyEngine's init do).
+pub const DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN: &str = "device_rekey_node_key_unknown";
+/// v50.0.0 (CIRISPersist#916) — the member is not on the room's authorized
+/// roster at the call's instant: a removed member's new device gets nothing.
+pub const DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE: &str = "device_rekey_member_not_active";
+/// v50.0.0 (CIRISPersist#916) — the device has no valid content-KEM
+/// `encryption_pubkeys`: there is nothing to wrap to, and there is no
+/// plaintext fallback (§10.1.4).
+pub const DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS: &str = "device_rekey_no_encryption_pubkeys";
 
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
 /// state a standing question is asked against: each key that has appeared, and
@@ -1644,6 +1677,34 @@ where
     }
 }
 
+/// v50.0.0 (CIRISPersist#916) — `(owner, device)` when `row` is an owner-binding
+/// `delegates_to(owner → device)`, the row a receive door re-wraps on.
+pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
+    (row.attestation_type == types::attestation_type::DELEGATES_TO
+        && admission::is_owner_binding_envelope(&row.attestation_envelope)
+        && !row.attested_key_id.is_empty())
+    .then(|| (row.attesting_key_id.clone(), row.attested_key_id.clone()))
+}
+
+/// v50.0.0 (CIRISPersist#916) — run
+/// [`FederationDirectory::rewrap_own_epochs_for_device`] after a receive door
+/// admitted its row. The row stands whatever happens here: a failure is
+/// logged and the pending-`KeyGrant` sweep retries the walk.
+pub(crate) async fn rewrap_after_admission<F>(directory: &F, owner: &str, device: &str)
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Err(e) = directory.rewrap_own_epochs_for_device(owner, device).await {
+        tracing::warn!(
+            error = %e,
+            owner = %owner,
+            device = %device,
+            "admitted; re-wrap of this node's epochs to the device failed and is left to the \
+             pending-KeyGrant sweep (#916)"
+        );
+    }
+}
+
 /// v48.0.0 (CIRISPersist#860) — is `key_id` on `community_key_id`'s roster
 /// NOW, by the one fold? The single-member question every gate that used to
 /// read `community.members` asks instead (a raw read misses the widening
@@ -2362,6 +2423,26 @@ pub trait FederationDirectory: Send + Sync {
             .await
     }
 
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **re-wrap this
+    /// node's own community-DEK epochs to `device`, a device of `owner`**.
+    /// The receive doors call it after admitting what makes a device a
+    /// member's — an owner-binding
+    /// ([`apply_replicated_attestation`](Self::apply_replicated_attestation),
+    /// [`put_attestation_synced`](Self::put_attestation_synced)) or a signed
+    /// occurrence (`put_identity_occurrence`) — so every host reaches it
+    /// without a signer: it writes grant rows only, and each written grant
+    /// leaves its epoch DIRTY in the V146 emission ledger, which the
+    /// pending-`KeyGrant` loop every host runs signs and emits.
+    ///
+    /// The default is a no-op: a directory with no community-DEK plane has no
+    /// epochs to re-wrap. The sqlite and postgres backends run
+    /// [`at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices`](crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices)
+    /// under their node key (none set: nothing is theirs to re-wrap).
+    async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
+        let _ = (owner, device);
+        Ok(())
+    }
+
     /// v41.0.0 (CIRISPersist#804) — **the privileged SYNC door**: admit a row
     /// delivered over a session the transport authenticated as
     /// `authenticated_peer_key_id`.
@@ -2390,13 +2471,21 @@ pub trait FederationDirectory: Send + Sync {
         attestation: SignedAttestation,
         authenticated_peer_key_id: &str,
     ) -> Result<AttestationOutcome, Error> {
-        self.put_attestation_with_origin(
-            attestation,
-            replication::admission::WriteOrigin::Sync {
-                peer_key_id: authenticated_peer_key_id.to_owned(),
-            },
-        )
-        .await
+        let binding = owner_binding_of(&attestation.attestation);
+        let outcome = self
+            .put_attestation_with_origin(
+                attestation,
+                replication::admission::WriteOrigin::Sync {
+                    peer_key_id: authenticated_peer_key_id.to_owned(),
+                },
+            )
+            .await?;
+        // v50.0.0 (CIRISPersist#916) — a member's device owner-binding arriving
+        // over sync: this node re-wraps its own epochs to the device.
+        if let (AttestationOutcome::Inserted, Some((owner, device))) = (&outcome, binding) {
+            rewrap_after_admission(self, &owner, &device).await;
+        }
+        Ok(outcome)
     }
 
     /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
@@ -2449,6 +2538,9 @@ pub trait FederationDirectory: Send + Sync {
         };
         let incoming = &attestation.attestation;
         let attestation_id = incoming.attestation_id.clone();
+        // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
+        // learns a member has a device; read before the row is moved.
+        let binding = owner_binding_of(incoming);
         // The §6.1 silent-no-op door only exists for structural composers
         // that actually carry a references target — precompute the predicate
         // while `incoming` is still borrowed.
@@ -2481,6 +2573,9 @@ pub trait FederationDirectory: Send + Sync {
                     && self.get_attestation(&attestation_id).await?.is_none()
                 {
                     return Ok(Outcome::Deduplicated);
+                }
+                if let Some((owner, device)) = binding {
+                    rewrap_after_admission(self, &owner, &device).await;
                 }
                 Ok(Outcome::Inserted)
             }
@@ -8507,6 +8602,39 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the re-wrap of a
+    /// member's community DEK epochs to a new device was refused. Nothing is
+    /// granted. Authority is the member's owner-binding over the device, never
+    /// roster governance. Stable `kind()` token `federation_device_rekey_refused`.
+    ///
+    /// `rule` is one of [`DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN`] (RETRYABLE: the
+    /// host has not told the backend its key), [`DEVICE_REKEY_RULE_UNBOUND`] (RETRYABLE: the
+    /// owner-binding may not have replicated yet),
+    /// [`DEVICE_REKEY_RULE_OWNER_MISMATCH`],
+    /// [`DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER`],
+    /// [`DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE`] (RETRYABLE: the occurrence may
+    /// not have replicated yet),
+    /// [`DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE`] or
+    /// [`DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS`] (substantive until the
+    /// device registers keys). The rule rides the message across the FFI as
+    /// `"<kind>: <rule>"`.
+    #[error(
+        "re-wrap of {member_key_id:?}'s epochs in {community_key_id:?} to device \
+         {occurrence_key_id:?} refused ({rule}): a new device receives what its member holds \
+         only when the member's owner-binding names it, the member is active, and it has \
+         content-KEM keys (CIRISPersist#916)"
+    )]
+    DeviceRekeyRefused {
+        /// The room whose epochs would be re-wrapped.
+        community_key_id: String,
+        /// The member whose grants the device would receive.
+        member_key_id: String,
+        /// The new device's occurrence key.
+        occurrence_key_id: String,
+        /// Which clause refused; one of the rule tokens above.
+        rule: &'static str,
+    },
+
     /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — a
     /// membership LISTING (CC 2 `listed`) whose signature verified but which
     /// the listing door refuses. Nothing is stored. Stable `kind()` token
@@ -9963,6 +10091,7 @@ impl Error {
                 "federation_location_authority_unauthorized"
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
             Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"

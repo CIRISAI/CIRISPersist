@@ -380,6 +380,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v46.0.0 (#876) — the derivation input is a plain SELECT on the reader
     // path; the repair is a single guarded UPDATE on the writer's.
     ("community_dek_minters_granting", ConnClass::Read),
+    // v50.0.0 (#916) — what a member holds: a plain SELECT on the reader path.
+    ("community_dek_member_grant_epochs", ConnClass::Read),
     ("rebind_stranded_blob_epochs", ConnClass::Write),
     // v46.3.0 (#884) — the content-axis half of `minter_of_blob` is one
     // SELECT on the reader path (the community half delegates to
