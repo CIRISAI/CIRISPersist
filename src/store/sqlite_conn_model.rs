@@ -476,7 +476,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_witness_peer_ids", ConnClass::Read),
     ("load_content_kem_private_halves", ConnClass::Read),
     ("load_or_init_content_kem_identity", ConnClass::Write),
-    ("load_or_init_content_master", ConnClass::Write),
+    // v50.0.0 (#920) — the row load/init moved out of
+    // `load_or_init_content_master`, which now only resolves it.
+    ("load_or_init_content_master_row", ConnClass::Write),
     ("lookup_canonical_withdrawal", ConnClass::Read),
     ("lookup_community", ConnClass::Read),
     ("lookup_family", ConnClass::Read),

@@ -312,6 +312,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
+    // v50.0.0 (#920) — the content-master row load/init that
+    // `load_or_init_content_master` now resolves; the same door, split.
+    ("load_or_init_content_master_row", Class::Delegates),
     // #848 — the recipient-decrypt path: the identity floor is another door
     // (it mints on first call, first-write-wins), and unsealing our OWN
     // sealed private halves fails only on corrupt material — the substrate's
