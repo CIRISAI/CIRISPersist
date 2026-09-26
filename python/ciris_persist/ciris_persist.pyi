@@ -1335,6 +1335,9 @@ class Engine:
         ``expires_at = now()``, rationale = ``"revocation"``). Returns
         a JSON-encoded ``TrustGrantReceipt`` for the revocation event."""
 
+    def rewrap_own_epochs_to_member_devices_json(self, member_key_id: str | None = None, device_key_id: str | None = None) -> str:
+        """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — the minter side of the second device, on demand: re-wrap every retained epoch THIS node minte..."""
+
     def seal_stream_scoped(self, cohort_scope: str, stream_id: str, community_key_id: str | None = None, media_type: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (§12.3) — seal a live stream into a chunk_dag at cohort_scope. Refuses unless every chunk ROW is at the DAG's tier (I32); builds the manifest..."""
 

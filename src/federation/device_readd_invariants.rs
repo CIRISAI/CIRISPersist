@@ -299,10 +299,18 @@ pub(crate) mod bodies {
         let r: DeviceRekeyResult = door(bob_2.clone(), bob.clone())
             .await
             .unwrap_or_else(|e| panic!("(a) the door refused bob's own device: {e}"));
+        // E1 and E2 are this node's own (minter a1 = the node key): granted,
+        // their sets emitted. E3 was minted under b1 — re-wrapped here, but
+        // no set can carry it from this node: `local_only`, not `granted`.
         assert_eq!(
             sorted(r.granted.clone()),
-            sorted(epochs.clone()),
-            "(a) every epoch bob holds is granted"
+            sorted(vec![e1.clone(), e2.clone()]),
+            "(a) every epoch of this node's own that bob holds is granted"
+        );
+        assert_eq!(
+            r.local_only,
+            vec![e3.clone()],
+            "(a) a grant under another minter is reported local-only: {r:?}"
         );
         assert_eq!(r.epochs_scanned, 3, "(a) {r:?}");
         assert!(r.content_miss.is_empty(), "(a) {r:?}");
@@ -324,9 +332,15 @@ pub(crate) mod bodies {
                     .len(),
             );
         }
+        crate::federation::at_rest_cascade::orchestrate::REWRAPS_COMPUTED.with(|c| c.set(0));
         let again = door(bob_2.clone(), bob.clone()).await.unwrap();
+        assert_eq!(
+            crate::federation::at_rest_cascade::orchestrate::REWRAPS_COMPUTED.with(|c| c.get()),
+            0,
+            "(b) a re-run computes no wrap for an epoch the device already holds"
+        );
         assert!(
-            again.granted.is_empty(),
+            again.granted.is_empty() && again.local_only.is_empty(),
             "(b) a re-run grants nothing: {again:?}"
         );
         assert_eq!(
@@ -377,6 +391,8 @@ pub(crate) mod bodies {
             let (x, y) = (x.unwrap(), y.unwrap());
             let mut granted = x.granted.clone();
             granted.extend(y.granted.clone());
+            granted.extend(x.local_only.clone());
+            granted.extend(y.local_only.clone());
             assert_eq!(
                 sorted(granted),
                 sorted(epochs.clone()),
@@ -480,9 +496,9 @@ pub(crate) mod bodies {
 
         let r = door(bob_4.clone(), bob.clone()).await.unwrap();
         assert_eq!(
-            sorted(r.granted.clone()),
-            sorted(vec![e1.clone(), e3.clone()]),
-            "(g) the retained epochs are granted: {r:?}"
+            (r.granted.clone(), r.local_only.clone()),
+            (vec![e1.clone()], vec![e3.clone()]),
+            "(g) the retained epochs are granted (E3 locally): {r:?}"
         );
         let mut misses: Vec<(String, u64, EpochMissReason)> = r
             .content_miss
@@ -594,13 +610,27 @@ pub(crate) mod bodies {
             ensure_epoch_dek(b, &comm, &a2, 1).await.unwrap().epoch,
         );
         let absence = vec![e4.clone(), e5.clone()];
-        let swept = rewrap_own_epochs_to_member_devices(b, &a2, None, chrono::Utc::now())
+        // The passed device holds E4, E5 as carol's: wraps a set carried to
+        // this node (the KeyGrant union) — carol's minter wrapped it there.
+        for (m, e) in &absence {
+            b.community_dek_put_member_grants(
+                &comm,
+                m,
+                *e,
+                &[GrantWrap {
+                    recipient_key_id: passed.clone(),
+                    wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2
+                        .to_owned(),
+                    wrapped_dek: "cGFzc2Vk".into(),
+                }],
+            )
             .await
-            .unwrap_or_else(|e| panic!("(i) the minter's sweep: {e}"));
+            .unwrap();
+        }
         assert_eq!(
             grants_on(b, &comm, &absence, &passed).await,
             2,
-            "(i) precondition: the passed device holds E4, E5 as carol's ({swept:?})"
+            "(i) precondition: the passed device holds E4, E5 as carol's"
         );
         assert_eq!(
             grants_on(b, &comm, &absence, &lent).await,
@@ -656,8 +686,8 @@ pub(crate) mod bodies {
             .await
             .unwrap_or_else(|e| panic!("(i) the re-added member's device: {e}"));
         assert_eq!(
-            sorted(r.granted.clone()),
-            sorted(vec![e1.clone(), e3.clone()]),
+            (r.granted.clone(), r.local_only.clone()),
+            (vec![e1.clone()], vec![e3.clone()]),
             "(i) the re-added member's device gets what bob held: {r:?}"
         );
         assert_eq!(
@@ -670,6 +700,42 @@ pub(crate) mod bodies {
                 .iter()
                 .all(|m| !absence.contains(&(m.minter_key_id.clone(), m.epoch))),
             "(i) the absence span is not even 'held': {r:?}"
+        );
+
+        // (j) — a node bob OWNS but does not speak through (infrastructure he
+        // runs for others: owner-bound, its own singleton occurrence, no
+        // `(bob, node)` identity row) is not his device. The door refuses it
+        // by name; the minter's sweep never targets it — while it does reach
+        // bob's real device (the positive control).
+        let infra = format!("x1-{tag}");
+        ts::register_identity_key(b, &infra, NODE).await;
+        b.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&format!("bind-{infra}"), &bob, &infra),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("(j) bob binds the infra node: {e}"));
+        occur(b, &infra, &infra, Some(kem().0)).await;
+        let e = door(infra.clone(), bob.clone()).await.unwrap_err();
+        assert_eq!(
+            rule_of(&e),
+            crate::federation::DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE,
+            "(j) {e}"
+        );
+        let bob_7 = format!("b7-{tag}");
+        device(b, &bob_7, Some(&bob), Some(kem().0), tag).await;
+        let swept = rewrap_own_epochs_to_member_devices(b, &alice_1, None, chrono::Utc::now())
+            .await
+            .unwrap_or_else(|e| panic!("(j) the minter's sweep: {e}"));
+        assert_eq!(
+            grants_on(b, &comm, &epochs, &infra).await,
+            0,
+            "(j) the owned infra node receives nothing: {swept:?}"
+        );
+        assert!(
+            b.community_dek_has_member_grant(&comm, &e1.0, e1.1, &bob_7)
+                .await
+                .unwrap(),
+            "(j) the sweep did reach bob's real device: {swept:?}"
         );
     }
 }
@@ -803,19 +869,19 @@ pub(crate) mod two_node {
             .map(|(a, _)| a)
     }
 
-    /// A device node: its derived key registered as a NODE on both sides, its
-    /// singleton occurrence signed by itself on B (boot precedes claim), its
-    /// private KEM halves kept by the witness.
-    async fn device_on_b<B>(
-        a: &B,
-        b: &B,
-        alias: &str,
-    ) -> (
-        String,
-        crate::federation::identity_aggregate::ContentKemPrivate,
-    )
+    /// A device: its derived key registered as a NODE on both nodes, a fresh
+    /// content-KEM keypair whose private halves the witness keeps, and the
+    /// device's own signer (it signs its anchor).
+    struct Device {
+        key: String,
+        keys: crate::federation::EncryptionPubkeys,
+        private: crate::federation::identity_aggregate::ContentKemPrivate,
+        signer: std::sync::Arc<crate::signing::LocalSigner>,
+    }
+
+    async fn device<B>(a: &B, b: &B, alias: &str) -> Device
     where
-        B: BlobStorage + FederationDirectory + Sync,
+        B: FederationDirectory + Sync,
     {
         let signer = ts::local_signer(alias);
         let key = signer.derived_key_id();
@@ -825,29 +891,82 @@ pub(crate) mod two_node {
         let (x_priv, x_pub, ml_priv, ml_pub) =
             crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        publish_signed_content_only_occurrence(
-            b,
-            &signer,
-            &key,
-            &key,
-            device_class::SERVER,
-            None,
-            crate::federation::EncryptionPubkeys {
+        Device {
+            key,
+            keys: crate::federation::EncryptionPubkeys {
                 x25519_base64: B64.encode(x_pub),
                 ml_kem_768_base64: B64.encode(&ml_pub),
             },
-            None,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{alias}: publish the singleton on B: {e}"));
-        (
-            key,
-            crate::federation::identity_aggregate::ContentKemPrivate {
+            private: crate::federation::identity_aggregate::ContentKemPrivate {
                 x25519_priv: x_priv,
                 ml_kem_768_priv: ml_priv,
                 ml_kem_768_pub: ml_pub,
             },
+            signer,
+        }
+    }
+
+    /// The login anchor `(bob, device)` written by `backend`'s own host
+    /// through the trusted-local door (what PyEngine's
+    /// `put_identity_occurrence_json` writes) — no receive-door hook.
+    async fn anchor_local<B: FederationDirectory + Sync>(backend: &B, bob: &str, d: &Device) {
+        backend
+            .put_identity_occurrence_local(IdentityOccurrence {
+                identity_key_id: bob.to_owned(),
+                occurrence_key_id: d.key.clone(),
+                device_class: device_class::SERVER.to_owned(),
+                hardware_attestation: None,
+                asserted_at: chrono::Utc::now(),
+                valid_until: None,
+                encryption_pubkeys: Some(d.keys.clone()),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("anchor {} locally: {e}", d.key));
+    }
+
+    /// The signed login anchor `(bob, device)`, signed by the device and
+    /// lifted to bob by the owner-binding (§20.2), published on B.
+    async fn anchor_signed_on_b<B>(b: &B, bob: &str, d: &Device)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        publish_signed_content_only_occurrence(
+            b,
+            &d.signer,
+            bob,
+            &d.key,
+            device_class::SERVER,
+            None,
+            d.keys.clone(),
+            None,
         )
+        .await
+        .unwrap_or_else(|e| panic!("publish {}'s anchor on B: {e}", d.key));
+    }
+
+    /// The pending-set loop every host runs — PyEngine's `emit_pending_key_grants`
+    /// and init sweep, spelled as they spell it: `dirty_axes` for this node's
+    /// key, each emitted by the node's LocalSigner.
+    async fn dirty_emit<B>(a: &B, signer: &crate::signing::LocalSigner, me: &str) -> usize
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let mut n = 0;
+        for axis in crate::federation::key_grant::dirty_axes(a, me)
+            .await
+            .unwrap()
+        {
+            if crate::federation::key_grant::emit_key_grant_axis_with_local_signer(a, signer, &axis)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// B's signed occurrence for `device`, carried to A (the since-read).
@@ -946,144 +1065,208 @@ pub(crate) mod two_node {
         let foreign = format!("fm-{run}");
         ensure_epoch_dek(a, &l.comm, &foreign, 0).await.unwrap();
 
-        // (T) THE TRIGGER — bob's device d2 on B: its singleton, then bob's
-        // binding; both carried to A over the since-reads.
-        let (d2, d2_priv) = device_on_b(a, b, &format!("d2-{run}")).await;
-        let binding = bind_on_b(b, &bob, &d2, run).await;
-        carry_occurrence(a, b, &d2).await;
-        let outcome = l
-            .engine_a
-            .apply_replicated_attestation(SignedAttestation {
-                attestation: binding,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("(T) A admits bob's binding for d2: {e}"));
-        assert_eq!(outcome, ReplicatedAttestationOutcome::Inserted, "(T)");
-        for e in &own {
-            assert!(
-                a.community_dek_has_member_grant(&l.comm, &l.node_a, *e, &d2)
+        let (comm_r, node_a_r, node_b_r, foreign_r) = (&l.comm, &l.node_a, &l.node_b, &foreign);
+        let grants_of = move |device: String| async move {
+            let mut n = 0;
+            for e in [0u64, 1, 2] {
+                if a.community_dek_has_member_grant(comm_r, node_a_r, e, &device)
                     .await
-                    .unwrap(),
-                "(T) A re-wrapped its epoch {e} to d2 on the binding's arrival"
-            );
-        }
-        assert!(
-            !a.community_dek_has_member_grant(&l.comm, &l.node_b, 0, &d2)
+                    .unwrap()
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
+        let peer_grant = move |device: String| async move {
+            a.community_dek_has_member_grant(comm_r, node_b_r, 0, &device)
                 .await
-                .unwrap(),
-            "(T) A never wraps B's epoch: only B can sign that set"
+                .unwrap()
+                || a.community_dek_has_member_grant(comm_r, foreign_r, 0, &device)
+                    .await
+                    .unwrap()
+        };
+
+        // (T1) THE TRAIT DOOR — `FederationDirectory::apply_replicated_attestation`
+        // on A, the call PyEngine and CIRISEdge's bridge make. d1's anchor is
+        // already on A (A's host wrote it); bob's binding arrives from B.
+        let d1 = device(a, b, &format!("d1-{run}")).await;
+        anchor_local(a, &bob, &d1).await;
+        let binding = bind_on_b(b, &bob, &d1.key, run).await;
+        let outcome = FederationDirectory::apply_replicated_attestation(
+            a,
+            SignedAttestation {
+                attestation: binding,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("(T1) A admits bob's binding for d1: {e}"));
+        assert_eq!(outcome, ReplicatedAttestationOutcome::Inserted, "(T1)");
+        assert_eq!(
+            grants_of(d1.key.clone()).await,
+            3,
+            "(T1) the trait door re-wrapped A's epochs to d1"
         );
-        // A's sets carry d2 → B admits them → d2's wraps on B open to the DEK
+        assert!(
+            !peer_grant(d1.key.clone()).await,
+            "(T1) never B's epoch, never a foreign-named one"
+        );
+
+        // (T2) THE SYNC DOOR — `put_attestation_synced`, CIRISEdge's attributed
+        // door.
+        let d2 = device(a, b, &format!("d2-{run}")).await;
+        anchor_local(a, &bob, &d2).await;
+        let binding = bind_on_b(b, &bob, &d2.key, run).await;
+        FederationDirectory::put_attestation_synced(
+            a,
+            SignedAttestation {
+                attestation: binding,
+            },
+            &l.node_b,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("(T2) A admits bob's binding for d2 over sync: {e}"));
+        assert_eq!(
+            grants_of(d2.key.clone()).await,
+            3,
+            "(T2) the sync door re-wrapped A's epochs to d2"
+        );
+
+        // (T3) THE OCCURRENCE DOOR — the wire order: bob's binding first (d3 is
+        // not yet bob's device on A: nothing), then d3's signed anchor over
+        // `list_signed_identity_occurrences_since` → A's `put_identity_occurrence`.
+        let d3 = device(a, b, &format!("d3-{run}")).await;
+        let binding = bind_on_b(b, &bob, &d3.key, run).await;
+        anchor_signed_on_b(b, &bob, &d3).await;
+        FederationDirectory::apply_replicated_attestation(
+            a,
+            SignedAttestation {
+                attestation: binding,
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("(T3) A admits bob's binding for d3: {e}"));
+        assert_eq!(
+            grants_of(d3.key.clone()).await,
+            0,
+            "(T3) precondition: no anchor on A yet, so d3 is no device of bob's"
+        );
+        carry_occurrence(a, b, &d3.key).await;
+        assert_eq!(
+            grants_of(d3.key.clone()).await,
+            3,
+            "(T3) the occurrence door re-wrapped A's epochs to d3"
+        );
+
+        // The sets: A's pending-set loop (the one PyEngine runs) signs and
+        // emits every epoch the doors dirtied; B admits them off A's
+        // `list_attestations_since`; on B each device's wrap opens to the DEK
         // bob's node already holds.
+        let signer_a = ts::local_signer(&format!("em-a-{run}"));
+        assert_eq!(signer_a.derived_key_id(), l.node_a, "fixture: A's signer");
+        assert!(
+            dirty_emit(a, &signer_a, &l.node_a).await >= 3,
+            "(T) the doors left A's three epochs dirty"
+        );
         let b_priv = b.load_content_kem_private_halves().await.unwrap();
         for e in &own {
-            let set = set_carrying(a, &l.comm, &l.node_a, *e, &d2)
-                .await
-                .unwrap_or_else(|| panic!("(T) A emitted a set for epoch {e} carrying d2"));
-            l.engine_b
-                .apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+            for d in [&d1, &d2, &d3] {
+                let set = set_carrying(a, &l.comm, &l.node_a, *e, &d.key)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("(T) A's loop emitted epoch {e}'s set carrying {}", d.key)
+                    });
+                crate::federation::key_grant::admit_replicated_key_grant(
+                    b,
+                    SignedKeyGrantSet { attestation: set },
+                )
                 .await
                 .unwrap_or_else(|err| panic!("(T) B admits A's set for epoch {e}: {err}"));
-            let (_, d2_wrap) = b
-                .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &d2)
-                .await
-                .unwrap()
-                .unwrap_or_else(|| panic!("(T) d2's wrap on A's epoch {e} reached B"));
-            let (_, bob_wrap) = b
-                .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &l.node_b)
-                .await
-                .unwrap()
-                .expect("bob's node's own wrap on B");
-            assert_eq!(
-                unwrap_dek_v2_json(&d2_priv, &d2_wrap).unwrap(),
-                unwrap_dek_v2_json(&b_priv, &bob_wrap).unwrap(),
-                "(T) on B, d2 opens A's epoch {e} to the DEK bob's node holds"
-            );
+                let (_, wrap) = b
+                    .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &d.key)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("(T) {}'s wrap on epoch {e} reached B", d.key));
+                let (_, bob_wrap) = b
+                    .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &l.node_b)
+                    .await
+                    .unwrap()
+                    .expect("bob's node's own wrap on B");
+                assert_eq!(
+                    unwrap_dek_v2_json(&d.private, &wrap).unwrap(),
+                    unwrap_dek_v2_json(&b_priv, &bob_wrap).unwrap(),
+                    "(T) on B, {} opens A's epoch {e} to the DEK bob's node holds",
+                    d.key
+                );
+            }
         }
 
-        // (S) THE SWEEP — d3's binding reaches A BEFORE its keys: nothing can
-        // be wrapped yet; the keys arrive; the pending sweep re-wraps and
-        // emits.
-        let (d3, _d3_priv) = device_on_b(a, b, &format!("d3-{run}")).await;
-        let binding = bind_on_b(b, &bob, &d3, run).await;
-        l.engine_a
-            .apply_replicated_attestation(SignedAttestation {
+        // (S) THE SWEEP — d4's binding reaches A through the trait door before
+        // its anchor (nothing); the anchor lands through a door with no hook;
+        // the pending sweep re-wraps and emits.
+        let d4 = device(a, b, &format!("d4-{run}")).await;
+        let binding = bind_on_b(b, &bob, &d4.key, run).await;
+        FederationDirectory::apply_replicated_attestation(
+            a,
+            SignedAttestation {
                 attestation: binding,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("(S) A admits bob's binding for d3: {e}"));
-        assert!(
-            !a.community_dek_has_member_grant(&l.comm, &l.node_a, 0, &d3)
-                .await
-                .unwrap(),
-            "(S) precondition: no keys on A yet, nothing wrapped"
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("(S) A admits bob's binding for d4: {e}"));
+        anchor_local(a, &bob, &d4).await;
+        assert_eq!(
+            grants_of(d4.key.clone()).await,
+            0,
+            "(S) precondition: no door re-wrapped d4 yet"
         );
-        carry_occurrence(a, b, &d3).await;
         l.engine_a
             .emit_pending_key_grants()
             .await
             .unwrap_or_else(|e| panic!("(S) A's pending sweep: {e}"));
+        assert_eq!(
+            grants_of(d4.key.clone()).await,
+            3,
+            "(S) the sweep re-wrapped A's epochs to d4"
+        );
         for e in &own {
             assert!(
-                a.community_dek_has_member_grant(&l.comm, &l.node_a, *e, &d3)
+                set_carrying(a, &l.comm, &l.node_a, *e, &d4.key)
                     .await
-                    .unwrap(),
-                "(S) the sweep re-wrapped A's epoch {e} to d3"
-            );
-            assert!(
-                set_carrying(a, &l.comm, &l.node_a, *e, &d3).await.is_some(),
-                "(S) and emitted epoch {e}'s set carrying d3"
+                    .is_some(),
+                "(S) and emitted epoch {e}'s set carrying d4"
             );
         }
 
-        // (D) THE HOST'S DOOR on the minter — d4 bound and keyed on A directly
-        // (no trigger): the door grants A's epochs, the foreign-named one
-        // locally, reports B's as minted elsewhere, and emits sets for A's
-        // own epochs only.
-        let d4_alias = format!("d4-{run}");
-        let d4 = ts::local_signer(&d4_alias).derived_key_id();
-        ts::register_hybrid_key_as(a, &d4, &d4_alias, NODE).await;
+        // (D) THE HOST'S DOOR on the minter — d5 bound and anchored on A
+        // through doors with no hook: the door grants A's epochs, the
+        // foreign-named one LOCALLY ONLY, reports B's as minted elsewhere, and
+        // emits sets for A's own epochs only.
+        let d5 = device(a, b, &format!("d5-{run}")).await;
         a.put_attestation(SignedAttestation {
-            attestation: ts::owner_binding_attestation(&format!("bind-{d4}-{run}"), &bob, &d4),
+            attestation: ts::owner_binding_attestation(
+                &format!("bind-{}-{run}", d5.key),
+                &bob,
+                &d5.key,
+            ),
         })
         .await
-        .unwrap_or_else(|e| panic!("(D) bind d4 on A: {e}"));
-        let (d4_keys, _) = {
-            let (x_priv, x_pub, ml_priv, ml_pub) =
-                crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
-            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-            (
-                crate::federation::EncryptionPubkeys {
-                    x25519_base64: B64.encode(x_pub),
-                    ml_kem_768_base64: B64.encode(&ml_pub),
-                },
-                (x_priv, ml_priv),
-            )
-        };
-        a.put_identity_occurrence_local(IdentityOccurrence {
-            identity_key_id: d4.clone(),
-            occurrence_key_id: d4.clone(),
-            device_class: device_class::SERVER.to_owned(),
-            hardware_attestation: None,
-            asserted_at: chrono::Utc::now(),
-            valid_until: None,
-            encryption_pubkeys: Some(d4_keys),
-            transport_binding: None,
-            persist_row_hash: String::new(),
-        })
-        .await
-        .unwrap();
+        .unwrap_or_else(|e| panic!("(D) bind d5 on A: {e}"));
+        anchor_local(a, &bob, &d5).await;
         let r = l
             .engine_a
-            .rekey_community_member_device_add(&l.comm, &bob, &d4, &bob)
+            .rekey_community_member_device_add(&l.comm, &bob, &d5.key, &bob)
             .await
             .unwrap_or_else(|e| panic!("(D) the door on A: {e}"));
         let mut granted = r.granted.clone();
         granted.sort();
-        let mut want: Vec<(String, u64)> = own.iter().map(|e| (l.node_a.clone(), *e)).collect();
-        want.push((foreign.clone(), 0));
-        want.sort();
+        let want: Vec<(String, u64)> = own.iter().map(|e| (l.node_a.clone(), *e)).collect();
         assert_eq!(granted, want, "(D) {r:?}");
+        assert_eq!(
+            r.local_only,
+            vec![(foreign.clone(), 0)],
+            "(D) the foreign-named epoch is granted here and reported local-only: {r:?}"
+        );
         assert_eq!(
             r.content_miss
                 .iter()
@@ -1094,8 +1277,10 @@ pub(crate) mod two_node {
         );
         for e in &own {
             assert!(
-                set_carrying(a, &l.comm, &l.node_a, *e, &d4).await.is_some(),
-                "(D) the door emitted A's epoch {e} set carrying d4"
+                set_carrying(a, &l.comm, &l.node_a, *e, &d5.key)
+                    .await
+                    .is_some(),
+                "(D) the door emitted A's epoch {e} set carrying d5"
             );
         }
         assert!(

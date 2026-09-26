@@ -2335,6 +2335,30 @@ impl PyEngine {
                     let me = crate::signing::federation_key_id_of(&*signer)
                         .await
                         .map_err(|e| crate::federation::Error::Backend(format!("node key: {e}")))?;
+                    // v50.0.0 (CIRISPersist#916) — first re-wrap this node's
+                    // own epochs to every member device whose binding or keys
+                    // arrived since the last pass; the grants dirty their
+                    // epochs and the loop below emits them. Logged, not fatal.
+                    let now = chrono::Utc::now();
+                    let rewrapped = match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                pg.as_ref(), &me, None, now,
+                            )
+                            .await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                sq.as_ref(), &me, None, now,
+                            )
+                            .await
+                        }
+                    };
+                    if let Err(e) = rewrapped {
+                        tracing::warn!(error = %e, "member-device re-wrap sweep failed at init (#916)");
+                    }
                     let mut emitted = 0usize;
                     match &backend {
                         #[cfg(feature = "postgres")]
@@ -6598,6 +6622,36 @@ impl PyEngine {
             }
             py.detach(|| {
                 let me = runtime.block_on(self.local_derived_key_id_async())?;
+                // v50.0.0 (CIRISPersist#916) — the member-device re-wrap walk
+                // first (logged, not fatal); its grants dirty their epochs.
+                let now = chrono::Utc::now();
+                let rewrapped = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        let me = me.clone();
+                        runtime.block_on(async move {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                backend.as_ref(), &me, None, now,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        let me = me.clone();
+                        runtime.block_on(async move {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                backend.as_ref(), &me, None, now,
+                            )
+                            .await
+                        })
+                    }
+                };
+                if let Err(e) = rewrapped {
+                    tracing::warn!(error = %e, "member-device re-wrap sweep failed (#916)");
+                }
                 let axes = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -24320,9 +24374,12 @@ impl PyEngine {
     /// emitted. `authority_key_id` must be the member's owner-binding over the
     /// device and the member must be active in the room; a refusal raises
     /// `ValueError` whose message starts `federation_device_rekey_refused`.
-    /// JSON `{epochs_scanned, granted: [[minter, epoch]], already_held:
-    /// [[minter, epoch]], content_miss: [{minter_key_id, epoch, reason}]}` —
-    /// an epoch this node cannot recover is reported, never dropped.
+    /// JSON `{epochs_scanned, granted: [[minter, epoch]], local_only:
+    /// [[minter, epoch]], already_held: [[minter, epoch]], content_miss:
+    /// [{minter_key_id, epoch, reason}]}` — `granted` is this node's own
+    /// epochs (their sets are emitted), `local_only` a grant written under a
+    /// minter that is not this node's key (never emitted), and an epoch this
+    /// node cannot recover is reported, never dropped.
     fn rekey_community_member_device_add_json(
         &self,
         py: Python<'_>,
@@ -24350,6 +24407,7 @@ impl PyEngine {
                 serde_json::to_string(&serde_json::json!({
                     "epochs_scanned": r.epochs_scanned,
                     "granted": r.granted,
+                    "local_only": r.local_only,
                     "already_held": r.already_held,
                     "content_miss": r.content_miss.iter().map(|m| serde_json::json!({
                         "minter_key_id": m.minter_key_id,
@@ -24358,6 +24416,50 @@ impl PyEngine {
                     })).collect::<Vec<_>>(),
                 }))
                 .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the minter
+    /// side of the second device, on demand**: re-wrap every retained epoch
+    /// THIS node minted to each device of an active member that does not hold
+    /// it yet (a device = an active identity occurrence the member's live
+    /// owner-binding names), and emit each changed epoch's `KeyGrant` set.
+    /// `member_key_id` + `device_key_id` narrow the walk to one device; both
+    /// `None` sweeps every room. The receive doors and `emit_pending_key_grants`
+    /// run the same walk themselves. JSON `{changed: [[community, epoch]],
+    /// keyless: [[community, device]]}`.
+    #[pyo3(signature = (member_key_id = None, device_key_id = None))]
+    fn rewrap_own_epochs_to_member_devices_json(
+        &self,
+        py: Python<'_>,
+        member_key_id: Option<&str>,
+        device_key_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let only =
+                match (member_key_id, device_key_id) {
+                    (Some(m), Some(d)) => Some((m.to_owned(), d.to_owned())),
+                    (None, None) => None,
+                    _ => return Err(PyValueError::new_err(
+                        "rewrap_own_epochs_to_member_devices_json: pass both member_key_id and \
+                         device_key_id, or neither",
+                    )),
+                };
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(engine.rewrap_own_epochs_to_member_devices(
+                        only.as_ref().map(|(m, d)| (m.as_str(), d.as_str())),
+                    ))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({
+                    "changed": r.changed,
+                    "keyless": r.keyless,
+                }))
+                .map_err(|e| PyRuntimeError::new_err(format!("rewrap encode: {e}")))
             })
         })
     }

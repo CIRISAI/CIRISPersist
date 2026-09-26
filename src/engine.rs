@@ -6708,10 +6708,11 @@ impl Engine {
     /// minted to each live-owner-bound device of an ACTIVE member that holds
     /// no grant on it yet, and emit each changed epoch's `KeyGrant` set,
     /// signed by this node as its minter. `only = Some((member, device))`
-    /// narrows the walk to one binding; `None` sweeps every room this node
-    /// minted in. Runs itself when an owner-binding is admitted through
-    /// [`apply_replicated_attestation`](Self::apply_replicated_attestation)
-    /// and in [`emit_pending_key_grants`](Self::emit_pending_key_grants).
+    /// narrows the walk to one device; `None` sweeps every room this node
+    /// minted in. The receive doors run the walk themselves (grant rows only,
+    /// through `FederationDirectory::rewrap_own_epochs_for_device`) and
+    /// [`emit_pending_key_grants`](Self::emit_pending_key_grants) runs it
+    /// before emitting; this is the on-demand form that also emits.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn rewrap_own_epochs_to_member_devices(
         &self,
@@ -8170,42 +8171,25 @@ impl Engine {
         crate::federation::attestation_apply::ReplicatedAttestationOutcome,
         crate::federation::Error,
     > {
-        // v50.0.0 (CIRISPersist#916) — an owner-binding `delegates_to(owner →
-        // device)` arriving here is the moment a MINTER learns a member has a
-        // new device: re-wrap this node's own retained epochs to it.
-        let binding = (attestation.attestation.attestation_type
-            == crate::federation::types::attestation_type::DELEGATES_TO
-            && crate::federation::admission::is_owner_binding_envelope(
-                &attestation.attestation.attestation_envelope,
-            ))
-        .then(|| {
-            (
-                attestation.attestation.attesting_key_id.clone(),
-                attestation.attestation.attested_key_id.clone(),
-            )
-        });
+        // v50.0.0 (CIRISPersist#916) — the backend's receive door re-wraps this
+        // node's own epochs to a member's device when an owner-binding lands
+        // (grant rows, dirtying their epochs); THIS door, which holds a
+        // signer, emits the dirtied sets at once instead of at the next sweep.
+        let binding = crate::federation::owner_binding_of(&attestation.attestation);
         let outcome = self
             .federation_directory()
             .apply_replicated_attestation(attestation)
             .await?;
         if let (
             crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
-            Some((owner, device)),
+            Some(_),
         ) = (&outcome, binding)
         {
-            // The row is admitted whatever happens next; a failed re-wrap is
-            // retried by the pending-KeyGrant sweep, so it is logged, not
-            // returned as a refusal of a row that was stored.
-            if let Err(e) = self
-                .rewrap_own_epochs_to_member_devices(Some((&owner, &device)))
-                .await
-            {
+            if let Err(e) = self.emit_pending_key_grants().await {
                 tracing::warn!(
                     error = %e,
-                    owner = %owner,
-                    device = %device,
-                    "owner-binding admitted; re-wrap of this node's epochs to the device \
-                     failed and is left to the pending-KeyGrant sweep (#916)"
+                    "owner-binding admitted; the dirtied KeyGrant sets are left to the \
+                     pending sweep (#916)"
                 );
             }
         }

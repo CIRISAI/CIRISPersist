@@ -5081,6 +5081,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         row.map(pg_row_to_role_withdrawal).transpose()
     }
 
+    /// v50.0.0 (CIRISPersist#916) — the receive doors' re-wrap: this node's
+    /// own epochs (minter = the node key) to a member's device. Grant rows
+    /// only; each leaves its epoch dirty for the pending-`KeyGrant` loop.
+    async fn rewrap_own_epochs_for_device(
+        &self,
+        owner: &str,
+        device: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let Some(me) = crate::federation::FederationDirectory::node_key_id(self) else {
+            return Ok(());
+        };
+        crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+            self,
+            &me,
+            Some((owner, device)),
+            chrono::Utc::now(),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn put_attestation_with_origin(
         &self,
         attestation: crate::federation::SignedAttestation,
@@ -7075,6 +7096,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             signed_envelope,
             signature,
         } = occurrence;
+        // v50.0.0 (CIRISPersist#916) — who, through what, for the re-wrap below.
+        let rewrap_for = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -7182,6 +7205,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             drop(client);
             self.index_stored_record("IdentityOccurrence", &wire_index_key)
                 .await?;
+        }
+        // v50.0.0 (CIRISPersist#916) — a member's device occurrence arriving
+        // (typically after its owner-binding): this node re-wraps its own
+        // epochs to it. The row stands whatever the re-wrap does.
+        if rewrap_for.0 != rewrap_for.1 {
+            crate::federation::rewrap_after_admission(self, &rewrap_for.0, &rewrap_for.1).await;
         }
         Ok(())
     }

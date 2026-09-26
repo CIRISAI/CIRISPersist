@@ -430,6 +430,7 @@ Engine	minter_of_blob_json	empirical
 Engine	rekey_self_occurrence_add_json	deontic	
 Engine	rekey_family_member_add_json	deontic	
 Engine	rekey_community_member_device_add_json	deontic	
+Engine	rewrap_own_epochs_to_member_devices_json	deontic	
 Engine	list_identity_occurrences_for_json	ontological	
 Engine	list_live_occurrences	ontological	
 Engine	list_llm_calls	empirical	
