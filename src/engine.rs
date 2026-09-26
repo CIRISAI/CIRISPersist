@@ -2092,6 +2092,64 @@ impl Engine {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#920, `FSD/SECOND_DEVICE.md` §2) — **open the
+    /// durable MLS-state store at `path`, keyed from the root the content
+    /// master resolves to on this host**, and report which.
+    ///
+    /// The key is HKDF(root, [`MLS_STATE_CONTEXT`](crate::encrypted_kv::MLS_STATE_CONTEXT))
+    /// where the root is named by the persisted `federation_content_master`
+    /// row: the hardware-sealed seed (`key_kind='hardware'`) or the persisted
+    /// software content master (`key_kind='software'`). **The row wins**
+    /// (`BLOB_ENCRYPTION_AT_REST.md` §10.2): a store created on a software
+    /// host keeps opening after a TPM appears. A node with no row yet gets
+    /// one here, exactly as its first encrypted blob write would create it —
+    /// the MLS store is content at rest. There is no seed file and no third
+    /// root.
+    ///
+    /// Returns the store and its [`MlsStateCustody`](crate::encrypted_kv::MlsStateCustody)
+    /// (`Hardware` | `Software` plus a descriptor) so the host logs the class
+    /// by name. [`KVError::HardwareCustodyUnavailable`](crate::encrypted_kv::KVError::HardwareCustodyUnavailable)
+    /// is §11.7 only: the row says hardware and the seed is unreachable;
+    /// nothing is written and nothing is minted. A failure to load the row
+    /// is `KVError::Backend`.
+    ///
+    /// **Clean break:** replaces v49's `XChaChaKvStore::open_mls_state(path)`,
+    /// which asked the hardware seed only and so could only refuse on a
+    /// software host.
+    #[cfg(feature = "encrypted-kv")]
+    pub async fn open_mls_state(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<
+        (
+            crate::encrypted_kv::XChaChaKvStore,
+            crate::encrypted_kv::MlsStateCustody,
+        ),
+        crate::encrypted_kv::KVError,
+    > {
+        use crate::encrypted_kv::{hardware_mls_state_key, KVError, XChaChaKvStore};
+        use crate::federation::BlobStorage as _;
+        let row = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.load_or_init_content_master_row().await,
+            BackendDispatch::Sqlite(b) => b.load_or_init_content_master_row().await,
+        }
+        .map_err(|e| KVError::Backend(format!("content master row: {e}")))?;
+        let path = path.as_ref().to_path_buf();
+        // TPM + filesystem I/O: off the async workers.
+        tokio::task::spawn_blocking(move || {
+            XChaChaKvStore::open_mls_state_from_row(
+                path,
+                &row.key_kind,
+                row.master_key_b64.as_deref(),
+                &row.descriptor,
+                hardware_mls_state_key,
+            )
+        })
+        .await
+        .map_err(|e| KVError::Backend(format!("open_mls_state join: {e}")))?
+    }
+
     /// v3.4.0 (CIRISPersist#123) — delete one blob row by SHA from
     /// the underlying backend.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]

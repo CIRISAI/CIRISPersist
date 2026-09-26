@@ -117,6 +117,36 @@ pub enum ContentMasterSource {
     },
 }
 
+/// v50.0.0 (CIRISPersist#920) — the persisted `federation_content_master`
+/// row, verbatim: the authority on WHICH root this node uses (§10.2 — the
+/// row wins). Returned by
+/// [`BlobStorage::load_or_init_content_master_row`](crate::federation::BlobStorage::load_or_init_content_master_row)
+/// so a consumer that needs the root's KIND (the MLS-state opener) reads
+/// the same row the blob doors resolve, instead of re-deciding it.
+#[derive(Clone)]
+pub struct ContentMasterRow {
+    /// `"hardware"` | `"software"` (the V070 CHECK).
+    pub key_kind: String,
+    /// The 32-byte software master, base64 — present iff `key_kind='software'`.
+    pub master_key_b64: Option<String>,
+    /// Provenance string.
+    pub descriptor: String,
+}
+
+impl std::fmt::Debug for ContentMasterRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the software master.
+        f.debug_struct("ContentMasterRow")
+            .field("key_kind", &self.key_kind)
+            .field(
+                "master_key_b64",
+                &self.master_key_b64.as_ref().map(|_| "<redacted>"),
+            )
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
+
 /// v43.0.0 (§10.2) — **resolve the content-at-rest master key.**
 ///
 /// This is the function `at_rest_cascade`'s module header has always

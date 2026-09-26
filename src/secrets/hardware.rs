@@ -153,7 +153,9 @@ fn derive_hardware_master_for_context(
 /// The derivation proper, over an already-opened storage. Split out so the
 /// seed policy (§11.7) is testable against a double — the branch is
 /// unreachable on a host with no TPM, which is every CI runner.
-fn derive_with_storage(
+/// v50.0.0 (#920): `pub(crate)` so the MLS-state opener's hardware arm is
+/// driven over the same double (`encrypted_kv`'s I187).
+pub(crate) fn derive_with_storage(
     storage: &dyn ciris_keyring::SecureBlobStorage,
     context: &str,
     create_seed_if_absent: bool,
@@ -256,20 +258,19 @@ mod context_domain_separation_tests {
 }
 
 #[cfg(test)]
-mod seed_policy_tests {
-    //! §11.10 I11 — **a hardware root never re-mints.** The branch under test
-    //! is unreachable on a host without a TPM (every CI runner), so it is
-    //! driven through a storage double that reports hardware-backed.
+pub(crate) mod test_doubles {
+    //! A `SecureBlobStorage` that reports hardware-backed, so the seed policy
+    //! (§11.7) is drivable on hosts without a TPM (every CI runner). Shared
+    //! by `seed_policy_tests` and v50's I187 (`encrypted_kv`).
 
-    use ciris_keyring::SecureBlobStorage as _;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    struct FakeHardwareStorage {
+    pub(crate) struct FakeHardwareStorage {
         blobs: Mutex<HashMap<String, Vec<u8>>>,
     }
     impl FakeHardwareStorage {
-        fn empty() -> Self {
+        pub(crate) fn empty() -> Self {
             Self {
                 blobs: Mutex::new(HashMap::new()),
             }
@@ -313,6 +314,16 @@ mod seed_policy_tests {
             "fake hardware storage (test double)".into()
         }
     }
+}
+
+#[cfg(test)]
+mod seed_policy_tests {
+    //! §11.10 I11 — **a hardware root never re-mints.** The branch under test
+    //! is unreachable on a host without a TPM (every CI runner), so it is
+    //! driven through a storage double that reports hardware-backed.
+
+    use super::test_doubles::FakeHardwareStorage;
+    use ciris_keyring::SecureBlobStorage as _;
 
     /// The falsifier for I11: a re-derivation over an ABSENT seed must
     /// refuse, not mint. The first implementation minted — a lost keyring
