@@ -1242,6 +1242,12 @@ pub mod delegation_scope {
              envelope BOOLEAN grant, not a scope token, so it is not a value this inventory \
              offers",
         ),
+        (
+            "listing::LISTED_RULE_SCOPE_INVALID",
+            "v49.0.0 (CIRISPersist#912) — a REFUSAL RULE TOKEN \
+             (Error::MembershipListingRefused.rule = \"envelope_listed_scope_invalid\"), not a \
+             delegates_to scope value; `scope` in its name is the cohort scope a listing named",
+        ),
     ];
 
     /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split
