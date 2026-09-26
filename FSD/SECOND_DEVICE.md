@@ -69,35 +69,61 @@ So the rule is applied twice:
 
 `Engine::widen_audience` stays callable for a placed row. It is documented as the one deliberate path, and I186 pins that an explicit call still crosses.
 
-**Witness.** CIRISServer's self-files ladder:
-- two self FILE rows (`file:doc:v1`, with `filename` and a blob pointer) and one `chat:key_package:v1` row naming the owner's self room;
-- one of them still local when the sweep runs;
-- a family file row;
+**Where a row names its room (review of 4a973395, F1).** A row is placed if either of two things holds:
+- a top-level `COHORT_TARGET_ENVELOPE_FIELDS` alias is populated. Chat rows name their room this way (Edge `chat.rs`), as does every targeted placement;
+- a blob pointer's owner slot is non-empty: the `community_key_id` of a pointer-shaped member, at top level or as an array item (`blob_pointer::names_pointer_owner`, the same scan as `pointer_for`, with the discriminator shared). This is the room the bytes are held in.
+
+Edge v32.1.0's self FILE rows name their room ONLY in the pointer's slot. A self room has no `cohort_target_field` (`scope_room.rs`), and Edge's own test asserts "a self row names no cohort target". Edge's self-room file read keys on `file.pointer.community_key_id` (`files.rs`). The first cut read only the aliases, so every Edge self file row was still a candidate and was still widened.
+
+**SQL form of the pointer arm.** The member set is open: the Rust scan reads every member by construction. So the SQL walks the same two positions instead of a list of paths:
+- SQLite: `json_tree` restricted to a top-level member (`path = '$'`, not the root) or an item of a top-level array (`path` = that array's `fullkey` from `json_each`). Nested `json_each` cannot be used here: SQLite evaluates a table-valued function's argument on every row, and a scalar member's value is not JSON.
+- Postgres: `jsonb_each` plus `jsonb_array_elements` under a lateral join.
+
+The pointer discriminator is the same in all three: a 64-hex `content_sha256` string and a non-empty string `community_key_id`. There is no generated column: that would need a migration, and a stored copy of the rule would need its own drift check. The candidate set is small (`tier='federation' AND cohort_scope IN ('self','family')`), and the read already runs two correlated subqueries per row.
+
+**Witness.** CIRISServer's self-files ladder, primary arm in Edge's REAL self-file shape:
+- `file:v1`, with the pointer under `content`, the owner only in `content.community_key_id`, a `filename`, `evidence_refs`, and no top-level target;
+- two of these rows in the mesh, and one still local;
+- one `chat:key_package:v1` row naming the room at top level;
+- a family file row naming `family_key_id`;
 - a grant covering `file:`/`chat:` at `federation`.
 
-After the grant's own sweep plus an explicit one:
-- no `supersedes` anywhere in the corpus (the unfiltered enumerator) stands for a placed row;
+The candidate-read fixture adds a pointer inside an array (`attachments`) and a pointer with an EMPTY owner slot (stranded).
+
+Arm (d) models Edge's reads:
+- `files::in_room`: `dimension = file:v1` and the pointer's owner slot is the room;
+- `chat::rows_in_room`: top-level `community_key_id`;
+- both under `LifecycleView::Live`, so any row a `supersedes` stands for is hidden.
+
+It asserts every placed row's supersedes chain is empty and that the read lists exactly the originals. **RED before the pointer arm (commit 09cd8d99 on 4a973395):**
+- sqlite and postgres sweep: `I186 (d): the supersedes chain of placed row … is not empty — Edge's live listing hides it, and the second device lists nothing`;
+- memory, sqlite and postgres candidate read: the read returned `a-edge-attachment` and `a-edge-file`.
+
+After the fix:
+- no `supersedes` anywhere in the corpus stands for a placed row;
 - no other row carries a placed file's filename;
-- the room-keyed live read (rows naming the room, minus every row a `supersedes` stands for) lists exactly the original rows;
-- the stranded self file row (no target) is widened to `federation` (#530 unchanged).
+- the stranded self file row (no target, no pointer owner) is widened to `federation` (#530 unchanged).
 
-M9 (both halves of the fix removed, the d61614dc behaviour) is RED on this witness.
-
-Lane: `scripts/pg_test_db.sh -- cargo nextest run -j 3 --no-fail-fast --features sqlite,postgres -E 'test(sweep_placement) | test(530) | test(widen) | test(promote_consented)'` (19 tests; the postgres legs ran against a live database, 1–5 s each). Every mutant was applied to a clean committed tree and reverted with `git checkout --` before the next. 9 of 9 killed; none OOM-killed.
+Lane: `scripts/pg_test_db.sh -- cargo nextest run -j 3 --no-fail-fast --features sqlite,postgres -E 'test(sweep_placement) | test(530) | test(widen) | test(promote_consented)'` (19 tests; the postgres legs ran against a live database). Every mutant was applied to a clean committed tree (3c6139ff) and reverted with `git checkout --` before the next. 13 of 13 killed; none OOM-killed.
 
 | Mutant | Killed by |
 |---|---|
-| M1 drop the read's exclusion on all three backends (the `sweep_widen` guard kept) | I186 candidate read on memory, sqlite, postgres; I186 sweep on sqlite and postgres (a placed row is returned as a candidate) |
-| M2 exclude only `community_key_id` (the shared predicate and both SQL renderings) | the rendering pin (`i186_the_sql_renderings_name_every_alias`); I186 candidate read on all three; I186 sweep on both |
-| M3 exclude only when `cohort_scope = 'self'` | I186 candidate read on all three (the `family` row); I186 sweep on both |
-| M4 invert (exclude the rows WITHOUT a target) | I186 candidate read on all three, I186 sweep on both; the #530 tests `list_widening_candidates_filters_suppressed_scopes_530` and `consent_sweep_widens_a_row_that_entered_before_the_grant` |
-| M5 drop the read's exclusion on memory only | I186 candidate read on memory; (e) by its comparison ("sqlite and memory disagree") |
-| M6 an EMPTY target counts as a target (Rust `is_some()`, SQL without the `= ''` arm) | I186 candidate read on all three (`c-empty-target`). (e) passes, correctly: all three drift together |
-| M7 drop the read's exclusion on postgres only | I186 candidate read and sweep on postgres; (e) by its comparison ("postgres and memory disagree") |
-| M8 drop the `sweep_widen` guard (the read's exclusion kept): the sweep's pass-1 trigger | I186 sweep on sqlite and postgres ("placed row … was widened to [\"federation\"] — its filename and pointer left the room") |
-| M9 drop both (the d61614dc behaviour) | I186 candidate read on all three, I186 sweep on both |
+| M1 drop the read's exclusion (aliases and pointer) on all three backends, keep the sweep guard | I186 candidate read on memory, sqlite, postgres; I186 sweep on sqlite and postgres |
+| M2 read only the `community_key_id` alias | the rendering pin; candidate read on all three; sweep on both |
+| M3 exclude only when `cohort_scope = 'self'` | candidate read on all three (the family rows); sweep on both |
+| M4 invert | candidate read on all three; sweep on both; `list_widening_candidates_filters_suppressed_scopes_530`; `consent_sweep_widens_a_row_that_entered_before_the_grant` |
+| M5 drop the read's exclusion on memory only | candidate read on memory; (e) "sqlite and memory disagree" |
+| M6 an EMPTY alias counts as a target | candidate read on all three (`c-empty-target`) |
+| M7 drop the read's exclusion on postgres only | candidate read and sweep on postgres; (e) "postgres and memory disagree" |
+| M8 drop the `sweep_widen` guard (pass 1's trigger) | sweep on sqlite and postgres |
+| M9 drop the read's exclusion and the guard (d61614dc behaviour) | candidate read on all three; sweep on both |
+| **M10 drop the pointer arm on all three** (Rust and both SQL forms) | the rendering pin; candidate read on all three; sweep on both, by (d): "the supersedes chain of placed row … is not empty" |
+| **M11 the pointer arm on memory only** (both SQL forms lack it) | the rendering pin; candidate read on sqlite and postgres; (e) "sqlite and memory disagree"; sweep on both ("placed row … is a candidate") |
+| M12 pointer arm without array items (Rust and both SQL forms) | candidate read on all three (`a-edge-attachment`) |
+| M13 an EMPTY owner slot counts as a room (Rust and both SQL forms) | candidate read on all three (`c-pointer-no-owner`) |
 
-Deviations from §1, stated: none in the rule. Three readings made explicit.
-1. "Populated" means a non-empty JSON string, the same reading as `admission::envelope_cohort_target`. An empty or non-string alias names no target, so such a row stays a candidate (M6 pins it).
-2. "The same predicate" is one Rust function, `admission::envelope_names_cohort_target`, which memory and `sweep_widen` call. The SQL backends use two renderings built from the same `COHORT_TARGET_ENVELOPE_FIELDS` constant (`sqlite_/postgres_envelope_names_no_cohort_target`). A Rust post-filter on the SQL pages would run after `LIMIT`: an all-placed page would come back empty and end the sweep's keyset walk. I186 reads with a page size of 1 to walk past excluded rows, and the rendering pin plus (e) keep the three from drifting.
-3. §1 names the candidate read. The rule is also asked in `sweep_widen`, because pass 1 widens from the local page (#919's second comment: "cover every trigger"). A placed local row still enters the mesh at its own scope.
+**Deviation from §1, stated (F3).** §1 names only the four top-level aliases. Placement is now read from those aliases AND from a blob pointer's owner slot, because that slot is where Edge's self file rows name their room. The rule is still narrower than the issue's "or was placed by `share`": persist has no share marker. A row that names its room in neither place (for example a self row carrying no pointer and no alias) is still a candidate.
+
+Two further readings:
+1. "Populated" means a non-empty JSON string, both for an alias (the `envelope_cohort_target` reading, M6) and for an owner slot (M13). An empty or non-string value names no room.
+2. §1 names the candidate read. The rule is also asked in `sweep_widen`, because pass 1 widens from the local page (#919's second comment: "cover every trigger"). A placed local row still enters the mesh at its own scope.
