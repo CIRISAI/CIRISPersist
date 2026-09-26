@@ -24312,6 +24312,56 @@ impl PyEngine {
         })
     }
 
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
+    /// new device receives exactly what the member holds**: every retained
+    /// community DEK epoch `member_key_id` holds a grant on in
+    /// `community_key_id` is re-wrapped to `new_occurrence_key_id`, with no
+    /// epoch bump, and the epoch-axis `key_grant` sets this node minted are
+    /// emitted. `authority_key_id` must be the member's owner-binding over the
+    /// device and the member must be active in the room; a refusal raises
+    /// `ValueError` whose message starts `federation_device_rekey_refused`.
+    /// JSON `{epochs_scanned, granted: [[minter, epoch]], already_held:
+    /// [[minter, epoch]], content_miss: [{minter_key_id, epoch, reason}]}` —
+    /// an epoch this node cannot recover is reported, never dropped.
+    fn rekey_community_member_device_add_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        member_key_id: &str,
+        new_occurrence_key_id: &str,
+        authority_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let (comm, member, occ, authority) = (
+                community_key_id.to_owned(),
+                member_key_id.to_owned(),
+                new_occurrence_key_id.to_owned(),
+                authority_key_id.to_owned(),
+            );
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(
+                        engine.rekey_community_member_device_add(&comm, &member, &occ, &authority),
+                    )
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({
+                    "epochs_scanned": r.epochs_scanned,
+                    "granted": r.granted,
+                    "already_held": r.already_held,
+                    "content_miss": r.content_miss.iter().map(|m| serde_json::json!({
+                        "minter_key_id": m.minter_key_id,
+                        "epoch": m.epoch,
+                        "reason": m.reason.as_str(),
+                    })).collect::<Vec<_>>(),
+                }))
+                .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
+            })
+        })
+    }
+
     /// v44.6.0 (#857 §4) — `list_consent_peers` keyed by ANY key that stands
     /// for the machine (the union over its human principals and itself). JSON
     /// array of strings. FFI mirror of
