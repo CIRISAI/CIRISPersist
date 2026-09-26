@@ -368,6 +368,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_community_membership_revocations_for", ConnClass::Read),
     ("list_community_membership_widenings_for", ConnClass::Read),
     ("list_family_membership_widenings_for", ConnClass::Read),
+    // v49.0.0 (#912) — the listing plane's per-room read.
+    ("list_community_membership_listings_for", ConnClass::Read),
     ("list_consent_peers", ConnClass::Read),
     // v44.6.0 (#857, V147) — the consent_peer_set_for projection read; same class as its twin.
     ("list_consent_peers_for", ConnClass::Read),
@@ -438,6 +440,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ),
     (
         "list_signed_family_membership_widenings_since",
+        ConnClass::Read,
+    ),
+    (
+        "list_signed_community_membership_listings_since",
         ConnClass::Read,
     ),
     (
@@ -533,6 +539,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_community_membership_revocation", ConnClass::Write),
     ("put_community_membership_widening", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
+    ("put_community_membership_listing", ConnClass::Write),
     ("put_delivery_receipt", ConnClass::Write),
     ("put_detection_event", ConnClass::Write),
     ("put_edge_detection_event", ConnClass::Write),

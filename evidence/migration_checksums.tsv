@@ -297,3 +297,5 @@ sqlite	154	family_roster_plane	14032523887790980996
 postgres	154	family_roster_plane	15506396495817234548
 sqlite	155	group_supersede_proof	6245808473797147341
 postgres	155	group_supersede_proof	1139871493860484940
+sqlite	156	community_membership_listings	13268194549044074155
+postgres	156	community_membership_listings	3786676817650541590

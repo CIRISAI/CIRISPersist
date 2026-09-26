@@ -506,6 +506,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Delegates,
     ),
     ("pg_row_to_community_membership_widening", Class::Delegates),
+    // v49.0.0 (#912) — the listing plane's row mappers.
+    ("pg_row_to_community_membership_listing", Class::Delegates),
+    (
+        "pg_row_to_signed_community_membership_listing",
+        Class::Delegates,
+    ),
     // v49.0.0 (#910) — the family widening plane's row mappers.
     ("pg_row_to_family_membership_widening", Class::Delegates),
     (
@@ -629,6 +635,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ),
     ("sqlite_row_to_family_membership_widening", Class::Delegates),
     (
+        "sqlite_row_to_community_membership_listing",
+        Class::Delegates,
+    ),
+    (
+        "sqlite_row_to_signed_community_membership_listing",
+        Class::Delegates,
+    ),
+    (
         "sqlite_row_to_signed_family_membership_widening",
         Class::Delegates,
     ),
@@ -708,6 +722,8 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_family_roster_authority", Class::Gate),
     ("verify_family_membership_widening_admission", Class::Gate),
     ("reject_future_dated_family_widening", Class::Gate),
+    // v49.0.0 (#912) — the one listing door every backend runs.
+    ("check_community_membership_listing", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),

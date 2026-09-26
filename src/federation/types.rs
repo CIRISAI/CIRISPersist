@@ -1242,6 +1242,12 @@ pub mod delegation_scope {
              envelope BOOLEAN grant, not a scope token, so it is not a value this inventory \
              offers",
         ),
+        (
+            "listing::LISTED_RULE_SCOPE_INVALID",
+            "v49.0.0 (CIRISPersist#912) — a REFUSAL RULE TOKEN \
+             (Error::MembershipListingRefused.rule = \"envelope_listed_scope_invalid\"), not a \
+             delegates_to scope value; `scope` in its name is the cohort scope a listing named",
+        ),
     ];
 
     /// CC 3.4.7.3 — the legacy **unprefixed** agency kinds (the pre-split
@@ -7150,6 +7156,95 @@ impl ServedFamilyMembershipWidening {
                 &w.family_key_id,
                 &w.member_key_id,
                 &w.effective_at.to_rfc3339(),
+            ]),
+        )
+    }
+}
+
+/// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — one
+/// member's PUBLIC-LISTING choice in one room: CC 2's `listed`, a
+/// per-membership opt-in the member makes and no one else can. The plane is
+/// forward-only: setting it is a row with `listed: Some("public")`, clearing
+/// it is a LATER row with `listed: None`, and the latest row at or before an
+/// instant decides. Nothing is ever rewritten — and un-listing stops new
+/// readers but does not unread what was read while the member was listed.
+///
+/// Rooms only (`community` / `affiliations`, which share
+/// `federation_communities`). A family and `self` have no listing plane:
+/// CC 5.2 structural invisibility leaves nothing to list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityMembershipListing {
+    /// The room (`federation_communities.community_key_id`).
+    pub community_key_id: String,
+    /// The member whose membership is (un)listed — and the only key that may
+    /// sign the row.
+    pub member_key_id: String,
+    /// When the choice takes effect (`effective_at <= now`); the PK's third
+    /// part, so a later row supersedes an earlier one without touching it.
+    pub effective_at: DateTime<Utc>,
+    /// [`crate::federation::envelope::paths::LISTED`]: `Some("public")` lists
+    /// the membership; `None` clears it (and is omitted from the envelope,
+    /// exactly as CC 2 spells an absent member). No other value is admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed: Option<String>,
+    /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
+    pub persist_row_hash: String,
+}
+
+impl CommunityMembershipListing {
+    /// The signed preimage: the row minus `persist_row_hash` (the roster
+    /// planes' discipline). Carries the `listed` key only when `Some`.
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v =
+            serde_json::to_value(self).expect("CommunityMembershipListing always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+}
+
+/// A SIGNED [`CommunityMembershipListing`]: the hybrid scrub under
+/// `authority_key_id` over [`CommunityMembershipListing::signing_envelope`].
+/// There are no co-signatures — a listing is one person's disclosure, and the
+/// door refuses any signer but the member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedCommunityMembershipListing {
+    /// The listing itself.
+    pub community_membership_listing: CommunityMembershipListing,
+    /// The signer — must equal `member_key_id`.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 over the canonical envelope.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 over canonical ‖ ed_sig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
+}
+
+/// A served [`SignedCommunityMembershipListing`] with THIS node's serve
+/// position — the mirror of [`ServedCommunityMembershipWidening`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServedCommunityMembershipListing {
+    /// The signed row, unchanged.
+    pub listing: SignedCommunityMembershipListing,
+    /// THIS node's serve position on the row (node-local, never hashed).
+    pub admitted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServedCommunityMembershipListing {
+    /// The `(admitted_at, compound id)` pair a caller resumes from: the
+    /// three-part PK `(community_key_id, member_key_id, effective_at)`.
+    #[must_use]
+    pub fn resume_pair(&self) -> (chrono::DateTime<chrono::Utc>, String) {
+        let l = &self.listing.community_membership_listing;
+        (
+            self.admitted_at,
+            compound_resume_id(&[
+                &l.community_key_id,
+                &l.member_key_id,
+                &l.effective_at.to_rfc3339(),
             ]),
         )
     }

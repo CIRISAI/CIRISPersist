@@ -2302,9 +2302,9 @@ mod tests {
     fn i59_key_grant_is_the_sixteenth_kind_with_the_stated_policy_row() {
         use crate::federation::replication_policy::*;
         // v48.0.0 appended the 17th (`CommunityMembershipWidening`, #860),
-        // v49.0.0 the 18th (`FamilyMembershipWidening`, #910); KeyGrant stays
-        // at index 15.
-        assert_eq!(EnvelopeKind::ALL.len(), 18);
+        // v49.0.0 the 18th (`FamilyMembershipWidening`, #910) and the 19th
+        // (`CommunityMembershipListing`, #912); KeyGrant stays at index 15.
+        assert_eq!(EnvelopeKind::ALL.len(), 19);
         assert_eq!(
             EnvelopeKind::ALL[16],
             EnvelopeKind::CommunityMembershipWidening,
@@ -2314,6 +2314,11 @@ mod tests {
             EnvelopeKind::ALL[17],
             EnvelopeKind::FamilyMembershipWidening,
             "the 18th kind is appended after CommunityMembershipWidening"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[18],
+            EnvelopeKind::CommunityMembershipListing,
+            "the 19th kind is appended after FamilyMembershipWidening"
         );
         assert_eq!(
             EnvelopeKind::ALL[15],
@@ -2334,7 +2339,7 @@ mod tests {
         );
         assert_eq!(
             REPLICATION_POLICY_HASH,
-            "7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae"
+            "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a"
         );
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("WIRE_VOCABULARY_KINDS.md"),

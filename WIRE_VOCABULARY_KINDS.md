@@ -196,6 +196,48 @@ after `CommunityMembershipWidening` — never inserts, the order is hashed:
 
 `FSD/ROOM_ROSTER_AUTHORITY.md` §10 is the design.
 
+## Replicated `EnvelopeKind`s — the nineteenth kind, `CommunityMembershipListing` (v49.0.0, #912)
+
+Eighteen kinds through the #910 slice; v49.0.0 **appends** the nineteenth
+after `FamilyMembershipWidening` — never inserts, the order is hashed:
+
+| # | `EnvelopeKind` | carries | signer | binding | projections |
+|---|---|---|---|---|---|
+| 19 | `CommunityMembershipListing` | one row of `federation_community_membership_listings`: `(community_key_id, member_key_id, effective_at)` + `listed` (`"public"` or absent) — one member's CC 2 public-listing choice in one room | `RegisteredSigner` | `SelfOwn` | `[]` (the row IS the projection) |
+
+- **Wire shape.** A `SignedCommunityMembershipListing` is the listing row plus
+  the signer's hybrid scrub over its canonical (JCS) envelope with
+  `persist_row_hash` stripped. `listed` is omitted when absent (CC 2 spells a
+  private roster as the member absent). No co-signatures. It rides
+  `list_signed_community_membership_listings_since` (pair cursor; resume id =
+  the three-part compound of the PK).
+- **Admission** (`listing::check_community_membership_listing`, every
+  backend): the signature verifies; the signer IS the member, else
+  `Error::MembershipListingRefused` `envelope_listed_not_self_asserted` (the
+  clause that makes the field an opt-in and not a power); `listed` is `public`
+  or absent, else `envelope_listed_bad_value`; no future-dating; the room exists
+  (a family id is `envelope_listed_scope_invalid`, an unknown id the FK's
+  `InvalidArgument`); idempotent on the PK. Membership is NOT checked at the
+  door — rows arrive out of order.
+- **Fold.** `listed_members` / `listing::listed_community_members_at`: the
+  room's active members by `authorized_community_roster_at` whose latest
+  listing at or before the instant is `public`. Forward-only: clearing is a
+  later row with `listed` absent; nothing is rewritten. The only roster view a
+  non-member may be served (the host gates the endpoint).
+- **Vocabulary.** `listed` joined `universal_paths` (`paths::LISTED`):
+  `ENVELOPE_VOCABULARY_SHA256`
+  `4d7054a6…589b` → `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a`.
+  `history_on_join` is NOT adopted in v49.0.0 (a recorded decision; see the
+  re-pin log in `envelope.rs`).
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `7d0e97b4…4bae` → `5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a`;
+  `CONSENT_GRAMMAR_HASH` (`CommunityMembershipListing` is `StructuralPlane`)
+  `62de1696…133c` → `8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac`;
+  both directory-capsule wire digests (one op, one result appended — growth,
+  `DIRECTORY_ABI_VERSION` stays 5).
+
+`FSD/ROOM_ROSTER_AUTHORITY.md` §11 is the design.
+
 ---
 
 ## Why persist exposes no `send_trace_batch` wrapper

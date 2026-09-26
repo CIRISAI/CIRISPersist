@@ -32839,6 +32839,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
         // v49.0.0 (#908) — the same standing-not-signature refusal as #734.
         crate::federation::Error::RosterAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
+        // v49.0.0 (#912) — a listing its door refuses (not the member's own,
+        // or not `public`): the same caller-side refusal, the same type.
+        crate::federation::Error::MembershipListingRefused { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-role key is caller-side authorization failure; ValueError

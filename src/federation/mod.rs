@@ -120,6 +120,9 @@ pub mod family_roster_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
+/// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
+#[cfg(test)]
+pub mod listing_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
@@ -189,6 +192,9 @@ pub mod invariant;
 /// v42.0.0 (CIRISPersist#814 part 2) — the `licensure:{authority_id}` status
 /// fold: set-valued, with `revoked` absorbing.
 pub mod licensure;
+/// v49.0.0 (CIRISPersist#912) — the membership listing plane: CC 2's `listed`
+/// opt-in, its door and its one public roster view.
+pub mod listing;
 pub mod location;
 /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration: re-stamp the FINAL
 /// folded CEG state from the owner root, then purge what is provably dead.
@@ -528,7 +534,8 @@ pub use stream_sth::{
 };
 pub(crate) use tier_ingest::{attestation_reput_verdict, community_reput_verdict};
 pub use tier_ingest::{
-    verify_community_admission, verify_community_membership_revocation_admission,
+    verify_community_admission, verify_community_membership_listing_admission,
+    verify_community_membership_revocation_admission,
     verify_community_membership_widening_admission, verify_envelope_hybrid_signature,
     verify_family_admission, verify_family_membership_revocation_admission,
     verify_family_membership_widening_admission, verify_federation_tier_ingest,
@@ -556,6 +563,9 @@ pub use types::{
     SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
     SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
     TrustRow, TrustType,
+};
+pub use types::{
+    CommunityMembershipListing, ServedCommunityMembershipListing, SignedCommunityMembershipListing,
 };
 pub use types::{
     FamilyMembershipWidening, ServedFamilyMembershipWidening, SignedFamilyMembershipWidening,
@@ -877,6 +887,38 @@ pub fn authorized_roster_state_at(
     events: &[RosterEvent],
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> RosterState {
+    fold_roster(record_members, rules, events, as_of).0
+}
+
+/// v49.0.0 (CIRISPersist#912, v49 ruling 2026-09-25, CC 2 opt-in) — when each ACTIVE
+/// member's current membership span began: `None` for a record member never
+/// removed (the fold counts record members from the record, never from their
+/// `joined_at`, so their span is open to the beginning of time), else the
+/// `effective_at` of the applied widening that last (re)admitted them. A
+/// widening of a member who is already active (a role change) does NOT restart
+/// the span — they never left. A removed member has no entry. The same replay
+/// as [`authorized_roster_state_at`] (one loop, so the two cannot disagree).
+pub type RosterSpans = std::collections::BTreeMap<String, Option<chrono::DateTime<chrono::Utc>>>;
+
+/// See [`RosterSpans`].
+#[must_use]
+pub fn authorized_roster_spans_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> RosterSpans {
+    fold_roster(record_members, rules, events, as_of).1
+}
+
+/// The ONE authorized replay: the roster state and each active member's span
+/// start, built in the same pass.
+fn fold_roster(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> (RosterState, RosterSpans) {
     let mut ordered: Vec<RosterEvent> = events
         .iter()
         .filter(|e| e.effective_at <= as_of)
@@ -887,15 +929,25 @@ pub fn authorized_roster_state_at(
         .iter()
         .map(|m| (m.key_id.clone(), (true, m.clone())))
         .collect();
+    let mut spans: RosterSpans = record_members
+        .iter()
+        .map(|m| (m.key_id.clone(), None))
+        .collect();
     for e in ordered {
         if e.reversed {
             continue;
         }
         if roster_event_standing(rules, &state, &e).is_ok() {
+            let was_active = matches!(state.get(&e.member.key_id), Some((true, _)));
+            if !e.is_add {
+                spans.remove(&e.member.key_id);
+            } else if !was_active {
+                spans.insert(e.member.key_id.clone(), Some(e.effective_at));
+            }
             state.insert(e.member.key_id.clone(), (e.is_add, e.member));
         }
     }
-    state
+    (state, spans)
 }
 
 /// v49.0.0 (CIRISPersist#908) — the active members of
@@ -1326,6 +1378,37 @@ where
         authorized_roster_at(&record, RosterRules::of_family(family), &events, as_of)
             .into_iter()
             .map(roster_member_as_family_member)
+            .collect(),
+    )
+}
+
+/// v49.0.0 (CIRISPersist#912) — the authorized roster of a STORED room at
+/// `as_of` with each member's current span start ([`RosterSpans`]), in roster
+/// order: what a per-membership fact (a listing) is judged against.
+pub async fn authorized_community_roster_spans_at<F>(
+    directory: &F,
+    community: &Community,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    Vec<(
+        types::CommunityMember,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+    Error,
+>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let events = Box::pin(community_roster_events(directory, community)).await?;
+    let rules = RosterRules::of_community(community);
+    let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
+    Ok(
+        authorized_roster_at(&community.members, rules, &events, as_of)
+            .into_iter()
+            .map(|m| {
+                let start = spans.get(&m.key_id).copied().flatten();
+                (m, start)
+            })
             .collect(),
     )
 }
@@ -3910,6 +3993,23 @@ pub trait FederationDirectory: Send + Sync {
         widening: SignedCommunityMembershipWidening,
     ) -> Result<(), Error>;
 
+    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — record
+    /// one member's public-listing choice in one room (CC 2 `listed`). The
+    /// door is [`listing::check_community_membership_listing`]: the signature
+    /// verifies, the signer IS the member (else
+    /// [`Error::MembershipListingRefused`] `envelope_listed_not_self_asserted`),
+    /// the value is `public` or absent (`envelope_listed_bad_value`), the row
+    /// is not future-dated, the room exists (a family id is
+    /// `envelope_listed_scope_invalid`, an unknown id
+    /// [`Error::InvalidArgument`]). Membership is not checked — rows arrive
+    /// out of order; the fold decides. Idempotent on the `(community_key_id,
+    /// member_key_id, effective_at)` PK; forward-only (clearing is a later
+    /// row with `listed: None`).
+    async fn put_community_membership_listing(
+        &self,
+        listing: SignedCommunityMembershipListing,
+    ) -> Result<(), Error>;
+
     /// v4.8.0 — all identity-occurrence revocations for `identity_key_id`
     /// (no `effective_at` filter — full history). Keyed by the table's
     /// leading PK column.
@@ -3960,6 +4060,25 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipWidening>, Error>;
+
+    /// v49.0.0 (CIRISPersist#912) — every stored listing row for
+    /// `community_key_id` (full history, set and cleared, members or not;
+    /// [`listing::latest_listing_at`] folds them). A roster-holder's read:
+    /// never serve it to a non-member — [`Self::listed_members`] is the view
+    /// for them.
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipListing>, Error>;
+
+    /// v49.0.0 (CIRISPersist#912) — **the publicly listed members of a room,
+    /// now**: [`listing::listed_community_members_at`] at `Utc::now()`. The
+    /// ONLY roster view a non-member may be served (CC 2's one crack in
+    /// "never globally enumerable"); the endpoint that serves it is the
+    /// host's to gate. [`Error::InvalidArgument`] for an unknown room.
+    async fn listed_members(&self, community_key_id: &str) -> Result<Vec<CommunityMember>, Error> {
+        listing::listed_community_members_at(self, community_key_id, chrono::Utc::now()).await
+    }
 
     /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
     /// signer of the room's record and of every stored widening and
@@ -4230,6 +4349,16 @@ pub trait FederationDirectory: Send + Sync {
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedCommunityMembershipWidening>, Error>;
+
+    /// v49.0.0 (CIRISPersist#912) — bulk-list the signed
+    /// [`SignedCommunityMembershipListing`] wrappers since a cursor (the 19th
+    /// kind's serve read): pair cursor, resume id = the compound of
+    /// `(community_key_id, member_key_id, effective_at)`; signed rows only.
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipListing>, Error>;
 
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes (edge advertise/serve bridge; extends the
@@ -8360,6 +8489,30 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — a
+    /// membership LISTING (CC 2 `listed`) whose signature verified but which
+    /// the listing door refuses. Nothing is stored. Stable `kind()` token
+    /// `federation_membership_listing_refused`.
+    ///
+    /// `rule` is one of [`listing::LISTED_RULE_NOT_SELF_ASSERTED`] (the signer
+    /// is not the member — the clause that keeps the field an opt-in rather
+    /// than a power), [`listing::LISTED_RULE_BAD_VALUE`] (a value other than
+    /// `public`) or [`listing::LISTED_RULE_SCOPE_INVALID`] (the id names a
+    /// family, whose membership is structurally invisible). None is retryable.
+    #[error(
+        "membership listing in {community_key_id:?} signed by {offered_authority_key_id:?} \
+         refused ({rule}): only the member may list their own membership, and only as \
+         `public` (CIRISPersist#912)"
+    )]
+    MembershipListingRefused {
+        /// The group the listing names.
+        community_key_id: String,
+        /// The signer (whose signature DID verify).
+        offered_authority_key_id: String,
+        /// Which clause refused; one of the `listing::LISTED_RULE_*` tokens.
+        rule: &'static str,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3b). The submitted `scores`
     /// attestation's `dimension` failed one of the four
     /// operational-language tests (FSD-002 §1.10.1): rules/verdicts
@@ -9792,6 +9945,7 @@ impl Error {
                 "federation_location_authority_unauthorized"
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
