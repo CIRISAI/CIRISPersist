@@ -2104,7 +2104,10 @@ impl Engine {
     /// host keeps opening after a TPM appears. A node with no row yet gets
     /// one here, exactly as its first encrypted blob write would create it —
     /// the MLS store is content at rest. There is no seed file and no third
-    /// root.
+    /// root. A v49 store (keyed from the hardware seed whatever the row) under
+    /// a software row still opens, reported `Hardware` with a
+    /// `legacy-v49-hardware-keyed-under-software-row` descriptor and not
+    /// re-keyed — see `XChaChaKvStore::open_mls_state_from_row`.
     ///
     /// Returns the store and its [`MlsStateCustody`](crate::encrypted_kv::MlsStateCustody)
     /// (`Hardware` | `Software` plus a descriptor) so the host logs the class
@@ -2127,8 +2130,34 @@ impl Engine {
         ),
         crate::encrypted_kv::KVError,
     > {
-        use crate::encrypted_kv::{hardware_mls_state_key, KVError, XChaChaKvStore};
+        self.open_mls_state_with(path, crate::encrypted_kv::hardware_mls_state_key)
+            .await
+    }
+
+    /// [`open_mls_state`](Self::open_mls_state) over a supplied hardware
+    /// derivation, so the Engine-level witnesses (I187) can drive the
+    /// hardware and v49-compat arms over the storage double.
+    #[cfg(feature = "encrypted-kv")]
+    pub(crate) async fn open_mls_state_with(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        hardware: impl FnOnce(
+                bool,
+            )
+                -> Result<(zeroize::Zeroizing<Vec<u8>>, String), crate::encrypted_kv::KVError>
+            + Send
+            + 'static,
+    ) -> Result<
+        (
+            crate::encrypted_kv::XChaChaKvStore,
+            crate::encrypted_kv::MlsStateCustody,
+        ),
+        crate::encrypted_kv::KVError,
+    > {
+        use crate::encrypted_kv::{KVError, XChaChaKvStore};
         use crate::federation::BlobStorage as _;
+        // The row init's own derivation runs on the blocking pool inside
+        // the backend (§11.8).
         let row = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => b.load_or_init_content_master_row().await,
@@ -2141,9 +2170,9 @@ impl Engine {
             XChaChaKvStore::open_mls_state_from_row(
                 path,
                 &row.key_kind,
-                row.master_key_b64.as_deref(),
+                row.master_key_b64.as_ref().map(|b64| b64.as_str()),
                 &row.descriptor,
-                hardware_mls_state_key,
+                hardware,
             )
         })
         .await

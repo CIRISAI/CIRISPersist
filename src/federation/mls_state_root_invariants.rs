@@ -59,13 +59,35 @@ async fn content_master(engine: &Engine) -> [u8; 32] {
     }
 }
 
-async fn row_kind(engine: &Engine) -> String {
+/// The persisted row's kind, read with a plain SELECT that initialises
+/// nothing (#920 review, finding 5): `None` means there is no row.
+async fn row_kind_if_present(engine: &Engine) -> Option<String> {
     match engine.backend() {
         #[cfg(feature = "postgres")]
-        BackendDispatch::Postgres(b) => b.load_or_init_content_master_row().await.unwrap(),
-        BackendDispatch::Sqlite(b) => b.load_or_init_content_master_row().await.unwrap(),
+        BackendDispatch::Postgres(b) => b
+            .get_client()
+            .await
+            .unwrap()
+            .query_opt(
+                "SELECT key_kind FROM cirislens.federation_content_master WHERE id = 0",
+                &[],
+            )
+            .await
+            .unwrap()
+            .map(|r| r.get::<_, String>(0)),
+        BackendDispatch::Sqlite(b) => {
+            use rusqlite::OptionalExtension as _;
+            b.conn_handle()
+                .lock()
+                .query_row(
+                    "SELECT key_kind FROM federation_content_master WHERE id = 0",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .unwrap()
+        }
     }
-    .key_kind
 }
 
 fn has_kv_table(path: &std::path::Path) -> bool {
@@ -124,15 +146,81 @@ async fn software_row_opens_as_software(engine: &Engine) {
 /// I187 — a node with no row yet gets one (as its first blob write would),
 /// and the custody reported IS the row's kind.
 async fn no_row_initialises_it_and_reports_its_kind(engine: &Engine) {
+    assert_eq!(
+        row_kind_if_present(engine).await,
+        None,
+        "precondition: a fresh node has no content-master row"
+    );
     let dir = tempfile::tempdir().unwrap();
     let (_s, custody) = engine
         .open_mls_state(dir.path().join("mls.db"))
         .await
         .expect("a fresh node opens (its row is initialised on the way)");
+    let kind = row_kind_if_present(engine)
+        .await
+        .expect("open_mls_state must have initialised the content-master row");
     assert_eq!(
         custody.kind.as_str(),
-        row_kind(engine).await,
+        kind,
         "the custody must be the persisted row's kind"
+    );
+}
+
+/// I187(f) at the door (#920 review, finding 1) — a store v49 keyed from
+/// the hardware seed under a SOFTWARE row (CIRISEdge v32.1.0 on a TPM host)
+/// opens through the Engine as `Hardware` with the legacy descriptor; a
+/// fresh store on the same node still opens as `Software`.
+#[cfg(feature = "secrets")]
+async fn a_v49_store_under_a_software_row_opens_as_legacy_hardware(engine: &Engine) {
+    use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+    use std::sync::Arc;
+    seed_row(engine, "software", Some(B64.encode(SOFTWARE_MASTER))).await;
+    let storage = Arc::new(FakeHardwareStorage::empty());
+    let over_double = |storage: Arc<FakeHardwareStorage>| {
+        move |c: bool| {
+            derive_with_storage(storage.as_ref(), crate::encrypted_kv::MLS_STATE_CONTEXT, c)
+                .map(|(k, d)| (zeroize::Zeroizing::new(k), d))
+                .map_err(|e| KVError::HardwareCustodyUnavailable(e.to_string()))
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mls.db");
+    // v49's opener: the hardware seed under MLS_STATE_CONTEXT, whatever the row.
+    let (v49_key, _) = derive_with_storage(
+        storage.as_ref(),
+        crate::encrypted_kv::MLS_STATE_CONTEXT,
+        true,
+    )
+    .unwrap();
+    let s = XChaChaKvStore::open(&path, &v49_key).unwrap();
+    s.put("mls", b"group", b"v49-state").await.unwrap();
+    drop(s);
+
+    let (s, custody) = engine
+        .open_mls_state_with(&path, over_double(storage.clone()))
+        .await
+        .expect("the v49 store must still open");
+    assert_eq!(custody.kind, MlsStateCustodyKind::Hardware);
+    assert!(
+        custody
+            .descriptor
+            .contains("legacy-v49-hardware-keyed-under-software-row"),
+        "got: {}",
+        custody.descriptor
+    );
+    assert_eq!(
+        s.get("mls", b"group").await.unwrap().as_deref(),
+        Some(&b"v49-state"[..])
+    );
+
+    let (_s, custody) = engine
+        .open_mls_state_with(dir.path().join("fresh.db"), over_double(storage.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        custody.kind,
+        MlsStateCustodyKind::Software,
+        "the compat arm is a fallback, never a preference"
     );
 }
 
@@ -187,6 +275,12 @@ async fn i187_sqlite_hardware_row_without_a_seed_refuses() {
     hardware_row_without_a_seed_refuses(&sqlite_engine().await).await;
 }
 
+#[cfg(feature = "secrets")]
+#[tokio::test]
+async fn i187_sqlite_a_v49_store_under_a_software_row_opens_as_legacy_hardware() {
+    a_v49_store_under_a_software_row_opens_as_legacy_hardware(&sqlite_engine().await).await;
+}
+
 #[cfg(feature = "postgres")]
 mod postgres {
     use super::*;
@@ -218,5 +312,12 @@ mod postgres {
     async fn i187_postgres_hardware_row_without_a_seed_refuses() {
         let Some(e) = pg_engine().await else { return };
         hardware_row_without_a_seed_refuses(&e).await;
+    }
+
+    #[cfg(feature = "secrets")]
+    #[tokio::test]
+    async fn i187_postgres_a_v49_store_under_a_software_row_opens_as_legacy_hardware() {
+        let Some(e) = pg_engine().await else { return };
+        a_v49_store_under_a_software_row_opens_as_legacy_hardware(&e).await;
     }
 }

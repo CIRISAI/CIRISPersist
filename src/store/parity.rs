@@ -315,6 +315,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (#920) — the content-master row load/init that
     // `load_or_init_content_master` now resolves; the same door, split.
     ("load_or_init_content_master_row", Class::Delegates),
+    // v50.0.0 (#920 review) — the row init's `content_master_key(true)` runs
+    // on the blocking pool (§11.8). PLUMBING: it fails only on a join error
+    // (a panicked or cancelled blocking task), the runtime's terms, never a
+    // question about the caller's input; the root decision it wraps is the
+    // `ContentMasterSource` match that follows, unchanged.
+    ("spawn_blocking", Class::Plumbing),
     // #848 — the recipient-decrypt path: the identity floor is another door
     // (it mints on first call, first-write-wins), and unsealing our OWN
     // sealed private halves fails only on corrupt material — the substrate's
