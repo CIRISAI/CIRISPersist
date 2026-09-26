@@ -7,6 +7,90 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [49.0.0] - 2026-09-25
+
+### Changed — roster standing is the group's consensus protocol (CIRISPersist#908, #907; FSD `ROOM_ROSTER_AUTHORITY.md`)
+
+**MAJOR.** A membership change — a widening or a revocation, on a community **or a family** — is admitted only when its signers meet the group's own `consensus_protocol`, evaluated over the group's authorized roster at the row's `effective_at` (CC 4.4.3.2.3 / 4.4.3.4.2). Before v49 a valid signature from any registered key was enough (#908, the #734 shape on the roster plane). The operator ruled for the full CC reading, as a MAJOR, on 2026-09-24.
+
+- **One evaluator.** `federation::consensus::evaluate(Ballot) -> Verdict` is pure and total over the vocabulary: `founder_only` (any active founder), `unanimous`, `majority` (> half), `quorum:M/N` (M absolute, CC 4.4.3.4.2.1), `weighted:{rubric}` (declared in the record's `policy_blob.rubrics`; built-in `uniform_half`), `custom:{id}` (a declared expression over the primitives in `policy_blob.custom`), and `reverse_quorum:M/N:{window}` (a removal lands on one member's signature and is reversed by M in-window objections through the #574 fold; an addition needs the #574 dismissal threshold — never 1-of-N). `cohort_subkind: infrastructure` counts founders only. Every path reads the vocabulary through it: the roster planes, `verify_membership_quorum` / `supersede_*_with_quorum` (which used a fixed strict majority), and the trust-root charter threshold (its #557 floor unchanged, pinned against the old rule for every form at rosters 0–12). Rubrics and custom protocols are **declared data in the signed record**, never host callbacks — the fold runs on every node and must converge.
+- **Co-signed rows.** `SignedCommunityMembershipWidening`, `SignedCommunityMembershipRevocation`, `SignedFamilyMembershipRevocation` and the new `SignedFamilyMembershipWidening` carry `cosignatures: Vec<RosterCosignature>` (skip-if-empty, so single-signed bytes and content hashes are unchanged); every co-signature is hybrid-verified over the same envelope; a duplicate co-signer or one equal to the primary is refused. `AdmitSpec` gains `cosignatures`. `at_rest_cascade::orchestrate::rekey_community_member_revoke` and `Engine::rekey_community_member_revoke` gain `cosignatures: &[RosterCosignature]`. V153.
+- **Standing, in order:** a legacy row with no stored signer counts (admitted under the rules of its day); **a member removing themselves needs no one** (operator ruling — a consent floor); **a named moderator** (`moderate` duty, scoped to the room) is judged **at the change's own instant**, and **the appointment belongs to the epoch it was issued in**: its root must have been a steward-bound founder when appointing, and need not still be a member when the moderator acts. **No ending is retroactive** (operator ruling 2026-09-25): removal, `withdraws`, `recants` and slashing all leave past decisions intact; the recourse is re-adjudication (CC 4.2.6, 2.4.1); otherwise the protocol. **No change may leave members with no founder** — by removal or by a demoting role change (`roster_last_founder`). **The room's own key and the record signer no longer have standing** (neither is a CC admission path) — producers that signed removals as the room key must gather member signatures.
+- **One authorized fold.** `authorized_roster_state_at` replays each group's history (record members first, then dated events, a removal last at a tie) and applies an event only when its signers have standing in the state built so far; an unauthorized event is inert. Two nodes that received the same rows in different orders fold alike (I172). The door judges an incoming row against the history *without itself*, so an exact retry stays the #861 no-op.
+- **Refusal:** `Error::RosterAuthorityUnauthorized { group_key_id, offered_authority_key_id, rule }` (kind `federation_roster_authority_unauthorized`; Python raises the type `LocationAuthorityUnauthorized` does) with `rule` ∈ `roster_authority_not_established` (**retryable** — a signer has no event in the group yet), `roster_consensus_insufficient`, `roster_consensus_unevaluable`, `roster_last_founder`.
+- **Role changes ride widenings** (both group kinds): a widening naming an active member with a different role is a role change judged by the protocol; the same role is the idempotent no-op.
+- New directory reads `community_roster_signers` / `family_roster_signers` (default `Unsupported`; every backend overrides; the capsule proxy keeps the default like its per-group siblings — a capsule consumer folds from the signed since-reads, which carry every signer and co-signer, and **must apply the same standing rules in its own fold**).
+- #907: caller admission reads the fold — a widened member is admitted, a removed-then-re-added member is admitted again (`list_communities_for_member` is now history containment: record ∪ widenings).
+
+### Added — families get the room treatment; group amendments replicate (CIRISPersist#910; FSD §10)
+
+- **A family widening plane**: `federation_family_membership_widenings`, `FamilyMembershipWidening` / `Signed…` / `Served…`, **`EnvelopeKind::FamilyMembershipWidening` appended as the 18th kind**, doors and reads on every backend, the capsule's signed since-read. `add_family_member` is the local door onto it; **a family record is never rewritten to grow**. V154.
+- **Re-admission**: the family revocation key gains `effective_at` (a removed member can be re-added; an exact retry is the #861 no-op); its since-read resume id and wire-index record key are three-part.
+- **One fold at every family gate** (`active_family_members`, the admission readers, `verify_membership_quorum`'s prior roster, the at-rest family key fan-out).
+- **A group amendment replicates** (both kinds). What is left on the record — name, `consensus_protocol`, `policy_blob`, entrenchment — changes only through `supersede_*_with_quorum`, which now attaches `supersede_proof: GroupSupersedeProof { prior_persist_row_hash, change_envelope, quorum_signatures }` to the signed record (skip-if-none; not part of `signing_envelope()`), stores it (V155), and re-indexes the wire record. A replicated `put_family` / `put_community` under an occupied id is a no-op for identical content, applies a differing record **only** when the proof names the receiving node's own stored hash and `verify_membership_quorum` passes against the receiving node's own prior roster (and the change envelope describes the record), refuses a stale proof as retryable, and otherwise refuses with `Conflict` (#758's message for communities; the same shape for families — **a differing family record used to be a primary-key error on sql and a silent overwrite on memory**). An entrenched family stays entrenched, and its flag must match the envelope the quorum signed. A plain `supersede_*` drops any caller-supplied proof (nothing verified it).
+
+### Fixed — `list_attestations` honours the lifecycle view (CIRISPersist#909)
+
+`AttestationFilter::lifecycle` (default `Live`) hides rows retracted by a still-hiding `supersedes` / `withdraws` / `recants` from the same attester — the fold `list_scores` already applied. Every drive listing showed withdrawn and replaced files. sqlite and postgres; replication reads the since-cursor and is unaffected. I174.
+
+### Added — the `listed` membership listing plane, the 19th kind (CIRISPersist#912; FSD §11)
+
+CC 2's `listed` joins the signed vocabulary (`paths::LISTED`, `EnvelopeCore.listed`) as a **per-membership opt-in the member chooses**. The value is `public` or absent; absent means the roster is private.
+- **The plane.** `federation_community_membership_listings` (V156, both dialects) with `CommunityMembershipListing` / `Signed…` / `Served…`, **`EnvelopeKind::CommunityMembershipListing` appended as the 19th kind**, policy `RegisteredSigner` + `SelfOwn`, and doors and reads on every backend. The capsule proxies the signed since-read. It covers rooms only: families and `self` have no listing.
+- **The door.** Refusals are `Error::MembershipListingRefused { community_key_id, offered_authority_key_id, rule }` (kind `federation_membership_listing_refused`; Python `ValueError`), with three rules:
+  - `envelope_listed_not_self_asserted`: only the member lists themself. No founder, moderator or quorum can list them.
+  - `envelope_listed_bad_value`
+  - `envelope_listed_scope_invalid`: the id names a family.
+  - Future-dated rows and unknown rooms are `InvalidArgument`.
+- **`listed_members(room)`** returns the room's active members, by the authorized fold, whose latest listing **within their current membership span** is `public`. **It is the only roster view a non-member may be served**; the endpoint gating is the host's. A listing belongs to the membership it was made in:
+  - A listing made before joining stays inert.
+  - A removal ends it, and a re-added member is unlisted until they list again.
+  - A role change does not restart the span.
+- **Forward-only.** Clearing is a later row with `listed` absent. Un-listing does not unread what was read.
+- **Not adopted:** `history_on_join` is deliberately left out of v49, because no door would enforce it. The decision is recorded in the re-pin log.
+
+I183.
+
+### Added — the durable MLS-state store opens from persist's one hardware root (CIRISPersist#911; FSD §12)
+
+`XChaChaKvStore::open_mls_state(path)` keys the openmls cold-state store from the same hardware-sealed seed as the secrets master and the content-at-rest master, under a third HKDF context, `encrypted_kv::MLS_STATE_CONTEXT = "mls-state-at-rest-v1"` (the derivation is CIRISVerify's). Hosts pass a path and nothing else. Every host used to open the store with `open_in_memory(room_id)`, whose passphrase was a public id, so a restarted device lost its group state (CIRISServer#630). Only the first open of an empty store may seal a seed; a store in use re-derives and never mints. With no hardware seed the answer is **`KVError::HardwareCustodyUnavailable`** (new variant), the named degraded posture: nothing opens, and no public or derived passphrase stands in. I184.
+
+### Added — Android custody attested at key generation (CIRISPersist#915, CIRISServer#339; FSD §12)
+
+`AttestationEvidence::AndroidGenerationCustody` is a closed body with three fields: leaf hex, intermediate chain hex, and `challenge_policy: "generation_only"`. It is walked through CIRISVerify v17's `GenerationOnly` policy (CIRISVerify#293) against `HardwareAttestationPolicy::android_root_ders` (new field). The default anchors are verify's baked Google Hardware Attestation Root and Key Attestation CA1.
+- **Enforced:** the chain, and anti-lift (the attested key IS the record's Ed25519 key).
+- **Given up:** per-enrollment binding. That is sound because the record is signed by the key it attests, and the stored body says so.
+- **The class:** the key's **measured** security level, which meets the `SoftwareOnly` floor.
+- **Unchanged:** the YubiKey `GenerationCustody` arm.
+- **API:** `HardwareAttestationPolicy::check_structure` and `::check` take the record's raw Ed25519 key as a new second argument (`hardware_attestation::record_ed25519(&record)`). An Android body with no key is refused.
+- **Trust-root leg:** reports an Android holder as a walked chain (`layer_b: Some(true)`).
+
+I185.
+
+### Security — one Ed25519 rule, chosen (CIRISPersist#913)
+
+`verify/hybrid.rs` called the permissive `ClassicalVerifier::verify` on the federation-row floor while the trace floor called `verify_strict`. A small-order key admits `(R = identity, s = 0)` against any message; `HybridPolicy::Strict`'s ML-DSA-65 half contained it. CIRISVerify v17 makes the trait method strict, and persist now calls `verify_strict` **by name** so the rule is stated at the call site. Operators holding federation rows from producers other than verify's own should re-verify them once.
+
+### Changed — CIRISVerify v16.1.0 → v17.1.0
+
+Seven Cargo pins and the wheel's `ciris-verify>=17.1.0,<18`. v16.2.1 makes every `SecureBlobStorage` report an absent key as `KeyNotFound` (CIRISVerify#288). Persist decides seed absence with `exists()`, so production is unaffected, and the hardware-storage test double now honours the contract. v17.0.0 adds strict Ed25519 (#913 above), the keyring supersede fix (CIRISVerify#292), and `AndroidChallengePolicy` (#915 above). v17.1.0 stops reporting a lagging replica as a possible attack once per cycle (CIRISVerify#223); persist does not call that path.
+
+### Pins moved
+- `ENVELOPE_VOCABULARY_SHA256`: `4d7054a6…` → `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a` (`listed`).
+- `REPLICATION_POLICY_HASH`: `9d62d3a8…8a19` → `5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a`.
+- `CONSENT_GRAMMAR_HASH`: `07a677bb…64a9` → `8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac`.
+- Both policy hashes moved for the 18th and 19th kinds; the grammar itself is unchanged.
+- Both directory-capsule wire digests were re-pinned for appended variants. That is growth, so `DIRECTORY_ABI_VERSION` stays 5.
+- Migrations V153 through V156, with manifest rows.
+
+### Witnesses
+I170 (admission is the roster), I171 (every protocol arm), I172 (arrival order), I173 (legacy rows), I174 (#909), I175 (a moderator's change belongs to its instant), I176 (co-signatures verified), I177 (family plane converges; re-admission), I178 (amendments replicate), I179 (family standing; the fold's prior roster), I180 (last founder, leaving), I181 (reverse-quorum removal and reversal), I182 (declared rubrics and custom protocols), I183 (#912), I184 (#911), I185 (#915). **45 mutants, 45 killed**: 24 on the roster standing over two rounds (`FSD/ROOM_ROSTER_AUTHORITY.md` §6.1 — one first-round survivor was a missing witness, a stranger's removal under `reverse_quorum`, the other a wrong rule that the operator's non-retroactivity ruling replaced; I175b), 11 on the listing plane (§11), 10 on #911 / #915 (§12).
+
+### Adopter notes
+- **Edge:** re-pin CIRISVerify v17.1.0 with persist (one `ciris_crypto`); re-pin all three hashes; append `FamilyMembershipWidening` as the 18th kind and `CommunityMembershipListing` as the 19th (never insert); your openmls `StorageProvider` opens over `XChaChaKvStore::open_mls_state(path)` (#911, CIRISEdge#676); your roster fold must apply the same standing rules (co-signers, the protocol, self-leave, moderator-at-instant, last founder) or it will diverge from persist's; producers sign roster rows by the group's protocol, collecting co-signatures; family revocation resume ids are three-part.
+- **Server:** open the MLS store with `XChaChaKvStore::open_mls_state(path)` and handle `HardwareCustodyUnavailable` explicitly (#911); Android custody now arrives as `AndroidGenerationCustody` evidence, and persist has already walked it when a record is stored, so `admit_hardware_class` can read the measured class (#915); `check` / `check_structure` callers pass `record_ed25519(&record)`.
+- **Server:** the envelope → cosign → assemble step now produces a co-signed widening/revocation row; `roster_last_founder` is enforced in persist; a family grows through `add_family_member` on the plane (no record rewrite); a room key or record signer alone no longer removes a member.
+
 ## [48.0.0] - 2026-09-24
 
 ### Changed — a room's roster converges both ways (CIRISPersist#860; FSD `ROOM_ROSTER_PLANES.md`)

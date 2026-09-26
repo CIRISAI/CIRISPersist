@@ -38,48 +38,6 @@ use serde::{Deserialize, Serialize};
 
 use super::types;
 
-/// v31.0.0 (CIRISPersist#654) — **THE ONE PLACE A ROSTER GROWS.**
-///
-/// Appends `member` to `family`, recomputes the server-computed
-/// `persist_row_hash` over the grown record, and hybrid-Strict-verifies
-/// `spec`'s authority signature over the grown record's
-/// [`signing_envelope`](types::Family::signing_envelope) through
-/// [`verify_family_admission`](super::verify_family_admission) — the SAME gate
-/// `put_family` and `supersede_family` run, not a second one written for the
-/// add path.
-///
-/// Every backend calls this and then writes what it returns, so "what a roster
-/// addition is signed over" is decided once. Verify-before-mutation (AV-9): the
-/// gate runs before the caller's UPDATE, so a refused addition never touches
-/// the row.
-///
-/// The constitutional family is reserved by that gate (#648) and therefore
-/// cannot grow through this door either — its roster changes through the
-/// genesis/assemble ceremony (`put_family_local`) and nothing else, which is
-/// the same single-door property #648 established for its creation.
-pub async fn authorize_family_growth<F>(
-    directory: &F,
-    family: &types::Family,
-    member: types::FamilyMember,
-    spec: &AdmitSpec,
-) -> Result<types::Family, super::Error>
-where
-    F: super::FederationDirectory + ?Sized,
-{
-    let mut grown = family.clone();
-    grown.members.push(member);
-    let signed = super::SignedFamily {
-        family: grown,
-        authority_key_id: spec.authority_key_id.clone(),
-        scrub_signature_classical: spec.scrub_signature_classical.clone(),
-        scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
-    };
-    super::verify_family_admission(directory, &signed).await?;
-    let mut grown = signed.family;
-    grown.persist_row_hash = types::compute_persist_row_hash(&grown)?;
-    Ok(grown)
-}
-
 /// v31.0.0 (CIRISPersist#654) — the ONE place a test produces the authority
 /// signature a roster addition now needs.
 ///
@@ -91,28 +49,26 @@ where
 pub mod test_support {
     use super::{types, AdmitSpec};
 
-    /// The [`AdmitSpec`] for appending `member` to `family`, hybrid-signed by
-    /// `authority_key_id`'s deterministic test keypair over the GROWN record's
-    /// `signing_envelope()` — the exact preimage
-    /// [`super::authorize_family_growth`] verifies.
+    /// The [`AdmitSpec`] for adding `member` to `family`, hybrid-signed by
+    /// `authority_key_id`'s deterministic test keypair over the family
+    /// WIDENING row `add_family_member` builds (v49.0.0, CIRISPersist#910 — a
+    /// family grows on its widening plane; the grown record is no longer a
+    /// preimage anything verifies).
     ///
     /// `authority_key_id` MUST already be registered (e.g. via
-    /// `tier_ingest::test_support::register_hybrid_key`), the same precondition
-    /// `sign_family` documents.
+    /// `tier_ingest::test_support::register_hybrid_key`) and must have standing
+    /// by the family's `consensus_protocol` (a founder of a `founder_only`
+    /// family), the same preconditions production has.
     pub fn admit_family(
         authority_key_id: &str,
         family: &types::Family,
         member: &types::FamilyMember,
     ) -> AdmitSpec {
-        let mut grown = family.clone();
-        grown.members.push(member.clone());
-        let signed =
-            crate::federation::tier_ingest::test_support::sign_family(authority_key_id, grown);
-        AdmitSpec {
-            authority_key_id: signed.authority_key_id,
-            scrub_signature_classical: signed.scrub_signature_classical,
-            scrub_signature_pqc: signed.scrub_signature_pqc,
-        }
+        crate::federation::tier_ingest::test_support::family_widening_admit_spec(
+            authority_key_id,
+            &family.family_key_id,
+            member,
+        )
     }
 
     /// The community mirror of [`admit_family`].
@@ -197,6 +153,7 @@ pub mod test_support {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                cosignatures: Vec::new(),
             },
         }
     }
@@ -210,7 +167,7 @@ pub mod test_support {
     ///
     /// 1. an EMPTY [`AdmitSpec`] — what every pre-#654 caller effectively
     ///    supplied — is refused;
-    /// 2. a spec signed over a DIFFERENT grown roster does not admit this one;
+    /// 2. a spec signed over a DIFFERENT widening does not admit this one;
     /// 3. neither refusal touches `members` (verify-before-mutation, AV-9);
     /// 4. after a genuine signed add, the STORED row re-verifies against the
     ///    STORED signature — the property the old in-place mutation destroyed
@@ -250,6 +207,7 @@ pub mod test_support {
             authority_key_id: String::new(),
             scrub_signature_classical: String::new(),
             scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
         };
 
         // ── family plane ────────────────────────────────────────────────
@@ -262,7 +220,9 @@ pub mod test_support {
                     members: vec![types::FamilyMember {
                         key_id: seated.clone(),
                         joined_at: now,
-                        role: None,
+                        // v49.0.0 (#910): seated founds the family, so its
+                        // signature is the founder_only protocol.
+                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: now,
                     consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
@@ -298,7 +258,7 @@ pub mod test_support {
         directory
             .add_family_member(&fam, member.clone(), &wrong)
             .await
-            .expect_err("(2) a signature over a different grown roster must not admit this one");
+            .expect_err("(2) a signature over a different widening must not admit this one");
         assert_eq!(
             directory
                 .lookup_family(&fam)
@@ -319,9 +279,17 @@ pub mod test_support {
             .await?
             .into_iter()
             .find(|f| f.family.family.family_key_id == fam)
-            .expect("the grown family is served on the signed read surface")
+            .expect("the family is served on the signed read surface")
             .family;
-        assert_eq!(signed_fam.family.members.len(), 2, "({tag})");
+        // v49.0.0 (CIRISPersist#910) — the served RECORD is the founding one
+        // (growth rides the family widening plane; a grown record reaches no
+        // peer); the FOLD has both.
+        assert_eq!(signed_fam.family.members.len(), 1, "({tag})");
+        assert_eq!(
+            directory.active_family_members(&fam).await?.len(),
+            2,
+            "({tag}) the family widening is on the roster"
+        );
         crate::federation::verify_family_admission(directory, &signed_fam)
             .await
             .unwrap_or_else(|e| {
@@ -341,7 +309,9 @@ pub mod test_support {
                     members: vec![types::CommunityMember {
                         key_id: seated.clone(),
                         joined_at: now,
-                        role: None,
+                        // v49.0.0 (#908): seated founds the room, so its signature
+                        // is the founder_only protocol.
+                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
                     }],
                     founded_at: now,
                     consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
@@ -373,7 +343,7 @@ pub mod test_support {
         directory
             .add_community_member(&comm, member.clone(), &wrong)
             .await
-            .expect_err("(2) a signature over a different grown roster must not admit this one");
+            .expect_err("(2) a signature over a different widening must not admit this one");
         assert_eq!(
             directory
                 .lookup_community(&comm)
@@ -564,7 +534,8 @@ impl From<types::IdentityOccurrence> for RosterMember {
 ///
 /// # Why an addition needs one
 ///
-/// Roster growth mutates `members`, and `members` is INSIDE
+/// (Pre-v48/v49 history, kept for the reasoning:) roster growth mutated
+/// `members`, and `members` is INSIDE
 /// [`Family::signing_envelope`](types::Family::signing_envelope) /
 /// [`Community::signing_envelope`](types::Community::signing_envelope) — the
 /// whole record minus the server-computed `persist_row_hash`. So an unsigned
@@ -580,22 +551,15 @@ impl From<types::IdentityOccurrence> for RosterMember {
 ///
 /// # What the signature covers
 ///
-/// `JCS(signing_envelope())` of the **GROWN** record — the stored group with
-/// this member appended — verified through the same
-/// [`verify_family_admission`](crate::federation::verify_family_admission) /
-/// [`verify_community_admission`](crate::federation::verify_community_admission)
-/// gate `put_*` and `supersede_*` run. That is byte-identical to what a
-/// supersede of the same grown record would be signed over, which is the point:
-/// growing a roster is not a lesser act than replacing one, so it is not a
-/// second, weaker spelling of it.
-///
-/// A caller therefore signs a record it can compute in full: read the group,
-/// append the member it chose (`key_id` / `joined_at` / `role` are all
-/// caller-known — the v21.0.0 #502 E4 rule that every field the gate verifies
-/// over must be caller-known IN ADVANCE, the same reason a revocation's
-/// `removed_at` is its caller-supplied `effective_at` and not a server-minted
-/// `now`). If the stored roster moved under the caller between reading and
-/// writing, the signature simply does not verify and the add fails closed.
+/// v48.0.0 (rooms, CIRISPersist#860) and v49.0.0 (families, CIRISPersist#910)
+/// — `JCS(signing_envelope())` of the **membership WIDENING row** the local
+/// door builds, `{group, member.key_id, member.joined_at, effective_at =
+/// member.joined_at, member.role}`: a group never grows by rewriting its
+/// record (a rewritten record reaches no peer). Every field is caller-known
+/// IN ADVANCE (the v21.0.0 #502 E4 rule). The signer set (`authority_key_id`
+/// plus `cosignatures`) must meet the group's own `consensus_protocol` at the
+/// door. Before those versions the preimage was the GROWN record; a spec over
+/// it no longer verifies.
 ///
 /// Additive (`#[serde(default)]`) so an old JSON payload decodes fine and then
 /// fails closed at admission — an empty signer/signature never verifies.
@@ -606,13 +570,19 @@ pub struct AdmitSpec {
     #[serde(default)]
     pub authority_key_id: String,
     /// Ed25519 signature (base64) over `JCS(signing_envelope())` of the
-    /// GROWN group record.
+    /// membership widening row.
     #[serde(default)]
     pub scrub_signature_classical: String,
     /// ML-DSA-65 signature (base64) over the bound payload
     /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
+    /// v49.0.0 (CIRISPersist#908, #910) — co-signatures over the SAME widening
+    /// envelope, carried onto the widening `add_community_member` /
+    /// `add_family_member` builds so a multi-signature `consensus_protocol`
+    /// can be met.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<crate::federation::types::RosterCosignature>,
 }
 
 /// The knobs of a roster removal / swap-out (#249 Cut G1 §1/§6), uniform

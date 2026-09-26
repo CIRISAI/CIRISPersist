@@ -807,8 +807,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "16.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
+version = "17.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v17.1.0#cdc6498af2605a402bbff1e399c2c0795b968180"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -834,8 +834,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "16.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
+version = "17.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v17.1.0#cdc6498af2605a402bbff1e399c2c0795b968180"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "48.0.0"
+version = "49.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -904,6 +904,7 @@ dependencies = [
  "postgres-types",
  "proptest",
  "pyo3",
+ "rcgen",
  "redb",
  "refinery",
  "regex",
@@ -933,8 +934,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "16.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
+version = "17.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v17.1.0#cdc6498af2605a402bbff1e399c2c0795b968180"
 dependencies = [
  "android_system_properties",
  "async-trait",

@@ -11431,6 +11431,7 @@ impl PyEngine {
                                 authority_key_id,
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
+                                supersede_proof: None,
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -11500,6 +11501,7 @@ impl PyEngine {
                                 authority_key_id,
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
+                                supersede_proof: None,
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -23724,6 +23726,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -23736,6 +23739,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -23932,9 +23936,10 @@ impl PyEngine {
     }
 
     /// #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is
-    /// authorized by the group's current strict-majority quorum (composes
-    /// verify v6.9.0's `verify_membership_change`: distinct + strict-majority +
-    /// one-seat + entrenchment + anti-replay + prior-quorum). `change_envelope_json`
+    /// authorized by the group's current roster under the group's OWN
+    /// `consensus_protocol` (v49.0.0, #908: verify checks structure, one-seat,
+    /// anti-replay and every signature; persist's one evaluator decides the
+    /// threshold). `change_envelope_json`
     /// is the `cohort_build_membership_change_envelope` output the members
     /// cosigned; `signatures_json` is a JSON array of
     /// [`ciris_verify_core::threshold::ThresholdSignature`]. Returns `None` on
@@ -24017,6 +24022,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -24028,6 +24034,7 @@ impl PyEngine {
                 authority_key_id: String::new(),
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
+                supersede_proof: None,
             }),
             _ => None,
         };
@@ -32830,6 +32837,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // replicated yet) from a substantive verdict, but only `kind()` crosses
         // the FFI — so a caller that must distinguish them reads the message.
         crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
+        // v49.0.0 (#908) — the same standing-not-signature refusal as #734.
+        crate::federation::Error::RosterAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
+        // v49.0.0 (#912) — a listing its door refuses (not the member's own,
+        // or not `public`): the same caller-side refusal, the same type.
+        crate::federation::Error::MembershipListingRefused { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 3.4.7.3) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-role key is caller-side authorization failure; ValueError

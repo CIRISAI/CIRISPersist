@@ -143,7 +143,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // Driver plumbing; it cannot refuse anything about the caller's input.
     ("start", Class::Plumbing),
     ("assemble_fountain_content", Class::Delegates),
-    ("authorize_family_growth", Class::Gate),
     ("backfill_trace_dedup_shard_keys", Class::Delegates),
     ("bytes", Class::Plumbing),
     ("caller_scope_from_directory", Class::Gate),
@@ -388,6 +387,39 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // the mappers' own decode helpers. Plumbing — they fail only on the
     // substrate's own stored bytes (a corrupt column), never on caller input.
     ("decode_witness_set", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#908) — the V153 `cosignatures` column decoders,
+    // siblings of `decode_witness_set` / `pg_witness_set`. Plumbing — they
+    // fail only on the substrate's own stored JSON, never on caller input;
+    // the co-signatures themselves were verified at the put door.
+    ("pg_roster_cosignatures", Class::Plumbing),
+    ("sqlite_roster_cosignatures", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#908) — `community_roster_signers`' local row
+    // mapper (a closure, one per backend): it maps this door's own SELECT of
+    // stored signers onto `RosterEventSigner`. Plumbing — a read door that
+    // refuses nothing; it fails only on a driver error or a corrupt column.
+    ("roster_event_signers", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#910.5) — the V155 `supersede_proof` column codecs.
+    // Plumbing — they fail only on the substrate's own stored JSON (or on
+    // serializing a proof already decoded); the proof itself is judged by
+    // the route below, never by its codec.
+    ("pg_supersede_proof", Class::Plumbing),
+    ("pg_supersede_proof_value", Class::Plumbing),
+    ("sqlite_supersede_proof", Class::Plumbing),
+    ("sqlite_supersede_proof_json", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#910.5) — sqlite's supersede carries a stale-proof
+    // verdict out of its write closure through a mutex slot; taking the lock
+    // refuses nothing (it fails only on a poisoned mutex).
+    ("lock", Class::Plumbing),
+    // v49.0.0 (CIRISPersist#910.5) — the occupied-id route of the replicated
+    // group doors: an identical re-put settles, a differing record is refused
+    // unless its supersede proof names this node's prior version and passes
+    // the group's own quorum. Gate — it refuses the caller's record.
+    ("route_occupied_community", Class::Gate),
+    ("route_occupied_family", Class::Gate),
+    // v49.0.0 (CIRISPersist#910.5) — inside every backend's supersede
+    // transaction: a proof over a version this node does not hold is refused
+    // as stale. Gate.
+    ("check_proof_names_prior", Class::Gate),
     // v39.0.0 — the whole crossing decision: custody verification, every
     // inherited co-scrub, `check_promotion_admission`, and the nine
     // contextual-integrity axes. Delegates, not Gate: it is the door's helper
@@ -474,6 +506,18 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Delegates,
     ),
     ("pg_row_to_community_membership_widening", Class::Delegates),
+    // v49.0.0 (#912) — the listing plane's row mappers.
+    ("pg_row_to_community_membership_listing", Class::Delegates),
+    (
+        "pg_row_to_signed_community_membership_listing",
+        Class::Delegates,
+    ),
+    // v49.0.0 (#910) — the family widening plane's row mappers.
+    ("pg_row_to_family_membership_widening", Class::Delegates),
+    (
+        "pg_row_to_signed_family_membership_widening",
+        Class::Delegates,
+    ),
     (
         "pg_row_to_signed_community_membership_widening",
         Class::Delegates,
@@ -589,6 +633,19 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         "sqlite_row_to_community_membership_widening",
         Class::Delegates,
     ),
+    ("sqlite_row_to_family_membership_widening", Class::Delegates),
+    (
+        "sqlite_row_to_community_membership_listing",
+        Class::Delegates,
+    ),
+    (
+        "sqlite_row_to_signed_community_membership_listing",
+        Class::Delegates,
+    ),
+    (
+        "sqlite_row_to_signed_family_membership_widening",
+        Class::Delegates,
+    ),
     (
         "sqlite_row_to_signed_community_membership_widening",
         Class::Delegates,
@@ -658,6 +715,15 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
         Class::Gate,
     ),
     ("reject_future_dated_community_widening", Class::Gate),
+    // v49.0.0 (#908) — the standing gate both membership doors run.
+    ("check_community_roster_authority", Class::Gate),
+    // v49.0.0 (#910) — the family doors' standing gate, signature gate and
+    // future-dating gate (the family twins of the three room gates above).
+    ("check_family_roster_authority", Class::Gate),
+    ("verify_family_membership_widening_admission", Class::Gate),
+    ("reject_future_dated_family_widening", Class::Gate),
+    // v49.0.0 (#912) — the one listing door every backend runs.
+    ("check_community_membership_listing", Class::Gate),
     ("verify_consent_record_transit_ingest", Class::Gate),
     ("verify_family_admission", Class::Gate),
     ("verify_family_membership_revocation_admission", Class::Gate),

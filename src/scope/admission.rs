@@ -488,7 +488,7 @@ mod revocation_honesty_tests {
 
         sq.put_family_membership_revocation(
             crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                "fam-1",
+                "bob-root", /* v49.0.0 (#910): the member leaves on their own signature */
                 FamilyMembershipRevocation {
                     family_key_id: "fam-1".into(),
                     removed_identity_key_id: "bob-root".into(),

@@ -458,7 +458,11 @@ fn evaluate_holder_hardware(
 ) -> HolderHardware {
     use super::hardware_attestation::AttestationEvidence;
     use ciris_keyring::HardwareType;
-    let class = match policy.check_structure(&rec.key_id, rec.attestation_evidence.as_ref()) {
+    let class = match policy.check_structure(
+        &rec.key_id,
+        super::hardware_attestation::record_ed25519(rec).as_deref(),
+        rec.attestation_evidence.as_ref(),
+    ) {
         Err(e) => {
             return HolderHardware {
                 key_id: rec.key_id.clone(),
@@ -475,12 +479,20 @@ fn evaluate_holder_hardware(
         .as_ref()
         .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
         .is_some_and(|e| matches!(e, AttestationEvidence::GenerationCustody(_)));
+    // v49.0.0 (CIRISPersist#915) — an Android generation-custody chain was
+    // walked inside `check_structure` (it needs the record's key, which is
+    // where anti-lift lives), so reaching here means the walk passed.
+    let is_android = rec
+        .attestation_evidence
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<AttestationEvidence>(v.clone()).ok())
+        .is_some_and(|e| matches!(e, AttestationEvidence::AndroidGenerationCustody(_)));
     if !is_custody {
         return HolderHardware {
             key_id: rec.key_id.clone(),
             class,
             layer_a: true,
-            layer_b: None,
+            layer_b: is_android.then_some(true),
             refusal: None,
         };
     }
@@ -848,16 +860,44 @@ where
 /// FAIL-SECURE: `unanimous` (and any form this function does not recognise)
 /// demands the whole roster rather than a guess, because under-counting a
 /// threshold is the failure mode #557 exists to close.
+///
+/// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §0 item 4) — the
+/// per-protocol count comes from the one evaluator's
+/// [`required_signatures`](super::consensus::required_signatures); this
+/// function only applies the #557 floor and the fail-secure readings on top:
+///
+/// - a count ⇒ that count, floored;
+/// - no count for `founder_only` (a founder, not a number) ⇒ the floor;
+/// - no count for anything else (`weighted:`, `custom:`, unparseable) ⇒ the
+///   whole roster;
+/// - `reverse_quorum:` ⇒ the whole roster. The evaluator's count for that form
+///   is its FORWARD addition threshold (the #574 dismissal threshold), but a
+///   charter is not a roster addition, and a reverse threshold must never be
+///   mistaken for a smaller forward one
+///   ([`REVERSE_QUORUM_PREFIX`](super::types::consensus_protocol::REVERSE_QUORUM_PREFIX)).
+///   This keeps #557's count exactly: before the evaluator existed, this form
+///   fell through as unrecognised.
+///
+/// For every CANONICAL form the count is #557's, unchanged (pinned against the
+/// pre-v49.0.0 rule by `charter_threshold_is_the_557_rule_on_every_canonical_form`).
+/// The one reading that moved is a non-canonical `quorum:M/N` (`M > N`, `N = 0`,
+/// or an `M` past `u32`), which the old parser read as `M` and the evaluator
+/// refuses to parse, so it now reads as the whole roster. No stored family can
+/// carry one: `put_family` / `supersede_family` refuse it at
+/// [`check_consensus_protocol_form`](super::check_consensus_protocol_form).
 pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_size: usize) -> usize {
+    use super::types::consensus_protocol as cp;
     let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
-    let policy = match family.consensus_protocol.as_str() {
-        "founder_only" | "majority" => floor,
-        "unanimous" => roster_size,
-        other => super::genesis::bundle::parse_quorum(other).map_or(
+    let protocol = family.consensus_protocol.as_str();
+    let policy = if protocol.starts_with(cp::REVERSE_QUORUM_PREFIX) {
+        roster_size
+    } else {
+        match super::consensus::required_signatures(protocol, roster_size) {
+            Some(n) => n,
+            None if protocol == cp::FOUNDER_ONLY => floor,
             // Unrecognised policy ⇒ unanimity, never a guessed-low number.
-            roster_size,
-            |(m, _)| m,
-        ),
+            None => roster_size,
+        }
     };
     policy.max(floor)
 }
@@ -3378,6 +3418,111 @@ mod accord_root_tests {
                 "federation_accord_root_unnamed",
                 "a malformed accord_root ({junk}) must fail CLOSED"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod charter_threshold_tests {
+    use super::super::types::{consensus_protocol, Family};
+    use super::family_charter_threshold;
+
+    fn family(cp: &str) -> Family {
+        Family {
+            family_key_id: "fam".into(),
+            family_name: "fam".into(),
+            members: vec![],
+            founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            consensus_protocol: cp.into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    /// The #557 rule exactly as it read before v49.0.0 (#908), kept verbatim
+    /// as the reference the refactor onto `consensus::required_signatures` is
+    /// measured against.
+    fn pre_v49(cp: &str, roster_size: usize) -> usize {
+        let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
+        let policy = match cp {
+            "founder_only" | "majority" => floor,
+            "unanimous" => roster_size,
+            other => {
+                super::super::genesis::bundle::parse_quorum(other).map_or(roster_size, |(m, _)| m)
+            }
+        };
+        policy.max(floor)
+    }
+
+    /// v49.0.0 (#908, FSD §0 item 4) — a pure refactor: on every canonical
+    /// form, at every roster size, the charter count is the #557 count.
+    #[test]
+    fn charter_threshold_is_the_557_rule_on_every_canonical_form() {
+        let mut forms: Vec<String> = vec![
+            "founder_only".into(),
+            "unanimous".into(),
+            "majority".into(),
+            "weighted:uniform_half".into(),
+            "weighted:board".into(),
+            "custom:council".into(),
+            "reverse_quorum:2/9:86400".into(),
+            "reverse_quorum:2/9:86400+escalate:3600:3".into(),
+            "reverse_quorum:1/3:60".into(),
+        ];
+        for n in 1..=9u32 {
+            for m in 0..=n {
+                forms.push(format!("quorum:{m}/{n}"));
+            }
+        }
+        for cp in &forms {
+            assert!(
+                consensus_protocol::is_canonical_form(cp),
+                "fixture {cp:?} must be canonical"
+            );
+            for roster in 0..=12 {
+                assert_eq!(
+                    family_charter_threshold(&family(cp), roster),
+                    pre_v49(cp, roster),
+                    "{cp:?} at roster {roster}"
+                );
+            }
+        }
+    }
+
+    /// The reverse (objection) form must never read as a smaller forward
+    /// charter count. The evaluator's `required_signatures` DOES return a
+    /// count for it (its forward addition threshold), so a parser-level
+    /// witness would pass while the charter under-counted; ask the charter.
+    #[test]
+    fn a_reverse_quorum_charter_reads_unanimity() {
+        assert_eq!(
+            family_charter_threshold(&family("reverse_quorum:2/9:86400"), 9),
+            9
+        );
+        assert_eq!(
+            family_charter_threshold(&family("reverse_quorum:2/9:86400+escalate:3600:3"), 9),
+            9
+        );
+        // Control: the forward form of the same numbers is floored, not unanimity.
+        assert_eq!(family_charter_threshold(&family("quorum:2/9"), 9), 5);
+    }
+
+    /// The only strings whose count moved are non-canonical, and the family
+    /// write gate refuses every one of them — so no stored family reads
+    /// differently.
+    #[test]
+    fn the_moved_readings_are_unwritable() {
+        for cp in [
+            "quorum:7/5",
+            "quorum:2/0",
+            "quorum:0/0",
+            "quorum:99999999999/99999999999",
+        ] {
+            assert!(
+                crate::federation::check_consensus_protocol_form(cp).is_err(),
+                "{cp:?} must be refused at the write gate"
+            );
+            assert_eq!(family_charter_threshold(&family(cp), 5), 5, "{cp:?}");
         }
     }
 }

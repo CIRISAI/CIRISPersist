@@ -814,6 +814,7 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
         authority_key_id: rogue.clone(),
         scrub_signature_classical: "AA==".to_owned(),
         scrub_signature_pqc: None,
+        supersede_proof: None,
     };
     let err = dir
         .put_family(squat)

@@ -211,6 +211,16 @@ pub(crate) const CRYPTO_COLUMNS: &[CryptoColumn] = &[
         shared_by: None,
     },
     CryptoColumn {
+        table: "federation_family_membership_widenings",
+        column: "scrub_signature_pqc",
+        shared_by: None,
+    },
+    CryptoColumn {
+        table: "federation_community_membership_listings",
+        column: "scrub_signature_pqc",
+        shared_by: None,
+    },
+    CryptoColumn {
         table: "federation_keys",
         column: "pubkey_ml_dsa_65",
         shared_by: None,

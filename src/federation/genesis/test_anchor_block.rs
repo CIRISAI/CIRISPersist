@@ -285,7 +285,7 @@ mod tests {
         let pair = test_anchor_minted_by();
         assert_eq!(
             pair,
-            format!("persist v{} / verify v16.1.0", env!("CARGO_PKG_VERSION")),
+            format!("persist v{} / verify v17.1.0", env!("CARGO_PKG_VERSION")),
             "I162: the verify half is the Cargo.toml tag; bump it there, never here"
         );
         let seed = decode_seed_b64(TEST_ANCHOR_SHARED_SEED_B64).unwrap();

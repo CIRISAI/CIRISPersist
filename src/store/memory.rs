@@ -261,8 +261,24 @@ struct State {
             ciris_verify_core::transport_binding::TransportBindingSignature,
         ),
     >,
-    federation_family_membership_revocations:
-        HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
+    /// v49.0.0 (#910.1, V154 mirror) — keyed on the three-part PK
+    /// `(family, member, effective_at)`: a re-added member can be removed again.
+    federation_family_membership_revocations: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::FamilyMembershipRevocation,
+    >,
+    /// v49.0.0 (#912, V156 mirror) — the listing plane: the signed row (its
+    /// `persist_row_hash` stamped), keyed on the three-part PK.
+    federation_community_membership_listings: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::SignedCommunityMembershipListing,
+    >,
+    /// v49.0.0 (#910, V154 mirror) — the family widening plane, keyed on its
+    /// three-part PK.
+    federation_family_membership_widenings: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        crate::federation::FamilyMembershipWidening,
+    >,
     /// v48.0.0 (#860) — keyed on the three-part PK `(room, member,
     /// effective_at)`: a re-added member can be removed again.
     federation_community_membership_revocations: HashMap<
@@ -405,9 +421,20 @@ struct State {
     /// mirror of `federation_family_authority_sigs`, keyed by
     /// `community_key_id`.
     federation_community_authority_sigs: HashMap<String, AuthoritySig>,
+    /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the `supersede_proof` a
+    /// family's current version carries, keyed by `family_key_id`. Absent for
+    /// a founding record or one superseded without a quorum.
+    federation_family_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
+    /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the community twin of
+    /// `federation_family_supersede_proofs`, keyed by `community_key_id`.
+    federation_community_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_family_membership_revocations`.
-    federation_family_membership_revocation_authority_sigs: HashMap<(String, String), AuthoritySig>,
+    federation_family_membership_revocation_authority_sigs:
+        HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
+    /// v49.0.0 (#910) — keyed like `federation_family_membership_widenings`.
+    federation_family_membership_widening_authority_sigs:
+        HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_community_membership_revocations`.
     federation_community_membership_revocation_authority_sigs:
@@ -415,6 +442,30 @@ struct State {
     /// v48.0.0 (#860) — keyed like `federation_community_membership_widenings`.
     federation_community_membership_widening_authority_sigs:
         HashMap<(String, String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
+    /// v49.0.0 (CIRISPersist#908, V153 mirror) — the co-signatures the door
+    /// verified, keyed like `federation_family_membership_revocations`.
+    /// Absent ⇒ none (a single-signed row).
+    federation_family_membership_revocation_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
+    /// v49.0.0 (#910) — keyed like `federation_family_membership_widenings`.
+    federation_family_membership_widening_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
+    /// v49.0.0 (CIRISPersist#908, V153 mirror) — keyed like
+    /// `federation_community_membership_revocations`.
+    federation_community_membership_revocation_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
+    /// v49.0.0 (CIRISPersist#908, V153 mirror) — keyed like
+    /// `federation_community_membership_widenings`.
+    federation_community_membership_widening_cosignatures: HashMap<
+        (String, String, chrono::DateTime<chrono::Utc>),
+        Vec<crate::federation::RosterCosignature>,
+    >,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_location_proofs`.
     federation_location_proof_authority_sigs:
@@ -538,6 +589,8 @@ const PLANE_LOCATION_PROOF: &str = "LocationProof";
 const PLANE_FAMILY_MEMBERSHIP_REVOCATION: &str = "FamilyMembershipRevocation";
 const PLANE_COMMUNITY_MEMBERSHIP_REVOCATION: &str = "CommunityMembershipRevocation";
 const PLANE_COMMUNITY_MEMBERSHIP_WIDENING: &str = "CommunityMembershipWidening";
+const PLANE_FAMILY_MEMBERSHIP_WIDENING: &str = "FamilyMembershipWidening";
+const PLANE_COMMUNITY_MEMBERSHIP_LISTING: &str = "CommunityMembershipListing";
 const PLANE_IDENTITY_OCCURRENCE: &str = "IdentityOccurrence";
 const PLANE_IDENTITY_OCCURRENCE_REVOCATION: &str = "IdentityOccurrenceRevocation";
 const PLANE_TRANSPORT_DESTINATION: &str = "TransportDestination";
@@ -670,8 +723,46 @@ fn family_membership_revocation_rows(
                 crate::federation::types::compound_resume_id(&[
                     &r.family_key_id,
                     &r.removed_identity_key_id,
+                    &r.effective_at.to_rfc3339(),
                 ]),
                 r.removed_at,
+            )
+        })
+        .collect()
+}
+/// v49.0.0 (#912) — every listing row is stamped at admission; the fallback
+/// (its `effective_at`) is never read.
+fn community_membership_listing_rows(
+    state: &State,
+) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_community_membership_listings
+        .values()
+        .map(|l| {
+            let l = &l.community_membership_listing;
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &l.community_key_id,
+                    &l.member_key_id,
+                    &l.effective_at.to_rfc3339(),
+                ]),
+                l.effective_at,
+            )
+        })
+        .collect()
+}
+fn family_membership_widening_rows(state: &State) -> Vec<(String, chrono::DateTime<chrono::Utc>)> {
+    state
+        .federation_family_membership_widenings
+        .values()
+        .map(|w| {
+            (
+                crate::federation::types::compound_resume_id(&[
+                    &w.family_key_id,
+                    &w.member_key_id,
+                    &w.effective_at.to_rfc3339(),
+                ]),
+                w.joined_at,
             )
         })
         .collect()
@@ -825,6 +916,8 @@ impl Default for MemoryBackend {
                 federation_identity_occurrence_revocations: HashMap::new(),
                 federation_identity_occurrence_revocation_sigs: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
+                federation_family_membership_widenings: HashMap::new(),
+                federation_community_membership_listings: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
                 federation_community_membership_widenings: HashMap::new(),
                 federation_community_dek_epoch: HashMap::new(),
@@ -856,9 +949,16 @@ impl Default for MemoryBackend {
                 consent_peer_set_for: Vec::new(),
                 federation_family_authority_sigs: HashMap::new(),
                 federation_community_authority_sigs: HashMap::new(),
+                federation_family_supersede_proofs: HashMap::new(),
+                federation_community_supersede_proofs: HashMap::new(),
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
+                federation_family_membership_widening_authority_sigs: HashMap::new(),
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
                 federation_community_membership_widening_authority_sigs: HashMap::new(),
+                federation_family_membership_revocation_cosignatures: HashMap::new(),
+                federation_family_membership_widening_cosignatures: HashMap::new(),
+                federation_community_membership_revocation_cosignatures: HashMap::new(),
+                federation_community_membership_widening_cosignatures: HashMap::new(),
                 federation_location_proof_authority_sigs: HashMap::new(),
                 signed_wire_index: HashMap::new(),
                 known_wire_hashes: HashMap::new(),
@@ -5606,11 +5706,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // locks itself). Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused.
+        // (Memory used to OVERWRITE here — `put_family_local` is a map insert.)
+        if crate::federation::group_amendment::route_occupied_family(self, &family).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
         let crate::federation::SignedFamily {
             family: row,
             authority_key_id,
             scrub_signature_classical,
             scrub_signature_pqc,
+            supersede_proof,
         } = family;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
@@ -5631,6 +5741,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     scrub_signature_pqc.clone(),
                 ),
             );
+            // v49.0.0 (#910.5) — a first copy of an amended version keeps its
+            // proof, so the next peer can apply it.
+            match supersede_proof {
+                Some(p) => {
+                    state
+                        .federation_family_supersede_proofs
+                        .insert(family_key_id.clone(), p);
+                }
+                None => {
+                    state
+                        .federation_family_supersede_proofs
+                        .remove(&family_key_id);
+                }
+            }
             // v36.0.0 (#668) — attaching the authority signature is what makes
             // the row visible to the signed serve cursor; re-stamp the serve
             // position here (V130 mirror).
@@ -5682,55 +5806,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
-    async fn add_family_member(
-        &self,
-        family_key_id: &str,
-        member: crate::federation::types::FamilyMember,
-        spec: &crate::federation::cohort::AdmitSpec,
-    ) -> Result<bool, crate::federation::Error> {
-        // v31.0.0 (CIRISPersist#654) — THE AUTHORSHIP GATE, verify-before-
-        // mutation; see the sqlite twin. It MUST run before `self.state.lock()`
-        // (the verify resolves keys through the directory, which takes the same
-        // lock) — the ordering `put_family` on this backend already documents.
-        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
-            crate::federation::Error::InvalidArgument(format!(
-                "add_family_member names unknown family_key_id {family_key_id:?}"
-            ))
-        })?;
-        if family.members.iter().any(|m| m.key_id == member.key_id) {
-            return Ok(false); // already on the roster — no-op, nothing to authorize
-        }
-        let grown =
-            crate::federation::cohort::authorize_family_growth(self, &family, member, spec).await?;
-        {
-            let mut state = self.state.lock().expect("memory backend lock");
-            // v31.0.0 (CIRISPersist#654/#651) — the roster and the signature
-            // that authorizes it are written together, under one guard.
-            state
-                .federation_families
-                .insert(family_key_id.to_owned(), grown);
-            state.federation_family_authority_sigs.insert(
-                family_key_id.to_owned(),
-                (
-                    spec.authority_key_id.clone(),
-                    spec.scrub_signature_classical.clone(),
-                    spec.scrub_signature_pqc.clone(),
-                ),
-            );
-            // v36.0.0 (#668/#707-class) — a roster grow rewrites the served
-            // bytes; the serve position moves with them.
-            let rows = family_rows(&state);
-            allocate_and_stamp(&mut state, PLANE_FAMILY, family_key_id.to_owned(), rows);
-        }
-        // v31.0.0 (CIRISPersist#654) — re-index; see the sqlite twin.
-        self.index_stored_record(
-            "Family",
-            &crate::federation::wire_index::record_key(&[("family_key_id", family_key_id)]),
-        )
-        .await?;
-        Ok(true)
-    }
-
     async fn lookup_family(
         &self,
         family_key_id: &str,
@@ -5761,134 +5836,197 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
         };
         let now = chrono::Utc::now();
-        let mut state = self.state.lock().expect("memory backend lock");
-        match cohort {
-            Cohort::Family => {
-                // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
-                // wrapper. Decoding the bare record here is what silently
-                // stranded the caller's signature while every field
-                // `signing_envelope()` covers was replaced below.
-                let crate::federation::SignedFamily {
-                    family: mut new_fam,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
-                })?;
-                new_fam.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
-                let key = new_fam.family_key_id.clone();
-                let prior = state
-                    .federation_families
-                    .get(&key)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!(
-                            "supersede: unknown family group {key:?} (nothing to supersede)"
-                        ))
-                    })?;
-                let cur_ver = *state
-                    .federation_group_current_version
-                    .get(&(cohort_str.clone(), key.clone()))
-                    .unwrap_or(&1);
-                let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
-                state
-                    .federation_group_versions
-                    .entry((cohort_str.clone(), key.clone()))
-                    .or_default()
-                    .push(GroupVersion {
-                        cohort,
-                        group_key_id: key.clone(),
-                        version: cur_ver,
-                        snapshot,
-                        authorization,
-                        superseded_at: Some(now),
-                        is_current: false,
-                    });
-                state.federation_families.insert(key.clone(), new_fam);
-                // v31.0.0 (CIRISPersist#651) — the signature moves with the
-                // record it authorizes, in the same critical section.
-                state.federation_family_authority_sigs.insert(
-                    key.clone(),
-                    (
+        let group_key_id =
+            crate::federation::group_amendment::snapshot_group_key_id(cohort, &new_snapshot);
+        // The lock is scoped to this block so it is released before the
+        // re-index below awaits.
+        let next = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            match cohort {
+                Cohort::Family => {
+                    // v31.0.0 (CIRISPersist#651) — the snapshot is the SIGNED
+                    // wrapper. Decoding the bare record here is what silently
+                    // stranded the caller's signature while every field
+                    // `signing_envelope()` covers was replaced below.
+                    let crate::federation::SignedFamily {
+                        family: mut new_fam,
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
-                    ),
-                );
-                // v36.0.0 (#668/#707-class) — a supersede rewrites the served
-                // bytes; the serve position moves with them.
-                let rows = family_rows(&state);
-                allocate_and_stamp(&mut state, PLANE_FAMILY, key.clone(), rows);
-                let next = cur_ver + 1;
-                state
-                    .federation_group_current_version
-                    .insert((cohort_str, key), next);
-                Ok(next)
-            }
-            Cohort::Community | Cohort::Affiliations => {
-                // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
-                // family arm above.
-                let crate::federation::SignedCommunity {
-                    community: mut new_comm,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
-                } = serde_json::from_value(new_snapshot).map_err(|e| {
-                    Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
-                })?;
-                new_comm.persist_row_hash =
-                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
-                let key = new_comm.community_key_id.clone();
-                let prior = state
-                    .federation_communities
-                    .get(&key)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidArgument(format!(
+                        supersede_proof,
+                    } = serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
+                    })?;
+                    new_fam.persist_row_hash =
+                        crate::federation::types::compute_persist_row_hash(&new_fam)?;
+                    let key = new_fam.family_key_id.clone();
+                    let prior = state
+                        .federation_families
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::InvalidArgument(format!(
+                                "supersede: unknown family group {key:?} (nothing to supersede)"
+                            ))
+                        })?;
+                    // v49.0.0 (#910.5) — a proof names the version it replaces;
+                    // checked under the same lock that replaces it.
+                    if let Some(p) = &supersede_proof {
+                        crate::federation::group_amendment::check_proof_names_prior(
+                            &cohort_str,
+                            &key,
+                            p,
+                            &prior.persist_row_hash,
+                        )?;
+                    }
+                    let cur_ver = *state
+                        .federation_group_current_version
+                        .get(&(cohort_str.clone(), key.clone()))
+                        .unwrap_or(&1);
+                    let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
+                    state
+                        .federation_group_versions
+                        .entry((cohort_str.clone(), key.clone()))
+                        .or_default()
+                        .push(GroupVersion {
+                            cohort,
+                            group_key_id: key.clone(),
+                            version: cur_ver,
+                            snapshot,
+                            authorization,
+                            superseded_at: Some(now),
+                            is_current: false,
+                        });
+                    state.federation_families.insert(key.clone(), new_fam);
+                    // v31.0.0 (CIRISPersist#651) — the signature moves with the
+                    // record it authorizes, in the same critical section.
+                    state.federation_family_authority_sigs.insert(
+                        key.clone(),
+                        (
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                        ),
+                    );
+                    // v49.0.0 (#910.5) — the proof moves with the version it
+                    // authorized; a supersede without one clears the last one.
+                    match supersede_proof {
+                        Some(p) => {
+                            state
+                                .federation_family_supersede_proofs
+                                .insert(key.clone(), p);
+                        }
+                        None => {
+                            state.federation_family_supersede_proofs.remove(&key);
+                        }
+                    }
+                    // v36.0.0 (#668/#707-class) — a supersede rewrites the served
+                    // bytes; the serve position moves with them.
+                    let rows = family_rows(&state);
+                    allocate_and_stamp(&mut state, PLANE_FAMILY, key.clone(), rows);
+                    let next = cur_ver + 1;
+                    state
+                        .federation_group_current_version
+                        .insert((cohort_str, key), next);
+                    next
+                }
+                Cohort::Community | Cohort::Affiliations => {
+                    // v31.0.0 (CIRISPersist#651) — the SIGNED wrapper; see the
+                    // family arm above.
+                    let crate::federation::SignedCommunity {
+                        community: mut new_comm,
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        supersede_proof,
+                    } = serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                    })?;
+                    new_comm.persist_row_hash =
+                        crate::federation::types::compute_persist_row_hash(&new_comm)?;
+                    let key = new_comm.community_key_id.clone();
+                    let prior =
+                        state
+                            .federation_communities
+                            .get(&key)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::InvalidArgument(format!(
                             "supersede: unknown community group {key:?} (nothing to supersede)"
                         ))
-                    })?;
-                let cur_ver = *state
-                    .federation_group_current_version
-                    .get(&(cohort_str.clone(), key.clone()))
-                    .unwrap_or(&1);
-                let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
-                state
-                    .federation_group_versions
-                    .entry((cohort_str.clone(), key.clone()))
-                    .or_default()
-                    .push(GroupVersion {
-                        cohort,
-                        group_key_id: key.clone(),
-                        version: cur_ver,
-                        snapshot,
-                        authorization,
-                        superseded_at: Some(now),
-                        is_current: false,
-                    });
-                state.federation_communities.insert(key.clone(), new_comm);
-                // v31.0.0 (CIRISPersist#651) — see the family arm.
-                state.federation_community_authority_sigs.insert(
-                    key.clone(),
-                    (
-                        authority_key_id,
-                        scrub_signature_classical,
-                        scrub_signature_pqc,
-                    ),
-                );
-                // v36.0.0 (#668/#707-class) — see the family arm.
-                let rows = community_rows(&state);
-                allocate_and_stamp(&mut state, PLANE_COMMUNITY, key.clone(), rows);
-                let next = cur_ver + 1;
-                state
-                    .federation_group_current_version
-                    .insert((cohort_str, key), next);
-                Ok(next)
+                            })?;
+                    // v49.0.0 (#910.5) — see the family arm.
+                    if let Some(p) = &supersede_proof {
+                        crate::federation::group_amendment::check_proof_names_prior(
+                            &cohort_str,
+                            &key,
+                            p,
+                            &prior.persist_row_hash,
+                        )?;
+                    }
+                    let cur_ver = *state
+                        .federation_group_current_version
+                        .get(&(cohort_str.clone(), key.clone()))
+                        .unwrap_or(&1);
+                    let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
+                    state
+                        .federation_group_versions
+                        .entry((cohort_str.clone(), key.clone()))
+                        .or_default()
+                        .push(GroupVersion {
+                            cohort,
+                            group_key_id: key.clone(),
+                            version: cur_ver,
+                            snapshot,
+                            authorization,
+                            superseded_at: Some(now),
+                            is_current: false,
+                        });
+                    state.federation_communities.insert(key.clone(), new_comm);
+                    // v31.0.0 (CIRISPersist#651) — see the family arm.
+                    state.federation_community_authority_sigs.insert(
+                        key.clone(),
+                        (
+                            authority_key_id,
+                            scrub_signature_classical,
+                            scrub_signature_pqc,
+                        ),
+                    );
+                    // v49.0.0 (#910.5) — see the family arm.
+                    match supersede_proof {
+                        Some(p) => {
+                            state
+                                .federation_community_supersede_proofs
+                                .insert(key.clone(), p);
+                        }
+                        None => {
+                            state.federation_community_supersede_proofs.remove(&key);
+                        }
+                    }
+                    // v36.0.0 (#668/#707-class) — see the family arm.
+                    let rows = community_rows(&state);
+                    allocate_and_stamp(&mut state, PLANE_COMMUNITY, key.clone(), rows);
+                    let next = cur_ver + 1;
+                    state
+                        .federation_group_current_version
+                        .insert((cohort_str, key), next);
+                    next
+                }
+                Cohort::SelfId => unreachable!("guarded above"),
             }
-            Cohort::SelfId => unreachable!("guarded above"),
-        }
+        };
+        // v49.0.0 (#910.5) — a supersede changes the served record; re-index
+        // it, or a peer's content-hash lookup never sees the new version.
+        let (kind, key_field) = match cohort {
+            Cohort::Family => ("Family", "family_key_id"),
+            _ => ("Community", "community_key_id"),
+        };
+        self.index_stored_record(
+            kind,
+            &crate::federation::wire_index::record_key(&[(key_field, &group_key_id)]),
+        )
+        .await?;
+        Ok(next)
     }
 
     // #249 Cut G2 (§8) — full version chain: history rows + the live current.
@@ -5951,7 +6089,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_families
             .values()
-            .filter(|f| f.members.iter().any(|m| m.key_id == member_identity_key_id))
+            // v49.0.0 (CIRISPersist#910) — containment in the family's
+            // HISTORY: on the record, or named by a widening. Still raw.
+            .filter(|f| {
+                f.members.iter().any(|m| m.key_id == member_identity_key_id)
+                    || state
+                        .federation_family_membership_widenings
+                        .values()
+                        .any(|w| {
+                            w.family_key_id == f.family_key_id
+                                && w.member_key_id == member_identity_key_id
+                        })
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.family_key_id.cmp(&b.family_key_id));
@@ -5966,7 +6115,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // other admission step (mirrors put_family). Hybrid-Strict vs the
         // authority's registered pubkeys.
         crate::federation::verify_community_admission(self, &community).await?;
-        let mut row = community.community;
+        let row = community.community;
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
@@ -5988,6 +6137,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // for rosters with no node/agent members.
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
+        // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
+        // is a no-op, a proof-carrying amendment this node's own state
+        // authorizes is applied as a supersede, anything else is refused (the
+        // #758 verdict below still settles a concurrent insert). Before the
+        // state lock: it reads through the directory.
+        let offered = crate::federation::SignedCommunity {
+            community: row,
+            authority_key_id: community.authority_key_id,
+            scrub_signature_classical: community.scrub_signature_classical,
+            scrub_signature_pqc: community.scrub_signature_pqc,
+            supersede_proof: community.supersede_proof,
+        };
+        if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
+            == crate::federation::group_amendment::OccupiedRoute::Settled
+        {
+            return Ok(());
+        }
+        let community = offered;
+        let mut row = community.community;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v48.0.0 (CIRISPersist#860) — a room is a KEYLESS identifier (as
@@ -6024,6 +6192,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     community.scrub_signature_pqc,
                 ),
             );
+            // v49.0.0 (#910.5) — a first copy of an amended version keeps its
+            // proof, so the next peer can apply it.
+            if let Some(p) = community.supersede_proof {
+                state
+                    .federation_community_supersede_proofs
+                    .insert(row.community_key_id.clone(), p);
+            }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at =
                 next_plane_position(&state, PLANE_COMMUNITY, community_rows(&state).into_iter());
@@ -6055,7 +6230,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_communities
             .values()
-            .filter(|c| c.members.iter().any(|m| m.key_id == member_identity_key_id))
+            // v49.0.0 (CIRISPersist#907) — containment in the room's
+            // HISTORY: on the record, or named by a widening. Still raw.
+            .filter(|c| {
+                c.members.iter().any(|m| m.key_id == member_identity_key_id)
+                    || state
+                        .federation_community_membership_widenings
+                        .values()
+                        .any(|w| {
+                            w.community_key_id == c.community_key_id
+                                && w.member_key_id == member_identity_key_id
+                        })
+            })
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
@@ -6559,6 +6745,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // indistinguishable from a real one.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
+        // v49.0.0 (CIRISPersist#910.3) — standing, by the family's own
+        // `consensus_protocol` at the row's instant (the #908 family half).
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &revocation.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &revocation.authority_key_id,
+                &revocation.cosignatures,
+            ),
+            crate::federation::types::FamilyMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
+            true,
+            row.effective_at,
+        )
+        .await?;
         // CEG §7.7 (CIRISPersist#161 Ask 5) — the removal-direction
         // membership-change hard_case (`change_kind: "removed"`), keyed on the
         // re-key epoch (`effective_at`). Built before the lock; RECORDED after
@@ -6593,25 +6798,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let revocation_key = (
                 row.family_key_id.clone(),
                 row.removed_identity_key_id.clone(),
+                row.effective_at,
             );
-            // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK, as on
-            // sqlite / postgres: a repeat is a no-op UNLESS it moves the
-            // removal earlier, which replaces the stored row (fail-secure; see
-            // the sqlite door). Before this memory overwrote on EVERY repeat,
-            // and the SQL backends refused every repeat.
-            if let Some(stored) = state
+            // v47.1.0 (CIRISPersist#861) — IDEMPOTENT on the PK. v49.0.0
+            // (#910.1, V154): the PK carries `effective_at`, so an exact retry
+            // is the no-op and a removal at another instant is another event
+            // (a re-removal after a re-add, or an earlier removal the fold
+            // honours first).
+            if state
                 .federation_family_membership_revocations
-                .get(&revocation_key)
+                .contains_key(&revocation_key)
             {
-                if row.effective_at >= stored.effective_at {
-                    return Ok(());
-                }
+                return Ok(());
             }
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `revocation.*`.
+            let effective_at_rfc3339 = revocation_key.2.to_rfc3339();
             let wire_index_key = crate::federation::wire_index::record_key(&[
                 ("family_key_id", &revocation_key.0),
                 ("removed_identity_key_id", &revocation_key.1),
+                ("effective_at", &effective_at_rfc3339),
             ]);
             // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
             // signature the gate above already verified (was verified-then-
@@ -6626,6 +6832,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_family_membership_revocation_cosignatures
+                .insert(revocation_key.clone(), revocation.cosignatures);
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
                 &state,
@@ -6635,6 +6845,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let resume = crate::federation::types::compound_resume_id(&[
                 &revocation_key.0,
                 &revocation_key.1,
+                &effective_at_rfc3339,
             ]);
             state
                 .federation_family_membership_revocations
@@ -6678,6 +6889,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::community_dek::reject_future_dated_community_revocation(
             row.effective_at,
         )?;
+        // v49.0.0 (CIRISPersist#908) — standing, before the epoch rotates.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &revocation.authority_key_id,
+            &std::iter::once(revocation.authority_key_id.clone())
+                .chain(
+                    revocation
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            crate::federation::types::CommunityMember {
+                key_id: row.removed_identity_key_id.clone(),
+                joined_at: row.effective_at,
+                role: None,
+            },
+            true,
+            row.effective_at,
+        )
+        .await?;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v48.0.0 (CIRISPersist#860, V151) — the group FK points at the
@@ -6771,6 +7004,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         revocation.scrub_signature_pqc,
                     ),
                 );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_community_membership_revocation_cosignatures
+                .insert(revocation_key.clone(), revocation.cosignatures);
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at = next_plane_position(
                 &state,
@@ -6807,6 +7044,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
         let mut row = widening.community_membership_widening;
         crate::federation::community_dek::reject_future_dated_community_widening(row.effective_at)?;
+        // v49.0.0 (CIRISPersist#908) — the signer must have standing.
+        crate::federation::check_community_roster_authority(
+            self,
+            &row.community_key_id,
+            &widening.authority_key_id,
+            &std::iter::once(widening.authority_key_id.clone())
+                .chain(
+                    widening
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.authority_key_id.clone()),
+                )
+                .collect(),
+            row.member(),
+            false,
+            row.effective_at,
+        )
+        .await?;
         let community = self
             .lookup_community(&row.community_key_id)
             .await?
@@ -6858,6 +7113,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         widening.scrub_signature_pqc,
                     ),
                 );
+            // v49.0.0 (CIRISPersist#908, V153 mirror).
+            state
+                .federation_community_membership_widening_cosignatures
+                .insert(key.clone(), widening.cosignatures);
             let admitted_at = next_plane_position(
                 &state,
                 PLANE_COMMUNITY_MEMBERSHIP_WIDENING,
@@ -6880,6 +7139,165 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             wire_index_key
         };
         self.index_stored_record("CommunityMembershipWidening", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
+    async fn put_family_membership_widening(
+        &self,
+        widening: crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) —
+        // the family twin of the room's widening door; see the sqlite twin.
+        crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
+        let mut row = widening.family_membership_widening;
+        crate::federation::reject_future_dated_family_widening(row.effective_at)?;
+        crate::federation::check_family_roster_authority(
+            self,
+            &row.family_key_id,
+            &widening.authority_key_id,
+            &crate::federation::roster_row_signer_set(
+                &widening.authority_key_id,
+                &widening.cosignatures,
+            ),
+            row.member(),
+            false,
+            row.effective_at,
+        )
+        .await?;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // The V154 FKs: the family (a keyless group) and the member (a key).
+            if !state.federation_families.contains_key(&row.family_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_families",
+                    row.family_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.member_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    row.member_key_id
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let key = (
+                row.family_key_id.clone(),
+                row.member_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_family_membership_widenings
+                .contains_key(&key)
+            {
+                return Ok(());
+            }
+            let effective_at_rfc3339 = key.2.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("family_key_id", &key.0),
+                ("member_key_id", &key.1),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            state
+                .federation_family_membership_widening_authority_sigs
+                .insert(
+                    key.clone(),
+                    (
+                        widening.authority_key_id,
+                        widening.scrub_signature_classical,
+                        widening.scrub_signature_pqc,
+                    ),
+                );
+            state
+                .federation_family_membership_widening_cosignatures
+                .insert(key.clone(), widening.cosignatures);
+            let admitted_at = next_plane_position(
+                &state,
+                PLANE_FAMILY_MEMBERSHIP_WIDENING,
+                family_membership_widening_rows(&state).into_iter(),
+            );
+            let resume = crate::federation::types::compound_resume_id(&[
+                &key.0,
+                &key.1,
+                &effective_at_rfc3339,
+            ]);
+            state
+                .federation_family_membership_widenings
+                .insert(key, row);
+            stamp_plane_position(
+                &mut state,
+                PLANE_FAMILY_MEMBERSHIP_WIDENING,
+                resume,
+                admitted_at,
+            );
+            wire_index_key
+        };
+        self.index_stored_record("FamilyMembershipWidening", &wire_index_key)
+            .await?;
+        Ok(())
+    }
+
+    async fn put_community_membership_listing(
+        &self,
+        listing: crate::federation::SignedCommunityMembershipListing,
+    ) -> Result<(), crate::federation::Error> {
+        // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
+        // mirror; see the sqlite twin.
+        crate::federation::listing::check_community_membership_listing(self, &listing).await?;
+        let mut listing = listing;
+        let wire_index_key = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // The V156 FKs: the room (the door checked it) and the member.
+            if !state
+                .federation_communities
+                .contains_key(&listing.community_membership_listing.community_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_communities",
+                    listing.community_membership_listing.community_key_id
+                )));
+            }
+            if !state
+                .federation_keys
+                .contains_key(&listing.community_membership_listing.member_key_id)
+            {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{} does not exist in federation_keys",
+                    listing.community_membership_listing.member_key_id
+                )));
+            }
+            let row = &mut listing.community_membership_listing;
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&*row)?;
+            let key = (
+                row.community_key_id.clone(),
+                row.member_key_id.clone(),
+                row.effective_at,
+            );
+            if state
+                .federation_community_membership_listings
+                .contains_key(&key)
+            {
+                return Ok(());
+            }
+            let effective_at_rfc3339 = key.2.to_rfc3339();
+            let wire_index_key = crate::federation::wire_index::record_key(&[
+                ("community_key_id", &key.0),
+                ("member_key_id", &key.1),
+                ("effective_at", &effective_at_rfc3339),
+            ]);
+            let resume = crate::federation::types::compound_resume_id(&[
+                &key.0,
+                &key.1,
+                &effective_at_rfc3339,
+            ]);
+            let rows = community_membership_listing_rows(&state);
+            allocate_and_stamp(&mut state, PLANE_COMMUNITY_MEMBERSHIP_LISTING, resume, rows);
+            state
+                .federation_community_membership_listings
+                .insert(key, listing);
+            wire_index_key
+        };
+        self.index_stored_record("CommunityMembershipListing", &wire_index_key)
             .await?;
         Ok(())
     }
@@ -6986,6 +7404,165 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .then_with(|| a.effective_at.cmp(&b.effective_at))
         });
         Ok(rows)
+    }
+
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_community_membership_listings
+            .values()
+            .map(|l| &l.community_membership_listing)
+            .filter(|l| l.community_key_id == community_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.member_key_id
+                .cmp(&b.member_key_id)
+                .then_with(|| a.effective_at.cmp(&b.effective_at))
+        });
+        Ok(rows)
+    }
+
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        if !state.federation_communities.contains_key(community_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "community_roster_signers names unknown community_key_id {community_key_id:?}"
+            )));
+        }
+        let record_authority_key_id = state
+            .federation_community_authority_sigs
+            .get(community_key_id)
+            .map(|s| s.0.clone());
+        type EventKey = (String, String, chrono::DateTime<chrono::Utc>);
+        let signer =
+            |key: &EventKey,
+             sigs: &HashMap<EventKey, AuthoritySig>,
+             cosigs: &HashMap<EventKey, Vec<crate::federation::RosterCosignature>>| {
+                crate::federation::RosterEventSigner {
+                    member_key_id: key.1.clone(),
+                    effective_at: key.2,
+                    authority_key_id: sigs.get(key).map(|s| s.0.clone()),
+                    cosigner_key_ids: cosigs
+                        .get(key)
+                        .map(|c| c.iter().map(|c| c.authority_key_id.clone()).collect())
+                        .unwrap_or_default(),
+                }
+            };
+        let widening_signers = state
+            .federation_community_membership_widenings
+            .keys()
+            .filter(|k| k.0 == community_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_community_membership_widening_authority_sigs,
+                    &state.federation_community_membership_widening_cosignatures,
+                )
+            })
+            .collect();
+        let revocation_signers = state
+            .federation_community_membership_revocations
+            .keys()
+            .filter(|k| k.0 == community_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_community_membership_revocation_authority_sigs,
+                    &state.federation_community_membership_revocation_cosignatures,
+                )
+            })
+            .collect();
+        Ok(crate::federation::CommunityRosterSigners {
+            record_authority_key_id,
+            widening_signers,
+            revocation_signers,
+        })
+    }
+
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipWidening>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_family_membership_widenings
+            .values()
+            .filter(|w| w.family_key_id == family_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.member_key_id
+                .cmp(&b.member_key_id)
+                .then_with(|| a.effective_at.cmp(&b.effective_at))
+        });
+        Ok(rows)
+    }
+
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<crate::federation::CommunityRosterSigners, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        if !state.federation_families.contains_key(family_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "family_roster_signers names unknown family_key_id {family_key_id:?}"
+            )));
+        }
+        let record_authority_key_id = state
+            .federation_family_authority_sigs
+            .get(family_key_id)
+            .map(|s| s.0.clone());
+        type EventKey = (String, String, chrono::DateTime<chrono::Utc>);
+        let signer =
+            |key: &EventKey,
+             sigs: &HashMap<EventKey, AuthoritySig>,
+             cosigs: &HashMap<EventKey, Vec<crate::federation::RosterCosignature>>| {
+                crate::federation::RosterEventSigner {
+                    member_key_id: key.1.clone(),
+                    effective_at: key.2,
+                    authority_key_id: sigs.get(key).map(|s| s.0.clone()),
+                    cosigner_key_ids: cosigs
+                        .get(key)
+                        .map(|c| c.iter().map(|c| c.authority_key_id.clone()).collect())
+                        .unwrap_or_default(),
+                }
+            };
+        let widening_signers = state
+            .federation_family_membership_widenings
+            .keys()
+            .filter(|k| k.0 == family_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_family_membership_widening_authority_sigs,
+                    &state.federation_family_membership_widening_cosignatures,
+                )
+            })
+            .collect();
+        let revocation_signers = state
+            .federation_family_membership_revocations
+            .keys()
+            .filter(|k| k.0 == family_key_id)
+            .map(|k| {
+                signer(
+                    k,
+                    &state.federation_family_membership_revocation_authority_sigs,
+                    &state.federation_family_membership_revocation_cosignatures,
+                )
+            })
+            .collect();
+        Ok(crate::federation::CommunityRosterSigners {
+            record_authority_key_id,
+            widening_signers,
+            revocation_signers,
+        })
     }
 
     // ─── v6.7.0 (CIRISPersist#146 Ask 3 / #161 Ask 5) — hard_case:* surface.
@@ -7698,6 +8275,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        supersede_proof: state
+                            .federation_family_supersede_proofs
+                            .get(&f.family_key_id)
+                            .cloned(),
                     },
                 })
             })
@@ -7743,6 +8324,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        supersede_proof: state
+                            .federation_community_supersede_proofs
+                            .get(&c.community_key_id)
+                            .cloned(),
                     },
                 })
             })
@@ -7837,6 +8422,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::federation::types::compound_resume_id(&[
                 &r.family_key_id,
                 &r.removed_identity_key_id,
+                &r.effective_at.to_rfc3339(),
             ])
         };
         let position = |r: &crate::federation::types::FamilyMembershipRevocation| {
@@ -7848,27 +8434,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )
         };
         let since_parts = since.as_ref().map(|(s_at, s_id)| {
-            let [a, b] = crate::federation::types::split_resume_id::<2>(s_id);
-            (*s_at, a.to_owned(), b.to_owned())
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
         });
         let mut rows: Vec<_> = state
             .federation_family_membership_revocations
             .values()
             .filter(|r| {
-                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b)| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
                     (
                         position(r),
                         r.family_key_id.as_str(),
                         r.removed_identity_key_id.as_str(),
-                    ) > (*s_at, s_a.as_str(), s_b.as_str())
+                        r.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
                 })
             })
             .filter_map(|r| {
-                let key = (r.family_key_id.clone(), r.removed_identity_key_id.clone());
+                let key = (
+                    r.family_key_id.clone(),
+                    r.removed_identity_key_id.clone(),
+                    r.effective_at,
+                );
                 let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
                     .federation_family_membership_revocation_authority_sigs
                     .get(&key)?
                     .clone();
+                let cosignatures = state
+                    .federation_family_membership_revocation_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(crate::federation::ServedFamilyMembershipRevocation {
                     admitted_at: position(r),
                     revocation: crate::federation::SignedFamilyMembershipRevocation {
@@ -7876,6 +8472,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures,
                     },
                 })
             })
@@ -7887,6 +8484,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .cmp(&b.admitted_at)
                 .then_with(|| ar.family_key_id.cmp(&br.family_key_id))
                 .then_with(|| ar.removed_identity_key_id.cmp(&br.removed_identity_key_id))
+                .then_with(|| ar.effective_at.cmp(&br.effective_at))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -7941,6 +8539,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .federation_community_membership_revocation_authority_sigs
                     .get(&key)?
                     .clone();
+                let cosignatures = state
+                    .federation_community_membership_revocation_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(crate::federation::ServedCommunityMembershipRevocation {
                     admitted_at: position(r),
                     revocation: crate::federation::SignedCommunityMembershipRevocation {
@@ -7948,6 +8551,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures,
                     },
                 })
             })
@@ -8014,6 +8618,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .federation_community_membership_widening_authority_sigs
                     .get(&key)?
                     .clone();
+                let cosignatures = state
+                    .federation_community_membership_widening_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(crate::federation::ServedCommunityMembershipWidening {
                     admitted_at: position(w),
                     widening: crate::federation::SignedCommunityMembershipWidening {
@@ -8021,6 +8630,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures,
                     },
                 })
             })
@@ -8031,6 +8641,141 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             a.admitted_at
                 .cmp(&b.admitted_at)
                 .then_with(|| aw.community_key_id.cmp(&bw.community_key_id))
+                .then_with(|| aw.member_key_id.cmp(&bw.member_key_id))
+                .then_with(|| aw.effective_at.cmp(&bw.effective_at))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let position = |l: &crate::federation::types::CommunityMembershipListing| {
+            plane_position(
+                &state,
+                PLANE_COMMUNITY_MEMBERSHIP_LISTING,
+                &crate::federation::types::compound_resume_id(&[
+                    &l.community_key_id,
+                    &l.member_key_id,
+                    &l.effective_at.to_rfc3339(),
+                ]),
+                l.effective_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
+        });
+        let mut rows: Vec<_> = state
+            .federation_community_membership_listings
+            .values()
+            .filter(|s| !s.authority_key_id.is_empty())
+            .filter(|s| {
+                let l = &s.community_membership_listing;
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
+                    (
+                        position(l),
+                        l.community_key_id.as_str(),
+                        l.member_key_id.as_str(),
+                        l.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
+                })
+            })
+            .map(|s| crate::federation::ServedCommunityMembershipListing {
+                admitted_at: position(&s.community_membership_listing),
+                listing: s.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let al = &a.listing.community_membership_listing;
+            let bl = &b.listing.community_membership_listing;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| al.community_key_id.cmp(&bl.community_key_id))
+                .then_with(|| al.member_key_id.cmp(&bl.member_key_id))
+                .then_with(|| al.effective_at.cmp(&bl.effective_at))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let resume_id = |w: &crate::federation::types::FamilyMembershipWidening| {
+            crate::federation::types::compound_resume_id(&[
+                &w.family_key_id,
+                &w.member_key_id,
+                &w.effective_at.to_rfc3339(),
+            ])
+        };
+        let position = |w: &crate::federation::types::FamilyMembershipWidening| {
+            plane_position(
+                &state,
+                PLANE_FAMILY_MEMBERSHIP_WIDENING,
+                &resume_id(w),
+                w.joined_at,
+            )
+        };
+        let since_parts = since.as_ref().map(|(s_at, s_id)| {
+            let [a, b, c] = crate::federation::types::split_resume_id::<3>(s_id);
+            (*s_at, a.to_owned(), b.to_owned(), c.to_owned())
+        });
+        let mut rows: Vec<_> = state
+            .federation_family_membership_widenings
+            .values()
+            .filter(|w| {
+                since_parts.as_ref().is_none_or(|(s_at, s_a, s_b, s_c)| {
+                    (
+                        position(w),
+                        w.family_key_id.as_str(),
+                        w.member_key_id.as_str(),
+                        w.effective_at.to_rfc3339().as_str(),
+                    ) > (*s_at, s_a.as_str(), s_b.as_str(), s_c.as_str())
+                })
+            })
+            .filter_map(|w| {
+                let key = (
+                    w.family_key_id.clone(),
+                    w.member_key_id.clone(),
+                    w.effective_at,
+                );
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_family_membership_widening_authority_sigs
+                    .get(&key)?
+                    .clone();
+                let cosignatures = state
+                    .federation_family_membership_widening_cosignatures
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
+                Some(crate::federation::ServedFamilyMembershipWidening {
+                    admitted_at: position(w),
+                    widening: crate::federation::SignedFamilyMembershipWidening {
+                        family_membership_widening: w.clone(),
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
+                        cosignatures,
+                    },
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let aw = &a.widening.family_membership_widening;
+            let bw = &b.widening.family_membership_widening;
+            a.admitted_at
+                .cmp(&b.admitted_at)
+                .then_with(|| aw.family_key_id.cmp(&bw.family_key_id))
                 .then_with(|| aw.member_key_id.cmp(&bw.member_key_id))
                 .then_with(|| aw.effective_at.cmp(&bw.effective_at))
         });
@@ -17827,7 +18572,7 @@ mod tests {
         // future-dated check below is the actual thing under test.
         let rev = |effective_at: chrono::DateTime<chrono::Utc>| {
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                "ob-owner",
+                "ob-node", /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::CommunityMembershipRevocation {
                     community_key_id: "ob-owner".into(),
                     removed_identity_key_id: "ob-node".into(),
@@ -17880,7 +18625,11 @@ mod tests {
         // The affiliations group is a community row (shared storage), founded
         // by the user-role member ob-owner.
         let group = "aff-grp";
-        put_community_with(&backend, group, vec![member("ob-owner")], None)
+        // v49.0.0 (#908): ob-owner founds the group, so its signature is
+        // the founder_only protocol.
+        let mut founder = member("ob-owner");
+        founder.role = Some("founder".into());
+        put_community_with(&backend, group, vec![founder], None)
             .await
             .expect("affiliations group (community row) created");
 
@@ -17940,7 +18689,8 @@ mod tests {
                 "ob-joiner",
                 crate::federation::tier_ingest::test_support::sign_revoke_spec(
                     Cohort::Affiliations,
-                    group,
+                    "ob-joiner",
+                    // v49.0.0 (#908): the member leaves on their own signature.
                     group,
                     "ob-joiner",
                     chrono::Utc::now(),
@@ -18518,7 +19268,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "fam-A",
+                    "carol", /* v49.0.0 (#910): the member leaves on their own signature */
                     rev.clone(),
                 ),
             )
@@ -18547,7 +19297,8 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "fam-A", rev,
+                    "carol", /* v49.0.0 (#910): the member leaves on their own signature */
+                    rev,
                 ),
             )
             .await
@@ -19088,7 +19839,8 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    "acm-comm",
+                    // v49.0.0 (#908): acm-1 leaves on their own signature.
+                    "acm-1",
                     crate::federation::CommunityMembershipRevocation {
                         community_key_id: "acm-comm".into(),
                         removed_identity_key_id: "acm-1".into(),
@@ -19136,7 +19888,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "afm-fam",
+                    "afm-carol", /* v49.0.0 (#910): the member leaves on their own signature */
                     FamilyMembershipRevocation {
                         family_key_id: "afm-fam".into(),
                         removed_identity_key_id: "afm-carol".into(),
@@ -19162,7 +19914,7 @@ mod tests {
         backend
             .put_family_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
-                    "afm-fam",
+                    "afm-carol", /* v49.0.0 (#910): the member leaves on their own signature */
                     FamilyMembershipRevocation {
                         family_key_id: "afm-fam".into(),
                         removed_identity_key_id: "afm-carol".into(),
@@ -19186,14 +19938,16 @@ mod tests {
     async fn add_community_member_grows_roster_idempotent() {
         let backend = MemoryBackend::new();
         let ids = seed_user_keys(&backend, "addc", 3).await;
-        put_community_with(&backend, "addc-comm", vec![member(&ids[0])], None)
+        // v49.0.0 (#908): addc-0 is the founder, whose signature IS the
+        // founder_only protocol.
+        let mut founder = member(&ids[0]);
+        founder.role = Some("founder".into());
+        put_community_with(&backend, "addc-comm", vec![founder], None)
             .await
             .unwrap();
         // Genuine add → true, appears in both lookup + active reader.
-        // v31.0.0 (CIRISPersist#654) — signed over the GROWN envelope.
-        let admit = crate::federation::cohort::test_support::admit_community_via(
+        let admit = crate::federation::tier_ingest::test_support::widening_admit_spec_by_consensus(
             &backend,
-            &ids[0],
             "addc-comm",
             &member("addc-1"),
         )
@@ -19628,7 +20382,9 @@ mod tests {
         seed(&b, "bk-no", "bk-prim", identity_type::PRIMITIVE).await;
         b.put_community_membership_revocation(
             crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                "bk-no",
+                // v49.0.0 (#908): the member leaves on their own signature —
+                // nobody holds standing in a moderator-less founder_only room.
+                "bk-prim",
                 crate::federation::types::CommunityMembershipRevocation {
                     community_key_id: "bk-no".into(),
                     removed_identity_key_id: "bk-prim".into(),
@@ -20583,6 +21339,34 @@ mod tests {
         .await;
     }
 
+    /// v49.0.0 — the MEMORY leg of the shared `ActionRef` witness: the
+    /// reverse-quorum fold reverses an action named only by an id no
+    /// attestation carries (the roster-row shape).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_action_ref_parity_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_action_ref(
+            &backend,
+            "memory-rqa",
+        )
+        .await;
+    }
+
+    /// v49.0.0 — I181 on memory: a reverse-quorum roster removal.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_roster_removal_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum_roster_removal(
+            &backend,
+            "memory-rqr",
+        )
+        .await;
+    }
+
     /// CIRISPersist#591 — the MEMORY leg of the shared
     /// escalation-on-silence witness. Memory tolerates what sqlite and postgres
     /// reject, so this leg is where a divergence in the steward tier's
@@ -21297,9 +22081,11 @@ mod tests {
         ts::seed_two_member_community(&b, cid, alice, bob).await;
 
         let first = now - chrono::Duration::seconds(5);
-        for at in [first, now] {
+        // v49.0.0 (CIRISPersist#910.1, V154) — the family PK carries the
+        // instant too: an EXACT repeat is the #861 no-op.
+        for at in [first, first] {
             b.put_family_membership_revocation(ts::sign_family_membership_revocation(
-                fam,
+                bob, /* v49.0.0 (#910): the member leaves on their own signature */
                 crate::federation::types::FamilyMembershipRevocation {
                     family_key_id: fam.into(),
                     removed_identity_key_id: bob.into(),
@@ -21320,6 +22106,29 @@ mod tests {
             first.timestamp(),
             "the FIRST recorded family revocation stands — memory used to overwrite it"
         );
+        // A removal at ANOTHER instant is another event, stored beside it.
+        b.put_family_membership_revocation(ts::sign_family_membership_revocation(
+            bob,
+            crate::federation::types::FamilyMembershipRevocation {
+                family_key_id: fam.into(),
+                removed_identity_key_id: bob.into(),
+                removed_at: now,
+                effective_at: now,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("a removal at another instant is admitted");
+        assert_eq!(
+            b.list_family_membership_revocations_for(fam)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "#910.1: a removal at another instant is another row"
+        );
 
         let epoch = || {
             b.state
@@ -21336,7 +22145,7 @@ mod tests {
         // instant is another event (a re-added member can be removed again).
         for at in [first, first] {
             b.put_community_membership_revocation(ts::sign_community_membership_revocation(
-                cid,
+                bob, /* v49.0.0 (#908): the member leaves on their own signature */
                 crate::federation::types::CommunityMembershipRevocation {
                     community_key_id: cid.into(),
                     removed_identity_key_id: bob.into(),
@@ -23255,11 +24064,20 @@ mod tests {
                 crate::federation::types::Family {
                     family_key_id: "e4-fmr-fam".into(),
                     family_name: "E4 FMR Household".into(),
-                    members: vec![crate::federation::types::FamilyMember {
-                        key_id: "e4-fmr-member".into(),
-                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        role: None,
-                    }],
+                    members: vec![
+                        crate::federation::types::FamilyMember {
+                            key_id: "e4-fmr-member".into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: None,
+                        },
+                        // v49.0.0 (#910): the honest authority has standing
+                        // — it founds this `founder_only` family.
+                        crate::federation::types::FamilyMember {
+                            key_id: "e4-fmr-authority".into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+                        },
+                    ],
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
@@ -23343,8 +24161,10 @@ mod tests {
         }
         backend
             .put_community(
+                // v49.0.0 (#908) — the real authority is the room's record
+                // signer, so its honest removal has standing.
                 crate::federation::tier_ingest::test_support::sign_community(
-                    "e4-cmr-comm",
+                    "e4-cmr-authority",
                     crate::federation::types::Community {
                         community_key_id: "e4-cmr-comm".into(),
                         community_name: "E4 CMR Co-op".into(),
@@ -23381,7 +24201,8 @@ mod tests {
                 "e4-cmr-attacker",
                 forged_rev,
             );
-        forged.authority_key_id = "e4-cmr-authority".to_owned();
+        // v49.0.0 (#908): the honest authority is the member leaving.
+        forged.authority_key_id = "e4-cmr-member".to_owned();
         let err = backend
             .put_community_membership_revocation(forged)
             .await
@@ -23419,7 +24240,7 @@ mod tests {
         backend
             .put_community_membership_revocation(
                 crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
-                    "e4-cmr-authority",
+                    "e4-cmr-member",
                     honest_rev,
                 ),
             )

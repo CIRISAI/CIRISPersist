@@ -6954,6 +6954,124 @@ async fn scoped_delegation_reach(
     max_depth: usize,
     policy: DelegationWalkPolicy,
 ) -> Result<ScopedReach, Error> {
+    scoped_delegation_reach_at(
+        directory,
+        issuer,
+        targets,
+        scope_token,
+        max_depth,
+        policy,
+        DelegationWalkLens::default(),
+    )
+    .await
+}
+
+/// v49.0.0 (#908) — a half-open `[start, end)` span during which a key held
+/// authority in a group (`end: None` = still holds it).
+pub(crate) type AuthorityInterval = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §3 "Walk") — how
+/// ONE walk is read: at an instant, and/or within one community. The default
+/// lens (`as_of: None`, `community_id: None`) is the walk exactly as it was
+/// before v49.0.0, byte for byte — every pre-existing caller passes it.
+///
+/// One walk, two readings — never a second walk that could drift (the #593
+/// lesson: three hand-mirrored BFS copies disagreed while the build stayed
+/// green).
+#[derive(Debug, Clone, Copy, Default)]
+struct DelegationWalkLens<'a> {
+    /// `Some(t)`: judge the chain AS OF `t` (CC 4.2 — a delegation is measured
+    /// live at the act's `asserted_at`; CC 2.4.1 `withdraws-isn't-retroactive`).
+    /// An edge counts only if `asserted_at <= t` and it has not expired at `t`
+    /// (`expires_at` absent or `> t`); a retraction — gate (a) or gate (b) —
+    /// counts only if ITS `asserted_at <= t`. A later retraction therefore does
+    /// not reach back over acts made while the edge was live.
+    ///
+    /// `None`: no instant. Every edge that exists counts and every retraction
+    /// that exists kills — and, deliberately, `expires_at` is NOT consulted, so
+    /// the pre-v49 callers behave identically.
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Some(C)`: follow only edges scoped to community `C` or scoped to no
+    /// cohort at all (CC 4.5.4 — a moderator appointment is
+    /// `delegates_to(authority → K, scope ⊇ {moderate}, community_id: C)`). The
+    /// cohort an edge names is read with [`envelope_cohort_target`], the SAME
+    /// reading the write gate and the §11.11 moderator gate use (every alias in
+    /// [`COHORT_TARGET_ENVELOPE_FIELDS`]); a split-brain edge whose aliases
+    /// disagree is not followed (fail-closed). Applied to EVERY edge on the
+    /// chain, not only the root's: a sub-delegation into another room does not
+    /// carry this room's duty.
+    ///
+    /// Absent-as-unscoped is a compatibility reading: no appointment this
+    /// substrate or its fixtures mint carries `community_id` today
+    /// ([`is_named_moderator`] scopes by requiring the ROOT to be in C's
+    /// authority set, never by the edge), so refusing unscoped edges would
+    /// strip every existing moderator of standing.
+    ///
+    /// `None`: no community filter (the pre-v49 walk).
+    community_id: Option<&'a str>,
+    /// v49.0.0 (#908, operator ruling 2026-09-25) — `Some(intervals)`: the
+    /// ROOT's own first-hop edges count only if issued while the root held
+    /// authority (inside one of these half-open `[start, end)` intervals). An
+    /// appointment belongs to the epoch it was issued in: a founder who later
+    /// leaves does not lapse it, and a key that was not a founder when it
+    /// appointed never conferred the duty. Deeper edges are judged by the
+    /// ordinary gates. `None`: no epoch filter (every pre-existing caller).
+    root_authority: Option<&'a [AuthorityInterval]>,
+}
+
+impl DelegationWalkLens<'_> {
+    /// Was a row asserted at or before the lens instant? Always true unset.
+    fn asserted_by(&self, row: &super::Attestation) -> bool {
+        self.as_of.is_none_or(|t| row.asserted_at <= t)
+    }
+
+    /// Was the ROOT's first-hop `edge` issued while the root held authority?
+    /// Always true when no epoch filter is set.
+    fn admits_root_edge(&self, edge: &super::Attestation) -> bool {
+        self.root_authority.is_none_or(|iv| {
+            iv.iter()
+                .any(|(s, e)| edge.asserted_at >= *s && e.is_none_or(|e| edge.asserted_at < e))
+        })
+    }
+
+    /// Is `edge` a live edge under this lens (time and community)?
+    fn admits_edge(&self, edge: &super::Attestation) -> bool {
+        if let Some(t) = self.as_of {
+            if edge.asserted_at > t {
+                return false;
+            }
+            if edge.expires_at.is_some_and(|x| x <= t) {
+                return false;
+            }
+        }
+        if let Some(c) = self.community_id {
+            match envelope_cohort_target(&edge.attestation_envelope) {
+                Ok(None) => {}
+                Ok(Some(named)) if named == c => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// [`scoped_delegation_reach`] read through a [`DelegationWalkLens`] — the ONE
+/// body. See [`scoped_delegation_reach`] for the walk's full contract; the lens
+/// only removes edges and retractions the instant or the community excludes,
+/// and removes them BEFORE any gate or flag observes them (an edge not yet
+/// asserted at `t` did not exist at `t`).
+async fn scoped_delegation_reach_at(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    targets: &std::collections::HashSet<String>,
+    scope_token: &str,
+    max_depth: usize,
+    policy: DelegationWalkPolicy,
+    lens: DelegationWalkLens<'_>,
+) -> Result<ScopedReach, Error> {
     use std::collections::{HashMap, HashSet, VecDeque};
     let mut out = ScopedReach::default();
     let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
@@ -7022,8 +7140,11 @@ async fn scoped_delegation_reach(
         // same thing on every plane.
         let mut retracted: HashSet<String> = HashSet::new();
         for r in &rows {
-            if r.attestation_type == attestation_type::WITHDRAWS
-                || r.attestation_type == attestation_type::RECANTS
+            // v49.0.0 (#908) — under an instant, a retraction asserted after
+            // it had not happened yet (CC 2.4.1). Unset, always true.
+            if (r.attestation_type == attestation_type::WITHDRAWS
+                || r.attestation_type == attestation_type::RECANTS)
+                && lens.asserted_by(r)
             {
                 retracted.insert(r.attested_key_id.clone());
             }
@@ -7031,6 +7152,14 @@ async fn scoped_delegation_reach(
         let is_issuer = node.depth == 0;
         for r in rows {
             if r.attestation_type != attestation_type::DELEGATES_TO {
+                continue;
+            }
+            // v49.0.0 (#908) — the lens: not yet asserted / expired at the
+            // instant, or scoped to another room. Unset lens admits all.
+            if !lens.admits_edge(&r) {
+                continue;
+            }
+            if is_issuer && !lens.admits_root_edge(&r) {
                 continue;
             }
             if is_issuer {
@@ -7084,7 +7213,10 @@ async fn scoped_delegation_reach(
             // per recipient so the fan-out is bounded by distinct recipients
             // rather than by edges.
             if !incoming_retracted.contains_key(&r.attested_key_id) {
-                let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                let mut incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                // v49.0.0 (#908) — only retractions asserted by the instant.
+                // Unset lens: nothing is dropped.
+                incoming.retain(|row| lens.asserted_by(row));
                 incoming_retracted.insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
             }
             if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
@@ -12400,6 +12532,114 @@ pub async fn moderators_of(
     let mut out: Vec<String> = out.into_iter().collect();
     out.sort();
     Ok(out)
+}
+
+/// v49.0.0 (#908, operator ruling 2026-09-25) — [`moderation_reach_of_at`]
+/// with the root's authority INTERVALS: only first-hop appointments the root
+/// issued while it held authority count (an appointment belongs to its epoch;
+/// the root need not still hold authority at `as_of`).
+pub(crate) async fn moderation_reach_of_at_within(
+    directory: &dyn super::FederationDirectory,
+    root: &str,
+    community_id: &str,
+    as_of: chrono::DateTime<chrono::Utc>,
+    root_authority: &[(
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )],
+) -> Result<Vec<String>, Error> {
+    Ok(scoped_delegation_reach_at(
+        directory,
+        root,
+        &std::collections::HashSet::new(),
+        DELEGATION_SCOPE_MODERATE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+        DelegationWalkLens {
+            as_of: Some(as_of),
+            community_id: Some(community_id),
+            root_authority: Some(root_authority),
+        },
+    )
+    .await?
+    .reached
+    .into_iter()
+    .collect())
+}
+
+/// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §2 "Named
+/// moderators keep standing, judged at the change's instant") — every key
+/// `root` reaches under the `moderate`-duty walk **as of `as_of`, within
+/// community `community_id`**: the SAME body as [`moderation_reach_of`]
+/// ([`scoped_delegation_reach_at`]), read through a [`DelegationWalkLens`].
+///
+/// * **At an instant (CC 4.2, CC 2.4.1).** An edge counts only if it was
+///   asserted at or before `as_of` and had not expired at `as_of`; a
+///   retraction — by the granter naming the recipient, or an admitted
+///   `withdraws`/`recants` naming the edge — counts only if it was asserted at
+///   or before `as_of`. So a change a moderator made while appointed keeps its
+///   standing after the appointment is withdrawn, and a change dated before
+///   the appointment never had any.
+/// * **Within one community (CC 4.5.4).** Only edges whose envelope names
+///   `community_id` — read by [`envelope_cohort_target`], every alias the
+///   write gate reads — or names NO cohort at all are followed. Absent is
+///   accepted as unscoped for compatibility: no appointment minted by this
+///   substrate or its fixtures carries `community_id` today, and the
+///   pre-existing moderator readers scope by the ROOT's membership in the
+///   authority set rather than by the edge. An edge naming another room is
+///   not followed; an edge whose aliases disagree is not followed.
+///
+/// The caller supplies the root (a steward-bound founder of the room, from its
+/// own fold) and the instant (the change's `effective_at`).
+// The roster fold (a sibling v49.0.0 slice) is its production caller; until
+// it lands the only caller is `moderation_walk_asof_invariants`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn moderation_reach_of_at(
+    directory: &dyn super::FederationDirectory,
+    root: &str,
+    community_id: &str,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Error> {
+    Ok(scoped_delegation_reach_at(
+        directory,
+        root,
+        &std::collections::HashSet::new(),
+        DELEGATION_SCOPE_MODERATE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+        DelegationWalkLens {
+            as_of: Some(as_of),
+            community_id: Some(community_id),
+            root_authority: None,
+        },
+    )
+    .await?
+    .reached
+    .into_iter()
+    .collect())
+}
+
+/// v49.0.0 (CIRISPersist#908) — every key `root` reaches under the
+/// `moderate`-duty walk: the SAME walk [`appointed_moderators_of`] runs,
+/// exposed to the authorized roster fold, which supplies its own static roots
+/// (it must never ask the fold for them). Its one caller is the
+/// backend-gated I175 witness, so it is gated the same way (the server-only
+/// test axis builds under `-D warnings`).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn moderation_reach_of(
+    directory: &dyn super::FederationDirectory,
+    root: &str,
+) -> Result<Vec<String>, Error> {
+    Ok(enumerate_scoped_delegation_reach(
+        directory,
+        root,
+        DELEGATION_SCOPE_MODERATE,
+        MAX_MODERATION_DELEGATION_DEPTH,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await?
+    .into_iter()
+    .collect())
 }
 
 /// CIRISPersist#591 — the **APPOINTED** moderator set of community

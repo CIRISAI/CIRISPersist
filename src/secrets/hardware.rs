@@ -108,6 +108,27 @@ pub(crate) fn derive_hardware_content_master_key(
     )
 }
 
+/// v49.0.0 (CIRISPersist#911) — the **MLS-state-at-rest** key, derived from
+/// the SAME hardware-sealed seed under a third context,
+/// [`crate::encrypted_kv::MLS_STATE_CONTEXT`]. It keys the durable
+/// [`crate::encrypted_kv::XChaChaKvStore`] that holds openmls's
+/// `StorageProvider` cold state, so a restarted device keeps its group
+/// state (CIRISServer#630). A host that sealed its own seed for this would
+/// be the second root §4.3 forbids: two things to seal, two to rotate, two
+/// ways to lose the state.
+///
+/// `create_seed_if_absent` follows §11.7: only the first open of a store
+/// that holds nothing yet may seal a seed.
+#[cfg(feature = "encrypted-kv")]
+pub(crate) fn derive_hardware_mls_state_key(
+    create_seed_if_absent: bool,
+) -> Result<(Vec<u8>, String), SecretsError> {
+    derive_hardware_master_for_context(
+        crate::encrypted_kv::MLS_STATE_CONTEXT,
+        create_seed_if_absent,
+    )
+}
+
 /// The shared body: seal-if-absent, then HKDF under `context`.
 /// `create_seed_if_absent` — v43.0.0 (`BLOB_ENCRYPTION_AT_REST.md` §11.7).
 /// The FIRST derivation on a host may seal a fresh seed. A derivation that
@@ -202,6 +223,25 @@ mod context_domain_separation_tests {
     /// Both are documented "stable wire constants" — changing one orphans
     /// everything encrypted under it — so this also pins that a careless
     /// rename cannot silently merge them.
+    /// v49.0.0 (CIRISPersist#911) — THREE contexts now share the seed:
+    /// secrets, content, and MLS state. Pairwise distinct, or two stores
+    /// share one key.
+    #[test]
+    fn every_hardware_context_is_domain_separated() {
+        let all = [
+            super::SECRETS_MASTER_CONTEXT,
+            crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT,
+            #[cfg(feature = "encrypted-kv")]
+            crate::encrypted_kv::MLS_STATE_CONTEXT,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.is_empty());
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two hardware contexts collide: {a}");
+            }
+        }
+    }
+
     #[test]
     fn the_content_context_is_domain_separated() {
         let secrets = super::SECRETS_MASTER_CONTEXT;
@@ -249,7 +289,12 @@ mod seed_policy_tests {
                 .unwrap()
                 .get(key_id)
                 .cloned()
-                .ok_or(ciris_keyring::KeyringError::NoPlatformSupport)
+                // CIRISVerify v16.2.1 (#288/#289): an absent key MUST be
+                // `KeyNotFound` on every `SecureBlobStorage` — the double
+                // honours the contract it stands in for.
+                .ok_or_else(|| ciris_keyring::KeyringError::KeyNotFound {
+                    alias: key_id.to_owned(),
+                })
         }
         fn exists(&self, key_id: &str) -> bool {
             self.blobs.lock().unwrap().contains_key(key_id)
@@ -308,5 +353,29 @@ mod seed_policy_tests {
             first, other,
             "a different context must derive a different master"
         );
+    }
+
+    /// v49.0.0 (CIRISPersist#911) — the MLS-state key is a third distinct
+    /// key from the one seed, and it re-derives stably (a restarted device
+    /// reopens its store).
+    #[cfg(feature = "encrypted-kv")]
+    #[test]
+    fn the_mls_state_key_is_a_third_stable_key_from_the_one_seed() {
+        let storage = FakeHardwareStorage::empty();
+        let (mls, descriptor) =
+            super::derive_with_storage(&storage, crate::encrypted_kv::MLS_STATE_CONTEXT, true)
+                .expect("first MLS-state derivation may seal the seed");
+        assert!(descriptor.contains(crate::encrypted_kv::MLS_STATE_CONTEXT));
+        let (again, _) =
+            super::derive_with_storage(&storage, crate::encrypted_kv::MLS_STATE_CONTEXT, false)
+                .expect("re-derivation over the present seed");
+        assert_eq!(mls, again, "a restart must re-derive the same key");
+        for other in [
+            super::SECRETS_MASTER_CONTEXT,
+            crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT,
+        ] {
+            let (k, _) = super::derive_with_storage(&storage, other, false).unwrap();
+            assert_ne!(mls, k, "the MLS-state key equals the {other} key");
+        }
     }
 }

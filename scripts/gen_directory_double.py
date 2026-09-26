@@ -69,6 +69,11 @@ DELEGATED_DEFAULTS = (
     # v45.0.0 (#871) — defaulted `Unsupported`, overridden by every backend.
     "list_holders_sized",
     "list_derived_hex",
+    # v49.0.0 (#908) — defaulted `Unsupported`, overridden by every backend;
+    # the authorized roster fold reads it through the double.
+    "community_roster_signers",
+    # v49.0.0 (#910) — the family twin, same shape and same reason.
+    "family_roster_signers",
 )
 
 ROOT = Path(__file__).resolve().parent.parent

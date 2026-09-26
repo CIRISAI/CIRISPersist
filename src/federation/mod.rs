@@ -55,6 +55,7 @@ pub mod bootstrap_admission;
 pub mod canonical_at_rest;
 pub mod capacity;
 pub mod cohort;
+pub mod consensus;
 // CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
 // content under the envelope: the per-chunk seal, the sealed manifest, the
 // decrypting range read and the live-stream chunk listing.
@@ -113,6 +114,20 @@ pub mod bytes_plane_tombstone_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+/// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
+#[cfg(test)]
+pub mod family_roster_invariants;
+/// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
+#[cfg(test)]
+pub mod group_amendment_invariants;
+/// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
+#[cfg(test)]
+pub mod listing_invariants;
+/// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
+#[cfg(test)]
+pub mod moderation_walk_asof_invariants;
+#[cfg(test)]
+pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
 #[cfg(test)]
 pub mod room_roster_invariants;
@@ -124,6 +139,9 @@ pub mod self_collective_invariants;
 /// v47.3.0 (CIRISPersist#901) — I154–I158: a root is as attested as its holders.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod trust_root_hardware_invariants;
+// v49.0.0 (CIRISPersist#915) — I185, Android generation custody.
+#[cfg(test)]
+mod android_custody_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -139,6 +157,7 @@ pub mod emit;
 pub mod family_rules;
 pub mod genesis;
 pub mod goal;
+pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
@@ -173,6 +192,9 @@ pub mod invariant;
 /// v42.0.0 (CIRISPersist#814 part 2) — the `licensure:{authority_id}` status
 /// fold: set-valued, with `revoked` absorbing.
 pub mod licensure;
+/// v49.0.0 (CIRISPersist#912) — the membership listing plane: CC 2's `listed`
+/// opt-in, its door and its one public roster view.
+pub mod listing;
 pub mod location;
 /// v31.0.0 (CIRISPersist#650) — the in-place v31 migration: re-stamp the FINAL
 /// folded CEG state from the owner root, then purge what is provably dead.
@@ -512,11 +534,12 @@ pub use stream_sth::{
 };
 pub(crate) use tier_ingest::{attestation_reput_verdict, community_reput_verdict};
 pub use tier_ingest::{
-    verify_community_admission, verify_community_membership_revocation_admission,
+    verify_community_admission, verify_community_membership_listing_admission,
+    verify_community_membership_revocation_admission,
     verify_community_membership_widening_admission, verify_envelope_hybrid_signature,
     verify_family_admission, verify_family_membership_revocation_admission,
-    verify_federation_tier_ingest, verify_location_proof_admission, verify_revocation_admission,
-    verify_row_hybrid_signature,
+    verify_family_membership_widening_admission, verify_federation_tier_ingest,
+    verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
@@ -526,20 +549,28 @@ pub use topology::{
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
-    CommunityMembershipWidening, EmitAttestationInput, EncryptionPubkeys, Family, FamilyMember,
-    FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation,
-    KeyRecord, KnownHashEviction, KnownWireHash, LocationProof, PeerMetadataRow, PeerPolicyBlob,
-    Revocation, ServedAttestation, ServedCommunity, ServedCommunityMembershipRevocation,
-    ServedCommunityMembershipWidening, ServedFamily, ServedFamilyMembershipRevocation,
-    ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation, ServedKeyRecord,
-    ServedLocationProof, ServedOrgMembership, ServedOrganization, ServedPartnerRecord,
-    ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination, SignedAttestation,
-    SignedCommunity, SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening,
-    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
-    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
-    SignedTouchClaim, SignedTrustGrant, SignedTrustRevocation, SignerForm, TrustClass, TrustFilter,
-    TrustGrant, TrustRelationship, TrustRow, TrustType,
+    CommunityMembershipWidening, CommunityRosterSigners, EmitAttestationInput, EncryptionPubkeys,
+    Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence,
+    IdentityOccurrenceRevocation, KeyRecord, KnownHashEviction, KnownWireHash, LocationProof,
+    PeerMetadataRow, PeerPolicyBlob, Revocation, ServedAttestation, ServedCommunity,
+    ServedCommunityMembershipRevocation, ServedCommunityMembershipWidening, ServedFamily,
+    ServedFamilyMembershipRevocation, ServedIdentityOccurrence, ServedIdentityOccurrenceRevocation,
+    ServedKeyRecord, ServedLocationProof, ServedOrgMembership, ServedOrganization,
+    ServedPartnerRecord, ServedRevocation, ServedSignedPartnerRecord, ServedTransportDestination,
+    SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
+    SignedCommunityMembershipWidening, SignedFamily, SignedFamilyMembershipRevocation,
+    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    SignedLocationProof, SignedRevocation, SignedTouchClaim, SignedTrustGrant,
+    SignedTrustRevocation, SignerForm, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
+    TrustRow, TrustType,
 };
+pub use types::{
+    CommunityMembershipListing, ServedCommunityMembershipListing, SignedCommunityMembershipListing,
+};
+pub use types::{
+    FamilyMembershipWidening, ServedFamilyMembershipWidening, SignedFamilyMembershipWidening,
+};
+pub use types::{GroupSupersedeProof, RosterCosignature, RosterEventSigner};
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
 /// revocations** fold, shared by every "currently-active membership"
@@ -571,8 +602,11 @@ where
         .collect()
 }
 
-/// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.4) — **the one
-/// roster fold.** For every key id that appears on the record, in a widening
+/// v48.0.0 (CIRISPersist#860, FSD `ROOM_ROSTER_PLANES.md` §3.4) — **the
+/// unsigned roster fold.** v49.0.0 (#908): it does not judge who signed an
+/// event; every directory read uses [`authorized_community_roster_at`], which
+/// replays in this same order and applies only events whose signer has
+/// standing. For every key id that appears on the record, in a widening
 /// or in a revocation, the latest event with `effective_at <= as_of` decides:
 /// a record membership or a widening is an add, a revocation is a remove.
 /// A record membership counts FROM THE RECORD, not from its signer-chosen
@@ -634,6 +668,955 @@ pub fn active_roster_at(
     out
 }
 
+/// v49.0.0 (CIRISPersist#908) — the RETRYABLE [`Error::RosterAuthorityUnauthorized`]
+/// rule: the protocol is not met and at least one signer has no event in the
+/// room yet. Rows arrive out of order; the event that makes the signer a member
+/// may not be here yet, and persist holds no deferral queue — the caller
+/// re-submits.
+pub const ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED: &str = "roster_authority_not_established";
+/// v49.0.0 (CIRISPersist#908) — substantive: every signer is known to the room
+/// and the room's `consensus_protocol` is not met by them.
+pub const ROSTER_CONSENSUS_INSUFFICIENT: &str = "roster_consensus_insufficient";
+/// v49.0.0 (CIRISPersist#908) — substantive: the room's protocol cannot be
+/// evaluated from signed state (an undeclared `weighted:` rubric or `custom:`
+/// id, a malformed declaration, a non-canonical string).
+pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
+/// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
+/// with other active members and no active founder.
+pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
+
+/// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
+/// state a standing question is asked against: each key that has appeared, and
+/// whether its latest applied event left it active.
+pub type RosterState = std::collections::BTreeMap<String, (bool, types::CommunityMember)>;
+
+/// v49.0.0 (CIRISPersist#908) — the group-level inputs every standing question
+/// reads: the protocol string, the `cohort_subkind`, and the record's
+/// `policy_blob` (rubric and custom declarations). Borrowed from the record.
+#[derive(Debug, Clone, Copy)]
+pub struct RosterRules<'a> {
+    /// `consensus_protocol`.
+    pub protocol: &'a str,
+    /// `cohort_subkind` (`infrastructure` counts founders only).
+    pub subkind: Option<&'a str>,
+    /// The record's `policy_blob`.
+    pub policy_blob: Option<&'a serde_json::Value>,
+}
+
+impl<'a> RosterRules<'a> {
+    /// The rules a stored community declares.
+    pub fn of_community(c: &'a Community) -> Self {
+        Self {
+            protocol: &c.consensus_protocol,
+            subkind: c
+                .policy_blob
+                .as_ref()
+                .and_then(|b| b.get("cohort_subkind"))
+                .and_then(|v| v.as_str()),
+            policy_blob: c.policy_blob.as_ref(),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#910) — the rules a stored family declares: its
+    /// `consensus_protocol`, and nothing else (a family has no
+    /// `cohort_subkind` and no `policy_blob`, so a `weighted:` / `custom:`
+    /// family protocol is `roster_consensus_unevaluable`).
+    pub fn of_family(f: &'a Family) -> Self {
+        Self {
+            protocol: &f.consensus_protocol,
+            subkind: None,
+            policy_blob: None,
+        }
+    }
+}
+
+/// v49.0.0 (CIRISPersist#910) — a family roster entry in the fold's member
+/// shape. The two groups' members carry the same three fields; the fold is
+/// written once over [`types::CommunityMember`].
+#[must_use]
+pub fn family_member_as_roster_member(m: &types::FamilyMember) -> types::CommunityMember {
+    types::CommunityMember {
+        key_id: m.key_id.clone(),
+        joined_at: m.joined_at,
+        role: m.role.clone(),
+    }
+}
+
+/// The inverse of [`family_member_as_roster_member`].
+#[must_use]
+pub fn roster_member_as_family_member(m: types::CommunityMember) -> types::FamilyMember {
+    types::FamilyMember {
+        key_id: m.key_id,
+        joined_at: m.joined_at,
+        role: m.role,
+    }
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §3) — one dated roster event, prepared for
+/// the pure fold: who it adds or removes, every key whose signature over it
+/// verified (empty for a legacy row admitted before signers were stored), the
+/// founders whose `moderate` delegation reached a signer AT THIS EVENT'S
+/// INSTANT, and whether a `reverse_quorum` objection fold has reversed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterEvent {
+    /// The event's effective instant.
+    pub effective_at: chrono::DateTime<chrono::Utc>,
+    /// A widening (`true`) or a revocation (`false`).
+    pub is_add: bool,
+    /// The member added or removed.
+    pub member: types::CommunityMember,
+    /// Primary signer ∪ co-signers; empty ⇒ a legacy row, which counts.
+    pub signers: std::collections::BTreeSet<String>,
+    /// Founders from whom a live (at `effective_at`) `moderate` chain reaches a
+    /// signer. The fold honours one only while it is an active founder.
+    pub moderator_roots: std::collections::BTreeSet<String>,
+    /// A `reverse_quorum` removal the objection fold has reversed.
+    pub reversed: bool,
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §2) — does `e` have standing against `state`
+/// (the authorized roster immediately before it)? `Ok(())` or the refusing
+/// rule token with a human-readable detail.
+///
+/// In order: a legacy row counts; a member removing themselves needs no one
+/// (operator ruling — leaving is a consent floor); a named moderator judged at
+/// the event's instant; otherwise the room's `consensus_protocol` through the
+/// ONE evaluator ([`consensus::evaluate`]). Every admitted change must also
+/// leave a founder whenever it leaves members (the last-founder rule).
+pub fn roster_event_standing(
+    rules: RosterRules<'_>,
+    state: &RosterState,
+    e: &RosterEvent,
+) -> Result<(), (&'static str, String)> {
+    let is_active_founder = |k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER));
+    // Standing without the protocol: a legacy row (admitted before signers
+    // were stored); a member leaving on their own signature; a named
+    // moderator whose appointment was live at this event's instant and was
+    // issued while its root held authority (operator ruling 2026-09-25: no
+    // ending is retroactive, and the root need not still be a member).
+    let standing_without_protocol = e.signers.is_empty()
+        || (!e.is_add && e.signers.contains(&e.member.key_id))
+        || !e.moderator_roots.is_empty();
+    let admitted = if standing_without_protocol {
+        Ok(())
+    } else {
+        let seats: Vec<consensus::Seat> = state
+            .values()
+            .filter(|(active, _)| *active)
+            .map(|(_, m)| consensus::Seat {
+                key_id: m.key_id.clone(),
+                role: m.role.clone(),
+            })
+            .collect();
+        match consensus::evaluate(&consensus::Ballot {
+            protocol: rules.protocol,
+            subkind: rules.subkind,
+            policy_blob: rules.policy_blob,
+            roster: &seats,
+            signers: &e.signers,
+            direction: if e.is_add {
+                consensus::Direction::Add
+            } else {
+                consensus::Direction::Remove
+            },
+        }) {
+            consensus::Verdict::Admit => Ok(()),
+            consensus::Verdict::Unevaluable { reason } => {
+                Err((ROSTER_CONSENSUS_UNEVALUABLE, reason))
+            }
+            consensus::Verdict::Insufficient { detail } => {
+                if e.signers.iter().any(|s| !state.contains_key(s)) {
+                    Err((ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED, detail))
+                } else {
+                    Err((ROSTER_CONSENSUS_INSUFFICIENT, detail))
+                }
+            }
+        }
+    };
+    admitted?;
+    // The last-founder rule: a removal — or a role change that demotes — that
+    // leaves members but no founder.
+    let loses_founder = is_active_founder(&e.member.key_id)
+        && (!e.is_add || e.member.role.as_deref() != Some(admission::MEMBER_ROLE_FOUNDER));
+    if loses_founder {
+        let founders_after = state
+            .iter()
+            .filter(|(k, (active, m))| {
+                *active
+                    && k.as_str() != e.member.key_id
+                    && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
+            })
+            .count();
+        let others_after = state
+            .iter()
+            .filter(|(k, (active, _))| *active && k.as_str() != e.member.key_id)
+            .count();
+        if founders_after == 0 && others_after > 0 {
+            return Err((
+                ROSTER_LAST_FOUNDER,
+                format!(
+                    "removing or demoting {} would leave {others_after} member(s) and no founder",
+                    e.member.key_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sort_roster_events(events: &mut [RosterEvent]) {
+    events.sort_by(|a, b| {
+        a.effective_at
+            .cmp(&b.effective_at)
+            .then_with(|| b.is_add.cmp(&a.is_add))
+            .then_with(|| a.member.key_id.cmp(&b.member.key_id))
+    });
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §3) — **the authorized roster fold.** The v48
+/// replay order (record members first — counted from the record, never their
+/// `joined_at` —, then dated events by `effective_at`, a removal last at a tie,
+/// then member key), applying an event only if [`roster_event_standing`] admits
+/// it against the state built so far and it has not been reversed. An unapplied
+/// event is inert. Every node replays the same stored history the same way, so
+/// nodes that received rows in different orders agree.
+#[must_use]
+pub fn authorized_roster_state_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> RosterState {
+    fold_roster(record_members, rules, events, as_of).0
+}
+
+/// v49.0.0 (CIRISPersist#912, v49 ruling 2026-09-25, CC 2 opt-in) — when each ACTIVE
+/// member's current membership span began: `None` for a record member never
+/// removed (the fold counts record members from the record, never from their
+/// `joined_at`, so their span is open to the beginning of time), else the
+/// `effective_at` of the applied widening that last (re)admitted them. A
+/// widening of a member who is already active (a role change) does NOT restart
+/// the span — they never left. A removed member has no entry. The same replay
+/// as [`authorized_roster_state_at`] (one loop, so the two cannot disagree).
+pub type RosterSpans = std::collections::BTreeMap<String, Option<chrono::DateTime<chrono::Utc>>>;
+
+/// See [`RosterSpans`].
+#[must_use]
+pub fn authorized_roster_spans_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> RosterSpans {
+    fold_roster(record_members, rules, events, as_of).1
+}
+
+/// The ONE authorized replay: the roster state and each active member's span
+/// start, built in the same pass.
+fn fold_roster(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> (RosterState, RosterSpans) {
+    let mut ordered: Vec<RosterEvent> = events
+        .iter()
+        .filter(|e| e.effective_at <= as_of)
+        .cloned()
+        .collect();
+    sort_roster_events(&mut ordered);
+    let mut state: RosterState = record_members
+        .iter()
+        .map(|m| (m.key_id.clone(), (true, m.clone())))
+        .collect();
+    let mut spans: RosterSpans = record_members
+        .iter()
+        .map(|m| (m.key_id.clone(), None))
+        .collect();
+    for e in ordered {
+        if e.reversed {
+            continue;
+        }
+        if roster_event_standing(rules, &state, &e).is_ok() {
+            let was_active = matches!(state.get(&e.member.key_id), Some((true, _)));
+            if !e.is_add {
+                spans.remove(&e.member.key_id);
+            } else if !was_active {
+                spans.insert(e.member.key_id.clone(), Some(e.effective_at));
+            }
+            state.insert(e.member.key_id.clone(), (e.is_add, e.member));
+        }
+    }
+    (state, spans)
+}
+
+/// v49.0.0 (CIRISPersist#908) — the active members of
+/// [`authorized_roster_state_at`], record order first, then widened members by
+/// key id (the same projection as [`active_roster_at`]).
+#[must_use]
+pub fn authorized_roster_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Vec<types::CommunityMember> {
+    let state = authorized_roster_state_at(record_members, rules, events, as_of);
+    let mut out = Vec::new();
+    for m in record_members {
+        if let Some((true, member)) = state.get(&m.key_id) {
+            out.push(member.clone());
+        }
+    }
+    for (key_id, (active, member)) in &state {
+        if *active && !record_members.iter().any(|m| &m.key_id == key_id) {
+            out.push(member.clone());
+        }
+    }
+    out
+}
+
+/// Every key that is ever a founder of the room: the record's founders and any
+/// member widened in as one. The candidate roots of a moderation chain; the
+/// fold honours a root only while it is an active founder.
+fn founder_candidates(
+    community: &Community,
+    widenings: &[CommunityMembershipWidening],
+) -> std::collections::BTreeSet<String> {
+    let founder = Some(admission::MEMBER_ROLE_FOUNDER);
+    community
+        .members
+        .iter()
+        .filter(|m| m.role.as_deref() == founder)
+        .map(|m| m.key_id.clone())
+        .chain(
+            widenings
+                .iter()
+                .filter(|w| w.role.as_deref() == founder)
+                .map(|w| w.member_key_id.clone()),
+        )
+        .collect()
+}
+
+/// Which of `roots` reach any of `signers` by a `moderate` chain scoped to the
+/// room and live at `at` (CC 4.5.4; judged at the change's instant, CC 4.2).
+/// The instants each candidate root held authority (was an active founder),
+/// as half-open `[start, end)` intervals.
+type RootAuthorityIntervals = std::collections::BTreeMap<
+    String,
+    Vec<(
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+>;
+
+/// v49.0.0 (#908, operator ruling 2026-09-25) — when did each of `roots` hold
+/// authority in the group? Replays `events` (whose moderator standing is NOT
+/// yet known, so none is used — an appointment's authority cannot depend on
+/// the appointments it confers) and records each root's active-founder
+/// intervals. A founder on the record holds authority from the beginning.
+fn root_authority_intervals(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    roots: &std::collections::BTreeSet<String>,
+) -> RootAuthorityIntervals {
+    let founder = Some(admission::MEMBER_ROLE_FOUNDER);
+    let is_f = |state: &RosterState, k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == founder);
+    let mut ordered: Vec<RosterEvent> = events
+        .iter()
+        .map(|e| RosterEvent {
+            moderator_roots: Default::default(),
+            ..e.clone()
+        })
+        .collect();
+    sort_roster_events(&mut ordered);
+    let mut state: RosterState = record_members
+        .iter()
+        .map(|m| (m.key_id.clone(), (true, m.clone())))
+        .collect();
+    let mut out: RootAuthorityIntervals = RootAuthorityIntervals::new();
+    let mut open: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> = roots
+        .iter()
+        .filter(|r| is_f(&state, r))
+        .map(|r| (r.clone(), chrono::DateTime::<chrono::Utc>::MIN_UTC))
+        .collect();
+    for e in ordered {
+        if e.reversed || roster_event_standing(rules, &state, &e).is_err() {
+            continue;
+        }
+        state.insert(e.member.key_id.clone(), (e.is_add, e.member.clone()));
+        let k = &e.member.key_id;
+        if !roots.contains(k) {
+            continue;
+        }
+        match (open.contains_key(k), is_f(&state, k)) {
+            (false, true) => {
+                open.insert(k.clone(), e.effective_at);
+            }
+            (true, false) => {
+                let start = open.remove(k).expect("open");
+                out.entry(k.clone())
+                    .or_default()
+                    .push((start, Some(e.effective_at)));
+            }
+            _ => {}
+        }
+    }
+    for (k, start) in open {
+        out.entry(k).or_default().push((start, None));
+    }
+    out
+}
+
+async fn moderator_roots_at<F>(
+    directory: &F,
+    community_key_id: &str,
+    roots: &std::collections::BTreeSet<String>,
+    intervals: &RootAuthorityIntervals,
+    signers: &std::collections::BTreeSet<String>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let dir = directory.as_dyn_directory();
+    let mut out = std::collections::BTreeSet::new();
+    for root in roots {
+        if signers.contains(root) || !Box::pin(admission::is_steward_bound(dir, root)).await? {
+            continue;
+        }
+        let Some(iv) = intervals.get(root).filter(|iv| !iv.is_empty()) else {
+            continue;
+        };
+        let reach = Box::pin(admission::moderation_reach_of_at_within(
+            dir,
+            root,
+            community_key_id,
+            at,
+            iv,
+        ))
+        .await?;
+        if reach.iter().any(|k| signers.contains(k)) {
+            out.insert(root.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn signer_set(e: &types::RosterEventSigner) -> std::collections::BTreeSet<String> {
+    e.authority_key_id
+        .iter()
+        .cloned()
+        .chain(e.cosigner_key_ids.iter().cloned())
+        .collect()
+}
+
+/// v49.0.0 (CIRISPersist#910) — one stored roster row of either group, before
+/// its signers are attached: what [`prepare_roster_events`] turns into a
+/// [`RosterEvent`].
+struct StoredRosterEvent {
+    is_add: bool,
+    member: types::CommunityMember,
+    effective_at: chrono::DateTime<chrono::Utc>,
+    row_hash: String,
+}
+
+/// v49.0.0 (CIRISPersist#908; group-generic since #910) — prepare a group's
+/// stored roster rows for the pure fold: signer sets, moderator roots at each
+/// event's instant (`moderation_roots` — `None` for a group with no
+/// moderation plane, a family), and (under `reverse_quorum`) whether the
+/// objection fold reversed a removal. The action a roster removal's objections
+/// name is the revocation's `persist_row_hash`; its actor is the primary
+/// signer; its instant is `effective_at`.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_roster_events<F>(
+    directory: &F,
+    cohort: cohort::Cohort,
+    group_key_id: &str,
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    stored: Vec<StoredRosterEvent>,
+    signers: &CommunityRosterSigners,
+    moderation_roots: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Vec<RosterEvent>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = group_key_id;
+    let reverse = rules
+        .protocol
+        .starts_with(types::consensus_protocol::REVERSE_QUORUM_PREFIX);
+    fn find<'s>(
+        list: &'s [types::RosterEventSigner],
+        member: &str,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Option<&'s types::RosterEventSigner> {
+        list.iter()
+            .find(|s| s.member_key_id == member && s.effective_at == at)
+    }
+    let mut events = Vec::with_capacity(stored.len());
+    let mut reverse_candidates: Vec<(usize, String, String)> = Vec::new();
+    for ev in stored {
+        let list = if ev.is_add {
+            &signers.widening_signers
+        } else {
+            &signers.revocation_signers
+        };
+        let row_signer = find(list, &ev.member.key_id, ev.effective_at);
+        let s = row_signer.map(signer_set).unwrap_or_default();
+        // Moderator standing is filled in a second pass (below): it needs
+        // each root's authority intervals, which come from these events.
+        let moderator_roots = std::collections::BTreeSet::new();
+        if !ev.is_add && reverse {
+            if let Some(actor) = row_signer.and_then(|x| x.authority_key_id.clone()) {
+                reverse_candidates.push((events.len(), actor, ev.row_hash.clone()));
+            }
+        }
+        events.push(RosterEvent {
+            effective_at: ev.effective_at,
+            is_add: ev.is_add,
+            member: ev.member,
+            signers: s,
+            moderator_roots,
+            reversed: false,
+        });
+    }
+    if let Some(roots) = moderation_roots {
+        let intervals = root_authority_intervals(record_members, rules, &events, roots);
+        for ev in events.iter_mut() {
+            if ev.signers.is_empty() {
+                continue;
+            }
+            ev.moderator_roots = Box::pin(moderator_roots_at(
+                directory,
+                id,
+                roots,
+                &intervals,
+                &ev.signers,
+                ev.effective_at,
+            ))
+            .await?;
+        }
+    }
+    if reverse_candidates.is_empty() {
+        return Ok(events);
+    }
+    // Reverse quorum: the objection fold counts against the roster with NO
+    // reversals applied — the members who could object — supplied here,
+    // because the fold's own roster read would re-enter this function.
+    let now = chrono::Utc::now();
+    let state0 = authorized_roster_state_at(record_members, rules, &events, now);
+    let roster0: Vec<String> = state0
+        .iter()
+        .filter(|(_, (active, _))| *active)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let policy = reverse_quorum::ReverseQuorumPolicy::parse(rules.protocol);
+    // Only a group with a moderation plane has appointed duty-holders; a
+    // family's steward tier folds to `NoDutyHolders` inside the objection
+    // fold (it never appointed anybody) and escalates on schedule.
+    let duty_holders = if moderation_roots.is_some() && policy.and_then(|p| p.steward).is_some() {
+        let dir = directory.as_dyn_directory();
+        let mut out = std::collections::BTreeSet::new();
+        for (k, (active, m)) in &state0 {
+            if *active
+                && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
+                && Box::pin(admission::is_steward_bound(dir, k)).await?
+            {
+                out.insert(k.clone());
+                out.extend(Box::pin(admission::moderation_reach_of_at(dir, k, id, now)).await?);
+            }
+        }
+        Some(out.into_iter().collect::<Vec<_>>())
+    } else {
+        None
+    };
+    for (idx, actor, row_hash) in reverse_candidates {
+        let fold = Box::pin(reverse_quorum::resolve_reverse_quorum_with(
+            directory.as_dyn_directory(),
+            cohort,
+            id,
+            roster0.clone(),
+            policy,
+            duty_holders.clone(),
+            reverse_quorum::ActionRef {
+                actor_key_id: &actor,
+                action_id: &row_hash,
+                asserted_at: events[idx].effective_at,
+            },
+            now,
+        ))
+        .await?;
+        events[idx].reversed = fold.standing == reverse_quorum::ReverseQuorumStanding::Reversed;
+    }
+    Ok(events)
+}
+
+/// v49.0.0 (CIRISPersist#908) — every stored roster event of `community`,
+/// prepared for the pure fold by [`prepare_roster_events`] (the moderation
+/// plane is the room's).
+pub async fn community_roster_events<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<Vec<RosterEvent>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = &community.community_key_id;
+    let signers = directory.community_roster_signers(id).await?;
+    let widenings = directory
+        .list_community_membership_widenings_for(id)
+        .await?;
+    let revocations = directory
+        .list_community_membership_revocations_for(id)
+        .await?;
+    let roots = founder_candidates(community, &widenings);
+    let stored = widenings
+        .iter()
+        .map(|w| StoredRosterEvent {
+            is_add: true,
+            member: w.member(),
+            effective_at: w.effective_at,
+            row_hash: w.persist_row_hash.clone(),
+        })
+        .chain(revocations.iter().map(|r| StoredRosterEvent {
+            is_add: false,
+            member: types::CommunityMember {
+                key_id: r.removed_identity_key_id.clone(),
+                joined_at: r.effective_at,
+                role: None,
+            },
+            effective_at: r.effective_at,
+            row_hash: r.persist_row_hash.clone(),
+        }))
+        .collect();
+    Box::pin(prepare_roster_events(
+        directory,
+        cohort::Cohort::Community,
+        id,
+        &community.members,
+        RosterRules::of_community(community),
+        stored,
+        &signers,
+        Some(&roots),
+    ))
+    .await
+}
+
+/// v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.3) — every
+/// stored roster event of `family` (its widening and revocation planes),
+/// prepared for the SAME pure fold rooms use. A family has no moderation
+/// plane, so no event is ever carried by a moderator; a legacy row, a member
+/// leaving, the family's own `consensus_protocol` and the last-founder rule
+/// apply exactly as for rooms.
+pub async fn family_roster_events<F>(
+    directory: &F,
+    family: &Family,
+) -> Result<Vec<RosterEvent>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let id = &family.family_key_id;
+    let signers = directory.family_roster_signers(id).await?;
+    let widenings = directory.list_family_membership_widenings_for(id).await?;
+    let revocations = directory.list_family_membership_revocations_for(id).await?;
+    let stored = widenings
+        .iter()
+        .map(|w| StoredRosterEvent {
+            is_add: true,
+            member: family_member_as_roster_member(&w.member()),
+            effective_at: w.effective_at,
+            row_hash: w.persist_row_hash.clone(),
+        })
+        .chain(revocations.iter().map(|r| StoredRosterEvent {
+            is_add: false,
+            member: types::CommunityMember {
+                key_id: r.removed_identity_key_id.clone(),
+                joined_at: r.effective_at,
+                role: None,
+            },
+            effective_at: r.effective_at,
+            row_hash: r.persist_row_hash.clone(),
+        }))
+        .collect();
+    let record: Vec<types::CommunityMember> = family
+        .members
+        .iter()
+        .map(family_member_as_roster_member)
+        .collect();
+    Box::pin(prepare_roster_events(
+        directory,
+        cohort::Cohort::Family,
+        id,
+        &record,
+        RosterRules::of_family(family),
+        stored,
+        &signers,
+        None,
+    ))
+    .await
+}
+
+/// v49.0.0 (CIRISPersist#910) — the authorized roster of a STORED family at
+/// `as_of`: the one fold every family gate reads (the family twin of
+/// [`authorized_community_roster_at`]).
+pub async fn authorized_family_roster_at<F>(
+    directory: &F,
+    family: &Family,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<types::FamilyMember>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let events = Box::pin(family_roster_events(directory, family)).await?;
+    let record: Vec<types::CommunityMember> = family
+        .members
+        .iter()
+        .map(family_member_as_roster_member)
+        .collect();
+    Ok(
+        authorized_roster_at(&record, RosterRules::of_family(family), &events, as_of)
+            .into_iter()
+            .map(roster_member_as_family_member)
+            .collect(),
+    )
+}
+
+/// v49.0.0 (CIRISPersist#912) — the authorized roster of a STORED room at
+/// `as_of` with each member's current span start ([`RosterSpans`]), in roster
+/// order: what a per-membership fact (a listing) is judged against.
+pub async fn authorized_community_roster_spans_at<F>(
+    directory: &F,
+    community: &Community,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    Vec<(
+        types::CommunityMember,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+    Error,
+>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let events = Box::pin(community_roster_events(directory, community)).await?;
+    let rules = RosterRules::of_community(community);
+    let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
+    Ok(
+        authorized_roster_at(&community.members, rules, &events, as_of)
+            .into_iter()
+            .map(|m| {
+                let start = spans.get(&m.key_id).copied().flatten();
+                (m, start)
+            })
+            .collect(),
+    )
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §3) — the authorized roster of a STORED room
+/// at `as_of`: the one fold every directory read uses.
+pub async fn authorized_community_roster_at<F>(
+    directory: &F,
+    community: &Community,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<types::CommunityMember>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // Boxed: the replay nests the moderator walk and the reverse-quorum
+    // fold; a caller's future must not inline all of it (2 MiB worker stacks).
+    let events = Box::pin(community_roster_events(directory, community)).await?;
+    Ok(authorized_roster_at(
+        &community.members,
+        RosterRules::of_community(community),
+        &events,
+        as_of,
+    ))
+}
+
+/// v49.0.0 (CIRISPersist#908; group-generic since #910) — judge one incoming
+/// roster row against the group's authorized state at `effective_at`, built
+/// from `events` WITHOUT the row itself (an exact retry of a stored row — the
+/// #861 no-op — must not be judged against a roster its own admission
+/// changed). `moderation_roots` is `None` for a group with no moderation
+/// plane. The ONE standing function, [`roster_event_standing`], decides.
+#[allow(clippy::too_many_arguments)]
+async fn check_roster_authority_over<F>(
+    directory: &F,
+    group_key_id: &str,
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: Vec<RosterEvent>,
+    moderation_roots: Option<std::collections::BTreeSet<String>>,
+    primary: &str,
+    signers: &std::collections::BTreeSet<String>,
+    incoming: types::CommunityMember,
+    is_revocation: bool,
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let events: Vec<RosterEvent> = events
+        .into_iter()
+        .filter(|e| {
+            !(e.is_add == !is_revocation
+                && e.effective_at == effective_at
+                && e.member.key_id == incoming.key_id)
+        })
+        .collect();
+    let state = authorized_roster_state_at(record_members, rules, &events, effective_at);
+    let moderator_roots = match moderation_roots {
+        Some(mut roots) => {
+            if !is_revocation && incoming.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER) {
+                roots.remove(&incoming.key_id);
+            }
+            Box::pin(moderator_roots_at(
+                directory,
+                group_key_id,
+                &roots,
+                &root_authority_intervals(record_members, rules, &events, &roots),
+                signers,
+                effective_at,
+            ))
+            .await?
+        }
+        None => std::collections::BTreeSet::new(),
+    };
+    let e = RosterEvent {
+        effective_at,
+        is_add: !is_revocation,
+        member: incoming,
+        signers: signers.clone(),
+        moderator_roots,
+        reversed: false,
+    };
+    roster_event_standing(rules, &state, &e).map_err(|(rule, detail)| {
+        tracing::debug!(group_key_id, primary, rule, detail = %detail, "roster change refused");
+        Error::RosterAuthorityUnauthorized {
+            group_key_id: group_key_id.to_owned(),
+            offered_authority_key_id: primary.to_owned(),
+            rule,
+        }
+    })
+}
+
+/// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
+/// incoming widening (`is_revocation == false`) or revocation, signed by
+/// `signers` (the primary and every verified co-signer), against the room's
+/// authorized state at `effective_at`. An unknown room is not this check's
+/// refusal (the door's room check / FK refuses it), so it returns `Ok(())`.
+pub async fn check_community_roster_authority<F>(
+    directory: &F,
+    community_key_id: &str,
+    primary: &str,
+    signers: &std::collections::BTreeSet<String>,
+    incoming: types::CommunityMember,
+    is_revocation: bool,
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(community) = directory.lookup_community(community_key_id).await? else {
+        return Ok(());
+    };
+    let events = Box::pin(community_roster_events(directory, &community)).await?;
+    let roots = founder_candidates(
+        &community,
+        &directory
+            .list_community_membership_widenings_for(community_key_id)
+            .await?,
+    );
+    Box::pin(check_roster_authority_over(
+        directory,
+        community_key_id,
+        &community.members,
+        RosterRules::of_community(&community),
+        events,
+        Some(roots),
+        primary,
+        signers,
+        incoming,
+        is_revocation,
+        effective_at,
+    ))
+    .await
+}
+
+/// v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.3) — the
+/// family twin of [`check_community_roster_authority`]: the family doors
+/// (`put_family_membership_widening`, `put_family_membership_revocation`) ask
+/// the family's own `consensus_protocol` through the SAME standing function
+/// rooms use. An unknown family returns `Ok(())` (the door's FK refuses it).
+pub async fn check_family_roster_authority<F>(
+    directory: &F,
+    family_key_id: &str,
+    primary: &str,
+    signers: &std::collections::BTreeSet<String>,
+    incoming: types::FamilyMember,
+    is_revocation: bool,
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(family) = directory.lookup_family(family_key_id).await? else {
+        return Ok(());
+    };
+    let events = Box::pin(family_roster_events(directory, &family)).await?;
+    let record: Vec<types::CommunityMember> = family
+        .members
+        .iter()
+        .map(family_member_as_roster_member)
+        .collect();
+    Box::pin(check_roster_authority_over(
+        directory,
+        family_key_id,
+        &record,
+        RosterRules::of_family(&family),
+        events,
+        None,
+        primary,
+        signers,
+        family_member_as_roster_member(&incoming),
+        is_revocation,
+        effective_at,
+    ))
+    .await
+}
+
+/// v49.0.0 (CIRISPersist#910) — the signer set of a roster row: the primary
+/// and every co-signer (the co-signatures have already verified at the door).
+#[must_use]
+pub fn roster_row_signer_set(
+    primary: &str,
+    cosignatures: &[types::RosterCosignature],
+) -> std::collections::BTreeSet<String> {
+    std::iter::once(primary.to_owned())
+        .chain(cosignatures.iter().map(|c| c.authority_key_id.clone()))
+        .collect()
+}
+
+/// v49.0.0 (CIRISPersist#910) — a family widening's `effective_at` may not be
+/// future-dated beyond the same skew bound a room's is: the fold orders by
+/// instant, and a far-future instant would let a row sit unadmitted-in-effect
+/// for as long as its signer chose.
+pub fn reject_future_dated_family_widening(
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    let max_allowed = chrono::Utc::now()
+        + chrono::Duration::seconds(community_dek::COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
+    if effective_at > max_allowed {
+        return Err(Error::InvalidArgument(format!(
+            "family membership widening effective_at {effective_at} is future-dated \
+             (> now + {}s)",
+            community_dek::COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS
+        )));
+    }
+    Ok(())
+}
+
 /// v48.0.0 (CIRISPersist#860) — the roster a READ-TIME gate judges: the one
 /// fold when the room is stored, the record's own members when it is not
 /// yet (a put-time check on an incoming record has nothing else to fold).
@@ -678,7 +1661,7 @@ where
 /// authorized in `change_envelope` (`group_key_id` + member `key_id` set +
 /// `consensus_protocol` all match). Defends against verifying one membership
 /// change and storing another.
-fn assert_change_envelope_matches(
+pub(crate) fn assert_change_envelope_matches(
     group_key_id: &str,
     new_member_key_ids: &std::collections::BTreeSet<&str>,
     new_consensus_protocol: &str,
@@ -2785,53 +3768,75 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v6.2.0 (CIRISPersist#161 A4/A5, CEG §11.7.1) — admit one identity
-    /// into an existing family roster, additively. This is the **roster-
-    /// grow** primitive that makes family-member *addition* first-class
-    /// and symmetric with the removal path
-    /// ([`put_family_membership_revocation`](Self::put_family_membership_revocation)):
-    /// addition mutates the roster in place, removal stays append-only
-    /// revocation the `*_active` reads compose against.
+    /// into an existing family roster, additively: the addition half of a
+    /// membership change, symmetric with
+    /// [`put_family_membership_revocation`](Self::put_family_membership_revocation).
     ///
-    /// Idempotent on `member.key_id`: a member already on the roster is a
-    /// no-op and returns `Ok(false)`; a genuine add returns `Ok(true)`.
-    /// The family must exist ([`Error::InvalidArgument`] otherwise).
-    /// Recomputes `persist_row_hash` over the grown roster.
+    /// v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1/§10.4)
+    /// — **the local door onto the family widening plane**, the exact twin of
+    /// [`Self::add_community_member`]. The family RECORD is never rewritten to
+    /// grow (a rewritten record reaches no peer: the replicated `put_family` is
+    /// INSERT-only); the addition is a signed
+    /// [`types::FamilyMembershipWidening`] row — `{member.key_id,
+    /// member.joined_at, effective_at = member.joined_at, member.role}` — and
+    /// `spec` (with `spec.cosignatures`) is the authority scrub over THAT row's
+    /// envelope, judged by the family's own `consensus_protocol` at the door.
+    /// Returns `Ok(true)` when the row is new, `Ok(false)` — nothing written —
+    /// when the member is already active by the one fold WITH THE SAME ROLE
+    /// (a different role is a role change, admitted like any other widening)
+    /// or the byte-identical row is already held. The family must exist
+    /// ([`Error::InvalidArgument`] otherwise).
     ///
-    /// # v31.0.0 (CIRISPersist#654) — the addition carries an authority signature
-    ///
-    /// `spec` is the caller's hybrid signature over the **grown** record's
-    /// [`Family::signing_envelope`](types::Family::signing_envelope), verified
-    /// through the same [`verify_family_admission`] gate `put_family` and
-    /// `supersede_family` run (see [`cohort::AdmitSpec`] and
-    /// [`cohort::authorize_family_growth`]). Before this, roster growth was an
-    /// UNAUTHENTICATED write door into `federation_families.members` — inside
-    /// the signing preimage — that also left the row's stored
-    /// `authority_key_id` / `scrub_signature_*` describing the roster that used
-    /// to be there. Implementations MUST write the new signature columns in the
-    /// SAME statement as `members` + `persist_row_hash` (#651's rule: the
-    /// record and the signature that authorizes it travel together, because the
-    /// way they go stale is by being able to move apart) and MUST re-index
-    /// `signed_wire_index` afterwards (#547/#640).
-    ///
-    /// The idempotent no-op returns `Ok(false)` BEFORE the gate: no row is
-    /// written, so there is nothing to authorize, and demanding a signature
-    /// over a record that is not going to be stored would break the idempotency
-    /// the membership-change drivers depend on.
-    ///
-    /// This is the forward-path half of a membership-change: the at-rest
-    /// cascade re-key
-    /// ([`rekey_family_member_add`](crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add))
-    /// grants an already-rostered member *past* family blobs; this call puts
-    /// them on the roster so `resolve_recipients` includes them in *future*
-    /// writes too. Since #654 the caller runs this FIRST and the re-key driver
-    /// second — the driver holds no key material, so it can neither produce
-    /// this signature nor relay one over a record it mints fields of.
+    /// Before v49.0.0 this grew `federation_families.members` in place under a
+    /// signature over the grown record (#654); that preimage no longer
+    /// verifies — the break is the reason this rides v49.0.0.
     async fn add_family_member(
         &self,
         family_key_id: &str,
         member: types::FamilyMember,
         spec: &cohort::AdmitSpec,
-    ) -> Result<bool, Error>;
+    ) -> Result<bool, Error> {
+        let Some(record) = self.lookup_family(family_key_id).await? else {
+            return Err(Error::InvalidArgument(format!(
+                "add_family_member names unknown family_key_id {family_key_id:?}"
+            )));
+        };
+        let widening = types::FamilyMembershipWidening {
+            family_key_id: family_key_id.to_owned(),
+            member_key_id: member.key_id,
+            joined_at: member.joined_at,
+            effective_at: member.joined_at,
+            role: member.role,
+            persist_row_hash: String::new(),
+        };
+        let already = self
+            .list_family_membership_widenings_for(family_key_id)
+            .await?
+            .iter()
+            .any(|w| {
+                w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
+            });
+        if !already {
+            // Already active at that instant with the same role: the row
+            // would not move the fold.
+            let active = authorized_family_roster_at(self, &record, widening.effective_at).await?;
+            if active
+                .iter()
+                .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
+            {
+                return Ok(false);
+            }
+        }
+        self.put_family_membership_widening(SignedFamilyMembershipWidening {
+            family_membership_widening: widening,
+            authority_key_id: spec.authority_key_id.clone(),
+            scrub_signature_classical: spec.scrub_signature_classical.clone(),
+            scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
+            cosignatures: spec.cosignatures.clone(),
+        })
+        .await?;
+        Ok(!already)
+    }
 
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
     /// `None` if absent.
@@ -2841,6 +3846,10 @@ pub trait FederationDirectory: Send + Sync {
     /// belongs to (the DEK-cascade fan-out path for
     /// `cohort_scope: family` content + the membership-change-
     /// ceremony propagation walker).
+    ///
+    /// v49.0.0 (CIRISPersist#910) — containment in the family's HISTORY: on
+    /// the record, or named by a widening. Still raw (a removed member is
+    /// listed); the `_active` readers fold.
     ///
     /// Scans the `members` JSONB / TEXT field; postgres uses the
     /// V059 GIN index for O(log N), sqlite falls back to a full scan
@@ -2943,10 +3952,27 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v4.8.0 — record a family-membership removal. Append-only;
-    /// idempotent on the `(family_key_id, removed_identity_key_id)` PK.
+    /// idempotent on the `(family_key_id, removed_identity_key_id,
+    /// effective_at)` PK (v49.0.0, #910.1 — V154: a re-added member can be
+    /// removed again; an exact retry is the #861 no-op). v49.0.0 (#910.3): the
+    /// signer set must have standing by the family's `consensus_protocol` at
+    /// `effective_at` ([`check_family_roster_authority`]).
     async fn put_family_membership_revocation(
         &self,
         revocation: SignedFamilyMembershipRevocation,
+    ) -> Result<(), Error>;
+
+    /// v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) —
+    /// record a family-membership ADDITION on its own append plane: the family
+    /// twin of [`Self::put_community_membership_widening`]. The primary and
+    /// every co-signature hybrid-verify over the row's envelope; a future-dated
+    /// row is refused; the member must be a registered key; the signer set must
+    /// have standing by the family's own `consensus_protocol` at `effective_at`
+    /// ([`check_family_roster_authority`]); idempotent on the `(family_key_id,
+    /// member_key_id, effective_at)` PK.
+    async fn put_family_membership_widening(
+        &self,
+        widening: SignedFamilyMembershipWidening,
     ) -> Result<(), Error>;
 
     /// v4.8.0 — record a community-membership removal. Structural mirror
@@ -2967,6 +3993,23 @@ pub trait FederationDirectory: Send + Sync {
         widening: SignedCommunityMembershipWidening,
     ) -> Result<(), Error>;
 
+    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — record
+    /// one member's public-listing choice in one room (CC 2 `listed`). The
+    /// door is [`listing::check_community_membership_listing`]: the signature
+    /// verifies, the signer IS the member (else
+    /// [`Error::MembershipListingRefused`] `envelope_listed_not_self_asserted`),
+    /// the value is `public` or absent (`envelope_listed_bad_value`), the row
+    /// is not future-dated, the room exists (a family id is
+    /// `envelope_listed_scope_invalid`, an unknown id
+    /// [`Error::InvalidArgument`]). Membership is not checked — rows arrive
+    /// out of order; the fold decides. Idempotent on the `(community_key_id,
+    /// member_key_id, effective_at)` PK; forward-only (clearing is a later
+    /// row with `listed: None`).
+    async fn put_community_membership_listing(
+        &self,
+        listing: SignedCommunityMembershipListing,
+    ) -> Result<(), Error>;
+
     /// v4.8.0 — all identity-occurrence revocations for `identity_key_id`
     /// (no `effective_at` filter — full history). Keyed by the table's
     /// leading PK column.
@@ -2981,6 +4024,30 @@ pub trait FederationDirectory: Send + Sync {
         family_key_id: &str,
     ) -> Result<Vec<FamilyMembershipRevocation>, Error>;
 
+    /// v49.0.0 (CIRISPersist#910) — all family-membership widenings for
+    /// `family_key_id` (full history; the fold orders them).
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<FamilyMembershipWidening>, Error>;
+
+    /// v49.0.0 (CIRISPersist#910) — the signer of the family's record and of
+    /// every stored family widening and revocation: what
+    /// [`authorized_family_roster_at`] needs to judge standing. The same
+    /// [`CommunityRosterSigners`] shape a room answers with (one shape of
+    /// roster plane, one shape of signers). [`Error::InvalidArgument`] for an
+    /// unknown family. Default `Unsupported`, so every fold over an
+    /// implementor without it fails secure.
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<CommunityRosterSigners, Error> {
+        let _ = family_key_id;
+        Err(Error::Unsupported {
+            method: "family_roster_signers",
+        })
+    }
+
     /// v4.8.0 — all community-membership revocations for
     /// `community_key_id`.
     async fn list_community_membership_revocations_for(
@@ -2993,6 +4060,40 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         community_key_id: &str,
     ) -> Result<Vec<CommunityMembershipWidening>, Error>;
+
+    /// v49.0.0 (CIRISPersist#912) — every stored listing row for
+    /// `community_key_id` (full history, set and cleared, members or not;
+    /// [`listing::latest_listing_at`] folds them). A roster-holder's read:
+    /// never serve it to a non-member — [`Self::listed_members`] is the view
+    /// for them.
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipListing>, Error>;
+
+    /// v49.0.0 (CIRISPersist#912) — **the publicly listed members of a room,
+    /// now**: [`listing::listed_community_members_at`] at `Utc::now()`. The
+    /// ONLY roster view a non-member may be served (CC 2's one crack in
+    /// "never globally enumerable"); the endpoint that serves it is the
+    /// host's to gate. [`Error::InvalidArgument`] for an unknown room.
+    async fn listed_members(&self, community_key_id: &str) -> Result<Vec<CommunityMember>, Error> {
+        listing::listed_community_members_at(self, community_key_id, chrono::Utc::now()).await
+    }
+
+    /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the
+    /// signer of the room's record and of every stored widening and
+    /// revocation: what [`authorized_roster_at`] needs to judge standing.
+    /// [`Error::InvalidArgument`] for an unknown room. Default `Unsupported`,
+    /// so every fold over an implementor without it fails secure.
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<CommunityRosterSigners, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "community_roster_signers",
+        })
+    }
 
     /// v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — record a
     /// `location_proof`. Runs the §0.8 H3 canonicalization gate +
@@ -3208,13 +4309,24 @@ pub trait FederationDirectory: Send + Sync {
     /// [`SignedFamilyMembershipRevocation`] wrappers since a cursor.
     /// Structural mirror of [`Self::list_signed_families_since`]:
     /// pair-cursor (#668) whose resume id is the compound of
-    /// `(family_key_id, removed_identity_key_id)`; signed-rows-only
-    /// contract identical.
+    /// `(family_key_id, removed_identity_key_id, effective_at)` (v49.0.0,
+    /// #910.1); signed-rows-only contract identical.
     async fn list_signed_family_membership_revocations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedFamilyMembershipRevocation>, Error>;
+
+    /// v49.0.0 (CIRISPersist#910) — bulk-list the signed
+    /// [`SignedFamilyMembershipWidening`] wrappers since a cursor: the family
+    /// twin of [`Self::list_signed_community_membership_widenings_since`];
+    /// resume id = the compound of `(family_key_id, member_key_id,
+    /// effective_at)`.
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error>;
 
     /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
     /// [`SignedCommunityMembershipRevocation`] wrappers since a cursor.
@@ -3237,6 +4349,16 @@ pub trait FederationDirectory: Send + Sync {
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
         limit: u32,
     ) -> Result<Vec<ServedCommunityMembershipWidening>, Error>;
+
+    /// v49.0.0 (CIRISPersist#912) — bulk-list the signed
+    /// [`SignedCommunityMembershipListing`] wrappers since a cursor (the 19th
+    /// kind's serve read): pair cursor, resume id = the compound of
+    /// `(community_key_id, member_key_id, effective_at)`; signed rows only.
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipListing>, Error>;
 
     // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
     //     PRIMARY signed planes (edge advertise/serve bridge; extends the
@@ -3581,11 +4703,13 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// v4.8.0 (#161 Ask 2) — families `member_identity_key_id` is
-    /// **currently** an active member of: a member of the roster AND not
-    /// removed by a revocation whose `effective_at <= now`. Default impl
-    /// composes [`Self::list_families_for_member`] with a per-family
-    /// [`Self::list_family_membership_revocations_for`] (family-count
-    /// cardinality is small — tens, not thousands).
+    /// **currently** an active member of.
+    ///
+    /// v49.0.0 (CIRISPersist#910.3) — the candidates are every family the
+    /// member appears in (record OR widening), and each is kept iff the member
+    /// is on its AUTHORIZED roster now ([`authorized_family_roster_at`]): a
+    /// widened member is in, a removed-then-re-added member is in, a removed
+    /// one is out. The hand-rolled "any revocation wins" spelling is gone.
     async fn list_families_for_member_active(
         &self,
         member_identity_key_id: &str,
@@ -3596,13 +4720,8 @@ pub trait FederationDirectory: Send + Sync {
             .await?;
         let mut active = Vec::with_capacity(families.len());
         for f in families {
-            let revs = self
-                .list_family_membership_revocations_for(&f.family_key_id)
-                .await?;
-            let removed = revs.iter().any(|r| {
-                r.removed_identity_key_id == member_identity_key_id && r.effective_at <= now
-            });
-            if !removed {
+            let roster = authorized_family_roster_at(self, &f, now).await?;
+            if roster.iter().any(|m| m.key_id == member_identity_key_id) {
                 active.push(f);
             }
         }
@@ -3620,15 +4739,15 @@ pub trait FederationDirectory: Send + Sync {
         let communities = self
             .list_communities_for_member(member_identity_key_id)
             .await?;
+        // v49.0.0 (CIRISPersist#907) — the candidates are every room the
+        // member appears in (record OR widening), and each is kept iff the
+        // member is on its AUTHORIZED roster now: a widened member is in, a
+        // removed-then-re-added member is in, a removed one is out. The
+        // hand-rolled "any revocation wins" spelling is gone.
         let mut active = Vec::with_capacity(communities.len());
         for c in communities {
-            let revs = self
-                .list_community_membership_revocations_for(&c.community_key_id)
-                .await?;
-            let removed = revs.iter().any(|r| {
-                r.removed_identity_key_id == member_identity_key_id && r.effective_at <= now
-            });
-            if !removed {
+            let roster = authorized_community_roster_at(self, &c, now).await?;
+            if roster.iter().any(|m| m.key_id == member_identity_key_id) {
                 active.push(c);
             }
         }
@@ -3644,15 +4763,15 @@ pub trait FederationDirectory: Send + Sync {
     // [`removed_key_ids_at`] fold so the revocation-subtraction logic is
     // never forked (the community-DEK cascade composes the same fold).
 
-    /// #249 Cut B — the **active member roster** of `family_key_id`: the
-    /// family's `members` MINUS every member removed by a revocation whose
-    /// `effective_at <= now`. A future-dated revocation does NOT drop its
-    /// subject (the member is active until its effective time arrives).
+    /// #249 Cut B — the **active member roster** of `family_key_id`.
     ///
-    /// Default impl composes [`Self::lookup_family`] with
-    /// [`Self::list_family_membership_revocations_for`] through the shared
-    /// [`removed_key_ids_at`] fold; backends need not override.
-    /// [`Error::InvalidArgument`] if the family is unknown.
+    /// v49.0.0 (CIRISPersist#910.3) — ONE fold, the rooms' fold: the record's
+    /// members plus the family widening plane minus the revocation plane, by
+    /// effective instant, applying only events whose signer set has standing
+    /// by the family's `consensus_protocol` ([`authorized_family_roster_at`]).
+    /// A future-dated revocation does NOT drop its subject (the member is
+    /// active until its effective time arrives). [`Error::InvalidArgument`] if
+    /// the family is unknown.
     async fn active_family_members(
         &self,
         family_key_id: &str,
@@ -3662,19 +4781,7 @@ pub trait FederationDirectory: Send + Sync {
                 "active_family_members names unknown family_key_id {family_key_id:?}"
             ))
         })?;
-        let revs = self
-            .list_family_membership_revocations_for(family_key_id)
-            .await?;
-        let removed = removed_key_ids_at(
-            revs.iter()
-                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
-            chrono::Utc::now(),
-        );
-        Ok(family
-            .members
-            .into_iter()
-            .filter(|m| !removed.contains(m.key_id.as_str()))
-            .collect())
+        authorized_family_roster_at(self, &family, chrono::Utc::now()).await
     }
 
     /// v38.2.0 (PR #761 review) — occurrence → identity through the ACTIVE
@@ -3841,19 +4948,9 @@ pub trait FederationDirectory: Send + Sync {
             })?;
         // v48.0.0 (CIRISPersist#860, FSD §3.4) — ONE fold: the record's
         // members plus the widening plane minus the revocation plane, by
-        // effective instant.
-        let widenings = self
-            .list_community_membership_widenings_for(community_key_id)
-            .await?;
-        let revs = self
-            .list_community_membership_revocations_for(community_key_id)
-            .await?;
-        Ok(active_roster_at(
-            &community.members,
-            &widenings,
-            &revs,
-            chrono::Utc::now(),
-        ))
+        // effective instant. v49.0.0 (#908): only events whose signer has
+        // standing count.
+        authorized_community_roster_at(self, &community, chrono::Utc::now()).await
     }
 
     /// #249 Cut B — incremental **community-roster grow**. The exact mirror
@@ -3921,16 +5018,15 @@ pub trait FederationDirectory: Send + Sync {
                         "add_community_member names unknown community_key_id {community_key_id:?}"
                     ))
                 })?;
-            let revocations = self
-                .list_community_membership_revocations_for(community_key_id)
-                .await?;
-            let active = active_roster_at(
-                &record.members,
-                &widenings,
-                &revocations,
-                widening.effective_at,
-            );
-            if active.iter().any(|m| m.key_id == widening.member_key_id) {
+            let active =
+                authorized_community_roster_at(self, &record, widening.effective_at).await?;
+            // v49.0.0 (#910.4) — an active member with the SAME role is the
+            // idempotent no-op; a different role is a role change, judged by
+            // the protocol at the door like any other widening.
+            if active
+                .iter()
+                .any(|m| m.key_id == widening.member_key_id && m.role == widening.role)
+            {
                 return Ok(false);
             }
         }
@@ -3939,6 +5035,7 @@ pub trait FederationDirectory: Send + Sync {
             authority_key_id: spec.authority_key_id.clone(),
             scrub_signature_classical: spec.scrub_signature_classical.clone(),
             scrub_signature_pqc: spec.scrub_signature_pqc.clone(),
+            cosignatures: spec.cosignatures.clone(),
         })
         .await?;
         Ok(!already)
@@ -4300,6 +5397,7 @@ pub trait FederationDirectory: Send + Sync {
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
+                    cosignatures: Vec::new(),
                 })
                 .await?;
             }
@@ -4324,6 +5422,7 @@ pub trait FederationDirectory: Send + Sync {
                         authority_key_id,
                         scrub_signature_classical,
                         scrub_signature_pqc,
+                        cosignatures: Vec::new(),
                     },
                 )
                 .await?;
@@ -4465,48 +5564,33 @@ pub trait FederationDirectory: Send + Sync {
     /// justification recorded on the superseded prior version.
     async fn supersede_family(
         &self,
-        new: types::SignedFamily,
+        mut new: types::SignedFamily,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        check_consensus_protocol_form(&new.family.consensus_protocol)?;
-        // v31.0.0 (CIRISPersist#651) — THE AUTHORSHIP GATE. `put_family` has
-        // run this since v21.0.0 (#502 E4); supersede ran NOTHING, so
-        // `federation_families` had a SECOND write door that admitted a
-        // re-baselined roster, a new `consensus_protocol` and a new
-        // `family_name` on FK-existence alone. Superseding is not a lesser act
-        // than creating — it is the act that REPLACES what creation
-        // established — so it is gated identically, and before any write.
-        crate::federation::verify_family_admission(self, &new).await?;
-        // The snapshot is the SIGNED WRAPPER, not the bare record. Serializing
-        // `.family` alone is what dropped the caller's freshly-minted
-        // signature on the floor: `signing_envelope()` covers `members`,
-        // `family_name`, `founded_at` and `consensus_protocol`, so a supersede
-        // that carries the record without its signature leaves the stored
-        // `authority_key_id` / `scrub_signature_*` describing a roster that is
-        // no longer there. Same discipline as #649's `AttestationReseal`: the
-        // record and the signature that authorizes it travel together, because
-        // the way they go stale is by being able to move apart.
-        let snapshot = serde_json::to_value(&new)
-            .map_err(|e| Error::Backend(format!("supersede_family snapshot serialize: {e}")))?;
-        self.supersede_group_row(cohort::Cohort::Family, snapshot, authorization)
-            .await
+        // v49.0.0 (#910.5) — a supersede proof is attached only by
+        // `supersede_family_with_quorum`, after it verified the quorum. One
+        // handed in here was verified by no one, so it is not stored (a peer
+        // would refuse it anyway; this node must not serve it as its own).
+        new.supersede_proof = None;
+        group_amendment::supersede_family_signed(self, new, authorization).await
     }
 
     /// #249 Cut G2 (§3) — supersede a community with new content as a new
     /// version. Mirror of [`Self::supersede_family`].
     async fn supersede_community(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        // v31.0.0 (CIRISPersist#651) — the authorship gate + the signed
-        // wrapper as the snapshot. See [`Self::supersede_family`] for why both.
-        crate::federation::verify_community_admission(self, &new).await?;
-        let snapshot = serde_json::to_value(&new)
-            .map_err(|e| Error::Backend(format!("supersede_community snapshot serialize: {e}")))?;
-        self.supersede_group_row(cohort::Cohort::Community, snapshot, authorization)
-            .await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family`].
+        new.supersede_proof = None;
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Community,
+            new,
+            authorization,
+        )
+        .await
     }
 
     /// CC 4.4.3.2.8 / #308 — supersede an `affiliations` group. Identical to
@@ -4516,23 +5600,18 @@ pub trait FederationDirectory: Send + Sync {
     /// stays separable per tier.
     async fn supersede_affiliations(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, Error> {
-        check_consensus_protocol_form(&new.community.consensus_protocol)?;
-        // v31.0.0 (CIRISPersist#651) — gated and signature-carrying for the
-        // same reason as its two siblings. #651 named the family and community
-        // arms; this THIRD arm shares `SignedCommunity` and the
-        // `federation_communities` storage with the community arm, so fixing
-        // the two named doors and leaving this one open would have left the
-        // identical hole reachable under a different discriminator — which is
-        // exactly the by-name evadability #598 refused for the instant gate.
-        crate::federation::verify_community_admission(self, &new).await?;
-        let snapshot = serde_json::to_value(&new).map_err(|e| {
-            Error::Backend(format!("supersede_affiliations snapshot serialize: {e}"))
-        })?;
-        self.supersede_group_row(cohort::Cohort::Affiliations, snapshot, authorization)
-            .await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family`].
+        new.supersede_proof = None;
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Affiliations,
+            new,
+            authorization,
+        )
+        .await
     }
 
     /// #249 Cut G2 (§8) — alias for [`Self::list_group_versions`]: the
@@ -4575,33 +5654,61 @@ pub trait FederationDirectory: Send + Sync {
     // primitives, so backend parity is inherited.
 
     /// #249 Cut G3 (§4/§5), robust on Cut G3.5 — verify a membership change is
-    /// authorized by the group's **current** strict-majority quorum, composing
-    /// CIRISVerify v6.9.0's general
-    /// [`verify_membership_change`](ciris_verify_core::accord_genesis::verify_membership_change)
-    /// (CIRISVerify#104). `change_envelope` is the canonical membership-change
+    /// authorized by the group's **current** roster under the group's **own**
+    /// `consensus_protocol`. `change_envelope` is the canonical membership-change
     /// payload (build it with [`Self::build_membership_change_envelope`]); the
     /// **prior** roster cosigned its JCS bytes.
     ///
-    /// Inherits verify's full fail-closed gate — strictly stronger than the
-    /// v9.7.0 count-only check:
-    /// - well-formed + **distinct** member `key_id`s;
-    /// - **strict-majority** `quorum:M/N` (`2M>N`) over the new roster;
-    /// - **one-seat key-distinctness** — the new roster resolves to **distinct
-    ///   pubkeys** in the directory (no human seated under two `key_id`s);
-    /// - **entrenchment preserved** — `family_key_id` unchanged, an entrenched
-    ///   group cannot be de-entrenched;
-    /// - **anti-replay** — `supersedes.prior_member_key_ids` MUST equal the
-    ///   actual prior roster (no presenting the change against a different
-    ///   prior state);
-    /// - the **prior** roster's strict-majority quorum validly signed the new
-    ///   envelope (role-agnostic, hybrid; classical-only does not count —
-    ///   CC 5.3.2.4.3.1).
+    /// v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md` §0 item 3) —
+    /// **the threshold is the group's protocol, decided by
+    /// [`consensus::evaluate`].** Before v49.0.0 this composed CIRISVerify's
+    /// `verify_membership_change`, which demands a STRICT MAJORITY of the prior
+    /// roster whatever the group declared (and refused outright any prior group
+    /// whose protocol was not `quorum:M/N`) — so a `founder_only` room needed a
+    /// majority, a `unanimous` one settled for one. That function cannot be told
+    /// to skip its own threshold, so this method composes verify's lower-level
+    /// primitives instead, and verify still does every piece of cryptography:
+    ///
+    /// 1. **Structure.** For an ENTRENCHED prior group, verify's own
+    ///    [`validate_membership_change_structure`](ciris_verify_core::accord_genesis::validate_membership_change_structure),
+    ///    unchanged — which pins the new protocol to a strict-majority
+    ///    `quorum:M/N` (the growable accord's entrenched invariant). For any
+    ///    other group the same checks minus that pin (the group's protocol is
+    ///    its own choice, CC 4.4.3.4.2): distinct member `key_id`s; the new
+    ///    roster resolves to **distinct pubkeys** (one-seat, via verify's
+    ///    [`roster_from_envelope`](ciris_verify_core::accord_genesis::roster_from_envelope));
+    ///    `family_key_id` unchanged; the new `consensus_protocol` a canonical
+    ///    form; **anti-replay** `supersedes.prior_member_key_ids` equals the
+    ///    actual prior roster.
+    /// 2. **One seat on the prior roster.** verify's `roster_from_envelope`
+    ///    over the prior envelope (distinct ids, every member resolved, no
+    ///    pubkey seated twice) — so one human cannot count twice.
+    /// 3. **Who signed.** Each submitted signature is checked by verify's
+    ///    [`verify_threshold_signatures`](ciris_verify_core::threshold::verify_threshold_signatures)
+    ///    at threshold 1 against the one prior member it names (hybrid,
+    ///    classical-only does not count — CC 5.3.2.4.3.1). The member ids that
+    ///    verified are the signer set.
+    /// 4. **The threshold.** [`consensus::evaluate`] over the group's ACTIVE
+    ///    roster with roles (a community's authorized fold,
+    ///    [`Self::active_community_members`]; a family's
+    ///    [`Self::active_family_members`]), the group's `consensus_protocol`,
+    ///    and — for a community — its record's `policy_blob` and
+    ///    `policy_blob.cohort_subkind` (families have neither).
+    ///
+    /// **Direction.** A change that only GAINS members is an `Add`; one that
+    /// only LOSES members is a `Remove`; a **mixed** change (gains and losses)
+    /// is evaluated BOTH ways and admitted only if both admit; a change that
+    /// moves no one (a protocol-only rewrite) is judged as an `Add` — a change
+    /// of the rules is never the cheap protective direction. Only
+    /// `reverse_quorum` reads the direction.
     ///
     /// The `directory` handed to verify is the authoritative `federation_keys`
-    /// pin set for the prior roster ∪ the new roster (resolved via
+    /// pin set for the active roster ∪ the new roster (resolved via
     /// [`Self::lookup_public_key`]); authorization is exactly as strong as it.
-    /// [`Error::InvalidArgument`] (wrapping the verify-side `AccordGenesisError`)
-    /// on any failed check; the `self` cohort has no quorum.
+    /// [`Error::InvalidArgument`] on any failed check — a structural refusal
+    /// wraps the verify-side `AccordGenesisError`; an insufficient signer set
+    /// carries the evaluator's detail; an unevaluable protocol names the
+    /// reason. The `self` cohort has no quorum.
     async fn verify_membership_quorum(
         &self,
         cohort: cohort::Cohort,
@@ -4609,12 +5716,69 @@ pub trait FederationDirectory: Send + Sync {
         change_envelope: &serde_json::Value,
         signatures: &[ciris_verify_core::threshold::ThresholdSignature],
     ) -> Result<(), Error> {
+        use ciris_verify_core::accord_genesis as ag;
         use ciris_verify_core::threshold::ThresholdMember;
+        let refuse = |detail: String| {
+            Error::InvalidArgument(format!(
+                "verify_membership_quorum: membership change not authorized: {detail}"
+            ))
+        };
         let prior_envelope = self.group_prior_envelope(cohort, group_key_id).await?;
-        // Directory = prior active roster ∪ the new envelope's members,
-        // resolved to their REGISTERED pinned hybrid pubkeys. verify resolves
-        // the NEW roster against this for the one-seat (distinct-pubkey) check
-        // and the PRIOR roster for the quorum count, so it must cover both.
+        // The group's protocol inputs and its ACTIVE roster with roles — the
+        // roster the evaluator judges. `group_prior_envelope` has already
+        // refused an unknown group and the `self` cohort.
+        let (protocol, subkind, policy_blob, roster): (
+            String,
+            Option<String>,
+            Option<serde_json::Value>,
+            Vec<consensus::Seat>,
+        ) = match cohort {
+            cohort::Cohort::Family => {
+                let f = self.lookup_family(group_key_id).await?.ok_or_else(|| {
+                    Error::InvalidArgument(format!("unknown family group {group_key_id:?}"))
+                })?;
+                let roster = self
+                    .active_family_members(group_key_id)
+                    .await?
+                    .into_iter()
+                    .map(|m| consensus::Seat {
+                        key_id: m.key_id,
+                        role: m.role,
+                    })
+                    .collect();
+                (f.consensus_protocol, None, None, roster)
+            }
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                let c = self.lookup_community(group_key_id).await?.ok_or_else(|| {
+                    Error::InvalidArgument(format!("unknown community group {group_key_id:?}"))
+                })?;
+                let subkind = c
+                    .policy_blob
+                    .as_ref()
+                    .and_then(|b| b.get("cohort_subkind"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let roster = self
+                    .active_community_members(group_key_id)
+                    .await?
+                    .into_iter()
+                    .map(|m| consensus::Seat {
+                        key_id: m.key_id,
+                        role: m.role,
+                    })
+                    .collect();
+                (c.consensus_protocol, subkind, c.policy_blob, roster)
+            }
+            cohort::Cohort::SelfId => {
+                return Err(Error::InvalidArgument(
+                    "the `self` cohort has no quorum / membership-change envelope".to_string(),
+                ))
+            }
+        };
+        // Directory = active roster ∪ the new envelope's members, resolved to
+        // their REGISTERED pinned hybrid pubkeys. verify resolves the NEW
+        // roster against this for the one-seat (distinct-pubkey) check and the
+        // PRIOR roster for signature verification, so it must cover both.
         let mut key_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for m in self.active_members(cohort, group_key_id).await? {
             key_ids.insert(m.key_id);
@@ -4637,17 +5801,119 @@ pub trait FederationDirectory: Send + Sync {
                 });
             }
         }
-        ciris_verify_core::accord_genesis::verify_membership_change(
-            &prior_envelope,
-            change_envelope,
-            signatures,
-            &directory,
-        )
-        .map_err(|e| {
-            Error::InvalidArgument(format!(
-                "verify_membership_quorum: membership change not authorized: {e}"
-            ))
-        })
+
+        // 1. Structure.
+        let prior_entrenched = prior_envelope.get("consensus_protocol_entrenched")
+            == Some(&serde_json::Value::Bool(true));
+        let new_roster = if prior_entrenched {
+            ag::validate_membership_change_structure(&prior_envelope, change_envelope, &directory)
+                .map_err(|e| refuse(e.to_string()))?;
+            ag::roster_from_envelope(change_envelope, &directory)
+                .map_err(|e| refuse(e.to_string()))?
+        } else {
+            let new_roster = ag::roster_from_envelope(change_envelope, &directory)
+                .map_err(|e| refuse(e.to_string()))?;
+            if change_envelope.get("family_key_id") != prior_envelope.get("family_key_id") {
+                return Err(refuse(
+                    "membership change must keep the same family_key_id".to_string(),
+                ));
+            }
+            let new_protocol = change_envelope
+                .get("consensus_protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !types::consensus_protocol::is_canonical_form(new_protocol) {
+                return Err(refuse(format!(
+                    "consensus_protocol {new_protocol:?} is not a canonical form"
+                )));
+            }
+            new_roster
+        };
+        // 2. One seat on the prior roster (verify's derivation).
+        let prior_roster = ag::roster_from_envelope(&prior_envelope, &directory)
+            .map_err(|e| refuse(e.to_string()))?;
+        if !prior_entrenched {
+            // Anti-replay (verify's structural gate does this for the
+            // entrenched arm): the change names the roster it supersedes.
+            let claimed_prior: Vec<&str> = change_envelope
+                .get("supersedes")
+                .and_then(|s| s.get("prior_member_key_ids"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .ok_or_else(|| refuse("membership change missing `supersedes`".to_string()))?;
+            let actual_prior: Vec<&str> =
+                prior_roster.iter().map(|m| m.member_id.as_str()).collect();
+            if claimed_prior != actual_prior {
+                return Err(refuse(
+                    "supersedes.prior_member_key_ids does not match the prior group".to_string(),
+                ));
+            }
+        }
+
+        // 3. Who signed: verify's hybrid threshold primitive, one member at a
+        //    time, so the member ids that verified are known (the aggregate
+        //    call returns only a count).
+        let bytes = ag::accord_family_signing_bytes(change_envelope)
+            .map_err(|e| refuse(format!("canonicalize: {e}")))?;
+        let mut signers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for sig in signatures {
+            let Some(member) = prior_roster.iter().find(|m| m.member_id == sig.member_id) else {
+                continue;
+            };
+            if ciris_verify_core::threshold::verify_threshold_signatures(
+                &bytes,
+                std::slice::from_ref(member),
+                std::slice::from_ref(sig),
+                1,
+            )
+            .is_ok()
+            {
+                signers.insert(sig.member_id.clone());
+            }
+        }
+
+        // 4. The threshold: the group's own protocol, by the one evaluator.
+        let prior_ids: std::collections::BTreeSet<&str> =
+            prior_roster.iter().map(|m| m.member_id.as_str()).collect();
+        let new_ids: std::collections::BTreeSet<&str> =
+            new_roster.iter().map(|m| m.member_id.as_str()).collect();
+        let gains = new_ids.difference(&prior_ids).next().is_some();
+        let loses = prior_ids.difference(&new_ids).next().is_some();
+        // A mixed change is judged both ways. Today the Remove pass can never
+        // refuse what the Add pass admitted (the evaluator reads direction only
+        // for reverse_quorum, where a removal always admits), so dropping it is
+        // an EQUIVALENT mutant — kept as the defensive half for any future
+        // protocol that makes removal the stricter direction. A change that
+        // moves no one (a protocol-only rewrite) is an Add: the cheap
+        // protective direction must never rewrite the room's rules.
+        let directions: &[consensus::Direction] = match (gains, loses) {
+            (true, true) => &[consensus::Direction::Add, consensus::Direction::Remove],
+            (false, true) => &[consensus::Direction::Remove],
+            _ => &[consensus::Direction::Add],
+        };
+        for &direction in directions {
+            match consensus::evaluate(&consensus::Ballot {
+                protocol: &protocol,
+                subkind: subkind.as_deref(),
+                policy_blob: policy_blob.as_ref(),
+                roster: &roster,
+                signers: &signers,
+                direction,
+            }) {
+                consensus::Verdict::Admit => {}
+                consensus::Verdict::Insufficient { detail } => {
+                    return Err(refuse(format!(
+                        "consensus_protocol not met ({direction:?}): {detail}"
+                    )))
+                }
+                consensus::Verdict::Unevaluable { reason } => {
+                    return Err(refuse(format!(
+                        "consensus_protocol {protocol:?} cannot be evaluated: {reason}"
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// #249 Cut G3.5 — the family-shaped **prior envelope** of the live
@@ -4686,8 +5952,14 @@ pub trait FederationDirectory: Send + Sync {
                 Ok(serde_json::json!({
                     "family_key_id": f.family_key_id,
                     "family_name": f.family_name,
+                    // v49.0.0 (#910.2) — the prior roster the quorum sees is
+                    // the family's authorized fold, not the record's members.
                     "members": members_json(
-                        f.members.into_iter().map(|m| (m.key_id, m.role)).collect()
+                        authorized_family_roster_at(self, &f, chrono::Utc::now())
+                            .await?
+                            .into_iter()
+                            .map(|m| (m.key_id, m.role))
+                            .collect()
                     ),
                     "consensus_protocol": f.consensus_protocol,
                     "consensus_protocol_entrenched": f.consensus_protocol_entrenched,
@@ -4754,14 +6026,15 @@ pub trait FederationDirectory: Send + Sync {
     }
 
     /// #249 Cut G3 (§3/§4/§5) — quorum-gated family supersede: verify the
-    /// current roster's strict-majority quorum cosigned `change_envelope` via
-    /// [`Self::verify_membership_quorum`], THEN [`Self::supersede_family`],
+    /// current roster cosigned `change_envelope` to the family's own
+    /// `consensus_protocol` (v49.0.0, #908 — no longer a fixed strict majority)
+    /// via [`Self::verify_membership_quorum`], THEN [`Self::supersede_family`],
     /// recording `{change_envelope, quorum_signatures}` as the superseded
     /// version's authorization (the §8 audit trail). The quorum is checked
     /// against the PRIOR group — the current holders authorize the change.
     async fn supersede_family_with_quorum(
         &self,
-        new: types::SignedFamily,
+        mut new: types::SignedFamily,
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
@@ -4780,6 +6053,23 @@ pub trait FederationDirectory: Send + Sync {
             &new.family.consensus_protocol,
             &change_envelope,
         )?;
+        let prior = self
+            .lookup_family(&new.family.family_key_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "supersede: unknown family group {:?} (nothing to supersede)",
+                    new.family.family_key_id
+                ))
+            })?;
+        // v49.0.0 (#910.5) — the entrenchment the record stores is the one the
+        // quorum signed, and an entrenched family stays entrenched (the same
+        // check a peer runs before applying this version).
+        group_amendment::check_family_entrenchment(
+            prior.consensus_protocol_entrenched,
+            new.family.consensus_protocol_entrenched,
+            &change_envelope,
+        )?;
         self.verify_membership_quorum(
             cohort::Cohort::Family,
             &new.family.family_key_id,
@@ -4791,14 +6081,21 @@ pub trait FederationDirectory: Send + Sync {
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
         });
-        self.supersede_family(new, Some(authorization)).await
+        // v49.0.0 (#910.5) — the record carries what authorized it, so a
+        // peer can apply it against ITS OWN prior version and roster.
+        new.supersede_proof = Some(types::GroupSupersedeProof {
+            prior_persist_row_hash: prior.persist_row_hash,
+            change_envelope,
+            quorum_signatures: signatures,
+        });
+        group_amendment::supersede_family_signed(self, new, Some(authorization)).await
     }
 
     /// #249 Cut G3 — quorum-gated community supersede. Mirror of
     /// [`Self::supersede_family_with_quorum`].
     async fn supersede_community_with_quorum(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
@@ -4825,7 +6122,23 @@ pub trait FederationDirectory: Send + Sync {
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
         });
-        self.supersede_community(new, Some(authorization)).await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
+        new.supersede_proof = Some(types::GroupSupersedeProof {
+            prior_persist_row_hash: self
+                .lookup_community(&new.community.community_key_id)
+                .await?
+                .map(|c| c.persist_row_hash)
+                .unwrap_or_default(),
+            change_envelope,
+            quorum_signatures: signatures,
+        });
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Community,
+            new,
+            Some(authorization),
+        )
+        .await
     }
 
     /// CC 4.4.3.2.8 / #308 — quorum-gated `affiliations` supersede. Mirror of
@@ -4834,7 +6147,7 @@ pub trait FederationDirectory: Send + Sync {
     /// `affiliations` discriminator via [`Self::supersede_affiliations`].
     async fn supersede_affiliations_with_quorum(
         &self,
-        new: types::SignedCommunity,
+        mut new: types::SignedCommunity,
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
@@ -4861,7 +6174,23 @@ pub trait FederationDirectory: Send + Sync {
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
         });
-        self.supersede_affiliations(new, Some(authorization)).await
+        // v49.0.0 (#910.5) — see [`Self::supersede_family_with_quorum`].
+        new.supersede_proof = Some(types::GroupSupersedeProof {
+            prior_persist_row_hash: self
+                .lookup_community(&new.community.community_key_id)
+                .await?
+                .map(|c| c.persist_row_hash)
+                .unwrap_or_default(),
+            change_envelope,
+            quorum_signatures: signatures,
+        });
+        group_amendment::supersede_community_signed(
+            self,
+            cohort::Cohort::Affiliations,
+            new,
+            Some(authorization),
+        )
+        .await
     }
 
     /// #249 Cut B — the INBOUND delegation walk: every key that holds a
@@ -7132,6 +8461,58 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v49.0.0 (CIRISPersist#908, #910; FSD `ROOM_ROSTER_AUTHORITY.md` §2, §4) —
+    /// a membership widening or revocation (a community's or a family's) whose
+    /// signatures verified, but whose signer set does not give it STANDING in
+    /// the group at the row's `effective_at`: the group's `consensus_protocol`
+    /// is not met by the signers who are active members (CC 4.4.3.2.3), the
+    /// row is not a member leaving on their own signature, no signer is a
+    /// named moderator live at that instant, or the change would leave members
+    /// with no founder. The row is not stored and a revocation does not rotate
+    /// the epoch. Stable `kind()` token `federation_roster_authority_unauthorized`.
+    ///
+    /// `rule` is one of [`ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED`] (RETRYABLE: a
+    /// signer has no event in the group yet — rows arrive out of order),
+    /// [`ROSTER_CONSENSUS_INSUFFICIENT`], [`ROSTER_CONSENSUS_UNEVALUABLE`] or
+    /// [`ROSTER_LAST_FOUNDER`].
+    #[error(
+        "roster change in group {group_key_id:?} signed by {offered_authority_key_id:?} \
+         has no standing ({rule}): a valid signature proves who signed, not that the \
+         group's consensus_protocol is met (CIRISPersist#908)"
+    )]
+    RosterAuthorityUnauthorized {
+        /// The community or family whose roster the row would change.
+        group_key_id: String,
+        /// The primary signer (every signature, co-signers included, verified).
+        offered_authority_key_id: String,
+        /// Which clause refused; one of the rule tokens above.
+        rule: &'static str,
+    },
+
+    /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — a
+    /// membership LISTING (CC 2 `listed`) whose signature verified but which
+    /// the listing door refuses. Nothing is stored. Stable `kind()` token
+    /// `federation_membership_listing_refused`.
+    ///
+    /// `rule` is one of [`listing::LISTED_RULE_NOT_SELF_ASSERTED`] (the signer
+    /// is not the member — the clause that keeps the field an opt-in rather
+    /// than a power), [`listing::LISTED_RULE_BAD_VALUE`] (a value other than
+    /// `public`) or [`listing::LISTED_RULE_SCOPE_INVALID`] (the id names a
+    /// family, whose membership is structurally invisible). None is retryable.
+    #[error(
+        "membership listing in {community_key_id:?} signed by {offered_authority_key_id:?} \
+         refused ({rule}): only the member may list their own membership, and only as \
+         `public` (CIRISPersist#912)"
+    )]
+    MembershipListingRefused {
+        /// The group the listing names.
+        community_key_id: String,
+        /// The signer (whose signature DID verify).
+        offered_authority_key_id: String,
+        /// Which clause refused; one of the `listing::LISTED_RULE_*` tokens.
+        rule: &'static str,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3b). The submitted `scores`
     /// attestation's `dimension` failed one of the four
     /// operational-language tests (FSD-002 §1.10.1): rules/verdicts
@@ -8563,6 +9944,8 @@ impl Error {
             Error::LocationAuthorityUnauthorized { .. } => {
                 "federation_location_authority_unauthorized"
             }
+            Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }

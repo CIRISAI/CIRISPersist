@@ -728,7 +728,7 @@ pub mod two_node {
             "{tag} I63: the removal is newer than the mint"
         );
         let rev = ts::sign_community_membership_revocation(
-            &comm,
+            &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: xavier.clone(),
@@ -1193,7 +1193,7 @@ pub mod two_node {
         let removed_at = chrono::Utc::now();
         let effective_at = removed_at + chrono::Duration::milliseconds(400);
         let rev = ts::sign_community_membership_revocation(
-            &comm,
+            &xavier, /* v49.0.0 (#908): the member leaves on their own signature */
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: xavier.clone(),
@@ -1384,8 +1384,9 @@ pub mod two_node {
         );
         // (3) alice removed, effective before a later set's asserted_at: the
         // principal is no longer a member — refused.
+        // v49.0.0 (#908): alice leaves on her own signature.
         let rev = ts::sign_community_membership_revocation(
-            &comm,
+            &alice,
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: alice.clone(),
@@ -2300,13 +2301,24 @@ mod tests {
     #[test]
     fn i59_key_grant_is_the_sixteenth_kind_with_the_stated_policy_row() {
         use crate::federation::replication_policy::*;
-        // v48.0.0 appended the 17th (`CommunityMembershipWidening`, #860);
-        // KeyGrant stays at index 15.
-        assert_eq!(EnvelopeKind::ALL.len(), 17);
+        // v48.0.0 appended the 17th (`CommunityMembershipWidening`, #860),
+        // v49.0.0 the 18th (`FamilyMembershipWidening`, #910) and the 19th
+        // (`CommunityMembershipListing`, #912); KeyGrant stays at index 15.
+        assert_eq!(EnvelopeKind::ALL.len(), 19);
         assert_eq!(
             EnvelopeKind::ALL[16],
             EnvelopeKind::CommunityMembershipWidening,
             "the 17th kind is appended after KeyGrant"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[17],
+            EnvelopeKind::FamilyMembershipWidening,
+            "the 18th kind is appended after CommunityMembershipWidening"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[18],
+            EnvelopeKind::CommunityMembershipListing,
+            "the 19th kind is appended after FamilyMembershipWidening"
         );
         assert_eq!(
             EnvelopeKind::ALL[15],
@@ -2327,7 +2339,7 @@ mod tests {
         );
         assert_eq!(
             REPLICATION_POLICY_HASH,
-            "9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19"
+            "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a"
         );
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("WIRE_VOCABULARY_KINDS.md"),

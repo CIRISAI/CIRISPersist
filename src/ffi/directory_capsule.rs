@@ -993,6 +993,26 @@ pub enum DirectoryOp {
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
     },
+    /// v49.0.0 (CIRISPersist#910) —
+    /// [`FederationDirectory::list_signed_family_membership_widenings_since`],
+    /// the family twin of [`DirectoryOp::ListSignedCommunityMembershipWideningsSince`].
+    /// Result rides `SignedFamilyMembershipWidenings`. APPEND-ONLY (Growth).
+    ListSignedFamilyMembershipWideningsSince {
+        /// Cursor (None ⇒ from start).
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// v49.0.0 (CIRISPersist#912) —
+    /// [`FederationDirectory::list_signed_community_membership_listings_since`],
+    /// the 19th kind's serve read. Result rides
+    /// `SignedCommunityMembershipListings`. APPEND-ONLY (Growth).
+    ListSignedCommunityMembershipListingsSince {
+        /// Cursor (None ⇒ from start).
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        /// Page cap.
+        limit: u32,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1223,6 +1243,12 @@ pub enum DirectoryOpResult {
     /// [`DirectoryOp::EvictKnownWireHashes`] (CIRISPersist#785) — evicted,
     /// remaining, and how far over bound the floor left it. APPEND-ONLY.
     KnownHashEviction(crate::federation::KnownHashEviction),
+    /// v49.0.0 (CIRISPersist#910) — `list_signed_family_membership_widenings_since`.
+    /// APPEND-ONLY (Growth).
+    SignedFamilyMembershipWidenings(Vec<crate::federation::ServedFamilyMembershipWidening>),
+    /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
+    /// APPEND-ONLY (Growth).
+    SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1898,6 +1924,24 @@ pub async fn dispatch_directory_op(
         DirectoryOp::EvictKnownWireHashes { cutoff, bound } => {
             match dir.evict_known_wire_hashes(cutoff, bound).await {
                 Ok(v) => DirectoryOpResult::KnownHashEviction(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedFamilyMembershipWideningsSince { since, limit } => {
+            match dir
+                .list_signed_family_membership_widenings_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedFamilyMembershipWidenings(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit } => {
+            match dir
+                .list_signed_community_membership_listings_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedCommunityMembershipListings(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -3201,6 +3245,24 @@ impl FederationDirectory for OpsDirectory {
             method: "put_community_membership_widening",
         })
     }
+    async fn put_family_membership_widening(
+        &self,
+        widening: crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), Error> {
+        let _ = widening;
+        Err(Error::Unsupported {
+            method: "put_family_membership_widening",
+        })
+    }
+    async fn put_community_membership_listing(
+        &self,
+        listing: crate::federation::SignedCommunityMembershipListing,
+    ) -> Result<(), Error> {
+        let _ = listing;
+        Err(Error::Unsupported {
+            method: "put_community_membership_listing",
+        })
+    }
     async fn list_identity_occurrence_revocations_for(
         &self,
         identity_key_id: &str,
@@ -3493,6 +3555,44 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedCommunityMembershipWidenings(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#910) — the family widening since-read, proxied
+    /// like the room's: a capsule consumer folds from the signed since-reads.
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedFamilyMembershipWidening>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedFamilyMembershipWideningsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedFamilyMembershipWidenings(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v49.0.0 (CIRISPersist#912) — the listing since-read, proxied like the
+    /// widening planes': a capsule consumer converges the 19th kind from it.
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::ServedCommunityMembershipListing>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedCommunityMembershipListingsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunityMembershipListings(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3846,6 +3946,24 @@ impl FederationDirectory for OpsDirectory {
         let _ = community_key_id;
         Err(Error::Unsupported {
             method: "list_community_membership_widenings_for",
+        })
+    }
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::FamilyMembershipWidening>, Error> {
+        let _ = family_key_id;
+        Err(Error::Unsupported {
+            method: "list_family_membership_widenings_for",
+        })
+    }
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::CommunityMembershipListing>, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "list_community_membership_listings_for",
         })
     }
     async fn list_location_proofs_for(
@@ -4618,7 +4736,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "e36a7660dc27121c56fb33c580cbcd9a3c2fbc5359775931ab812fa39d87e2dc",
+            "78bc01eff2751ddbb5a202e8e63c3833c425f3a3797efb8c6840d304ec0e99b3",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4651,7 +4769,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "5199d54a6f8a1ef0ad0c22d0984d29aeff071664e7a9ff1b8bb02020c3306cde",
+            "11ef765f51d36e2cf6cb72c9f38906fde813eec6e6af8b20c87451f3e25d687a",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

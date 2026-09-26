@@ -1,0 +1,24 @@
+-- V155 — the quorum proof a group amendment replicates with
+-- v49.0.0 (CIRISPersist#910 item 5, FSD ROOM_ROSTER_AUTHORITY.md §10)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V155__group_supersede_proof.sql
+--
+-- # Why
+--
+-- `supersede_family_with_quorum` / `supersede_community_with_quorum` rewrote
+-- the local group row and reached no peer: the replicated `put_family` kept
+-- its first copy, and `put_community` refused a differing record (#758). A
+-- peer can apply an amendment it did not witness only if the record carries
+-- what authorized it — the prior version's `persist_row_hash`, the change
+-- envelope the prior roster signed, and those signatures.
+--
+-- # What changes
+--
+-- A nullable `supersede_proof` column (a JSON `GroupSupersedeProof`) on
+-- `federation_families` and `federation_communities`. A quorum supersede
+-- writes it with the new version; any other write leaves it NULL. The signed
+-- since-reads serve it, and a NULL is omitted on the wire, so a record that
+-- never carried one keeps its bytes and content hash. Additive — a plain ADD
+-- COLUMN, no rebuild.
+ALTER TABLE federation_families ADD COLUMN supersede_proof TEXT;
+ALTER TABLE federation_communities ADD COLUMN supersede_proof TEXT;

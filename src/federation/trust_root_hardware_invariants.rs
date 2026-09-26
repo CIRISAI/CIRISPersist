@@ -266,20 +266,22 @@ pub mod bodies {
         let fresh = strongbox_evidence_at(now);
         assert!(
             policy
-                .check(&format!("{tag}-k"), Some(&stale), now)
+                .check(&format!("{tag}-k"), None, Some(&stale), now)
                 .is_err(),
             "{tag} I155: ADMISSION refuses a stale nonce"
         );
         assert!(
             policy
-                .check_structure(&format!("{tag}-k"), Some(&stale))
+                .check_structure(&format!("{tag}-k"), None, Some(&stale))
                 .is_ok(),
             "{tag} I155: VALIDITY accepts it — structure, no clock"
         );
         assert!(
-            policy.check(&format!("{tag}-k"), Some(&fresh), now).is_ok()
+            policy
+                .check(&format!("{tag}-k"), None, Some(&fresh), now)
+                .is_ok()
                 && policy
-                    .check_structure(&format!("{tag}-k"), Some(&fresh))
+                    .check_structure(&format!("{tag}-k"), None, Some(&fresh))
                     .is_ok(),
             "{tag} I155: a fresh nonce passes both"
         );

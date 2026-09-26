@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 96 delegations, generated. Every one: fault first, then delegate.
+// 103 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -142,19 +142,6 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.accord_nonce_issued(family_key_id, nonce).await
-    }
-    async fn add_family_member(
-        &self,
-        family_key_id: &str,
-        member: types::FamilyMember,
-        spec: &cohort::AdmitSpec,
-    ) -> Result<bool, Error> {
-        if let Some(e) = self.faulted("add_family_member") {
-            return Err(e);
-        }
-        self.inner
-            .add_family_member(family_key_id, member, spec)
-            .await
     }
     async fn apply_replicated_accord_evidence(
         &self,
@@ -252,6 +239,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.communities_containing(cell_id).await
     }
+    async fn community_roster_signers(
+        &self,
+        community_key_id: &str,
+    ) -> Result<CommunityRosterSigners, Error> {
+        if let Some(e) = self.faulted("community_roster_signers") {
+            return Err(e);
+        }
+        self.inner.community_roster_signers(community_key_id).await
+    }
     async fn enter_mesh(
         &self,
         attestation_id: &str,
@@ -297,6 +293,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.evict_known_wire_hashes(cutoff, bound).await
+    }
+    async fn family_roster_signers(
+        &self,
+        family_key_id: &str,
+    ) -> Result<CommunityRosterSigners, Error> {
+        if let Some(e) = self.faulted("family_roster_signers") {
+            return Err(e);
+        }
+        self.inner.family_roster_signers(family_key_id).await
     }
     async fn get_accord_decision(
         &self,
@@ -434,6 +439,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             .list_communities_for_member(member_identity_key_id)
             .await
     }
+    async fn list_community_membership_listings_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipListing>, Error> {
+        if let Some(e) = self.faulted("list_community_membership_listings_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_community_membership_listings_for(community_key_id)
+            .await
+    }
     async fn list_community_membership_revocations_for(
         &self,
         community_key_id: &str,
@@ -485,6 +501,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_family_membership_revocations_for(family_key_id)
+            .await
+    }
+    async fn list_family_membership_widenings_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<FamilyMembershipWidening>, Error> {
+        if let Some(e) = self.faulted("list_family_membership_widenings_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_family_membership_widenings_for(family_key_id)
             .await
     }
     async fn list_group_versions(
@@ -687,6 +714,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.list_signed_communities_since(since, limit).await
     }
+    async fn list_signed_community_membership_listings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedCommunityMembershipListing>, Error> {
+        if let Some(e) = self.faulted("list_signed_community_membership_listings_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_community_membership_listings_since(since, limit)
+            .await
+    }
     async fn list_signed_community_membership_revocations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -731,6 +770,18 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_signed_family_membership_revocations_since(since, limit)
+            .await
+    }
+    async fn list_signed_family_membership_widenings_since(
+        &self,
+        since: Option<(chrono::DateTime<chrono::Utc>, String)>,
+        limit: u32,
+    ) -> Result<Vec<ServedFamilyMembershipWidening>, Error> {
+        if let Some(e) = self.faulted("list_signed_family_membership_widenings_since") {
+            return Err(e);
+        }
+        self.inner
+            .list_signed_family_membership_widenings_since(since, limit)
             .await
     }
     async fn list_signed_identity_occurrence_revocations_since(
@@ -927,6 +978,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_community(community).await
     }
+    async fn put_community_membership_listing(
+        &self,
+        listing: SignedCommunityMembershipListing,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_community_membership_listing") {
+            return Err(e);
+        }
+        self.inner.put_community_membership_listing(listing).await
+    }
     async fn put_community_membership_revocation(
         &self,
         revocation: SignedCommunityMembershipRevocation,
@@ -963,6 +1023,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .put_family_membership_revocation(revocation)
             .await
+    }
+    async fn put_family_membership_widening(
+        &self,
+        widening: SignedFamilyMembershipWidening,
+    ) -> Result<(), Error> {
+        if let Some(e) = self.faulted("put_family_membership_widening") {
+            return Err(e);
+        }
+        self.inner.put_family_membership_widening(widening).await
     }
     async fn put_identity_occurrence(
         &self,

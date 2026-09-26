@@ -157,6 +157,87 @@ after `KeyGrant` — never inserts, the order is hashed:
 
 `FSD/ROOM_ROSTER_PLANES.md` is the design.
 
+## Replicated `EnvelopeKind`s — the eighteenth kind, `FamilyMembershipWidening` (v49.0.0, #910)
+
+Seventeen kinds shipped through v48.0.0; v49.0.0 **appends** the eighteenth
+after `CommunityMembershipWidening` — never inserts, the order is hashed:
+
+| # | `EnvelopeKind` | carries | signer | binding | projections |
+|---|---|---|---|---|---|
+| 18 | `FamilyMembershipWidening` | one row of `federation_family_membership_widenings`: `(family_key_id, member_key_id, effective_at)` + `joined_at`, `role`, `cosignatures` — the family addition plane, the twin of `CommunityMembershipWidening` | `RegisteredSigner` | `OwnerOf` | `[]` (E4: the row IS the projection) |
+
+- **Wire shape.** A `SignedFamilyMembershipWidening` is the widening row plus
+  the primary signer's hybrid scrub over its canonical (JCS) envelope with
+  `persist_row_hash` stripped, and any `cosignatures` over the same envelope
+  (omitted when empty). It rides `list_signed_family_membership_widenings_since`
+  (pair cursor; resume id = the three-part compound of the PK).
+- **Admission** (`tier_ingest::verify_family_membership_widening_admission`,
+  then `check_family_roster_authority`): the primary and every co-signature
+  verify; a future-dated row is refused
+  (`reject_future_dated_family_widening`); the signer set must meet the
+  family's own `consensus_protocol` at `effective_at` (the same
+  `roster_event_standing` rooms use; a family has no moderation plane); the
+  family must exist and the member must be a registered key; idempotent on the
+  three-part PK.
+- **Fold.** `authorized_family_roster_at`: the record's members, then the
+  family widening and revocation planes by `effective_at` (a removal wins a
+  tie), applying only events with standing. `active_family_members`,
+  `list_families_for_member_active`, the admission readers, the at-rest family
+  fan-out and `verify_membership_quorum`'s prior roster all read it.
+  `add_family_member` is the local door onto the plane; no door rewrites a
+  family record to grow it.
+- **The family revocation key** gains `effective_at` (V154): a re-added
+  member can be removed again; the since-read's resume id and the wire-index
+  record key are the three-part compound.
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `9d62d3a8…8a19` → `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae`;
+  `CONSENT_GRAMMAR_HASH` (`FamilyMembershipWidening` is `StructuralPlane`)
+  `07a677bb…64a9` → `62de16961aa7e631d999611b30bdcf9dc42c683e9e69a0c142b710609f9e133c`.
+
+`FSD/ROOM_ROSTER_AUTHORITY.md` §10 is the design.
+
+## Replicated `EnvelopeKind`s — the nineteenth kind, `CommunityMembershipListing` (v49.0.0, #912)
+
+Eighteen kinds through the #910 slice; v49.0.0 **appends** the nineteenth
+after `FamilyMembershipWidening` — never inserts, the order is hashed:
+
+| # | `EnvelopeKind` | carries | signer | binding | projections |
+|---|---|---|---|---|---|
+| 19 | `CommunityMembershipListing` | one row of `federation_community_membership_listings`: `(community_key_id, member_key_id, effective_at)` + `listed` (`"public"` or absent) — one member's CC 2 public-listing choice in one room | `RegisteredSigner` | `SelfOwn` | `[]` (the row IS the projection) |
+
+- **Wire shape.** A `SignedCommunityMembershipListing` is the listing row plus
+  the signer's hybrid scrub over its canonical (JCS) envelope with
+  `persist_row_hash` stripped. `listed` is omitted when absent (CC 2 spells a
+  private roster as the member absent). No co-signatures. It rides
+  `list_signed_community_membership_listings_since` (pair cursor; resume id =
+  the three-part compound of the PK).
+- **Admission** (`listing::check_community_membership_listing`, every
+  backend): the signature verifies; the signer IS the member, else
+  `Error::MembershipListingRefused` `envelope_listed_not_self_asserted` (the
+  clause that makes the field an opt-in and not a power); `listed` is `public`
+  or absent, else `envelope_listed_bad_value`; no future-dating; the room exists
+  (a family id is `envelope_listed_scope_invalid`, an unknown id the FK's
+  `InvalidArgument`); idempotent on the PK. Membership is NOT checked at the
+  door — rows arrive out of order.
+- **Fold.** `listed_members` / `listing::listed_community_members_at`: the
+  room's active members by `authorized_community_roster_at` whose latest
+  listing at or before the instant is `public`. Forward-only: clearing is a
+  later row with `listed` absent; nothing is rewritten. The only roster view a
+  non-member may be served (the host gates the endpoint).
+- **Vocabulary.** `listed` joined `universal_paths` (`paths::LISTED`):
+  `ENVELOPE_VOCABULARY_SHA256`
+  `4d7054a6…589b` → `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a`.
+  `history_on_join` is NOT adopted in v49.0.0 (a recorded decision; see the
+  re-pin log in `envelope.rs`).
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `7d0e97b4…4bae` → `5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a`;
+  `CONSENT_GRAMMAR_HASH` (`CommunityMembershipListing` is `StructuralPlane`)
+  `62de1696…133c` → `8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac`;
+  both directory-capsule wire digests (one op, one result appended — growth,
+  `DIRECTORY_ABI_VERSION` stays 5).
+
+`FSD/ROOM_ROSTER_AUTHORITY.md` §11 is the design.
+
 ---
 
 ## Why persist exposes no `send_trace_batch` wrapper

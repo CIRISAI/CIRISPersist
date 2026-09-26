@@ -55,7 +55,7 @@ fn a1_evidence() -> serde_json::Value {
 #[test]
 fn real_yubikey_custody_attestation_is_admitted_554() {
     let p = HardwareAttestationPolicy::default();
-    p.check("A1", Some(&a1_evidence()), chrono::Utc::now())
+    p.check("A1", None, Some(&a1_evidence()), chrono::Utc::now())
         .expect("#554: the real ceremony's custody attestation must be admissible");
 }
 
@@ -77,7 +77,7 @@ fn tampered_piv_cert_is_refused_naming_the_binding_554() {
     ev["body"]["yubikey_piv_attestation_9c_hex"] = serde_json::json!(tampered);
 
     let err = p
-        .check("A1", Some(&ev), chrono::Utc::now())
+        .check("A1", None, Some(&ev), chrono::Utc::now())
         .expect_err("#554: a tampered PIV cert must not be admitted");
     let msg = err.to_string();
     assert!(
@@ -104,7 +104,7 @@ fn tampered_chain_cert_is_refused_naming_the_binding_554() {
     ev["body"]["yubikey_attestation_chain_hex"][0] = serde_json::json!(tampered);
 
     let err = p
-        .check("A1", Some(&ev), chrono::Utc::now())
+        .check("A1", None, Some(&ev), chrono::Utc::now())
         .expect_err("#554: a tampered chain cert must not be admitted");
     assert!(
         err.to_string().contains("yubikey_attestation_chain"),
@@ -121,7 +121,7 @@ fn unknown_custody_tier_is_refused_naming_the_tier_554() {
     ev["body"]["signed_envelope"]["custody_tier"] = serde_json::json!("air_gapped_hsm_supreme");
 
     let err = p
-        .check("A1", Some(&ev), chrono::Utc::now())
+        .check("A1", None, Some(&ev), chrono::Utc::now())
         .expect_err("#554: an unrecognized custody tier must not be admitted");
     let msg = err.to_string();
     assert!(
@@ -136,7 +136,7 @@ fn unknown_custody_tier_is_refused_naming_the_tier_554() {
 fn custody_attestation_for_another_holder_is_refused_554() {
     let p = HardwareAttestationPolicy::default();
     let err = p
-        .check("B1", Some(&a1_evidence()), chrono::Utc::now())
+        .check("B1", None, Some(&a1_evidence()), chrono::Utc::now())
         .expect_err("#554: A1's custody attestation must not admit B1");
     assert!(
         err.to_string().contains("holder_key_id"),
@@ -231,6 +231,7 @@ async fn bundle_verifier_and_put_gate_agree_on_holder_evidence_554() {
     for h in &bundle.holders {
         p.check(
             &h.record.key_id,
+            ciris_persist::federation::hardware_attestation::record_ed25519(&h.record).as_deref(),
             h.record.attestation_evidence.as_ref(),
             chrono::Utc::now(),
         )

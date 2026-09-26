@@ -363,12 +363,10 @@ pub mod orchestrate {
             .map_err(map_dir_err)?;
         // v48.0.0 (CIRISPersist#860) — the wrap set is the one fold: a widened
         // member is wrapped at the next seal; a removed one is not.
-        let widenings = backend
-            .list_community_membership_widenings_for(&community.community_key_id)
+        // v49.0.0 (#908): only events whose signer has standing count.
+        let roster = crate::federation::authorized_community_roster_at(backend, community, now)
             .await
             .map_err(map_dir_err)?;
-        let roster =
-            crate::federation::active_roster_at(&community.members, &widenings, &revs, now);
         // The removal's EFFECTIVE instant, not the instant it was recorded:
         // a removal admitted with a (skew-window) future `effective_at` lets
         // a seal in between mint an epoch newer than `removed_at` that still
@@ -1781,8 +1779,9 @@ pub mod lifecycle_support {
     {
         use crate::federation::tier_ingest::test_support as ts;
         let now = chrono::Utc::now();
-        let signed = ts::sign_community_membership_revocation(
-            community_key_id,
+        // v49.0.0 (#908): signed as the room's protocol requires.
+        let signed = ts::sign_revocation_by_consensus(
+            backend,
             crate::federation::types::CommunityMembershipRevocation {
                 community_key_id: community_key_id.to_owned(),
                 removed_identity_key_id: removed_identity.to_owned(),
@@ -1792,7 +1791,8 @@ pub mod lifecycle_support {
                 witness_set: vec![],
                 persist_row_hash: String::new(),
             },
-        );
+        )
+        .await;
         backend
             .put_community_membership_revocation(signed.clone())
             .await
@@ -1853,9 +1853,11 @@ pub mod lifecycle_harness {
     /// v47.1.0 (CIRISPersist#861) — **the family twin of step 4b**: the trait
     /// documents BOTH removal doors as idempotent on their PK, and a consumer
     /// retrying after a partial failure (the shape I18 exists for) relies on
-    /// it. A repeat is `Ok` and changes nothing — unless it moves the removal
-    /// EARLIER, which replaces the stored revocation (fail-secure: family
-    /// removals may be scheduled; community ones may not, SecReview F4).
+    /// it. v49.0.0 (CIRISPersist#910.1, V154): the family PK carries
+    /// `effective_at`, so an EXACT repeat is the no-op, and an earlier removal
+    /// (a scheduled family removal a guardian now needs immediately) is
+    /// another event the fold honours at once — fail-secure acceleration, now
+    /// without rewriting the scheduled row.
     pub async fn exercise_family_revocation_repeat_861<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -1874,27 +1876,27 @@ pub mod lifecycle_harness {
             ],
         )
         .await;
-        let revoke = |effective_at: chrono::DateTime<chrono::Utc>| {
-            backend.put_family_membership_revocation(ts::sign_family_membership_revocation(
-                &fam,
+        let removal = |effective_at: chrono::DateTime<chrono::Utc>| {
+            // v49.0.0 (#910): bob leaves on his own signature.
+            ts::sign_family_membership_revocation(
+                &bob,
                 crate::federation::types::FamilyMembershipRevocation {
                     family_key_id: fam.clone(),
                     removed_identity_key_id: bob.clone(),
-                    removed_at: chrono::Utc::now(),
+                    removed_at: effective_at,
                     effective_at,
                     reason: None,
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
-            ))
+            )
         };
-        let stored_effective = || async {
-            let rows = backend
+        let stored_rows = || async {
+            backend
                 .list_family_membership_revocations_for(&fam)
                 .await
-                .unwrap_or_else(|e| panic!("{tag}: read back: {e}"));
-            assert_eq!(rows.len(), 1, "{tag}: one member, one revocation row");
-            rows[0].effective_at
+                .unwrap_or_else(|e| panic!("{tag}: read back: {e}"))
+                .len()
         };
         let bob_active = || async {
             backend
@@ -1907,7 +1909,9 @@ pub mod lifecycle_harness {
 
         // (1) A scheduled removal — bob stays active until it takes effect.
         let scheduled = chrono::Utc::now() + chrono::Duration::days(30);
-        revoke(scheduled)
+        let first = removal(scheduled);
+        backend
+            .put_family_membership_revocation(first.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag}: a scheduled family removal lands: {e}"));
         assert!(
@@ -1915,30 +1919,31 @@ pub mod lifecycle_harness {
             "{tag}: a future-dated removal leaves the member active"
         );
 
-        // (2) THE #861 RETRY — a repeat that does not move the removal earlier
-        // is Ok and changes nothing (sqlite and postgres returned UNIQUE here).
-        revoke(scheduled + chrono::Duration::days(10))
+        // (2) THE #861 RETRY — the exact row again is Ok and changes nothing
+        // (sqlite and postgres returned UNIQUE here before v47.1).
+        backend
+            .put_family_membership_revocation(first)
             .await
             .unwrap_or_else(|e| {
                 panic!("{tag}: #861 — a repeated family removal is a no-op, got {e}")
             });
         assert_eq!(
-            stored_effective().await.timestamp(),
-            scheduled.timestamp(),
-            "{tag}: a repeat that does not move the removal earlier changes nothing"
+            stored_rows().await,
+            1,
+            "{tag}: the exact repeat stored nothing"
         );
 
         // (3) ACCELERATION — fail-secure: a guardian who scheduled the
-        // removal and now needs it immediately gets it. A silent `Ok` that
-        // kept the 30-day date would report a removal that had not happened.
-        let now = chrono::Utc::now();
-        revoke(now)
+        // removal and now needs it immediately gets it: an earlier removal is
+        // another event, and the fold honours it now.
+        backend
+            .put_family_membership_revocation(removal(chrono::Utc::now()))
             .await
-            .unwrap_or_else(|e| panic!("{tag}: an earlier repeat accelerates the removal: {e}"));
+            .unwrap_or_else(|e| panic!("{tag}: an earlier removal accelerates: {e}"));
         assert_eq!(
-            stored_effective().await.timestamp(),
-            now.timestamp(),
-            "{tag}: the earlier effective_at replaced the scheduled one"
+            stored_rows().await,
+            2,
+            "{tag}: the earlier removal is a second event (#910.1)"
         );
         assert!(
             !bob_active().await,

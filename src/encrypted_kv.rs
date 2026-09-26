@@ -88,6 +88,15 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
+/// v49.0.0 (CIRISPersist#911) — HKDF `context` under which the durable MLS
+/// state store's key derives from persist's ONE hardware-sealed seed,
+/// beside `secrets-store-master-v1` and
+/// [`crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT`]
+/// ([`XChaChaKvStore::open_mls_state`]). **Stable wire constant** —
+/// changing it derives a different key, and every store opened under the
+/// old one then refuses with [`KVError::WrongPassphrase`].
+pub const MLS_STATE_CONTEXT: &str = "mls-state-at-rest-v1";
+
 /// XChaCha20-Poly1305 key length (bytes).
 const KEY_LEN: usize = 32;
 
@@ -149,6 +158,17 @@ pub enum KVError {
     /// Caller passed an invalid argument (empty namespace, reserved
     /// namespace, etc.).
     InvalidArgument(String),
+    /// v49.0.0 (CIRISPersist#911) — [`XChaChaKvStore::open_mls_state`]
+    /// found no hardware-sealed seed to root the store in: no TPM /
+    /// Keystore / Secure Enclave, a build without the `secrets` feature,
+    /// `CIRIS_DATA_DIR` unset, or (for a store already in use) a seed that
+    /// has gone missing. **This is the degraded posture, named.** The store
+    /// is not opened; nothing falls back to a derived or public passphrase.
+    /// The host chooses what it does instead — keep MLS state in memory
+    /// (today's behaviour: a restart loses group state), or open with
+    /// [`XChaChaKvStore::open`] and a passphrase the OPERATOR supplies
+    /// (FSD §7.8's phone-class tier). A room id is not a passphrase.
+    HardwareCustodyUnavailable(String),
 }
 
 impl std::fmt::Display for KVError {
@@ -162,6 +182,11 @@ impl std::fmt::Display for KVError {
             KVError::Crypto(m) => write!(f, "encrypted-kv: crypto fault: {m}"),
             KVError::Backend(m) => write!(f, "encrypted-kv: backend error: {m}"),
             KVError::InvalidArgument(m) => write!(f, "encrypted-kv: invalid argument: {m}"),
+            KVError::HardwareCustodyUnavailable(m) => write!(
+                f,
+                "encrypted-kv: no hardware-sealed seed to root the store in — not opened \
+                 (degraded posture; the host decides): {m}"
+            ),
         }
     }
 }
@@ -335,6 +360,55 @@ impl XChaChaKvStore {
     pub fn open_in_memory(passphrase: &[u8]) -> Result<Self, KVError> {
         let conn = Connection::open_in_memory().map_err(|e| KVError::Backend(e.to_string()))?;
         Self::from_connection(conn, passphrase)
+    }
+
+    /// v49.0.0 (CIRISPersist#911) — **open the durable MLS-state store at
+    /// `path`, keyed from persist's hardware-sealed seed.** The host passes
+    /// a path and nothing else: the key is HKDF-derived (by CIRISVerify)
+    /// from the same seed as the secrets master and the content-at-rest
+    /// master, under [`MLS_STATE_CONTEXT`], so every host gets the same key
+    /// custody and there is still one root to seal.
+    ///
+    /// Only the FIRST open of a store that holds nothing may seal a seed.
+    /// Reopening a store already in use re-derives and never mints
+    /// (`BLOB_ENCRYPTION_AT_REST.md` §11.7): a lost keyring with the TPM
+    /// still present would otherwise yield a different key and the state
+    /// would be unreadable while new writes went on.
+    ///
+    /// No hardware seed ⇒ [`KVError::HardwareCustodyUnavailable`], the
+    /// named degraded posture. **Synchronous / blocking** (TPM +
+    /// filesystem I/O) — call from `spawn_blocking`.
+    pub fn open_mls_state(path: impl AsRef<Path>) -> Result<Self, KVError> {
+        let conn = Connection::open(path).map_err(|e| KVError::Backend(e.to_string()))?;
+        Self::open_rooted(conn, hardware_mls_state_key)
+    }
+
+    /// The seed policy of [`open_mls_state`](Self::open_mls_state) over a
+    /// supplied derivation, so it is testable without a TPM (every CI
+    /// runner): `derive(create_seed_if_absent)` is asked to create only
+    /// when the store holds no verifier row yet.
+    fn open_rooted(
+        conn: Connection,
+        derive: impl FnOnce(bool) -> Result<Zeroizing<Vec<u8>>, KVError>,
+    ) -> Result<Self, KVError> {
+        let in_use = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'encrypted_kv'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+            && conn
+                .query_row(
+                    "SELECT 1 FROM encrypted_kv WHERE ns_blind = ?1 AND key_blind = ?2",
+                    rusqlite::params![VERIFIER_NS_BLIND.to_vec(), VERIFIER_KEY_BLIND.to_vec()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+        let key = derive(!in_use)?;
+        Self::from_connection(conn, &key)
     }
 
     fn from_connection(conn: Connection, passphrase: &[u8]) -> Result<Self, KVError> {
@@ -648,6 +722,23 @@ impl EncryptedKVStore for XChaChaKvStore {
     }
 }
 
+/// The production derivation behind [`XChaChaKvStore::open_mls_state`].
+fn hardware_mls_state_key(create_seed_if_absent: bool) -> Result<Zeroizing<Vec<u8>>, KVError> {
+    #[cfg(feature = "secrets")]
+    {
+        crate::secrets::hardware::derive_hardware_mls_state_key(create_seed_if_absent)
+            .map(|(key, _descriptor)| Zeroizing::new(key))
+            .map_err(|e| KVError::HardwareCustodyUnavailable(e.to_string()))
+    }
+    #[cfg(not(feature = "secrets"))]
+    {
+        let _ = create_seed_if_absent;
+        Err(KVError::HardwareCustodyUnavailable(
+            "built without the `secrets` feature — no hardware-sealed seed is reachable".into(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +927,120 @@ mod tests {
             return false;
         }
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // ── v49.0.0 (CIRISPersist#911) — the hardware-rooted MLS-state opener.
+    // The TPM branch is unreachable on CI, so the seed policy is driven
+    // through `open_rooted` with a stand-in derivation; the derivation
+    // itself is witnessed in `secrets::hardware`'s seed-policy tests.
+
+    fn derive_recording(
+        key: [u8; 32],
+        asked: &std::cell::Cell<Option<bool>>,
+    ) -> impl FnOnce(bool) -> Result<Zeroizing<Vec<u8>>, KVError> + '_ {
+        move |create| {
+            asked.set(Some(create));
+            Ok(Zeroizing::new(key.to_vec()))
+        }
+    }
+
+    /// I184 — only the FIRST open of an empty store may seal a seed; a
+    /// store in use re-derives (never mints), and its state survives the
+    /// reopen, which is the restart CIRISServer#630 needs.
+    #[tokio::test]
+    async fn i184_the_first_open_may_seal_a_reopen_never_mints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let asked = std::cell::Cell::new(None);
+        let s = XChaChaKvStore::open_rooted(
+            Connection::open(&path).unwrap(),
+            derive_recording([7; 32], &asked),
+        )
+        .unwrap();
+        assert_eq!(asked.get(), Some(true), "an empty store may seal the seed");
+        s.put("mls", b"group", b"epoch-state").await.unwrap();
+        drop(s);
+
+        let asked = std::cell::Cell::new(None);
+        let s = XChaChaKvStore::open_rooted(
+            Connection::open(&path).unwrap(),
+            derive_recording([7; 32], &asked),
+        )
+        .unwrap();
+        assert_eq!(
+            asked.get(),
+            Some(false),
+            "a store in use must never mint a seed"
+        );
+        assert_eq!(
+            s.get("mls", b"group").await.unwrap().as_deref(),
+            Some(&b"epoch-state"[..]),
+            "the state survives the restart"
+        );
+    }
+
+    /// I184 — a different key (another context, or a re-minted seed) is
+    /// refused by the verifier: the store never opens over state it cannot
+    /// read.
+    #[test]
+    fn i184_a_different_key_is_refused_not_reinitialised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let asked = std::cell::Cell::new(None);
+        drop(
+            XChaChaKvStore::open_rooted(
+                Connection::open(&path).unwrap(),
+                derive_recording([7; 32], &asked),
+            )
+            .unwrap(),
+        );
+        let err = XChaChaKvStore::open_rooted(
+            Connection::open(&path).unwrap(),
+            derive_recording([8; 32], &asked),
+        )
+        .err()
+        .expect("a different key must not open the store");
+        assert!(matches!(err, KVError::WrongPassphrase), "got {err}");
+    }
+
+    /// I184 — no hardware seed is the NAMED degraded posture: the store is
+    /// not opened and nothing is written. The public-id passphrase every
+    /// host used (`open_in_memory(room_id)`) is not a fallback.
+    #[test]
+    fn i184_no_hardware_seed_is_named_and_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let err = XChaChaKvStore::open_rooted(Connection::open(&path).unwrap(), |_| {
+            Err(KVError::HardwareCustodyUnavailable("no TPM".into()))
+        })
+        .err()
+        .expect("no seed must not open");
+        assert!(
+            matches!(err, KVError::HardwareCustodyUnavailable(_)),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("degraded posture"));
+        let conn = Connection::open(&path).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'encrypted_kv'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "a refused open must leave nothing behind");
+    }
+
+    /// I184 — the production opener on a build or host without hardware
+    /// custody answers by name, never by opening under something else. (On
+    /// a host that HAS a TPM and a data dir it opens; both outcomes are
+    /// named, and no third one exists.)
+    #[test]
+    fn i184_the_production_opener_answers_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        match XChaChaKvStore::open_mls_state(dir.path().join("mls.db")) {
+            Ok(_) | Err(KVError::HardwareCustodyUnavailable(_)) => {}
+            Err(other) => panic!("the opener answered outside its vocabulary: {other}"),
+        }
     }
 }

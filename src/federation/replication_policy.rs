@@ -125,12 +125,23 @@ pub enum EnvelopeKind {
     /// the addition plane, the mirror of the revocation (E4); the 17th kind, APPENDED. A forged
     /// widening is an unauthorized reader at the minter's next seal.
     CommunityMembershipWidening,
+    /// v49.0.0 (CIRISPersist#910) — `federation_family_membership_widenings`:
+    /// the family addition plane, the twin of [`Self::CommunityMembershipWidening`]
+    /// (E4); the 18th kind, APPENDED. A forged widening is an unauthorized
+    /// reader of every family-scoped write after it.
+    FamilyMembershipWidening,
+    /// v49.0.0 (CIRISPersist#912) — `federation_community_membership_listings`:
+    /// one member's CC 2 `listed` choice in one room; the 19th kind, APPENDED.
+    /// Self-owned ([`SignerBinding::SelfOwn`]): the only admissible signer is
+    /// the membership's subject. A forged listing would disclose a member who
+    /// did not choose it.
+    CommunityMembershipListing,
 }
 
 impl EnvelopeKind {
     /// Every kind, in the canonical (manifest-hashed) order. APPENDED, never
     /// inserted — the order is hashed.
-    pub const ALL: [EnvelopeKind; 17] = [
+    pub const ALL: [EnvelopeKind; 19] = [
         EnvelopeKind::Key,
         EnvelopeKind::Attestation,
         EnvelopeKind::Revocation,
@@ -148,6 +159,8 @@ impl EnvelopeKind {
         EnvelopeKind::AccordQuorumEvidence,
         EnvelopeKind::KeyGrant,
         EnvelopeKind::CommunityMembershipWidening,
+        EnvelopeKind::FamilyMembershipWidening,
+        EnvelopeKind::CommunityMembershipListing,
     ];
 
     /// The stable wire token (must match edge's `as_str`; pinned by hash).
@@ -171,6 +184,8 @@ impl EnvelopeKind {
             EnvelopeKind::AccordQuorumEvidence => "AccordQuorumEvidence",
             EnvelopeKind::KeyGrant => "KeyGrant",
             EnvelopeKind::CommunityMembershipWidening => "CommunityMembershipWidening",
+            EnvelopeKind::FamilyMembershipWidening => "FamilyMembershipWidening",
+            EnvelopeKind::CommunityMembershipListing => "CommunityMembershipListing",
         }
     }
 }
@@ -338,9 +353,21 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
         ),
         K::FamilyMembershipRevocation
         | K::CommunityMembershipRevocation
-        | K::CommunityMembershipWidening => (
+        | K::CommunityMembershipWidening
+        | K::FamilyMembershipWidening => (
             S::RegisteredSigner,
             B::OwnerOf,
+            PopOnInsert::NotApplicable,
+            &[],
+        ),
+        // v49.0.0 (#912): a listing is the MEMBER's own disclosure. The
+        // binding is `SelfOwn` — "the signer IS the subject" — not the roster
+        // planes' `OwnerOf`: no founder, moderator or consensus signs a
+        // member into public view (CC 2: the substrate does not solicit). The
+        // door enforces it as `envelope_listed_not_self_asserted`.
+        K::CommunityMembershipListing => (
+            S::RegisteredSigner,
+            B::SelfOwn,
             PopOnInsert::NotApplicable,
             &[],
         ),
@@ -422,8 +449,21 @@ pub fn replication_policy_sha256() -> String {
 /// `3af30bccf437679ecccba325e2db055824b4721eeac069fc30a38d7a0723bbef`
 /// (v31.1.0 – v44.2.1, the 15-kind era). CIRISServer re-pins; CIRISEdge adds
 /// the wire kind (its protocol enum mirrors the sixteen names in order).
+/// v48.0.0 (CIRISPersist#860) — re-pinned for the 17th kind
+/// ([`EnvelopeKind::CommunityMembershipWidening`]). Previous value:
+/// `c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d`.
+/// v49.0.0 (CIRISPersist#910) — re-pinned for the 18th kind
+/// ([`EnvelopeKind::FamilyMembershipWidening`], APPENDED; policy tuple
+/// identical to the community widening's). Previous value:
+/// `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19`
+/// (v48.0.0). CIRISEdge appends the 18th name to its protocol enum.
+/// v49.0.0 (CIRISPersist#912) — re-pinned for the 19th kind
+/// ([`EnvelopeKind::CommunityMembershipListing`], APPENDED; `RegisteredSigner`
+/// and `SelfOwn` — the member's own disclosure). Previous value:
+/// `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae` (the
+/// 18-kind v49.0.0 development value). CIRISEdge appends the 19th name.
 pub const REPLICATION_POLICY_HASH: &str =
-    "9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19";
+    "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a";
 
 #[cfg(test)]
 mod tests {
@@ -452,8 +492,19 @@ mod tests {
         }
         assert_eq!(
             EnvelopeKind::ALL.len(),
-            17,
-            "the wire-kind count is pinned (v48.0.0: +CommunityMembershipWidening)"
+            19,
+            "the wire-kind count is pinned (v49.0.0: +FamilyMembershipWidening, \
+             +CommunityMembershipListing)"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[17],
+            EnvelopeKind::FamilyMembershipWidening,
+            "the 18th kind is APPENDED after CommunityMembershipWidening (the order is hashed)"
+        );
+        assert_eq!(
+            EnvelopeKind::ALL[18],
+            EnvelopeKind::CommunityMembershipListing,
+            "the 19th kind is APPENDED after FamilyMembershipWidening (the order is hashed)"
         );
     }
 }
