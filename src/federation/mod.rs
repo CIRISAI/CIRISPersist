@@ -887,7 +887,7 @@ pub fn authorized_roster_state_at(
     fold_roster(record_members, rules, events, as_of).0
 }
 
-/// v49.0.0 (CIRISPersist#912, operator ruling 2026-09-25) — when each ACTIVE
+/// v49.0.0 (CIRISPersist#912, v49 ruling 2026-09-25, CC 2 opt-in) — when each ACTIVE
 /// member's current membership span began: `None` for a record member never
 /// removed (the fold counts record members from the record, never from their
 /// `joined_at`, so their span is open to the beginning of time), else the

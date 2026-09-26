@@ -125,7 +125,7 @@ where
 /// the member's current span, [`super::RosterSpans`]; `None` = open to the
 /// beginning of time) and at or before `as_of`, the latest. A row from before
 /// the span — made before joining, or in an earlier membership ended by a
-/// removal — does not count (operator ruling 2026-09-25: a listing belongs to
+/// removal — does not count (v49 ruling 2026-09-25, CC 2 opt-in: a listing belongs to
 /// the membership it was made in). The PK carries `effective_at`, so one
 /// member has at most one row per instant and "latest" is total.
 #[must_use]

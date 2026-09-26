@@ -6,7 +6,7 @@
 //! the founder cannot list anyone (`envelope_listed_not_self_asserted`, no row
 //! stored); a value other than `public` is refused (`envelope_listed_bad_value`);
 //! a later clear un-lists and both rows stay stored; a listing belongs to the
-//! membership span it was made in (operator ruling 2026-09-25) — a non-member's
+//! membership span it was made in (v49 ruling 2026-09-25, CC 2 opt-in) — a non-member's
 //! listing is stored and stays inert after they are widened in until they list
 //! again, a removed member's listing stops appearing, a removed-then-re-added
 //! member is unlisted until they list again, and a role change is not a new
@@ -285,7 +285,7 @@ pub mod bodies {
         );
 
         // ── a pre-join listing is stored and stays inert ──────────────
-        // (operator ruling 2026-09-25: a listing belongs to the membership it
+        // (v49 ruling 2026-09-25, CC 2 opt-in: a listing belongs to the membership it
         // was made in; consent outranks listing before joining)
         let dave = format!("{tag}-dave");
         ts::register_hybrid_key_as(d, &dave, &dave, identity_type::USER).await;
