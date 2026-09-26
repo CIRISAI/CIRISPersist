@@ -54,3 +54,24 @@ Also locked, built elsewhere: #914 — disclosure sets are blobs (the ruling is 
 Per slice: witnesses RED first, then green on every backend; a mutation round on the new predicate/door (table appended below by the slice); an independent review against this document. Release: the full unfiltered lanes (sqlite, postgres, union), the gate chain, `certify.sh full` on the exact SHA.
 
 ## 7. Mutation tables (appended by each slice)
+
+### #920 — the MLS-state root follows the content master
+
+**Opener:** `Engine::open_mls_state(&self, path: impl AsRef<Path>) -> Result<(XChaChaKvStore, MlsStateCustody), KVError>` (async; gated on `encrypted-kv`), where `MlsStateCustody { kind: MlsStateCustodyKind /* Hardware | Software */, descriptor: String }` and `kind.as_str()` is `"hardware"` / `"software"`. It reads, or initialises, the row through the new `BlobStorage::load_or_init_content_master_row` (sqlite, postgres; `load_or_init_content_master` now resolves that row), then calls `XChaChaKvStore::open_mls_state_from_row` (`pub(crate)`, no backend import) on the blocking pool. v49's `XChaChaKvStore::open_mls_state(path)` is removed. The error type is `KVError`, so hosts match `HardwareCustodyUnavailable` directly; a row-load failure is `KVError::Backend`.
+
+**Mechanism.** Both arms call CIRISVerify's `derive_symmetric_key` (HKDF-SHA-256, verify's salt, `info = MLS_STATE_CONTEXT`). The software arm passes the persisted master through an in-process, read-only, one-entry `SecureBlobStorage` that reports `is_hardware_backed() == false`. So the two arms share one mechanism and differ only in the root, and persist implements no KDF of its own.
+
+**Deviation from §2.** §2 said first-open-may-seal is unchanged. It is not. Under a `hardware` row the opener asks `create_seed_if_absent = false` on every open, including the first open of an empty store. The row's existence proves a seed was sealed when the row was written. An absent seed is §11.7's lost keyring, and minting there would also move the content master and orphan the corpus. So the only moment a seed may be sealed is the content-master row's own initialisation, which `open_mls_state` performs on a node with no row. `open_rooted` still reports `first_open` and the I184 witnesses stand, but nothing grants a mint from it.
+
+Lane: `scripts/pg_test_db.sh -- cargo nextest run -j 3 --features postgres,sqlite,encrypted-kv,secrets -E 'test(i184) | test(i187) | test(mls_state) | test(domain_separated) | test(content_master)'`. Baseline: 24/24 pass. Each mutant was applied to a clean committed tree and reverted before the next.
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M1 | software arm derives under `CONTENT_MASTER_CONTEXT` (collides with the content domain) | KILLED 23/24 | `i187_b_the_mls_key_is_domain_separated_from_the_content_master` |
+| M2 | software arm reports `kind: Hardware` | KILLED 18/24 | i187_a, i187_e, and the sqlite and postgres Engine legs `software_row_opens_as_software` and `no_row_initialises_it_and_reports_its_kind` |
+| M3 | §11.7 refusal replaced by minting (`hardware(true)`) | KILLED 21/24 | `i187_c_…refuses_and_writes_nothing`, `i187_c_a_present_tpm_with_an_absent_seed_never_mints`, `i187_d_…reopen_never_mints` |
+| M4 | the row-wins rule dropped (hardware preferred when available) | KILLED 20/24 | i187_a, i187_b, i187_e, `i187_a_malformed_row_refuses` |
+| M5 | v49's policy restored: may mint on a store's first open (`hardware(!path.exists())`) | KILLED 21/24 | the two i187_c legs and i187_d |
+| M6 | software arm uses the content master verbatim (no HKDF) | KILLED 21/24 | i187_b, and the sqlite and postgres `software_row_opens_as_software` legs |
+
+6/6 killed. The postgres legs ran against a fresh database under `pg_test_db.sh`, taking about 1.3–1.5 s each, so they did not pass vacuously. On this host `CIRIS_DATA_DIR` is unset, so the door-level hardware-row leg measured the refusal rather than skipping. The hardware arm is witnessed deterministically over `secrets::hardware::test_doubles::FakeHardwareStorage` through `derive_with_storage`, which is now `pub(crate)`.
