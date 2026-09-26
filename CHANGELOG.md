@@ -7,6 +7,12 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [50.0.0] - 2026-09-26
+
+### Changed — the second device (CIRISPersist#919, #916, #920, #917; FSD `SECOND_DEVICE.md`)
+
+**MAJOR.** TODO — filled at release from the slices.
+
 ## [49.0.0] - 2026-09-25
 
 ### Changed — roster standing is the group's consensus protocol (CIRISPersist#908, #907; FSD `ROOM_ROSTER_AUTHORITY.md`)
