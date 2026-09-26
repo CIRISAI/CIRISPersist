@@ -96,7 +96,7 @@ pub mod bodies {
     /// from a key id's first 32 bytes, and a uuid tag in front would give
     /// every member one keypair) on `d`. Returns the family id and the member
     /// key ids.
-    async fn make_family(
+    pub async fn make_family(
         d: &dyn FederationDirectory,
         tag: &str,
         fam_name: &str,
