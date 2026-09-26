@@ -2665,8 +2665,10 @@ pub trait FederationDirectory: Send + Sync {
     /// placed, never a candidate (CIRISPersist#919).** A row whose signed
     /// envelope names a target
     /// ([`admission::envelope_names_cohort_target`]: any populated
-    /// [`admission::COHORT_TARGET_ENVELOPE_FIELDS`] member) had its audience
-    /// chosen by its emitter; a covering grant does not re-place it. Every
+    /// [`admission::COHORT_TARGET_ENVELOPE_FIELDS`] member, or a blob
+    /// pointer's non-empty owner slot — how a self file row names its room)
+    /// had its audience chosen by its emitter; a covering grant does not
+    /// re-place it. Every
     /// backend applies the exclusion INSIDE the page (before `LIMIT`), so the
     /// keyset walk is unchanged.
     async fn list_widening_candidates(

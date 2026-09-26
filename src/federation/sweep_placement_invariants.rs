@@ -10,8 +10,14 @@
 //! self-room KeyPackage widened to `federation` seconds after `share` placed
 //! it, and the owner's second device never joined.
 //!
-//! I186 — on CIRISServer's self-files ladder (self FILE rows and the MLS
-//! KeyPackage in the owner's self room, a family file row, a consent grant
+//! A self FILE row names its room in a second place: Edge writes it with no
+//! top-level target, and the owner only in the blob pointer's slot
+//! (`content.community_key_id`), which is what Edge's self-room file read
+//! keys on. That slot is a placement too
+//! ([`crate::federation::blob_pointer::names_pointer_owner`]).
+//!
+//! I186 — on CIRISServer's self-files ladder (self FILE rows in Edge's real
+//! shape and the MLS KeyPackage in the owner's self room, a family file row, a consent grant
 //! covering `file:` and `chat:` at `federation`): (a) no self-room row is a
 //! widening candidate, and after the sweep none has a widening ANYWHERE in the
 //! corpus — metadata (filename, pointer) never leaves the room; this holds for
@@ -398,6 +404,13 @@ mod run {
             assert!(
                 pg.contains(&format!("-> '{f}'")),
                 "postgres misses {f}: {pg}"
+            );
+        }
+        // …and both carry the pointer owner-slot arm.
+        for (name, sql) in [("sqlite", &lite), ("postgres", &pg)] {
+            assert!(
+                sql.contains("content_sha256") && sql.matches("community_key_id").count() >= 2,
+                "{name} misses the pointer owner-slot arm: {sql}"
             );
         }
     }

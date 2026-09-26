@@ -12297,21 +12297,35 @@ pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Result<Option<&st
 }
 
 /// v50.0.0 (CIRISPersist#919) — **whether a row was PLACED**: its signed
-/// envelope names a cohort target under any populated alias in
-/// [`COHORT_TARGET_ENVELOPE_FIELDS`] (a non-empty string — the same reading
-/// as [`envelope_cohort_target`], which treats an empty or non-string value
-/// as no target). A split-brain row names targets, so it is placed too.
+/// envelope names the room or family it belongs to, in either of the two
+/// places a producer writes that:
+///
+/// 1. a populated top-level alias in [`COHORT_TARGET_ENVELOPE_FIELDS`] (a
+///    non-empty string — the same reading as [`envelope_cohort_target`],
+///    which treats an empty or non-string value as no target; a split-brain
+///    row names targets, so it is placed too). Chat rows and every targeted
+///    placement name it here;
+/// 2. a blob pointer's non-empty OWNER SLOT
+///    ([`super::blob_pointer::names_pointer_owner`]: the `community_key_id`
+///    of a pointer-shaped member, top level or an array item) — the room the
+///    bytes are held in. Edge's self FILE rows name their room ONLY here: a
+///    self room has no top-level cohort target, and Edge's self-room file
+///    read keys on the pointer's slot.
 ///
 /// A placed row's audience was chosen by its emitter (CC 3.1.9: `cohort_scope`
 /// is the emitter's per-envelope choice; CC 5.2 for `self`/`family`), so it is
 /// never a consent-sweep widening candidate: a covering grant says nothing
 /// about its audience, and a widening names only the NEW placement's target,
-/// which for `federation` is none — the room's own fold would find nothing.
+/// which for `federation` is none — the room's own read would find nothing,
+/// and the row's metadata (a file's name and pointer) would be published to
+/// the whole federation.
 ///
-/// This is the rule every backend's `list_widening_candidates` applies: memory
-/// calls it directly; sqlite and postgres render it with
+/// This is the rule every backend's `list_widening_candidates` applies, and
+/// the consent sweep's widening step: memory and the sweep call it directly;
+/// sqlite and postgres render it with
 /// [`sqlite_envelope_names_no_cohort_target`] /
-/// [`postgres_envelope_names_no_cohort_target`], built from the same constant.
+/// [`postgres_envelope_names_no_cohort_target`], built from the same constant
+/// and the same pointer discriminator.
 #[must_use]
 pub fn envelope_names_cohort_target(envelope: &serde_json::Value) -> bool {
     COHORT_TARGET_ENVELOPE_FIELDS.iter().any(|field| {
@@ -12319,17 +12333,32 @@ pub fn envelope_names_cohort_target(envelope: &serde_json::Value) -> bool {
             .get(*field)
             .and_then(serde_json::Value::as_str)
             .is_some_and(|v| !v.is_empty())
-    })
+    }) || super::blob_pointer::names_pointer_owner(envelope)
 }
 
 /// v50.0.0 (CIRISPersist#919) — the negation of
 /// [`envelope_names_cohort_target`] as a SQLite predicate over the TEXT JSON
-/// column `envelope_column`: for every alias, the member is absent, not a
-/// string, or empty. NULL-free (`IFNULL`), so an absent member reads as
-/// "names no target" rather than poisoning the conjunction.
+/// column `envelope_column`.
+///
+/// Alias arm: for every alias, the member is absent, not a string, or empty.
+/// NULL-free (`IFNULL`), so an absent member reads as "names no target"
+/// rather than poisoning the conjunction.
+///
+/// Pointer arm: no pointer-shaped object (a `content_sha256` of 64 hex beside
+/// a `community_key_id`) at a top-level member or an item of a top-level
+/// array carries a non-empty owner slot. The member set is OPEN (the Rust
+/// scan reads every member, by construction), so it is walked with
+/// `json_tree` restricted to exactly the positions the scan reads — a
+/// top-level member (`path = '$'`, not the root itself) or an item of a
+/// top-level array (`path` = that array's `fullkey`) — rather than a list of
+/// member paths persist would have to keep in step with its producers, and
+/// rather than a generated column (a migration, and a stored copy of a rule
+/// that would then need its own drift pin). `json_each` cannot be nested
+/// here: SQLite evaluates a table-valued function's argument on every row,
+/// and a scalar member's value is not JSON.
 #[must_use]
 pub fn sqlite_envelope_names_no_cohort_target(envelope_column: &str) -> String {
-    let arms: Vec<String> = COHORT_TARGET_ENVELOPE_FIELDS
+    let mut arms: Vec<String> = COHORT_TARGET_ENVELOPE_FIELDS
         .iter()
         .map(|f| {
             format!(
@@ -12338,15 +12367,30 @@ pub fn sqlite_envelope_names_no_cohort_target(envelope_column: &str) -> String {
             )
         })
         .collect();
+    arms.push(format!(
+        "NOT EXISTS (SELECT 1 FROM json_tree({envelope_column}) ptr \
+         WHERE ptr.type = 'object' \
+           AND ((ptr.path = '$' AND ptr.fullkey <> '$') \
+                OR ptr.path IN (SELECT top.fullkey FROM json_each({envelope_column}) top \
+                                WHERE top.type = 'array')) \
+           AND json_type(ptr.value, '$.content_sha256') = 'text' \
+           AND length(json_extract(ptr.value, '$.content_sha256')) = 64 \
+           AND json_extract(ptr.value, '$.content_sha256') NOT GLOB '*[^0-9a-fA-F]*' \
+           AND json_type(ptr.value, '$.community_key_id') = 'text' \
+           AND json_extract(ptr.value, '$.community_key_id') <> '')"
+    ));
     format!("({})", arms.join(" AND "))
 }
 
 /// v50.0.0 (CIRISPersist#919) — the Postgres twin of
 /// [`sqlite_envelope_names_no_cohort_target`]: for every alias, the member is
-/// absent, not a JSON string, or empty.
+/// absent, not a JSON string, or empty; and no pointer-shaped object at a
+/// top-level member or an item of a top-level array carries a non-empty
+/// owner slot (`jsonb_each` + `jsonb_array_elements`, the scan's two
+/// positions exactly).
 #[must_use]
 pub fn postgres_envelope_names_no_cohort_target(envelope_column: &str) -> String {
-    let arms: Vec<String> = COHORT_TARGET_ENVELOPE_FIELDS
+    let mut arms: Vec<String> = COHORT_TARGET_ENVELOPE_FIELDS
         .iter()
         .map(|f| {
             format!(
@@ -12355,6 +12399,22 @@ pub fn postgres_envelope_names_no_cohort_target(envelope_column: &str) -> String
             )
         })
         .collect();
+    arms.push(format!(
+        "NOT EXISTS (SELECT 1 FROM jsonb_each(CASE WHEN jsonb_typeof({envelope_column}::jsonb) \
+                                                  = 'object' \
+                                             THEN {envelope_column}::jsonb \
+                                             ELSE '{{}}'::jsonb END) top \
+         CROSS JOIN LATERAL (SELECT top.value AS v \
+                             UNION ALL \
+                             SELECT item FROM jsonb_array_elements( \
+                                 CASE WHEN jsonb_typeof(top.value) = 'array' \
+                                      THEN top.value ELSE '[]'::jsonb END) item) ptr \
+         WHERE jsonb_typeof(ptr.v) = 'object' \
+           AND jsonb_typeof(ptr.v -> 'content_sha256') = 'string' \
+           AND (ptr.v ->> 'content_sha256') ~ '^[0-9a-fA-F]{{64}}$' \
+           AND jsonb_typeof(ptr.v -> 'community_key_id') = 'string' \
+           AND (ptr.v ->> 'community_key_id') <> '')"
+    ));
     format!("({})", arms.join(" AND "))
 }
 
