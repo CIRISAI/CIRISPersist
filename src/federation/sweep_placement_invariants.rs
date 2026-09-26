@@ -162,7 +162,16 @@ pub mod bodies {
     ///
     /// `c-pointer-no-owner` carries a pointer whose owner slot is EMPTY (a
     /// non-community pointer): the slot names no room, so it is stranded.
-    pub const STRANDED: &[&str] = &["c-stranded", "c-empty-target", "c-pointer-no-owner"];
+    /// `c-pointer-nested` carries a pointer WITH an owner one level under an
+    /// object member: the pointer scan reads top-level members and array
+    /// items only, so it is stranded too — and a SQL form that walked deeper
+    /// would disagree with memory on (e).
+    pub const STRANDED: &[&str] = &[
+        "c-stranded",
+        "c-empty-target",
+        "c-pointer-no-owner",
+        "c-pointer-nested",
+    ];
 
     /// Seed the fixture on `d` and return the candidate read's ids that
     /// belong to it, suffix stripped and sorted (so three backends compare).
@@ -303,6 +312,20 @@ pub mod bodies {
             ),
         )
         .await;
+        put(
+            d,
+            row(
+                &id("c-pointer-nested"),
+                &node,
+                cohort_scope::SELF,
+                serde_json::json!({
+                    "dimension": "file:v1",
+                    "meta": { "content": edge_pointer(&id("c-pointer-nested"), &owner) },
+                }),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
 
         let tail = format!("-{s}");
         let mut got: Vec<String> = Vec::new();
@@ -406,12 +429,35 @@ mod run {
                 "postgres misses {f}: {pg}"
             );
         }
-        // …and both carry the pointer owner-slot arm.
-        for (name, sql) in [("sqlite", &lite), ("postgres", &pg)] {
-            assert!(
-                sql.contains("content_sha256") && sql.matches("community_key_id").count() >= 2,
-                "{name} misses the pointer owner-slot arm: {sql}"
-            );
+        // …and each carries the pointer owner-slot arm. The markers are the
+        // arm's OWN spellings (the alias arm also spells `community_key_id`,
+        // so a bare count of it cannot tell the arm is there).
+        for (name, sql, markers) in [
+            (
+                "sqlite",
+                &lite,
+                [
+                    "json_tree(",
+                    "ptr.value, '$.content_sha256'",
+                    "ptr.value, '$.community_key_id'",
+                ],
+            ),
+            (
+                "postgres",
+                &pg,
+                [
+                    "jsonb_array_elements(",
+                    "ptr.v ->> 'content_sha256'",
+                    "ptr.v ->> 'community_key_id'",
+                ],
+            ),
+        ] {
+            for m in markers {
+                assert!(
+                    sql.contains(m),
+                    "{name} misses the pointer owner-slot arm ({m:?}): {sql}"
+                );
+            }
         }
     }
 
