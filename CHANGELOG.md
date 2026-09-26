@@ -53,9 +53,9 @@ I185.
 
 `verify/hybrid.rs` called the permissive `ClassicalVerifier::verify` on the federation-row floor while the trace floor called `verify_strict`. A small-order key admits `(R = identity, s = 0)` against any message; `HybridPolicy::Strict`'s ML-DSA-65 half contained it. CIRISVerify v17 makes the trait method strict, and persist now calls `verify_strict` **by name** so the rule is stated at the call site. Operators holding federation rows from producers other than verify's own should re-verify them once.
 
-### Changed — CIRISVerify v16.1.0 → v17.0.0
+### Changed — CIRISVerify v16.1.0 → v17.1.0
 
-Seven Cargo pins and the wheel's `ciris-verify>=17.0.0,<18`. v16.2.1 makes every `SecureBlobStorage` report an absent key as `KeyNotFound` (CIRISVerify#288). Persist decides seed absence with `exists()`, so production is unaffected, and the hardware-storage test double now honours the contract. v17.0.0 adds strict Ed25519 (#913 above), the keyring supersede fix (CIRISVerify#292), and `AndroidChallengePolicy` (#915 above).
+Seven Cargo pins and the wheel's `ciris-verify>=17.1.0,<18`. v16.2.1 makes every `SecureBlobStorage` report an absent key as `KeyNotFound` (CIRISVerify#288). Persist decides seed absence with `exists()`, so production is unaffected, and the hardware-storage test double now honours the contract. v17.0.0 adds strict Ed25519 (#913 above), the keyring supersede fix (CIRISVerify#292), and `AndroidChallengePolicy` (#915 above). v17.1.0 stops reporting a lagging replica as a possible attack once per cycle (CIRISVerify#223); persist does not call that path.
 
 ### Pins moved
 `REPLICATION_POLICY_HASH` `9d62d3a8…8a19` → `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae`; `CONSENT_GRAMMAR_HASH` `07a677bb…64a9` → `62de16961aa7e631d999611b30bdcf9dc42c683e9e69a0c142b710609f9e133c` (the 18th kind; the grammar itself is unchanged); both directory-capsule wire digests re-pinned for appended variants (growth — `DIRECTORY_ABI_VERSION` stays 5). Migrations V153, V154 (and V155) with manifest rows.
