@@ -69,13 +69,19 @@ Per slice: witnesses RED first, then green on every backend; a mutation round on
 
 Lane: `scripts/pg_test_db.sh -- cargo nextest run -j 3 --features postgres,sqlite,encrypted-kv,secrets -E 'test(i184) | test(i187) | test(mls_state) | test(domain_separated) | test(content_master)'`. Baseline: 24/24 pass. Each mutant was applied to a clean committed tree and reverted before the next.
 
+**Review round (after the independent review; tree at `c8e12b3a`).** The first round's six mutants were re-run on the reviewed code and four new ones were added. The lane gains `test(seed)`. Baseline: 66/66.
+
 | # | Mutant | Result | Killed by |
 |---|---|---|---|
-| M1 | software arm derives under `CONTENT_MASTER_CONTEXT` (collides with the content domain) | KILLED 23/24 | `i187_b_the_mls_key_is_domain_separated_from_the_content_master` |
-| M2 | software arm reports `kind: Hardware` | KILLED 18/24 | i187_a, i187_e, and the sqlite and postgres Engine legs `software_row_opens_as_software` and `no_row_initialises_it_and_reports_its_kind` |
-| M3 | §11.7 refusal replaced by minting (`hardware(true)`) | KILLED 21/24 | `i187_c_…refuses_and_writes_nothing`, `i187_c_a_present_tpm_with_an_absent_seed_never_mints`, `i187_d_…reopen_never_mints` |
-| M4 | the row-wins rule dropped (hardware preferred when available) | KILLED 20/24 | i187_a, i187_b, i187_e, `i187_a_malformed_row_refuses` |
-| M5 | v49's policy restored: may mint on a store's first open (`hardware(!path.exists())`) | KILLED 21/24 | the two i187_c legs and i187_d |
-| M6 | software arm uses the content master verbatim (no HKDF) | KILLED 21/24 | i187_b, and the sqlite and postgres `software_row_opens_as_software` legs |
+| M1 | software arm derives under `CONTENT_MASTER_CONTEXT` | KILLED 65/66 | `i187_b_…domain_separated…` |
+| M2 | software arm reports `kind: Hardware` | KILLED 57/66 | i187_a, i187_e, i187_f fresh-stays-software, and the sqlite+postgres Engine legs (software row, no-row, v49 compat) |
+| M3 | §11.7 refusal replaced by minting (`hardware(true)`) | KILLED 63/66 | both i187_c tests, i187_d |
+| M4 | row-wins dropped: hardware preferred whenever available | KILLED 58/66 | i187_a, i187_a malformed, i187_b, i187_e, both i187_f units, both Engine v49 legs |
+| M5 | v49's may-mint-on-first-open (`hardware(!path.exists())`) | KILLED 63/66 | both i187_c tests, i187_d (in the combined run the mutant did not compile, so it was fixed and re-run alone) |
+| M6 | software arm uses the master verbatim, no HKDF | KILLED 63/66 | i187_b, and the sqlite+postgres software legs |
+| M7 | compat arm dropped (a v49 store under a software row is `WrongPassphrase`) | KILLED 62/66 | `i187_f_a_v49_store…`, `i187_f_the_compat_arm_never_mints`, both Engine v49 legs |
+| M8 | compat arm PREFERRED: hardware key tried first under a software row | KILLED 59/66 | i187_a, malformed, i187_b, **i187_e**, fresh-stays-software, both Engine v49 legs |
+| M9 | compat arm may mint (`hardware(true)`) | KILLED 64/66 | `i187_f_a_v49_store…` (asked to mint), `i187_f_the_compat_arm_never_mints` |
+| M10 | `SEED_MINT_LOCK` dropped | KILLED 65/66 | `concurrent_first_derivations_seal_one_seed` |
 
-6/6 killed. The postgres legs ran against a fresh database under `pg_test_db.sh`, taking about 1.3–1.5 s each, so they did not pass vacuously. On this host `CIRIS_DATA_DIR` is unset, so the door-level hardware-row leg measured the refusal rather than skipping. The hardware arm is witnessed deterministically over `secrets::hardware::test_doubles::FakeHardwareStorage` through `derive_with_storage`, which is now `pub(crate)`.
+10/10 killed; no `signal: 9`.
