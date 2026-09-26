@@ -91,6 +91,8 @@ pub mod bodies {
 
     /// Seed the fixture on `d` and return the candidate read's ids that
     /// belong to it, suffix stripped and sorted (so three backends compare).
+    /// Asserts nothing: (e) compares the sets, so a backend that drifts is
+    /// caught by the comparison, not only by its own expectation.
     pub async fn i186_candidate_set(d: &dyn FederationDirectory, s: &str) -> Vec<String> {
         // The distinguishing part LEADS every key id: the test signer seeds
         // from a key id's first 32 bytes.
@@ -192,6 +194,12 @@ pub mod bodies {
             );
         }
         got.sort();
+        got
+    }
+
+    /// **I186 — the candidate read returns the stranded rows only**, on `d`.
+    pub async fn i186_candidate_read_is_stranded_only(d: &dyn FederationDirectory, s: &str) {
+        let got = i186_candidate_set(d, s).await;
         let mut want: Vec<String> = STRANDED.iter().map(|n| (*n).to_owned()).collect();
         want.sort();
         assert_eq!(
@@ -200,7 +208,6 @@ pub mod bodies {
              target ({:?}) was placed by its emitter and is never a candidate (CIRISPersist#919)",
             PLACED
         );
-        got
     }
 }
 
@@ -217,7 +224,7 @@ mod run {
                 #[tokio::test]
                 async fn i186_candidate_read() {
                     let Some(d) = $fresh.await else { return };
-                    super::super::bodies::i186_candidate_set(
+                    super::super::bodies::i186_candidate_read_is_stranded_only(
                         &d as &dyn FederationDirectory,
                         &super::suffix(),
                     )
