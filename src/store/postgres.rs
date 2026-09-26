@@ -15271,13 +15271,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
         member_key_id: &str,
         wrap_algorithm: &str,
         wrapped_dek: &str,
-    ) -> Result<(), crate::federation::BlobError> {
+    ) -> Result<bool, crate::federation::BlobError> {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let ep = epoch as i64;
-        client
+        let inserted = client
             .execute(
                 "INSERT INTO cirislens.federation_community_dek_member_grants (\
                     community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
@@ -15298,7 +15298,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
                     "community_dek_put_member_grant: {e}"
                 ))
             })?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     async fn community_dek_put_member_grants(

@@ -14,19 +14,22 @@
 #[cfg(test)]
 pub(crate) mod bodies {
     use crate::federation::at_rest_cascade::orchestrate::{
-        rekey_community_member_device_add, DeviceRekeyResult, EpochMissReason,
+        rekey_community_member_device_add, rewrap_own_epochs_to_member_devices, DeviceRekeyResult,
+        EpochMissReason,
     };
     use crate::federation::at_rest_cascade::{unwrap_dek_v2_json, DEK_LEN};
-    use crate::federation::community_dek::orchestrate::ensure_epoch_dek;
+    use crate::federation::community_dek::orchestrate::{ensure_epoch_dek, set_key_state};
     use crate::federation::identity_aggregate::{mint_content_kem_keypair, ContentKemPrivate};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::types::{
         consensus_protocol, device_class, Community, CommunityMember,
-        CommunityMembershipRevocation, IdentityOccurrence,
+        CommunityMembershipRevocation, CommunityMembershipWidening, IdentityOccurrence,
+        IdentityOccurrenceRevocation,
     };
     use crate::federation::{
-        hard_case, BlobStorage, EncryptionPubkeys, Error, FederationDirectory, SignedAttestation,
+        hard_case, BlobStorage, DekKeyState, EncryptionPubkeys, Error, FederationDirectory,
+        GrantWrap, SignedAttestation,
     };
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use std::future::Future;
@@ -164,7 +167,9 @@ pub(crate) mod bodies {
         v
     }
 
-    /// **I188** — the whole invariant, arm by arm, on one fixture.
+    /// **I188** — the whole invariant, arm by arm, on one fixture. The
+    /// backend's own node key is `a1-{tag}` (the runner sets it), so an epoch
+    /// minted by `a1` is "ours" and every other minter is a peer.
     pub(crate) async fn i188_the_device_gets_what_the_member_holds<B>(
         b: &B,
         tag: &str,
@@ -180,27 +185,26 @@ pub(crate) mod bodies {
         let carol = format!("carol-{tag}");
         let alice_1 = format!("a1-{tag}");
         let bob_1 = format!("b1-{tag}");
+        // A bob device that later passes to carol (arm (i)).
+        let passed = format!("n1-{tag}");
 
         for k in [&comm, &alice, &bob, &carol, &alice_1, &bob_1] {
             ts::register_hybrid_key_as(b, k, k, USER).await;
         }
+        ts::register_identity_key(b, &passed, NODE).await;
         b.put_community(ts::sign_community(
             &comm,
             Community {
                 community_key_id: comm.clone(),
                 community_name: "second device".into(),
-                members: vec![
-                    CommunityMember {
-                        key_id: alice.clone(),
+                members: [(&alice, true), (&bob, false), (&carol, false)]
+                    .into_iter()
+                    .map(|(k, founder)| CommunityMember {
+                        key_id: k.clone(),
                         joined_at: at("2026-01-01T00:00:00Z"),
-                        role: Some("founder".into()),
-                    },
-                    CommunityMember {
-                        key_id: bob.clone(),
-                        joined_at: at("2026-01-01T00:00:00Z"),
-                        role: None,
-                    },
-                ],
+                        role: founder.then(|| "founder".to_owned()),
+                    })
+                    .collect(),
                 founded_at: at("2026-01-01T00:00:00Z"),
                 consensus_protocol: consensus_protocol::MAJORITY.to_owned(),
                 policy_blob: None,
@@ -214,6 +218,7 @@ pub(crate) mod bodies {
         let (bob_1_keys, bob_1_priv) = kem();
         occur(b, &alice, &alice_1, Some(alice_1_keys)).await;
         occur(b, &bob, &bob_1, Some(bob_1_keys)).await;
+        occur(b, &bob, &passed, Some(kem().0)).await;
 
         // Three epochs, two minters: alice-1 mints E1 and (after its own
         // rotation) E2; bob-1 mints E3. Every one fans out to bob-1.
@@ -340,6 +345,23 @@ pub(crate) mod bodies {
             );
         }
 
+        // (b') — the insert decides: a grant written by someone else between
+        // the pre-check and the put is `already_held`, not `granted`. The
+        // floor reports it (a second put of the same row inserts nothing).
+        assert!(
+            !b.community_dek_put_member_grant(
+                &comm,
+                &e1.0,
+                e1.1,
+                &bob_2,
+                crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2,
+                "b3RoZXI",
+            )
+            .await
+            .unwrap(),
+            "(b') a put over an existing grant reports no insert"
+        );
+
         // (c) — a device bound to ANOTHER owner is refused by name, and
         // receives nothing — whoever claims the authority.
         for authority in [&bob, &carol] {
@@ -396,35 +418,67 @@ pub(crate) mod bodies {
             "(f) the exclusion is recorded: {recorded:?}"
         );
 
-        // (g) — E2's DEK row is gone from this node: E2 is REPORTED, E1 and
-        // E3 are still granted.
+        // (g) — three epochs bob holds that this node cannot re-wrap, each
+        // reported with its own reason; E1 and E3 are still granted.
+        //   LostLocally — OUR epoch E2 (minter a1 = this node) lost its row.
         drop_dek_row(comm.clone(), e2.0.clone(), e2.1).await;
+        //   MintedElsewhere — a peer's epoch, known here only by bob-1's wrap.
+        let peer = (format!("pm-{tag}"), 0u64);
+        let bob_1_wrap = |w: String| GrantWrap {
+            recipient_key_id: bob_1.clone(),
+            wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.to_owned(),
+            wrapped_dek: w,
+        };
+        b.community_dek_put_member_grants(&comm, &peer.0, peer.1, &[bob_1_wrap("cGVlcg".into())])
+            .await
+            .unwrap();
+        //   Destroyed — an epoch of ours destroyed by policy, whose grant to
+        //   bob-1 came back through the KeyGrant union (an echo of our own set).
+        let gone = (format!("d1-{tag}"), 0u64);
+        ensure_epoch_dek(b, &comm, &gone.0, 0).await.unwrap();
+        let (_, saved) = b
+            .community_dek_member_grant_wrap(&comm, &gone.0, 0, &bob_1)
+            .await
+            .unwrap()
+            .expect("bob-1 is wrapped at mint");
+        b.community_dek_bump_epoch(&comm, &gone.0).await.unwrap();
+        set_key_state(b, &comm, &gone.0, 0, DekKeyState::Destroyed)
+            .await
+            .unwrap_or_else(|e| panic!("(g) destroy: {e}"));
+        b.community_dek_put_member_grants(&comm, &gone.0, 0, &[bob_1_wrap(saved)])
+            .await
+            .unwrap();
+
         let r = door(bob_4.clone(), bob.clone()).await.unwrap();
         assert_eq!(
             sorted(r.granted.clone()),
             sorted(vec![e1.clone(), e3.clone()]),
             "(g) the retained epochs are granted: {r:?}"
         );
-        assert_eq!(r.content_miss.len(), 1, "(g) {r:?}");
+        let mut misses: Vec<(String, u64, EpochMissReason)> = r
+            .content_miss
+            .iter()
+            .map(|m| (m.minter_key_id.clone(), m.epoch, m.reason))
+            .collect();
+        misses.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
+        let mut want = vec![
+            (e2.0.clone(), e2.1, EpochMissReason::LostLocally),
+            (peer.0.clone(), peer.1, EpochMissReason::MintedElsewhere),
+            (gone.0.clone(), gone.1, EpochMissReason::Destroyed),
+        ];
+        want.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
         assert_eq!(
-            (
-                r.content_miss[0].minter_key_id.clone(),
-                r.content_miss[0].epoch
-            ),
-            e2.clone(),
-            "(g) the unretained epoch is named"
+            misses, want,
+            "(g) every unretained epoch is named, by reason"
         );
-        assert_eq!(
-            r.content_miss[0].reason,
-            EpochMissReason::NotRetainedHere,
-            "(g)"
-        );
-        assert!(
-            !b.community_dek_has_member_grant(&comm, &e2.0, e2.1, &bob_4)
-                .await
-                .unwrap(),
-            "(g) nothing was granted on the unretained epoch"
-        );
+        for (m, e, _) in &want {
+            assert!(
+                !b.community_dek_has_member_grant(&comm, m, *e, &bob_4)
+                    .await
+                    .unwrap(),
+                "(g) nothing was granted on ({m}, {e})"
+            );
+        }
 
         // (h) — no epoch bump: every minter's pointer and epoch list is as
         // it was before any door ran (less the row arm (g) itself deleted).
@@ -457,14 +511,14 @@ pub(crate) mod bodies {
 
         // (e) — bob leaves the room (his own signature: self-leave); his next
         // device is refused and receives nothing.
-        let now = chrono::Utc::now();
+        let left = chrono::Utc::now();
         b.put_community_membership_revocation(ts::sign_community_membership_revocation(
             &bob,
             CommunityMembershipRevocation {
                 community_key_id: comm.clone(),
                 removed_identity_key_id: bob.clone(),
-                removed_at: now,
-                effective_at: now,
+                removed_at: left,
+                effective_at: left,
                 reason: None,
                 witness_set: vec![],
                 persist_row_hash: String::new(),
@@ -479,6 +533,115 @@ pub(crate) mod bodies {
             "(e) {e}"
         );
         assert_eq!(grants_on(b, &comm, &epochs, &bob_5).await, 0, "(e)");
+
+        // (i) — THE ABSENCE SPAN. While bob is out, E4 and E5 are minted
+        // (minter a2), and two keys that bob's history names come to hold
+        // them under someone else:
+        //   `passed` — bob's own device (a stale `(bob, n1)` row, holding
+        //   E1..E3 from bob's time) that passes to carol by an owner-binding
+        //   and is re-wrapped E4, E5 by the minter as carol's device;
+        //   `lent` — carol's occurrence while bob is out (E4, E5 by the fan-out),
+        //   then revoked and bound to bob.
+        let lent = format!("n2-{tag}");
+        ts::register_identity_key(b, &lent, NODE).await;
+        occur(b, &carol, &lent, Some(kem().0)).await;
+        b.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(
+                &format!("bind-carol-{passed}"),
+                &carol,
+                &passed,
+            ),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("(i) carol binds the passed device: {e}"));
+        let a2 = format!("a2-{tag}");
+        let e4 = (
+            a2.clone(),
+            ensure_epoch_dek(b, &comm, &a2, 0).await.unwrap().epoch,
+        );
+        b.community_dek_bump_epoch(&comm, &a2).await.unwrap();
+        let e5 = (
+            a2.clone(),
+            ensure_epoch_dek(b, &comm, &a2, 1).await.unwrap().epoch,
+        );
+        let absence = vec![e4.clone(), e5.clone()];
+        let swept = rewrap_own_epochs_to_member_devices(b, &a2, None, chrono::Utc::now())
+            .await
+            .unwrap_or_else(|e| panic!("(i) the minter's sweep: {e}"));
+        assert_eq!(
+            grants_on(b, &comm, &absence, &passed).await,
+            2,
+            "(i) precondition: the passed device holds E4, E5 as carol's ({swept:?})"
+        );
+        assert_eq!(
+            grants_on(b, &comm, &absence, &lent).await,
+            2,
+            "(i) precondition: carol's occurrence holds E4, E5"
+        );
+        assert_eq!(
+            grants_on(b, &comm, &absence, &bob_1).await,
+            0,
+            "(i) precondition: bob held nothing minted while he was out"
+        );
+        b.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+            identity_key_id: carol.clone(),
+            occurrence_key_id: lent.clone(),
+            revoked_at: chrono::Utc::now(),
+            effective_at: chrono::Utc::now(),
+            reason: None,
+            witness_set: vec![carol.clone()],
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("(i) carol revokes the lent occurrence: {e}"));
+        b.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&format!("bind-bob-{lent}"), &bob, &lent),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("(i) bob binds the lent device: {e}"));
+
+        // bob is re-added (alice and carol: the room's majority).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let back = chrono::Utc::now();
+        let mut w = ts::sign_community_membership_widening(
+            &alice,
+            CommunityMembershipWidening {
+                community_key_id: comm.clone(),
+                member_key_id: bob.clone(),
+                joined_at: back,
+                effective_at: back,
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_community_membership_widening(&mut w, &carol);
+        b.put_community_membership_widening(w)
+            .await
+            .unwrap_or_else(|e| panic!("(i) bob re-added: {e}"));
+
+        // bob's new device: what bob's devices held before he left (Option
+        // A), reported misses as before — and NOTHING from the absence span.
+        let bob_6 = format!("b6-{tag}");
+        device(b, &bob_6, Some(&bob), Some(kem().0), tag).await;
+        let r = door(bob_6.clone(), bob.clone())
+            .await
+            .unwrap_or_else(|e| panic!("(i) the re-added member's device: {e}"));
+        assert_eq!(
+            sorted(r.granted.clone()),
+            sorted(vec![e1.clone(), e3.clone()]),
+            "(i) the re-added member's device gets what bob held: {r:?}"
+        );
+        assert_eq!(
+            grants_on(b, &comm, &absence, &bob_6).await,
+            0,
+            "(i) nothing from the absence span reaches bob's device: {r:?}"
+        );
+        assert!(
+            r.content_miss
+                .iter()
+                .all(|m| !absence.contains(&(m.minter_key_id.clone(), m.epoch))),
+            "(i) the absence span is not even 'held': {r:?}"
+        );
     }
 }
 
@@ -510,12 +673,10 @@ mod run {
                 .unwrap();
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         };
-        super::bodies::i188_the_device_gets_what_the_member_holds(
-            b.as_ref(),
-            &format!("i188-{}", suffix()),
-            &drop,
-        )
-        .await;
+        let tag = format!("i188-{}", suffix());
+        // The node's own key: epochs minted by `a1-{tag}` are this node's.
+        b.set_node_key_id(format!("a1-{tag}"));
+        super::bodies::i188_the_device_gets_what_the_member_holds(b.as_ref(), &tag, &drop).await;
     }
 
     #[cfg(feature = "postgres")]
@@ -544,10 +705,412 @@ mod run {
                     .unwrap();
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         };
-        super::bodies::i188_the_device_gets_what_the_member_holds(
-            b.as_ref(),
-            &format!("i188-{}", suffix()),
-            &drop,
+        let tag = format!("i188-{}", suffix());
+        // The node's own key: epochs minted by `a1-{tag}` are this node's.
+        b.set_node_key_id(format!("a1-{tag}"));
+        super::bodies::i188_the_device_gets_what_the_member_holds(b.as_ref(), &tag, &drop).await;
+    }
+}
+
+/// v50.0.0 (CIRISPersist#916 review) — **the minter side, across two nodes,
+/// delivered through the planes.** Node A (alice's) minted the room's
+/// history; bob's node B is where bob adds a device. The device's owner-binding
+/// and occurrence travel B → A on the signed since-reads; A re-wraps its own
+/// epochs and emits the sets; B admits them and the device's wraps open.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod two_node {
+    use crate::federation::at_rest_cascade::orchestrate::EpochMissReason;
+    use crate::federation::at_rest_cascade::unwrap_dek_v2_json;
+    use crate::federation::community_dek::orchestrate::ensure_epoch_dek;
+    use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
+    use crate::federation::key_grant::{
+        publish_signed_content_only_occurrence, KeyGrantAxis, KeyGrantSet, SignedKeyGrantSet,
+        KEY_GRANT_EPOCH_ATTESTATION_TYPE,
+    };
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::cohort_scope::COMMUNITY;
+    use crate::federation::types::identity_type::NODE;
+    use crate::federation::types::{device_class, IdentityOccurrence};
+    use crate::federation::{
+        attestation_apply::ReplicatedAttestationOutcome, Attestation, BlobStorage,
+        FederationDirectory, SignedAttestation,
+    };
+
+    /// Every epoch-axis set on `backend` for `(comm, minter, epoch)`.
+    async fn sets_on<B: FederationDirectory + Sync>(
+        backend: &B,
+        comm: &str,
+        minter: &str,
+        epoch: u64,
+    ) -> Vec<(Attestation, KeyGrantSet)> {
+        backend
+            .list_attestations_since(None, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.attestation)
+            .filter(|a| a.attestation_type == KEY_GRANT_EPOCH_ATTESTATION_TYPE)
+            .filter_map(|a| KeyGrantSet::from_attestation(&a).ok().map(|s| (a, s)))
+            .filter(|(_, s)| {
+                matches!(&s.axis, KeyGrantAxis::Epoch { community_key_id, minter_key_id, epoch: e }
+                    if community_key_id == comm && minter_key_id == minter && *e == epoch)
+            })
+            .collect()
+    }
+
+    /// A set on `backend` for `(comm, minter, epoch)` that carries a wrap to
+    /// `device`, if any.
+    async fn set_carrying<B: FederationDirectory + Sync>(
+        backend: &B,
+        comm: &str,
+        minter: &str,
+        epoch: u64,
+        device: &str,
+    ) -> Option<Attestation> {
+        sets_on(backend, comm, minter, epoch)
+            .await
+            .into_iter()
+            .find(|(_, s)| s.wraps.iter().any(|w| w.recipient_key_id == device))
+            .map(|(a, _)| a)
+    }
+
+    /// A device node: its derived key registered as a NODE on both sides, its
+    /// singleton occurrence signed by itself on B (boot precedes claim), its
+    /// private KEM halves kept by the witness.
+    async fn device_on_b<B>(
+        a: &B,
+        b: &B,
+        alias: &str,
+    ) -> (
+        String,
+        crate::federation::identity_aggregate::ContentKemPrivate,
+    )
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let signer = ts::local_signer(alias);
+        let key = signer.derived_key_id();
+        for n in [a, b] {
+            ts::register_hybrid_key_as(n, &key, alias, NODE).await;
+        }
+        let (x_priv, x_pub, ml_priv, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        publish_signed_content_only_occurrence(
+            b,
+            &signer,
+            &key,
+            &key,
+            device_class::SERVER,
+            None,
+            crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(&ml_pub),
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{alias}: publish the singleton on B: {e}"));
+        (
+            key,
+            crate::federation::identity_aggregate::ContentKemPrivate {
+                x25519_priv: x_priv,
+                ml_kem_768_priv: ml_priv,
+                ml_kem_768_pub: ml_pub,
+            },
+        )
+    }
+
+    /// B's signed occurrence for `device`, carried to A (the since-read).
+    async fn carry_occurrence<B: FederationDirectory + Sync>(a: &B, b: &B, device: &str) {
+        let served = b
+            .list_signed_identity_occurrences_since(None, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == device)
+            .unwrap_or_else(|| panic!("{device}'s occurrence is on B's since-read"));
+        a.put_identity_occurrence(served.occurrence)
+            .await
+            .unwrap_or_else(|e| panic!("A admits {device}'s occurrence: {e}"));
+    }
+
+    /// bob's owner-binding for `device`, admitted on B, then read off B's
+    /// since-read — the row A's replication bridge would receive.
+    async fn bind_on_b<B: FederationDirectory + Sync>(
+        b: &B,
+        bob: &str,
+        device: &str,
+        run: &str,
+    ) -> Attestation {
+        let id = format!("bind-{device}-{run}");
+        b.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&id, bob, device),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("B admits bob's binding for {device}: {e}"));
+        b.list_attestations_since(None, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.attestation)
+            .find(|a| a.attestation_id == id)
+            .expect("the binding is on B's since-read")
+    }
+
+    /// **I188 (two nodes)** — the minter re-wraps its own history to the
+    /// member's new device on the binding's arrival (trigger), or in its
+    /// pending sweep when the device's keys arrive after the binding; the
+    /// host's door on the minter emits only what the minter minted.
+    pub(crate) async fn i188_the_minter_rewraps_its_own_history<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let bob = format!("em-bob-{run}");
+        let (a, b) = (l.ba.as_ref(), l.bb.as_ref());
+
+        // A mints E1..E3 through the production door (each seal emits its set).
+        for (i, body) in [&b"one"[..], &b"two"[..], &b"three"[..]]
+            .into_iter()
+            .enumerate()
+        {
+            if i > 0 {
+                a.community_dek_bump_epoch(&l.comm, &l.node_a)
+                    .await
+                    .unwrap();
+            }
+            l.engine_a
+                .put_blob_scoped(COMMUNITY, Some(&l.comm), body, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("A seals #{i}: {e}"));
+        }
+        let own: Vec<u64> = vec![0, 1, 2];
+        for e in &own {
+            assert!(
+                a.community_dek_has_member_grant(&l.comm, &l.node_a, *e, &l.node_b)
+                    .await
+                    .unwrap(),
+                "precondition: bob's node holds A's epoch {e} on A"
+            );
+        }
+        // B mints its own epoch; A admits B's set — a PEER's epoch on A.
+        l.engine_b
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"b's", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("B seals: {e}"));
+        let (b_set, _) = sets_on(b, &l.comm, &l.node_b, 0)
+            .await
+            .into_iter()
+            .next()
+            .expect("B emitted its set");
+        l.engine_a
+            .apply_replicated_key_grant(SignedKeyGrantSet { attestation: b_set })
+            .await
+            .unwrap_or_else(|e| panic!("A admits B's set: {e}"));
+        // And an epoch A holds a self-retention for under a FOREIGN minter's
+        // name: the door may re-wrap it locally, never sign a set for it.
+        let foreign = format!("fm-{run}");
+        ensure_epoch_dek(a, &l.comm, &foreign, 0).await.unwrap();
+
+        // (T) THE TRIGGER — bob's device d2 on B: its singleton, then bob's
+        // binding; both carried to A over the since-reads.
+        let (d2, d2_priv) = device_on_b(a, b, &format!("d2-{run}")).await;
+        let binding = bind_on_b(b, &bob, &d2, run).await;
+        carry_occurrence(a, b, &d2).await;
+        let outcome = l
+            .engine_a
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("(T) A admits bob's binding for d2: {e}"));
+        assert_eq!(outcome, ReplicatedAttestationOutcome::Inserted, "(T)");
+        for e in &own {
+            assert!(
+                a.community_dek_has_member_grant(&l.comm, &l.node_a, *e, &d2)
+                    .await
+                    .unwrap(),
+                "(T) A re-wrapped its epoch {e} to d2 on the binding's arrival"
+            );
+        }
+        assert!(
+            !a.community_dek_has_member_grant(&l.comm, &l.node_b, 0, &d2)
+                .await
+                .unwrap(),
+            "(T) A never wraps B's epoch: only B can sign that set"
+        );
+        // A's sets carry d2 → B admits them → d2's wraps on B open to the DEK
+        // bob's node already holds.
+        let b_priv = b.load_content_kem_private_halves().await.unwrap();
+        for e in &own {
+            let set = set_carrying(a, &l.comm, &l.node_a, *e, &d2)
+                .await
+                .unwrap_or_else(|| panic!("(T) A emitted a set for epoch {e} carrying d2"));
+            l.engine_b
+                .apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+                .await
+                .unwrap_or_else(|err| panic!("(T) B admits A's set for epoch {e}: {err}"));
+            let (_, d2_wrap) = b
+                .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &d2)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("(T) d2's wrap on A's epoch {e} reached B"));
+            let (_, bob_wrap) = b
+                .community_dek_member_grant_wrap(&l.comm, &l.node_a, *e, &l.node_b)
+                .await
+                .unwrap()
+                .expect("bob's node's own wrap on B");
+            assert_eq!(
+                unwrap_dek_v2_json(&d2_priv, &d2_wrap).unwrap(),
+                unwrap_dek_v2_json(&b_priv, &bob_wrap).unwrap(),
+                "(T) on B, d2 opens A's epoch {e} to the DEK bob's node holds"
+            );
+        }
+
+        // (S) THE SWEEP — d3's binding reaches A BEFORE its keys: nothing can
+        // be wrapped yet; the keys arrive; the pending sweep re-wraps and
+        // emits.
+        let (d3, _d3_priv) = device_on_b(a, b, &format!("d3-{run}")).await;
+        let binding = bind_on_b(b, &bob, &d3, run).await;
+        l.engine_a
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("(S) A admits bob's binding for d3: {e}"));
+        assert!(
+            !a.community_dek_has_member_grant(&l.comm, &l.node_a, 0, &d3)
+                .await
+                .unwrap(),
+            "(S) precondition: no keys on A yet, nothing wrapped"
+        );
+        carry_occurrence(a, b, &d3).await;
+        l.engine_a
+            .emit_pending_key_grants()
+            .await
+            .unwrap_or_else(|e| panic!("(S) A's pending sweep: {e}"));
+        for e in &own {
+            assert!(
+                a.community_dek_has_member_grant(&l.comm, &l.node_a, *e, &d3)
+                    .await
+                    .unwrap(),
+                "(S) the sweep re-wrapped A's epoch {e} to d3"
+            );
+            assert!(
+                set_carrying(a, &l.comm, &l.node_a, *e, &d3).await.is_some(),
+                "(S) and emitted epoch {e}'s set carrying d3"
+            );
+        }
+
+        // (D) THE HOST'S DOOR on the minter — d4 bound and keyed on A directly
+        // (no trigger): the door grants A's epochs, the foreign-named one
+        // locally, reports B's as minted elsewhere, and emits sets for A's
+        // own epochs only.
+        let d4_alias = format!("d4-{run}");
+        let d4 = ts::local_signer(&d4_alias).derived_key_id();
+        ts::register_hybrid_key_as(a, &d4, &d4_alias, NODE).await;
+        a.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&format!("bind-{d4}-{run}"), &bob, &d4),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("(D) bind d4 on A: {e}"));
+        let (d4_keys, _) = {
+            let (x_priv, x_pub, ml_priv, ml_pub) =
+                crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            (
+                crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(x_pub),
+                    ml_kem_768_base64: B64.encode(&ml_pub),
+                },
+                (x_priv, ml_priv),
+            )
+        };
+        a.put_identity_occurrence_local(IdentityOccurrence {
+            identity_key_id: d4.clone(),
+            occurrence_key_id: d4.clone(),
+            device_class: device_class::SERVER.to_owned(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now(),
+            valid_until: None,
+            encryption_pubkeys: Some(d4_keys),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap();
+        let r = l
+            .engine_a
+            .rekey_community_member_device_add(&l.comm, &bob, &d4, &bob)
+            .await
+            .unwrap_or_else(|e| panic!("(D) the door on A: {e}"));
+        let mut granted = r.granted.clone();
+        granted.sort();
+        let mut want: Vec<(String, u64)> = own.iter().map(|e| (l.node_a.clone(), *e)).collect();
+        want.push((foreign.clone(), 0));
+        want.sort();
+        assert_eq!(granted, want, "(D) {r:?}");
+        assert_eq!(
+            r.content_miss
+                .iter()
+                .map(|m| (m.minter_key_id.clone(), m.epoch, m.reason))
+                .collect::<Vec<_>>(),
+            vec![(l.node_b.clone(), 0, EpochMissReason::MintedElsewhere)],
+            "(D) B's epoch is B's to re-wrap: {r:?}"
+        );
+        for e in &own {
+            assert!(
+                set_carrying(a, &l.comm, &l.node_a, *e, &d4).await.is_some(),
+                "(D) the door emitted A's epoch {e} set carrying d4"
+            );
+        }
+        assert!(
+            sets_on(a, &l.comm, &foreign, 0).await.is_empty(),
+            "(D) no set is ever signed for an epoch this node did not mint"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod run_two_node {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i188_two_node_sqlite() {
+        super::two_node::i188_the_minter_rewraps_its_own_history(
+            "sqlite::memory:",
+            "sqlite::memory:",
+            &suffix(),
+            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::sqlite::SqliteBackend,
+                >,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i188_two_node_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        super::two_node::i188_the_minter_rewraps_its_own_history(
+            &a,
+            &b,
+            &suffix(),
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::postgres::PostgresBackend,
+                >,
         )
         .await;
     }

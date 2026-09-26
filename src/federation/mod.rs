@@ -689,8 +689,9 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
 
 /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
-/// no live owner-binding: nobody is responsible for it, so no member's history
-/// can be handed to it.
+/// no live owner-binding here: nobody is responsible for it, so no member's
+/// history can be handed to it. RETRYABLE: the out-of-order case — the owner's
+/// binding may not have replicated to this node yet.
 pub const DEVICE_REKEY_RULE_UNBOUND: &str = "device_rekey_unbound";
 /// v50.0.0 (CIRISPersist#916) — the device's live owner-binding names someone
 /// other than the member: another person's machine.
@@ -8515,11 +8516,14 @@ pub enum Error {
     /// granted. Authority is the member's owner-binding over the device, never
     /// roster governance. Stable `kind()` token `federation_device_rekey_refused`.
     ///
-    /// `rule` is one of [`DEVICE_REKEY_RULE_UNBOUND`],
+    /// `rule` is one of [`DEVICE_REKEY_RULE_UNBOUND`] (RETRYABLE: the
+    /// owner-binding may not have replicated yet),
     /// [`DEVICE_REKEY_RULE_OWNER_MISMATCH`],
     /// [`DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER`],
     /// [`DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE`] or
-    /// [`DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS`]. None is retryable as-is.
+    /// [`DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS`] (substantive until the
+    /// device registers keys). The rule rides the message across the FFI as
+    /// `"<kind>: <rule>"`.
     #[error(
         "re-wrap of {member_key_id:?}'s epochs in {community_key_id:?} to device \
          {occurrence_key_id:?} refused ({rule}): a new device receives what its member holds \

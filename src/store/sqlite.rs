@@ -14578,28 +14578,30 @@ impl crate::federation::BlobStorage for SqliteBackend {
         member_key_id: &str,
         wrap_algorithm: &str,
         wrapped_dek: &str,
-    ) -> Result<(), crate::federation::BlobError> {
+    ) -> Result<bool, crate::federation::BlobError> {
         let community = community_key_id.to_owned();
         let minter = minter_key_id.to_owned();
         let ep = epoch as i64;
         let member = member_key_id.to_owned();
         let alg = wrap_algorithm.to_owned();
         let wrapped = wrapped_dek.to_owned();
-        self.write(move |conn| -> Result<(), rusqlite::Error> {
-            conn.execute(
-                "INSERT INTO federation_community_dek_member_grants (\
-                    community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT (community_key_id, minter_key_id, epoch, member_key_id) DO NOTHING",
-                rusqlite::params![community, minter, ep, member, alg, wrapped],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("community_dek_put_member_grant: {e}"))
-        })?;
-        Ok(())
+        let inserted = self
+            .write(move |conn| -> Result<usize, rusqlite::Error> {
+                conn.execute(
+                    "INSERT INTO federation_community_dek_member_grants (\
+                        community_key_id, minter_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT (community_key_id, minter_key_id, epoch, member_key_id) DO NOTHING",
+                    rusqlite::params![community, minter, ep, member, alg, wrapped],
+                )
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_put_member_grant: {e}"
+                ))
+            })?;
+        Ok(inserted > 0)
     }
 
     async fn community_dek_put_member_grants(

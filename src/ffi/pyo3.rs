@@ -32655,6 +32655,13 @@ fn write_scope_refused_message(kind: &str, reason: &crate::scope::ScopeRefusalRe
     format!("{kind}: {}", reason.kind())
 }
 
+/// v50.0.0 (#916 review) — a refusal whose `rule` token decides what the
+/// caller does next (retry, or not) carries it across the FFI:
+/// `"<kind>: <rule>"`, the [`write_scope_refused_message`] shape.
+fn rule_refusal_message(kind: &str, rule: &str) -> String {
+    format!("{kind}: {rule}")
+}
+
 fn rate_limited_message(
     kind: &str,
     reason: crate::federation::PeerQuotaRefusal,
@@ -32884,14 +32891,25 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // authorization failure; ValueError (4xx). Location is self-knowledge:
         // a third party has no source for where a subject is. The `rule` field
         // separates the RETRYABLE out-of-order case (the `delegates_to` has not
-        // replicated yet) from a substantive verdict, but only `kind()` crosses
-        // the FFI — so a caller that must distinguish them reads the message.
-        crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
-        // v49.0.0 (#908) — the same standing-not-signature refusal as #734.
-        crate::federation::Error::RosterAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
+        // replicated yet) from a substantive verdict. v50.0.0 (#916 review):
+        // until this cut only `kind()` crossed the FFI, so the message a caller
+        // was told to read carried no rule; it now reads `"<kind>: <rule>"`
+        // (the `rate_limited_message` shape) — `except ValueError` and a
+        // `startswith(kind)` check are unchanged, an equality match breaks.
+        crate::federation::Error::LocationAuthorityUnauthorized { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
+        // v49.0.0 (#908) — the same standing-not-signature refusal as #734;
+        // `roster_authority_not_established` is the retryable rule.
+        crate::federation::Error::RosterAuthorityUnauthorized { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
         // v50.0.0 (#916) — a device re-wrap refused on the owner-binding, the
-        // roster or the device's keys: the same caller-side refusal, the same type.
-        crate::federation::Error::DeviceRekeyRefused { .. } => PyValueError::new_err(kind),
+        // roster or the device's keys: the same caller-side refusal, the same
+        // type; `device_rekey_unbound` is the retryable rule.
+        crate::federation::Error::DeviceRekeyRefused { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
         // v49.0.0 (#912) — a listing its door refuses (not the member's own,
         // or not `public`): the same caller-side refusal, the same type.
         crate::federation::Error::MembershipListingRefused { .. } => PyValueError::new_err(kind),
@@ -34922,6 +34940,37 @@ mod tests {
 
     /// v47.0.0 (CIRISPersist#797) — the AV-45 reason reaches the host, and
     /// the retryable one is distinguishable from the terminal ones.
+    #[test]
+    fn rule_refusals_carry_the_rule_across_the_ffi_916() {
+        let e = crate::federation::Error::DeviceRekeyRefused {
+            community_key_id: "c".into(),
+            member_key_id: "m".into(),
+            occurrence_key_id: "d".into(),
+            rule: crate::federation::DEVICE_REKEY_RULE_UNBOUND,
+        };
+        assert_eq!(
+            rule_refusal_message(e.kind(), crate::federation::DEVICE_REKEY_RULE_UNBOUND),
+            "federation_device_rekey_refused: device_rekey_unbound"
+        );
+        pyo3::Python::initialize();
+        for (e, want) in [
+            (e, "federation_device_rekey_refused: device_rekey_unbound"),
+            (
+                crate::federation::Error::RosterAuthorityUnauthorized {
+                    group_key_id: "g".into(),
+                    offered_authority_key_id: "a".into(),
+                    rule: crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
+                },
+                "federation_roster_authority_unauthorized: roster_authority_not_established",
+            ),
+        ] {
+            let py_err = federation_err_to_py(e);
+            pyo3::Python::attach(|py| {
+                assert_eq!(py_err.value(py).to_string(), want);
+            });
+        }
+    }
+
     #[test]
     fn write_scope_refused_message_carries_the_reason_797() {
         use crate::scope::ScopeRefusalReason as R;
