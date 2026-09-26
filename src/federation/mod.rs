@@ -704,6 +704,12 @@ pub const DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER: &str = "device_rekey_authority_
 /// (infrastructure operated for others) is not their device and receives none
 /// of their history. RETRYABLE: the occurrence may not have replicated yet.
 pub const DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE: &str = "device_rekey_not_an_occurrence";
+/// v50.0.0 (CIRISPersist#916 review, N1) — the backend does not know this
+/// node's own key (`node_key_id()` unset: a host that never told it), so it
+/// cannot tell its own epochs from a peer's. Refused rather than misreported;
+/// RETRYABLE once the host sets the key (every `Engine` constructor and
+/// PyEngine's init do).
+pub const DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN: &str = "device_rekey_node_key_unknown";
 /// v50.0.0 (CIRISPersist#916) — the member is not on the room's authorized
 /// roster at the call's instant: a removed member's new device gets nothing.
 pub const DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE: &str = "device_rekey_member_not_active";
@@ -8583,7 +8589,8 @@ pub enum Error {
     /// granted. Authority is the member's owner-binding over the device, never
     /// roster governance. Stable `kind()` token `federation_device_rekey_refused`.
     ///
-    /// `rule` is one of [`DEVICE_REKEY_RULE_UNBOUND`] (RETRYABLE: the
+    /// `rule` is one of [`DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN`] (RETRYABLE: the
+    /// host has not told the backend its key), [`DEVICE_REKEY_RULE_UNBOUND`] (RETRYABLE: the
     /// owner-binding may not have replicated yet),
     /// [`DEVICE_REKEY_RULE_OWNER_MISMATCH`],
     /// [`DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER`],

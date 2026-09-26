@@ -5090,6 +5090,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         device: &str,
     ) -> Result<(), crate::federation::Error> {
         let Some(me) = crate::federation::FederationDirectory::node_key_id(self) else {
+            // Not silent (#916 review, N1): with no node key this backend
+            // cannot know which epochs are its own, so it re-wraps none; the
+            // host that never set it is named in the log.
+            tracing::warn!(
+                owner = %owner,
+                device = %device,
+                "no node key set on this backend: the member-device re-wrap is skipped \
+                 (set it through an Engine / PyEngine constructor) (#916)"
+            );
             return Ok(());
         };
         crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(

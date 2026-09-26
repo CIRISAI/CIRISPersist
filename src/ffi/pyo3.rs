@@ -2298,6 +2298,20 @@ impl PyEngine {
             let key: Option<String> = py
                 .detach(|| runtime.block_on(crate::signing::federation_key_id_of(&*signer_for_key)))
                 .ok();
+            // v50.0.0 (CIRISPersist#916 review, N1) — tell the backend who
+            // this node is, exactly as the `Engine` constructors do
+            // (`set_backend_node_key_id`): the receive doors' re-wrap, the
+            // device door and every "do I trust this" gate ask the backend's
+            // `node_key_id()`, and a wheel host that never set it answered
+            // them as nobody.
+            if let Some(k) = key.as_deref() {
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => pg.set_node_key_id(k),
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => sq.set_node_key_id(k),
+                }
+            }
             match &backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {

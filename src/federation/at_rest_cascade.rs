@@ -1974,16 +1974,19 @@ pub mod orchestrate {
     /// door and the minter-side sweep. Authority is the CALLER's: both check
     /// the owner-binding and the roster before calling. Re-wraps every epoch
     /// the member's `holders` ([`member_holders`], computed once per member
-    /// by the caller) hold a grant on — only `only_minter`'s when set (the
+    /// by the caller) hold a grant on — only `me`'s when `only_mine` (the
     /// sweep re-wraps its own epochs and no one else's) — to `device`'s
-    /// `keys`, from persist's own self-retention row.
+    /// `keys`, from persist's own self-retention row. `me` is this node's
+    /// key, named by the caller: it decides `granted` vs `local_only` and
+    /// `minted_elsewhere` vs `lost_locally`, so it is never guessed here.
     async fn rewrap_held_epochs<B>(
         backend: &B,
         community_key_id: &str,
         holders: &[String],
         device: &str,
         keys: &EncryptionPubkeys,
-        only_minter: Option<&str>,
+        me: &str,
+        only_mine: bool,
     ) -> Result<DeviceRekeyResult, crate::federation::Error>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -1996,7 +1999,7 @@ pub mod orchestrate {
             .await
             .map_err(blob)?
             .into_iter()
-            .filter(|(m, _)| only_minter.is_none_or(|o| o == m.as_str()))
+            .filter(|(m, _)| !only_mine || m == me)
             .collect();
 
         let mut result = DeviceRekeyResult {
@@ -2006,7 +2009,6 @@ pub mod orchestrate {
         if held.is_empty() {
             return Ok(result);
         }
-        let node_key = backend.node_key_id();
         let content_master = backend.load_or_init_content_master().await.map_err(blob)?;
         for (minter, epoch) in held {
             if backend
@@ -2032,7 +2034,7 @@ pub mod orchestrate {
                     .is_some()
                 {
                     EpochMissReason::Destroyed
-                } else if node_key.as_deref().is_some_and(|k| k != minter) {
+                } else if minter != me {
                     EpochMissReason::MintedElsewhere
                 } else {
                     EpochMissReason::LostLocally
@@ -2065,7 +2067,7 @@ pub mod orchestrate {
                 .map_err(blob)?
             {
                 result.already_held.push((minter, epoch));
-            } else if node_key.as_deref() == Some(minter.as_str()) {
+            } else if minter == me {
                 result.granted.push((minter, epoch));
             } else {
                 result.local_only.push((minter, epoch));
@@ -2102,6 +2104,8 @@ pub mod orchestrate {
     /// is acting and must be that owner. Refused as
     /// [`Error::DeviceRekeyRefused`](crate::federation::Error::DeviceRekeyRefused)
     /// by rule, before anything is written:
+    /// 0. the backend must know this node's key (`node_key_id()`) — else
+    ///    `device_rekey_node_key_unknown`: it decides what is this node's own;
     /// 1. `owner_of(new_occurrence_key_id)` must be `member_key_id` — an
     ///    unbound device is `device_rekey_unbound` (retryable: the binding may
     ///    not have replicated yet), one bound to another person
@@ -2134,6 +2138,15 @@ pub mod orchestrate {
             member_key_id: member_key_id.to_owned(),
             occurrence_key_id: new_occurrence_key_id.to_owned(),
             rule,
+        };
+
+        // 0 — who THIS node is decides which epochs are its own (`granted`,
+        // emitted) and which a peer's; a backend nobody told cannot answer,
+        // and a guess would misreport both. Refused, before anything else.
+        let Some(me) = backend.node_key_id() else {
+            return Err(refuse(
+                crate::federation::DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN,
+            ));
         };
 
         // 1 + 2 — the member's owner-binding over THIS machine.
@@ -2211,7 +2224,8 @@ pub mod orchestrate {
             &holders,
             new_occurrence_key_id,
             &keys,
-            None,
+            &me,
+            false,
         )
         .await
     }
@@ -2267,6 +2281,17 @@ pub mod orchestrate {
             std::collections::HashMap::new();
         let mut devices_of: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
+        // The narrow walk (a receive-door trigger, which also fires on every
+        // idempotent re-delivery) settles the cheap questions first: is this a
+        // device of the member at all, and in which rooms does the member hold
+        // an epoch of this minter's — so only those rooms fold a roster (#916
+        // review).
+        if let Some((m, d)) = only {
+            if !is_member_device(backend, m, d).await? {
+                return Ok(report);
+            }
+            holders_of.insert(m.to_owned(), member_holders(backend, m).await?);
+        }
         for community_key_id in backend.community_dek_communities().await.map_err(blob)? {
             if backend
                 .community_dek_epochs(&community_key_id, minter_key_id)
@@ -2275,6 +2300,17 @@ pub mod orchestrate {
                 .is_empty()
             {
                 continue;
+            }
+            if let Some((m, _)) = only {
+                if !backend
+                    .community_dek_member_grant_epochs(&community_key_id, &holders_of[m])
+                    .await
+                    .map_err(blob)?
+                    .iter()
+                    .any(|(minter, _)| minter == minter_key_id)
+                {
+                    continue;
+                }
             }
             let Some(community) = backend.lookup_community(&community_key_id).await? else {
                 continue;
@@ -2326,7 +2362,8 @@ pub mod orchestrate {
                         holders,
                         &device,
                         &keys,
-                        Some(minter_key_id),
+                        minter_key_id,
+                        true,
                     )
                     .await?;
                     for (_, epoch) in r.granted {

@@ -740,8 +740,66 @@ pub(crate) mod bodies {
     }
 }
 
+/// v50.0.0 (#916 review, N1) — a backend nobody told its node key (a host
+/// that never set it) cannot tell its own epochs from a peer's: the door
+/// refuses by name rather than misclassify, and the receive-door hook
+/// re-wraps nothing (logged).
+#[cfg(test)]
+pub(crate) async fn i188_no_node_key<B>(b: &B, tag: &str)
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    assert!(b.node_key_id().is_none(), "precondition: no node key");
+    let e = crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add(
+        b,
+        &format!("room-{tag}"),
+        &format!("bob-{tag}"),
+        &format!("b2-{tag}"),
+        &format!("bob-{tag}"),
+        chrono::Utc::now(),
+    )
+    .await
+    .expect_err("a backend with no node key must refuse");
+    match e {
+        crate::federation::Error::DeviceRekeyRefused { rule, .. } => assert_eq!(
+            rule,
+            crate::federation::DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN,
+            "the refusal names the missing key"
+        ),
+        other => panic!("expected DeviceRekeyRefused, got {other}"),
+    }
+    b.rewrap_own_epochs_for_device(&format!("bob-{tag}"), &format!("b2-{tag}"))
+        .await
+        .expect("the hook skips (logged), it does not fail the admitted row");
+}
+
 #[cfg(test)]
 mod run {
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i188_no_node_key_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::i188_no_node_key(&b, &format!("nk-{}", suffix())).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i188_no_node_key_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::i188_no_node_key(&b, &format!("nk-{}", suffix())).await;
+    }
+
     fn suffix() -> String {
         uuid::Uuid::new_v4().simple().to_string()
     }

@@ -5786,14 +5786,24 @@ impl Engine {
                 tracing::warn!(error = %e, "member-device re-wrap sweep failed (#916)");
             }
         }
+        self.emit_dirty_key_grants(&me).await
+    }
+
+    /// #848 §14 (V146) — the emission half of
+    /// [`emit_pending_key_grants`](Self::emit_pending_key_grants): every
+    /// dirty set `me` owes, signed and emitted — no re-wrap walk. v50.0.0
+    /// (#916 review, N2): what a receive door runs after its backend hook
+    /// already did the narrow re-wrap.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn emit_dirty_key_grants(&self, me: &str) -> Result<usize, crate::federation::BlobError> {
         let axes = match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => {
-                crate::federation::key_grant::dirty_axes(b.as_ref(), &me).await
+                crate::federation::key_grant::dirty_axes(b.as_ref(), me).await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => {
-                crate::federation::key_grant::dirty_axes(b.as_ref(), &me).await
+                crate::federation::key_grant::dirty_axes(b.as_ref(), me).await
             }
         }
         .map_err(|e| crate::federation::BlobError::Backend(format!("key_grant ledger: {e}")))?;
@@ -6626,6 +6636,28 @@ impl Engine {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#916 review, N1) — an `Engine` over a shared
+    /// backend (`from_shared*`) is built synchronously and never told the
+    /// backend its key; the #916 doors tell it before they need it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn ensure_backend_node_key(&self) {
+        let known = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+            }
+        };
+        if !known {
+            if let Ok(k) = self.local_derived_key_id().await {
+                self.set_backend_node_key_id(&k);
+            }
+        }
+    }
+
     /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
     /// new device receives exactly what the member holds**: every retained
     /// `(community, minter, epoch)` DEK the member holds a grant on is
@@ -6658,6 +6690,7 @@ impl Engine {
             crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
         })?;
         use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add;
+        self.ensure_backend_node_key().await;
         let now = chrono::Utc::now();
         let r = match &self.backend {
             #[cfg(feature = "postgres")]
@@ -8176,6 +8209,9 @@ impl Engine {
         // (grant rows, dirtying their epochs); THIS door, which holds a
         // signer, emits the dirtied sets at once instead of at the next sweep.
         let binding = crate::federation::owner_binding_of(&attestation.attestation);
+        if binding.is_some() {
+            self.ensure_backend_node_key().await;
+        }
         let outcome = self
             .federation_directory()
             .apply_replicated_attestation(attestation)
@@ -8185,7 +8221,13 @@ impl Engine {
             Some(_),
         ) = (&outcome, binding)
         {
-            if let Err(e) = self.emit_pending_key_grants().await {
+            let emitted = match self.local_derived_key_id().await {
+                Ok(me) => self.emit_dirty_key_grants(&me).await,
+                Err(e) => Err(crate::federation::BlobError::Backend(format!(
+                    "local derived key id: {e}"
+                ))),
+            };
+            if let Err(e) = emitted {
                 tracing::warn!(
                     error = %e,
                     "owner-binding admitted; the dirtied KeyGrant sets are left to the \
