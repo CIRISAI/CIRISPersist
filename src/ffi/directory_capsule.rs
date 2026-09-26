@@ -1604,11 +1604,21 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        // v50.0.0 (CIRISPersist#917) — the op is the stored-write door under
+        // the Sync origin, not the typed `put_attestation_synced`: that door's
+        // plan runs on the NEAR side (the proxy inherits the default body, and
+        // `get_attestation` crosses as its own op), so the op keeps answering
+        // `AttestationOutcome` and the ABI does not move.
         DirectoryOp::PutAttestationSynced {
             attestation,
             authenticated_peer_key_id,
         } => match dir
-            .put_attestation_synced(attestation, &authenticated_peer_key_id)
+            .put_attestation_with_origin(
+                attestation,
+                crate::federation::replication::admission::WriteOrigin::Sync {
+                    peer_key_id: authenticated_peer_key_id,
+                },
+            )
             .await
         {
             Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),

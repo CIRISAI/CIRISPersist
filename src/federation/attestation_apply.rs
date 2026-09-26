@@ -281,6 +281,85 @@ pub(crate) fn plan_replicated_attestation_apply(
     Ok(refused(AttestationRefusalReason::ConflictingAttestation))
 }
 
+/// v50.0.0 (CIRISPersist#917) — **the one body both typed Attestation-plane
+/// doors run**: fetch the stored row, run
+/// [`plan_replicated_attestation_apply`], act on the plan, and write an
+/// admitted row through the stored-write door under `origin`.
+///
+/// [`apply_replicated_attestation`](super::FederationDirectory::apply_replicated_attestation)
+/// passes [`WriteOrigin::Wire`](super::replication::admission::WriteOrigin::Wire);
+/// [`put_attestation_synced`](super::FederationDirectory::put_attestation_synced)
+/// passes [`WriteOrigin::Sync`](super::replication::admission::WriteOrigin::Sync)
+/// naming the authenticated peer. Origin changes WHICH budget a fresh row is
+/// metered against (the cohort question stays inside the write door) and
+/// nothing else, so the same bytes classify to the same outcome on both
+/// doors by construction — before #917 the synced door ran a binary
+/// `persist_row_hash` verdict instead and booked a decoration-only
+/// re-delivery as `Error::Conflict` while this body booked it as a duplicate.
+pub(crate) async fn apply_planned<D>(
+    dir: &D,
+    attestation: super::SignedAttestation,
+    origin: super::replication::admission::WriteOrigin,
+) -> Result<ReplicatedAttestationOutcome, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    use super::precedence;
+    use ReplicatedAttestationOutcome as Outcome;
+    use ReplicatedAttestationPlan as Plan;
+    let incoming = &attestation.attestation;
+    let attestation_id = incoming.attestation_id.clone();
+    // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
+    // learns a member has a device; read before the row is moved.
+    let binding = super::owner_binding_of(incoming);
+    // The §6.1 silent-no-op door only exists for structural composers
+    // that actually carry a references target — precompute the predicate
+    // while `incoming` is still borrowed.
+    let dedup_possible = precedence::is_structural_composer(&incoming.attestation_type)
+        && precedence::references_attestation_id_from_envelope(&incoming.attestation_envelope)
+            .is_some();
+    let planned = match dir.get_attestation(&attestation_id).await {
+        Ok(existing) => Some(plan_replicated_attestation_apply(
+            existing.as_ref(),
+            incoming,
+        )?),
+        // The #603 arm: this directory cannot answer, so apply plan-free.
+        Err(Error::Unsupported { .. }) => None,
+        // Every other failure is *could not ask*, which is never *absent*.
+        Err(e) => return Err(e),
+    };
+    match planned {
+        Some(Plan::Unchanged) => return Ok(Outcome::Unchanged),
+        Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
+        Some(Plan::Insert) | None => {}
+    }
+    match dir.put_attestation_with_origin(attestation, origin).await {
+        Ok(_) => {
+            // §6.1: a structural-composer replay is a silent `Ok` with NO
+            // row written. Ask the store what it actually did, so
+            // `Inserted` keeps meaning inserted. Skipped on the plan-free
+            // fallback (this directory cannot be asked).
+            if dedup_possible
+                && planned.is_some()
+                && dir.get_attestation(&attestation_id).await?.is_none()
+            {
+                return Ok(Outcome::Deduplicated);
+            }
+            // v50.0.0 (CIRISPersist#916, #917) — the ONE re-wrap site for both
+            // typed doors: a row the store actually inserted, never a settled
+            // one.
+            if let Some((owner, device)) = binding {
+                super::rewrap_after_admission(dir, &owner, &device).await;
+            }
+            Ok(Outcome::Inserted)
+        }
+        Err(e) if e.is_duplicate_key() => Ok(Outcome::Refused {
+            reason: AttestationRefusalReason::StoreConflict,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

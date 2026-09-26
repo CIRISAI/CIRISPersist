@@ -152,6 +152,9 @@ mod mls_state_root_invariants;
 // v50.0.0 (CIRISPersist#916) — I188, a member's new device gets what the member holds.
 #[cfg(test)]
 mod device_readd_invariants;
+// v50.0.0 (CIRISPersist#917) — I189, the attributed sync door's typed outcome.
+#[cfg(test)]
+mod synced_door_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -2466,26 +2469,55 @@ pub trait FederationDirectory: Send + Sync {
     /// Not safe to expose across a wire: reaching this means in-process code
     /// on this node, the same boundary that lets that code write to storage
     /// directly.
+    ///
+    /// # v50.0.0 (CIRISPersist#917) — BREAKING: the typed pre-write outcome
+    ///
+    /// Returns [`attestation_apply::ReplicatedAttestationOutcome`] — the SAME
+    /// enum [`Self::apply_replicated_attestation`] returns, decided by the
+    /// SAME body ([`attestation_apply::apply_planned`]) over
+    /// `(existing, incoming)`, so the same bytes yield the same variant on
+    /// both doors:
+    ///
+    /// - absent id ⇒ `Inserted` (or `Deduplicated`, the §6.1 composer replay);
+    /// - byte-identical re-delivery ⇒ `Unchanged`;
+    /// - same signed assertion and producer, different unsigned decoration ⇒
+    ///   `Refused { AlreadyPresentIdentical }` — a duplicate, never a
+    ///   conflict;
+    /// - a different signed row under the id ⇒
+    ///   `Refused { ConflictingAttestation }`;
+    /// - a lost plan/act race ⇒ `Refused { StoreConflict }` (transient).
+    ///
+    /// The previous shape — `Ok(AttestationOutcome::AlreadyHeld)` for equal
+    /// `persist_row_hash`, a bare `Err(Error::Conflict)` for everything else
+    /// under an occupied id — is REMOVED (clean break). That verdict could
+    /// not tell decoration from disagreement, so CIRISEdge booked a
+    /// decoration-only re-delivery as a refusal on this door and as a
+    /// duplicate on the unattributed one.
+    ///
+    /// The peer and its metering are unchanged: an admitted fresh row is
+    /// written through [`Self::put_attestation_with_origin`] with
+    /// `WriteOrigin::Sync`, which decides the cohort question as above and
+    /// refuses a stranger over budget with the same
+    /// [`Error::RateLimited`] as before. A row the plan resolves against the
+    /// stored one (`Unchanged` / `Refused`) is decided before that door and
+    /// charges no budget — exactly as on the unattributed door, which any
+    /// caller already reaches.
+    ///
+    /// [`AttestationOutcome`] stays the return of the local doors
+    /// ([`Self::put_attestation`], [`Self::put_attestation_authored`]).
     async fn put_attestation_synced(
         &self,
         attestation: SignedAttestation,
         authenticated_peer_key_id: &str,
-    ) -> Result<AttestationOutcome, Error> {
-        let binding = owner_binding_of(&attestation.attestation);
-        let outcome = self
-            .put_attestation_with_origin(
-                attestation,
-                replication::admission::WriteOrigin::Sync {
-                    peer_key_id: authenticated_peer_key_id.to_owned(),
-                },
-            )
-            .await?;
-        // v50.0.0 (CIRISPersist#916) — a member's device owner-binding arriving
-        // over sync: this node re-wraps its own epochs to the device.
-        if let (AttestationOutcome::Inserted, Some((owner, device))) = (&outcome, binding) {
-            rewrap_after_admission(self, &owner, &device).await;
-        }
-        Ok(outcome)
+    ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
+        attestation_apply::apply_planned(
+            self,
+            attestation,
+            replication::admission::WriteOrigin::Sync {
+                peer_key_id: authenticated_peer_key_id.to_owned(),
+            },
+        )
+        .await
     }
 
     /// v36.0.0 (CIRISPersist#624) — the **typed, pre-write replicated
@@ -2532,58 +2564,12 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attestation: SignedAttestation,
     ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
-        use attestation_apply::{
-            plan_replicated_attestation_apply, AttestationRefusalReason,
-            ReplicatedAttestationOutcome as Outcome, ReplicatedAttestationPlan as Plan,
-        };
-        let incoming = &attestation.attestation;
-        let attestation_id = incoming.attestation_id.clone();
-        // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
-        // learns a member has a device; read before the row is moved.
-        let binding = owner_binding_of(incoming);
-        // The §6.1 silent-no-op door only exists for structural composers
-        // that actually carry a references target — precompute the predicate
-        // while `incoming` is still borrowed.
-        let dedup_possible = precedence::is_structural_composer(&incoming.attestation_type)
-            && precedence::references_attestation_id_from_envelope(&incoming.attestation_envelope)
-                .is_some();
-        let planned = match self.get_attestation(&attestation_id).await {
-            Ok(existing) => Some(plan_replicated_attestation_apply(
-                existing.as_ref(),
-                incoming,
-            )?),
-            // The #603 arm: this directory cannot answer, so apply plan-free.
-            Err(Error::Unsupported { .. }) => None,
-            // Every other failure is *could not ask*, which is never *absent*.
-            Err(e) => return Err(e),
-        };
-        match planned {
-            Some(Plan::Unchanged) => return Ok(Outcome::Unchanged),
-            Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
-            Some(Plan::Insert) | None => {}
-        }
-        match self.put_attestation(attestation).await {
-            Ok(_) => {
-                // §6.1: a structural-composer replay is a silent `Ok` with NO
-                // row written. Ask the store what it actually did, so
-                // `Inserted` keeps meaning inserted. Skipped on the plan-free
-                // fallback (this directory cannot be asked).
-                if dedup_possible
-                    && planned.is_some()
-                    && self.get_attestation(&attestation_id).await?.is_none()
-                {
-                    return Ok(Outcome::Deduplicated);
-                }
-                if let Some((owner, device)) = binding {
-                    rewrap_after_admission(self, &owner, &device).await;
-                }
-                Ok(Outcome::Inserted)
-            }
-            Err(e) if e.is_duplicate_key() => Ok(Outcome::Refused {
-                reason: AttestationRefusalReason::StoreConflict,
-            }),
-            Err(e) => Err(e),
-        }
+        attestation_apply::apply_planned(
+            self,
+            attestation,
+            replication::admission::WriteOrigin::Wire,
+        )
+        .await
     }
 
     /// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — **upsert** a local-tier
