@@ -54,3 +54,21 @@ Also locked, built elsewhere: #914 — disclosure sets are blobs (the ruling is 
 Per slice: witnesses RED first, then green on every backend; a mutation round on the new predicate/door (table appended below by the slice); an independent review against this document. Release: the full unfiltered lanes (sqlite, postgres, union), the gate chain, `certify.sh full` on the exact SHA.
 
 ## 7. Mutation tables (appended by each slice)
+
+### #919 — the sweep never widens a placed row
+
+Lane: `scripts/pg_test_db.sh -- cargo nextest run -j 3 --no-fail-fast --features sqlite,postgres -E 'test(sweep_placement) | test(530) | test(widen) | test(promote_consented)'` (19 tests; the postgres legs ran against a live database, 1–4 s each). Every mutant was applied to a clean committed tree and reverted with `git checkout --` before the next. 7 of 7 killed; none OOM-killed.
+
+| Mutant | Killed by |
+|---|---|
+| M1 drop the exclusion on all three backends | I186 candidate read on memory, sqlite, postgres; I186 sweep on sqlite, postgres; (e) |
+| M2 exclude only `community_key_id` (the shared predicate and both SQL renderings) | the rendering pin (`i186_the_sql_renderings_name_every_alias`); I186 candidate read on all three; I186 sweep on sqlite, postgres (the family row); (e) |
+| M3 exclude only when `cohort_scope = 'self'` | I186 candidate read on all three (the `family` row); I186 sweep on sqlite, postgres; (e) |
+| M4 invert (exclude the rows WITHOUT a target) | I186 on all three, I186 sweep on both; the #530 tests `list_widening_candidates_filters_suppressed_scopes_530` and `consent_sweep_widens_a_row_that_entered_before_the_grant` |
+| M5 drop it on memory only | I186 candidate read on memory; (e) by its comparison ("sqlite and memory disagree") |
+| M6 an EMPTY target counts as a target (Rust `is_some()`, SQL without the `= ''` arm) | I186 candidate read on all three (`c-empty-target`); (e) |
+| M7 drop it on postgres only | I186 candidate read and sweep on postgres; (e) by its comparison ("postgres and memory disagree") |
+
+Deviations from §1, stated: none in the rule. Two readings made explicit. (1) "Populated" means a non-empty JSON string, the same reading as `admission::envelope_cohort_target`: an empty or non-string alias names no target, so such a row stays a candidate (M6 pins it). (2) "The same predicate" is one Rust function, `admission::envelope_names_cohort_target`, which memory calls, plus two SQL renderings built from the same `COHORT_TARGET_ENVELOPE_FIELDS` constant (`sqlite_/postgres_envelope_names_no_cohort_target`). A Rust post-filter on the SQL pages would run after `LIMIT`, and an all-placed page would come back empty and end the sweep's keyset walk (it stops on an empty page). I186 reads with a page size of 1, so it walks past the excluded rows. The rendering pin and (e) keep the three from drifting.
+
+Not changed, and outside §1: pass 1 of `promote_consented_backlog` (local rows: enter the mesh, then widen) does not consult this predicate. Every local row is `self`-scoped. A local row whose envelope names a room would still be widened after it enters the mesh. §1 locates the defect in the candidate read, so this slice leaves pass 1 alone.
