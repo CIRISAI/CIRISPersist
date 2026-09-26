@@ -136,6 +136,9 @@ pub mod room_roster_invariants;
 pub mod scope_classifier_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+/// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
+#[cfg(test)]
+pub mod sweep_placement_invariants;
 /// v47.3.0 (CIRISPersist#901) — I154–I158: a root is as attested as its holders.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod trust_root_hardware_invariants;
