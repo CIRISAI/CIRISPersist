@@ -1087,6 +1087,28 @@ pub(crate) mod two_node {
                     .unwrap()
         };
 
+        // (T0) THE ENGINE DOOR — `Engine::apply_replicated_attestation`: the
+        // backend's hook re-wraps, and the Engine, which holds the signer,
+        // emits the dirtied sets at once — no loop run by the witness.
+        let d0 = device(a, b, &format!("d0-{run}")).await;
+        anchor_local(a, &bob, &d0).await;
+        let binding = bind_on_b(b, &bob, &d0.key, run).await;
+        l.engine_a
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("(T0) A's engine admits bob's binding for d0: {e}"));
+        assert_eq!(grants_of(d0.key.clone()).await, 3, "(T0) re-wrapped");
+        for e in &own {
+            assert!(
+                set_carrying(a, &l.comm, &l.node_a, *e, &d0.key)
+                    .await
+                    .is_some(),
+                "(T0) the engine emitted epoch {e}'s set carrying d0 at once"
+            );
+        }
+
         // (T1) THE TRAIT DOOR — `FederationDirectory::apply_replicated_attestation`
         // on A, the call PyEngine and CIRISEdge's bridge make. d1's anchor is
         // already on A (A's host wrote it); bob's binding arrives from B.
