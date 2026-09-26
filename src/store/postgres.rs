@@ -6259,7 +6259,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// stranded rows (`tier = 'federation'` with a suppressed
     /// `cohort_scope`). Structural twin of `list_local_tier_attestations`;
     /// only the `WHERE` predicate differs (`tier = 'federation'` +
-    /// `cohort_scope IN ('self','family')`).
+    /// `cohort_scope IN ('self','family')`). v50.0.0 (CIRISPersist#919) —
+    /// stranded rows only: a row whose envelope names a cohort target was
+    /// placed there and is excluded by
+    /// [`crate::federation::admission::postgres_envelope_names_no_cohort_target`],
+    /// inside the `LIMIT`.
     async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,
@@ -6270,9 +6274,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let limit = i64::from(limit);
+        let unplaced = crate::federation::admission::postgres_envelope_names_no_cohort_target(
+            "a.attestation_envelope",
+        );
         let rows = client
             .query(
-                "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                &format!(
+                    "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
                     attestation_type, weight::float8 AS weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, scrub_signature_classical, \
                     scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
@@ -6280,6 +6288,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations a \
                  WHERE a.tier = 'federation' AND a.cohort_scope IN ('self', 'family') \
+                   AND {unplaced} \
                    AND ($1::text IS NULL OR a.attestation_id::text > $1) \
                    AND NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations s \
                                    WHERE s.attestation_type = $3 \
@@ -6296,7 +6305,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                                      AND (e.attestation_envelope::jsonb ->> 'dimension') \
                                          IS NOT DISTINCT FROM \
                                          (a.attestation_envelope::jsonb ->> 'dimension')) \
-                 ORDER BY a.attestation_id ASC LIMIT $2",
+                 ORDER BY a.attestation_id ASC LIMIT $2"
+                ),
                 // The pointer read names its DISCRIMINATOR in the same breath:
                 // bound from the closed constant, never a hand-typed literal.
                 &[

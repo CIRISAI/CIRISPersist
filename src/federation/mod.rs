@@ -2660,6 +2660,15 @@ pub trait FederationDirectory: Send + Sync {
     /// `list_stranded_federation_attestations` (#530): those rows are not
     /// stranded, they are the CC 5.2 shape — this page is what
     /// `Engine::promote_consented_backlog` widens when a grant covers them.
+    ///
+    /// v50.0.0 — **stranded rows only — a row naming a cohort target is
+    /// placed, never a candidate (CIRISPersist#919).** A row whose signed
+    /// envelope names a target
+    /// ([`admission::envelope_names_cohort_target`]: any populated
+    /// [`admission::COHORT_TARGET_ENVELOPE_FIELDS`] member) had its audience
+    /// chosen by its emitter; a covering grant does not re-place it. Every
+    /// backend applies the exclusion INSIDE the page (before `LIMIT`), so the
+    /// keyset walk is unchanged.
     async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,

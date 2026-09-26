@@ -252,6 +252,26 @@ mod run {
         Some(b)
     }
 
+    /// The two SQL renderings are built from the one constant: every alias
+    /// is spelled in each (a hand-edited rendering that dropped one would
+    /// leave the SQL backends admitting rows memory excludes).
+    #[test]
+    fn i186_the_sql_renderings_name_every_alias() {
+        use crate::federation::admission as adm;
+        let lite = adm::sqlite_envelope_names_no_cohort_target("e");
+        let pg = adm::postgres_envelope_names_no_cohort_target("e");
+        for f in adm::COHORT_TARGET_ENVELOPE_FIELDS {
+            assert!(
+                lite.contains(&format!("'$.{f}'")),
+                "sqlite misses {f}: {lite}"
+            );
+            assert!(
+                pg.contains(&format!("-> '{f}'")),
+                "postgres misses {f}: {pg}"
+            );
+        }
+    }
+
     runners!(on_memory, super::memory());
     #[cfg(feature = "sqlite")]
     runners!(on_sqlite, super::sqlite());

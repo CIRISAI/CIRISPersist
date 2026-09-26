@@ -12296,6 +12296,68 @@ pub fn envelope_cohort_target(envelope: &serde_json::Value) -> Result<Option<&st
     Ok(found.map(|(_, v)| v))
 }
 
+/// v50.0.0 (CIRISPersist#919) — **whether a row was PLACED**: its signed
+/// envelope names a cohort target under any populated alias in
+/// [`COHORT_TARGET_ENVELOPE_FIELDS`] (a non-empty string — the same reading
+/// as [`envelope_cohort_target`], which treats an empty or non-string value
+/// as no target). A split-brain row names targets, so it is placed too.
+///
+/// A placed row's audience was chosen by its emitter (CC 3.1.9: `cohort_scope`
+/// is the emitter's per-envelope choice; CC 5.2 for `self`/`family`), so it is
+/// never a consent-sweep widening candidate: a covering grant says nothing
+/// about its audience, and a widening names only the NEW placement's target,
+/// which for `federation` is none — the room's own fold would find nothing.
+///
+/// This is the rule every backend's `list_widening_candidates` applies: memory
+/// calls it directly; sqlite and postgres render it with
+/// [`sqlite_envelope_names_no_cohort_target`] /
+/// [`postgres_envelope_names_no_cohort_target`], built from the same constant.
+#[must_use]
+pub fn envelope_names_cohort_target(envelope: &serde_json::Value) -> bool {
+    COHORT_TARGET_ENVELOPE_FIELDS.iter().any(|field| {
+        envelope
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// v50.0.0 (CIRISPersist#919) — the negation of
+/// [`envelope_names_cohort_target`] as a SQLite predicate over the TEXT JSON
+/// column `envelope_column`: for every alias, the member is absent, not a
+/// string, or empty. NULL-free (`IFNULL`), so an absent member reads as
+/// "names no target" rather than poisoning the conjunction.
+#[must_use]
+pub fn sqlite_envelope_names_no_cohort_target(envelope_column: &str) -> String {
+    let arms: Vec<String> = COHORT_TARGET_ENVELOPE_FIELDS
+        .iter()
+        .map(|f| {
+            format!(
+                "(IFNULL(json_type({envelope_column}, '$.{f}'), '') <> 'text' \
+                 OR json_extract({envelope_column}, '$.{f}') = '')"
+            )
+        })
+        .collect();
+    format!("({})", arms.join(" AND "))
+}
+
+/// v50.0.0 (CIRISPersist#919) — the Postgres twin of
+/// [`sqlite_envelope_names_no_cohort_target`]: for every alias, the member is
+/// absent, not a JSON string, or empty.
+#[must_use]
+pub fn postgres_envelope_names_no_cohort_target(envelope_column: &str) -> String {
+    let arms: Vec<String> = COHORT_TARGET_ENVELOPE_FIELDS
+        .iter()
+        .map(|f| {
+            format!(
+                "(COALESCE(jsonb_typeof({envelope_column}::jsonb -> '{f}'), '') <> 'string' \
+                 OR ({envelope_column}::jsonb ->> '{f}') = '')"
+            )
+        })
+        .collect();
+    format!("({})", arms.join(" AND "))
+}
+
 /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
 /// point for the §11.11 federation-apply re-check (point ii). A
 /// **federation-tier** attestation keyed on a community `C` is a "federation

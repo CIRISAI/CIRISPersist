@@ -5607,7 +5607,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     /// only the `WHERE` predicate differs (`tier = 'federation'` +
     /// `cohort_scope IN ('self','family')` — the two
     /// `suppresses_holds_bytes` scopes, spelled literally to keep the
-    /// index-friendly SQL self-contained).
+    /// index-friendly SQL self-contained). v50.0.0 (CIRISPersist#919) —
+    /// stranded rows only: a row whose envelope names a cohort target was
+    /// placed there and is excluded by
+    /// [`crate::federation::admission::sqlite_envelope_names_no_cohort_target`],
+    /// inside the `LIMIT`, so the keyset walk never ends on an excluded page.
     async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,
@@ -5615,8 +5619,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
         let after = after_attestation_id.map(str::to_owned);
         let limit = i64::from(limit);
+        let unplaced = crate::federation::admission::sqlite_envelope_names_no_cohort_target(
+            "a.attestation_envelope",
+        );
         self.read(move |conn| -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
@@ -5624,6 +5631,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM federation_attestations a \
                  WHERE a.tier = 'federation' AND a.cohort_scope IN ('self', 'family') \
+                   AND {unplaced} \
                    AND (?1 IS NULL OR a.attestation_id > ?1) \
                    AND NOT EXISTS (SELECT 1 FROM federation_attestations s \
                                    WHERE s.attestation_type = ?3 \
@@ -5641,7 +5649,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                                      AND json_extract(e.attestation_envelope, '$.dimension') \
                                          = json_extract(a.attestation_envelope, '$.dimension')) \
                  ORDER BY a.attestation_id ASC LIMIT ?2",
-            )?;
+            ))?;
             // The pointer read names its DISCRIMINATOR in the same breath: the
             // composer is bound from the closed constant, never a hand-typed
             // literal (CC 4.5.1.1 op-separation —
