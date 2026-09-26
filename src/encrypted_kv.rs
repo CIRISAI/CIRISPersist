@@ -161,7 +161,9 @@ const SOFTWARE_ROOT_KEY_ID: &str = "federation-content-master-software";
 /// seed unusable the reason is kept.
 #[derive(Debug)]
 pub(crate) enum HardwareRootError {
-    /// This host's secure storage is not hardware-backed.
+    /// This host's secure storage is not hardware-backed. Constructed only
+    /// by the `secrets` derivation; a build without it answers `Unreachable`.
+    #[cfg_attr(not(feature = "secrets"), allow(dead_code))]
     NotHardwareBacked(String),
     /// Hardware backing is (or may be) present; the seed cannot be used.
     Unreachable(String),
