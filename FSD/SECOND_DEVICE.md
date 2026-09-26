@@ -102,9 +102,9 @@ Per slice: witnesses RED first, then green on every backend; a mutation round on
 | M07 | authority check dropped | KILLED | (c') |
 | M08 | keyless exclusion not recorded | KILLED | (f) recorded |
 | M09 | already-held pre-check dropped | KILLED | (b) zero wraps computed on a re-run |
-| M10 | trait `apply_replicated_attestation` hook dropped | KILLED | two-node (T1) |
-| M11 | `put_attestation_synced` hook dropped | KILLED | two-node (T2) |
-| M12 | full walk dropped from `Engine::emit_pending_key_grants` | KILLED | two-node (S) |
+| M10 | trait `apply_replicated_attestation` hook dropped | KILLED (re-run at 35dc5c45) | two-node (T0) — the Engine door routes through the trait default |
+| M11 | `put_attestation_synced` hook dropped | KILLED (re-run) | two-node (T2) |
+| M12 | full walk dropped from `Engine::emit_pending_key_grants` | KILLED (re-run) | two-node (S) |
 | M13 | door's emit loop deleted | KILLED | two-node (D) |
 | M14 | door's own-minter emit filter inverted | KILLED | two-node (D) |
 | M15 | other-party owner-binding filter dropped | KILLED | (i) absence-span epochs leak |
@@ -112,10 +112,11 @@ Per slice: witnesses RED first, then green on every backend; a mutation round on
 | M17 | miss reasons collapsed to `minted_elsewhere` | KILLED | (g) |
 | M18 | insert result ignored | KILLED | (b'') two racing calls |
 | M19 | signed `put_identity_occurrence` hook dropped (sqlite + postgres) | KILLED | two-node (T3) |
-| M20 | hook stamps the epochs emitted after re-wrapping (the dirty mark lost) | KILLED | two-node (T0) — no set emitted |
+| M20 | hook stamps the epochs emitted after re-wrapping (the dirty mark lost) | KILLED (re-run) | two-node (T0) — no set emitted |
 | M21 | door's identity-occurrence check dropped | KILLED | (j) |
 | M22 | walk targets `nodes_owned_by` AND the occurrence check dropped | KILLED | (j) |
 | M23 | `local_only` classification dropped | KILLED | (a); two-node (D) |
-| M24 | `Engine::apply_replicated_attestation`'s immediate emission dropped | KILLED | two-node (T0) |
+| M24 | `Engine::apply_replicated_attestation`'s dirty-set emission dropped | KILLED (re-run) | two-node (T0) |
+| M25 | no node key: the door proceeds with an empty key instead of refusing | KILLED | `i188_no_node_key` (sqlite, postgres) |
 
-24/24 killed; in every run the other 87–89 lane tests stayed green. Not run as separate mutants: the walk's candidate list alone switched to `nodes_owned_by` is equivalent while `is_member_device` also guards it (two layers, M22 removes both); the hoisted holder set computed without excluding the device is equivalent (the device is itself a clean holder, and its grants are already held).
+25/25 killed (M10–M12, M20, M24 re-run and M25 added at 35dc5c45 on 93 lane tests); in every run the other 87–89 lane tests stayed green. Not run as separate mutants: the walk's candidate list alone switched to `nodes_owned_by` is equivalent while `is_member_device` also guards it (two layers, M22 removes both); the hoisted holder set computed without excluding the device is equivalent (the device is itself a clean holder, and its grants are already held).
