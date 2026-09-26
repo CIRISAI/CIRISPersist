@@ -136,64 +136,11 @@ pub mod bodies {
         d.get_attestation(id).await.expect("get_attestation")
     }
 
-    /// Arms (a)–(e). `a` is driven through the synced door, `b` (a fresh
-    /// directory) through the unattributed door, with the SAME bytes in the
-    /// same order.
-    pub async fn i189_one_outcome_on_both_doors(
-        a: &dyn FederationDirectory,
-        b: &dyn FederationDirectory,
-        p: &Parties,
-        tag: &str,
-    ) {
-        seat(a, p, tag).await;
-        seat(b, p, tag).await;
-        let id = format!("{tag}-row");
-        let row = scores_row(&id, &p.author, &p.author, "trust:demo:v1");
-        let deco = decorated(&row);
-        let rival = rival(&row);
-
-        // (a) first delivery.
-        let got = a
-            .put_attestation_synced(signed(&row), &p.mate)
+    /// The stored row still carries the held row's bytes.
+    async fn untouched(seat: &dyn FederationDirectory, held: &Attestation, tag: &str, what: &str) {
+        let after = stored(seat, &held.attestation_id)
             .await
-            .unwrap_or_else(|e| panic!("({tag}) I189(a): {e}"));
-        assert_eq!(
-            got,
-            Outcome::Inserted,
-            "({tag}) I189(a): a new row is Inserted"
-        );
-        let held = stored(a, &id)
-            .await
-            .unwrap_or_else(|| panic!("({tag}) I189(a): Inserted must mean stored"));
-
-        // (b) byte-identical re-delivery — the mint, and the stored row as the
-        // wire re-offers it.
-        for (what, offer) in [("mint", &row), ("stored row", &held)] {
-            let got = a
-                .put_attestation_synced(signed(offer), &p.mate)
-                .await
-                .unwrap_or_else(|e| panic!("({tag}) I189(b) {what}: {e}"));
-            assert_eq!(
-                got,
-                Outcome::Unchanged,
-                "({tag}) I189(b): a byte-identical re-delivery ({what}) is Unchanged"
-            );
-        }
-
-        // (c) decoration-only re-delivery — a duplicate, never a Conflict.
-        let got = a.put_attestation_synced(signed(&deco), &p.mate).await;
-        assert!(
-            matches!(
-                got,
-                Ok(Outcome::Refused {
-                    reason: Reason::AlreadyPresentIdentical
-                })
-            ),
-            "({tag}) I189(c): the same signed assertion with different unsigned decoration \
-             is `already_present_identical` on the attributed door — got {got:?}. \
-             `Err(Conflict)` is the pre-#917 binary verdict CIRISEdge booked as a refusal"
-        );
-        let after = stored(a, &id).await.expect("still held");
+            .expect("still held");
         assert_eq!(
             (
                 &after.persist_row_hash,
@@ -205,11 +152,99 @@ pub mod bodies {
                 &held.scrub_signature_pqc,
                 held.scrub_timestamp
             ),
-            "({tag}) I189(c): a duplicate must leave the stored row untouched"
+            "({tag}) I189{what}: the stored row must be untouched"
         );
+    }
+
+    /// Where a body seats its fixture and reads the stored row (`seat`, a
+    /// backend) and which directory it drives the door through (`door`: the
+    /// same backend, or an `OpsDirectory` over it — the capsule arm).
+    #[derive(Clone, Copy)]
+    pub struct Node<'a> {
+        pub seat: &'a dyn FederationDirectory,
+        pub door: &'a dyn FederationDirectory,
+    }
+
+    impl<'a> Node<'a> {
+        pub fn direct(d: &'a dyn FederationDirectory) -> Self {
+            Self { seat: d, door: d }
+        }
+    }
+
+    /// A row that COPIES the held row's `original_content_hash`, producer pair
+    /// and signatures onto a different envelope — a claim of "same assertion"
+    /// its own bytes do not support.
+    fn forged(row: &Attestation, other: &Attestation) -> Attestation {
+        let mut forged = row.clone();
+        forged.attestation_envelope = other.attestation_envelope.clone();
+        forged
+    }
+
+    /// A replay of the held id whose envelope is over the size cap. The claim
+    /// fields are the held row's, so only the size gate can stop the plan from
+    /// canonicalizing it for free.
+    fn oversize(row: &Attestation) -> Attestation {
+        let mut big = row.clone();
+        big.attestation_envelope["pad"] = serde_json::json!("o".repeat(1_100 * 1024));
+        big
+    }
+
+    /// Arms (a)–(e), (h), (i). `a` is driven through the synced door, `b` (a
+    /// fresh node) through the unattributed door, with the SAME bytes in the
+    /// same order.
+    pub async fn i189_one_outcome_on_both_doors(a: Node<'_>, b: Node<'_>, p: &Parties, tag: &str) {
+        seat(a.seat, p, tag).await;
+        seat(b.seat, p, tag).await;
+        let id = format!("{tag}-row");
+        let row = scores_row(&id, &p.author, &p.author, "trust:demo:v1");
+        let deco = decorated(&row);
+        let rival = rival(&row);
+        let forged = forged(&row, &rival);
+        let synced = |offer: &Attestation| a.door.put_attestation_synced(signed(offer), &p.mate);
+
+        // (a) first delivery.
+        let got = synced(&row)
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) I189(a): {e}"));
+        assert_eq!(
+            got,
+            Outcome::Inserted,
+            "({tag}) I189(a): a new row is Inserted"
+        );
+        let held = stored(a.seat, &id)
+            .await
+            .unwrap_or_else(|| panic!("({tag}) I189(a): Inserted must mean stored"));
+
+        // (b) byte-identical re-delivery — the mint, and the stored row as the
+        // wire re-offers it.
+        for (what, offer) in [("mint", &row), ("stored row", &held)] {
+            let got = synced(offer)
+                .await
+                .unwrap_or_else(|e| panic!("({tag}) I189(b) {what}: {e}"));
+            assert_eq!(
+                got,
+                Outcome::Unchanged,
+                "({tag}) I189(b): a byte-identical re-delivery ({what}) is Unchanged"
+            );
+        }
+
+        // (c) decoration-only re-delivery — a duplicate, never a Conflict.
+        let got = synced(&deco).await;
+        assert!(
+            matches!(
+                got,
+                Ok(Outcome::Refused {
+                    reason: Reason::AlreadyPresentIdentical
+                })
+            ),
+            "({tag}) I189(c): the same signed assertion with different unsigned decoration \
+             is `already_present_identical` on the attributed door — got {got:?}. \
+             `Err(Conflict)` is the pre-#917 binary verdict CIRISEdge booked as a refusal"
+        );
+        untouched(a.seat, &held, tag, "(c) a duplicate").await;
 
         // (d) a different signed row under the same id.
-        let got = a.put_attestation_synced(signed(&rival), &p.mate).await;
+        let got = synced(&rival).await;
         assert!(
             matches!(
                 got,
@@ -220,14 +255,35 @@ pub mod bodies {
             "({tag}) I189(d): a different signed row under an occupied id is \
              `conflicting_attestation` — got {got:?}"
         );
-        let after = stored(a, &id).await.expect("still held");
-        assert_eq!(
-            after.persist_row_hash, held.persist_row_hash,
-            "({tag}) I189(d): first-seen wins; the stored row is untouched"
+        untouched(a.seat, &held, tag, "(d) first-seen wins").await;
+
+        // (h) the held row's hash and producer copied onto another envelope.
+        let got = synced(&forged).await;
+        assert!(
+            matches!(
+                got,
+                Ok(Outcome::Refused {
+                    reason: Reason::ConflictingAttestation
+                })
+            ),
+            "({tag}) I189(h): a row whose envelope does not hash to the \
+             `original_content_hash` it claims is a conflict, not a quiet duplicate — \
+             got {got:?}"
         );
+        untouched(a.seat, &held, tag, "(h) a forged claim").await;
+
+        // (i) a replay of the held id over the size cap is refused by the size
+        // gate before the plan pays for it — not classified.
+        let got = synced(&oversize(&held)).await;
+        assert!(
+            matches!(&got, Err(e) if e.to_string().contains("envelope too large")),
+            "({tag}) I189(i): an over-cap replay of a held id must meet the size gate, \
+             not the plan — got {got:?}"
+        );
+        untouched(a.seat, &held, tag, "(i) an over-cap replay").await;
 
         // (e) the same bytes, same order, through the unattributed door.
-        let synced = [
+        let want = [
             Outcome::Inserted,
             Outcome::Unchanged,
             Outcome::Refused {
@@ -236,9 +292,13 @@ pub mod bodies {
             Outcome::Refused {
                 reason: Reason::ConflictingAttestation,
             },
+            Outcome::Refused {
+                reason: Reason::ConflictingAttestation,
+            },
         ];
-        for (offer, want) in [&row, &row, &deco, &rival].into_iter().zip(synced) {
+        for (offer, want) in [&row, &row, &deco, &rival, &forged].into_iter().zip(want) {
             let got = b
+                .door
                 .apply_replicated_attestation(signed(offer))
                 .await
                 .unwrap_or_else(|e| panic!("({tag}) I189(e): {e}"));
@@ -248,6 +308,14 @@ pub mod bodies {
                  attributed door did"
             );
         }
+        let got = b
+            .door
+            .apply_replicated_attestation(signed(&oversize(&held)))
+            .await;
+        assert!(
+            matches!(&got, Err(e) if e.to_string().contains("envelope too large")),
+            "({tag}) I189(e/i): the unattributed door meets the same size gate — got {got:?}"
+        );
     }
 
     /// Arm (f): the peer is still metered. A stranger's rows are charged to
@@ -351,12 +419,57 @@ mod run {
                     };
                     let p = super::super::bodies::Parties::new(&us, &tag);
                     super::super::bodies::i189_one_outcome_on_both_doors(
-                        &a as &dyn FederationDirectory,
-                        &b as &dyn FederationDirectory,
+                        super::super::bodies::Node::direct(&a as &dyn FederationDirectory),
+                        super::super::bodies::Node::direct(&b as &dyn FederationDirectory),
                         &p,
                         &tag,
                     )
                     .await
+                }
+                /// The capsule arm: the same bytes through an `OpsDirectory`
+                /// over this backend — CIRISEdge's shape — classify the same.
+                #[test]
+                fn i189_the_capsule_carries_the_outcome() {
+                    use std::sync::Arc;
+                    let rt = Arc::new(
+                        tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .enable_all()
+                            .build()
+                            .expect("runtime"),
+                    );
+                    let tag = super::tag("capsule");
+                    let us = format!("{tag}-us");
+                    let (Some(a), Some(b)) =
+                        rt.block_on(async { ($fresh(&us).await, $fresh(&us).await) })
+                    else {
+                        return;
+                    };
+                    let a: Arc<dyn FederationDirectory> = Arc::new(a);
+                    let b: Arc<dyn FederationDirectory> = Arc::new(b);
+                    let proxy = |d: &Arc<dyn FederationDirectory>| {
+                        crate::ffi::directory_capsule::build_ops_directory(
+                            crate::ffi::directory_capsule::build_persist_directory(d.clone()),
+                            Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+                                rt.clone(),
+                            )),
+                        )
+                        .expect("abi ok")
+                    };
+                    let (pa, pb) = (proxy(&a), proxy(&b));
+                    let p = super::super::bodies::Parties::new(&us, &tag);
+                    rt.block_on(super::super::bodies::i189_one_outcome_on_both_doors(
+                        super::super::bodies::Node {
+                            seat: a.as_ref(),
+                            door: pa.as_ref(),
+                        },
+                        super::super::bodies::Node {
+                            seat: b.as_ref(),
+                            door: pb.as_ref(),
+                        },
+                        &p,
+                        &tag,
+                    ));
                 }
                 #[tokio::test]
                 async fn i189_the_peer_is_still_metered() {
