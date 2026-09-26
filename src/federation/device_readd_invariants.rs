@@ -1074,7 +1074,7 @@ pub(crate) mod two_node {
         run: &str,
         pick: Pick<B>,
     ) where
-        B: BlobStorage + FederationDirectory + Sync,
+        B: BlobStorage + FederationDirectory + Sync + 'static,
     {
         let l = ladder(dsn_a, dsn_b, run, pick).await;
         let bob = format!("em-bob-{run}");
@@ -1238,6 +1238,61 @@ pub(crate) mod two_node {
             "(T3) the occurrence door re-wrapped A's epochs to d3"
         );
 
+        // (T4)/(T5) THE CAPSULE — CIRISEdge's shape: an `OpsDirectory` over
+        // A's backend. The typed doors cross whole (#917 phase 2): the far side
+        // runs `apply_planned`, whose one hook re-wraps on A's backend. d6
+        // through `ApplyReplicatedAttestation`, d7 through
+        // `ApplyReplicatedAttestationSynced`.
+        let rt = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("capsule runtime"),
+        );
+        // Never dropped: a runtime may not be dropped inside this async test.
+        std::mem::forget(rt.clone());
+        let proxy = crate::ffi::directory_capsule::build_ops_directory(
+            crate::ffi::directory_capsule::build_persist_directory(
+                l.ba.clone() as std::sync::Arc<dyn FederationDirectory>
+            ),
+            std::sync::Arc::new(crate::ffi::executor_capsule::build_persist_executor(rt)),
+        )
+        .expect("abi ok");
+        let d6 = device(a, b, &format!("d6-{run}")).await;
+        anchor_local(a, &bob, &d6).await;
+        let binding = bind_on_b(b, &bob, &d6.key, run).await;
+        let outcome = proxy
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("(T4) A admits bob's binding for d6 via the capsule: {e}"));
+        assert_eq!(outcome, ReplicatedAttestationOutcome::Inserted, "(T4)");
+        assert_eq!(
+            grants_of(d6.key.clone()).await,
+            3,
+            "(T4) the capsule's unattributed op re-wrapped A's epochs to d6 on A's backend"
+        );
+        let d7 = device(a, b, &format!("d7-{run}")).await;
+        anchor_local(a, &bob, &d7).await;
+        let binding = bind_on_b(b, &bob, &d7.key, run).await;
+        let outcome = proxy
+            .put_attestation_synced(
+                SignedAttestation {
+                    attestation: binding,
+                },
+                &l.node_b,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("(T5) A admits bob's binding for d7 via the capsule: {e}"));
+        assert_eq!(outcome, ReplicatedAttestationOutcome::Inserted, "(T5)");
+        assert_eq!(
+            grants_of(d7.key.clone()).await,
+            3,
+            "(T5) the capsule's synced op re-wrapped A's epochs to d7 on A's backend"
+        );
+
         // The sets: A's pending-set loop (the one PyEngine runs) signs and
         // emits every epoch the doors dirtied; B admits them off A's
         // `list_attestations_since`; on B each device's wrap opens to the DEK
@@ -1250,7 +1305,7 @@ pub(crate) mod two_node {
         );
         let b_priv = b.load_content_kem_private_halves().await.unwrap();
         for e in &own {
-            for d in [&d1, &d2, &d3] {
+            for d in [&d1, &d2, &d3, &d6, &d7] {
                 let set = set_carrying(a, &l.comm, &l.node_a, *e, &d.key)
                     .await
                     .unwrap_or_else(|| {
