@@ -142,6 +142,9 @@ pub mod trust_root_hardware_invariants;
 // v49.0.0 (CIRISPersist#915) — I185, Android generation custody.
 #[cfg(test)]
 mod android_custody_invariants;
+// v50.0.0 (CIRISPersist#916) — I188, a member's new device gets what the member holds.
+#[cfg(test)]
+mod device_readd_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -684,6 +687,24 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 /// v49.0.0 (CIRISPersist#908) — substantive: the change would leave the group
 /// with other active members and no active founder.
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
+
+/// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
+/// no live owner-binding: nobody is responsible for it, so no member's history
+/// can be handed to it.
+pub const DEVICE_REKEY_RULE_UNBOUND: &str = "device_rekey_unbound";
+/// v50.0.0 (CIRISPersist#916) — the device's live owner-binding names someone
+/// other than the member: another person's machine.
+pub const DEVICE_REKEY_RULE_OWNER_MISMATCH: &str = "device_rekey_owner_mismatch";
+/// v50.0.0 (CIRISPersist#916) — the offered authority is not the device's
+/// owner: the binding speaks for the human, and only the human adds a device.
+pub const DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER: &str = "device_rekey_authority_not_owner";
+/// v50.0.0 (CIRISPersist#916) — the member is not on the room's authorized
+/// roster at the call's instant: a removed member's new device gets nothing.
+pub const DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE: &str = "device_rekey_member_not_active";
+/// v50.0.0 (CIRISPersist#916) — the device has no valid content-KEM
+/// `encryption_pubkeys`: there is nothing to wrap to, and there is no
+/// plaintext fallback (§10.1.4).
+pub const DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS: &str = "device_rekey_no_encryption_pubkeys";
 
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
 /// state a standing question is asked against: each key that has appeared, and
@@ -8489,6 +8510,33 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the re-wrap of a
+    /// member's community DEK epochs to a new device was refused. Nothing is
+    /// granted. Authority is the member's owner-binding over the device, never
+    /// roster governance. Stable `kind()` token `federation_device_rekey_refused`.
+    ///
+    /// `rule` is one of [`DEVICE_REKEY_RULE_UNBOUND`],
+    /// [`DEVICE_REKEY_RULE_OWNER_MISMATCH`],
+    /// [`DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER`],
+    /// [`DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE`] or
+    /// [`DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS`]. None is retryable as-is.
+    #[error(
+        "re-wrap of {member_key_id:?}'s epochs in {community_key_id:?} to device \
+         {occurrence_key_id:?} refused ({rule}): a new device receives what its member holds \
+         only when the member's owner-binding names it, the member is active, and it has \
+         content-KEM keys (CIRISPersist#916)"
+    )]
+    DeviceRekeyRefused {
+        /// The room whose epochs would be re-wrapped.
+        community_key_id: String,
+        /// The member whose grants the device would receive.
+        member_key_id: String,
+        /// The new device's occurrence key.
+        occurrence_key_id: String,
+        /// Which clause refused; one of the rule tokens above.
+        rule: &'static str,
+    },
+
     /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — a
     /// membership LISTING (CC 2 `listed`) whose signature verified but which
     /// the listing door refuses. Nothing is stored. Stable `kind()` token
@@ -9945,6 +9993,7 @@ impl Error {
                 "federation_location_authority_unauthorized"
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
             Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"

@@ -6604,6 +6604,81 @@ impl Engine {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
+    /// new device receives exactly what the member holds**: every retained
+    /// `(community, minter, epoch)` DEK the member holds a grant on is
+    /// re-wrapped to `new_occurrence_key_id`'s content-KEM keys, with no epoch
+    /// bump, idempotently. Authority is `authority_key_id` = the member's
+    /// owner-binding over the device, and the member must be active in the
+    /// room now; each refusal is a typed
+    /// [`Error::DeviceRekeyRefused`](crate::federation::Error::DeviceRekeyRefused).
+    /// See [`at_rest_cascade::orchestrate::rekey_community_member_device_add`](crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add).
+    ///
+    /// Each epoch THIS node minted that gained the device's wrap has its full
+    /// epoch-axis `KeyGrant` set emitted (§14), the same path a fresh seal
+    /// uses, so the device's own node receives the key. An epoch another node
+    /// minted is reported in `content_miss` (`not_retained_here`): only its
+    /// minter can sign the set that carries it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rekey_community_member_device_add(
+        &self,
+        community_key_id: &str,
+        member_key_id: &str,
+        new_occurrence_key_id: &str,
+        authority_key_id: &str,
+    ) -> Result<
+        crate::federation::at_rest_cascade::orchestrate::DeviceRekeyResult,
+        crate::federation::Error,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_device_add;
+        let now = chrono::Utc::now();
+        let r = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                rekey_community_member_device_add(
+                    arc.as_ref(),
+                    community_key_id,
+                    member_key_id,
+                    new_occurrence_key_id,
+                    authority_key_id,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                rekey_community_member_device_add(
+                    arc.as_ref(),
+                    community_key_id,
+                    member_key_id,
+                    new_occurrence_key_id,
+                    authority_key_id,
+                    now,
+                )
+                .await
+            }
+        }?;
+        // #848 (§14) — the set follows the new wrap. Only this node's own
+        // minter signs a set (`admit_replicated_key_grant`: signer == minter).
+        let minter = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("local derived key id: {e}")))?;
+        for (m, epoch) in r.granted.iter().filter(|(m, _)| *m == minter) {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Epoch {
+                community_key_id: community_key_id.to_owned(),
+                minter_key_id: m.clone(),
+                epoch: *epoch,
+            })
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("key_grant emission: {e}")))?;
+        }
+        Ok(r)
+    }
+
     /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
     /// retroactive ADD re-wrap for a **self** occurrence-add: a person
     /// admitting new device-occurrence(s) into their self-collective. Same

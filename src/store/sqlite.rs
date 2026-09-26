@@ -15334,6 +15334,44 @@ impl crate::federation::BlobStorage for SqliteBackend {
         })
     }
 
+    /// v50.0.0 (#916, FSD/SECOND_DEVICE.md §3) — what a member holds: the
+    /// DISTINCT `(minter, epoch)` pairs of the community on which any of the
+    /// member's occurrences holds a grant, ordered.
+    async fn community_dek_member_grant_epochs(
+        &self,
+        community_key_id: &str,
+        member_key_ids: &[String],
+    ) -> Result<Vec<(String, u64)>, crate::federation::BlobError> {
+        if member_key_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let c = community_key_id.to_owned();
+        let members = member_key_ids.to_vec();
+        self.read(move |conn| -> Result<Vec<(String, u64)>, rusqlite::Error> {
+            let placeholders = (0..members.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT DISTINCT minter_key_id, epoch FROM federation_community_dek_member_grants \
+                  WHERE community_key_id = ?1 AND member_key_id IN ({placeholders}) \
+                  ORDER BY minter_key_id ASC, epoch ASC"
+            ))?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&c];
+            params.extend(members.iter().map(|m| m as &dyn rusqlite::ToSql));
+            let rows: Result<Vec<(String, u64)>, rusqlite::Error> = stmt
+                .query_map(params.as_slice(), |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+                })?
+                .collect();
+            rows
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_member_grant_epochs: {e}"))
+        })
+    }
+
     /// v46.0.0 (#876, FSD/EPOCH_MINTER.md §3) — the repair. A binding whose
     /// recorded minter holds neither DEK state nor a grant at this
     /// `(community, epoch)` is STRANDED — it can never authorize anyone —

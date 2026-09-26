@@ -32839,6 +32839,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
         // v49.0.0 (#908) — the same standing-not-signature refusal as #734.
         crate::federation::Error::RosterAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
+        // v50.0.0 (#916) — a device re-wrap refused on the owner-binding, the
+        // roster or the device's keys: the same caller-side refusal, the same type.
+        crate::federation::Error::DeviceRekeyRefused { .. } => PyValueError::new_err(kind),
         // v49.0.0 (#912) — a listing its door refuses (not the member's own,
         // or not `public`): the same caller-side refusal, the same type.
         crate::federation::Error::MembershipListingRefused { .. } => PyValueError::new_err(kind),
