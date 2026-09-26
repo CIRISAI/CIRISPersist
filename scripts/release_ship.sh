@@ -60,7 +60,10 @@ for i in $(seq 1 30); do gh release view "v$ver" >/dev/null 2>&1 && break; sleep
 gh release view "v$ver" >/dev/null 2>&1 || { echo "release v$ver never appeared"; exit 13; }
 gh release view "v$ver" --json assets --jq '[.assets[].name] | join(", ")'
 gh release edit "v$ver" --notes-file "$tmp/tagbody.md" >/dev/null || { echo "release edit failed"; exit 14; }
-body_bytes=$(gh release view "v$ver" --json body --jq '.body | length')
+# BYTES, not characters: jq's `length` counts code points, and v49.0.0's
+# section (85 more bytes than characters — em dashes, arrows) failed this
+# check with a body byte-identical to the tag.
+body_bytes=$(gh release view "v$ver" --json body --jq '.body' | wc -c)
 echo "release body bytes=$body_bytes (tag body $in_bytes)"
 [ "$body_bytes" -ge $(( in_bytes - 64 )) ] || { echo "release body too short — not the CHANGELOG section"; exit 15; }
 echo "=== RELEASE_SHIP_DONE v$ver at $merge_sha ==="
