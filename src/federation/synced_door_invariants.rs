@@ -279,7 +279,11 @@ pub mod bodies {
         let mut limited = 0u32;
         while size >= 64 * 1024 {
             n += 1;
-            assert!(n < 400, "({tag}) I189(f): the drain did not converge");
+            assert!(
+                n < 400,
+                "({tag}) I189(f): 400 rows from a non-cohort peer never met the author's \
+                 per-peer limit — the synced door is not metering a stranger as a stranger"
+            );
             let mut junk = scores_row(
                 &format!("{tag}-junk-{n}"),
                 &p.author,
