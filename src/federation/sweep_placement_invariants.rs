@@ -45,6 +45,40 @@ pub mod bodies {
         })
     }
 
+    /// The at-rest sha a fixture row's pointer names: unique per row.
+    pub fn sha_of(id: &str) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(id.as_bytes()))
+    }
+
+    /// Edge's blob pointer (`group_content::BlobPointer`), its owner slot
+    /// `community_key_id` naming the room the bytes are held in.
+    pub fn edge_pointer(id: &str, owner_slot: &str) -> serde_json::Value {
+        serde_json::json!({
+            "community_key_id": owner_slot,
+            "tier": "invisible_encrypted",
+            "content_sha256": sha_of(id),
+            "content_field": "body",
+            "media_type": "text/plain",
+        })
+    }
+
+    /// **A self file row exactly as Edge v32.1.0 writes it** (`files.rs`
+    /// `file_row`): `file:v1`, the pointer under `content`, the filename, the
+    /// citation — and NO top-level cohort target (`scope_room.rs`: a self room
+    /// has no `cohort_target_field`; Edge's own test asserts "a self row names
+    /// no cohort target"). The owner lives only in the pointer's slot, which
+    /// is what Edge's self-room file read keys on (`files.rs`
+    /// `file.pointer.community_key_id == room.content_group_id()`).
+    pub fn edge_self_file_envelope(id: &str, owner: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dimension": "file:v1",
+            "content": edge_pointer(id, owner),
+            "filename": format!("{id}.jpg"),
+            "evidence_refs": [sha_of(id)],
+        })
+    }
+
     /// A self-room MLS handshake row (Edge's `key_package_attestation_in`).
     pub fn chat_envelope(id: &str) -> serde_json::Value {
         serde_json::json!({
@@ -108,6 +142,8 @@ pub mod bodies {
     /// exclusion that reads only `community_key_id` leaves the others
     /// candidates.
     pub const PLACED: &[&str] = &[
+        "a-edge-file",
+        "a-edge-attachment",
         "a-room-community-key-id",
         "a-room-community-id",
         "a-room-cohort-key-id",
@@ -117,7 +153,10 @@ pub mod bodies {
     /// The rows that ARE stranded: no target, or an EMPTY target (not
     /// populated — [`crate::federation::admission::envelope_cohort_target`]
     /// reads it as no target, and the candidate read must agree).
-    pub const STRANDED: &[&str] = &["c-stranded", "c-empty-target"];
+    ///
+    /// `c-pointer-no-owner` carries a pointer whose owner slot is EMPTY (a
+    /// non-community pointer): the slot names no room, so it is stranded.
+    pub const STRANDED: &[&str] = &["c-stranded", "c-empty-target", "c-pointer-no-owner"];
 
     /// Seed the fixture on `d` and return the candidate read's ids that
     /// belong to it, suffix stripped and sorted (so three backends compare).
@@ -165,6 +204,36 @@ pub mod bodies {
             )
             .await;
         }
+        // (a) Edge's REAL self file row: no top-level target, the owner in
+        // the pointer's slot only.
+        put(
+            d,
+            row(
+                &id("a-edge-file"),
+                &node,
+                cohort_scope::SELF,
+                edge_self_file_envelope(&id("a-edge-file"), &owner),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
+        // …and a pointer inside an ARRAY member (a list of attachments): the
+        // pointer scan reads array items too, so the SQL forms must.
+        put(
+            d,
+            row(
+                &id("a-edge-attachment"),
+                &node,
+                cohort_scope::SELF,
+                serde_json::json!({
+                    "dimension": "file:v1",
+                    "filename": format!("{}.jpg", id("a-edge-attachment")),
+                    "attachments": [edge_pointer(&id("a-edge-attachment"), &owner)],
+                }),
+                serde_json::json!({}),
+            ),
+        )
+        .await;
         // (b) a family row naming its family, by a member.
         put(
             d,
@@ -210,6 +279,21 @@ pub mod bodies {
                 cohort_scope::SELF,
                 file_envelope(&id("c-empty-target")),
                 serde_json::json!({ "community_key_id": "" }),
+            ),
+        )
+        .await;
+
+        put(
+            d,
+            row(
+                &id("c-pointer-no-owner"),
+                &node,
+                cohort_scope::SELF,
+                serde_json::json!({
+                    "dimension": "file:v1",
+                    "content": edge_pointer(&id("c-pointer-no-owner"), ""),
+                }),
+                serde_json::json!({}),
             ),
         )
         .await;
@@ -405,7 +489,7 @@ mod run {
         .await
         .expect("I186: family");
 
-        use super::bodies::{chat_envelope, file_envelope};
+        use super::bodies::{chat_envelope, edge_self_file_envelope, file_envelope};
         let emit = |scope: &'static str,
                     mut envelope: serde_json::Value,
                     target: serde_json::Value| {
@@ -418,16 +502,18 @@ mod run {
             EmitAttestationInput::with_envelope(attestation_type::SCORES, envelope, scope)
         };
         let in_room = serde_json::json!({ "community_key_id": owner });
-        // (a) the self room, as `share(.., With::MyDevices, ..)` places it: two
-        // self FILE rows and the MLS KeyPackage, `community_key_id = <owner>`.
+        // (a) the self room, as Edge v32.1.0 places it: two self FILE rows in
+        // Edge's real shape (the owner ONLY in the pointer's slot, no
+        // top-level target) and the MLS KeyPackage (top-level
+        // `community_key_id = <owner>`, `chat.rs`).
         let mut placed: Vec<String> = Vec::new();
         for i in 0..2 {
             placed.push(
                 engine
                     .emit_attestation_self(emit(
                         cohort_scope::SELF,
-                        file_envelope(&format!("a-file{i}-{s}")),
-                        in_room.clone(),
+                        edge_self_file_envelope(&format!("a-file{i}-{s}"), &owner),
+                        serde_json::json!({}),
                     ))
                     .await
                     .expect("I186: a self-room file row"),
@@ -445,8 +531,8 @@ mod run {
         // …and one placed row that is still LOCAL: the sweep's pass 1 enters
         // it into the mesh and would widen it right after, from the local
         // page — a trigger the candidate read never sees.
-        let mut local_env = file_envelope(&format!("a-local-{s}"));
-        local_env["community_key_id"] = serde_json::json!(owner);
+        // Edge authors every file row LOCAL at `self`; this is that row.
+        let local_env = edge_self_file_envelope(&format!("a-local-{s}"), &owner);
         let room_local = dir
             .attestation_insert_local(crate::federation::types::LocalAttestationInput {
                 attestation_id: None,
@@ -548,6 +634,62 @@ mod run {
             vec![cohort_scope::FEDERATION.to_owned()],
             "I186 (c): a stranded self row under a federation grant is widened (#530)"
         );
+        // (d) THE SECOND DEVICE'S READ, modelled on Edge v32.1.0: a file is in
+        // the self room when its POINTER's owner slot is the room
+        // (`files::in_room`: `file.pointer.community_key_id ==
+        // room.content_group_id()`); a chat row when its top-level
+        // `community_key_id` is (`chat::rows_in_room`). Both read
+        // `LifecycleView::Live`: a row some `supersedes` stands for is hidden
+        // (CC 4.4.3.3.1). The originals must be listed, all of them, with an
+        // EMPTY supersedes chain.
+        let superseded: Vec<&str> = corpus
+            .iter()
+            .filter(|a| a.attestation_type == attestation_type::SUPERSEDES)
+            .filter_map(|a| {
+                crate::federation::precedence::references_attestation_id_from_envelope(
+                    &a.attestation_envelope,
+                )
+            })
+            .collect();
+        for id in &room_rows {
+            assert!(
+                !superseded.contains(&id.as_str()),
+                "I186 (d): the supersedes chain of placed row {id} is not empty — Edge's live \
+                 listing hides it, and the second device lists nothing"
+            );
+        }
+        let in_self_room = |a: &crate::federation::Attestation| -> bool {
+            let env = &a.attestation_envelope;
+            let file_in_room = env.get("dimension").and_then(serde_json::Value::as_str)
+                == Some("file:v1")
+                && env
+                    .get("content")
+                    .and_then(|p| p.get("community_key_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(owner.as_str());
+            let chat_in_room = env
+                .get("dimension")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|d| d.starts_with("chat:"))
+                && env
+                    .get("community_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(owner.as_str());
+            file_in_room || chat_in_room
+        };
+        let mut live_in_room: Vec<String> = corpus
+            .iter()
+            .filter(|a| in_self_room(a) && !superseded.contains(&a.attestation_id.as_str()))
+            .map(|a| a.attestation_id.clone())
+            .collect();
+        live_in_room.sort();
+        let mut want = room_rows.clone();
+        want.sort();
+        assert_eq!(
+            live_in_room, want,
+            "I186 (d): the second device's room read lists the original rows, unsuperseded"
+        );
+
         // (a), (b) — METADATA NEVER LEAVES THE ROOM: no `supersedes` anywhere
         // in the corpus stands for a placed row, no other row carries its
         // filename, and the row itself is what it was.
@@ -615,38 +757,6 @@ mod run {
                 "I186: placed row {id} is a candidate: {candidates:?}"
             );
         }
-        // (d) THE SECOND DEVICE'S READ: the room-keyed fold (Edge's
-        // `rows_in_room` / `files::in_room`, `LifecycleView::Live`) — rows
-        // naming the room, minus every row a `supersedes` stands for
-        // (CC 4.4.3.3.1). It returns the ORIGINAL rows, all of them.
-        let superseded: Vec<&str> = corpus
-            .iter()
-            .filter(|a| a.attestation_type == attestation_type::SUPERSEDES)
-            .filter_map(|a| {
-                crate::federation::precedence::references_attestation_id_from_envelope(
-                    &a.attestation_envelope,
-                )
-            })
-            .collect();
-        let mut live_in_room: Vec<String> = corpus
-            .iter()
-            .filter(|a| {
-                crate::federation::admission::envelope_cohort_target(&a.attestation_envelope)
-                    .ok()
-                    .flatten()
-                    == Some(owner.as_str())
-                    && !superseded.contains(&a.attestation_id.as_str())
-            })
-            .map(|a| a.attestation_id.clone())
-            .collect();
-        live_in_room.sort();
-        let mut want = room_rows.clone();
-        want.sort();
-        assert_eq!(
-            live_in_room, want,
-            "I186 (d): the second device's room read lists the original rows, unsuperseded"
-        );
-
         // The one DELIBERATE path stays callable: a host publishing a placed
         // row wider is the member's choice (`Engine::widen_audience`).
         let chat_row = dir.get_attestation(&room_chat).await.unwrap().expect("row");
