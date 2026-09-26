@@ -63,22 +63,38 @@ Per slice: witnesses RED first, then green on every backend; a mutation round on
 
 ### #916 — the device re-wrap (I188)
 
-**Door (final signature).** `at_rest_cascade::orchestrate::rekey_community_member_device_add(backend, community_key_id, member_key_id, new_occurrence_key_id, authority_key_id, as_of) -> Result<DeviceRekeyResult, federation::Error>` (sqlite, postgres — the memory backend has no community DEK plane); `Engine::rekey_community_member_device_add(community_key_id, member_key_id, new_occurrence_key_id, authority_key_id)`, which emits the epoch-axis `KeyGrant` set of every granted epoch this node minted; `PyEngine.rekey_community_member_device_add_json`. `DeviceRekeyResult { epochs_scanned, granted, already_held, content_miss: [EpochMiss { minter_key_id, epoch, reason: Destroyed | NotRetainedHere }] }`. Refusals: `Error::DeviceRekeyRefused { community_key_id, member_key_id, occurrence_key_id, rule }`, `kind()` `federation_device_rekey_refused`, Python `ValueError`; rules `device_rekey_unbound`, `device_rekey_owner_mismatch`, `device_rekey_authority_not_owner`, `device_rekey_member_not_active`, `device_rekey_no_encryption_pubkeys` (the last also records `hard_case:recipient_excluded`). New floor read `community_dek_member_grant_epochs(community, member_key_ids)`. No `EnvelopeKind`, no hash moved: the wraps land on the existing member-grant plane and ride the existing epoch-axis `KeyGrant` set.
+**Doors (final signatures).**
+- Host's door: `at_rest_cascade::orchestrate::rekey_community_member_device_add(backend, community_key_id, member_key_id, new_occurrence_key_id, authority_key_id, as_of) -> Result<DeviceRekeyResult, federation::Error>`; `Engine::rekey_community_member_device_add(community_key_id, member_key_id, new_occurrence_key_id, authority_key_id)` (emits the epoch-axis `KeyGrant` set of each granted epoch this node minted); `PyEngine.rekey_community_member_device_add_json`.
+- Minter side: `at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(backend, minter_key_id, only: Option<(member, device)>, as_of) -> Result<MinterRewrapReport { changed, keyless }, Error>`; `Engine::rewrap_own_epochs_to_member_devices(only)` (emits each changed epoch's set). Runs itself on an owner-binding `Inserted` through `Engine::apply_replicated_attestation` (failure logged; the row stands) and first thing in `Engine::emit_pending_key_grants` (boot and on demand).
+- `DeviceRekeyResult { epochs_scanned, granted, already_held, content_miss: [EpochMiss { minter_key_id, epoch, reason: Destroyed | LostLocally | MintedElsewhere }] }`; `granted`/`already_held` are decided by the insert (`community_dek_put_member_grant` now returns whether it inserted).
+- Refusals: `Error::DeviceRekeyRefused { community_key_id, member_key_id, occurrence_key_id, rule }`, `kind()` `federation_device_rekey_refused`, Python `ValueError` whose message is `"<kind>: <rule>"` (as are `RosterAuthorityUnauthorized` and `LocationAuthorityUnauthorized` now). Rules `device_rekey_unbound` (retryable), `device_rekey_owner_mismatch`, `device_rekey_authority_not_owner`, `device_rekey_member_not_active`, `device_rekey_no_encryption_pubkeys` (also records `hard_case:recipient_excluded`).
+- New floor read `community_dek_member_grant_epochs(community, member_key_ids)`. No `EnvelopeKind`, no hash moved.
 
-**Deviations from §3, stated.** (1) `authority_key_id` must equal the member, who must be `owner_of(device)`; a device key does not stand in for its human. (2) "All minters' epochs" is honoured where this node holds the self-retention row; an epoch another node minted is reported `not_retained_here`, never re-wrapped from this node's private halves — only its minter can sign the set that carries a wrap (`admit_replicated_key_grant`: signer == minter), so each member node re-wraps its own epochs. (3) "What the member holds" is the grants of every occurrence the member ever had (a lost device's grants count) plus the member key. (4) A normally destroyed epoch deletes its grants in the same transaction, so it no longer appears as held; `Destroyed` is reported only when grant rows outlive the material. (5) The device's keys are `resolve_encryption_keys(device)` (anchor row first, revocation- and validity-aware).
+**Holder set.** The member key, the member's occurrences and the member's owned nodes, minus any key another party has ever held (an owner-binding over it by anyone else, live or not; an identity row for it under anyone else). Exclusion, not an instant cut: the available instants are signer-chosen (approved, 2026-09-26).
 
-**Mutation table** (lane `test(device_readd) | test(i188) | test(key_grant) | test(rekey) | test(epoch)`, `--features sqlite,postgres`, under `scripts/pg_test_db.sh`; unmutated baseline 89/89; each mutant reverted before the next):
+**Two-node delivery path (I188 two-node, sqlite and postgres).** A (alice's node) seals E1..E3 through `put_blob_scoped`; B seals its own epoch and A admits B's set through `Engine::apply_replicated_key_grant`. (T) Device d2's self-signed singleton occurrence is published on B and carried to A by `list_signed_identity_occurrences_since` → A's `put_identity_occurrence` (the gated door); bob's owner-binding is admitted on B and carried by `list_attestations_since` → `engine_a.apply_replicated_attestation` (Inserted → the trigger). A's re-wrapped sets are read off A's `list_attestations_since` (the `key_grant:epoch:v1` rows carrying d2) → `engine_b.apply_replicated_key_grant`; on B, d2's wrap opens (d2's kept private halves) to the DEK B's own wrap opens to. (S) d3's binding arrives before its occurrence: nothing is wrapped; the occurrence arrives; `emit_pending_key_grants` re-wraps and emits. (D) The host's door on A for d4 grants A's epochs and a foreign-named local epoch, reports B's `minted_elsewhere`, emits sets for A's epochs only, and none for the foreign minter.
 
-| Mutant | Result | Caught by |
-|---|---|---|
-| owner-binding check dropped (`owner_of` replaced by the member) | KILLED (sqlite, postgres) | (c) carol's device granted E1..E3 |
-| roster-active check dropped | KILLED | (e) removed member's device not refused |
-| only the latest epoch re-wrapped | KILLED | (a) every epoch bob holds is granted |
-| every granted epoch's minter bumped | KILLED | (h) the epoch counters are unchanged |
-| keyless device returns `Ok(empty)` instead of refusing | KILLED | (f) refusal expected |
-| unretained epoch silently skipped (no `content_miss`) | KILLED | (g) the unretained epoch is named |
-| authority check dropped | KILLED | (c') alice as authority for bob's device |
-| keyless exclusion not recorded (hard case future dropped) | KILLED | (f) the exclusion is recorded |
-| already-held pre-check dropped | KILLED | (b) a re-run grants nothing |
+**Mutation table** (lane `test(device_readd) | test(i188) | test(key_grant) | test(rekey) | test(epoch)`, `--features sqlite,postgres`, under `scripts/pg_test_db.sh`; 91 tests; each mutant reverted before the next; no OOM):
 
-9/9 killed; in every mutant run the other 87 lane tests stayed green.
+| # | Mutant | Result | Caught by |
+|---|---|---|---|
+| M01 | owner-binding check dropped | KILLED | (c) carol's device granted |
+| M02 | roster-active check dropped | KILLED | (e) |
+| M03 | only the latest held epoch re-wrapped | KILLED | (a); two-node (T) |
+| M04 | each granted epoch's minter bumped | KILLED | (h) |
+| M05 | keyless device returns `Ok` | KILLED | (f) |
+| M06 | unretained epoch skipped silently | KILLED | (g); two-node (D) |
+| M07 | authority check dropped | KILLED | (c') |
+| M08 | keyless exclusion not recorded | KILLED | (f) |
+| M09 | already-held pre-check dropped | SURVIVED — equivalent | the insert now decides `already_held`; the pre-check only saves the unwrap and the ML-KEM encap on a re-run. No observable to witness. |
+| M10 | attestation trigger dropped | KILLED | two-node (T) |
+| M11 | trigger's set emission dropped | KILLED | two-node (T) — no set carries d2 |
+| M12 | sweep call in `emit_pending_key_grants` dropped | KILLED | two-node (S) |
+| M13 | door's emit loop deleted | KILLED | two-node (D) |
+| M14 | door's own-minter emit filter inverted | KILLED | two-node (D) |
+| M15 | other-party owner-binding filter dropped | KILLED | (i) absence-span epochs leak |
+| M16 | other-identity filter dropped | KILLED | (i) absence-span epochs leak |
+| M17 | miss reasons collapsed to `minted_elsewhere` | KILLED | (g) |
+| M18 | insert result ignored (always `granted`) | first SURVIVED (masked by the pre-check); KILLED after arm (b'') — two racing calls | (b'') |
+
+17/18 killed; M09 is equivalent by construction. In every killed run the other 89 lane tests stayed green.
