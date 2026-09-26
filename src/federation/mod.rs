@@ -884,6 +884,38 @@ pub fn authorized_roster_state_at(
     events: &[RosterEvent],
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> RosterState {
+    fold_roster(record_members, rules, events, as_of).0
+}
+
+/// v49.0.0 (CIRISPersist#912, operator ruling 2026-09-25) — when each ACTIVE
+/// member's current membership span began: `None` for a record member never
+/// removed (the fold counts record members from the record, never from their
+/// `joined_at`, so their span is open to the beginning of time), else the
+/// `effective_at` of the applied widening that last (re)admitted them. A
+/// widening of a member who is already active (a role change) does NOT restart
+/// the span — they never left. A removed member has no entry. The same replay
+/// as [`authorized_roster_state_at`] (one loop, so the two cannot disagree).
+pub type RosterSpans = std::collections::BTreeMap<String, Option<chrono::DateTime<chrono::Utc>>>;
+
+/// See [`RosterSpans`].
+#[must_use]
+pub fn authorized_roster_spans_at(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> RosterSpans {
+    fold_roster(record_members, rules, events, as_of).1
+}
+
+/// The ONE authorized replay: the roster state and each active member's span
+/// start, built in the same pass.
+fn fold_roster(
+    record_members: &[types::CommunityMember],
+    rules: RosterRules<'_>,
+    events: &[RosterEvent],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> (RosterState, RosterSpans) {
     let mut ordered: Vec<RosterEvent> = events
         .iter()
         .filter(|e| e.effective_at <= as_of)
@@ -894,15 +926,25 @@ pub fn authorized_roster_state_at(
         .iter()
         .map(|m| (m.key_id.clone(), (true, m.clone())))
         .collect();
+    let mut spans: RosterSpans = record_members
+        .iter()
+        .map(|m| (m.key_id.clone(), None))
+        .collect();
     for e in ordered {
         if e.reversed {
             continue;
         }
         if roster_event_standing(rules, &state, &e).is_ok() {
+            let was_active = matches!(state.get(&e.member.key_id), Some((true, _)));
+            if !e.is_add {
+                spans.remove(&e.member.key_id);
+            } else if !was_active {
+                spans.insert(e.member.key_id.clone(), Some(e.effective_at));
+            }
             state.insert(e.member.key_id.clone(), (e.is_add, e.member));
         }
     }
-    state
+    (state, spans)
 }
 
 /// v49.0.0 (CIRISPersist#908) — the active members of
@@ -1333,6 +1375,37 @@ where
         authorized_roster_at(&record, RosterRules::of_family(family), &events, as_of)
             .into_iter()
             .map(roster_member_as_family_member)
+            .collect(),
+    )
+}
+
+/// v49.0.0 (CIRISPersist#912) — the authorized roster of a STORED room at
+/// `as_of` with each member's current span start ([`RosterSpans`]), in roster
+/// order: what a per-membership fact (a listing) is judged against.
+pub async fn authorized_community_roster_spans_at<F>(
+    directory: &F,
+    community: &Community,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<
+    Vec<(
+        types::CommunityMember,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )>,
+    Error,
+>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let events = Box::pin(community_roster_events(directory, community)).await?;
+    let rules = RosterRules::of_community(community);
+    let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
+    Ok(
+        authorized_roster_at(&community.members, rules, &events, as_of)
+            .into_iter()
+            .map(|m| {
+                let start = spans.get(&m.key_id).copied().flatten();
+                (m, start)
+            })
             .collect(),
     )
 }

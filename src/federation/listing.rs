@@ -120,32 +120,45 @@ where
     Ok(())
 }
 
-/// The latest listing per member at or before `as_of` — the forward-only fold.
-/// The PK carries `effective_at`, so one member has at most one row per
-/// instant and "latest" is total.
+/// The member's deciding listing at `as_of` — the forward-only fold over ONE
+/// membership span: among the rows made at or after `span_start` (the start of
+/// the member's current span, [`super::RosterSpans`]; `None` = open to the
+/// beginning of time) and at or before `as_of`, the latest. A row from before
+/// the span — made before joining, or in an earlier membership ended by a
+/// removal — does not count (operator ruling 2026-09-25: a listing belongs to
+/// the membership it was made in). The PK carries `effective_at`, so one
+/// member has at most one row per instant and "latest" is total.
 #[must_use]
 pub fn latest_listing_at(
     listings: &[CommunityMembershipListing],
     member_key_id: &str,
+    span_start: Option<chrono::DateTime<chrono::Utc>>,
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> Option<CommunityMembershipListing> {
     listings
         .iter()
-        .filter(|l| l.member_key_id == member_key_id && l.effective_at <= as_of)
+        .filter(|l| {
+            l.member_key_id == member_key_id
+                && l.effective_at <= as_of
+                && span_start.is_none_or(|start| l.effective_at >= start)
+        })
         .max_by_key(|l| l.effective_at)
         .cloned()
 }
 
 /// v49.0.0 (CIRISPersist#912) — **the publicly listed members of a room at
 /// `as_of`**: the room's ACTIVE members by the authorized fold
-/// ([`super::authorized_community_roster_at`]) whose latest listing at or
-/// before `as_of` is [`LISTED_PUBLIC`], in roster order.
+/// ([`super::authorized_community_roster_spans_at`]) whose latest listing
+/// WITHIN THEIR CURRENT MEMBERSHIP SPAN and at or before `as_of` is
+/// [`LISTED_PUBLIC`], in roster order.
 ///
 /// This is the ONLY roster view a non-member may be served — the one crack CC 2
 /// opens in "never globally enumerable", made of the members who chose it.
 /// Persist does not gate the endpoint that serves it; the host does. A removed
-/// member drops out with their membership (their rows stay stored); a listing
-/// made before its signer became a member takes effect once they are one.
+/// member drops out with their membership, and a removal ends every listing
+/// made before it: re-added, they are unlisted until they list again. A
+/// listing made before its signer became a member is stored and stays inert.
+/// A role change of an active member does not restart the span.
 /// [`Error::InvalidArgument`] for an unknown room.
 pub async fn listed_community_members_at<F>(
     directory: &F,
@@ -163,7 +176,7 @@ where
                 "listed_members names unknown community_key_id {community_key_id:?}"
             ))
         })?;
-    let roster = Box::pin(super::authorized_community_roster_at(
+    let roster = Box::pin(super::authorized_community_roster_spans_at(
         directory, &community, as_of,
     ))
     .await?;
@@ -172,12 +185,13 @@ where
         .await?;
     Ok(roster
         .into_iter()
-        .filter(|m| {
-            latest_listing_at(&listings, &m.key_id, as_of)
+        .filter(|(m, span_start)| {
+            latest_listing_at(&listings, &m.key_id, *span_start, as_of)
                 .and_then(|l| l.listed)
                 .as_deref()
                 == Some(LISTED_PUBLIC)
         })
+        .map(|(m, _)| m)
         .collect())
 }
 
@@ -222,7 +236,7 @@ mod tests {
         ];
         let at = |s: &str| s.parse().unwrap();
         let listed = |m: &str, s: &str| {
-            latest_listing_at(&rows, m, at(s))
+            latest_listing_at(&rows, m, None, at(s))
                 .and_then(|l| l.listed)
                 .is_some()
         };
@@ -232,5 +246,74 @@ mod tests {
         assert!(!listed("bob", "2026-03-05T00:00:00Z"));
         assert!(!listed("carol", "2026-03-08T00:00:00Z"));
         assert!(listed("carol", "2026-03-09T00:00:00Z"));
+    }
+
+    /// A row from before the span does not count; one AT the span start does.
+    #[test]
+    fn a_listing_belongs_to_its_span() {
+        let rows = vec![row("bob", "2026-03-01T00:00:00Z", Some(LISTED_PUBLIC))];
+        let at = |s: &str| -> chrono::DateTime<chrono::Utc> { s.parse().unwrap() };
+        let now = at("2026-04-01T00:00:00Z");
+        assert!(latest_listing_at(&rows, "bob", None, now).is_some());
+        assert!(latest_listing_at(&rows, "bob", Some(at("2026-03-01T00:00:00Z")), now).is_some());
+        assert!(latest_listing_at(&rows, "bob", Some(at("2026-03-02T00:00:00Z")), now).is_none());
+    }
+
+    /// The span fold: a record member is open to the beginning of time; a
+    /// removal ends the span; a re-add starts a new one; a widening of an
+    /// ACTIVE member (a role change) does not restart it.
+    #[test]
+    fn spans_restart_on_readmission_not_on_role_change() {
+        use crate::federation::{authorized_roster_spans_at, RosterEvent, RosterRules};
+        let at = |s: &str| -> chrono::DateTime<chrono::Utc> { s.parse().unwrap() };
+        let m = |k: &str, role: Option<&str>| CommunityMember {
+            key_id: k.into(),
+            joined_at: at("2026-01-01T00:00:00Z"),
+            role: role.map(str::to_owned),
+        };
+        // Legacy (signer-less) events count, so the fold applies each.
+        let ev = |t: &str, is_add: bool, member: CommunityMember| RosterEvent {
+            effective_at: at(t),
+            is_add,
+            member,
+            signers: Default::default(),
+            moderator_roots: Default::default(),
+            reversed: false,
+        };
+        let record = vec![
+            m("alice", Some("founder")),
+            m("bob", None),
+            m("carol", None),
+        ];
+        let events = vec![
+            ev("2026-03-01T00:00:00Z", false, m("bob", None)),
+            ev("2026-03-02T00:00:00Z", true, m("bob", None)),
+            ev("2026-03-03T00:00:00Z", true, m("bob", Some("moderator"))),
+            ev("2026-03-04T00:00:00Z", true, m("carol", Some("moderator"))),
+            ev("2026-03-05T00:00:00Z", true, m("dave", None)),
+            ev("2026-03-06T00:00:00Z", false, m("dave", None)),
+        ];
+        let rules = RosterRules {
+            protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            subkind: None,
+            policy_blob: None,
+        };
+        let spans = authorized_roster_spans_at(&record, rules, &events, at("2026-04-01T00:00:00Z"));
+        assert_eq!(
+            spans.get("alice"),
+            Some(&None),
+            "a record member: open span"
+        );
+        assert_eq!(
+            spans.get("bob"),
+            Some(&Some(at("2026-03-02T00:00:00Z"))),
+            "re-added at 03-02; the 03-03 role change does not restart it"
+        );
+        assert_eq!(
+            spans.get("carol"),
+            Some(&None),
+            "a role change keeps the open span"
+        );
+        assert_eq!(spans.get("dave"), None, "removed: no span");
     }
 }

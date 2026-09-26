@@ -5,11 +5,13 @@
 //! a member lists themself and appears in `listed_members`, nobody else does;
 //! the founder cannot list anyone (`envelope_listed_not_self_asserted`, no row
 //! stored); a value other than `public` is refused (`envelope_listed_bad_value`);
-//! a later clear un-lists and both rows stay stored; a non-member's listing is
-//! stored, has no effect, and takes effect once they are widened in; a removed
-//! member's earlier listing stops appearing; a family id is
-//! `envelope_listed_scope_invalid`; two directories converge through the
-//! signed since-read.
+//! a later clear un-lists and both rows stay stored; a listing belongs to the
+//! membership span it was made in (operator ruling 2026-09-25) — a non-member's
+//! listing is stored and stays inert after they are widened in until they list
+//! again, a removed member's listing stops appearing, a removed-then-re-added
+//! member is unlisted until they list again, and a role change is not a new
+//! span; a family id is `envelope_listed_scope_invalid`; two directories
+//! converge through the signed since-read.
 
 /// The backend-agnostic witness bodies; `run` instantiates them per backend.
 #[cfg(test)]
@@ -54,7 +56,14 @@ pub mod bodies {
             .await
     }
 
-    async fn widen(d: &dyn FederationDirectory, signer: &str, room: &str, member: &str, t: &str) {
+    async fn widen(
+        d: &dyn FederationDirectory,
+        signer: &str,
+        room: &str,
+        member: &str,
+        t: &str,
+        role: Option<&str>,
+    ) {
         d.put_community_membership_widening(ts::sign_community_membership_widening(
             signer,
             CommunityMembershipWidening {
@@ -62,7 +71,7 @@ pub mod bodies {
                 member_key_id: member.to_owned(),
                 joined_at: at(t),
                 effective_at: at(t),
-                role: None,
+                role: role.map(str::to_owned),
                 persist_row_hash: String::new(),
             },
         ))
@@ -275,7 +284,9 @@ pub mod bodies {
             "{tag} I183: read at an earlier instant, bob was listed"
         );
 
-        // ── a non-member's listing is stored and waits for the fold ───
+        // ── a pre-join listing is stored and stays inert ──────────────
+        // (operator ruling 2026-09-25: a listing belongs to the membership it
+        // was made in; consent outranks listing before joining)
         let dave = format!("{tag}-dave");
         ts::register_hybrid_key_as(d, &dave, &dave, identity_type::USER).await;
         list_as(
@@ -290,11 +301,22 @@ pub mod bodies {
             listed(d, &room).await.is_empty(),
             "{tag} I183: a non-member is never listed"
         );
-        widen(d, &alice, &room, &dave, "2026-03-07T00:00:00Z").await;
+        widen(d, &alice, &room, &dave, "2026-03-07T00:00:00Z", None).await;
+        assert!(
+            listed(d, &room).await.is_empty(),
+            "{tag} I183: dave's pre-join listing does NOT carry into his membership"
+        );
+        list_as(
+            d,
+            &dave,
+            listing(&room, &dave, "2026-03-07T12:00:00Z", Some(LISTED_PUBLIC)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I183: dave lists as a member: {e}"));
         assert_eq!(
             listed(d, &room).await,
             vec![dave.clone()],
-            "{tag} I183: dave's listing takes effect once he is a member"
+            "{tag} I183: dave is listed once he chooses it as a member"
         );
 
         // ── a removed member drops out; their row stays ───────────────
@@ -314,6 +336,57 @@ pub mod bodies {
         );
         assert_eq!(rows_of(d, &room, &carol).await, 1);
 
+        // ── a removal ends the listing: re-added, unlisted until chosen ─
+        list_as(
+            d,
+            &bob,
+            listing(&room, &bob, "2026-03-10T00:00:00Z", Some(LISTED_PUBLIC)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I183: bob lists again: {e}"));
+        assert_eq!(listed(d, &room).await, vec![bob.clone(), dave.clone()]);
+        revoke(d, &alice, &room, &bob, "2026-03-11T00:00:00Z").await;
+        widen(d, &alice, &room, &bob, "2026-03-12T00:00:00Z", None).await;
+        assert_eq!(
+            listed(d, &room).await,
+            vec![dave.clone()],
+            "{tag} I183: a re-added member is unlisted until they list again"
+        );
+        list_as(
+            d,
+            &bob,
+            listing(&room, &bob, "2026-03-13T00:00:00Z", Some(LISTED_PUBLIC)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I183: bob lists in his new membership: {e}"));
+        assert_eq!(listed(d, &room).await, vec![bob.clone(), dave.clone()]);
+
+        // ── a role change is not a new membership ─────────────────────
+        widen(
+            d,
+            &alice,
+            &room,
+            &dave,
+            "2026-03-14T00:00:00Z",
+            Some("editor"),
+        )
+        .await;
+        let roles: Vec<_> = d
+            .listed_members(&room)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.key_id, m.role))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (bob.clone(), None),
+                (dave.clone(), Some("editor".to_owned()))
+            ],
+            "{tag} I183: a listed member whose role changes stays listed"
+        );
+
         // ── the served row is the signed row, byte-exact ──────────────
         let served: Vec<_> = d
             .list_signed_community_membership_listings_since(None, u32::MAX)
@@ -322,7 +395,7 @@ pub mod bodies {
             .into_iter()
             .filter(|l| l.listing.community_membership_listing.community_key_id == room)
             .collect();
-        assert_eq!(served.len(), 4, "{tag} I183: bob ×2, dave, carol");
+        assert_eq!(served.len(), 7, "{tag} I183: bob ×4, dave ×2, carol");
         let first = served
             .iter()
             .find(|l| {
@@ -386,8 +459,16 @@ pub mod bodies {
         .await
         .unwrap();
         for d in [a, b] {
-            widen(d, &alice, &room, &dave, "2026-03-05T00:00:00Z").await;
+            widen(d, &alice, &room, &dave, "2026-03-05T00:00:00Z", None).await;
         }
+        // dave's 03-04 row predates his membership (inert); this one counts.
+        list_as(
+            a,
+            &dave,
+            listing(&room, &dave, "2026-03-06T00:00:00Z", Some(LISTED_PUBLIC)),
+        )
+        .await
+        .unwrap();
         assert!(listed(b, &room).await.is_empty(), "{tag} I183: control");
 
         let mut cursor = None;
@@ -406,7 +487,7 @@ pub mod bodies {
                 applied += 1;
             }
         }
-        assert_eq!(applied, 4, "{tag} I183: every row crossed, once");
+        assert_eq!(applied, 5, "{tag} I183: every row crossed, once");
         let (la, lb) = (listed(a, &room).await, listed(b, &room).await);
         assert_eq!(la, vec![carol.clone(), dave.clone()], "{tag} I183: A");
         assert_eq!(la, lb, "{tag} I183: A and B agree on the listed members");
