@@ -54,3 +54,25 @@ Also locked, built elsewhere: #914 — disclosure sets are blobs (the ruling is 
 Per slice: witnesses RED first, then green on every backend; a mutation round on the new predicate/door (table appended below by the slice); an independent review against this document. Release: the full unfiltered lanes (sqlite, postgres, union), the gate chain, `certify.sh full` on the exact SHA.
 
 ## 7. Mutation tables (appended by each slice)
+
+### #916 — the device re-wrap (I188)
+
+**Door (final signature).** `at_rest_cascade::orchestrate::rekey_community_member_device_add(backend, community_key_id, member_key_id, new_occurrence_key_id, authority_key_id, as_of) -> Result<DeviceRekeyResult, federation::Error>` (sqlite, postgres — the memory backend has no community DEK plane); `Engine::rekey_community_member_device_add(community_key_id, member_key_id, new_occurrence_key_id, authority_key_id)`, which emits the epoch-axis `KeyGrant` set of every granted epoch this node minted; `PyEngine.rekey_community_member_device_add_json`. `DeviceRekeyResult { epochs_scanned, granted, already_held, content_miss: [EpochMiss { minter_key_id, epoch, reason: Destroyed | NotRetainedHere }] }`. Refusals: `Error::DeviceRekeyRefused { community_key_id, member_key_id, occurrence_key_id, rule }`, `kind()` `federation_device_rekey_refused`, Python `ValueError`; rules `device_rekey_unbound`, `device_rekey_owner_mismatch`, `device_rekey_authority_not_owner`, `device_rekey_member_not_active`, `device_rekey_no_encryption_pubkeys` (the last also records `hard_case:recipient_excluded`). New floor read `community_dek_member_grant_epochs(community, member_key_ids)`. No `EnvelopeKind`, no hash moved: the wraps land on the existing member-grant plane and ride the existing epoch-axis `KeyGrant` set.
+
+**Deviations from §3, stated.** (1) `authority_key_id` must equal the member, who must be `owner_of(device)`; a device key does not stand in for its human. (2) "All minters' epochs" is honoured where this node holds the self-retention row; an epoch another node minted is reported `not_retained_here`, never re-wrapped from this node's private halves — only its minter can sign the set that carries a wrap (`admit_replicated_key_grant`: signer == minter), so each member node re-wraps its own epochs. (3) "What the member holds" is the grants of every occurrence the member ever had (a lost device's grants count) plus the member key. (4) A normally destroyed epoch deletes its grants in the same transaction, so it no longer appears as held; `Destroyed` is reported only when grant rows outlive the material. (5) The device's keys are `resolve_encryption_keys(device)` (anchor row first, revocation- and validity-aware).
+
+**Mutation table** (lane `test(device_readd) | test(i188) | test(key_grant) | test(rekey) | test(epoch)`, `--features sqlite,postgres`, under `scripts/pg_test_db.sh`; unmutated baseline 89/89; each mutant reverted before the next):
+
+| Mutant | Result | Caught by |
+|---|---|---|
+| owner-binding check dropped (`owner_of` replaced by the member) | KILLED (sqlite, postgres) | (c) carol's device granted E1..E3 |
+| roster-active check dropped | KILLED | (e) removed member's device not refused |
+| only the latest epoch re-wrapped | KILLED | (a) every epoch bob holds is granted |
+| every granted epoch's minter bumped | KILLED | (h) the epoch counters are unchanged |
+| keyless device returns `Ok(empty)` instead of refusing | KILLED | (f) refusal expected |
+| unretained epoch silently skipped (no `content_miss`) | KILLED | (g) the unretained epoch is named |
+| authority check dropped | KILLED | (c') alice as authority for bob's device |
+| keyless exclusion not recorded (hard case future dropped) | KILLED | (f) the exclusion is recorded |
+| already-held pre-check dropped | KILLED | (b) a re-run grants nothing |
+
+9/9 killed; in every mutant run the other 87 lane tests stayed green.
