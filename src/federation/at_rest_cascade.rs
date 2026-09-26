@@ -117,6 +117,40 @@ pub enum ContentMasterSource {
     },
 }
 
+/// v50.0.0 (CIRISPersist#920) — the persisted `federation_content_master`
+/// row, verbatim: the authority on WHICH root this node uses (§10.2 — the
+/// row wins). Returned by
+/// [`BlobStorage::load_or_init_content_master_row`](crate::federation::BlobStorage::load_or_init_content_master_row)
+/// so a consumer that needs the root's KIND (the MLS-state opener) reads
+/// the same row the blob doors resolve, instead of re-deciding it.
+#[derive(Clone)]
+pub struct ContentMasterRow {
+    /// `"hardware"` | `"software"` (the V070 CHECK).
+    pub key_kind: String,
+    /// The 32-byte software master, base64 — present iff `key_kind='software'`.
+    /// `Zeroizing` (v50, #920 review): scrubbed on drop, as is every copy
+    /// persist makes of it. The driver's own row buffers and CIRISVerify's
+    /// internal `seed` / `derived` copies inside `derive_symmetric_key` are
+    /// outside persist's reach (filed upstream with CIRISVerify).
+    pub master_key_b64: Option<zeroize::Zeroizing<String>>,
+    /// Provenance string.
+    pub descriptor: String,
+}
+
+impl std::fmt::Debug for ContentMasterRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the software master.
+        f.debug_struct("ContentMasterRow")
+            .field("key_kind", &self.key_kind)
+            .field(
+                "master_key_b64",
+                &self.master_key_b64.as_ref().map(|_| "<redacted>"),
+            )
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
+
 /// v43.0.0 (§10.2) — **resolve the content-at-rest master key.**
 ///
 /// This is the function `at_rest_cascade`'s module header has always
@@ -155,18 +189,22 @@ pub fn content_master_key(create_seed_if_absent: bool) -> ContentMasterSource {
             // `derive_hardware_master_for_context` already asserts the length,
             // but this is the boundary where a wrong length would become a
             // silent truncation, so it is re-checked rather than assumed.
-            Ok((master, descriptor)) => match <[u8; 32]>::try_from(master.as_slice()) {
-                Ok(key) => ContentMasterSource::Hardware {
-                    key: zeroize::Zeroizing::new(key),
-                    descriptor,
-                },
-                Err(_) => ContentMasterSource::SoftwareFallback {
-                    reason: format!(
-                        "verify derived a {}-byte content master, expected 32",
-                        master.len()
-                    ),
-                },
-            },
+            Ok((master, descriptor)) => {
+                // Scrubbed on drop (v50, #920 review).
+                let master = zeroize::Zeroizing::new(master);
+                match <[u8; 32]>::try_from(master.as_slice()) {
+                    Ok(key) => ContentMasterSource::Hardware {
+                        key: zeroize::Zeroizing::new(key),
+                        descriptor,
+                    },
+                    Err(_) => ContentMasterSource::SoftwareFallback {
+                        reason: format!(
+                            "verify derived a {}-byte content master, expected 32",
+                            master.len()
+                        ),
+                    },
+                }
+            }
             Err(e) => ContentMasterSource::SoftwareFallback {
                 reason: format!("hardware content master unavailable: {e}"),
             },
@@ -271,9 +309,12 @@ pub fn resolve_persisted_content_master(
     use base64::Engine as _;
     match (key_kind, master_key_b64) {
         ("software", Some(b64)) => {
-            let raw = B64
-                .decode(b64)
-                .map_err(|e| AtRestError::Crypto(format!("content-master b64: {e}")))?;
+            // Scrubbed on drop (v50, #920 review); the returned array is the
+            // caller's copy, as the `[u8; 32]` signature has always made it.
+            let raw = zeroize::Zeroizing::new(
+                B64.decode(b64)
+                    .map_err(|e| AtRestError::Crypto(format!("content-master b64: {e}")))?,
+            );
             <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
                 AtRestError::Crypto(format!(
                     "content master is {} bytes, expected 32",

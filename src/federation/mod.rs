@@ -145,6 +145,10 @@ pub mod trust_root_hardware_invariants;
 // v49.0.0 (CIRISPersist#915) — I185, Android generation custody.
 #[cfg(test)]
 mod android_custody_invariants;
+// v50.0.0 (CIRISPersist#920) — I187, the MLS-state root follows the content
+// master, through `Engine::open_mls_state` on every backend that has the row.
+#[cfg(all(test, feature = "encrypted-kv"))]
+mod mls_state_root_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.

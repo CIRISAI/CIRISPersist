@@ -2129,6 +2129,19 @@ pub trait BlobStorage: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
+    /// v50.0.0 (CIRISPersist#920) — the persisted content-master ROW
+    /// (`key_kind`, `master_key_b64`, `descriptor`), initialised exactly as
+    /// [`load_or_init_content_master`](Self::load_or_init_content_master)
+    /// initialises it on a node that has sealed nothing yet (hardware root
+    /// if reachable, else a fresh software master recorded as software;
+    /// concurrent first-callers converge on the PK). The row is returned
+    /// unresolved: `load_or_init_content_master` resolves it to the key, and
+    /// `Engine::open_mls_state` reads its KIND to pick the MLS-state root.
+    fn load_or_init_content_master_row(
+        &self,
+    ) -> impl Future<Output = Result<crate::federation::at_rest_cascade::ContentMasterRow, BlobError>>
+           + Send;
+
     /// v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) — load this node's
     /// **content-KEM identity** (the content-encryption keypair role of
     /// the [`LocalIdentityAggregate`](crate::federation::LocalIdentityAggregate)),

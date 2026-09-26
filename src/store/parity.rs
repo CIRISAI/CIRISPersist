@@ -312,6 +312,21 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
+    // v50.0.0 (#920) — the content-master row load/init that
+    // `load_or_init_content_master` now resolves; the same door, split.
+    ("load_or_init_content_master_row", Class::Delegates),
+    // v50.0.0 (#920 review) — POSTGRES ONLY: the postgres
+    // `load_or_init_content_master_row` runs `content_master_key(true)` on the
+    // blocking pool (§11.8); tokio-postgres already requires a runtime, so a
+    // bare `spawn_blocking` there is sound. PLUMBING: its only failure is the
+    // join (a panicked or cancelled task), the runtime's terms, never a
+    // question about the caller's input. SQLite never calls it — it uses
+    // `sqlite_conn_model::dispatch_blocking`, which returns the value (no
+    // propagated error) and runs inline with no runtime (#158); a bare
+    // `spawn_blocking` reappearing in a sqlite door is a regression of that,
+    // which this row would NOT catch — `sqlite_conn_model`'s module header is
+    // the rule.
+    ("spawn_blocking", Class::Plumbing),
     // #848 — the recipient-decrypt path: the identity floor is another door
     // (it mints on first call, first-write-wins), and unsealing our OWN
     // sealed private halves fails only on corrupt material — the substrate's

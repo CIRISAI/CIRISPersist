@@ -82,7 +82,15 @@ fn secrets_storage_dir() -> Result<std::path::PathBuf, SecretsError> {
 /// clean, expected outcome on a no-TPM host, not an error to surface.
 pub(crate) fn derive_hardware_master_key() -> Result<(Vec<u8>, String), SecretsError> {
     // The secrets store's first migration legitimately CREATES the seed.
-    derive_hardware_master_for_context(SECRETS_MASTER_CONTEXT, true)
+    // "Keeping the software master" is THIS caller's meaning of the refusal,
+    // so it is said here, not in the shared derivation (v50, #920 review: the
+    // MLS-state opener wrapped it into a §11.7 refusal where it was false).
+    derive_hardware_master_for_context(SECRETS_MASTER_CONTEXT, true).map_err(|e| match e {
+        SecretsError::HardwareKeyUnavailable(m) => {
+            SecretsError::HardwareKeyUnavailable(format!("{m} — keeping the software master key"))
+        }
+        other => other,
+    })
 }
 
 /// v43.0.0 (BLOB_ENCRYPTION_AT_REST.md §10.2) — the **content-at-rest**
@@ -117,13 +125,24 @@ pub(crate) fn derive_hardware_content_master_key(
 /// be the second root §4.3 forbids: two things to seal, two to rotate, two
 /// ways to lose the state.
 ///
-/// `create_seed_if_absent` follows §11.7: only the first open of a store
-/// that holds nothing yet may seal a seed.
+/// v50.0.0 (#920): the seed is the content master's. The MLS-state opener
+/// always passes `create_seed_if_absent = false` — under a hardware row the
+/// seed was sealed when the row was written, and an absent one is §11.7's
+/// lost keyring. The only moment the MLS/content path seals a seed is the
+/// content-master row's initialisation.
 #[cfg(feature = "encrypted-kv")]
 pub(crate) fn derive_hardware_mls_state_key(
     create_seed_if_absent: bool,
-) -> Result<(Vec<u8>, String), SecretsError> {
-    derive_hardware_master_for_context(
+) -> Result<(Vec<u8>, String), HardwareDeriveError> {
+    // Typed (v50 #920 re-check): the opener distinguishes no hardware backing
+    // from an unreachable seed.
+    let storage_dir = secrets_storage_dir()
+        .map_err(|e| HardwareDeriveError::Unreachable(format!("keyring directory: {e}")))?;
+    let storage = create_platform_storage(SECRETS_STORAGE_ALIAS, storage_dir).map_err(|e| {
+        HardwareDeriveError::Unreachable(format!("secure storage init failed: {e}"))
+    })?;
+    derive_with_storage_typed(
+        storage.as_ref(),
         crate::encrypted_kv::MLS_STATE_CONTEXT,
         create_seed_if_absent,
     )
@@ -150,32 +169,88 @@ fn derive_hardware_master_for_context(
     derive_with_storage(storage.as_ref(), context, create_seed_if_absent)
 }
 
+/// Serializes the seed's exists-then-store in this process (see
+/// [`derive_with_storage`]).
+static SEED_MINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// v50.0.0 (#920 re-check) — why a hardware derivation produced no key.
+#[derive(Debug)]
+pub(crate) enum HardwareDeriveError {
+    /// The platform storage is not hardware-backed (no TPM / Keystore /
+    /// Secure Enclave). No hardware-rooted key has ever existed here.
+    NotHardwareBacked(String),
+    /// Hardware backing is (or may be) present but the seed cannot be used:
+    /// absent under a re-derivation (§11.7), `CIRIS_DATA_DIR` unset, storage
+    /// init / sealing / derivation failed.
+    Unreachable(String),
+    /// A crypto primitive faulted (RNG, wrong derived length).
+    Crypto(String),
+}
+
+impl From<HardwareDeriveError> for SecretsError {
+    fn from(e: HardwareDeriveError) -> Self {
+        match e {
+            HardwareDeriveError::NotHardwareBacked(m) | HardwareDeriveError::Unreachable(m) => {
+                SecretsError::HardwareKeyUnavailable(m)
+            }
+            HardwareDeriveError::Crypto(m) => SecretsError::Crypto(m),
+        }
+    }
+}
+
 /// The derivation proper, over an already-opened storage. Split out so the
 /// seed policy (§11.7) is testable against a double — the branch is
 /// unreachable on a host with no TPM, which is every CI runner.
-fn derive_with_storage(
+/// v50.0.0 (#920): `pub(crate)` so the MLS-state opener's hardware arm is
+/// driven over the same double (`encrypted_kv`'s I187).
+pub(crate) fn derive_with_storage(
     storage: &dyn ciris_keyring::SecureBlobStorage,
     context: &str,
     create_seed_if_absent: bool,
 ) -> Result<(Vec<u8>, String), SecretsError> {
+    derive_with_storage_typed(storage, context, create_seed_if_absent).map_err(Into::into)
+}
+
+/// v50.0.0 (#920 re-check) — [`derive_with_storage`] with the refusal TYPED,
+/// so a caller can tell "this host has no hardware-backed storage" from "the
+/// storage is hardware-backed but the seed cannot be used" without reading a
+/// message. The MLS-state opener's v49 compatibility arm needs exactly that
+/// split: v49 could never have keyed a store on a host with no hardware
+/// backing.
+pub(crate) fn derive_with_storage_typed(
+    storage: &dyn ciris_keyring::SecureBlobStorage,
+    context: &str,
+    create_seed_if_absent: bool,
+) -> Result<(Vec<u8>, String), HardwareDeriveError> {
     // No TPM / Keystore / Secure Enclave → no hardware migration.
     // create_platform_storage would have fallen back to software file
     // storage; deriving a "hardware" master from that is dishonest, so
     // refuse and let the caller keep the software master key.
     if !storage.is_hardware_backed() {
-        return Err(SecretsError::HardwareKeyUnavailable(
+        return Err(HardwareDeriveError::NotHardwareBacked(
             "no hardware-backed secure storage on this platform \
-             (no TPM / Keystore / Secure Enclave) — keeping the software master key"
+             (no TPM / Keystore / Secure Enclave)"
                 .into(),
         ));
     }
+
+    // v50.0.0 (#920 review, finding 2) — exists-then-store is a check and an
+    // act; two in-process first derivations (the first blob write and the
+    // first MLS-state open) could each see "absent" and seal DIFFERENT seeds,
+    // the second silently replacing the root the first already used. Held
+    // across the pair (and the derivation, which is cheap next to the TPM
+    // I/O it follows). Process-wide only: another process on the same
+    // keyring is not serialized by this.
+    let _minting = SEED_MINT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Ensure the hardware-sealed seed exists. The first migration on a
     // host generates + seals it; later calls re-derive the same master
     // from the same seed (idempotent).
     if !storage.exists(SECRETS_SEED_KEY_ID) {
         if !create_seed_if_absent {
-            return Err(SecretsError::HardwareKeyUnavailable(format!(
+            return Err(HardwareDeriveError::Unreachable(format!(
                 "the hardware-sealed seed {SECRETS_SEED_KEY_ID:?} is ABSENT and this derivation \
                  (context={context}) is a re-derivation of a master already in use. Refusing to \
                  mint a replacement: it would be a different key, and everything sealed under \
@@ -186,21 +261,29 @@ fn derive_with_storage(
         // v1.10.1 (#87 review H2) — `Zeroizing` scrubs the raw seed on
         // drop. The seed is the hardware root: leaking it compromises
         // every key ever derived from it.
-        let seed = Zeroizing::new(crypto::random_bytes(crypto::KEY_LEN)?);
+        let seed = Zeroizing::new(
+            crypto::random_bytes(crypto::KEY_LEN)
+                .map_err(|e| HardwareDeriveError::Crypto(e.to_string()))?,
+        );
         storage
             .store(SECRETS_SEED_KEY_ID, &seed)
-            .map_err(|e| SecretsError::HardwareKeyUnavailable(format!("seal secrets seed: {e}")))?;
+            .map_err(|e| HardwareDeriveError::Unreachable(format!("seal secrets seed: {e}")))?;
     }
 
     // CIRISVerify owns the derivation (HKDF-SHA256 over the sealed
     // seed). Persist never implements the KDF itself.
-    let master = ciris_verify_core::derive_symmetric_key(storage, SECRETS_SEED_KEY_ID, context)
-        .map_err(|e| {
-            SecretsError::HardwareKeyUnavailable(format!("verify derive_symmetric_key failed: {e}"))
-        })?;
+    // Zeroizing until it leaves (v50, #920 review): a length refusal below
+    // must not drop an unscrubbed master.
+    let mut master = Zeroizing::new(
+        ciris_verify_core::derive_symmetric_key(storage, SECRETS_SEED_KEY_ID, context).map_err(
+            |e| {
+                HardwareDeriveError::Unreachable(format!("verify derive_symmetric_key failed: {e}"))
+            },
+        )?,
+    );
 
     if master.len() != crypto::KEY_LEN {
-        return Err(SecretsError::Crypto(format!(
+        return Err(HardwareDeriveError::Crypto(format!(
             "verify derived a {}-byte key; expected {}",
             master.len(),
             crypto::KEY_LEN
@@ -208,7 +291,7 @@ fn derive_with_storage(
     }
 
     let descriptor = format!("hardware-blob-storage seed={SECRETS_SEED_KEY_ID} context={context}");
-    Ok((master, descriptor))
+    Ok((std::mem::take(&mut *master), descriptor))
 }
 
 #[cfg(test)]
@@ -256,27 +339,48 @@ mod context_domain_separation_tests {
 }
 
 #[cfg(test)]
-mod seed_policy_tests {
-    //! §11.10 I11 — **a hardware root never re-mints.** The branch under test
-    //! is unreachable on a host without a TPM (every CI runner), so it is
-    //! driven through a storage double that reports hardware-backed.
+pub(crate) mod test_doubles {
+    //! A `SecureBlobStorage` that reports hardware-backed, so the seed policy
+    //! (§11.7) is drivable on hosts without a TPM (every CI runner). Shared
+    //! by `seed_policy_tests` and v50's I187 (`encrypted_kv`).
 
-    use ciris_keyring::SecureBlobStorage as _;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    struct FakeHardwareStorage {
+    pub(crate) struct FakeHardwareStorage {
         blobs: Mutex<HashMap<String, Vec<u8>>>,
+        /// Every `store` call, counted (the seed-race witness).
+        pub(crate) stores: std::sync::atomic::AtomicUsize,
+        /// Widens the exists-then-store window so a race is reproducible.
+        exists_delay: std::time::Duration,
+        hardware_backed: bool,
     }
     impl FakeHardwareStorage {
-        fn empty() -> Self {
+        pub(crate) fn empty() -> Self {
+            Self::with_exists_delay(std::time::Duration::ZERO)
+        }
+        pub(crate) fn with_exists_delay(exists_delay: std::time::Duration) -> Self {
             Self {
                 blobs: Mutex::new(HashMap::new()),
+                stores: std::sync::atomic::AtomicUsize::new(0),
+                exists_delay,
+                hardware_backed: true,
+            }
+        }
+        /// The same double reporting NO hardware backing (a no-TPM host's
+        /// software file storage). Used by `encrypted_kv`'s I187 twin.
+        #[cfg(feature = "encrypted-kv")]
+        pub(crate) fn not_hardware_backed() -> Self {
+            Self {
+                hardware_backed: false,
+                ..Self::empty()
             }
         }
     }
     impl ciris_keyring::SecureBlobStorage for FakeHardwareStorage {
         fn store(&self, key_id: &str, data: &[u8]) -> Result<(), ciris_keyring::KeyringError> {
+            self.stores
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.blobs
                 .lock()
                 .unwrap()
@@ -297,7 +401,9 @@ mod seed_policy_tests {
                 })
         }
         fn exists(&self, key_id: &str) -> bool {
-            self.blobs.lock().unwrap().contains_key(key_id)
+            let present = self.blobs.lock().unwrap().contains_key(key_id);
+            std::thread::sleep(self.exists_delay);
+            present
         }
         fn delete(&self, key_id: &str) -> Result<(), ciris_keyring::KeyringError> {
             self.blobs.lock().unwrap().remove(key_id);
@@ -307,12 +413,22 @@ mod seed_policy_tests {
             Ok(self.blobs.lock().unwrap().keys().cloned().collect())
         }
         fn is_hardware_backed(&self) -> bool {
-            true
+            self.hardware_backed
         }
         fn diagnostics(&self) -> String {
             "fake hardware storage (test double)".into()
         }
     }
+}
+
+#[cfg(test)]
+mod seed_policy_tests {
+    //! §11.10 I11 — **a hardware root never re-mints.** The branch under test
+    //! is unreachable on a host without a TPM (every CI runner), so it is
+    //! driven through a storage double that reports hardware-backed.
+
+    use super::test_doubles::FakeHardwareStorage;
+    use ciris_keyring::SecureBlobStorage as _;
 
     /// The falsifier for I11: a re-derivation over an ABSENT seed must
     /// refuse, not mint. The first implementation minted — a lost keyring
@@ -377,5 +493,38 @@ mod seed_policy_tests {
             let (k, _) = super::derive_with_storage(&storage, other, false).unwrap();
             assert_ne!(mls, k, "the MLS-state key equals the {other} key");
         }
+    }
+
+    /// v50.0.0 (#920 review, finding 2) — concurrent first derivations in
+    /// one process (the first blob write racing the first MLS-state open)
+    /// seal ONE seed, and every caller derives the same key from it.
+    #[test]
+    fn concurrent_first_derivations_seal_one_seed() {
+        use std::sync::atomic::Ordering;
+        let storage = std::sync::Arc::new(FakeHardwareStorage::with_exists_delay(
+            std::time::Duration::from_millis(25),
+        ));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (storage, barrier) = (storage.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::derive_with_storage(storage.as_ref(), "content-at-rest-master-v1", true)
+                        .expect("a first derivation may seal")
+                        .0
+                })
+            })
+            .collect();
+        let keys: Vec<Vec<u8>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            storage.stores.load(Ordering::SeqCst),
+            1,
+            "concurrent first derivations sealed more than one seed"
+        );
+        assert!(
+            keys.windows(2).all(|w| w[0] == w[1]),
+            "callers derived different keys"
+        );
     }
 }

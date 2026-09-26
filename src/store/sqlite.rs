@@ -15618,15 +15618,26 @@ impl crate::federation::BlobStorage for SqliteBackend {
     }
 
     async fn load_or_init_content_master(&self) -> Result<[u8; 32], crate::federation::BlobError> {
+        // v50.0.0 (#920) — the row load/init lives in
+        // `load_or_init_content_master_row`; this door resolves it to the key.
+        let row = self.load_or_init_content_master_row().await?;
+        crate::federation::at_rest_cascade::resolve_persisted_content_master_cached(
+            &row.key_kind,
+            row.master_key_b64.as_ref().map(|b64| b64.as_str()),
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))
+    }
+
+    async fn load_or_init_content_master_row(
+        &self,
+    ) -> Result<crate::federation::at_rest_cascade::ContentMasterRow, crate::federation::BlobError>
+    {
         use crate::federation::at_rest_cascade::{
-            content_master_key, resolve_persisted_content_master_cached, ContentMasterSource,
+            content_master_key, ContentMasterRow, ContentMasterSource,
         };
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
-
-        let map_at_rest = |e: crate::federation::at_rest_cascade::AtRestError| {
-            crate::federation::BlobError::Backend(e.to_string())
-        };
 
         // v43.0.0 (§10.2) — THE PERSISTED ROW WINS. Read before deriving.
         //
@@ -15638,11 +15649,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // RE-WRAP operation, never a re-derivation.
         fn read_content_master_row(
             conn: &rusqlite::Connection,
-        ) -> rusqlite::Result<Option<(String, Option<String>)>> {
+        ) -> rusqlite::Result<Option<ContentMasterRow>> {
             conn.query_row(
-                "SELECT key_kind, master_key_b64 FROM federation_content_master WHERE id = 0",
+                "SELECT key_kind, master_key_b64, descriptor \
+                 FROM federation_content_master WHERE id = 0",
                 [],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| {
+                    Ok(ContentMasterRow {
+                        key_kind: r.get(0)?,
+                        master_key_b64: r.get::<_, Option<String>>(1)?.map(zeroize::Zeroizing::new),
+                        descriptor: r.get(2)?,
+                    })
+                },
             )
             .optional()
         }
@@ -15650,23 +15668,28 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let existing = self.read(read_content_master_row).await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("content-master read: {e}"))
         })?;
-        if let Some((kind, stored)) = existing {
-            return resolve_persisted_content_master_cached(&kind, stored.as_deref())
-                .await
-                .map_err(map_at_rest);
+        if let Some(row) = existing {
+            return Ok(row);
         }
 
         // No row yet: this node has sealed nothing, so it is free to take the
         // hardware root. This is the ONLY moment that choice is free.
-        let (kind, key_b64, descriptor) = match content_master_key(true) {
+        // §11.8 — TPM + filesystem I/O off the async workers (v50, #920
+        // review), through the module's dispatcher, NOT bare `spawn_blocking`:
+        // with no tokio runtime current (a cohabiting consumer's statically
+        // linked persist, #158) it runs inline instead of panicking.
+        let source =
+            crate::store::sqlite_conn_model::dispatch_blocking(|| content_master_key(true)).await;
+        let (kind, key_b64, descriptor) = match source {
             ContentMasterSource::Hardware { descriptor, .. } => ("hardware", None, descriptor),
             ContentMasterSource::SoftwareFallback { reason } => {
-                let fresh = ciris_crypto::random::bytes(32).map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("content-master rng: {e}"))
-                })?;
+                let fresh =
+                    zeroize::Zeroizing::new(ciris_crypto::random::bytes(32).map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("content-master rng: {e}"))
+                    })?);
                 (
                     "software",
-                    Some(B64.encode(&fresh)),
+                    Some(zeroize::Zeroizing::new(B64.encode(&*fresh))),
                     format!("software content-at-rest master ({reason})"),
                 )
             }
@@ -15677,7 +15700,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             conn.execute(
                 "INSERT INTO federation_content_master (id, key_kind, master_key_b64, descriptor) \
                  VALUES (0, ?1, ?2, ?3) ON CONFLICT (id) DO NOTHING",
-                rusqlite::params![k, b, descriptor],
+                rusqlite::params![k, b.as_ref().map(|b64| b64.as_str()), descriptor],
             )?;
             Ok(())
         })
@@ -15691,8 +15714,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         // Returning our locally-minted key here would give two processes two
         // different masters for the same node — the race the PK exists to
         // collapse.
-        let (kind, stored) = self
-            .read(read_content_master_row)
+        self.read(read_content_master_row)
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("content-master re-read: {e}"))
@@ -15701,10 +15723,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 crate::federation::BlobError::Backend(
                     "content-master row absent immediately after insert".into(),
                 )
-            })?;
-        resolve_persisted_content_master_cached(&kind, stored.as_deref())
-            .await
-            .map_err(map_at_rest)
+            })
     }
 
     async fn load_or_init_content_kem_identity(

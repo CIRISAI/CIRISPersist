@@ -16353,19 +16353,50 @@ impl crate::federation::BlobStorage for PostgresBackend {
     }
 
     async fn load_or_init_content_master(&self) -> Result<[u8; 32], crate::federation::BlobError> {
+        // v50.0.0 (#920) — the row load/init lives in
+        // `load_or_init_content_master_row`; this door resolves it to the key.
+        let row = self.load_or_init_content_master_row().await?;
+        crate::federation::at_rest_cascade::resolve_persisted_content_master_cached(
+            &row.key_kind,
+            row.master_key_b64.as_ref().map(|b64| b64.as_str()),
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))
+    }
+
+    async fn load_or_init_content_master_row(
+        &self,
+    ) -> Result<crate::federation::at_rest_cascade::ContentMasterRow, crate::federation::BlobError>
+    {
         use crate::federation::at_rest_cascade::{
-            content_master_key, resolve_persisted_content_master_cached, ContentMasterSource,
+            content_master_key, ContentMasterRow, ContentMasterSource,
         };
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
 
-        let map_at_rest = |e: crate::federation::at_rest_cascade::AtRestError| {
-            crate::federation::BlobError::Backend(e.to_string())
-        };
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let to_row =
+            |row: &tokio_postgres::Row| -> Result<ContentMasterRow, crate::federation::BlobError> {
+                Ok(ContentMasterRow {
+                    key_kind: row.safe_get_with::<String, _, _, _>(
+                        "key_kind",
+                        crate::federation::BlobError::Backend,
+                    )?,
+                    master_key_b64: row
+                        .safe_get_with::<Option<String>, _, _, _>(
+                            "master_key_b64",
+                            crate::federation::BlobError::Backend,
+                        )?
+                        .map(zeroize::Zeroizing::new),
+                    descriptor: row.safe_get_with::<String, _, _, _>(
+                        "descriptor",
+                        crate::federation::BlobError::Backend,
+                    )?,
+                })
+            };
 
         // v43.0.0 (§10.2) — THE PERSISTED ROW WINS. Read before deriving.
         // See the SQLite twin for the full rationale: re-deriving over an
@@ -16373,7 +16404,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // content-KEM private halves sealed under it.
         let existing = client
             .query_opt(
-                "SELECT key_kind, master_key_b64 \
+                "SELECT key_kind, master_key_b64, descriptor \
                  FROM cirislens.federation_content_master WHERE id = 0",
                 &[],
             )
@@ -16382,32 +16413,29 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 crate::federation::BlobError::Backend(format!("content-master read: {e}"))
             })?;
         if let Some(row) = existing {
-            let kind: String = row.safe_get_with::<String, _, _, _>(
-                "key_kind",
-                crate::federation::BlobError::Backend,
-            )?;
-            let stored: Option<String> = row.safe_get_with::<Option<String>, _, _, _>(
-                "master_key_b64",
-                crate::federation::BlobError::Backend,
-            )?;
-            return resolve_persisted_content_master_cached(&kind, stored.as_deref())
-                .await
-                .map_err(map_at_rest);
+            return to_row(&row);
         }
 
         // No row yet: free to take the hardware root, and this is the only
         // moment that choice is free.
-        let (kind, key_b64, descriptor) = match content_master_key(true) {
+        // §11.8 — TPM + filesystem I/O off the async workers (v50, #920 review).
+        let source = tokio::task::spawn_blocking(|| content_master_key(true))
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("content-master derive join: {e}"))
+            })?;
+        let (kind, key_b64, descriptor) = match source {
             ContentMasterSource::Hardware { descriptor, .. } => {
-                ("hardware", None::<String>, descriptor)
+                ("hardware", None::<zeroize::Zeroizing<String>>, descriptor)
             }
             ContentMasterSource::SoftwareFallback { reason } => {
-                let fresh = ciris_crypto::random::bytes(32).map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("content-master rng: {e}"))
-                })?;
+                let fresh =
+                    zeroize::Zeroizing::new(ciris_crypto::random::bytes(32).map_err(|e| {
+                        crate::federation::BlobError::Backend(format!("content-master rng: {e}"))
+                    })?);
                 (
                     "software",
-                    Some(B64.encode(&fresh)),
+                    Some(zeroize::Zeroizing::new(B64.encode(&*fresh))),
                     format!("software content-at-rest master ({reason})"),
                 )
             }
@@ -16418,7 +16446,11 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 "INSERT INTO cirislens.federation_content_master \
                     (id, key_kind, master_key_b64, descriptor) \
                  VALUES (0, $1, $2, $3) ON CONFLICT (id) DO NOTHING",
-                &[&kind, &key_b64, &descriptor],
+                &[
+                    &kind,
+                    &key_b64.as_ref().map(|b64| b64.as_str()),
+                    &descriptor,
+                ],
             )
             .await
             .map_err(|e| {
@@ -16430,7 +16462,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         // processes two different masters for one node.
         let row = client
             .query_one(
-                "SELECT key_kind, master_key_b64 \
+                "SELECT key_kind, master_key_b64, descriptor \
                  FROM cirislens.federation_content_master WHERE id = 0",
                 &[],
             )
@@ -16438,15 +16470,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("content-master re-read: {e}"))
             })?;
-        let kind: String = row
-            .safe_get_with::<String, _, _, _>("key_kind", crate::federation::BlobError::Backend)?;
-        let stored: Option<String> = row.safe_get_with::<Option<String>, _, _, _>(
-            "master_key_b64",
-            crate::federation::BlobError::Backend,
-        )?;
-        resolve_persisted_content_master_cached(&kind, stored.as_deref())
-            .await
-            .map_err(map_at_rest)
+        to_row(&row)
     }
 
     async fn load_or_init_content_kem_identity(
