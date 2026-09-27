@@ -1306,6 +1306,114 @@ pub(crate) mod bodies {
         assert!(cc::resolve_community(d, CANON).await.unwrap().is_some());
     }
 
+    /// (o″) — final review R2: a resignation does not LAPSE after one more
+    /// version. F2 resigns; the other founders' v6 that still records F2 is
+    /// refused on the local door and the replicated door
+    /// (`resignation_carried_forward`); the correct v6 amends F2 out; and F2
+    /// with F0 then produces no v7 (F2 is no founder of v6), on either door.
+    pub async fn o3_a_resignation_does_not_lapse(d: &dyn FederationDirectory) {
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, "rr-steward", "user,steward").await;
+        for n in ["rr-serve-node", "rr2-serve-node"] {
+            ts::register_hybrid_key_as(d, n, n, identity_type::NODE).await;
+        }
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+            .await
+            .expect("F2 resigns");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let keeps = with_member(canonical_row(&FOUNDERS), "rr-serve-node", "member");
+        let e = founders_supersede(d, keeps.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect_err("local: a version still recording the resigned founder");
+        assert_violation(
+            &e,
+            crate::federation::admission::TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD,
+        );
+        let offered = hand_proof(d, keeps, &[FOUNDERS[0], FOUNDERS[1]], FOUNDERS[0], |_| {}).await;
+        let e = d
+            .put_community(offered)
+            .await
+            .expect_err("replicated chain: a version still recording the resigned founder");
+        assert_violation(
+            &e,
+            crate::federation::admission::TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD,
+        );
+        let v6 = swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "rr-steward");
+        founders_supersede(d, v6.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("the founders amend the resigned seat out");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for v7 in [
+            swapped(v6.clone(), "rr-steward", FOUNDERS[2]),
+            with_member(v6.clone(), "rr2-serve-node", "member"),
+        ] {
+            assert!(
+                founders_supersede(d, v7.clone(), &[FOUNDERS[2], FOUNDERS[0]])
+                    .await
+                    .is_err(),
+                "local: F2 and F0 produce no v7"
+            );
+            let offered = hand_proof(d, v7, &[FOUNDERS[2], FOUNDERS[0]], FOUNDERS[0], |_| {}).await;
+            assert!(
+                d.put_community(offered).await.is_err(),
+                "replicated: F2 and F0 produce no v7"
+            );
+        }
+        assert_eq!(
+            cc::resolve_community(d, CANON)
+                .await
+                .unwrap()
+                .unwrap()
+                .founders,
+            vec![
+                FOUNDERS[0].to_owned(),
+                FOUNDERS[1].to_owned(),
+                "rr-steward".to_owned()
+            ]
+        );
+    }
+
+    /// Review TOCTOU: `supersede_community_with_quorum` skips the generic
+    /// quorum when a trust root's chain holds, and `prepare_trust_root_supersede`
+    /// re-reads the standing. If the chain stopped holding in between (here: a
+    /// NotRooted constraint row kept as data), a flagged prepare refuses rather
+    /// than passing a non-grade version through unquorate; unflagged, the
+    /// generic quorum already ran and the version passes to the write.
+    pub async fn t_a_skipped_quorum_is_never_written(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        const OTHER: &str = "infra-room-t";
+        let mut other = canonical_row(&FOUNDERS);
+        other.community_key_id = OTHER.to_owned();
+        other.members.retain(|m| m.key_id != SERVE_NODE);
+        d.apply_replicated_community(ts::sign_community(FOUNDERS[0], other.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cc::stored_standing(d, OTHER).await.unwrap(),
+            cc::StoredStanding::NotRooted { .. }
+        ));
+        let mut plain = other;
+        plain.policy_blob = None;
+        let e = cc::prepare_trust_root_supersede(
+            d,
+            ts::sign_community(FOUNDERS[0], plain.clone()),
+            true,
+        )
+        .await
+        .expect_err("the quorum was skipped and the chain no longer holds");
+        assert_violation(&e, "stopped holding");
+        cc::prepare_trust_root_supersede(d, ts::sign_community(FOUNDERS[0], plain), false)
+            .await
+            .expect("unflagged: the generic quorum already judged it");
+    }
+
     /// (r) — #925's NODE-BEARING half, apart from the `user` half: a
     /// `user,steward` founder that becomes an agreed occurrence of a `node`
     /// identity (the identity claims it, the occurrence signs its own
@@ -2352,6 +2460,22 @@ mod run {
                 async fn i190_r() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::r_a_founder_turned_node_bearing(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_o3() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::o3_a_resignation_does_not_lapse(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_t() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::t_a_skipped_quorum_is_never_written(
                         &d as &dyn FederationDirectory,
                     )
                     .await

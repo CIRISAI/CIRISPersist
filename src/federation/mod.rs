@@ -6052,6 +6052,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Community,
             new,
             authorization,
+            false,
         )
         .await
     }
@@ -6073,6 +6074,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Affiliations,
             new,
             authorization,
+            false,
         )
         .await
     }
@@ -6592,9 +6594,10 @@ pub trait FederationDirectory: Send + Sync {
         // before any write): the one predicate the replicated door runs. The
         // folded roster would re-apply a resignation the record has since
         // cleared by re-seating the key, so the two doors would disagree.
-        if !canonical_community::founders_link_is_the_quorum(self, &new.community.community_key_id)
-            .await?
-        {
+        let founders_link_is_the_quorum =
+            canonical_community::founders_link_is_the_quorum(self, &new.community.community_key_id)
+                .await?;
+        if !founders_link_is_the_quorum {
             self.verify_membership_quorum(
                 cohort::Cohort::Community,
                 &new.community.community_key_id,
@@ -6622,6 +6625,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Community,
             new,
             Some(authorization),
+            founders_link_is_the_quorum,
         )
         .await
     }
@@ -6674,6 +6678,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Affiliations,
             new,
             Some(authorization),
+            false,
         )
         .await
     }

@@ -406,12 +406,16 @@ where
 
 /// The community / affiliations twin of [`supersede_family_signed`]; `cohort`
 /// picks the history discriminator (CC 4.4.3.2.8 / #308 — both share the
-/// `federation_communities` row).
+/// `federation_communities` row). `generic_quorum_skipped` is true when the
+/// caller skipped the folded-roster quorum because a trust root's chain held
+/// (the founders' link stands in for it); if the chain no longer holds here,
+/// the supersede is refused, never written unquorate.
 pub(crate) async fn supersede_community_signed<F>(
     dir: &F,
     cohort: Cohort,
     new: SignedCommunity,
     authorization: Option<serde_json::Value>,
+    generic_quorum_skipped: bool,
 ) -> Result<u32, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -428,7 +432,9 @@ where
     .await?;
     // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified
     // founders' link of the held version, and is stored carrying its chain.
-    let new = super::canonical_community::prepare_trust_root_supersede(dir, new).await?;
+    let new =
+        super::canonical_community::prepare_trust_root_supersede(dir, new, generic_quorum_skipped)
+            .await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",

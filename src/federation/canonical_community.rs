@@ -477,10 +477,12 @@ fn envelope_founders(change_envelope: &serde_json::Value) -> std::collections::B
 struct Memo {
     records: std::collections::HashMap<String, Option<KeyRecord>>,
     conferred: std::collections::HashMap<String, bool>,
-    /// Per community: each key's earliest self-signed resignation instant.
+    /// Per community: every self-signed resignation instant of each key,
+    /// ascending (a re-seated founder may resign again; the earliest alone
+    /// would mask the later one behind the re-seat floor).
     resignations: std::collections::HashMap<
         String,
-        std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+        std::collections::HashMap<String, Vec<chrono::DateTime<chrono::Utc>>>,
     >,
 }
 
@@ -522,15 +524,19 @@ impl Memo {
         Ok(c)
     }
 
-    /// The earliest self-signed resignation of `key_id` from `community_key_id`
-    /// (a founder's own plane revocation, signed by that founder alone), if
-    /// any. Read once per community per call.
-    async fn resigned_at<F>(
+    /// Whether `key_id` resigned from `community_key_id` (its own plane
+    /// revocation, signed by that founder alone) at an instant in
+    /// `(after, until]` — `after` inclusive when `inclusive`. Read once per
+    /// community per call.
+    async fn resigned_within<F>(
         &mut self,
         directory: &F,
         community_key_id: &str,
         key_id: &str,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+        after: Option<chrono::DateTime<chrono::Utc>>,
+        inclusive: bool,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error>
     where
         F: FederationDirectory + ?Sized,
     {
@@ -542,10 +548,9 @@ impl Memo {
                         if r.authority_key_id.as_deref() == Some(r.member_key_id.as_str())
                             && r.cosigner_key_ids.is_empty()
                         {
-                            let at = map.entry(r.member_key_id).or_insert(r.effective_at);
-                            if r.effective_at < *at {
-                                *at = r.effective_at;
-                            }
+                            map.entry(r.member_key_id)
+                                .or_insert_with(Vec::new)
+                                .push(r.effective_at);
                         }
                     }
                 }
@@ -556,7 +561,13 @@ impl Memo {
             }
             self.resignations.insert(community_key_id.to_owned(), map);
         }
-        Ok(self.resignations[community_key_id].get(key_id).copied())
+        Ok(self.resignations[community_key_id]
+            .get(key_id)
+            .is_some_and(|all| {
+                all.iter().any(|r| {
+                    *r <= until && after.is_none_or(|a| if inclusive { *r >= a } else { *r > a })
+                })
+            }))
     }
 
     /// When the withdrawal of `key_id`'s steward conferral took effect — a
@@ -623,13 +634,18 @@ impl Memo {
         {
             return Ok(false);
         }
-        if let Some(resigned) = self
-            .resigned_at(directory, community_key_id, key_id)
+        if self
+            .resigned_within(
+                directory,
+                community_key_id,
+                key_id,
+                resignation_floor,
+                false,
+                when,
+            )
             .await?
         {
-            if resignation_floor.is_none_or(|f| resigned > f) && when >= resigned {
-                return Ok(false);
-            }
+            return Ok(false);
         }
         Ok(
             match directory
@@ -772,6 +788,29 @@ where
         ));
     }
     let prior_founders = founders(prior);
+    // Review R2: a resignation does not LAPSE. A link that still records a
+    // founder carried from the prior version, whose resignation falls at or
+    // after the prior's instant and at or before this link's, is refused: the
+    // other founders must amend the seat out, so no later version records a
+    // resigned founder and the prior-instant floor stays sound. A founder the
+    // link newly seats is a re-seat — the founders' quorum speaking later —
+    // and clears an older resignation (LOW-1).
+    for f in founders(&next.community) {
+        if prior_founders.contains(&f)
+            && memo
+                .resigned_within(directory, id, f, Some(floor), true, amended_at)
+                .await?
+        {
+            return Err(violation(
+                id,
+                super::admission::TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD,
+                format!(
+                    "the version still records {f:?} as a founder after their resignation; the \
+                     founders must amend the seat out"
+                ),
+            ));
+        }
+    }
     let bytes =
         ciris_verify_core::accord_genesis::accord_family_signing_bytes(&proof.change_envelope)
             .map_err(|e| Error::InvalidArgument(format!("founders' change envelope: {e}")))?;
@@ -1577,6 +1616,7 @@ where
 pub async fn prepare_trust_root_supersede<F>(
     directory: &F,
     mut new: SignedCommunity,
+    generic_quorum_skipped: bool,
 ) -> Result<SignedCommunity, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1591,6 +1631,15 @@ where
             check_lineage_caps(&new)?;
             Ok(new)
         }
+        // The caller skipped the generic quorum because the chain held when
+        // it looked; it no longer does. Nothing judged this version's quorum,
+        // so it is refused rather than written (review TOCTOU).
+        None if generic_quorum_skipped => Err(violation(
+            &id,
+            super::admission::TRUST_ROOT_RULE_CHAIN,
+            "the trust root's chain stopped holding during the supersede; the founders' link \
+             that stood in for the quorum no longer applies — retry",
+        )),
         None if is_trust_root_grade(&new.community) => Err(violation(
             &id,
             super::admission::INFRA_RULE_GRADE_CHANGED,

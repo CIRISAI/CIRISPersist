@@ -12184,6 +12184,11 @@ pub const TRUST_ROOT_RULE_FOUNDER_SEAT_ON_PLANE: &str = "founder_seat_on_plane";
 /// the founder co-signed).
 pub const TRUST_ROOT_RULE_RESIGNATION_BACKDATED: &str = "resignation_backdated";
 
+/// v50.0.0 (CIRISPersist#926, final review R2) — rule: a founders' link still
+/// records a founder carried from the prior version after that founder's
+/// resignation (a resignation never lapses; the seat is amended out).
+pub const TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD: &str = "resignation_carried_forward";
+
 /// v50.0.0 (CIRISPersist#927, review M1) — THE `infrastructure` quorum parser:
 /// `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC
 /// 3.2: "a single founder must not be able to admit unilaterally";
