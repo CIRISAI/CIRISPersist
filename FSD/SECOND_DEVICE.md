@@ -860,7 +860,7 @@ Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_su
 
 **#809.** The Rust-side consumer gate was already a gate (`verify_bundle_quorum`), and I190 (f) witnesses it through the pin. The REPORTED-not-gated assertion #809 tracked was the release pre-flight in `.github/workflows/ci.yml`. It is now `scripts/preflight_trust_root.py` and GATED: an unparseable `consensus_protocol` is refused, and so are distinct seated authorizations short of M. The step runs a 12-fixture self-test first, including #809's `authorizations: []` row, which now exits 1. The live registry passed it on 2026-09-26 (2 ≥ 2; `accepts_this_root=false` warned). It counts authorizations and does not verify their signatures.
 
-**Invariant I190** (memory, sqlite, postgres, 61 tests):
+**Invariant I190** (memory, sqlite, postgres, 64 tests):
 - (a) the fixture row admits under a 2-of-3 accord co-scrub, resolves, and its co-signature is served byte-exact;
 - (b) 1-of-3, a founder co-signature and founders alone are refused; a forged co-scrub is refused even beside a quorum, and so is a doubled co-signer;
 - (c) a node-bearing founder (#925), a self-declared steward, each shape clause, and a squatted reserved id are refused;
@@ -884,9 +884,10 @@ Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_su
   - the lone founder's amendment falls short;
   - a re-birth over the ROOTED row, and one not founded later, are refused;
   - the accord re-birth replaces the stalled row (`accord_rebirth_replaces_stalled`), and it is rooted again;
-- (o) a founder resigns by their own plane revocation: the row stalls, a later link counting them falls short, and the others retire the seat through the record; the founders then RE-SEAT the key and the older resignation no longer applies (LOW-1);
+- (o) a founder resigns by their own plane revocation: the row stalls, a later link counting them falls short, and the others retire the seat through the record; the founders then RE-SEAT the key, the older resignation no longer applies (LOW-1), and the re-seated founder co-signs a later link on the local door (MEDIUM-R (b), and the one-quorum rule);
 - (o′) F2 co-signs v2; F2's resignation dated between the birth and v2's `amended_at` is refused with `resignation_backdated`, and the row stays Rooted with every founder; the same resignation dated now is admitted and stalls the row (MEDIUM-R);
-- (q) both doors, one predicate: a reserved-id squat, a short birth, a body variant under a genuine proof and a role-binding replay are refused on `put_community` (the typed rule, via `assert_violation`) and on `apply_replicated_community` (`Refused { DegradesConformance }`, or the propagated insufficient-quorum error), and nothing moves; the accord birth is `Inserted`, its re-offer `Unchanged`, and a genuine founders' link `Superseded` through the replicated entry; another id's unverifying constraint row is refused locally and kept as data on the replicated entry (`NotRooted`, never resolved);
+- (r) #925's node-bearing half on its own: a `user,steward` founder that becomes an agreed occurrence of a `node` identity stalls a Rooted row whose standing was already cached (naming the founder), and a birth naming such a founder is refused with `node_bearing_founder`;
+- (q) both doors, one predicate: a reserved-id squat, a short birth, a body variant under a genuine proof and a role-binding replay are refused on `put_community` (the typed rule, via `assert_violation`) and on `apply_replicated_community` (`Refused { DegradesConformance }`, or the propagated insufficient-quorum error), and nothing moves; the accord birth is `Inserted`, its re-offer `Unchanged`, and a genuine founders' link `Superseded` through the replicated entry; another id's unverifying constraint row is refused locally and kept as data on the replicated entry (`NotRooted`, never resolved), and one founder of its `quorum:2/3` cannot supersede it into a plain room on the local door (the generic quorum still holds there);
 - (p) a withdrawal through the accord with a short signed window:
   - the response carries its evidence;
   - a fresh consumer re-tallies it and REFUSES a retired-key fork signed after the window, although it recorded the withdrawal after the fork was signed;
@@ -916,6 +917,7 @@ Plus the server route test on both paths.
 - Round 3, the chain (59d402cf): `pyo3,sqlite` 3446/3446; `postgres,sqlite` under `pg_test_db.sh` 3376/3376; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2456 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt for round 3: no pyo3 signature changed, and `put_community_json` passes an empty `lineage`.
 - Round 4, the second ruling (2e1ba7e0): `pyo3,sqlite` 3455/3455; `postgres,sqlite` under `pg_test_db.sh` 3385/3385; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2462 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt: no pyo3 signature changed.
 - Round 5, recovery and resignation (b97978ce): `pyo3,sqlite` 3464/3464; `postgres,sqlite` under `pg_test_db.sh` 3394/3394; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2468 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt: no pyo3 signature changed; the response gained an additive field.
+- Round 6, the rebase and the fold (991f8857 on `v50-926`; the commit after it changes only this FSD): `cargo nextest run -j 3 --features pyo3,sqlite --no-fail-fast` in two partitions, 1774 + 1767 = 3541/3541; `scripts/pg_test_db.sh -- cargo nextest run -j 3 --features postgres,sqlite --no-fail-fast` in two partitions, 1739 + 1732 = 3471/3471 (233 s and 286 s: a database was present); `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2520 passed, 0 failed, 1 ignored; `RUSTFLAGS="-D warnings" cargo check --features server` exit 0; `python3 scripts/pyi_surface.py check` exit 0; `python3 scripts/gen_directory_double.py --check` current (105 delegations). The Python wheel was not rebuilt: no pyo3 signature changed in the fold.
 
 **Mutation table, round 1 (#926).** The round ran on 34fe6df5, with M12 re-run on dc2fa151.
 - **Lane:** `test(i190) | test(canonical) | test(genesis) | test(bundle) | test(trust_root) | test(conferral)`, `--features sqlite,postgres`, under `scripts/pg_test_db.sh`.
@@ -1098,6 +1100,85 @@ Plus the server route test on both paths.
 | O1 | resignation ignored in `founder_counts` | 3 | (o) |
 | O2 | resignation refused on the plane | 3 | (o) |
 | O3 | a resigned seat kept in the link seats | 0 | equivalent (see above) |
+| W1 | withdrawal instant from the local clock | 3 | (p) |
+| W2 | the response omits the withdrawal evidence | 3 | (p) |
+| W3 | the pin does not admit the withdrawal evidence | 3 | (p) |
+| W4 | co-signer records not served | 3 | (e) |
+| A1 | `amended_at` floor dropped | 3 | (h) |
+| A2 | `amended_at` future bound dropped | 3 | (h) |
+
+**Mutation table, round 6 (the rebase onto 3d0df4e8, the rc5 fold, MEDIUM-R, the LOWs).** B1–B4, D1–D3, L1, L2, and the first L3 and F1 runs ran on 55e32510 (baseline 347/347). Every other mutant, and the L3 and F1 re-runs, ran on 991f8857, which adds I190 (r) and (q)'s local-quorum leg. Its three survivors ran 350/350 green, which is that commit's baseline.
+- **Lane:** `test(i190) | test(canonical) | test(genesis) | test(bundle) | test(trust_root) | test(conferral) | test(supersede)`, `--features sqlite,postgres --lib`, under `scripts/pg_test_db.sh`. Every run had a database.
+- **Discipline:** each mutant was reverted before the next, and no mutant was OOM-killed.
+- **Result:** 63 mutants. 60 killed. 3 are equivalent:
+  - O3, as in round 5: M is absolute.
+  - F2: a node-bearing founder is already dropped from the link seats by `founder_counts`, and the only other node-bearing seats are serve-node members, which `quorum:M/N` over founders never counts.
+  - RC: the trust-root guard runs first and admits only member changes and a founder's own self-leave. rc5's gate admits both, and both refuse the last founder. The early return removes a second gate; it changes no verdict.
+- **L3 and F1 first survived.**
+  - L3: a data-kept constraint row at another id could be superseded locally with no quorum. (q) now asserts the generic quorum holds there.
+  - F1: (c)'s node founder is `node,steward`, so the `user` half refused it and the node-bearing half was never measured. (r) makes a `user,steward` founder an agreed occurrence of a `node` identity. Both were then killed.
+- **The required mutant B1** (MEDIUM-R's past floor dropped) is KILLED by (o′) on all three backends.
+- **Round 5's mutants were re-run** on the folded code (anchors moved for M6, C7, O1, O2, O3, R1, W2).
+
+| # | Mutant | Failed | Killed by (I190 arm) |
+|---|---|---|---|
+| B1 | MEDIUM-R (a): the plane's past floor dropped | 3 | (o′) |
+| B2 | MEDIUM-R (b): a link counts a resignation older than its prior | 3 | (o) |
+| B3 | LOW-1: the standing ignores the re-seat floor | 3 | (o) |
+| B4 | LOW-1: resolve lists the plane roster's founders | 3 | (o) |
+| D1 | the replicated entry skips the trust-root predicate | 3 | (q) |
+| D2 | the replicated entry is lenient for the reserved id | 3 | (q) |
+| D3 | the replicated legacy-as-data allowance dropped | 3 | (q) |
+| L1 | a local trust-root amendment also runs the folded quorum | 6 | (h), (o) |
+| L2 | the local door skips the folded quorum for every row | 3 | `engine::tests::quorum_supersede_protocol_decides` |
+| L3 | the local door skips the folded quorum for a NotRooted constraint row | 0, then 3 | (q) |
+| F1 | the founder's node-bearing half dropped (door and link instant) | 0, then 3 | (r) |
+| F2 | link seats never node-bearing | 0 | equivalent (see above) |
+| F3 | the standing cache key omits the node-bearing inputs | 3 | (r) |
+| RC | rc5's founder-count gate also runs for a trust root | 0 | equivalent (see above) |
+| M1 | accord quorum check dropped (birth) | 15 | (b), (e), (j), (m), (q) |
+| M2 | 1-of-3 admitted (birth) | 12 | (b), (e), (m), (q) |
+| M3 | entrenchment not required | 6 | (c), (g) |
+| M4 | the route serves no community | 12 | (e), (h), (l), (p) |
+| M5 | #809 CI gate reverted to report | 1 | CI witness |
+| M6 | founder human-key rule skipped at the door | 3 | (c) |
+| M7 | founder accord-conferral skipped at the door | 6 | (c), (h) |
+| M8 | the local door skips the founders' link | 6 | (g), (h) |
+| M9 | `ciris-canonical` not reserved | 9 | (c), (j), (q) |
+| M10 | trust-root community not a `trust:accepts` subject | 6 | (d), (j) |
+| M11 | the pin skips `verify_bundle_quorum` | 3 | (f) |
+| M12 | co-signatures not verified at the door | 3 | (b) |
+| N5 | roster-plane guard dropped | 9 | (i), (i) moderator, (o′) |
+| N8 | the steward-binding probe ignores the accord door | 3 | (i) |
+| N9 | resolve does not re-judge the row | 15 | (j), (k), (m), (q), (r) |
+| N10 | read-side shape re-check dropped | 3 | (j) |
+| N13 | the community root is valid without its family | 3 | (d) |
+| R1 | a peer re-demands the accord count | 6 | (h), (q) |
+| C1 | chain walk skipped on a fresh node | 6 | (h), (p) |
+| C2 | a link's founders' quorum not required | 9 | (h), (o), (p) |
+| C2b | a link's prior hash not checked | 3 | (h) |
+| C4 | envelope role binding not checked | 6 | (h), (q) |
+| C6 | `stored_standing` proof-only arm | 6 | (j), (p) |
+| C7 | every-recorded-founder counting dropped | 15 | (k), (k′), (o), (o′), (r) |
+| C8 | multi-hop apply skips intermediate versions | 6 | (h), (p) |
+| C9 | a squat not replaced by the birth chain | 6 | (j), (p) |
+| P1 | the plane admits a founder-seat change | 6 | (i), (i) moderator |
+| P2 | role binding skipped when the founder set moves | 3 | (h) |
+| P3 | a link counts a withdrawn record founder | 12 | (h), (k), (k′), (p) |
+| P4 | the next-content hash binding dropped | 6 | (h), (q) |
+| P5 | the authority need not be a counted founder | 3 | (h) |
+| P6 | a link's authority signature not verified | 3 | (h) |
+| P7 | the standing cache keyed on the row alone | 18 | (k), (k′), (m), (o′), (p), (r) |
+| P8 | lineage length cap dropped | 3 | (n) |
+| P9 | lineage byte cap dropped | 3 | (n) |
+| P10 | a rotation un-counts historical signatures | 15 | (h), (k), (k′), (l), (p) |
+| P11 | the bundle response serves only the current version's keys | 6 | (l), (p) |
+| K1 | re-birth refused over a stalled row | 3 | (k′) |
+| K2 | re-birth replaces a ROOTED row | 3 | (k′) |
+| K3 | re-birth need not be founded later | 3 | (k′) |
+| O1 | resignation ignored in `founder_counts` | 6 | (o), (o′) |
+| O2 | resignation refused on the plane | 6 | (o), (o′) |
+| O3 | a resigned seat kept in the link seats | 0 | equivalent (absolute M) |
 | W1 | withdrawal instant from the local clock | 3 | (p) |
 | W2 | the response omits the withdrawal evidence | 3 | (p) |
 | W3 | the pin does not admit the withdrawal evidence | 3 | (p) |
