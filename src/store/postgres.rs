@@ -52,6 +52,227 @@ mod embedded {
     refinery::embed_migrations!("migrations/postgres/lens");
 }
 
+/// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step, with the
+/// door it was reached through: `put_public_key` is the local mint
+/// ([`KeyDoor::LocalMint`](crate::federation::register::KeyDoor::LocalMint));
+/// the replicated `Insert` arm stores a key minted elsewhere
+/// ([`KeyDoor::ReplicatedInsert`](crate::federation::register::KeyDoor::ReplicatedInsert)).
+/// Every gate is the same on both except CC 3.4.7.3 Clause A, which gates
+/// minting only.
+impl PostgresBackend {
+    pub(crate) async fn put_public_key_at_door(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+        door: crate::federation::register::KeyDoor,
+    ) -> Result<(), crate::federation::Error> {
+        let mut row = record.record;
+        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST, first thing: the
+        // registration envelope is replaced by its JCS form, so the bytes
+        // bound into `federation_keys.registration_envelope` are the bytes
+        // `verify_key_registration` hashes and the producer signed.
+        // Idempotent, therefore signature-transparent; ahead of the role
+        // lift so every reader below sees one shape.
+        crate::federation::canonical_at_rest::canonicalize_in_place(
+            &mut row.registration_envelope,
+        )?;
+        // v19.0.0 (#486) — lift envelope-attested roles into the claim
+        // surface BEFORE the role write-gates (lift-then-gate).
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
+
+        // v10.1.0 (CIRISPersist#275 hardening) — universal write-path
+        // invariant: pubkey_ed25519_base64 MUST decode to a 32-byte Ed25519
+        // key. Rejects a wrong-curve / malformed key (e.g. a 65-byte P-256
+        // point) at admission for EVERY registration path — the backstop the
+        // #275 saga proved was missing. Backend-symmetric with SQLite. Runs
+        // first so a bad key leaves no trace.
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        // v50.0.0 (CIRISPersist#925 ask 5, review M5) — CC 3.4.7.3 Clause A
+        // gates MINTING: a local mint of a fused key is refused. A key minted
+        // ELSEWHERE and arriving through the replicated `Insert` arm is
+        // admitted as gated data (Clause B and the steward gates apply to it
+        // wherever it acts): non-conformance is a reason to re-mint, and its
+        // signed history stays verifiable.
+        if door == crate::federation::register::KeyDoor::LocalMint {
+            crate::federation::register::check_node_identity_exclusive(&row)?;
+        }
+
+        // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
+        // admission gate for accord_holder rows. Runs BEFORE
+        // persist_row_hash + INSERT so rejected rows leave no trace.
+        // #441: evaluated over identity_type ∪
+        // roles (claims_role) — an `accord_holder` claim in the set form
+        // ("agent,accord_holder") or in the roles vector hits the same
+        // gate as the scalar.
+        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
+        // runs structure + freshness; any other evidence-carrying row runs
+        // structure alone (a replicated body is checked where it lands).
+        self.hardware_attestation_policy()
+            .admit_key_record(&row, chrono::Utc::now())?;
+
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — the consent_role token is a
+        // PURE predicate over a closed vocabulary, so it leads the four
+        // accord-conferral gates below, every one of which is a directory walk.
+        // v31.2.0 (CIRISPersist#670): it used to run AFTER them, and after the
+        // conflict-check read — a row naming a token that does not exist paid
+        // for four authority resolutions before anything told it so, on the two
+        // backends production runs and not on memory. Backend-symmetric now.
+        // The wire ⇔ stored `'unregistered'` mapping stays at the bind site,
+        // where the column is written.
+        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+
+        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
+        // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
+        // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
+        // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
+        // anchor). This is the substrate write chokepoint every registration
+        // path funnels through, so a self-signed / non-anchor-scrubbed
+        // `canonical` claim is refused here before any INSERT
+        // (verify-before-mutation). Backend-symmetric with SQLite + memory.
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
+        // co-scrub gate as `canonical`. Fail-closed before any write.
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
+        // gate: every remaining privileged `identity_type` is accord-conferred,
+        // never self-asserted. Same chokepoint, same fail-closed posture; the
+        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
+        // and is proven to cover every reserved-prefix rule.
+        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
+
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!(
+                "original_content_hash hex decode: {e}"
+            ))
+        })?;
+        // Reject non-hybrid algorithm values; schema CHECK constraint
+        // enforces this too, but we want a clean federation::Error
+        // shape rather than a backend SQL error string.
+        if row.algorithm != crate::federation::types::algorithm::HYBRID {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "algorithm must be 'hybrid' (got '{}')",
+                row.algorithm
+            )));
+        }
+
+        // Idempotent on (key_id, persist_row_hash). DO NOTHING when
+        // (key_id, persist_row_hash) match exactly; raise Conflict
+        // when key_id matches but content differs.
+        //
+        // v1.3.0 (CIRISPersist#46): write the roles list to the TEXT[]
+        // column. Empty Vec maps to NULL via Option<&Vec<String>>.
+        let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
+            None
+        } else {
+            Some(&row.capability_roles)
+        };
+        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — map wire None ⇔ the stored
+        // V020 'unregistered' default (the column is NOT NULL). The admission
+        // gate on the token itself (Rust-level, so PG's V020 CHECK and
+        // CHECK-less SQLite behave identically) ran at the top of this door,
+        // ahead of the conferral walks — CIRISPersist#670.
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
+                .to_owned();
+        // v13.2.0 (CIRISPersist#383) — the 2nd..Nth anchor scrubs serialize to
+        // the V096 `additional_scrubs` JSON-array TEXT column. Empty → "[]"
+        // (the column DEFAULT), so a single-scrub row is byte-stable.
+        let additional_scrubs_param =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
+        // v31.0.0 (#644) — registration_envelope is TEXT since V122.
+        let registration_envelope_text =
+            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
+        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
+        // stamped here and never read from the wire. The serve cursor keys on
+        // it, so a record whose `scrub_timestamp` is old — the everyday
+        // delayed-replication case on the identity plane — still lands ahead of
+        // every consumer's cursor instead of behind it.
+        let admitted_at = self.next_key_serve_position(&client).await?;
+        let result = client
+            .execute(
+                "INSERT INTO cirislens.federation_keys (\
+                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence, consent_role, additional_scrubs, admitted_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
+                 ON CONFLICT (key_id) DO NOTHING",
+                &[
+                    &row.key_id,
+                    &row.pubkey_ed25519_base64,
+                    &row.pubkey_ml_dsa_65_base64,
+                    &row.algorithm,
+                    &row.identity_type,
+                    &row.identity_ref,
+                    &row.valid_from,
+                    &row.valid_until,
+                    &registration_envelope_text,
+                    &original_content_hash,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.pqc_completed_at,
+                    &row.persist_row_hash,
+                    &roles_param,
+                    &row.attestation_evidence,
+                    &consent_role_stored,
+                    &additional_scrubs_param,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("insert federation_keys: {e}"))
+            })?;
+
+        if result == 0 {
+            // ON CONFLICT triggered — check if hash matches.
+            let existing: Option<String> = client
+                .query_opt(
+                    "SELECT persist_row_hash FROM cirislens.federation_keys WHERE key_id = $1",
+                    &[&row.key_id],
+                )
+                .await
+                .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?
+                .map(|r| r.get(0));
+            if let Some(existing_hash) = existing {
+                if existing_hash != row.persist_row_hash {
+                    return Err(crate::federation::Error::Conflict(format!(
+                        "key_id {} already exists with different content",
+                        row.key_id
+                    )));
+                }
+            }
+        }
+        // v21.1.0 (CIRISPersist#507b) — reached only on a fresh insert or an
+        // idempotent identical-content replay.
+        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
+        // path and the four mutators cannot compute the entry differently.
+        // v31.0.0 (CIRISPersist#640) — and that shared derivation now reads
+        // the row BACK: `row` is the caller's struct, which differs from the
+        // stored one whenever `TIMESTAMPTZ` rounds a sub-microsecond instant
+        // (reachable over the wire from a sqlite-backed origin, whose
+        // `to_rfc3339()` TEXT round-trips nanoseconds) or the storage boundary
+        // normalizes `consent_role`. See `wire_index::key_entry_as_stored`.
+        drop(client);
+        self.index_stored_key_row(&row.key_id).await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod attestation_id_is_text_622 {
     //! v30.6.0 (CIRISPersist#622) — **no attestation id is parsed as a UUID.**
@@ -26145,227 +26366,6 @@ pub(crate) mod postgres_serial_scan {
             }
         }
         (scanned, bad)
-    }
-}
-
-/// v50.0.0 (CIRISPersist#925 review M5) — the key-record store step, with the
-/// door it was reached through: `put_public_key` is the local mint
-/// ([`KeyDoor::LocalMint`](crate::federation::register::KeyDoor::LocalMint));
-/// the replicated `Insert` arm stores a key minted elsewhere
-/// ([`KeyDoor::ReplicatedInsert`](crate::federation::register::KeyDoor::ReplicatedInsert)).
-/// Every gate is the same on both except CC 3.4.7.3 Clause A, which gates
-/// minting only.
-impl PostgresBackend {
-    pub(crate) async fn put_public_key_at_door(
-        &self,
-        record: crate::federation::SignedKeyRecord,
-        door: crate::federation::register::KeyDoor,
-    ) -> Result<(), crate::federation::Error> {
-        let mut row = record.record;
-        // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST, first thing: the
-        // registration envelope is replaced by its JCS form, so the bytes
-        // bound into `federation_keys.registration_envelope` are the bytes
-        // `verify_key_registration` hashes and the producer signed.
-        // Idempotent, therefore signature-transparent; ahead of the role
-        // lift so every reader below sees one shape.
-        crate::federation::canonical_at_rest::canonicalize_in_place(
-            &mut row.registration_envelope,
-        )?;
-        // v19.0.0 (#486) — lift envelope-attested roles into the claim
-        // surface BEFORE the role write-gates (lift-then-gate).
-        crate::federation::admission::lift_envelope_attested_roles(&mut row);
-
-        // v10.1.0 (CIRISPersist#275 hardening) — universal write-path
-        // invariant: pubkey_ed25519_base64 MUST decode to a 32-byte Ed25519
-        // key. Rejects a wrong-curve / malformed key (e.g. a 65-byte P-256
-        // point) at admission for EVERY registration path — the backstop the
-        // #275 saga proved was missing. Backend-symmetric with SQLite. Runs
-        // first so a bad key leaves no trace.
-        crate::federation::register::validate_registration_pubkey(&row)?;
-        // v50.0.0 (CIRISPersist#925 ask 5, review M5) — CC 3.4.7.3 Clause A
-        // gates MINTING: a local mint of a fused key is refused. A key minted
-        // ELSEWHERE and arriving through the replicated `Insert` arm is
-        // admitted as gated data (Clause B and the steward gates apply to it
-        // wherever it acts): non-conformance is a reason to re-mint, and its
-        // signed history stays verifiable.
-        if door == crate::federation::register::KeyDoor::LocalMint {
-            crate::federation::register::check_node_identity_exclusive(&row)?;
-        }
-
-        // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
-        // admission gate for accord_holder rows. Runs BEFORE
-        // persist_row_hash + INSERT so rejected rows leave no trace.
-        // #441: evaluated over identity_type ∪
-        // roles (claims_role) — an `accord_holder` claim in the set form
-        // ("agent,accord_holder") or in the roles vector hits the same
-        // gate as the scalar.
-        // v47.3.0 (CIRISPersist#901) — one door predicate: an accord_holder
-        // runs structure + freshness; any other evidence-carrying row runs
-        // structure alone (a replicated body is checked where it lands).
-        self.hardware_attestation_policy()
-            .admit_key_record(&row, chrono::Utc::now())?;
-
-        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — the consent_role token is a
-        // PURE predicate over a closed vocabulary, so it leads the four
-        // accord-conferral gates below, every one of which is a directory walk.
-        // v31.2.0 (CIRISPersist#670): it used to run AFTER them, and after the
-        // conflict-check read — a row naming a token that does not exist paid
-        // for four authority resolutions before anything told it so, on the two
-        // backends production runs and not on memory. Backend-symmetric now.
-        // The wire ⇔ stored `'unregistered'` mapping stays at the bind site,
-        // where the column is written.
-        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
-
-        // v13.0.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
-        // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
-        // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
-        // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
-        // anchor). This is the substrate write chokepoint every registration
-        // path funnels through, so a self-signed / non-anchor-scrubbed
-        // `canonical` claim is refused here before any INSERT
-        // (verify-before-mutation). Backend-symmetric with SQLite + memory.
-        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
-        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
-        // co-scrub gate as `canonical`. Fail-closed before any write.
-        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
-        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
-        // accord-conferred, same ceremony. Fail-closed before any write.
-        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
-        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
-        // gate: every remaining privileged `identity_type` is accord-conferred,
-        // never self-asserted. Same chokepoint, same fail-closed posture; the
-        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
-        // and is proven to cover every reserved-prefix rule.
-        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
-
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-
-        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
-            crate::federation::Error::InvalidArgument(format!(
-                "original_content_hash hex decode: {e}"
-            ))
-        })?;
-        // Reject non-hybrid algorithm values; schema CHECK constraint
-        // enforces this too, but we want a clean federation::Error
-        // shape rather than a backend SQL error string.
-        if row.algorithm != crate::federation::types::algorithm::HYBRID {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "algorithm must be 'hybrid' (got '{}')",
-                row.algorithm
-            )));
-        }
-
-        // Idempotent on (key_id, persist_row_hash). DO NOTHING when
-        // (key_id, persist_row_hash) match exactly; raise Conflict
-        // when key_id matches but content differs.
-        //
-        // v1.3.0 (CIRISPersist#46): write the roles list to the TEXT[]
-        // column. Empty Vec maps to NULL via Option<&Vec<String>>.
-        let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
-            None
-        } else {
-            Some(&row.capability_roles)
-        };
-        // v13.0.0 (CIRISPersist#365, CC 3.4.7.2) — map wire None ⇔ the stored
-        // V020 'unregistered' default (the column is NOT NULL). The admission
-        // gate on the token itself (Rust-level, so PG's V020 CHECK and
-        // CHECK-less SQLite behave identically) ran at the top of this door,
-        // ahead of the conferral walks — CIRISPersist#670.
-        let consent_role_stored =
-            crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
-                .to_owned();
-        // v13.2.0 (CIRISPersist#383) — the 2nd..Nth anchor scrubs serialize to
-        // the V096 `additional_scrubs` JSON-array TEXT column. Empty → "[]"
-        // (the column DEFAULT), so a single-scrub row is byte-stable.
-        let additional_scrubs_param =
-            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
-                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
-            })?;
-        // v31.0.0 (#644) — registration_envelope is TEXT since V122.
-        let registration_envelope_text =
-            pg_envelope_text(&row.registration_envelope, "registration_envelope")?;
-        // v31.4.0 (CIRISPersist#682) — THIS node's admission position (V126),
-        // stamped here and never read from the wire. The serve cursor keys on
-        // it, so a record whose `scrub_timestamp` is old — the everyday
-        // delayed-replication case on the identity plane — still lands ahead of
-        // every consumer's cursor instead of behind it.
-        let admitted_at = self.next_key_serve_position(&client).await?;
-        let result = client
-            .execute(
-                "INSERT INTO cirislens.federation_keys (\
-                    key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
-                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role, additional_scrubs, admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) \
-                 ON CONFLICT (key_id) DO NOTHING",
-                &[
-                    &row.key_id,
-                    &row.pubkey_ed25519_base64,
-                    &row.pubkey_ml_dsa_65_base64,
-                    &row.algorithm,
-                    &row.identity_type,
-                    &row.identity_ref,
-                    &row.valid_from,
-                    &row.valid_until,
-                    &registration_envelope_text,
-                    &original_content_hash,
-                    &row.scrub_signature_classical,
-                    &row.scrub_signature_pqc,
-                    &row.scrub_key_id,
-                    &row.scrub_timestamp,
-                    &row.pqc_completed_at,
-                    &row.persist_row_hash,
-                    &roles_param,
-                    &row.attestation_evidence,
-                    &consent_role_stored,
-                    &additional_scrubs_param,
-                    &admitted_at,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("insert federation_keys: {e}"))
-            })?;
-
-        if result == 0 {
-            // ON CONFLICT triggered — check if hash matches.
-            let existing: Option<String> = client
-                .query_opt(
-                    "SELECT persist_row_hash FROM cirislens.federation_keys WHERE key_id = $1",
-                    &[&row.key_id],
-                )
-                .await
-                .map_err(|e| crate::federation::Error::Backend(format!("conflict check: {e}")))?
-                .map(|r| r.get(0));
-            if let Some(existing_hash) = existing {
-                if existing_hash != row.persist_row_hash {
-                    return Err(crate::federation::Error::Conflict(format!(
-                        "key_id {} already exists with different content",
-                        row.key_id
-                    )));
-                }
-            }
-        }
-        // v21.1.0 (CIRISPersist#507b) — reached only on a fresh insert or an
-        // idempotent identical-content replay.
-        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
-        // path and the four mutators cannot compute the entry differently.
-        // v31.0.0 (CIRISPersist#640) — and that shared derivation now reads
-        // the row BACK: `row` is the caller's struct, which differs from the
-        // stored one whenever `TIMESTAMPTZ` rounds a sub-microsecond instant
-        // (reachable over the wire from a sqlite-backed origin, whose
-        // `to_rfc3339()` TEXT round-trips nanoseconds) or the storage boundary
-        // normalizes `consent_role`. See `wire_index::key_entry_as_stored`.
-        drop(client);
-        self.index_stored_key_row(&row.key_id).await?;
-        Ok(())
     }
 }
 

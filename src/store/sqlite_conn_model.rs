@@ -561,7 +561,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_org_membership", ConnClass::Write),
     ("put_organization", ConnClass::Write),
     ("put_partner_record", ConnClass::Write),
-    ("put_public_key", ConnClass::Write),
+    // v50.0.0 (review M5) — `put_public_key` delegates to this store step.
+    ("put_public_key_at_door", ConnClass::Write),
     ("put_revocation", ConnClass::Write),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),
