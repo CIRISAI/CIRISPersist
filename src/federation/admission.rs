@@ -15122,10 +15122,14 @@ mod tests {
     #[test]
     fn admission_rejects_accord_dimension_from_agent() {
         let p = default_policy();
+        // v50.0.0 (CIRISPersist#924): CC 3.1.1's leaf is
+        // `accord:invoke:constitutional:{halt_id}` — lowercase, R3 (`accord:*`
+        // is `leaves_closed`). The uppercase fixture this used to carry is the
+        // old shape `accord_invoke_old_uppercase_shape_fails_loudly` refuses.
         let err = p
             .check(
                 attestation_type::SCORES,
-                Some("accord:invoke:CONSTITUTIONAL:halt_id_42:v1"),
+                Some("accord:invoke:constitutional:halt_id_42:v1"),
                 identity_type::AGENT,
             )
             .unwrap_err();
@@ -15133,6 +15137,81 @@ mod tests {
             err,
             Error::AccordDimensionRequiresAccordHolder { .. }
         ));
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CC 3.1.1 + CC 4.2.1.1 `ciris.accord_invoke.v2`)
+    /// — **the old invocation shape fails loudly, never by accident.**
+    ///
+    /// CC lowercased the accord invocation kinds and moved the canonical-bytes
+    /// domain label to `.v2` so an old signature cannot verify. Persist holds
+    /// no invocation canonical bytes (verify-core signs and verifies them), so
+    /// the persist-side witness is the DIMENSION: the old
+    /// `accord:invoke:CONSTITUTIONAL:…` spelling is refused
+    /// `namespace_dimension_case_malformed` at the case gate on every row, the
+    /// new leaf resolves to its own CC row, and a leaf CC does not name under
+    /// the closed `accord:*` is `namespace_family_unregistered`.
+    #[test]
+    fn accord_invoke_old_uppercase_shape_fails_loudly() {
+        use crate::federation::namespace::matcher::{match_family, Refusal};
+        let old = match_family("accord:invoke:CONSTITUTIONAL:halt_id_42:v1");
+        assert_eq!(old.refusal, Some(Refusal::CaseMalformed), "{old:?}");
+        let new = match_family("accord:invoke:constitutional:halt_id_42:v1");
+        assert_eq!(
+            new.family,
+            Some("accord:invoke:constitutional:{halt_id}"),
+            "{new:?}"
+        );
+        assert_eq!(new.refusal, None);
+        assert_eq!(
+            new.binds.get("halt_id").map(String::as_str),
+            Some("halt_id_42")
+        );
+        for (kind, leaf) in [
+            ("notify", "accord:invoke:notify:{notify_id}"),
+            ("drill", "accord:invoke:drill:{drill_id}"),
+        ] {
+            let m = match_family(&format!("accord:invoke:{kind}:x1:v1"));
+            assert_eq!((m.family, m.refusal), (Some(leaf), None));
+        }
+        let unnamed = match_family("accord:invoke:halt:x1:v1");
+        assert_eq!(unnamed.refusal, Some(Refusal::FamilyUnregistered));
+
+        // …and at the door: the case gate refuses the old shape by its token.
+        let now = chrono::Utc::now();
+        let mut row = crate::federation::Attestation {
+            attestation_id: "a".into(),
+            attesting_key_id: "k".into(),
+            attested_key_id: "k".into(),
+            attestation_type: attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "accord:invoke:CONSTITUTIONAL:halt_id_42:v1"
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k".into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::SELF.into(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.into(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        let err = check_dimension_case_rule(&row).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("namespace_dimension_case_malformed"),
+            "{err}"
+        );
+        row.attestation_envelope =
+            serde_json::json!({ "dimension": "accord:invoke:constitutional:halt_id_42:v1" });
+        check_dimension_case_rule(&row).unwrap();
     }
 
     #[test]
