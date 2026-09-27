@@ -17241,7 +17241,7 @@ mod tests {
             ),
             (
                 "ward-A",
-                "capacity_assurance:reversible_excluded:financial",
+                "capacity_assurance:reversible_excluded:financial:v1",
                 "sbi-a-rev",
             ),
         ] {

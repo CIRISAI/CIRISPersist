@@ -23472,7 +23472,7 @@ mod tests {
             "aic-fin-rex",
             "ai-assessor",
             "ai-A",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         )
         .await;
 
@@ -23626,7 +23626,7 @@ mod tests {
             "t1c-pend",
             "t1-assessor",
             "t1-A",
-            "capacity_assurance:reversible_pending:medical",
+            "capacity_assurance:reversible_pending:medical:v1",
         )
         .await;
 
@@ -23687,7 +23687,7 @@ mod tests {
             "pdc-rex",
             "pd-assessor",
             "pd-A",
-            "capacity_assurance:reversible_excluded:voting",
+            "capacity_assurance:reversible_excluded:voting:v1",
         )
         .await;
         let e = backend
@@ -23730,7 +23730,7 @@ mod tests {
             "cfc-rex",
             "cf-assessor",
             "cf-A",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         )
         .await;
         // petitioner == the assessor → conflicted.
@@ -23774,7 +23774,7 @@ mod tests {
             "flc-rex",
             "fl-assessor",
             "fl-A",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         )
         .await;
         // Admit a binding whose valid_until is ALREADY in the past (structurally

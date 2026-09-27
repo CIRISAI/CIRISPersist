@@ -69,6 +69,53 @@ pub mod reversible {
     /// `capacity_assurance:reversible_pending:{domain}` — exclusion in
     /// progress (T1 acute-window only).
     pub const PENDING_PREFIX: &str = "capacity_assurance:reversible_pending:";
+
+    /// v50.0.0 (CIRISPersist#924) — why a companion namespace is malformed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CompanionShapeError {
+        /// Right arity, but `{domain}` is not a lowercase CC vocabulary token
+        /// (`Financial`) — `namespace_dimension_case_malformed`.
+        CaseMalformed,
+        /// Not exactly `{domain}:{version}` below the prefix (extra depth,
+        /// no version) — no shape CC names, `namespace_family_unregistered`.
+        Unregistered,
+    }
+
+    /// v50.0.0 (CIRISPersist#924) — the ONE parse of a CC 3.4.12 companion:
+    /// `capacity_assurance:reversible_{excluded|pending}:{domain}:{version}`,
+    /// exactly one `{domain}` segment (a lowercase vocab token, the
+    /// manifest's `vocab_pattern`) and the trailing version (the manifest's
+    /// `version_segment.pattern`). `Ok(None)` for a namespace under neither
+    /// prefix; `Ok(Some((prefix, domain)))` for a well-formed companion.
+    ///
+    /// The rc5 registry carries no row for these (CIRISConstitution#117), so
+    /// the one matcher cannot judge them and R2(b)'s carve-out
+    /// (`admission::CC_TEXT_LEAVES_WITHOUT_ROWS`) would otherwise excuse ANY
+    /// shape below the prefix — `:Financial:v1`, `:a:b:c:v1`. This hand check
+    /// is that carve-out's grammar, and the fold reads companions through it
+    /// too, so a malformed companion can neither be admitted nor counted.
+    pub fn parse_companion(
+        namespace: &str,
+    ) -> Result<Option<(&'static str, &str)>, CompanionShapeError> {
+        use crate::federation::namespace::matcher::{is_version_segment, is_vocab_token};
+        let Some((prefix, rest)) = [EXCLUDED_PREFIX, PENDING_PREFIX]
+            .into_iter()
+            .find_map(|p| namespace.strip_prefix(p).map(|r| (p, r)))
+        else {
+            return Ok(None);
+        };
+        let parts: Vec<&str> = rest.split(':').collect();
+        match parts.as_slice() {
+            [domain, version] if is_version_segment(version) => {
+                if is_vocab_token(domain) {
+                    Ok(Some((prefix, domain)))
+                } else {
+                    Err(CompanionShapeError::CaseMalformed)
+                }
+            }
+            _ => Err(CompanionShapeError::Unregistered),
+        }
+    }
 }
 
 /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — **T2 periodic-review cadence**:
@@ -341,12 +388,10 @@ pub async fn incapacity_facts(
                     .incapacity_attesters
                     .insert(r.attesting_key_id.clone());
             }
-        } else if let Some(d) = at.strip_prefix(reversible::EXCLUDED_PREFIX) {
-            if !d.is_empty() {
+        } else if let Ok(Some((prefix, d))) = reversible::parse_companion(at) {
+            if prefix == reversible::EXCLUDED_PREFIX {
                 facts.reversible_excluded_domains.insert(d.to_owned());
-            }
-        } else if let Some(d) = at.strip_prefix(reversible::PENDING_PREFIX) {
-            if !d.is_empty() {
+            } else {
                 facts.reversible_pending_domains.insert(d.to_owned());
             }
         }

@@ -709,6 +709,13 @@ pub fn is_version_segment(segment: &str) -> bool {
     rules().version.is_match(segment)
 }
 
+/// Does `token` match `_meta.case_rule.vocab_pattern` (a lowercase CC
+/// vocabulary token)? For hand checks the registry cannot express as a row.
+#[must_use]
+pub fn is_vocab_token(token: &str) -> bool {
+    rules().vocab.is_match(token)
+}
+
 /// The trailing version segment of `dimension` — its LAST `:`-segment, when
 /// that matches the manifest's pattern. CC 3.1.7 R3: the version is trailing,
 /// exactly one, after the family's own segments.

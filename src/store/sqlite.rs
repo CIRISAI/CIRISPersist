@@ -45456,7 +45456,7 @@ mod tests {
         }
         for token in [
             "capacity_assurance:panel:financial:incapacitated:v1",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         ] {
             backend
                 .put_attestation(SignedAttestation {
@@ -45520,7 +45520,7 @@ mod tests {
             .unwrap();
         for token in [
             "capacity_assurance:panel:financial:incapacitated:v1",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         ] {
             backend
                 .put_attestation(SignedAttestation {

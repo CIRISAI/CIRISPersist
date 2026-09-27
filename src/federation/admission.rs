@@ -1221,10 +1221,38 @@ pub fn check_namespace_family_registered(namespace: &str) -> Result<(), Error> {
     if stem.is_empty() || UNREGISTERED_GATED_FAMILIES.contains(&stem) {
         return Ok(());
     }
-    let cc_refuses = match_family(namespace).refusal == Some(Refusal::FamilyUnregistered)
-        && !CC_TEXT_LEAVES_WITHOUT_ROWS
-            .iter()
-            .any(|(p, _)| namespace.starts_with(p));
+    // The carve-out excuses only a WELL-FORMED companion: its own grammar is
+    // the hand check `capacity::reversible::parse_companion` (review closure —
+    // without it `…:Financial:v1` and `…:a:b:c:v1` rode the carve-out past
+    // both R2(b) and the case gate, which only fires on a matched family).
+    let carved_out = match crate::federation::capacity::reversible::parse_companion(namespace) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(crate::federation::capacity::reversible::CompanionShapeError::CaseMalformed) => {
+            return Err(Error::InvalidArgument(format!(
+                "{}: {namespace:?} is a CC 3.4.12 capacity companion whose {{domain}} is not a \
+                 lowercase CC vocabulary token — refused, never folded",
+                Refusal::CaseMalformed
+            )));
+        }
+        // Not a companion shape. Admitted only as whatever registered row it
+        // resolves to cleanly (`…:a:b:v1` is `capacity_assurance:{level}:…`);
+        // any refusal the matcher raises — `…:a:b:c:v1` is case-malformed to
+        // CC, which the dimension-only case gate never sees on the
+        // `attestation_type` surface companions ride — refuses here.
+        Err(crate::federation::capacity::reversible::CompanionShapeError::Unregistered) => {
+            if match_family(namespace).refusal.is_some() {
+                return Err(Error::NamespaceFamilyUnregistered {
+                    namespace: namespace.to_owned(),
+                    family_stem: stem.to_owned(),
+                    reason: NamespaceConformanceReason::FamilyUnregistered.as_str(),
+                });
+            }
+            false
+        }
+    };
+    let cc_refuses =
+        match_family(namespace).refusal == Some(Refusal::FamilyUnregistered) && !carved_out;
     let governed_unrowed = is_governed_family(namespace) && !registry::is_stem_registered(stem);
     if !cc_refuses && !governed_unrowed {
         return Ok(());
@@ -17132,6 +17160,49 @@ mod tests {
                 "{prefix:?} is not under a CC reserved stem — the carve-out excuses nothing"
             );
             assert!(check_namespace_family_registered(&dim).is_ok(), "{dim}");
+        }
+        // Review closure: the carve-out is the companion GRAMMAR, not the
+        // prefix — one lowercase `{domain}` plus the trailing version.
+        for (prefix, _) in CC_TEXT_LEAVES_WITHOUT_ROWS {
+            let bad_case = format!("{prefix}Financial:v1");
+            let err = check_namespace_family_registered(&bad_case).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("namespace_dimension_case_malformed"),
+                "{bad_case}: {err}"
+            );
+            // Extra depth is never a COMPANION. `…:a:b:c:v1` matches no row
+            // and the carve-out no longer excuses it: R2(b) refuses.
+            let deep = format!("{prefix}a:b:c:v1");
+            assert!(
+                matches!(
+                    check_namespace_family_registered(&deep),
+                    Err(Error::NamespaceFamilyUnregistered { .. })
+                ),
+                "{deep}: extra arity is no shape CC names"
+            );
+            // `…:a:b:v1` is the one depth CC DOES register — as
+            // `capacity_assurance:{level}:{domain}:{band}:{version}` with
+            // `{level}` (open vocabulary) = `reversible_excluded` — so R2(b)
+            // has no ground to refuse it. What the closure guarantees is that
+            // it is not read as a companion: the companion parse refuses it,
+            // so the CC 3.4.12 fold never counts it as an exclusion.
+            let two = format!("{prefix}a:b:v1");
+            assert_eq!(
+                crate::federation::capacity::reversible::parse_companion(&two),
+                Err(crate::federation::capacity::reversible::CompanionShapeError::Unregistered),
+                "{two}"
+            );
+            assert_eq!(
+                crate::federation::namespace::matcher::match_family(&two).family,
+                Some("capacity_assurance:{level}:{domain}:{band}:{version}")
+            );
+            assert!(
+                check_namespace_family_registered(&format!("{prefix}financial")).is_err(),
+                "the trailing version is required"
+            );
+            check_namespace_family_registered(&format!("{prefix}financial:v1"))
+                .expect("the well-formed companion is admitted");
         }
         let sibling = "capacity_assurance:reversible_imagined:financial:v1";
         assert!(
