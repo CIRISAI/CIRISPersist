@@ -1525,6 +1525,45 @@ pub mod bodies {
         w
     }
 
+    /// **Final check (3d) — the local-tier door records the depth too.** A
+    /// local-tier `withdraws` becomes a federation row IN PLACE at
+    /// `enter_mesh`, where the bytes-plane fold sees it, so the local write
+    /// records the node's depth exactly as `put_attestation` does.
+    pub async fn local_withdraws_records_its_depth(d: &dyn FederationDirectory, tag: &str) {
+        let issuer = format!("local-issuer-{tag}");
+        register(d, &issuer, &[it::USER]).await;
+        let input = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: issuer.clone(),
+            attested_key_id: None,
+            attestation_type: attestation_type::WITHDRAWS.into(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "dimension": "file:doc:v1",
+                    "references_attestation_id": format!("absent-{tag}"),
+                    "withdrawal_reason": "CC 2.3",
+                }),
+            )
+            .unwrap(),
+            subject_key_ids: vec![],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        let id = d
+            .attestation_insert_local(input)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: a local-tier withdraws: {e}"));
+        assert_eq!(
+            d.withdraws_admission_depth(&id).await.unwrap(),
+            Some(crate::federation::DEFAULT_DELEGATION_DEPTH),
+            "{tag}: the local door records the node's depth"
+        );
+    }
+
     /// **Final check — the depth is written with the row, and repaired.** The
     /// caller breaks the depth store (`break_store`), heals it (`heal_store`)
     /// and forgets one row's depth (`forget`), in its own dialect:
@@ -1761,6 +1800,7 @@ mod runners {
                 case!(clause_a_peer_record_is_a_local_mint);
                 case!(infrastructure_founder_count_is_fixed_by_the_record);
                 case!(replicated_supersede_never_degrades_a_conformant_room);
+                case!(local_withdraws_records_its_depth);
                 case!(clause_a_replicated_insert_admits_a_fused_key);
             }
         };
