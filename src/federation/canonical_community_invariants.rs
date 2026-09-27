@@ -1380,6 +1380,48 @@ pub(crate) mod bodies {
         );
     }
 
+    /// (o‴) — every resignation counts, not only the earliest: F2 resigns,
+    /// the founders retire F2 and then RE-SEAT F2 through the record (the
+    /// re-seat clears the first resignation), and F2 resigns AGAIN, dated after
+    /// the re-seat head. The row stalls, naming F2.
+    pub async fn o4_a_second_resignation_counts(d: &dyn FederationDirectory) {
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, "rs-steward", "user,steward").await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+            .await
+            .expect("F2 resigns");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            d,
+            swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "rs-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("the founders retire F2");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(d, canonical_row(&FOUNDERS), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("the founders re-seat F2");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+            .await
+            .expect("the re-seated F2 resigns again");
+        match cc::stored_standing(d, CANON).await.unwrap() {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains(FOUNDERS[2]), "{reason}")
+            }
+            other => panic!("the second resignation stalls the row: {other:?}"),
+        }
+        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+    }
+
     /// Review TOCTOU: `supersede_community_with_quorum` skips the generic
     /// quorum when a trust root's chain holds, and `prepare_trust_root_supersede`
     /// re-reads the standing. If the chain stopped holding in between (here: a
@@ -1509,9 +1551,43 @@ pub(crate) mod bodies {
                 .founders,
             FOUNDERS.to_vec()
         );
-        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+        // Equality: dated EXACTLY at the link head's `amended_at` is refused
+        // too — the head's own link judges resignations up to and including
+        // its instant, so admitting it would un-root the chain.
+        let head = cc::lookup_signed_community(d, CANON)
             .await
-            .expect("the same resignation dated now is admitted");
+            .unwrap()
+            .unwrap();
+        let t2: chrono::DateTime<chrono::Utc> =
+            head.supersede_proof.as_ref().unwrap().change_envelope[cc::AMENDED_AT]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+        let e = d
+            .put_community_membership_revocation(founder_revocation_at(
+                &[FOUNDERS[2]],
+                FOUNDERS[2],
+                t2,
+            ))
+            .await
+            .expect_err("a resignation dated exactly at the head's instant");
+        assert_violation(
+            &e,
+            crate::federation::admission::TRUST_ROOT_RULE_RESIGNATION_BACKDATED,
+        );
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        d.put_community_membership_revocation(founder_revocation_at(
+            &[FOUNDERS[2]],
+            FOUNDERS[2],
+            t2 + chrono::Duration::seconds(1),
+        ))
+        .await
+        .expect("the same resignation one second after the head is admitted");
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert!(matches!(
             cc::stored_standing(d, CANON).await.unwrap(),
             cc::StoredStanding::Stalled { .. }
@@ -2468,6 +2544,14 @@ mod run {
                 async fn i190_o3() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::o3_a_resignation_does_not_lapse(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_o4() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::o4_a_second_resignation_counts(
                         &d as &dyn FederationDirectory,
                     )
                     .await

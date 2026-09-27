@@ -1162,6 +1162,28 @@ where
             .map(|m| (m.key_id, m.role))
             .collect();
     feed("folded", &serde_json::json!(folded));
+    // Every self-signed resignation instant (`Memo::resigned_within` reads
+    // these). The fold alone is not enough: a re-seated founder's SECOND
+    // resignation leaves the folded roster unchanged — the first one already
+    // folded them out — so a key without it served a stale Rooted verdict.
+    let mut resignations: Vec<(String, String)> = match directory
+        .community_roster_signers(&signed.community.community_key_id)
+        .await
+    {
+        Ok(signers) => signers
+            .revocation_signers
+            .into_iter()
+            .filter(|r| {
+                r.authority_key_id.as_deref() == Some(r.member_key_id.as_str())
+                    && r.cosigner_key_ids.is_empty()
+            })
+            .map(|r| (r.member_key_id, r.effective_at.to_rfc3339()))
+            .collect(),
+        Err(Error::Unsupported { .. } | Error::InvalidArgument(_)) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    resignations.sort();
+    feed("resignations", &serde_json::json!(resignations));
     Ok(hex::encode(h.finalize()))
 }
 
@@ -1697,19 +1719,21 @@ where
         && signers.len() == 1
         && signers.contains(&incoming.key_id);
     if resignation {
-        // Review MEDIUM-R (a): a resignation dated before the stored head's
-        // instant would un-count a link the founder co-signed and un-root the
-        // row on every node. Refused: a founder resigns from now on, not in
-        // the past.
+        // Review MEDIUM-R (a): a resignation dated at or before the stored
+        // head's instant would un-count a link the founder co-signed and
+        // un-root the row on every node — the head's own link judges
+        // resignations up to and INCLUDING its `amended_at`, so equality is
+        // refused too. A founder resigns strictly after the head, never over
+        // it.
         if let Some(head) = lookup_signed_community(directory, &community.community_key_id).await? {
             let instant = head_instant(&head);
-            if effective_at < instant {
+            if effective_at <= instant {
                 return Err(violation(
                     &community.community_key_id,
                     super::admission::TRUST_ROOT_RULE_RESIGNATION_BACKDATED,
                     format!(
-                        "{:?}'s resignation is dated {effective_at}, before the head's instant \
-                         {instant}: a resignation cannot reach back over a link",
+                        "{:?}'s resignation is dated {effective_at}, not strictly after the \
+                         head's instant {instant}: a resignation cannot reach back over a link",
                         incoming.key_id
                     ),
                 ));

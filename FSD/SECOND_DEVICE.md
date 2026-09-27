@@ -788,7 +788,7 @@ If the chain verifies but a recorded founder no longer counts (a withdrawn or ro
 - **One predicate on the plane (the rc5 reconcile).** rc5's `check_infrastructure_founder_count_unchanged(.., self_leave)` returns early for a trust-root row. The trust-root guard (`check_trust_root_roster_change`) is then the only gate. It refuses every founder change on the plane (`founder_seat_on_plane`) except a founder's own self-leave, which it admits as the resignation. There is no double gate.
 - **The last founder cannot resign on the plane.** The ordinary last-founder rule runs after the guard, and it refuses removing the only founder. A sole founder leaves through the accord (a withdrawal, then a re-birth).
 - **No backdating (MEDIUM-R).** The resignation's `effective_at` is signer-chosen, so two rules bound it:
-  - (a) The plane door refuses a resignation whose `effective_at` is earlier than the stored head's instant: its link's `amended_at`, or `founded_at` for a birth. The refusal is the typed `resignation_backdated`. A founder therefore cannot date a resignation before a link they co-signed and so retroactively un-count that link.
+  - (a) The plane door refuses a resignation whose `effective_at` is not STRICTLY AFTER the stored head's instant: its link's `amended_at`, or `founded_at` for a birth. Equality is refused as well (re-check B): the head's own link judges resignations up to and including its `amended_at`, so a resignation dated exactly at a link head would have un-counted the founder's signature on that link and un-rooted the row mesh-wide. The refusal is the typed `resignation_backdated`. A founder therefore cannot date a resignation before a link they co-signed and so retroactively un-count that link.
   - (b) In `founder_counts`, for a link, a stored resignation applies only when its `effective_at` is later than the PRIOR version's instant. For the standing, it applies only when later than the version that seated the key (`seated_since`). This floor is sound only together with the carry-forward refusal above: by induction, no admitted version records a founder past their resignation unless a later version re-seated them, so a resignation older than the prior's instant cannot belong to a founder the prior carried. The round-5 form of (b), without that refusal, let a resignation lapse (R2).
   - I190 (o′) witnesses (a) and (o″) the carry-forward refusal, on all three backends.
   - Residual, stated: a node holding an OLDER head can admit a resignation dated between its head and a newer link the founder signed. That node then refuses the newer link, because its founders' count falls short. This is divergence the founder chose, by signing both a link and a resignation dated before it. The nodes that already hold the newer head refuse the resignation.
@@ -803,7 +803,8 @@ The trade, stated: ONE founder can stall the default trust root. That is consent
 - the accord family record and its active roster;
 - the key record and steward withdrawal of every holder and of every key the chain names;
 - each such key's node-bearing inputs (`node_bearing_of`: its own `node` bit and the intervals in which it is an occurrence of a node identity), so a key turning node-bearing is a new key;
-- the community's folded roster.
+- the community's folded roster;
+- every self-signed resignation instant. The fold alone was not enough: a re-seated founder's SECOND resignation leaves the folded roster unchanged, because the first had already folded them out, so the cache served a stale Rooted. I190 (o‴) found this.
 
 Any change to those inputs is a new key; a holder revocation, a founder withdrawal or rotation, a plane change and an amendment all are. A read with unchanged inputs verifies no signature: the cache key costs only directory reads. Within one computation, each founder's conferral co-scrub is verified once (`Memo`). The cache drops everything past 256 entries.
 
@@ -860,7 +861,7 @@ Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_su
 
 **#809.** The Rust-side consumer gate was already a gate (`verify_bundle_quorum`), and I190 (f) witnesses it through the pin. The REPORTED-not-gated assertion #809 tracked was the release pre-flight in `.github/workflows/ci.yml`. It is now `scripts/preflight_trust_root.py` and GATED: an unparseable `consensus_protocol` is refused, and so are distinct seated authorizations short of M. The step runs a 12-fixture self-test first, including #809's `authorizations: []` row, which now exits 1. The live registry passed it on 2026-09-26 (2 ≥ 2; `accepts_this_root=false` warned). It counts authorizations and does not verify their signatures.
 
-**Invariant I190** (memory, sqlite, postgres, 70 tests):
+**Invariant I190** (memory, sqlite, postgres, 73 tests):
 - (a) the fixture row admits under a 2-of-3 accord co-scrub, resolves, and its co-signature is served byte-exact;
 - (b) 1-of-3, a founder co-signature and founders alone are refused; a forged co-scrub is refused even beside a quorum, and so is a doubled co-signer;
 - (c) a node-bearing founder (#925), a self-declared steward, each shape clause, and a squatted reserved id are refused;
@@ -886,6 +887,8 @@ Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_su
   - the accord re-birth replaces the stalled row (`accord_rebirth_replaces_stalled`), and it is rooted again;
 - (o) a founder resigns by their own plane revocation: the row stalls, a later link counting them falls short, and the others retire the seat through the record; the founders then RE-SEAT the key, the older resignation no longer applies (LOW-1), and the re-seated founder co-signs a later link on the local door (MEDIUM-R (b), and the one-quorum rule);
 - (o′) F2 co-signs v2; F2's resignation dated between the birth and v2's `amended_at` is refused with `resignation_backdated`, and the row stays Rooted with every founder; the same resignation dated now is admitted and stalls the row (MEDIUM-R);
+- (o′) additionally: a resignation dated EXACTLY at the link head's `amended_at` is refused and the row stays Rooted; one second later it is admitted and the row stalls;
+- (o‴) every resignation counts: F2 resigns, is retired, is re-seated through the record, and resigns again after the re-seat head; the row stalls, naming F2;
 - (o″) R2: F2 resigns; the other founders' v6 that still records F2 is refused on the local and the replicated door (`resignation_carried_forward`); the v6 that amends F2 out is admitted and Rooted; F2 with F0 then produces no v7 (re-seating F2, or adding a member) on either door;
 - (t) the TOCTOU arm: `prepare_trust_root_supersede` flagged as having skipped the generic quorum refuses over a NotRooted constraint row; unflagged it passes;
 - (r) #925's node-bearing half on its own: a `user,steward` founder that becomes an agreed occurrence of a `node` identity stalls a Rooted row whose standing was already cached (naming the founder), and a birth naming such a founder is refused with `node_bearing_founder`;
@@ -1204,5 +1207,5 @@ Plus the server route test on both paths.
 | O3 | a resigned seat kept in the link seats | 0 | equivalent (absolute M) |
 
 - **B2's meaning changed.** Before R2 it was the only thing a lapse turned on, and its floor was what made the lapse possible. After R2 no admitted version carries a founder past their resignation, so B2 now guards only the re-seat. A re-seated founder's older resignation must not un-count a later link they co-sign. (o) is the arm that measures that.
-- **Not witnessed:** the memo now keeps every resignation of a key, not only the earliest. That matters for a founder who resigns, is re-seated, and resigns again. No I190 arm drives a second plane resignation, so a mutant that keeps only the earliest would survive this lane. The plane may refuse the second revocation anyway; that is untested.
+- **Superseded by round 8:** this round's "not witnessed" note on keeping every resignation. (o‴) now witnesses it, and building (o‴) found that the standing cache key omitted the resignations.
 
