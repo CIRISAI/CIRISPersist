@@ -393,15 +393,21 @@ The exact-count pin in `evidence_cc_impl_rows_pin_the_current_crate_version` mov
 
    It is not in `verify_key_registration`: every door above runs it. A pre-gate fused key is refused any rewrite of its record (it re-mints), and Clause B still gates it where it sits. The Clause B witnesses (`hybrid_node_agent_key_still_refuses_agency_773`, `node_agent_hybrid_carries_agency_admitted{,_sqlite}`, `pg_node_agency_duplicate_identity_type_token`) now plant their fused key below the door, because the door now refuses to mint it. The upgrade and supersede doors are witnessed by `clause_a_on_the_rewrite_doors_{sqlite,postgres}`.
 7. **"Infrastructure family" is not representable.** A `Family` has no `cohort_subkind`, so #927's refusal is on communities. `family_quorum_over` gains no identity filter: #925 is scoped to `infrastructure` communities.
-8. **The withdraws WRITE gate walks 5 hops. A stored row keeps the depth it was admitted under** (review H2, ruled: v49's "past actions validly decided stand").
-   - **The write gate** (`check_withdraws_admission` → `resolve_withdraws_admission_rule`, which uses the new `_at` forms) takes the CC 4.1.1 default. A NEW withdraws over a 6-to-16-hop proxy chain is refused with `beyond_delegation_depth_cap: true`.
-   - **Why the stored rule is not simply read.** The bytes-plane fold (`blob_tombstone::retiring_composer`) re-derives every stored withdraws at read time. It must: #853 ruled "re-derive, never read the stored rule", so a proxy edge withdrawn since stops the retirement.
-   - **So it re-derives at the depth ceiling, `MAX_WITHDRAWS_DELEGATION_DEPTH` (16),** the walk every pre-v50 row was admitted under, not at the new default. A withdraws validly decided before v50 keeps retiring its bytes, and the attestation-plane fold keeps honouring the stored `withdraws_admission_rule` (arm 3) as before.
-   - **The rule (ruled 2026-09-27, accepting this over the literal ask).** No depth is stored per row, so "honour the stored depth" has nothing to read. Re-deriving at the ceiling keeps #853 ("re-derive, never read the stored rule") and makes nothing retroactive: every stored row was admitted under a walk of at most 16 hops, and a proxy edge withdrawn since still stops the retirement.
-   - Witness: `withdraws_admitted_under_the_old_depth_still_retires` (memory, sqlite, postgres).
-     - Its stored row is admitted by the deferred arm: its target is absent at admission, which is the read-time position of any pre-v50 row. It is not planted below the door with a rule recorded. The fold ignores the stored rule, so the two are equivalent for this fold.
-     - It then shows a NEW 6-hop withdraws refused at admission.
-   - **Mixed-fleet divergence (stated, until the fleet upgrades):** a v49 node admits a 6-to-16-hop withdraws that a v50 node refuses at its replicated door. The two nodes then disagree about that row until the v49 node upgrades. The v50 node never stores the row, so the bytes it withdraws stay live there. This belongs in the release note.
+8. **The withdraws WRITE gate walks 5 hops, and each stored row keeps the depth it was admitted under** (review H2; final check: the depth is persisted, V157).
+   - **The write gate** (`check_withdraws_admission`) walks rules 3/4 at the node's `withdraws_delegation_depth()`: the CC 4.1.1 default (5), unless the host opted in with `set_withdraws_delegation_depth(n)`, clamped at 16. A NEW withdraws over a chain deeper than that is refused with `beyond_delegation_depth_cap: true`.
+   - **The depth is recorded with the row.** V157 adds `federation_withdraws_admission_depths(attestation_id, depth)` on sqlite and postgres (the memory backend mirrors it). Every backend's `put_attestation` records the depth in the same write, and on postgres right after the insert.
+   - **Backfill.** Every `withdraws` stored before V157 was admitted under the 16-hop walk and is backfilled at 16. A row with nothing recorded reads as 16. The bytes are pinned in `evidence/migration_checksums.tsv`.
+   - **The bytes-plane fold re-derives at the ROW's depth.** `blob_tombstone::retiring_composer` still re-walks the edges as they stand now (#853: re-derive, never read the stored rule), at `withdraws_admission_depth(row)`. So a pre-v50 withdraws keeps retiring what it retired. A NEW withdraws admitted by the deferred arm (target absent at admission) can no longer retire bytes through a chain deeper than the gate that admitted it walked, which closes the plane split the ceiling rule left open.
+   - **Witnesses:**
+     - `withdraws_retire_at_their_admission_depth` (memory, sqlite, postgres; the runner sets the opt-in):
+       - (A) a deferred 6-hop withdraws recorded at 5 does not retire;
+       - (B) with the target present it is refused, too deep;
+       - (C) under an opt-in to 6 it is recorded at 6 and retires.
+     - `sqlite::tests::withdraws_admission_depth_is_backfilled` (V156 → V157 migration witness): a pre-V157 withdraws gets 16; a non-withdraws row gets nothing.
+   - **Residuals:**
+     - The postgres write records the depth right after the insert, not in the same transaction. A lost write reads as 16, the legacy depth.
+     - The capsule proxy's `withdraws_admission_depth` is the trait default (`None` → 16). A fold run over the capsule proxy reads the ceiling.
+   - **Mixed-fleet divergence (stated, until the fleet upgrades):** a v49 node admits a 6-to-16-hop withdraws that a v50 node refuses at its replicated door. The bytes it withdraws stay live on the v50 node until the fleet upgrades. This belongs in the release note.
 9. **Fixtures.** Infrastructure community fixtures in memory, sqlite, postgres and `community_dek` declared `majority` / `founder_only` and now declare `quorum:1/1`, through `tier_ingest::test_support::fixture_protocol`.
 
 ### 8.6 Mutation table
@@ -472,21 +478,45 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
 **M5 — the replicated `Insert` admits a fused key minted elsewhere.**
 - `put_public_key` is now the local-mint face of `put_public_key_at_door(record, KeyDoor)` on every backend. The replicated `Insert` arm reaches the same store step with `KeyDoor::ReplicatedInsert`, and Clause A gates `LocalMint` only. The admitted key is gated data: Clause B and the steward gates apply wherever it acts.
 - The replicated `Upgrade` / `Supersede` arms map a Clause A or `node`-immutability refusal to typed `Refused { node_identity_fused | node_identity_changed }`, never an `Err`.
-- The key-replication cursor lives in CIRISEdge. Persist's side of the contract is that every outcome of the apply door is typed `Ok`, so a refusal is recorded and skipped rather than re-polled.
+- The key-replication cursor lives in CIRISEdge. The NEW refusals on the apply door are typed (`Refused { node_identity_fused | node_identity_changed }`), so they are recorded and skipped rather than re-polled. Errors that predate this cut (for example a failed registration verify on the `Insert` arm) are unchanged.
 - Witness `clause_a_replicated_insert_admits_a_fused_key` (×3 backends): a fused replicated insert → `Inserted`; a pubkey swap over it → `Refused { pubkey_swap }`; a local mint of a fused key → `NodeIdentityNotExclusive`.
 
-**M6 — the record door judges a new or changed record AUTHORED HERE.** `put_community` calls `admission::check_infrastructure_record_admission(dir, record, authority_key_id)` on all three backends.
-- An identical re-put (same `persist_row_hash`) settles before conformance.
-- A record whose `authority_key_id` is not this node's key (`node_key_id`) is replicated data. It is admitted, and the fold's gates apply to it.
-- An unknown node key is judged as authored here, the stricter reading.
-- The local supersede doors are always judged. A replicated amendment (`route_occupied_community`) is data.
-- Witness `infrastructure_record_authored_elsewhere_is_data` (two nodes, ×3 backends):
-  - A legacy `founder_only` record is admitted on A as data, and an identical re-put settles.
-  - B syncs it from A's since-read.
-  - A NEW record signed by A's own key is refused, and a supersede is refused.
-  - With A's key then set to the record's signer, an identical re-put settles and a changed one is refused.
-- **Residual (authored-here heuristic).** `put_community` is also Edge's replication door, so persist tells local from replicated by the SIGNER. A human-signed record submitted locally through `put_community_json` (with a supplied signature) is therefore treated as data. Follow-up **CIRISPersist#931**: a distinct local community door.
+**M6 (final check) — the DOOR, not the signer, decides (CIRISPersist#931, brought into v50).** The round-2 design told local from replicated by the signer, and it switched the gate OFF on every real host. The Engine always sets the node key, and an infrastructure record is normally signed by its HUMAN founder, so any human-signed record read as "authored elsewhere". The tests stayed green only because test directories left the node key unset.
+- **Two doors, strict by default.**
+  - `put_community` (the trait door on all three backends; pyo3 `put_community_json`; the Engine's `put_community_self_signed`) is the LOCAL door. It runs `admission::check_infrastructure_record_admission(dir, record)`, the full CC 3.2 infrastructure gate, whoever signed. An identical re-put (same `persist_row_hash`) settles.
+  - `FederationDirectory::apply_replicated_community(record) -> ReplicatedCommunityOutcome` is the REPLICATED entry.
+    - It returns `Inserted`, `Unchanged`, `Superseded`, or `Refused { conflicting_record }`.
+    - A legacy non-conformant infrastructure record is admitted as data, and the fold's gates apply.
+    - An occupied id routes through the existing amendment checks (`route_occupied_community`).
+    - It is on the trait (default `Unsupported`), overridden by every backend, carried by the capsule op `ApplyReplicatedCommunity` / result `ReplicatedCommunityOutcome` (growth; both digests re-pinned), and exposed as pyo3 `apply_replicated_community_json`.
+  - Both doors share one store step, `put_community_at_door(record, CommunityDoor)`. A replication bridge (CIRISEdge) moves to the replicated entry.
+- **The local supersede doors are always judged.**
+- **Witnesses:**
+  - `infrastructure_record_authored_elsewhere_is_data` (two nodes, BOTH with their node key SET, ×3 backends):
+    - a human-signed `founder_only` infrastructure record through the local door is refused;
+    - the same record through the replicated entry is `Inserted`, and re-applied it is `Unchanged`;
+    - an identical re-put through the local door settles, and a changed one is refused;
+    - a supersede is refused;
+    - the second node syncs the record through its replicated entry.
+  - The capsule witness `apply_replicated_community_op_is_the_replicated_door`.
+  - The P3, item-5, fold-vector and last-founder fixtures now plant their legacy rooms through `apply_replicated_community`.
 - **Widening door unchanged.** It still refuses seating a node-bearing founder, whatever the signer, so a replicated legacy widening that seats one does not sync.
+
+**M1 loophole (final check) — `N` is the founder count.** The evaluator reads `quorum:M/N` with an ABSOLUTE `M` and never compares `N` with the founders, so `quorum:1/1` over three founders let one of them admit alone.
+- `check_infrastructure_consensus_protocol` now requires `N` == the record's founder count (`INFRA_RULE_QUORUM_N_NOT_FOUNDERS`), on top of the parser's `M ≥ 2 when N ≥ 2`.
+- In a CONFORMANT infrastructure room, `check_infrastructure_founder_count_unchanged` refuses any widening (add, promote, demote) or revocation that would move the founder count, at the widening and revocation doors of all three backends. The founder set moves by a supersede that re-declares `N`.
+- A legacy non-conformant room (replicated data) is not re-judged on its roster plane.
+- The record checks run in this order: a founder exists, then the protocol and its `N`, then node-bearing founders.
+- **Witnesses:**
+  - `infrastructure_protocol_must_be_quorum`: `quorum:1/1` over 3 founders and `quorum:2/3` over 2 are refused; `2/3` over 3 is admitted.
+  - `infrastructure_founder_count_is_fixed_by_the_record`: under `quorum:2/2` over 2 founders, adding a founder and removing one are refused, and a plain member is admitted.
+
+**H3's fifth door (final check) — `add_peer_record` is a local mint.** `check_peer_record_admission` runs Clause A on the record the door would write (a caller-supplied `identity_type`). It is reachable from pyo3 `add_peer_record_json` and the capsule op. Witness `clause_a_peer_record_is_a_local_mint` (×3). The rewrite doors' pure predicate `check_node_identity_unchanged` is pinned by the unit test `check_node_identity_unchanged_refuses_only_a_node_move`. The reanchor door's BELIEVED status rests on that tested predicate.
+
+**LOW (final check).**
+- `occurrence_agreed_to` has no owner-binding arm. It could only fire for a pre-gate fused identity, where it is unilateral again.
+- The M5 sentence is corrected: the NEW refusals are typed (`node_identity_fused` / `node_identity_changed`, and on the community plane `conflicting_record`). Not every error of every apply arm is.
+- The backdated-revocation clamp (a revocation's signer-chosen `effective_at` can reach back before the act it ends) is routed to **CIRISPersist#930** with the per-assertion occurrence history.
 
 **H3 strengthened — `node` never moves on a rewrite.**
 - `adopt_scrub_upgrade`, `supersede_canonical_record` and `adopt_genesis_reanchor` (sqlite, postgres; memory's `adopt_genesis_reanchor`) refuse a rewrite that adds or removes `node` (`Error::NodeIdentityImmutable`, `federation_node_identity_immutable`, `ValueError`). The stored row is unchanged.
@@ -541,6 +571,26 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
   - The withdraws write gate walks 5 hops (the mixed-fleet divergence is in §8.5(8)).
   - A node-bearing seat in an infrastructure room neither votes nor holds founder powers, judged at each change's instant.
 
+**Final-check additions:**
+- **Trait:**
+  - `FederationDirectory::apply_replicated_community`.
+  - `withdraws_delegation_depth()` and `withdraws_admission_depth(id)`.
+- **Types:**
+  - `CommunityDoor {Local, ReplicatedApply}`.
+  - `ReplicatedCommunityOutcome {Inserted, Unchanged, Superseded, Refused{reason}}`.
+  - `ReplicatedCommunityRefusal {ConflictingRecord}` (`conflicting_record`).
+- **Capsule:** op `ApplyReplicatedCommunity`, result `ReplicatedCommunityOutcome` (growth, digests re-pinned, ABI 6).
+- **pyo3:** `apply_replicated_community_json(payload_json) -> str` (classified deontic).
+- **Backends:** `set_withdraws_delegation_depth(n)`.
+- **Migration:** V157 `federation_withdraws_admission_depths` (both dialects). #926 renumbers to V158 at its rebase.
+- **Rule and gate:** rule constant `INFRA_RULE_QUORUM_N_NOT_FOUNDERS`; `admission::check_infrastructure_founder_count_unchanged`.
+- **Changed signature:** `check_infrastructure_record_admission(dir, community)` (the authority parameter is removed).
+- **Behaviour:**
+  - `put_community` judges every new or changed infrastructure record, whoever signed it.
+  - A replication bridge must call the replicated entry.
+  - `add_peer_record` refuses a fused `identity_type`.
+  - A conformant infrastructure room's founder count is fixed by its record.
+
 ### 8.9 Mutation round 3 (committed `8a3c1e66`)
 
 Lane: the original eight words plus `test(rc5_adopts) | test(abi_version)`, `--features sqlite,postgres` under `scripts/pg_test_db.sh -- cargo nextest run -j 3`. Baseline 163/163, postgres legs against a database. Every mutant was re-run because the fold and the keypairs changed. The script is uniquely named (`rc5s_mut.py`, clean-tree assert). **30/31 killed at `8a3c1e66`; P3 then gained its witness and is killed at `86fd2b12` — 31/31**. None OOM-killed. "×3" = memory, sqlite, postgres.
@@ -578,3 +628,30 @@ Lane: the original eight words plus `test(rc5_adopts) | test(abi_version)`, `--f
 | R5 | no-founder refusal dropped | 3 | protocol witness ×3 |
 | H3a | sqlite `adopt_scrub_upgrade` node-immutable dropped | 1 | rewrite doors sqlite |
 | H3b | postgres `supersede_canonical_record` node-immutable dropped | 1 | rewrite doors postgres |
+
+### 8.10 Mutation round 4 (final check, committed `c2b59b32`)
+
+Lane: round 3's, plus `test(replicated_community) | test(backfilled) | test(node_move)`. Baseline 175/175, postgres legs against a database. The round covers every changed site, plus the round-3 mutants whose witnesses changed fixtures. **20/20 killed**, none OOM-killed.
+
+| # | Mutant | Failed | Killed by |
+|---|---|---|---|
+| D1 | local door lenient (sqlite) | 4 | protocol, founder, H1 and door-split witnesses on sqlite |
+| D2 | replicated entry strict (sqlite) | 5 | door-split; P3, item-5, fold-vector and last-founder legacy plants on sqlite |
+| P5 | `add_peer_record` Clause A dropped | 3 | `clause_a_peer_record_is_a_local_mint` ×3 |
+| U1 | `check_node_identity_unchanged` never refuses | 3 | the unit pin; rewrite doors ×2 |
+| W1 | bytes-plane re-derivation at 16, ignoring the recorded depth | 3 | `withdraws_retire_at_their_admission_depth` ×3 (A) |
+| W2 | sqlite records the default, ignoring the opt-in | 1 | the same witness, sqlite (C) |
+| N6 | `N` not compared with the founder count | 3 | protocol witness ×3 |
+| N7 | roster founder-count guard dropped | 3 | `infrastructure_founder_count_is_fixed_by_the_record` ×3 |
+| M3b | protocol check dropped from record conformance | 7 | protocol ×3; door-split ×3; capsule door test |
+| R4b | identical re-put not settled on the local door | 3 | door-split ×3 |
+| R5 | no-founder refusal dropped | 3 | protocol witness ×3 |
+| M1 | node founder counted | 7 | consensus unit; fold vector ×3; item-5 ×3 |
+| M7 | fold seat `node_bearing: false` | 6 | fold vector ×3; item-5 ×3 |
+| M9 | occurrence resolution dropped | 21 | every occurrence-based witness |
+| N1 | agreement dropped | 3 | H1 witness ×3 |
+| I5a | judged at now | 6 | fold vector ×3; item-5 ×3 |
+| I5b | revocation instant ignored | 3 | item-5 ×3 |
+| P1 | last-founder counts node-bearing founders | 3 | last-founder witness ×3 |
+| P2 | root-authority cut dropped | 3 | moderation-root witness ×3 |
+| P3 | duty holders keep node-bearing founders | 3 | duty-holder witness ×3 |
