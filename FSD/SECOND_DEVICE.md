@@ -371,6 +371,8 @@ Mutation round 3, on 0b470523. Lane: the I189 lane plus #916's (`test(device_rea
 - Emit `accord:invoke:{constitutional|notify|drill}:{id}:v1` (lowercase, with the id); sign invocations under `ciris.accord_invoke.v2` (verify-side).
 - Emit `age_self_declared:band:{band}:v1`, `identity:canonical_binding:<64 hex>` (no `canonical:sha256:` inside the dimension), `hardware_custody:{snake_case HardwareType}:v1`.
 - A minor's owner-binding must be held at `cohort_scope: self`. At `federation` it refuses `federation_write_scope_refused: scope_minor_owner_binding_at_federation`, and so does WIDENING it there (`widen_audience`'s `supersedes`, including the sweep's widening step and the pyo3 widen — review HIGH-1).
+- **Follow-up, CIRISPersist#929 (minors × widening, peer side).** The gate recognises an announce by the widening's own body or by the prior it names. A receiving peer that does NOT hold the self-scope prior (usually: `self` is undiscoverable) can check only the body. If the prior is a purpose-only owner-binding (no `dimension`) and the widening stripped `delegation_purpose`, that peer would admit it. The origin's door refuses it, so the row needs a forgery written straight to a peer by the minor's own key.
+- **The capacity-companion carve-out is the companion grammar, not the prefix** (review closure). `capacity::reversible::parse_companion` admits `capacity_assurance:reversible_{excluded|pending}:{domain}:{version}` with one lowercase `{domain}` and the trailing version. `…:Financial:v1` refuses `namespace_dimension_case_malformed`. `…:a:b:c:v1` refuses `namespace_family_unregistered`. `…:a:b:v1` is not a companion but IS a registered `capacity_assurance:{level}:{domain}:{band}:{version}` row (`{level}` = `reversible_excluded`, open vocabulary), so it is admitted as that row and the CC 3.4.12 fold does not count it. **Wire change:** companions now carry the version tail (`capacity_assurance:reversible_excluded:financial:v1`); the versionless v49 spelling refuses. CC row ask: CIRISConstitution#117.
 - **CIRISVerify emits three `hardware_custody` dimensions v50 refuses** (no persist legacy arm; rc5 says refuse; the verify checklist item is filed by the release lead):
   | emitted today | refusal | emit instead |
   |---|---|---|
@@ -417,11 +419,17 @@ Lane (`--features sqlite,postgres --lib` under `scripts/pg_test_db.sh`, `-j 3`):
 | M12 (re-run) | `covers` without the grammar check | KILLED (2) | covers test, the sweep witness |
 | M16 (re-run) | minors gate removed from the promotion stack | KILLED (3) | minors ×3 |
 
+**Review closure on ed13d7e5** (lane plus `test(cc_text_leaves) | test(capacity)`; baseline included in the mutant's 237):
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M20 | companion carve-out ignores `parse_companion` (a malformed shape under the prefix is excused) | KILLED (1) | `cc_text_leaves_without_rows_are_still_rowless` |
+
 ### 10.6 For adopters at the tag (computed from the vendored files)
 
 **Constants.** `VENDORED_N_FAMILIES` 116 → **145**. `VENDORED_CC_VERSION` stays `1.0-rc5`. `VENDORED_SOURCE_SHA256` `87aede50…b9a9f5` → `f05682512c85c65c3f502e1ca81dfb032a6e6d24ab4206658fbf36ccaa702a75`. New: `VENDORED_REGISTRY_SHA256 = d6c87945ea08d72cc1f83820e35f0e3fb72cce47ea49f2ed3321d43219642ea6`, `VENDORED_CC_COMMIT = 4b624513458f2c9b236caf289dc2cd62aa048c24`. `supersets::VENDORED_MANIFEST_VERSION` stays **`0.3.0`**: it versions the supersets walk (`namespace_supersets.json`), which this cut did not re-vendor. Its seed pin (`VENDORED_SEED_REGISTRY_SHA256`) still names the rc2 registry, and that lag is declared.
 
-**Field-processor matrix and transform algebra: no shape change.** `TRANSFORM_ALGEBRA_HASH` is `b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b` at `ea14c27f` and at the tag. `transform_algebra_hash_is_pinned` recomputes it and passed in both full lanes. `transform.rs` and `namespace_supersets.json` are byte-unchanged in this cut, so no processor kind or transform op was added, removed or re-typed. The only change in `supersets.rs` is a `DELETED_PENDING_REVENDOR` entry for the deleted `is_attestation_ladder_dimension` citation. The registry itself carries no processor column.
+**Field-processor matrix and transform algebra: no shape change.** `TRANSFORM_ALGEBRA_HASH` is `b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b` at `ea14c27f` and at the tag. `transform_algebra_hash_is_pinned` recomputes it and passed in both full lanes on `6c731b25`: `pyo3,sqlite` started 2026-09-27 01:00:04 CDT (3432 passed) and `postgres,sqlite` started 01:09:08 CDT (3362 passed). `transform.rs` and `namespace_supersets.json` are byte-unchanged in this cut, so no processor kind or transform op was added, removed or re-typed. The only change in `supersets.rs` is a `DELETED_PENDING_REVENDOR` entry for the deleted `is_attestation_ladder_dimension` citation. The registry itself carries no processor column.
 
 **Family diff** (`python3 scripts/manifest_diff.py ea14c27f <tag>`; committed so the next re-vendor reruns it):
 
