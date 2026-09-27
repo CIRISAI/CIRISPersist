@@ -1306,6 +1306,56 @@ pub(crate) mod bodies {
         assert!(cc::resolve_community(d, CANON).await.unwrap().is_some());
     }
 
+    /// (r) — #925's NODE-BEARING half, apart from the `user` half: a
+    /// `user,steward` founder that becomes an agreed occurrence of a `node`
+    /// identity (the identity claims it, the occurrence signs its own
+    /// agreement) stops counting. A Rooted row, its standing already cached,
+    /// reads Stalled naming that founder (the cache key carries the
+    /// node-bearing inputs); and a birth naming such a founder is refused at
+    /// the door.
+    pub async fn r_a_founder_turned_node_bearing(d: &dyn FederationDirectory) {
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, "oc-steward", "user,steward").await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        ts::register_hybrid_key_as(d, "oc-node-id", "oc-node-id", identity_type::NODE).await;
+        let t = chrono::Utc::now() - chrono::Duration::seconds(2);
+        for (signer, occ, when) in [
+            ("oc-node-id", FOUNDERS[2], t),
+            (FOUNDERS[2], FOUNDERS[2], t + chrono::Duration::seconds(1)),
+            ("oc-node-id", "oc-steward", t),
+            ("oc-steward", "oc-steward", t + chrono::Duration::seconds(1)),
+        ] {
+            d.put_identity_occurrence(
+                ts::signed_content_only_occurrence(signer, "oc-node-id", occ, when).await,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("occurrence row by {signer}: {e}"));
+        }
+        match cc::stored_standing(d, CANON).await.unwrap() {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains(FOUNDERS[2]), "{reason}")
+            }
+            other => panic!("a founder turned node-bearing stalls the row: {other:?}"),
+        }
+        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+        let mut rebirth = canonical_row(&[FOUNDERS[0], FOUNDERS[1], "oc-steward"]);
+        rebirth.founded_at = at("2026-09-25T00:00:00Z");
+        let e = d
+            .put_community(signed(rebirth, &["A1", "B1"]))
+            .await
+            .expect_err("a founder that is an occurrence of a node is refused");
+        assert_violation(
+            &e,
+            crate::federation::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
+        );
+    }
+
     /// (o′) — MEDIUM-R: a founder cannot BACKDATE a resignation past a link
     /// they co-signed. F2 co-signs v2; a resignation dated between the birth
     /// and v2's `amended_at` is refused at the plane door with the typed
@@ -1524,6 +1574,39 @@ pub(crate) mod bodies {
             cc::StoredStanding::NotRooted { .. }
         ));
         assert!(cc::resolve_community(d, OTHER).await.unwrap().is_none());
+        // A row kept as data amends by the ordinary folded quorum: one founder
+        // of its `quorum:2/3` cannot turn it into a plain room.
+        let mut plain = d.lookup_community(OTHER).await.unwrap().unwrap();
+        plain.policy_blob = None;
+        let ids: Vec<String> = plain.members.iter().map(|m| m.key_id.clone()).collect();
+        let change = d
+            .build_membership_change_envelope(
+                crate::federation::cohort::Cohort::Community,
+                OTHER,
+                &ids,
+                false,
+                Some(&plain.consensus_protocol),
+            )
+            .await
+            .unwrap();
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        assert!(
+            d.supersede_community_with_quorum(
+                ts::sign_community(FOUNDERS[0], plain),
+                change,
+                vec![ts::threshold_sign(FOUNDERS[0], &bytes)],
+            )
+            .await
+            .is_err(),
+            "a NotRooted constraint row keeps the generic quorum on the local door"
+        );
+        assert!(d
+            .lookup_community(OTHER)
+            .await
+            .unwrap()
+            .unwrap()
+            .policy_blob
+            .is_some());
     }
 
     /// (p) — MEDIUM-W: a withdrawal's instant is the accord proposal's SIGNED
@@ -2261,6 +2344,14 @@ mod run {
                 async fn i190_o2() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::o2_a_backdated_resignation_is_refused(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_r() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::r_a_founder_turned_node_bearing(
                         &d as &dyn FederationDirectory,
                     )
                     .await
