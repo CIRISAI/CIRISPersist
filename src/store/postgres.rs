@@ -37643,8 +37643,11 @@ mod tests {
                     community_name: "ob-test".into(),
                     members,
                     founded_at: now,
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
+                    consensus_protocol:
+                        crate::federation::tier_ingest::test_support::fixture_protocol(
+                            policy.as_ref(),
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        ),
                     policy_blob: policy,
                     persist_row_hash: String::new(),
                 },

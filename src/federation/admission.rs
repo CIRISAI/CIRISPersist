@@ -7322,7 +7322,7 @@ async fn scoped_delegation_reach_at(
 /// v50.0.0 (CIRISPersist#928) — the `bool` projection of
 /// [`consent_revocation_reach`], which the admission gate reads for its
 /// beyond-cap signal.
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) async fn issuer_reaches_target_via_consent_revocation_delegation(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
