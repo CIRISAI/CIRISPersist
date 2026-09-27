@@ -398,3 +398,36 @@ Lane (`--features sqlite,postgres --lib` under `scripts/pg_test_db.sh`, `-j 3`):
 | M17 | `authority_for` reserved-stem fallback removed | KILLED (1) | lookup_resolves |
 
 17/17 killed on the final tree; three needed a witness written first.
+
+### 10.6 For adopters at the tag (computed from the vendored files)
+
+**Constants.** `VENDORED_N_FAMILIES` 116 → **145**. `VENDORED_CC_VERSION` stays `1.0-rc5`. `VENDORED_SOURCE_SHA256` `87aede50…b9a9f5` → `f05682512c85c65c3f502e1ca81dfb032a6e6d24ab4206658fbf36ccaa702a75`. New: `VENDORED_REGISTRY_SHA256 = d6c87945ea08d72cc1f83820e35f0e3fb72cce47ea49f2ed3321d43219642ea6`, `VENDORED_CC_COMMIT = 4b624513458f2c9b236caf289dc2cd62aa048c24`. `supersets::VENDORED_MANIFEST_VERSION` stays **`0.3.0`**: it versions the supersets walk (`namespace_supersets.json`), which this cut did not re-vendor. Its seed pin (`VENDORED_SEED_REGISTRY_SHA256`) still names the rc2 registry, and that lag is declared.
+
+**Field-processor matrix and transform algebra: no shape change.** `TRANSFORM_ALGEBRA_HASH` is `b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b` at `ea14c27f` and at the tag. `transform_algebra_hash_is_pinned` recomputes it and passed in both full lanes. `transform.rs` and `namespace_supersets.json` are byte-unchanged in this cut, so no processor kind or transform op was added, removed or re-typed. The only change in `supersets.rs` is a `DELETED_PENDING_REVENDOR` entry for the deleted `is_attestation_ladder_dimension` citation. The registry itself carries no processor column.
+
+**Family diff** (`python3 scripts/manifest_diff.py ea14c27f <tag>`; committed so the next re-vendor reruns it):
+
+- **(a) Added: 30** (net +29). `accord:human_dignity`, `accord:invoke:constitutional:{halt_id}`, `accord:invoke:drill:{drill_id}`, `accord:invoke:notify:{notify_id}`, `accord:lifecycle`, `accord:lifecycle:active`, `age_self_declared:band:{band}:{version}`, `audio:*`, `blog:*`, `chat:*`, `consent:decay:{stage}`, `consent:deletion_complete`, `consent:deletion_sla:{days}`, `consent:partnership_accept`, `consent:partnership_grant`, `consent:replication:{version}`, `consent:scope:{kind}`, `consent:state:{stance}`, `consent:stream:{kind}`, `encyclopedia:*`, `event:attendance`, `event:lifecycle:{state}`, `event:rsvp_count`, `film:*`, `identity:canonical_binding:{canonical_hash}`, `image:*`, `model_3d:*`, `news:*`, `topical_relation:{kind}`, `video:*`.
+- **(b) Removed or renamed: 1.** `age_self_declared:{band}:{version}` was renamed to `age_self_declared:band:{band}:{version}`. CC's generator lists it in `RETIRED_FAMILIES`, and persist's `RETIRED_FAMILIES` does too.
+- **(c) Existing families that changed: 23.**
+  - **Variadic wildcards:** `variadic: true` added on the `*` segment of `accord:*`, `dma:csdma:*`, `dma:dsdma:{domain}:*`, `dma:idma:*`, `dma:pdma:*` and `system:*`.
+  - **Leaves:** the same six families gained `leaves` / `leaves_closed`. Only `accord:*` is closed, with the six leaves above. The dma and system families carry `[]` / `false`.
+  - **Closed enumerations:** `age_assurance:{level}:{band}:{version}` `{level}` ∈ {provider, government} and `{band}` ∈ {minor, adult, under_13, 13_15, 16_17}; `hardware_custody:{platform}` ∈ the 13 `HardwareType` tokens.
+  - **Open enumerations** (canonical values only):
+    - `benchmark:he300:…` `{version}` {v1.0, v1.1, v1.2}
+    - `detection:distributive:access:{resource_type}` {compute}
+    - `fidelity:explainability_sla:{tier}` {l1_summary, l2_reasoning_trace, l3_full_dma_chain, l4_attested_chain}
+    - `goal:{scale}` {self}
+    - `locality:decision:{scale}` {local, regional, national, federation}
+    - `moderation:{allegation_type}` {rogue_vote}
+    - `multilateral_participation:{forum}:{kind}` {membership, voting, proposal_filing, observer_status}
+    - `regime:{artifact}:{version}` {manifest}
+  - **Patterns and standards:**
+    - `bond_posted:{currency}` `^[A-Z]{3}$` (ISO 4217)
+    - `provenance:build_manifest:{target}:locale:{lang_code}` (BCP 47 pattern)
+    - `transparency_log:cosigned:{tree_size}` `^[0-9]+$`
+    - `content_rating:{scheme}:{rating}` (standard named, no pattern)
+  - **`multi` placeholders:** `detection:correlated_action:{axis}`, `provenance:skill_import:{source}`.
+  - **Reserved rules:** `licensure:{authority_id}` went `reserved: true` (co-stewarded, CC 3.4.9) → `false`, with no rule. `session:{kind}`'s rule went `substrate-self-report` (CC 3.4.3) → `occurrence-self-report` (CC 3.1.3.1).
+  - **Prose only** (on top of the grammar changes above): `age_assurance`, `benchmark:he300` and `hardware_custody` descriptions.
+- **(d) `_meta.case_rule` gained** `external_standards`, `refusal_tokens`, `reserved_stems`, `version_segment` and `wildcard_rule`; `classes` and `placeholder_classes` changed. `reserved_stems` has six stems of `kind: reserved` (`accord:`, `transparency_log:cosigned:`, `detection:`, `capacity:`, `age_assurance:`, `capacity_assurance:`) and one of `kind: gated` (`age_self_declared:`). `version_segment` is: pattern `^v[0-9]+(\.[0-9]+)*$`, trailing, required, and exempt for the five attestation-ladder families plus `identity:canonical_binding:{canonical_hash}`. `_meta` also gained `registry_sha256`, and `n_families` / `per_component` moved.
