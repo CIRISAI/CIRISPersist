@@ -15576,6 +15576,34 @@ mod tests {
     /// manifest, with the manifest's `exempt` list as the only carve-outs.
     /// The v49 byte scan admitted a `:vN` anywhere (`...:v2:rights_asymmetry`)
     /// and knew nothing of dotted versions; both answers flip here.
+    /// v50.0.0 (CIRISPersist#924) — `parse_canonical_binding_hash` goes
+    /// through the one matcher: only CC's `identity:canonical_binding:{64
+    /// lowercase hex}` (an optional version tail tolerated) yields a hash; the
+    /// pre-v50 key-id spelling, uppercase, a short digest and trailing junk do
+    /// not (mutation M15 of the #924 round survived without this).
+    #[test]
+    fn canonical_binding_parse_goes_through_the_matcher_924() {
+        let h = "ab".repeat(32);
+        assert_eq!(
+            parse_canonical_binding_hash(&format!("identity:canonical_binding:{h}")),
+            Some(h.as_str())
+        );
+        assert_eq!(
+            parse_canonical_binding_hash(&format!("identity:canonical_binding:{h}:v1")),
+            Some(h.as_str()),
+            "the family is version-exempt, not version-forbidden"
+        );
+        for bad in [
+            format!("identity:canonical_binding:canonical:sha256:{h}"),
+            format!("identity:canonical_binding:{}", h.to_uppercase()),
+            "identity:canonical_binding:abcd".to_owned(),
+            format!("identity:canonical_binding:{h}:junk"),
+            "identity:canonical_binding:".to_owned(),
+        ] {
+            assert_eq!(parse_canonical_binding_hash(&bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn version_segment_is_trailing_and_read_from_the_manifest() {
         let policy = DimensionAdmissionPolicy::default();
