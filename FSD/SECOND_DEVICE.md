@@ -333,6 +333,11 @@ Three small CC 1.0-rc5 adopts (CIRISConstitution PR #113, read at its head `4b62
 - `node`-bearing (`federation::is_node_bearing_key`): the key's own `federation_keys` set contains `node`, or it is an ACTIVE occurrence of an identity whose set does (`active_identities_for_occurrence`).
 - Admission (`admission::check_infrastructure_founders_not_node`, rule `node_bearing_founder`): at `put_community` on all three backends, at the supersede door (`group_amendment::supersede_community_signed`, so `supersede_community` / `supersede_community_with_quorum` / `supersede_affiliations`), and at `put_community_membership_widening` on all three backends (a widening that seats a founder is the supersede of the CC 3.2 ceremony). The replicated amendment route is covered because `put_community` runs the check on the offered record before `route_occupied_community`.
 - Fold: `consensus::Seat` gains `node_bearing`; `consensus::eligible` drops a node-bearing seat in an `infrastructure` group whatever its role tag, so it neither votes nor counts in the denominator. The evaluator stays pure: the set is resolved from the roster reads (`federation::community_node_bearing_seats`, over the record's members and every widened member, only for an `infrastructure` community) and threaded in through `RosterRules::node_bearing` (`RosterRules::of_community(c, &nodes)` requires it, so no caller can forget it) and through `verify_membership_quorum`'s seat builder.
+- Agreement (review H1). The occurrence gate admits a row whose signer is the IDENTITY itself (`check_signer_acts_for`), so the occurrence never has to consent. The first cut counted every active occurrence binding, which let any registered `node` key N sign `{identity: N, occurrence: H}` for a human founder H and strip H's vote in every infrastructure fold and every replay.
+  - `is_node_bearing_key` now counts an occurrence binding only when the occurrence AGREED (`federation::occurrence_agreed_to`): either a stored signed occurrence row for the pair whose signer is the occurrence, or the occurrence's own live owner-binding naming the identity (`owner_of`).
+  - A trusted-local (unsigned) row carries no agreement.
+  - **Follow-up:** #873's principal resolver (`active_identities_for_occurrence`, used by the hold-side audience and write-side principal resolution) has the same unilateral-claim shape. It is left for a follow-up issue, not changed here.
+  - Witness: `identity_claim_alone_is_not_node_bearing_founder`.
 - Clause A (`register::check_node_identity_exclusive`): run by every backend's `put_public_key` right after `validate_registration_pubkey`, so every mint (`register_federation_key` verifies, then stores through `put_public_key`) and every replicated `Insert` runs it. Typed refusal `Error::NodeIdentityNotExclusive` (`federation_node_identity_not_exclusive`, Python `ValueError`).
 - Refusal type: `Error::CommunityConsensusProtocolViolation { community_key_id, rule, detail }`, `kind()` `federation_community_consensus_protocol_violation`, Display beginning `hard_case:community_consensus_protocol_violation:{community_key_id}`, Python `ValueError`.
 
@@ -344,7 +349,7 @@ Three small CC 1.0-rc5 adopts (CIRISConstitution PR #113, read at its head `4b62
 
 **Confirmed.** The code matches the text: `family_quorum_over` derives the family from the verified scrub set against this node's own rosters (no granter-declared field), and `check_family_charter_admission` refuses a charter naming a family that does not carry its quorum. The one observable divergence is the wire: `TrustedGrant::conferral_plane` serializes three values. `ConferralPlane` now documents the mapping (`Delegation` → delegation; `AccordCoScrub` → ceremony, shipped instance; `FamilyQuorum` → **ceremony plane, family form**). No rename.
 
-**Built.** `admission::check_infrastructure_consensus_protocol` (rule `protocol_not_quorum_m_of_n`): an `infrastructure` community whose protocol is not `quorum:M/N` (`founder_only`, `unanimous`, bare `majority`, `weighted:`, `custom:`, `reverse_quorum:`) is refused at `put_community` and at the supersede door, not evaluated. `family_charter_threshold`'s floors stay (they are the family plane's reading) and its doc points at the new refusal. Witness: `infrastructure_protocol_must_be_quorum` (memory, sqlite, postgres; each non-conformant form refused and not stored, the same form admitted outside `infrastructure`, and a supersede to `majority` refused).
+**Built.** `admission::check_infrastructure_consensus_protocol` (rule `protocol_not_quorum_m_of_n`): an `infrastructure` community whose protocol is not `quorum:M/N` with `1 ≤ M ≤ N` (review M1: `quorum:0/N` parses but admits a change no founder signed) (`founder_only`, `unanimous`, bare `majority`, `weighted:`, `custom:`, `reverse_quorum:`) is refused at `put_community` and at the supersede door, not evaluated. `family_charter_threshold`'s floors stay (they are the family plane's reading) and its doc points at the new refusal. Witness: `infrastructure_protocol_must_be_quorum` (memory, sqlite, postgres; each non-conformant form refused and not stored, the same form admitted outside `infrastructure`, and a supersede to `majority` refused).
 
 ### 8.3 #928 — a 5-hop delegation default; 16 stays the ceiling (CC 4.1.1 rc5)
 
@@ -378,9 +383,25 @@ The exact-count pin in `evidence_cc_impl_rows_pin_the_current_crate_version` mov
 3. **Keyed on the label.** Both conformance gates fire on `cohort_subkind: infrastructure` whether or not the community is *authorized* (`is_authorized_infrastructure_community`). An unauthorized label gets the stricter treatment everywhere else, and a conformance rule that an unauthorized label could skip would be the weaker one.
 4. **The widening door checks only the founder rule.** A widening is not a protocol change. A pre-gate stored infrastructure community with a non-`quorum:` protocol keeps admitting widenings under the protocol it stored. It is refused the next time its record is put or superseded.
 5. **The fold judges node-bearing now, not at the event's instant.** Seats are resolved from the current key record and current active occurrences. A key that becomes node-bearing later (bound as an occurrence of a `node` identity) loses its vote in every replay. Roster events it alone admitted then stop standing, as the ruling's "drop such a seat" reads. `node_founder_seat_does_not_vote` exercises exactly that transition.
-6. **Clause A runs only where a key is minted.** That is `put_public_key`, which also covers the replicated `Insert`. It does not run in `verify_key_registration` or in the replicated upgrade, rebind or supersede arms over an existing row: those mint nothing, and a pre-gate fused key is Clause B's to gate. The Clause B witnesses (`hybrid_node_agent_key_still_refuses_agency_773`, `node_agent_hybrid_carries_agency_admitted{,_sqlite}`, `pg_node_agency_duplicate_identity_type_token`) now plant their fused key below the door, because the door now refuses to mint it.
+6. **Clause A runs on every door that writes `identity_type`** (corrected after review H3; the first cut ran it only at `put_public_key`). The doors are:
+   - `put_public_key`: every mint and every replicated `Insert`.
+   - `adopt_scrub_upgrade`: the replicated `Upgrade` arm, which CAN change `identity_type`.
+   - `supersede_canonical_record`: the replicated `Supersede` arm.
+   - `adopt_genesis_reanchor`.
+   - `seed_genesis_accord_holders`.
+   - The rebind door (`register::prepare_rebind`).
+
+   It is not in `verify_key_registration`: every door above runs it. A pre-gate fused key is refused any rewrite of its record (it re-mints), and Clause B still gates it where it sits. The Clause B witnesses (`hybrid_node_agent_key_still_refuses_agency_773`, `node_agent_hybrid_carries_agency_admitted{,_sqlite}`, `pg_node_agency_duplicate_identity_type_token`) now plant their fused key below the door, because the door now refuses to mint it. The upgrade and supersede doors are witnessed by `clause_a_on_the_rewrite_doors_{sqlite,postgres}`.
 7. **"Infrastructure family" is not representable.** A `Family` has no `cohort_subkind`, so #927's refusal is on communities. `family_quorum_over` gains no identity filter: #925 is scoped to `infrastructure` communities.
-8. **The withdraws gate now walks 5 hops.** Before, a proxy chain of 6 to 16 hops admitted a `withdraws`; now it does not. The refusal says why (`beyond_delegation_depth_cap: true`). Nothing in the full lanes depended on the deeper reach.
+8. **The withdraws WRITE gate walks 5 hops. A stored row keeps the depth it was admitted under** (review H2, ruled: v49's "past actions validly decided stand").
+   - **The write gate** (`check_withdraws_admission` → `resolve_withdraws_admission_rule`, which uses the new `_at` forms) takes the CC 4.1.1 default. A NEW withdraws over a 6-to-16-hop proxy chain is refused with `beyond_delegation_depth_cap: true`.
+   - **Why the stored rule is not simply read.** The bytes-plane fold (`blob_tombstone::retiring_composer`) re-derives every stored withdraws at read time. It must: #853 ruled "re-derive, never read the stored rule", so a proxy edge withdrawn since stops the retirement.
+   - **So it re-derives at the depth ceiling, `MAX_WITHDRAWS_DELEGATION_DEPTH` (16),** the walk every pre-v50 row was admitted under, not at the new default. A withdraws validly decided before v50 keeps retiring its bytes, and the attestation-plane fold keeps honouring the stored `withdraws_admission_rule` (arm 3) as before.
+   - **Deviation from the literal ask.** The ruling says "honour the STORED admission rule/depth". No depth is stored per row, so the fold uses the ceiling that bounds every depth a stored row could have used. It keeps #853's liveness.
+   - Witness: `withdraws_admitted_under_the_old_depth_still_retires` (memory, sqlite, postgres).
+     - Its stored row is admitted by the deferred arm: its target is absent at admission, which is the read-time position of any pre-v50 row. It is not planted below the door with a rule recorded. The fold ignores the stored rule, so the two are equivalent for this fold.
+     - It then shows a NEW 6-hop withdraws refused at admission.
+   - **Mixed-fleet divergence (stated, until the fleet upgrades):** a v49 node admits a 6-to-16-hop withdraws that a v50 node refuses at its replicated door. The two nodes then disagree about that row until the v49 node upgrades. The v50 node never stores the row, so the bytes it withdraws stay live there. This belongs in the release note.
 9. **Fixtures.** Infrastructure community fixtures in memory, sqlite, postgres and `community_dek` declared `majority` / `founder_only` and now declare `quorum:1/1`, through `tier_ingest::test_support::fixture_protocol`.
 
 ### 8.6 Mutation table
@@ -401,3 +422,25 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
 | M9 | occurrence resolution dropped from `is_node_bearing_key` | 6 | `node_key_cannot_be_infrastructure_founder` ×3 (1b); `node_founder_seat_does_not_vote` ×3 |
 | M10 | withdraws gate walks at the ceiling (16) | 3 | `withdraws_walk_depth_defaults_to_five_hops` ×3 |
 | M11 | sqlite widening door unguarded | 1 | `node_key_cannot_be_infrastructure_founder` sqlite (4) |
+
+**Round 2 (after review H1/H2/H3/M1), committed tree `a318d27d`.** Same lane. Baseline 141/141, postgres legs against a database. Mutants now come from a uniquely named script (`rc5s_mut.py`) with a clean-tree assertion. **17/17 killed**, none OOM-killed.
+
+| # | Mutant | Failed | Killed by |
+|---|---|---|---|
+| N1 | H1 agreement check dropped (any active binding counts) | 3 | `identity_claim_alone_is_not_node_bearing_founder` ×3 |
+| N2 | H2 bytes-plane re-derivation at the new default | 3 | `withdraws_admitted_under_the_old_depth_still_retires` ×3 |
+| N3 | H3 Clause A dropped from sqlite `adopt_scrub_upgrade` | 1 | `clause_a_on_the_rewrite_doors_sqlite` |
+| N4 | H3 Clause A dropped from postgres `supersede_canonical_record` | 1 | `clause_a_on_the_rewrite_doors_postgres` |
+| N5 | M1 `quorum:0/N` conformant again | 3 | `infrastructure_protocol_must_be_quorum` ×3 |
+| M1 | node founder counted | 4 | consensus unit; `node_founder_seat_does_not_vote` ×3 |
+| M2 | Clause A refusal dropped | 6 | `clause_a_fused_key_is_not_minted` ×3; memory unit; `clause_a_on_the_rewrite_doors` ×2 |
+| M3 | infra protocol floored | 3 | `infrastructure_protocol_must_be_quorum` ×3 |
+| M4 | default depth 16 | 12 | the four depth witnesses ×3 |
+| M5a | graph over-cap as `WithinCap` | 3 | `delegation_graph_defaults_to_five_hops` ×3 |
+| M5b | scoped walk never records `beyond_cap` | 9 | withdraws, moderation and old-depth witnesses ×3 |
+| M6 | moderation default decoupled | 3 | `moderation_walk_depth_defaults_to_five_hops` ×3 |
+| M7 | identity-type thread dropped | 3 | `node_founder_seat_does_not_vote` ×3 |
+| M8 | supersede path unguarded | 6 | founder and protocol witnesses ×3 each |
+| M9 | occurrence resolution dropped | 9 | founder, fold-vector and H1 witnesses ×3 each |
+| M10 | withdraws WRITE gate at the ceiling | 3 | `withdraws_admitted_under_the_old_depth_still_retires` ×3 (the new-withdraws refusal) |
+| M11 | sqlite widening door unguarded | 1 | `node_key_cannot_be_infrastructure_founder` sqlite |
