@@ -16888,6 +16888,41 @@ mod tests {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112 ask 2) — **every
+    /// reserved-rule prefix in code is a manifest leaf, byte for byte.**
+    ///
+    /// `default_reserved_prefix_rules` and `HARD_CODED_RESERVED_STEMS` are
+    /// hand-spelled `starts_with` prefixes. A prefix spelled differently from
+    /// the registry (a case slip, `detection:distributive_access:`, a stem CC
+    /// renamed) gates NOTHING — every conformant dimension misses it — and no
+    /// other test would notice, because the rule still "works" on its own
+    /// fixture. So each must be a run of literal segments some registry family
+    /// starts with (or a CC `_meta.case_rule.reserved_stems` stem).
+    #[test]
+    fn reserved_prefix_rules_match_manifest_leaves() {
+        use crate::federation::namespace::matcher::{is_literal_family_prefix, reserved_stems};
+        let prefixes: Vec<String> = default_reserved_prefix_rules()
+            .into_iter()
+            .map(|r| r.pattern_prefix)
+            .chain(HARD_CODED_RESERVED_STEMS.iter().map(|s| (*s).to_owned()))
+            .collect();
+        assert!(prefixes.len() >= 10, "vacuous: {prefixes:?}");
+        let stems: Vec<&str> = reserved_stems().collect();
+        let bad: Vec<&String> = prefixes
+            .iter()
+            .filter(|p| !is_literal_family_prefix(p) && !stems.contains(&p.as_str()))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "reserved-rule prefix(es) {bad:?} are not a literal leaf of any vendored family nor \
+             a CC reserved stem — a rule spelled off the registry gates nothing"
+        );
+        // And the check bites: a near-miss spelling is not a leaf.
+        assert!(!is_literal_family_prefix("detection:distributive_access:"));
+        assert!(!is_literal_family_prefix("Detection:"));
+        assert!(!is_literal_family_prefix("detection:correlated_action"));
+    }
+
     /// v50.0.0 (CIRISPersist#924) — the CC-text-but-no-row carve-out is
     /// self-deleting and exact: each prefix is STILL refused
     /// `namespace_family_unregistered` by the one matcher (so the line is

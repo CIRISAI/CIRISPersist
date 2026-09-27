@@ -1307,5 +1307,280 @@ mod tests {
             .filter(|c| !carried.contains(**c))
             .collect();
         assert!(stale.is_empty(), "stale column pin(s): {stale:?}");
+
+        // v50.0.0 (CIRISPersist#924, CIRISConstitution#112 ask 2) — the same
+        // accounting over `_meta`, `_meta.case_rule`, its `version_segment`,
+        // and the per-segment keys. rc5 moved the GRAMMAR into these; an
+        // unread key there is a rule the substrate silently ignores.
+        let meta = &manifest["_meta"];
+        let cr = &meta["case_rule"];
+        account(
+            "_meta",
+            meta,
+            &[
+                (
+                    "cc_version",
+                    "RawMeta::cc_version (VENDORED_CC_VERSION drift gate)",
+                ),
+                (
+                    "source_sha256",
+                    "RawMeta::source_sha256 (VENDORED_SOURCE_SHA256)",
+                ),
+                (
+                    "n_families",
+                    "RawMeta::n_families (the #590 self-consistency gate)",
+                ),
+                (
+                    "private_use_prefix",
+                    "RawMeta::private_use_prefix + matcher::parse_rules",
+                ),
+                (
+                    "case_rule",
+                    "matcher::parse_rules (the grammar) — accounted key by key below",
+                ),
+                (
+                    "registry_sha256",
+                    "tests::vendored_registry_sha256_pins_the_cc_file (VENDORED_REGISTRY_SHA256)",
+                ),
+            ],
+            &[
+                (
+                    "generator",
+                    "provenance of the CC build tool; the bytes it produced are pinned by \
+                     registry_sha256, so naming the tool adds nothing enforceable",
+                ),
+                (
+                    "source",
+                    "the CC source path the rows were generated from; the source bytes are \
+                     pinned by source_sha256 and the grammar by registry_sha256",
+                ),
+                (
+                    "n_components",
+                    "a count of owning_component slugs — a CC-side summary with no rule \
+                     attached; persist keys nothing on component counts",
+                ),
+                (
+                    "n_components_normative",
+                    "the normative subset of n_components — a CC-side summary persist does not \
+                     key on; normativity of a FAMILY rides its rows, not this count",
+                ),
+                (
+                    "per_component",
+                    "per-component family counts — CC's own bookkeeping; the family set itself \
+                     is pinned row by row in VENDORED_FAMILY_PREFIXES",
+                ),
+                (
+                    "components_outside_normative",
+                    "which owning components are non-normative (cirisbench) — informational; \
+                     no admission rule reads a component's normativity",
+                ),
+            ],
+        );
+        account(
+            "_meta.case_rule",
+            cr,
+            &[
+                ("vocab_pattern", "matcher::parse_rules -> Rules::vocab"),
+                (
+                    "refusal_tokens",
+                    "matcher::parse_rules -> Rules::tokens (Refusal::as_str)",
+                ),
+                (
+                    "reserved_stems",
+                    "matcher::parse_rules -> reserved_stems / reserved_stem_rules",
+                ),
+                (
+                    "version_segment",
+                    "matcher::parse_rules -> version / exempt / version_required",
+                ),
+                (
+                    "external_standards",
+                    "matcher::parse_rules -> Rules::external",
+                ),
+                (
+                    "literal_pattern",
+                    "tests::every_literal_segment_matches_the_literal_pattern (a CC build gate, \
+                     re-checked here; literals themselves compare by byte equality)",
+                ),
+                (
+                    "refusal_token",
+                    "tests::the_singular_refusal_token_is_the_case_malformed_token (the pre-rc5 \
+                     key, pinned equal to refusal_tokens.case_malformed)",
+                ),
+                (
+                    "wildcard_rule",
+                    "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements",
+                ),
+            ],
+            &[
+                (
+                    "cc_ref",
+                    "the CC clause citation for the rule block (CC 3.1.7 R3) — a citation, not \
+                     a rule; the FSD and evidence rows cite it",
+                ),
+                (
+                    "classes",
+                    "prose glosses of the six segment classes; the classes themselves are read \
+                     per segment from families[].segments[].class",
+                ),
+                (
+                    "compare",
+                    "prose (\"byte-exact; consumers MUST NOT case-fold\") — the matcher's \
+                     byte-exact compare IS this rule, replayed by the 785 vectors",
+                ),
+                (
+                    "placeholder_classes",
+                    "the generator's INPUT table; its output is copied onto every segment's \
+                     class, which is what the matcher reads — reading both would be two \
+                     spellings of one fact",
+                ),
+                (
+                    "policy",
+                    "a one-line prose summary of the case policy; every clause of it is a key \
+                     the matcher reads",
+                ),
+            ],
+        );
+        account(
+            "_meta.case_rule.version_segment",
+            &cr["version_segment"],
+            &[
+                (
+                    "pattern",
+                    "matcher::parse_rules -> Rules::version (is_version_segment)",
+                ),
+                (
+                    "exempt",
+                    "matcher::parse_rules -> Rules::exempt (is_version_exempt)",
+                ),
+                (
+                    "required",
+                    "matcher::parse_rules -> Rules::version_required",
+                ),
+                (
+                    "position",
+                    "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements pins \
+                     it `trailing` (matcher::trailing_version)",
+                ),
+            ],
+            &[(
+                "note",
+                "the prose statement of the rule the other four keys carry as data",
+            )],
+        );
+        let mut seg_keys = serde_json::Map::new();
+        for fam in manifest["families"].as_array().unwrap() {
+            for seg in fam["segments"].as_array().unwrap() {
+                for (k, v) in seg.as_object().unwrap() {
+                    seg_keys.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        account(
+            "families[].segments[]",
+            &serde_json::Value::Object(seg_keys),
+            &[
+                ("segment", "RawSegment::segment + matcher::parse_rules"),
+                ("class", "RawSegment::class + matcher::parse_rules"),
+                ("pattern", "matcher::parse_rules -> Seg::pattern"),
+                (
+                    "values",
+                    "matcher::parse_rules -> Seg::values (closed enumerations)",
+                ),
+                ("open", "matcher::parse_rules -> Seg::open"),
+                ("multi", "matcher::parse_rules -> Seg::multi"),
+                (
+                    "variadic",
+                    "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements (every \
+                     wildcard segment carries variadic: true)",
+                ),
+            ],
+            &[(
+                "standard",
+                "the NAME of the outside standard an external segment follows (ISO 4217) — \
+                 prose; the enforceable part is its pattern, which the matcher reads",
+            )],
+        );
+
+        fn account(
+            what: &str,
+            obj: &serde_json::Value,
+            read: &[(&str, &str)],
+            inert: &[(&str, &str)],
+        ) {
+            for (_, why) in inert {
+                assert!(
+                    why.len() > 40,
+                    "a rationale under 40 chars is a shrug: {why:?}"
+                );
+            }
+            let carried: std::collections::BTreeSet<&str> = obj
+                .as_object()
+                .unwrap_or_else(|| panic!("{what} is not an object"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let accounted: std::collections::BTreeSet<&str> =
+                read.iter().chain(inert).map(|(k, _)| *k).collect();
+            let unaccounted: Vec<&&str> = carried.difference(&accounted).collect();
+            assert!(
+                unaccounted.is_empty(),
+                "{what} carries key(s) nothing reads and nobody has declared inert: \
+                 {unaccounted:?} (#724 / #924)"
+            );
+            let stale: Vec<&&str> = accounted.difference(&carried).collect();
+            assert!(stale.is_empty(), "{what}: stale key pin(s) {stale:?}");
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#924) — CC build-gates every literal stem against
+    /// `_meta.case_rule.literal_pattern`; persist re-checks it on the vendored
+    /// bytes, because the matcher compares literals by equality and would
+    /// silently carry a miscased stem.
+    #[test]
+    fn every_literal_segment_matches_the_literal_pattern() {
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let pat = regex::Regex::new(
+            root["_meta"]["case_rule"]["literal_pattern"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        for e in entries() {
+            for (seg, class) in &e.segments {
+                if *class == SegmentClass::Literal {
+                    assert!(pat.is_match(seg), "{}: literal {seg:?}", e.prefix);
+                }
+            }
+        }
+    }
+
+    /// The pre-rc5 singular `refusal_token` must still name the case token.
+    #[test]
+    fn the_singular_refusal_token_is_the_case_malformed_token() {
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let cr = &root["_meta"]["case_rule"];
+        assert_eq!(cr["refusal_token"], cr["refusal_tokens"]["case_malformed"]);
+    }
+
+    /// The matcher implements a VARIADIC trailing `*` and a TRAILING version
+    /// segment; the manifest says so in data, and this pins the two together.
+    #[test]
+    fn the_wildcard_rule_is_the_variadic_one_the_matcher_implements() {
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let cr = &root["_meta"]["case_rule"];
+        assert_eq!(cr["wildcard_rule"]["match"], "one_or_more_segments");
+        assert_eq!(cr["version_segment"]["position"], "trailing");
+        let mut wildcards = 0;
+        for fam in root["families"].as_array().unwrap() {
+            for seg in fam["segments"].as_array().unwrap() {
+                if seg["class"] == "wildcard" {
+                    wildcards += 1;
+                    assert_eq!(seg["variadic"], true, "{}", fam["prefix"]);
+                    assert_eq!(seg["segment"], "*");
+                }
+            }
+        }
+        assert!(wildcards >= 10, "vacuous: {wildcards}");
     }
 }

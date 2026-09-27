@@ -824,6 +824,26 @@ pub(crate) fn sample_dimension(family: &str) -> Option<String> {
     Some(out.join(":"))
 }
 
+/// Is `prefix` (ending in `:`) a run of LITERAL segments that some registry
+/// family starts with, byte for byte — `"detection:distributive:access:"` for
+/// `detection:distributive:access:{resource_type}`, `"system:"` for
+/// `system:*`? The spelling check a hand-written reserved-rule prefix must
+/// pass (`reserved_prefix_rules_match_manifest_leaves`).
+#[must_use]
+pub fn is_literal_family_prefix(prefix: &str) -> bool {
+    let Some(body) = prefix.strip_suffix(':') else {
+        return false;
+    };
+    let want: Vec<&str> = body.split(':').collect();
+    rules().families.iter().any(|f| {
+        f.segments.len() > want.len()
+            && f.segments
+                .iter()
+                .zip(&want)
+                .all(|(s, w)| s.class == Class::Literal && s.segment == *w)
+    })
+}
+
 /// Refusal lookup by its wire token (the inverse of [`Refusal::as_str`]).
 #[must_use]
 pub fn refusal_from_token(token: &str) -> Option<Refusal> {
