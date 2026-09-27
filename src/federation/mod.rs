@@ -150,7 +150,10 @@ mod android_custody_invariants;
 #[cfg(all(test, feature = "encrypted-kv"))]
 mod mls_state_root_invariants;
 // v50.0.0 (CIRISPersist#916) — I188, a member's new device gets what the member holds.
-#[cfg(test)]
+// sqlite and postgres only: the memory backend has no community DEK plane, so a
+// build with neither feature (the `server` axis) has no runner and the bodies
+// would be dead code under `-D warnings`.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod device_readd_invariants;
 // v50.0.0 (CIRISPersist#917) — I189, the attributed sync door's typed outcome.
 #[cfg(test)]
