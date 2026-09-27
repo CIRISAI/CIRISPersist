@@ -410,11 +410,30 @@ pub fn grant_attestation_prefixes(envelope: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// True iff any of `prefixes` is a `str::starts_with` prefix of
-/// `dimension` — i.e. the grant covers `dimension`.
+/// True iff the grant covers `dimension`: the dimension resolves under the CC
+/// 3.1.7 R3 grammar WITHOUT a refusal, and one of `prefixes` is a
+/// `str::starts_with` prefix of it.
+///
+/// v50.0.0 (CIRISPersist#924) — the grammar half goes through the ONE matcher
+/// ([`match_family`](crate::federation::namespace::matcher::match_family)).
+/// Before, `covers` was a raw byte prefix and a grant on `"trace:"` covered
+/// `trace:Complete:v1` or `trace:complete` as readily as `trace:complete:v1`
+/// — promotion followed consent onto rows the grammar calls malformed. Now a
+/// malformed, unversioned, closed-leaf or Private Use dimension is covered by
+/// no grant (fail-closed: consent never widens onto a row the door refuses).
+///
+/// The PREFIX half stays byte-exact, deliberately: `attestation_prefixes` is
+/// the signed grant's own scoping string (the #510 closed grammar, pinned by
+/// [`CONSENT_GRAMMAR_HASH`]). Re-reading it as a family name would change what
+/// every already-signed grant authorizes — a grant on `"credits:rust:"` would
+/// silently stop covering `credits:rust:en:alice:v1`, whose family
+/// `credits:{domain}:…` does not start with it.
 #[must_use]
 pub fn covers(prefixes: &[String], dimension: &str) -> bool {
     prefixes.iter().any(|p| dimension.starts_with(p.as_str()))
+        && crate::federation::namespace::matcher::match_family(dimension)
+            .refusal
+            .is_none()
 }
 
 // ───────────────────────── #510 P1: restriction application ─────────
@@ -828,6 +847,29 @@ mod tests {
         // our prefixes, so a same-named-but-different dimension family
         // must not match.
         assert!(!covers(&prefixes, "trace_summary:v1"));
+    }
+
+    /// v50.0.0 (CIRISPersist#924) — coverage goes through the one matcher: a
+    /// grant never covers a dimension the grammar refuses, however well its
+    /// bytes start.
+    #[test]
+    fn covers_refuses_what_the_grammar_refuses_924() {
+        let prefixes = vec!["trace:".to_string(), "accord:".to_string()];
+        assert!(covers(&prefixes, "trace:complete:v1"));
+        assert!(!covers(&prefixes, "trace:Complete:v1"), "case_malformed");
+        assert!(
+            !covers(&prefixes, "trace:complete"),
+            "missing_version_segment"
+        );
+        assert!(
+            !covers(&prefixes, "trace:complete:v1:v2"),
+            "a duplicated tail"
+        );
+        assert!(
+            !covers(&prefixes, "accord:invoke:halt:v1"),
+            "a closed reserved leaf CC does not name"
+        );
+        assert!(covers(&prefixes, "accord:lifecycle:v1"), "a named leaf");
     }
 
     // ─────────────────── #510 P1: the closed grammar ────────────────

@@ -231,7 +231,7 @@ mod tests {
         check_namespace_family_registered, governed_family_stems, UNREGISTERED_GATED_FAMILIES,
     };
     use crate::federation::namespace::registry::{
-        authority_for, family_stem, is_family_registered,
+        authority_for, family_stem, is_family_registered, is_stem_registered,
     };
     use crate::federation::namespace::AuthorityClass;
 
@@ -264,7 +264,7 @@ mod tests {
             );
         }
         assert!(
-            is_family_registered(REGIME_FAMILY_STEM),
+            is_stem_registered(REGIME_FAMILY_STEM),
             "the stem itself must be registered — R2 speaks at family-stem granularity"
         );
         // The row is spelled the way CC spells it. #571 asked for four leaf

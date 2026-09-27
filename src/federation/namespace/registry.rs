@@ -115,10 +115,15 @@ pub struct NamespaceEntry {
     /// `"provenance:build_manifest:{target}"`, `"accord:*"`,
     /// `"audit_chain:hash_continuity"`).
     pub prefix: String,
-    /// The literal prefix a concrete `dimension` is matched against — `prefix`
-    /// truncated at its first `{` parameter or `*` wildcard (e.g.
-    /// `"provenance:build_manifest:"`, `"accord:"`). Longest match wins in
-    /// [`authority_for`].
+    /// The family's literal stem — `prefix` truncated at its first `{`
+    /// parameter or `*` wildcard (e.g. `"provenance:build_manifest:"`,
+    /// `"accord:"`).
+    ///
+    /// v50.0.0 (CIRISPersist#924): DATA only. It no longer decides which
+    /// family a dimension resolves to — [`lookup`] asks the one matcher
+    /// ([`match_family`](super::matcher::match_family)) — and survives because
+    /// the entries are still ordered by it and the co-scrub classifier reads
+    /// it.
     pub match_prefix: String,
     /// The owning component slug (CC 3.1.N heading), e.g. `"persist"`,
     /// `"attestation"`, `"registry"`.
@@ -163,10 +168,6 @@ struct RawMeta {
     cc_version: String,
     source_sha256: String,
     n_families: usize,
-    /// v42.0.0 (CC 3.1.7 R3) — the case policy, carried as DATA so the gates
-    /// key on the manifest rather than on a convention nobody wrote down.
-    #[serde(default)]
-    case_rule: Option<RawCaseRule>,
     /// **The `_meta` key the R2 Private Use ask asked for, and the rc3
     /// re-vendor delivered.** `x_private:` on this cut.
     ///
@@ -192,12 +193,6 @@ struct RawMeta {
     /// parse.
     #[serde(default)]
     private_use_prefix: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct RawCaseRule {
-    vocab_pattern: String,
-    refusal_token: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -337,9 +332,9 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
             }
         })
         .collect();
-    // Longest match_prefix first so `authority_for`'s first hit is the most
-    // specific (e.g. `provenance:build_manifest:` beats a hypothetical
-    // `provenance:` before it).
+    // Longest match_prefix first — a stable, documented order for consumers
+    // that enumerate the registry (resolution is the matcher's, not this
+    // order's, since v50.0.0).
     entries.sort_by(|a, b| {
         b.match_prefix
             .len()
@@ -378,32 +373,22 @@ pub fn vendored_private_use_prefix() -> Option<&'static str> {
     .as_deref()
 }
 
-/// The [`NamespaceEntry`] whose `match_prefix` is the **longest prefix** of
-/// `dimension`, or `None` if `dimension` is outside the CC namespace. The
-/// registry is pre-sorted longest-first, so this returns the most specific
-/// match.
-pub fn lookup(dimension: &str) -> Option<&'static NamespaceEntry> {
-    registry()
-        .iter()
-        .find(|e| dimension.starts_with(&e.match_prefix))
-}
-
-/// v42.0.0 (CC 3.1.7 R3) — the `_meta.case_rule.vocab_pattern` a `vocab`
-/// segment must match, and the refusal token CC names for a violation.
+/// The [`NamespaceEntry`] `dimension` resolves to under the ONE matcher
+/// ([`match_family`](super::matcher::match_family), CC 3.1.7 R3), or `None`
+/// when no row claims it (open vocabulary, or a leaf under a reserved stem no
+/// row names).
 ///
-/// Read from the manifest rather than transcribed: a pattern hand-copied here
-/// is a claim about CC prose that nothing can contradict.
-#[must_use]
-pub fn case_rule() -> Option<(&'static str, &'static str)> {
-    static RULE: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
-    RULE.get_or_init(|| {
-        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).ok()?;
-        raw.meta
-            .case_rule
-            .map(|c| (c.vocab_pattern, c.refusal_token))
-    })
-    .as_ref()
-    .map(|(a, b)| (a.as_str(), b.as_str()))
+/// v50.0.0 (CIRISPersist#924) — used to be the longest LITERAL prefix
+/// (`match_prefix`), which let `session:a:b:c:v1` resolve to `session:{kind}`
+/// at the wrong arity and `accord:invoke:anything` resolve to `accord:*` as if
+/// it were a leaf CC names. The family is returned even when the dimension is
+/// REFUSED (a missing version, a closed-vocabulary value, an unlisted closed
+/// leaf): the family the refusal was judged against is still the authority a
+/// classifier must report — dropping a reservation because the row was also
+/// malformed would be a fail-open.
+pub fn lookup(dimension: &str) -> Option<&'static NamespaceEntry> {
+    let family = super::matcher::match_family(dimension).family?;
+    registry().iter().find(|e| e.prefix == family)
 }
 
 /// **`authority_for(dimension)`** — the emit authority the `dimension`'s
@@ -416,12 +401,29 @@ pub fn case_rule() -> Option<(&'static str, &'static str)> {
 /// [`AccordCoScrub`](AuthorityClass::AccordCoScrub) — identical to a canonical
 /// record, closing the chicken/egg.
 pub fn authority_for(dimension: &str) -> Authority {
-    lookup(dimension)
-        .map(|e| e.authority.clone())
-        .unwrap_or(Authority {
-            class: AuthorityClass::ProducerSteward,
-            reserved: None,
-        })
+    if let Some(e) = lookup(dimension) {
+        return e.authority.clone();
+    }
+    // v50.0.0 (CIRISPersist#924) — a dimension under a stem CC 3.4 reserves
+    // as a whole that no row claims (`capacity_assurance:reversible_excluded:
+    // financial:v1`): the old longest-literal-prefix lookup attributed it to
+    // the stem's row and so carried the reservation; the one matcher claims no
+    // row for it, and reporting it OPEN would drop the reservation. The stem's
+    // own `_meta.case_rule.reserved_stems` rule answers instead.
+    if let Some((rule, cc_ref)) = super::matcher::reserved_stem_rule(dimension) {
+        let reserved = ReservedRule {
+            rule: rule.to_owned(),
+            cc_ref: cc_ref.to_owned(),
+        };
+        return Authority {
+            class: class_for(dimension, Some(rule)),
+            reserved: Some(reserved),
+        };
+    }
+    Authority {
+        class: AuthorityClass::ProducerSteward,
+        reserved: None,
+    }
 }
 
 // ── (CIRISPersist#590, CC 3.1.7 R2) — family-STEM registration ──
@@ -459,15 +461,30 @@ pub fn registered_family_stems() -> &'static [&'static str] {
     })
 }
 
-/// **CC 3.1.7 R2 registration predicate** — does `dimension` sit on a family the
-/// vendored manifest registers? Consumes the MANIFEST, never a section-walk
-/// heuristic (R2's normative enforcement surface: "a walker that reads only
-/// `### 3.1.N` refuses traffic this Part reserves").
+/// **CC 3.1.7 R2 registration predicate** — does `dimension` resolve to a
+/// family row? Answered by the ONE matcher
+/// ([`match_family`](super::matcher::match_family)): a row claims it, and the
+/// claim is not an unlisted leaf under a closed reserved family
+/// (`namespace_family_unregistered`).
 ///
-/// Stem-granular by [`family_stem`]. `""` is not a family and answers `false`.
+/// v50.0.0 (CIRISPersist#924) — this used to be stem-granular (the first `:`),
+/// so `accord:invoke:anything:v1` read as registered because SOME `accord:`
+/// row existed, while CC closes `accord:*` to its six named leaves. A dimension
+/// that is well-registered but otherwise malformed (missing version, a closed
+/// vocabulary value) still answers `true` here — registration is R2's
+/// question; the grammar's other refusals are the case and version gates'.
+/// Asking about a STEM (`"regime:"`) is [`is_stem_registered`].
 #[must_use]
 pub fn is_family_registered(dimension: &str) -> bool {
-    let stem = family_stem(dimension);
+    let m = super::matcher::match_family(dimension);
+    m.family.is_some() && m.refusal != Some(super::matcher::Refusal::FamilyUnregistered)
+}
+
+/// Does ANY vendored row sit on `stem` (`"regime:"`, or a bare `"scores"`)? A
+/// set-membership question over the manifest's rows, not a dimension match —
+/// the R2(a) build gates ask it of the stems persist governs.
+#[must_use]
+pub fn is_stem_registered(stem: &str) -> bool {
     !stem.is_empty() && registered_family_stems().binary_search(&stem).is_ok()
 }
 

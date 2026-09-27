@@ -2174,7 +2174,7 @@ mod tests {
             .filter(|p| {
                 // `foo:*` → the family stem `foo:`.
                 let stem = p.trim_end_matches('*');
-                !super::super::registry::is_family_registered(stem)
+                !super::super::registry::is_stem_registered(stem)
             })
             .collect();
         let declared: std::collections::BTreeSet<&str> =
@@ -2191,7 +2191,7 @@ mod tests {
         );
         let resolved: Vec<&&str> = STILL_UNREGISTERED_COVERAGE_GAP
             .iter()
-            .filter(|p| super::super::registry::is_family_registered(p.trim_end_matches('*')))
+            .filter(|p| super::super::registry::is_stem_registered(p.trim_end_matches('*')))
             .collect();
         assert!(
             resolved.is_empty(),
@@ -3250,7 +3250,7 @@ mod tests {
                  it — the record describes nothing. Remove it here and from the R2 exception list."
             );
             assert!(
-                !registry::is_family_registered(stem),
+                !registry::is_stem_registered(stem),
                 "{stem:?} is recorded as uncatalogued but the vendored registry now REGISTERS it \
                  ({tracked} landed) — delete the line here and in UNREGISTERED_GATED_FAMILIES so \
                  CC 3.1.7 R2 judges it like every other family"

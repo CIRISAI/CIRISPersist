@@ -207,6 +207,8 @@ struct Rules {
     tokens: BTreeMap<String, String>,
     external: BTreeMap<String, Regex>,
     reserved_stems: Vec<String>,
+    /// `(stem, rule, cc_ref)` per `_meta.case_rule.reserved_stems` entry.
+    reserved_stem_rules: Vec<(String, String, String)>,
     families: Vec<Fam>,
     hex: Regex,
     version_like: Regex,
@@ -260,6 +262,21 @@ fn parse_rules(root: serde_json::Value) -> Rules {
         .map(|a| {
             a.iter()
                 .map(|s| str_of(&s["stem"], "reserved stem").to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let reserved_stem_rules = cr
+        .get("reserved_stems")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|s| {
+                    (
+                        str_of(&s["stem"], "reserved stem").to_owned(),
+                        str_of(&s["rule"], "reserved stem rule").to_owned(),
+                        str_of(&s["cc_ref"], "reserved stem cc_ref").to_owned(),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -330,6 +347,7 @@ fn parse_rules(root: serde_json::Value) -> Rules {
         tokens,
         external,
         reserved_stems,
+        reserved_stem_rules,
         families,
         hex: compile(HEX_PATTERN),
         version_like: compile(VERSION_LIKE),
@@ -720,6 +738,20 @@ pub fn version_segment_required() -> bool {
 /// The `_meta.case_rule.reserved_stems` stems, in manifest order.
 pub fn reserved_stems() -> impl Iterator<Item = &'static str> {
     rules().reserved_stems.iter().map(String::as_str)
+}
+
+/// The `(rule, cc_ref)` of the longest `_meta.case_rule.reserved_stems` stem
+/// `dimension` sits under, if any. What a classifier reports for a dimension
+/// under a reserved stem that no row claims — the reservation covers the
+/// leaves nobody minted yet (CC 3.1.7 R3), so it must not read as open.
+#[must_use]
+pub fn reserved_stem_rule(dimension: &str) -> Option<(&'static str, &'static str)> {
+    rules()
+        .reserved_stem_rules
+        .iter()
+        .filter(|(stem, _, _)| dimension.starts_with(stem.as_str()))
+        .max_by_key(|(stem, _, _)| stem.len())
+        .map(|(_, rule, cc_ref)| (rule.as_str(), cc_ref.as_str()))
 }
 
 /// A family's `{placeholder}` values, when its row enumerates them
