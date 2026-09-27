@@ -132,6 +132,21 @@ pub enum ScopeRefusalReason {
         "the claimed cohort's roster is not held here yet; membership is unresolved (retryable)"
     )]
     MembershipUnresolved,
+
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CIRISConstitution#111) — an
+    /// owner-binding carried at `cohort_scope: federation` (which is what
+    /// "announced" means: the node joins its owner's PUBLIC device roster)
+    /// whose granter — the owner — resolves to the `minor` age band. A
+    /// federation-scope owner-binding makes its owner contactable and
+    /// discoverable by unconnected adults, which the CC 3.4.13 Q5 hard floor
+    /// forbids for a minor and no steward, guardian or stacked consent may
+    /// lift. Terminal: the binding is admissible at `self`, where the node
+    /// stays on the derived plane.
+    #[error(
+        "a minor's owner-binding cannot be announced: cohort_scope federation is refused (CC \
+         5.4.6 / CC 3.4.13 Q5); hold it at self"
+    )]
+    MinorOwnerBindingAtFederation,
 }
 
 impl ScopeRefusalReason {
@@ -147,6 +162,7 @@ impl ScopeRefusalReason {
             Self::UnauthenticatedSuppressedCohort => "scope_unauthenticated_suppressed_cohort",
             Self::InvalidCohortScope(_) => "scope_invalid_cohort_scope",
             Self::MembershipUnresolved => "scope_membership_unresolved",
+            Self::MinorOwnerBindingAtFederation => "scope_minor_owner_binding_at_federation",
         }
     }
 }

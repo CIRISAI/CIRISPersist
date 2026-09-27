@@ -261,6 +261,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // policy question about the caller's input rather than a substrate one.
     ("attestation_reput_verdict", Class::Gate),
     ("check_single_node_owner_admission", Class::Gate),
+    // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
+    // refused at `cohort_scope: federation`.
+    ("check_minor_owner_binding_not_announced", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),

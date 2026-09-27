@@ -5063,6 +5063,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
             .await?;
 
+        // v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+        // owner-binding is never ANNOUNCED: refused at `cohort_scope:
+        // federation`. Backend-symmetric; verify-before-mutation.
+        crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
+
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
         // gate: a node has AT MOST ONE responsible steward, so a second,
         // distinct-owner owner-binding `delegates_to(U → node)` is rejected. Runs
@@ -40846,6 +40851,18 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::tier_ingest::test_support::exercise_node_speaks_for_owner(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+    /// owner-binding is never announced, sqlite arm.
+    #[tokio::test]
+    async fn minor_owner_binding_at_federation_is_refused_q5_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_minor_owner_binding_is_not_announced(
             &backend, "sqlite",
         )
         .await;

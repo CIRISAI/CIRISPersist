@@ -2686,6 +2686,118 @@ pub mod test_support {
         );
     }
 
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CIRISConstitution#111) — **the
+    /// roster invariant beside [`exercise_node_speaks_for_owner`]: a minor is
+    /// never announced.**
+    ///
+    /// A person's public device roster is exactly their nodes whose
+    /// owner-binding is carried at `cohort_scope: federation`. For an owner in
+    /// the `minor` band that is refused (CC 3.4.13 Q5 — no steward, guardian
+    /// or stacked consent lifts it); the same binding at `self` lands, so the
+    /// minor's node stays on the derived plane, owned and reachable by the
+    /// minor's own nodes. An ADULT-unknown owner (no age proof) announces
+    /// freely — presumption of sovereignty. Run through the real
+    /// `put_attestation` door on every backend.
+    pub(crate) async fn exercise_minor_owner_binding_is_not_announced(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{
+            attestation_type, cohort_scope, delegation_scope as ds, owner_binding,
+        };
+        let minor = format!("minor-924-{suffix}");
+        let adult = format!("adult-924-{suffix}");
+        let node_a = format!("node-a-924-{suffix}");
+        let node_b = format!("node-b-924-{suffix}");
+        let node_c = format!("node-c-924-{suffix}");
+        register_user_role_key(dir, &minor).await;
+        register_user_role_key(dir, &adult).await;
+        for k in [&node_a, &node_b, &node_c] {
+            register_hybrid_key(dir, k).await;
+        }
+        // The owner self-declares MINOR (the subject-signed self rung, CC
+        // 3.4.11; CC rc5's `age_self_declared:band:{band}:{version}` arity).
+        let decl_id = uuid::Uuid::new_v4().to_string();
+        let mut decl = bare_attestation(
+            &decl_id,
+            &minor,
+            &minor,
+            &serde_json::json!({ "id": decl_id }),
+        );
+        decl.attestation_type = "age_self_declared:band:minor:v1".to_owned();
+        seal_row_in_place(&minor, &mut decl);
+        dir.put_attestation(crate::federation::SignedAttestation { attestation: decl })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) self-declared minor: {e}"));
+        assert_eq!(
+            crate::federation::age::age_band(dir, &minor).await.unwrap(),
+            crate::federation::age::AgeBand::Minor
+        );
+
+        let binding = |owner: &str, node: &str, scope: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut b = bare_attestation(
+                &id,
+                owner,
+                node,
+                &serde_json::json!({
+                    "id": id,
+                    "kind": "delegates_to",
+                    "dimension": owner_binding::DIMENSION,
+                    "delegation_purpose": owner_binding::PURPOSE,
+                    "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                }),
+            );
+            b.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            b.cohort_scope = scope.to_owned();
+            seal_row_in_place(owner, &mut b);
+            crate::federation::SignedAttestation { attestation: b }
+        };
+
+        // (1) ANNOUNCED — the minor's federation-scope owner-binding refuses,
+        // by its own typed reason, and nothing is stored.
+        let err = dir
+            .put_attestation(binding(&minor, &node_a, cohort_scope::FEDERATION))
+            .await
+            .expect_err("a minor's owner-binding at cohort_scope federation must refuse");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
+                )
+            ),
+            "({suffix}) CC 5.4.6: refused as the announce of a minor, got {err:?}"
+        );
+        assert!(
+            crate::federation::admission::owner_of(dir, &node_a)
+                .await
+                .unwrap()
+                .is_none(),
+            "({suffix}) the refused binding left nothing behind"
+        );
+
+        // (2) The DERIVED plane — the same binding at `self` lands, and the
+        // node is the minor's.
+        dir.put_attestation(binding(&minor, &node_b, cohort_scope::SELF))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) a minor's self-scope owner-binding: {e}"));
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node_b)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(minor.as_str())
+        );
+
+        // (3) An owner with no age proof announces freely (presumption of
+        // sovereignty, CC 1.15.6) — the gate keys on the MINOR band, not on
+        // the absence of an adult one.
+        dir.put_attestation(binding(&adult, &node_c, cohort_scope::FEDERATION))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) an unknown-band owner announces: {e}"));
+    }
+
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role
     /// identity, so it steward-binds ITSELF (clause 1 of
     /// `steward_bindings_of`). Non-infrastructure community membership is an

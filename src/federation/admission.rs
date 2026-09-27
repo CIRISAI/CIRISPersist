@@ -2665,6 +2665,12 @@ pub async fn check_promotion_admission(
     // only as minor-guardianship.
     check_user_target_steward_binding_admission(directory, row).await?;
 
+    // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
+    // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
+    // the PROMOTION": the owner's age band is directory state that can have
+    // changed since the local write.
+    check_minor_owner_binding_not_announced(directory, row).await?;
+
     // CC 4.5.4 / §11.11 — a federation apply step keyed on a moderator-less
     // community. Tier-sensitive, and now reached for the first time.
     check_no_moderator_federate_apply(directory, row).await?;
@@ -13433,6 +13439,47 @@ pub async fn check_node_agency_admission(
 /// attested fiduciary binding (and re-asserts `target_is_self_sovereign` when
 /// no live incapacity is attested — the presumption of capacity).
 ///
+/// v50.0.0 (CIRISPersist#924, CC 5.4.6 — CIRISConstitution#111, ruled) —
+/// **a minor's owner-binding is never announced.**
+///
+/// CC 5.4.6: a person's public device roster is *exactly* the set of their
+/// nodes whose owner-binding is carried at `cohort_scope: federation` — that is
+/// what "announced" means. A federation-scope owner-binding makes its owner
+/// contactable and discoverable by unconnected adults, which the CC 3.4.13 Q5
+/// hard floor forbids for a minor, so "a node whose owner resolves to the
+/// `minor` band MUST NOT carry a federation-scope owner-binding, admission
+/// MUST refuse the promotion, and such a person is reachable only on the
+/// derived plane".
+///
+/// Refuses an owner-purpose `delegates_to`
+/// ([`is_owner_binding_envelope`]) at [`cohort_scope::FEDERATION`] whose
+/// GRANTER (`attesting_key_id` — the owner signs owner → node) resolves to
+/// [`AgeBand::Minor`](super::age::AgeBand::Minor) under
+/// [`super::age::age_band`]. An unknown band is not refused here (presumption
+/// of sovereignty, CC 1.15.6 — the same reading the steward-binding gate
+/// takes); every other scope is untouched, and the same binding at `self` is
+/// the lawful shape. Wired at every backend's `put_attestation` beside the
+/// steward-binding gate AND in the promotion stack, because the owner's band
+/// is directory state a local row can outlive.
+pub async fn check_minor_owner_binding_not_announced(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use super::age::{age_band, AgeBand};
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || row.cohort_scope != super::types::cohort_scope::FEDERATION
+        || !is_owner_binding_envelope(&row.attestation_envelope)
+    {
+        return Ok(());
+    }
+    if age_band(directory, &row.attesting_key_id).await? == AgeBand::Minor {
+        return Err(Error::WriteScopeRefused(
+            crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation,
+        ));
+    }
+    Ok(())
+}
+
 /// Verify-before-mutation (AV-9): wired into every backend's
 /// `put_attestation` immediately AFTER [`check_node_agency_admission`], so a
 /// rejected emission leaves no trace. Backend-agnostic — resolution uses the
