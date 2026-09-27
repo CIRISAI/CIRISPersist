@@ -18285,7 +18285,10 @@ mod tests {
                     crate::federation::types::Community {
                         community_key_id: community_id.into(),
                         community_name: "ob-test".into(),
-                        members,
+                        members: crate::federation::tier_ingest::test_support::fixture_members(
+                            policy_blob.as_ref(),
+                            members,
+                        ),
                         founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                         consensus_protocol:
                             crate::federation::tier_ingest::test_support::fixture_protocol(

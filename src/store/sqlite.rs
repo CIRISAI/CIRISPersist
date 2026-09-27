@@ -35763,14 +35763,17 @@ mod tests {
         crate::federation::Community {
             community_key_id: community_key_id.into(),
             community_name: community_name.into(),
-            members: members
-                .into_iter()
-                .map(|k| crate::federation::CommunityMember {
-                    key_id: k.into(),
-                    joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
-                    role: None,
-                })
-                .collect(),
+            members: crate::federation::tier_ingest::test_support::fixture_members(
+                policy_blob.as_ref(),
+                members
+                    .into_iter()
+                    .map(|k| crate::federation::CommunityMember {
+                        key_id: k.into(),
+                        joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                        role: None,
+                    })
+                    .collect(),
+            ),
             founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
             // v50.0.0 (CIRISPersist#927) — an infrastructure fixture declares
             // the quorum:M/N form CC 3.2 requires.

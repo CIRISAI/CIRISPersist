@@ -33519,14 +33519,17 @@ mod tests {
                 crate::federation::Community {
                     community_key_id: key.into(),
                     community_name: "Co-op".into(),
-                    members: members
-                        .into_iter()
-                        .map(|k| crate::federation::CommunityMember {
-                            key_id: k.into(),
-                            joined_at: now,
-                            role: None,
-                        })
-                        .collect(),
+                    members: crate::federation::tier_ingest::test_support::fixture_members(
+                        policy.as_ref(),
+                        members
+                            .into_iter()
+                            .map(|k| crate::federation::CommunityMember {
+                                key_id: k.into(),
+                                joined_at: now,
+                                role: None,
+                            })
+                            .collect(),
+                    ),
                     founded_at: now,
                     consensus_protocol:
                         crate::federation::tier_ingest::test_support::fixture_protocol(
@@ -37728,7 +37731,10 @@ mod tests {
                 crate::federation::Community {
                     community_key_id: cid.to_owned(),
                     community_name: "ob-test".into(),
-                    members,
+                    members: crate::federation::tier_ingest::test_support::fixture_members(
+                        policy.as_ref(),
+                        members,
+                    ),
                     founded_at: now,
                     consensus_protocol:
                         crate::federation::tier_ingest::test_support::fixture_protocol(

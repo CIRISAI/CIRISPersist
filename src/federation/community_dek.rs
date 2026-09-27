@@ -1589,7 +1589,10 @@ pub mod lifecycle_support {
                 crate::federation::types::Community {
                     community_key_id: community_key_id.to_owned(),
                     community_name: "Lifecycle Co-op".into(),
-                    members: roster,
+                    members: crate::federation::tier_ingest::test_support::fixture_members(
+                        policy_blob.as_ref(),
+                        roster,
+                    ),
                     founded_at: chrono::Utc::now(),
                     consensus_protocol:
                         crate::federation::tier_ingest::test_support::fixture_protocol(

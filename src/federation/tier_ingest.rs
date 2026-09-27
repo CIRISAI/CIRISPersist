@@ -1668,6 +1668,31 @@ pub mod test_support {
         }
     }
 
+    /// v50.0.0 (review) — `members` plus, when `policy_blob` labels the
+    /// fixture `infrastructure`, one founder (an unregistered human seat): an
+    /// infrastructure record with no founder is refused
+    /// (`INFRA_RULE_NO_FOUNDER`), and these fixtures test other things.
+    pub fn fixture_members(
+        policy_blob: Option<&serde_json::Value>,
+        mut members: Vec<crate::federation::types::CommunityMember>,
+    ) -> Vec<crate::federation::types::CommunityMember> {
+        let infra = policy_blob
+            .and_then(|b| b.get("cohort_subkind"))
+            .and_then(|v| v.as_str())
+            == Some(crate::federation::admission::COHORT_SUBKIND_INFRASTRUCTURE);
+        let has_founder = members
+            .iter()
+            .any(|m| m.role.as_deref() == Some(crate::federation::admission::MEMBER_ROLE_FOUNDER));
+        if infra && !has_founder {
+            members.push(crate::federation::types::CommunityMember {
+                key_id: "fixture-infrastructure-founder".into(),
+                joined_at: "2026-01-01T00:00:00Z".parse().expect("rfc3339"),
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+            });
+        }
+        members
+    }
+
     /// v50.0.0 (CIRISPersist#927, CC 3.2) — the `consensus_protocol` a
     /// community fixture declares: `otherwise`, unless `policy_blob` labels it
     /// `infrastructure`, which admits only a `quorum:M/N` form (a one-founder
