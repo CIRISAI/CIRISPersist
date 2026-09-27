@@ -2779,7 +2779,9 @@ pub mod test_support {
 
         // (2) The DERIVED plane — the same binding at `self` lands, and the
         // node is the minor's.
-        dir.put_attestation(binding(&minor, &node_b, cohort_scope::SELF))
+        let self_binding = binding(&minor, &node_b, cohort_scope::SELF);
+        let self_binding_id = self_binding.attestation.attestation_id.clone();
+        dir.put_attestation(self_binding)
             .await
             .unwrap_or_else(|e| panic!("({suffix}) a minor's self-scope owner-binding: {e}"));
         assert_eq!(
@@ -2809,12 +2811,46 @@ pub mod test_support {
             "({suffix}) CC 5.4.6 at the promote door, got {err:?}"
         );
 
+        // (2c) ANNOUNCING = the owner re-signing the binding at federation
+        // (CC 5.4.6, CLM-device-roster-announced) — i.e. `widen_audience`,
+        // the one widening path. The minor's self-scope binding does not
+        // widen (v50.0.0 review HIGH-1: a gate on `delegates_to` alone never
+        // saw the `supersedes` a widening writes).
+        let stored = dir
+            .get_attestation(&self_binding_id)
+            .await
+            .unwrap()
+            .expect("the self-scope binding is stored");
+        let err = widen(dir, &stored, crate::federation::Audience::Federation, &[])
+            .await
+            .expect_err("widening a minor's owner-binding to federation must refuse");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
+                )
+            ),
+            "({suffix}) CC 5.4.6 at the widening door, got {err:?}"
+        );
+
         // (3) An owner with no age proof announces freely (presumption of
         // sovereignty, CC 1.15.6) — the gate keys on the MINOR band, not on
-        // the absence of an adult one.
+        // the absence of an adult one — both directly and by widening.
         dir.put_attestation(binding(&adult, &node_c, cohort_scope::FEDERATION))
             .await
             .unwrap_or_else(|e| panic!("({suffix}) an unknown-band owner announces: {e}"));
+        let node_d = format!("node-d-924-{suffix}");
+        register_hybrid_key(dir, &node_d).await;
+        let adult_self = binding(&adult, &node_d, cohort_scope::SELF);
+        let adult_self_id = adult_self.attestation.attestation_id.clone();
+        dir.put_attestation(adult_self)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) adult self-scope binding: {e}"));
+        let stored = dir.get_attestation(&adult_self_id).await.unwrap().unwrap();
+        widen(dir, &stored, crate::federation::Audience::Federation, &[])
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) a non-minor's binding widens: {e}"));
     }
 
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role

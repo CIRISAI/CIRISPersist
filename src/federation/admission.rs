@@ -13452,7 +13452,10 @@ pub async fn check_node_agency_admission(
 /// derived plane".
 ///
 /// Refuses an owner-purpose `delegates_to`
-/// ([`is_owner_binding_envelope`]) at [`cohort_scope::FEDERATION`] whose
+/// ([`is_owner_binding_envelope`]) at [`cohort_scope::FEDERATION`] — or a
+/// `supersedes` WIDENING one to federation (`widen_audience`: the owner
+/// re-signing the binding at that audience, which is what CC calls
+/// announcing) — whose
 /// GRANTER (`attesting_key_id` — the owner signs owner → node) resolves to
 /// [`AgeBand::Minor`](super::age::AgeBand::Minor) under
 /// [`super::age::age_band`]. An unknown band is not refused here (presumption
@@ -13466,10 +13469,39 @@ pub async fn check_minor_owner_binding_not_announced(
     row: &super::Attestation,
 ) -> Result<(), Error> {
     use super::age::{age_band, AgeBand};
-    if row.attestation_type != attestation_type::DELEGATES_TO
-        || row.cohort_scope != super::types::cohort_scope::FEDERATION
-        || !is_owner_binding_envelope(&row.attestation_envelope)
-    {
+    if row.cohort_scope != super::types::cohort_scope::FEDERATION {
+        return Ok(());
+    }
+    let announces_an_owner_binding = if row.attestation_type == attestation_type::DELEGATES_TO {
+        is_owner_binding_envelope(&row.attestation_envelope)
+    } else if row.attestation_type == attestation_type::SUPERSEDES {
+        // v50.0.0 review (HIGH-1) — CC's own reading: "announcing = the owner
+        // re-signing the binding at that audience", which is exactly
+        // `widen_audience`: a `supersedes` at a wider `cohort_scope` over the
+        // SAME body. Every widening path (the explicit widen, the sweep's
+        // widening step, the pyo3 widen) writes that row through a put door,
+        // so this is the one site they all cross. Judged on the body carried
+        // AND on the prior it names — a widening whose body stripped the
+        // purpose marker still announces the binding it supersedes.
+        is_owner_binding_envelope(&row.attestation_envelope)
+            || match row
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID)
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(prior_id) => directory
+                    .get_attestation(prior_id)
+                    .await?
+                    .is_some_and(|prior| {
+                        prior.attestation_type == attestation_type::DELEGATES_TO
+                            && is_owner_binding_envelope(&prior.attestation_envelope)
+                    }),
+                None => false,
+            }
+    } else {
+        false
+    };
+    if !announces_an_owner_binding {
         return Ok(());
     }
     if age_band(directory, &row.attesting_key_id).await? == AgeBand::Minor {
