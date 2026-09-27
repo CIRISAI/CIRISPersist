@@ -24,6 +24,7 @@
 //! [`registry`] for the drift-control (the vendored-copy content hash gate).
 
 pub mod conformance;
+pub mod matcher;
 pub mod registry;
 pub mod supersets;
 

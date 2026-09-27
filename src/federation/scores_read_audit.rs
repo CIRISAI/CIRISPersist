@@ -1727,7 +1727,7 @@ mod tests {
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 116);
+        assert_eq!(vendored_family_polarities().len(), 145);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

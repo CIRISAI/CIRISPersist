@@ -34,7 +34,7 @@ use super::{Authority, AuthorityClass, ReservedRule};
 use std::sync::OnceLock;
 
 /// The vendored copy of the Constitution manifest, compiled in.
-const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
+pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
@@ -42,10 +42,28 @@ pub const VENDORED_CC_VERSION: &str = "1.0-rc5";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "87aede5012064288fd5ce8770d3e77a8c5131cd61d27799c4c06558507b9a9f5";
+    "f05682512c85c65c3f502e1ca81dfb032a6e6d24ab4206658fbf36ccaa702a75";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 116;
+pub const VENDORED_N_FAMILIES: usize = 145;
+
+/// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
+/// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
+/// the two hashes), so a wording edit elsewhere in CC Part 3 does not move it
+/// while `source_sha256` does. This is the pin CC asks every consumer to carry;
+/// [`tests::vendored_registry_sha256_pins_the_cc_file`] recomputes it over the
+/// vendored bytes the way `tools/build_cc_namespace.py` does.
+///
+/// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
+/// (PR #113, rc5 — an UNMERGED CC branch at vendor time), together with
+/// `namespace_match_vectors.json` from the same commit. JSON carries no
+/// comments, so this doc is the vendored files' header.
+pub const VENDORED_REGISTRY_SHA256: &str =
+    "d6c87945ea08d72cc1f83820e35f0e3fb72cce47ea49f2ed3321d43219642ea6";
+
+/// The CIRISConstitution commit both vendored manifests were copied from
+/// (`claude/backlog-integration-assignment-p3ydh0`, CIRISConstitution PR #113).
+pub const VENDORED_CC_COMMIT: &str = "4b624513458f2c9b236caf289dc2cd62aa048c24";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -474,9 +492,15 @@ pub fn is_family_registered(dimension: &str) -> bool {
 /// could see the other.
 pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "accord:*",
+    "accord:human_dignity",
+    "accord:invoke:constitutional:{halt_id}",
+    "accord:invoke:drill:{drill_id}",
+    "accord:invoke:notify:{notify_id}",
+    "accord:lifecycle",
+    "accord:lifecycle:active",
     "activity_tier:{period}",
     "age_assurance:{level}:{band}:{version}",
-    "age_self_declared:{band}:{version}",
+    "age_self_declared:band:{band}:{version}",
     "agent_files:{kind}:{platform_or_target}",
     "approach:{goal_id}",
     "attestation:agent_integrity",
@@ -484,10 +508,12 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "attestation:license_validity",
     "attestation:registry_consensus",
     "attestation:self_verify",
+    "audio:*",
     "audit_chain:hash_continuity",
     "autonomy:{aspect}",
     "benchmark:he300:{category}:{version}",
     "beneficence:{aspect}",
+    "blog:*",
     "bond_posted:{currency}",
     "build:registered:{target}",
     "capacity:composite",
@@ -498,6 +524,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "capacity:sustained_coherence",
     "capacity_assurance:{level}:{domain}:{band}:{version}",
     "cert_validity:{authority}",
+    "chat:*",
     "coherence_standing:{cohort}",
     "commitment_fulfillment:{prior_contribution_id}",
     "config:{scope}",
@@ -505,6 +532,15 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "conscience:entropy",
     "conscience:epistemic_humility",
     "conscience:optimization_veto",
+    "consent:decay:{stage}",
+    "consent:deletion_complete",
+    "consent:deletion_sla:{days}",
+    "consent:partnership_accept",
+    "consent:partnership_grant",
+    "consent:replication:{version}",
+    "consent:scope:{kind}",
+    "consent:state:{stance}",
+    "consent:stream:{kind}",
     "consent:{kind}",
     "content_class:{class}",
     "content_rating:{scheme}:{rating}",
@@ -526,16 +562,23 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "dma:idma:*",
     "dma:pdma:*",
     "duty:{kind}",
+    "encyclopedia:*",
+    "event:attendance",
+    "event:lifecycle:{state}",
+    "event:rsvp_count",
     "expertise:{domain}:{language}",
     "federation_directory:replication_lag",
     "fidelity:explainability_sla:{tier}",
     "fidelity:{aspect}",
+    "film:*",
     "goal:{scale}",
     "hard_case:{kind}",
     "hardware_custody:{platform}",
     "health:liveness:{version}",
     "holds_bytes:sha256:{prefix}",
+    "identity:canonical_binding:{canonical_hash}",
     "identity_continuity:relational_anchor",
+    "image:*",
     "integrity:{aspect}",
     "judge_model:verdict:{model_id}",
     "justice:{aspect}",
@@ -545,10 +588,12 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "manifold_conformity:{cohort}",
     "mesh_config:{key}",
     "method:{approach_id}:{substrate_rung}",
+    "model_3d:*",
     "moderation:{allegation_type}",
     "moderation_track_record:{community_key_id}",
     "multilateral_participation:{forum}:{kind}",
     "need:{domain}:{kind}",
+    "news:*",
     "non_maleficence:{aspect}",
     "objection:{state}",
     "ownership:{relation}:{target_kind}:{version}",
@@ -576,6 +621,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "slashing:{outcome}",
     "system:*",
     "testimonial_witness:{kind}",
+    "topical_relation:{kind}",
     "trace:{form}:{version}",
     "trace_summary:{kind}",
     "transparency_log:consistency",
@@ -584,6 +630,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "transport:{kind}",
     "trust:{job}:{version}",
     "truth_grounding:{subject}",
+    "video:*",
     "vote:{contribution_id}",
     "wa_adjudication:{state}",
     "watchlist:{id}",
@@ -592,13 +639,19 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,
-/// intentionally absent from this one. Empty as of the rc3 vendor: no CC family
-/// has ever been retired, and every disappearance so far has been a generator
-/// accident.
+/// intentionally absent from this one. The first real retirement landed with
+/// the v50.0.0 (rc5 @ 4b624513) vendor; every earlier disappearance was a
+/// generator accident.
 ///
 /// The escape hatch for [`VENDORED_FAMILY_PREFIXES`]: moving a line here is how
 /// a reviewer says "this removal is intended", in a diff someone must read.
-pub const RETIRED_FAMILIES: &[&str] = &[];
+pub const RETIRED_FAMILIES: &[&str] = &[
+    // CIRISConstitution#113 review (rc5 @ 4b624513): the two-segment arity no
+    // producer emitted, re-registered at the wire's arity as
+    // `age_self_declared:band:{band}:{version}` (CC 3.1.2). CC's own
+    // generator lists it in its `RETIRED_FAMILIES`.
+    "age_self_declared:{band}:{version}",
+];
 
 #[cfg(test)]
 mod tests {
@@ -655,6 +708,121 @@ mod tests {
             raw.families.len(),
             VENDORED_N_FAMILIES,
             "families[] length != _meta.n_families"
+        );
+    }
+
+    /// Python's `json.dumps(v, sort_keys=True, separators=(",", ":"))` with its
+    /// default `ensure_ascii=True` — the preimage `tools/build_cc_namespace.py`
+    /// hashes for `_meta.registry_sha256`. The manifest carries no floats (a
+    /// float's repr is the one place the two serializers would disagree), and
+    /// this refuses one rather than guessing.
+    fn python_canonical_json(v: &serde_json::Value, out: &mut String) {
+        use serde_json::Value as V;
+        fn string(s: &str, out: &mut String) {
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{08}' => out.push_str("\\b"),
+                    '\u{0c}' => out.push_str("\\f"),
+                    c if (c as u32) < 0x20 || (c as u32) > 0x7e && (c as u32) != 0x7f => {
+                        let mut buf = [0u16; 2];
+                        for unit in c.encode_utf16(&mut buf) {
+                            out.push_str(&format!("\\u{unit:04x}"));
+                        }
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        match v {
+            V::Null => out.push_str("null"),
+            V::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            V::Number(n) => {
+                let t = n.to_string();
+                assert!(
+                    !t.contains(['.', 'e', 'E']),
+                    "a float in the manifest: {t} — Python's repr and serde's may differ"
+                );
+                out.push_str(&t);
+            }
+            V::String(s) => string(s, out),
+            V::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    python_canonical_json(x, out);
+                }
+                out.push(']');
+            }
+            V::Object(o) => {
+                let mut keys: Vec<&String> = o.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    string(k, out);
+                    out.push(':');
+                    python_canonical_json(&o[k.as_str()], out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the grammar pin.
+    ///
+    /// Recomputes `_meta.registry_sha256` over the VENDORED bytes exactly as
+    /// `tools/build_cc_namespace.py` does (`sha256(json.dumps({"_meta": meta
+    /// minus source_sha256/registry_sha256, "families": families},
+    /// sort_keys=True, separators=(",",":")))`) and requires it to equal both
+    /// the file's own claim and [`VENDORED_REGISTRY_SHA256`]. A hand edit to
+    /// the vendored grammar — or a re-vendor that moved the bytes without the
+    /// pin — fails here, while a CC wording edit (which moves only
+    /// `source_sha256`) does not.
+    #[test]
+    fn vendored_registry_sha256_pins_the_cc_file() {
+        use sha2::{Digest, Sha256};
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let meta = root["_meta"].as_object().expect("_meta object");
+        let claimed = meta["registry_sha256"]
+            .as_str()
+            .expect("rc5 carries _meta.registry_sha256");
+        let mut grammar_meta = meta.clone();
+        grammar_meta.remove("source_sha256");
+        grammar_meta.remove("registry_sha256");
+        let grammar = serde_json::json!({
+            "_meta": serde_json::Value::Object(grammar_meta),
+            "families": root["families"].clone(),
+        });
+        let mut preimage = String::new();
+        python_canonical_json(&grammar, &mut preimage);
+        let recomputed = hex::encode(Sha256::digest(preimage.as_bytes()));
+        assert_eq!(
+            recomputed, claimed,
+            "the vendored grammar does not hash to its own _meta.registry_sha256 — the file \
+             was edited after CC generated it"
+        );
+        assert_eq!(
+            claimed, VENDORED_REGISTRY_SHA256,
+            "re-vendored without moving VENDORED_REGISTRY_SHA256 (the bytes and the pin move \
+             together)"
+        );
+        // The vectors file is generated from the same grammar and says so.
+        let vectors: serde_json::Value = serde_json::from_str(super::super::matcher::VECTORS_JSON)
+            .expect("vendored vectors parse");
+        assert_eq!(
+            vectors["_meta"]["registry_sha256"],
+            VENDORED_REGISTRY_SHA256
         );
     }
 
@@ -1040,11 +1208,23 @@ mod tests {
             "segments",
         ];
         // Columns read OUTSIDE the shared type, each naming its reader.
-        const READ_ELSEWHERE: &[(&str, &str)] = &[(
-            "polarity",
-            "scores_read_audit.rs#vendored_family_polarities (local parse, documented \
-             at that site) + the #724 cross-manifest agreement gate",
-        )];
+        const READ_ELSEWHERE: &[(&str, &str)] = &[
+            (
+                "polarity",
+                "scores_read_audit.rs#vendored_family_polarities (local parse, documented \
+                 at that site) + the #724 cross-manifest agreement gate",
+            ),
+            // v50.0.0 (CIRISPersist#924, CC 3.1.7 R2(b)/R3) — a reserved
+            // wildcard family's published leaves and whether they are closed.
+            (
+                "leaves",
+                "namespace/matcher.rs#parse_rules -> Fam::leaves (match_family)",
+            ),
+            (
+                "leaves_closed",
+                "namespace/matcher.rs#parse_rules -> Fam::leaves_closed (match_family)",
+            ),
+        ];
         // Columns deliberately inert, each naming WHY — the subtractive
         // manifest: a rationale under 40 chars is a shrug, not a reason.
         const DELIBERATELY_UNREAD: &[(&str, &str)] = &[(
