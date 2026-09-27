@@ -111,3 +111,13 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.10.1	CLM-ledger-fold	CIRISPersist	src/ledgers/standard.rs#conservation_fold	ciris-persist@50.0.0
 3.3.10.1	CLM-ledger-fold	CIRISPersist	src/ledgers/standard.rs#fold_canonical_bytes	ciris-persist@50.0.0
 4.5.1.1	CLM-ci-axis	CIRISPersist	src/federation/namespace/supersets.rs#fusion_classification	ciris-persist@50.0.0
+3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/namespace/matcher.rs#match_family	ciris-persist@50.0.0
+3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/namespace/matcher.rs#trailing_version	ciris-persist@50.0.0
+3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/namespace/matcher.rs#is_version_exempt	ciris-persist@50.0.0
+3.1.7	CLM-version-segment-suffix	CIRISPersist	src/federation/admission.rs#check_dimension_case_rule	ciris-persist@50.0.0
+3.4.1	CLM-reserved-leaves-closed	CIRISPersist	src/federation/namespace/matcher.rs#match_family	ciris-persist@50.0.0
+3.4.1	CLM-reserved-leaves-closed	CIRISPersist	src/federation/admission.rs#check_namespace_family_registered	ciris-persist@50.0.0
+4.2.1.1	CLM-accord-invoke-lowercase	CIRISPersist	src/federation/trust_root.rs#ACCORD_HEARTBEAT_DIMENSION	ciris-persist@50.0.0
+3.1.2	CLM-hardware-custody-vocabulary	CIRISPersist	src/federation/hardware_attestation.rs#HardwareTypePlatform	ciris-persist@50.0.0
+3.1.2	CLM-hardware-custody-vocabulary	CIRISPersist	src/federation/hardware_attestation.rs#hardware_class_multiplier	ciris-persist@50.0.0
+5.4.6	CLM-minor-no-federation-binding	CIRISPersist	src/federation/admission.rs#check_minor_owner_binding_not_announced	ciris-persist@50.0.0
