@@ -46,7 +46,7 @@ Messages and files written before a person's second device joined did not open o
 - I189 (a–i on memory, sqlite, postgres, plus the same sequence through an `OpsDirectory`). Edge's `bridge.rs` match on the old shape fails to compile on re-pin (intended: route through `attestation_outcome_to_apply`).
 
 ### Pins moved
-- Both directory-capsule wire digests (appended ops and result variant, #917): growth, `DIRECTORY_ABI_VERSION` stays 5. `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH` and `ENVELOPE_VOCABULARY_SHA256` are unchanged (no kind, no vocabulary change). No migration.
+- Both directory-capsule wire digests (appended ops and result variant, #917): op → `6611b3942471f85226d49d6702b3bc07880eb7f8fe0acd940b5f02d79f5c8d0d`, result → `457dad6209a9ba4fd0b322e3a24feb8b3163c6172e6f38afedd48665a8b47aec`; growth, `DIRECTORY_ABI_VERSION` stays 5. `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH` and `ENVELOPE_VOCABULARY_SHA256` are unchanged (no kind, no vocabulary change). No migration.
 - `BlobStorage` gains required `load_or_init_content_master_row` (#920) and `community_dek_member_grant_epochs` (#916); `FederationDirectory` gains defaulted `rewrap_own_epochs_for_device` (#916).
 
 ### Witnesses
