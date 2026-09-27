@@ -395,8 +395,11 @@ The exact-count pin in `evidence_cc_impl_rows_pin_the_current_crate_version` mov
 7. **"Infrastructure family" is not representable.** A `Family` has no `cohort_subkind`, so #927's refusal is on communities. `family_quorum_over` gains no identity filter: #925 is scoped to `infrastructure` communities.
 8. **The withdraws WRITE gate walks 5 hops, and each stored row keeps the depth it was admitted under** (review H2; final check: the depth is persisted, V157).
    - **The write gate** (`check_withdraws_admission`) walks rules 3/4 at the node's `withdraws_delegation_depth()`: the CC 4.1.1 default (5), unless the host opted in with `set_withdraws_delegation_depth(n)`, clamped at 16. A NEW withdraws over a chain deeper than that is refused with `beyond_delegation_depth_cap: true`.
-   - **The depth is recorded with the row.** V157 adds `federation_withdraws_admission_depths(attestation_id, depth)` on sqlite and postgres (the memory backend mirrors it). Every backend's `put_attestation` records the depth in the same write, and on postgres right after the insert.
+   - **The depth is recorded with the row, in ONE transaction.** V157 adds `federation_withdraws_admission_depths(attestation_id, depth)` on sqlite and postgres (the memory backend mirrors it under one lock). `put_attestation` writes the row and its depth in one transaction on both SQL dialects, so a failed depth write rolls the row back.
+   - **Repair.** An identical re-put of a held `withdraws` whose depth is missing records it, on both `AlreadyHeld` paths (the structural-composer dedup and the id collision) on all three backends.
+   - **The local-tier doors (3d)** (`attestation_insert_local` / `_upsert_local` → `sqlite_write_local_attestation`, `pg_write_local_attestation`, `memory_write_local_attestation`) also record the node's depth for a `withdraws` row, in their own transaction. A local row becomes a federation row IN PLACE at `enter_mesh`, where `list_attestations_referencing` sees it. The blob doors (`put_blob_with_scope`, `adopt_sealed_blob_at`) write `holds_bytes` rows and never a `withdraws`.
    - **Backfill.** Every `withdraws` stored before V157 was admitted under the 16-hop walk and is backfilled at 16. A row with nothing recorded reads as 16. The bytes are pinned in `evidence/migration_checksums.tsv`.
+   - **The pub read form.** `admission::check_withdraws_admission_as_admitted(dir, row)` re-derives a STORED withdraws at the row's recorded depth (nothing recorded reads as 16). `blob_tombstone::retiring_composer` uses it. CIRISServer's `drive.rs` (`withdrawn_by`) and CIRISEdge's `blob_swarm/revocation.rs` must call it instead of the write form: the write form walks the node's current depth, so it un-retires. The capsule proxy forwards the recorded depth (op `WithdrawsAdmissionDepth`) and never guesses.
    - **The bytes-plane fold re-derives at the ROW's depth.** `blob_tombstone::retiring_composer` still re-walks the edges as they stand now (#853: re-derive, never read the stored rule), at `withdraws_admission_depth(row)`. So a pre-v50 withdraws keeps retiring what it retired. A NEW withdraws admitted by the deferred arm (target absent at admission) can no longer retire bytes through a chain deeper than the gate that admitted it walked, which closes the plane split the ceiling rule left open.
    - **Witnesses:**
      - `withdraws_retire_at_their_admission_depth` (memory, sqlite, postgres; the runner sets the opt-in):
@@ -404,9 +407,10 @@ The exact-count pin in `evidence_cc_impl_rows_pin_the_current_crate_version` mov
        - (B) with the target present it is refused, too deep;
        - (C) under an opt-in to 6 it is recorded at 6 and retires.
      - `sqlite::tests::withdraws_admission_depth_is_backfilled` (V156 → V157 migration witness): a pre-V157 withdraws gets 16; a non-withdraws row gets nothing.
-   - **Residuals:**
-     - The postgres write records the depth right after the insert, not in the same transaction. A lost write reads as 16, the legacy depth.
-     - The capsule proxy's `withdraws_admission_depth` is the trait default (`None` → 16). A fold run over the capsule proxy reads the ceiling.
+     - (D) in the same body: the pub `check_withdraws_admission_as_admitted` admits a 16-depth row and a 6-depth opt-in row, and refuses (A)'s 5-depth deferred row.
+     - `withdraws_depth_is_written_with_the_row_{sqlite,postgres}`: with the depth store broken, the put fails and leaves NO attestation row; healed, it lands at 5; with that depth deleted, an identical re-put is `AlreadyHeld` and restores it. `memory::tests::withdraws_depth_is_repaired_on_an_identical_reput_memory` covers the repair.
+     - `local_withdraws_records_its_depth` (×3).
+     - The capsule `withdraws_admission_depth_op_forwards_the_recorded_depth`.
    - **Mixed-fleet divergence (stated, until the fleet upgrades):** a v49 node admits a 6-to-16-hop withdraws that a v50 node refuses at its replicated door. The bytes it withdraws stay live on the v50 node until the fleet upgrades. This belongs in the release note.
 9. **Fixtures.** Infrastructure community fixtures in memory, sqlite, postgres and `community_dek` declared `majority` / `founder_only` and now declare `quorum:1/1`, through `tier_ingest::test_support::fixture_protocol`.
 
@@ -485,12 +489,13 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
 - **Two doors, strict by default.**
   - `put_community` (the trait door on all three backends; pyo3 `put_community_json`; the Engine's `put_community_self_signed`) is the LOCAL door. It runs `admission::check_infrastructure_record_admission(dir, record)`, the full CC 3.2 infrastructure gate, whoever signed. An identical re-put (same `persist_row_hash`) settles.
   - `FederationDirectory::apply_replicated_community(record) -> ReplicatedCommunityOutcome` is the REPLICATED entry.
-    - It returns `Inserted`, `Unchanged`, `Superseded`, or `Refused { conflicting_record }`.
+    - It returns `Inserted`, `Unchanged`, `Superseded`, or `Refused { conflicting_record | degrades_conformance }`.
     - A legacy non-conformant infrastructure record is admitted as data, and the fold's gates apply.
     - An occupied id routes through the existing amendment checks (`route_occupied_community`).
     - It is on the trait (default `Unsupported`), overridden by every backend, carried by the capsule op `ApplyReplicatedCommunity` / result `ReplicatedCommunityOutcome` (growth; both digests re-pinned), and exposed as pyo3 `apply_replicated_community_json`.
   - Both doors share one store step, `put_community_at_door(record, CommunityDoor)`. A replication bridge (CIRISEdge) moves to the replicated entry.
 - **The local supersede doors are always judged.**
+- **A conformant room never degrades through the replicated door** (final check). `admission::check_replicated_supersede_does_not_degrade` refuses a received record that would supersede a STORED infrastructure record which passes conformance with one that fails it: `founder_only`, bare `majority`, a node-bearing founder, `N` ≠ founders. This holds whatever founders' proof the record carries (CC 3.2: a weakening supersede MUST be rejected). The refusal is typed: `Refused { degrades_conformance }`. A legacy room — nothing stored, or the stored version already non-conformant — still syncs. Witness `replicated_supersede_never_degrades_a_conformant_room` (×3): a proof-carrying supersede of a conformant `quorum:2/2` room to `founder_only`, and one seating a `node` founder under `quorum:3/3`, are both refused and change nothing; a legacy `majority` room still takes a proof-carrying supersede (`Superseded`).
 - **Witnesses:**
   - `infrastructure_record_authored_elsewhere_is_data` (two nodes, BOTH with their node key SET, ×3 backends):
     - a human-signed `founder_only` infrastructure record through the local door is refused;
@@ -505,17 +510,18 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
 **M1 loophole (final check) — `N` is the founder count.** The evaluator reads `quorum:M/N` with an ABSOLUTE `M` and never compares `N` with the founders, so `quorum:1/1` over three founders let one of them admit alone.
 - `check_infrastructure_consensus_protocol` now requires `N` == the record's founder count (`INFRA_RULE_QUORUM_N_NOT_FOUNDERS`), on top of the parser's `M ≥ 2 when N ≥ 2`.
 - In a CONFORMANT infrastructure room, `check_infrastructure_founder_count_unchanged` refuses any widening (add, promote, demote) or revocation that would move the founder count, at the widening and revocation doors of all three backends. The founder set moves by a supersede that re-declares `N`.
+- **Founder self-leave is exempt** (ruled 2026-09-27: v49's consent floor stands). A revocation signed by the removed founder is admitted, as `roster_event_standing` admits any self-leave. **Consequence (for the CHANGELOG):** N is the founder count AS ADMITTED. A self-leave may leave the remaining founders unable to reach M. The room is then frozen (no roster change, no supersede) until its conferring authority re-founds it; for `ciris-canonical`, that is an accord re-birth. The last-founder rule still refuses the last founder's leave.
 - A legacy non-conformant room (replicated data) is not re-judged on its roster plane.
 - The record checks run in this order: a founder exists, then the protocol and its `N`, then node-bearing founders.
 - **Witnesses:**
   - `infrastructure_protocol_must_be_quorum`: `quorum:1/1` over 3 founders and `quorum:2/3` over 2 are refused; `2/3` over 3 is admitted.
-  - `infrastructure_founder_count_is_fixed_by_the_record`: under `quorum:2/2` over 2 founders, adding a founder and removing one are refused, and a plain member is admitted.
+  - `infrastructure_founder_count_is_fixed_by_the_record`: under `quorum:2/3` over 3 founders, two founders adding a fourth is refused, and two founders removing the third is refused. A plain member is admitted, and the third founder leaving on their own signature is admitted.
 
 **H3's fifth door (final check) — `add_peer_record` is a local mint.** `check_peer_record_admission` runs Clause A on the record the door would write (a caller-supplied `identity_type`). It is reachable from pyo3 `add_peer_record_json` and the capsule op. Witness `clause_a_peer_record_is_a_local_mint` (×3). The rewrite doors' pure predicate `check_node_identity_unchanged` is pinned by the unit test `check_node_identity_unchanged_refuses_only_a_node_move`. The reanchor door's BELIEVED status rests on that tested predicate.
 
 **LOW (final check).**
 - `occurrence_agreed_to` has no owner-binding arm. It could only fire for a pre-gate fused identity, where it is unilateral again.
-- The M5 sentence is corrected: the NEW refusals are typed (`node_identity_fused` / `node_identity_changed`, and on the community plane `conflicting_record`). Not every error of every apply arm is.
+- The M5 sentence is corrected: the NEW refusals are typed (`node_identity_fused` / `node_identity_changed`, and on the community plane `conflicting_record` / `degrades_conformance`). Not every error of every apply arm is, and the replicated community outcome's doc says "the refusals are typed", not "every arm is Ok".
 - The backdated-revocation clamp (a revocation's signer-chosen `effective_at` can reach back before the act it ends) is routed to **CIRISPersist#930** with the per-assertion occurrence history.
 
 **H3 strengthened — `node` never moves on a rewrite.**
@@ -591,6 +597,18 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
   - `add_peer_record` refuses a fused `identity_type`.
   - A conformant infrastructure room's founder count is fixed by its record.
 
+**Final-check round 2 additions:**
+- `admission::check_withdraws_admission_as_admitted` (pub).
+- `admission::check_replicated_supersede_does_not_degrade` (pub).
+- `ReplicatedCommunityRefusal::DegradesConformance` (`degrades_conformance`).
+- Capsule op `WithdrawsAdmissionDepth` / result `WithdrawsAdmissionDepth(Option<u32>)` (growth; digests re-pinned; ABI 6).
+- `check_infrastructure_founder_count_unchanged` gains a `self_leave` parameter.
+- **Behaviour:**
+  - The depth is written in the row's transaction and repaired on an identical re-put.
+  - The local-tier doors record a `withdraws` row's depth.
+  - A founder may self-leave a conformant infrastructure room (it may then freeze).
+  - A conformant room never degrades through the replicated door.
+
 ### 8.9 Mutation round 3 (committed `8a3c1e66`)
 
 Lane: the original eight words plus `test(rc5_adopts) | test(abi_version)`, `--features sqlite,postgres` under `scripts/pg_test_db.sh -- cargo nextest run -j 3`. Baseline 163/163, postgres legs against a database. Every mutant was re-run because the fold and the keypairs changed. The script is uniquely named (`rc5s_mut.py`, clean-tree assert). **30/31 killed at `8a3c1e66`; P3 then gained its witness and is killed at `86fd2b12` — 31/31**. None OOM-killed. "×3" = memory, sqlite, postgres.
@@ -655,3 +673,23 @@ Lane: round 3's, plus `test(replicated_community) | test(backfilled) | test(node
 | P1 | last-founder counts node-bearing founders | 3 | last-founder witness ×3 |
 | P2 | root-authority cut dropped | 3 | moderation-root witness ×3 |
 | P3 | duty holders keep node-bearing founders | 3 | duty-holder witness ×3 |
+
+### 8.11 Mutation round 5 (final check round 2, committed `cf6ab4db`)
+
+Lane: round 4's, plus `test(withdraws_depth) | test(withdraws_admission_depth_op)`. Baseline 185/185, postgres against a database. **11/11 killed**, none OOM-killed. W2 (the recorded value) is not re-run: its anchor now appears on two doors (put and local), and each has its own witness below.
+
+| # | Mutant | Failed | Killed by |
+|---|---|---|---|
+| T1 | sqlite commits the row before the depth write | 1 | `withdraws_depth_is_written_with_the_row_sqlite` (the row survives a failed depth write) |
+| T2 | postgres commits the row before the depth write | 1 | `withdraws_depth_is_written_with_the_row_postgres` |
+| RP1 | sqlite dedup-path repair dropped | 1 | the same sqlite witness (the repair step) |
+| AH1 | the pub read form walks the node's current depth | 3 | `withdraws_retire_at_their_admission_depth` ×3 (D) |
+| CP1 | the capsule op returns `None` | 1 | `withdraws_admission_depth_op_forwards_the_recorded_depth` |
+| DG1 | the degrade check dropped | 3 | `replicated_supersede_never_degrades_a_conformant_room` ×3 |
+| SL1 | the self-leave exemption dropped | 3 | `infrastructure_founder_count_is_fixed_by_the_record` ×3 |
+| LD1 | sqlite local door records no depth | 1 | `local_withdraws_records_its_depth` sqlite |
+| D1 | local door lenient (re-run) | 4 | protocol, founder, H1 and door-split witnesses on sqlite |
+| D2 | replicated entry strict (re-run) | 6 | door-split; the legacy plants; the degrade witness |
+| N7 | roster founder-count guard dropped (re-run) | 3 | founder-count witness ×3 |
+
+The id-collision repair path for a `withdraws` is reachable only when the structural-composer dedup does not match first. For an identical re-put, the dedup always matches first, so a mutant of that second repair would be equivalent. It is kept as a belt, and not claimed as witnessed.
