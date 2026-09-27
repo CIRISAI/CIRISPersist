@@ -868,6 +868,33 @@ pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
     Ok(())
 }
 
+/// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — **`node` is
+/// exclusive.** A key record whose `identity_type` set contains `node` MUST NOT
+/// also contain `agent` or `user`: a key is substrate or actor, never both
+/// (the axis-fusion defect — one key answering both "which node" and "which
+/// agent"). Other co-locations on the substrate side (`canonical`, `steward`,
+/// `substrate_persist`, `witness`, …) stay conformant.
+///
+/// The key-record door: every backend's `put_public_key` runs it right after
+/// [`validate_registration_pubkey`], so every mint (`register_federation_key`
+/// verifies, then stores through `put_public_key`) and every replicated
+/// `Insert` (which stores through `put_public_key`) runs it. It is NOT run by
+/// the replicated upgrade / rebind / supersede arms over an EXISTING row: those
+/// do not mint a key, and a pre-gate fused key is Clause B's to gate, not a
+/// row this door can un-store. Clause B ([`check_node_agency_admission`](super::admission::check_node_agency_admission))
+/// is unchanged: it still gates fused keys that pre-date this door.
+pub fn check_node_identity_exclusive(record: &KeyRecord) -> Result<(), Error> {
+    use crate::federation::types::identity_type as it;
+    let set = it::parse_set(&record.identity_type);
+    if set.contains(&it::NODE) && (set.contains(&it::AGENT) || set.contains(&it::USER)) {
+        return Err(Error::NodeIdentityNotExclusive {
+            key_id: record.key_id.clone(),
+            identity_type: record.identity_type.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// v21.0.0 (CIRISPersist#502 E2) — does this record claim a role-gated
 /// identity? Canonical / accord_holder / infra:attest / co-steward
 /// registrations have their OWN admission (m-of-n co-scrub / HW), enforced

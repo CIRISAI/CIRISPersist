@@ -1742,7 +1742,9 @@ pub async fn dispatch_directory_op(
             match crate::federation::topology::build_delegation_graph(
                 dir,
                 &from_key,
-                max_depth as usize,
+                // The op always names a depth: an explicit caller choice
+                // (CC 4.1.1 opt-in), clamped at the ceiling.
+                Some(max_depth as usize),
             )
             .await
             {
@@ -5500,7 +5502,7 @@ mod tests {
             .block_on(crate::federation::topology::build_delegation_graph(
                 dir.as_ref(),
                 "root-key",
-                3,
+                Some(3),
             ))
             .expect("direct build_delegation_graph");
         match res {

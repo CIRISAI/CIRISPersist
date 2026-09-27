@@ -306,6 +306,14 @@ where
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
     super::verify_community_admission(dir, &new).await?;
+    // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — the supersede is gated as the
+    // record it replaces was: an infrastructure record stays quorum:M/N with
+    // no node-bearing founder.
+    super::admission::check_infrastructure_community_conformance(
+        dir.as_dyn_directory(),
+        &new.community,
+    )
+    .await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",

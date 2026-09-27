@@ -2727,6 +2727,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // backend that skipped this, so a malformed key it accepted was
         // refused by sqlite/postgres — restore the parity.
         crate::federation::register::validate_registration_pubkey(&row)?;
+        // v50.0.0 (CIRISPersist#925 ask 5) — CC 3.4.7.3 Clause A at the
+        // key-record door: `node` never shares a key with `agent` / `user`.
+        crate::federation::register::check_node_identity_exclusive(&row)?;
 
         // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation admission
         // gate for accord_holder rows. Runs BEFORE persist_row_hash + insert
@@ -6141,6 +6144,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // itself), so it MUST run before the state lock below to avoid a
         // re-entrant deadlock. No-op for infrastructure communities and
         // for rosters with no node/agent members.
+        // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — infrastructure conformance:
+        // a quorum:M/N protocol and no node-bearing founder. Reads the directory, so
+        // before any state lock.
+        crate::federation::admission::check_infrastructure_community_conformance(self, &row)
+            .await?;
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
         // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
@@ -7081,6 +7089,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             members: vec![row.member()],
             ..community
         };
+        // v50.0.0 (CIRISPersist#925) — a widening that seats a node-bearing
+        // key as founder of an infrastructure community is refused.
+        crate::federation::admission::check_infrastructure_founders_not_node(self, &probe).await?;
         crate::federation::admission::check_community_membership_steward_binding(self, &probe)
             .await?;
         let wire_index_key = {

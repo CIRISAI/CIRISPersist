@@ -558,9 +558,10 @@ pub use tier_ingest::{
     verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
 };
 pub use topology::{
-    build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
-    DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
-    WithdrawalEntry, MAX_DELEGATION_DEPTH,
+    build_delegation_graph, build_trust_topology, effective_delegation_depth, AuditChainEntry,
+    AuditChainProof, DelegationDepthOutcome, DelegationEdge, DelegationGraph, EdgeType,
+    FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology, WithdrawalEntry,
+    DEFAULT_DELEGATION_DEPTH, MAX_DELEGATION_DEPTH,
 };
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
@@ -747,19 +748,30 @@ pub struct RosterRules<'a> {
     pub subkind: Option<&'a str>,
     /// The record's `policy_blob`.
     pub policy_blob: Option<&'a serde_json::Value>,
+    /// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — the
+    /// group's `node`-bearing keys, resolved from the roster reads by
+    /// [`community_node_bearing_seats`]. The evaluator drops these seats in an
+    /// `infrastructure` group; it never re-reads the directory itself.
+    pub node_bearing: &'a std::collections::BTreeSet<String>,
 }
 
+/// The empty `node`-bearing set: a group whose rules never read it (a family,
+/// or a community that is not `infrastructure`).
+pub static NO_NODE_BEARING_SEATS: std::collections::BTreeSet<String> =
+    std::collections::BTreeSet::new();
+
 impl<'a> RosterRules<'a> {
-    /// The rules a stored community declares.
-    pub fn of_community(c: &'a Community) -> Self {
+    /// The rules a stored community declares, with its `node`-bearing seats
+    /// ([`community_node_bearing_seats`]).
+    pub fn of_community(
+        c: &'a Community,
+        node_bearing: &'a std::collections::BTreeSet<String>,
+    ) -> Self {
         Self {
             protocol: &c.consensus_protocol,
-            subkind: c
-                .policy_blob
-                .as_ref()
-                .and_then(|b| b.get("cohort_subkind"))
-                .and_then(|v| v.as_str()),
+            subkind: community_subkind(c),
             policy_blob: c.policy_blob.as_ref(),
+            node_bearing,
         }
     }
 
@@ -772,8 +784,78 @@ impl<'a> RosterRules<'a> {
             protocol: &f.consensus_protocol,
             subkind: None,
             policy_blob: None,
+            node_bearing: &NO_NODE_BEARING_SEATS,
         }
     }
+}
+
+/// A community's `policy_blob.cohort_subkind`, if any.
+#[must_use]
+pub fn community_subkind(c: &Community) -> Option<&str> {
+    c.policy_blob
+        .as_ref()
+        .and_then(|b| b.get("cohort_subkind"))
+        .and_then(|v| v.as_str())
+}
+
+/// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — is
+/// `key_id` a `node`-bearing key? True when its own `federation_keys` row's
+/// `identity_type` set contains `node`, or when it is an ACTIVE occurrence of
+/// an identity whose row's set does ([`FederationDirectory::active_identities_for_occurrence`]).
+/// An unresolved key is not `node`-bearing here (it has no record to judge;
+/// the membership doors FK-refuse it).
+pub async fn is_node_bearing_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let has_node = |rec: &KeyRecord| {
+        types::identity_type::set_contains(&rec.identity_type, types::identity_type::NODE)
+    };
+    if let Some(rec) = directory.lookup_public_key(key_id).await? {
+        if has_node(&rec) {
+            return Ok(true);
+        }
+    }
+    for identity in directory.active_identities_for_occurrence(key_id).await? {
+        if let Some(rec) = directory.lookup_public_key(&identity).await? {
+            if has_node(&rec) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// v50.0.0 (CIRISPersist#925) — the `node`-bearing keys among every key that
+/// is ever a member of `community` (the record's members and every widened
+/// member), for [`RosterRules::node_bearing`]. Empty — and no read is made —
+/// unless the community is `infrastructure`: the rule is CC 3.2's, scoped to
+/// that subkind.
+pub async fn community_node_bearing_seats<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<std::collections::BTreeSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = std::collections::BTreeSet::new();
+    if community_subkind(community) != Some(admission::COHORT_SUBKIND_INFRASTRUCTURE) {
+        return Ok(out);
+    }
+    let mut keys: std::collections::BTreeSet<String> =
+        community.members.iter().map(|m| m.key_id.clone()).collect();
+    for w in directory
+        .list_community_membership_widenings_for(&community.community_key_id)
+        .await?
+    {
+        keys.insert(w.member_key_id);
+    }
+    for k in keys {
+        if is_node_bearing_key(directory, &k).await? {
+            out.insert(k);
+        }
+    }
+    Ok(out)
 }
 
 /// v49.0.0 (CIRISPersist#910) — a family roster entry in the fold's member
@@ -852,6 +934,7 @@ pub fn roster_event_standing(
             .map(|(_, m)| consensus::Seat {
                 key_id: m.key_id.clone(),
                 role: m.role.clone(),
+                node_bearing: rules.node_bearing.contains(&m.key_id),
             })
             .collect();
         match consensus::evaluate(&consensus::Ballot {
@@ -1304,6 +1387,7 @@ where
 pub async fn community_roster_events<F>(
     directory: &F,
     community: &Community,
+    node_bearing: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<RosterEvent>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1341,7 +1425,7 @@ where
         cohort::Cohort::Community,
         id,
         &community.members,
-        RosterRules::of_community(community),
+        RosterRules::of_community(community, node_bearing),
         stored,
         &signers,
         Some(&roots),
@@ -1445,8 +1529,9 @@ pub async fn authorized_community_roster_spans_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let events = Box::pin(community_roster_events(directory, community)).await?;
-    let rules = RosterRules::of_community(community);
+    let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
+    let events = Box::pin(community_roster_events(directory, community, &nodes)).await?;
+    let rules = RosterRules::of_community(community, &nodes);
     let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
     Ok(
         authorized_roster_at(&community.members, rules, &events, as_of)
@@ -1471,10 +1556,11 @@ where
 {
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
-    let events = Box::pin(community_roster_events(directory, community)).await?;
+    let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
+    let events = Box::pin(community_roster_events(directory, community, &nodes)).await?;
     Ok(authorized_roster_at(
         &community.members,
-        RosterRules::of_community(community),
+        RosterRules::of_community(community, &nodes),
         &events,
         as_of,
     ))
@@ -1567,7 +1653,8 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
-    let events = Box::pin(community_roster_events(directory, &community)).await?;
+    let nodes = Box::pin(community_node_bearing_seats(directory, &community)).await?;
+    let events = Box::pin(community_roster_events(directory, &community, &nodes)).await?;
     let roots = founder_candidates(
         &community,
         &directory
@@ -1578,7 +1665,7 @@ where
         directory,
         community_key_id,
         &community.members,
-        RosterRules::of_community(&community),
+        RosterRules::of_community(&community, &nodes),
         events,
         Some(roots),
         primary,
@@ -5846,6 +5933,9 @@ pub trait FederationDirectory: Send + Sync {
                     .map(|m| consensus::Seat {
                         key_id: m.key_id,
                         role: m.role,
+                        // A family has no `cohort_subkind`; the #925 filter
+                        // never reads this.
+                        node_bearing: false,
                     })
                     .collect();
                 (f.consensus_protocol, None, None, roster)
@@ -5860,11 +5950,16 @@ pub trait FederationDirectory: Send + Sync {
                     .and_then(|b| b.get("cohort_subkind"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
+                // v50.0.0 (CIRISPersist#925) — the `node`-bearing seats,
+                // resolved here from the roster reads, never inside the
+                // evaluator.
+                let nodes = Box::pin(community_node_bearing_seats(self, &c)).await?;
                 let roster = self
                     .active_community_members(group_key_id)
                     .await?
                     .into_iter()
                     .map(|m| consensus::Seat {
+                        node_bearing: nodes.contains(&m.key_id),
                         key_id: m.key_id,
                         role: m.role,
                     })
@@ -9276,6 +9371,11 @@ pub enum Error {
         issuer: String,
         /// The `attestation_id` of the target `T` being withdrawn.
         target_attestation_id: String,
+        /// v50.0.0 (CIRISPersist#928, CC 4.1.1) — a `consent_revocation`
+        /// chain continued past the default depth cap (5): the proxy authority
+        /// may exist but is too deep to confer (self_verify only). `false`
+        /// when no chain reached the cap — nothing is there.
+        beyond_delegation_depth_cap: bool,
     },
 
     /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10 / §11.11 /
@@ -9735,6 +9835,44 @@ pub enum Error {
         member_role: &'static str,
     },
 
+    /// v50.0.0 (CIRISPersist#925/#927, CC 3.2 / CC 3.4.2) — an
+    /// `infrastructure` community record (or its supersede, or a widening
+    /// that promotes a founder) is non-conformant:
+    /// `hard_case:community_consensus_protocol_violation`. `rule` is
+    /// [`admission::INFRA_RULE_NODE_BEARING_FOUNDER`] (a `node`-bearing key
+    /// listed as founder — infrastructure does not vote) or
+    /// [`admission::INFRA_RULE_PROTOCOL_NOT_QUORUM`] (the protocol is not
+    /// `quorum:M/N`). Nothing is stored. Stable `kind()` token
+    /// `federation_community_consensus_protocol_violation`.
+    #[error(
+        "hard_case:community_consensus_protocol_violation:{community_key_id} ({rule}): {detail}"
+    )]
+    CommunityConsensusProtocolViolation {
+        /// The community whose record is non-conformant.
+        community_key_id: String,
+        /// Which CC 3.2 conformance rule refused.
+        rule: &'static str,
+        /// A human-readable account.
+        detail: String,
+    },
+
+    /// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — a key record
+    /// whose `identity_type` set contains `node` together with `agent` or
+    /// `user` was refused at the key-record door: a key is substrate or actor,
+    /// never both. Nothing is stored. Existing fused keys are not repaired by
+    /// this (Clause B still gates them wherever they appear). Stable `kind()`
+    /// token `federation_node_identity_not_exclusive`.
+    #[error(
+        "key {key_id:?} identity_type {identity_type:?} fuses node with an actor role \
+         (CC 3.4.7.3 Clause A: node is exclusive of agent and user)"
+    )]
+    NodeIdentityNotExclusive {
+        /// The refused record's `key_id`.
+        key_id: String,
+        /// The refused `identity_type` set as submitted.
+        identity_type: String,
+    },
+
     /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a `delegates_to`
     /// whose TARGET (`attested_key_id`) resolves to a `user`-role identity was
     /// REFUSED by the CC 3.2 user-target steward-binding gate. "Stewarding a
@@ -10149,6 +10287,10 @@ impl Error {
             Error::AccordEvidenceUnverified { .. } => "accord_evidence_unverified",
             Error::AccordEvidenceCarrierMalformed { .. } => "accord_evidence_carrier_malformed",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
+            Error::CommunityConsensusProtocolViolation { .. } => {
+                "federation_community_consensus_protocol_violation"
+            }
+            Error::NodeIdentityNotExclusive { .. } => "federation_node_identity_not_exclusive",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
             }

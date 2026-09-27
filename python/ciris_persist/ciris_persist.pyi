@@ -2723,7 +2723,7 @@ class Engine:
         matching row (no error — callers treat as stale id).
         """
 
-    def delegates_to_graph(self, from_key: str, max_depth: int) -> str:
+    def delegates_to_graph(self, from_key: str, max_depth: int | None = None) -> str:
         """(derived) empirical — v2.7.0 (CIRISPersist#104) — Delegation-graph BFS from from_key. Returns a JSON [crate::federation::DelegationGraph] with one [crate::federation::De..."""
 
     def delegations_to_json(self, key_id: str) -> str:

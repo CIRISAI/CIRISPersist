@@ -57,6 +57,13 @@ pub struct Seat {
     pub key_id: String,
     /// The member's role tag (`founder`, `member`, operator vocabulary), if any.
     pub role: Option<String>,
+    /// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — the
+    /// member's key is `node`-bearing: its own `identity_type` contains `node`,
+    /// or it is an occurrence of an identity whose `identity_type` does. The
+    /// caller resolves this from the roster reads (the evaluator stays pure);
+    /// [`eligible`] drops such a seat in an `infrastructure` group whatever its
+    /// role tag says.
+    pub node_bearing: bool,
 }
 
 impl Seat {
@@ -110,11 +117,19 @@ impl Verdict {
 
 /// The eligible set: founders only for `cohort_subkind: infrastructure`
 /// (CC 4.4.3.2.4.1(a)), the whole active roster otherwise.
+///
+/// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — in an
+/// `infrastructure` group a `node`-bearing seat is DROPPED even when it is
+/// tagged `founder`. The admission gate refuses such a row now, but rows
+/// admitted before the gate still exist; non-conformance is a reason to
+/// re-mint, never a reason the fold stops applying (the CC 3.4.7.3 Clause B
+/// posture). A dropped seat is not eligible, so its signature counts for
+/// nothing and it does not enlarge the denominator either.
 fn eligible<'a>(b: &Ballot<'a>) -> Vec<&'a Seat> {
     let founders_only = b.subkind == Some("infrastructure");
     b.roster
         .iter()
-        .filter(|s| !founders_only || s.is_founder())
+        .filter(|s| !founders_only || (s.is_founder() && !s.node_bearing))
         .collect()
 }
 
@@ -400,6 +415,7 @@ mod tests {
             .map(|(k, r)| Seat {
                 key_id: (*k).into(),
                 role: r.map(str::to_owned),
+                node_bearing: false,
             })
             .collect()
     }
@@ -531,5 +547,44 @@ mod tests {
             eval("whatever", &r, &["a"], None, Direction::Add),
             Verdict::Unevaluable { .. }
         ));
+    }
+
+    /// v50.0.0 (CIRISPersist#925) — a `node`-bearing key tagged `founder` in an
+    /// `infrastructure` group is not an eligible seat: it neither votes nor
+    /// counts in the denominator.
+    #[test]
+    fn node_founder_seat_is_not_eligible() {
+        let mut r = seats(&[("human", Some("founder")), ("install", Some("founder"))]);
+        r[1].node_bearing = true;
+        let b = Ballot {
+            protocol: "quorum:1/2",
+            subkind: Some("infrastructure"),
+            policy_blob: None,
+            roster: &r,
+            signers: &signers(&["install"]),
+            direction: Direction::Add,
+        };
+        let elig: Vec<&str> = eligible(&b).iter().map(|s| s.key_id.as_str()).collect();
+        assert_eq!(
+            elig,
+            vec!["human"],
+            "the node seat is dropped from the eligible set"
+        );
+        let v = evaluate(&b);
+        assert!(
+            !v.admits(),
+            "quorum:1/2 over one human founder + one node 'founder': the node's scrub \
+             does not admit: {v:?}"
+        );
+        assert!(
+            evaluate(&Ballot {
+                signers: &signers(&["human"]),
+                ..b
+            })
+            .admits(),
+            "the human founder's scrub still admits"
+        );
+        // Outside infrastructure the rule does not apply (CC 3.2 scopes it).
+        assert!(evaluate(&Ballot { subkind: None, ..b }).admits());
     }
 }

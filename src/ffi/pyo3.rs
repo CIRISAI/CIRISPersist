@@ -23257,16 +23257,20 @@ impl PyEngine {
     /// [`crate::federation::DelegationGraph`] with one
     /// [`crate::federation::DelegationEdge`] per `delegates_to:*`
     /// row reachable within `max_depth` (clamped to
-    /// [`crate::federation::MAX_DELEGATION_DEPTH`]).
+    /// [`crate::federation::MAX_DELEGATION_DEPTH`]). v50.0.0
+    /// (CIRISPersist#928, CC 4.1.1): `max_depth=None` walks the default 5
+    /// hops; a chain past the cap is reported in `depth_outcome` as
+    /// `beyond_cap_self_verify`.
     ///
     /// `withdraws` / `recants` rows are surfaced as a per-edge
     /// [`crate::federation::WithdrawalEntry`] annotation, not
     /// filtered out — UI policy decides whether to render the edge.
+    #[pyo3(signature = (from_key, max_depth=None))]
     fn delegates_to_graph(
         &self,
         py: Python<'_>,
         from_key: &str,
-        max_depth: usize,
+        max_depth: Option<usize>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -24878,6 +24882,8 @@ impl PyEngine {
                     "substrate_unavailable"
                 }
                 crate::federation::ReachabilityVerdict::NoTrustRoots => "no_trust_roots",
+                // v50.0.0 (CIRISPersist#928, CC 4.1.1) — too deep, not absent.
+                crate::federation::ReachabilityVerdict::BeyondDepthCap => "beyond_depth_cap",
             };
             Ok(token.to_owned())
         })
@@ -33103,6 +33109,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // failure (non-infra membership is an authority act that must root
         // in an owner); ValueError (4xx).
         crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
+        // v50.0.0 (CIRISPersist#925/#927) — a non-conformant infrastructure
+        // record and a fused node key are the submitter's to re-mint: 4xx.
+        crate::federation::Error::CommunityConsensusProtocolViolation { .. }
+        | crate::federation::Error::NodeIdentityNotExclusive { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused
         // user-target steward-binding (target is a self-sovereign adult / its
         // age is unverified / the granter is not a proven adult user) is a

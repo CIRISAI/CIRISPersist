@@ -3993,6 +3993,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // point) at admission for EVERY registration path — the backstop the
         // #275 saga proved was missing. Runs first so a bad key leaves no trace.
         crate::federation::register::validate_registration_pubkey(&row)?;
+        // v50.0.0 (CIRISPersist#925 ask 5) — CC 3.4.7.3 Clause A at the
+        // key-record door: `node` never shares a key with `agent` / `user`.
+        crate::federation::register::check_node_identity_exclusive(&row)?;
 
         // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
         // admission gate for accord_holder rows. Runs BEFORE
@@ -7407,6 +7410,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // non-infrastructure community membership. Directory reads run
         // before the write lock below. No-op for infrastructure
         // communities and for rosters with no node/agent members.
+        // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — infrastructure conformance:
+        // a quorum:M/N protocol and no node-bearing founder. Reads the directory, so
+        // before any state lock.
+        crate::federation::admission::check_infrastructure_community_conformance(self, &row)
+            .await?;
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
         // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
@@ -8589,6 +8597,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             members: vec![row.member()],
             ..community
         };
+        // v50.0.0 (CIRISPersist#925) — a widening that seats a node-bearing
+        // key as founder of an infrastructure community is refused.
+        crate::federation::admission::check_infrastructure_founders_not_node(self, &probe).await?;
         crate::federation::admission::check_community_membership_steward_binding(self, &probe)
             .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -44629,7 +44640,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let graph = crate::federation::build_delegation_graph(&backend, "del-root", 4)
+        let graph = crate::federation::build_delegation_graph(&backend, "del-root", Some(4))
             .await
             .unwrap();
         assert_eq!(graph.root_key, "del-root");
@@ -45874,7 +45885,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let graph = crate::federation::build_delegation_graph(&backend, "cyc-a", 8)
+        let graph = crate::federation::build_delegation_graph(&backend, "cyc-a", Some(8))
             .await
             .unwrap();
         // Both edges discovered; the cycle does NOT cause a second
@@ -45933,7 +45944,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let graph = crate::federation::build_delegation_graph(&backend, "w-root", 4)
+        let graph = crate::federation::build_delegation_graph(&backend, "w-root", Some(4))
             .await
             .unwrap();
         assert_eq!(graph.edges.len(), 1);
@@ -45954,7 +45965,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let graph = crate::federation::build_delegation_graph(&backend, "solo-key", 4)
+        let graph = crate::federation::build_delegation_graph(&backend, "solo-key", Some(4))
             .await
             .unwrap();
         assert!(graph.edges.is_empty());
