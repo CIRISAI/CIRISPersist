@@ -1535,6 +1535,33 @@ where
     Ok(true)
 }
 
+/// Whether the local quorum-gated supersede of `community_key_id` is judged by
+/// the founders' link alone: the stored row is trust-root grade and its chain
+/// holds (`Rooted` or `Stalled`). Anything else — no row, an ordinary room, a
+/// `NotRooted` squat — keeps the generic folded-roster quorum.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn founders_link_is_the_quorum<F>(
+    directory: &F,
+    community_key_id: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(stored) = directory.lookup_community(community_key_id).await? else {
+        return Ok(false);
+    };
+    if !is_trust_root_grade(&stored) {
+        return Ok(false);
+    }
+    Ok(stored_standing(directory, community_key_id)
+        .await?
+        .held()
+        .is_some())
+}
+
 /// The local supersede door's half (`supersede_community_signed`): for a
 /// ROOTED trust-root row, the new version must be a verified founders' link of
 /// the held one ([`verify_founders_link`]) whose founders all count now, and it

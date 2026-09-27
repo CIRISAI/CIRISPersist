@@ -6587,13 +6587,22 @@ pub trait FederationDirectory: Send + Sync {
             &new.community.consensus_protocol,
             &change_envelope,
         )?;
-        self.verify_membership_quorum(
-            cohort::Cohort::Community,
-            &new.community.community_key_id,
-            &change_envelope,
-            &signatures,
-        )
-        .await?;
+        // v50.0.0 (CIRISPersist#926) — for a trust root whose chain holds, the
+        // quorum IS the founders' link (`prepare_trust_root_supersede`, below,
+        // before any write): the one predicate the replicated door runs. The
+        // folded roster would re-apply a resignation the record has since
+        // cleared by re-seating the key, so the two doors would disagree.
+        if !canonical_community::founders_link_is_the_quorum(self, &new.community.community_key_id)
+            .await?
+        {
+            self.verify_membership_quorum(
+                cohort::Cohort::Community,
+                &new.community.community_key_id,
+                &change_envelope,
+                &signatures,
+            )
+            .await?;
+        }
         let authorization = serde_json::json!({
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,

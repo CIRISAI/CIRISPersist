@@ -725,7 +725,14 @@ pub(crate) mod bodies {
         let e = founders_supersede(a, v2_body.clone(), &[FOUNDERS[0]])
             .await
             .expect_err("one founder is not the founders' quorum");
-        assert!(e.to_string().contains("not authorized"), "{e:?}");
+        assert!(
+            matches!(
+                &e,
+                Error::RosterAuthorityUnauthorized { rule, .. }
+                    if *rule == crate::federation::ROSTER_CONSENSUS_INSUFFICIENT
+            ),
+            "the founders' link judges the local door too: {e:?}"
+        );
         let mut loosened = v2_body.clone();
         loosened.consensus_protocol = "quorum:3/3".to_owned();
         let e = founders_supersede(a, loosened, &[FOUNDERS[0], FOUNDERS[1]])
@@ -1284,6 +1291,19 @@ pub(crate) mod bodies {
                 .founders,
             FOUNDERS.to_vec()
         );
+        // …and the re-seated founder's signature counts on a LATER link: the
+        // old resignation is not later than that link's prior version
+        // (MEDIUM-R (b)).
+        ts::register_hybrid_key_as(d, "or-serve-node", "or-serve-node", identity_type::NODE).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            d,
+            with_member(canonical_row(&FOUNDERS), "or-serve-node", "member"),
+            &[FOUNDERS[2], FOUNDERS[0]],
+        )
+        .await
+        .expect("a re-seated founder co-signs a later link");
+        assert!(cc::resolve_community(d, CANON).await.unwrap().is_some());
     }
 
     /// (o′) — MEDIUM-R: a founder cannot BACKDATE a resignation past a link
