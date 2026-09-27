@@ -195,6 +195,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (review, M1 loophole) — Gate: a roster change may not move the
     // founder count of a conformant infrastructure room.
     ("check_infrastructure_founder_count_unchanged", Class::Gate),
+    // v50.0.0 (final check) — Gate: a conformant stored room never degrades
+    // through the replicated door.
+    ("check_replicated_supersede_does_not_degrade", Class::Gate),
     // v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — Gate: refuses a
     // key record fusing `node` with `agent`/`user`.
     ("check_node_identity_exclusive", Class::Gate),

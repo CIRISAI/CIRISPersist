@@ -4906,6 +4906,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         ))
                     })?;
                 if dup_exists {
+                    // v50.0.0 (review H2, final check) — an identical re-put of
+                    // a held `withdraws` whose admission depth is missing
+                    // records it now (idempotent repair).
+                    if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+                    {
+                        let id = row.attestation_id.clone();
+                        let depth =
+                            crate::federation::FederationDirectory::withdraws_delegation_depth(self)
+                                as i64;
+                        self.write(move |conn| {
+                            conn.execute(
+                                "INSERT OR IGNORE INTO federation_withdraws_admission_depths \
+                                 (attestation_id, depth) \
+                                 SELECT attestation_id, ?2 FROM federation_attestations \
+                                  WHERE attestation_id = ?1",
+                                rusqlite::params![id, depth],
+                            )
+                        })
+                        .await
+                        .map_err(|e| {
+                            crate::federation::Error::Backend(format!(
+                                "withdraws depth repair: {e}"
+                            ))
+                        })?;
+                    }
                     // v38.5.0 (#771) — the dedup path already returned
                     // success; now it can say WHICH success it was.
                     return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
@@ -5131,10 +5156,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let offered_hash_for_compare = row.persist_row_hash.clone();
         let id_for_compare = row.attestation_id.clone();
         let inserted = self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            // v50.0.0 (review H2, final check) — ONE transaction for the row,
+            // its projections and its admission depth: a depth write that fails
+            // rolls the row back, so a stored `withdraws` never reads as the
+            // lenient 16-hop legacy depth by accident.
+            let tx = conn.transaction()?;
             // v36.0.0 (#668) — THIS node's serve position (V130).
             let admitted_at =
-                sqlite_next_plane_position(conn, "federation_attestations", POS_ATTESTATION)?;
-            conn.execute(
+                sqlite_next_plane_position(&tx, "federation_attestations", POS_ATTESTATION)?;
+            tx.execute(
                 "INSERT OR IGNORE INTO federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
@@ -5182,31 +5212,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // Return without touching the projections: they were derived
             // from these same bytes when the row first landed, and
             // re-deriving them for a duplicate is at best wasted work.
-            let changed = conn.changes() > 0;
+            let changed = tx.changes() > 0;
             if !changed {
                 return Ok(false);
             }
             // v17.4.0 (V106) — maintain the subject projection (federation
             // tier: put_attestation writes federation-visible rows).
             sqlite_project_attestation_subjects(
-                conn,
+                &tx,
                 &row,
                 crate::federation::types::attestation_tier::FEDERATION,
             )?;
             // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
             // projection (grant upsert / withdraws-revocation fold) in the
             // SAME locked scope as the insert above.
-            sqlite_project_consent_peer_set(conn, &row)?;
+            sqlite_project_consent_peer_set(&tx, &row)?;
             // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
             // `blob_renditions` projection in the SAME locked scope.
-            sqlite_project_rendition_row(conn, &row)?;
+            sqlite_project_rendition_row(&tx, &row)?;
             if let Some(depth) = withdraws_depth {
-                conn.execute(
+                tx.execute(
                     "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
                      (attestation_id, depth) VALUES (?1, ?2)",
                     rusqlite::params![row.attestation_id, depth],
                 )?;
             }
+            tx.commit()?;
             Ok(true)
         }).await
         .map_err(|e| {
@@ -5254,6 +5285,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 &offered_hash_for_compare,
                 &id_for_compare,
             )?;
+            // v50.0.0 (review H2, final check) — an identical re-put of a
+            // `withdraws` whose admission depth is missing records it now
+            // (idempotent repair).
+            if let Some(depth) = withdraws_depth {
+                let id = id_for_compare.clone();
+                self.write(move |conn| {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO federation_withdraws_admission_depths \
+                         (attestation_id, depth) VALUES (?1, ?2)",
+                        rusqlite::params![id, depth],
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("withdraws depth repair: {e}"))
+                })?;
+            }
             return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
         }
         if let Some(wire_index_key) = &wire_index_key {
@@ -8184,12 +8232,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
         // infrastructure room would leave its declared N stale.
         if let Some(stored) = self.lookup_community(&row.community_key_id).await? {
+            let self_leave = revocation.authority_key_id == row.removed_identity_key_id
+                || revocation
+                    .cosignatures
+                    .iter()
+                    .any(|c| c.authority_key_id == row.removed_identity_key_id);
             crate::federation::admission::check_infrastructure_founder_count_unchanged(
                 self,
                 &stored,
                 &row.removed_identity_key_id,
                 None,
                 true,
+                self_leave,
                 row.effective_at,
             )
             .await?;
@@ -8414,6 +8468,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &stored_for_count,
             &row.member_key_id,
             row.role.as_deref(),
+            false,
             false,
             row.effective_at,
         )
@@ -19507,6 +19562,13 @@ impl SqliteBackend {
         let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
             .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
 
+        // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
+        // becomes a federation row in place at `enter_mesh`; its depth is
+        // recorded now, in the same transaction.
+        let withdraws_depth: Option<i64> =
+            (row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS).then(
+                || crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i64,
+            );
         self.write(move |conn| -> Result<(), rusqlite::Error> {
             let tx = conn.transaction()?;
             if replace {
@@ -19591,6 +19653,13 @@ impl SqliteBackend {
             // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
             // projection at the local door, in the same transaction.
             sqlite_project_rendition_row(&tx, &row)?;
+            if let Some(depth) = withdraws_depth {
+                tx.execute(
+                    "INSERT OR REPLACE INTO federation_withdraws_admission_depths \
+                     (attestation_id, depth) VALUES (?1, ?2)",
+                    rusqlite::params![row.attestation_id, depth],
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -25666,6 +25735,11 @@ impl SqliteBackend {
         // before any state lock.
         if door == crate::federation::CommunityDoor::Local {
             crate::federation::admission::check_infrastructure_record_admission(self, &row).await?;
+        } else {
+            // v50.0.0 (final check) — a conformant stored room never degrades
+            // through the replicated door.
+            crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
+                .await?;
         }
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;

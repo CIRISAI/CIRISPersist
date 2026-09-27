@@ -305,6 +305,11 @@ impl PostgresBackend {
         // before any state lock.
         if door == crate::federation::CommunityDoor::Local {
             crate::federation::admission::check_infrastructure_record_admission(self, &row).await?;
+        } else {
+            // v50.0.0 (final check) — a conformant stored room never degrades
+            // through the replicated door.
+            crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
+                .await?;
         }
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
@@ -5881,6 +5886,30 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         ))
                     })?;
                 if exists.is_some() {
+                    // v50.0.0 (review H2, final check) — an identical re-put of
+                    // a held `withdraws` whose admission depth is missing
+                    // records it now (idempotent repair).
+                    if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+                    {
+                        let depth =
+                            crate::federation::FederationDirectory::withdraws_delegation_depth(self)
+                                as i32;
+                        dedup_client
+                            .execute(
+                                "INSERT INTO cirislens.federation_withdraws_admission_depths \
+                                 (attestation_id, depth) \
+                                 SELECT attestation_id, $2 FROM cirislens.federation_attestations \
+                                  WHERE attestation_id = $1 \
+                                 ON CONFLICT (attestation_id) DO NOTHING",
+                                &[&row.attestation_id, &depth],
+                            )
+                            .await
+                            .map_err(|e| {
+                                crate::federation::Error::Backend(format!(
+                                    "withdraws depth repair: {e}"
+                                ))
+                            })?;
+                    }
                     // v38.5.0 (#771) — the dedup path names its outcome.
                     return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
                 }
@@ -6047,7 +6076,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // INSERT and every projection below share THIS client, exactly as
         // before; the only change is that a row rejected by tiers 3-4 no
         // longer holds one while it is refused.
-        let client = self
+        let mut client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
@@ -6115,7 +6144,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // twin and `attestation_reput_verdict`: a re-delivered identical row
         // is idempotent success the sender must be able to recognise, while
         // a DIFFERENT row under an occupied id stays a typed Conflict.
-        let inserted_rows = client
+        // v50.0.0 (review H2, final check) — ONE transaction for the row and
+        // its admission depth: a depth write that fails rolls the row back.
+        let is_withdraws =
+            row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS;
+        let withdraws_depth =
+            crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i32;
+        let tx = client.transaction().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("attestation transaction: {e}"))
+        })?;
+        let inserted_rows = tx
             .execute(
                 "INSERT INTO cirislens.federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
@@ -6164,6 +6202,21 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_attestation_pg_err("insert attestation"))?;
+        if inserted_rows > 0 && is_withdraws {
+            tx.execute(
+                "INSERT INTO cirislens.federation_withdraws_admission_depths \
+                 (attestation_id, depth) VALUES ($1, $2) \
+                 ON CONFLICT (attestation_id) DO UPDATE SET depth = EXCLUDED.depth",
+                &[&row.attestation_id, &withdraws_depth],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("withdraws admission depth: {e}"))
+            })?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("attestation commit: {e}")))?;
 
         if inserted_rows == 0 {
             // The id was occupied. RE-READ decides which case this is.
@@ -6196,6 +6249,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &row.persist_row_hash,
                 &row.attestation_id,
             )?;
+            // v50.0.0 (review H2, final check) — an identical re-put of a
+            // `withdraws` whose admission depth is missing records it now
+            // (idempotent repair).
+            if is_withdraws {
+                client
+                    .execute(
+                        "INSERT INTO cirislens.federation_withdraws_admission_depths \
+                         (attestation_id, depth) VALUES ($1, $2) \
+                         ON CONFLICT (attestation_id) DO NOTHING",
+                        &[&row.attestation_id, &withdraws_depth],
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("withdraws depth repair: {e}"))
+                    })?;
+            }
             return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
         }
         // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
@@ -6211,24 +6280,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.attestation_id,
                 )])
             });
-        // v50.0.0 (review H2, V157) — record the depth this `withdraws` was
-        // admitted under, beside the row (the attestation insert above has
-        // landed; a lost write here reads as the 16-hop legacy depth).
-        if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS {
-            let depth =
-                crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i32;
-            client
-                .execute(
-                    "INSERT INTO cirislens.federation_withdraws_admission_depths \
-                     (attestation_id, depth) VALUES ($1, $2) \
-                     ON CONFLICT (attestation_id) DO UPDATE SET depth = EXCLUDED.depth",
-                    &[&row.attestation_id, &depth],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("withdraws admission depth: {e}"))
-                })?;
-        }
         // v17.4.0 (V106) — maintain the subject projection (federation tier).
         pg_project_attestation_subjects(
             &**client,
@@ -9142,12 +9193,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
         // infrastructure room would leave its declared N stale.
         if let Some(stored) = self.lookup_community(&row.community_key_id).await? {
+            let self_leave = revocation.authority_key_id == row.removed_identity_key_id
+                || revocation
+                    .cosignatures
+                    .iter()
+                    .any(|c| c.authority_key_id == row.removed_identity_key_id);
             crate::federation::admission::check_infrastructure_founder_count_unchanged(
                 self,
                 &stored,
                 &row.removed_identity_key_id,
                 None,
                 true,
+                self_leave,
                 row.effective_at,
             )
             .await?;
@@ -9384,6 +9441,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &stored_for_count,
             &row.member_key_id,
             row.role.as_deref(),
+            false,
             false,
             row.effective_at,
         )
@@ -20480,6 +20538,21 @@ impl PostgresBackend {
         // v45.0.0 (CIRISPersist#871, FSD §5) — the V149 `blob_renditions`
         // projection at the local door, in the same transaction.
         pg_project_rendition_row(&*tx, &row).await?;
+        // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
+        // becomes a federation row in place at `enter_mesh`; its depth is
+        // recorded now, in the same transaction.
+        if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS {
+            let depth =
+                crate::federation::FederationDirectory::withdraws_delegation_depth(self) as i32;
+            tx.execute(
+                "INSERT INTO cirislens.federation_withdraws_admission_depths \
+                 (attestation_id, depth) VALUES ($1, $2) \
+                 ON CONFLICT (attestation_id) DO UPDATE SET depth = EXCLUDED.depth",
+                &[&attestation_id, &depth],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("withdraws admission depth: {e}")))?;
+        }
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;

@@ -1053,6 +1053,15 @@ pub enum DirectoryOp {
         /// The signed community row received from a peer.
         community: SignedCommunity,
     },
+    /// v50.0.0 (CIRISPersist#928, final check) —
+    /// [`FederationDirectory::withdraws_admission_depth`]: the depth a stored
+    /// `withdraws` was admitted under, so a capsule consumer re-deriving it at
+    /// read time walks the ROW's depth instead of guessing. Result rides
+    /// `WithdrawsAdmissionDepth`. APPEND-ONLY (Growth).
+    WithdrawsAdmissionDepth {
+        /// The `withdraws` row's id.
+        attestation_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1300,6 +1309,10 @@ pub enum DirectoryOpResult {
     /// community-plane outcome. A `Refused` carries its reason here, never
     /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
     ReplicatedCommunityOutcome(crate::federation::ReplicatedCommunityOutcome),
+    /// v50.0.0 (CIRISPersist#928) — `withdraws_admission_depth`: `None` when
+    /// nothing was recorded (a pre-V157 row reads as the 16-hop walk).
+    /// APPEND-ONLY (Growth).
+    WithdrawsAdmissionDepth(Option<u32>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -2029,6 +2042,14 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::WithdrawsAdmissionDepth { attestation_id } => {
+            match dir.withdraws_admission_depth(&attestation_id).await {
+                Ok(d) => DirectoryOpResult::WithdrawsAdmissionDepth(
+                    d.map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
+                ),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -2626,6 +2647,28 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#928, final check) — the recorded admission depth
+    /// of a stored `withdraws`, proxied: the proxy never guesses 16.
+    async fn withdraws_admission_depth(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<usize>, Error> {
+        match self
+            .run_op(&DirectoryOp::WithdrawsAdmissionDepth {
+                attestation_id: attestation_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::WithdrawsAdmissionDepth(d) => {
+                Ok(d.map(|d| usize::try_from(d).unwrap_or(usize::MAX)))
+            }
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4381,6 +4424,52 @@ mod tests {
         (dir, directory)
     }
 
+    /// v50.0.0 (CIRISPersist#928, final check) — the proxy forwards the
+    /// recorded admission depth of a stored `withdraws` (never guessing 16):
+    /// a deferred `withdraws` admitted at the default reads back 5 through the
+    /// op; an id with nothing recorded reads `None`.
+    #[test]
+    fn withdraws_admission_depth_op_forwards_the_recorded_depth() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(ts::register_hybrid_key_as(
+            dir.as_ref(),
+            "capsule-issuer",
+            "capsule-issuer",
+            crate::federation::types::identity_type::USER,
+        ));
+        let env = serde_json::json!({
+            "references_attestation_id": "not-yet-held",
+            "withdrawal_reason": "CC 2.3",
+        });
+        let wid = uuid::Uuid::new_v4().to_string();
+        let mut w = ts::bare_attestation(&wid, "capsule-issuer", "capsule-issuer", &env);
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        w.cohort_scope = "federation".into();
+        ts::seal_row_in_place("capsule-issuer", &mut w);
+        rt.block_on(dir.put_attestation(crate::federation::SignedAttestation { attestation: w }))
+            .expect("a deferred withdraws is admitted");
+        for (id, want) in [
+            (
+                wid.as_str(),
+                Some(crate::federation::DEFAULT_DELEGATION_DEPTH as u32),
+            ),
+            ("no-such-row", None),
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::WithdrawsAdmissionDepth {
+                    attestation_id: id.to_owned(),
+                },
+            ) {
+                DirectoryOpResult::WithdrawsAdmissionDepth(d) => assert_eq!(d, want, "{id}"),
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+    }
+
     /// v50.0.0 (CIRISPersist#931) — the capsule carries BOTH community doors:
     /// `PutCommunity` (local) refuses a human-signed legacy `founder_only`
     /// infrastructure record; `ApplyReplicatedCommunity` admits it as data
@@ -4945,7 +5034,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "cbe589af49192f7b64b28f6e838039a6b600eb8facdc9d515d8b94e9096fb42b",
+            "be22e2dc22c75b7c88cc236bfb5ea2c6613c8d3933b4efc554f9980b350731aa",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4981,14 +5070,15 @@ mod tests {
     /// existing touched. [`DIRECTORY_ABI_VERSION`] stays 5.
     ///
     /// Re-pinned again in v50.0.0 (CIRISPersist#931) — GROWTH on both halves:
-    /// the `ApplyReplicatedCommunity` op and the `ReplicatedCommunityOutcome`
-    /// result APPENDED. The version is 6 for #928's payload change
+    /// the `ApplyReplicatedCommunity` and `WithdrawsAdmissionDepth` ops and the
+    /// `ReplicatedCommunityOutcome` and `WithdrawsAdmissionDepth` results
+    /// APPENDED. The version is 6 for #928's payload change
     /// (`ReachabilityVerdict::BeyondDepthCap`), not for this.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "f94a6793f9558acb7414d155ba9192468b109ffc7de4a7a8f29f4e78cc97f55c",
+            "dccdb0994c22284eea288d333bb0160eaed3ed4dd1f0d19039368046bcf0d930",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

@@ -90,26 +90,18 @@ async fn retiring_composer(
             // overwritten with the re-derived one so `retraction_entitled`'s
             // arm 3 sees exactly what was proven now.
             // v50.0.0 (CIRISPersist#928 review H2, V157) — re-derived at the
-            // depth THIS ROW was admitted under: the edges are re-walked as
-            // they stand now (#853), the depth is the admission's. A row with
-            // nothing recorded (stored before V157 — backfilled — or by a door
-            // that records nothing) was admitted under the 16-hop walk. So a
-            // pre-v50 withdraws keeps retiring what it retired, and a NEW one
-            // admitted by the deferred arm cannot retire through a chain
-            // deeper than the gate that admitted it walked.
-            let depth = directory
-                .withdraws_admission_depth(&g.attestation_id)
-                .await?
-                .unwrap_or(crate::federation::admission::MAX_WITHDRAWS_DELEGATION_DEPTH);
-            let rederived = match crate::federation::admission::check_withdraws_admission_at(
-                directory, &g, depth,
-            )
-            .await
-            {
-                Ok(rule) => rule,
-                Err(Error::WithdrawsNotAdmitted { .. }) => None,
-                Err(e) => return Err(e),
-            };
+            // depth THIS ROW was admitted under, by the one pub read form
+            // every consumer shares (`check_withdraws_admission_as_admitted`).
+            let rederived =
+                match crate::federation::admission::check_withdraws_admission_as_admitted(
+                    directory, &g,
+                )
+                .await
+                {
+                    Ok(rule) => rule,
+                    Err(Error::WithdrawsNotAdmitted { .. }) => None,
+                    Err(e) => return Err(e),
+                };
             // The re-derivation is the ONLY authority here. Rules 1 and 2
             // (the target's own attester / a subject) are among what
             // `check_withdraws_admission` derives, so re-spelling them from

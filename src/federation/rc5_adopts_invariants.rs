@@ -1012,17 +1012,21 @@ pub mod bodies {
         }
     }
 
-    /// **Review, M1 loophole — a roster change may not make N stale.** A
-    /// conformant `quorum:2/2` infrastructure room of two founders: a widening
-    /// that adds a third founder, and a revocation that removes one, are
-    /// refused (`INFRA_RULE_QUORUM_N_NOT_FOUNDERS`) even with both founders'
-    /// signatures; a widening that adds a plain member is admitted.
+    /// **Review, M1 loophole — a roster change may not make N stale; a
+    /// founder may still leave.** A conformant `quorum:2/3` infrastructure room
+    /// of three founders:
+    /// - a widening that adds a fourth founder (two founders signing) is
+    ///   refused (`INFRA_RULE_QUORUM_N_NOT_FOUNDERS`);
+    /// - a plain member is admitted;
+    /// - two founders removing the third is refused;
+    /// - the third founder leaving on their OWN signature is admitted (v49's
+    ///   consent floor, ruled 2026-09-27): N is the founder count AS ADMITTED.
     pub async fn infrastructure_founder_count_is_fixed_by_the_record(
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let [h1, h2, h3, m] = ["h1", "h2", "h3", "m"].map(|n| format!("{n}-{tag}"));
-        for k in [&h1, &h2, &h3, &m] {
+        let [h1, h2, h3, h4, m] = ["h1", "h2", "h3", "h4", "m"].map(|n| format!("{n}-{tag}"));
+        for k in [&h1, &h2, &h3, &h4, &m] {
             ts::register_hybrid_key_as(d, k, k, it::USER).await;
         }
         let room = format!("root-{tag}");
@@ -1031,20 +1035,24 @@ pub mod bodies {
             &h1,
             infra_room(
                 &room,
-                "quorum:2/2",
-                vec![seat(&h1, "founder"), seat(&h2, "founder")],
+                "quorum:2/3",
+                vec![
+                    seat(&h1, "founder"),
+                    seat(&h2, "founder"),
+                    seat(&h3, "founder"),
+                ],
             ),
         ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: conformant room: {e}"));
-        let both = |mut w: crate::federation::SignedCommunityMembershipWidening| {
+        let by_two = |mut w: crate::federation::SignedCommunityMembershipWidening| {
             ts::cosign_community_membership_widening(&mut w, &h2);
             w
         };
-        let mut founder = widening_at(&room, &h3, ago(30));
+        let mut founder = widening_at(&room, &h4, ago(40));
         founder.role = Some("founder".into());
         let err = d
-            .put_community_membership_widening(both(ts::sign_community_membership_widening(
+            .put_community_membership_widening(by_two(ts::sign_community_membership_widening(
                 &h1, founder,
             )))
             .await
@@ -1054,33 +1062,132 @@ pub mod bodies {
             crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
             "{err}"
         );
-        d.put_community_membership_widening(both(ts::sign_community_membership_widening(
+        d.put_community_membership_widening(by_two(ts::sign_community_membership_widening(
             &h1,
-            widening_at(&room, &m, ago(20)),
+            widening_at(&room, &m, ago(30)),
         )))
         .await
         .unwrap_or_else(|e| panic!("{tag}: a plain member is admitted: {e}"));
-        let mut rev = ts::sign_community_membership_revocation(
-            &h1,
-            crate::federation::types::CommunityMembershipRevocation {
-                community_key_id: room.clone(),
-                removed_identity_key_id: h2.clone(),
-                removed_at: ago(10),
-                effective_at: ago(10),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        );
-        ts::cosign_community_membership_revocation(&mut rev, &h2);
+        let removal = |signer: &String, t| {
+            ts::sign_community_membership_revocation(
+                signer,
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: room.clone(),
+                    removed_identity_key_id: h3.clone(),
+                    removed_at: t,
+                    effective_at: t,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        let mut by_others = removal(&h1, ago(20));
+        ts::cosign_community_membership_revocation(&mut by_others, &h2);
         let err = d
-            .put_community_membership_revocation(rev)
+            .put_community_membership_revocation(by_others)
             .await
-            .expect_err("removing a founder would leave N stale");
+            .expect_err("other founders removing a founder would leave N stale");
         assert_eq!(
             violation_rule(&err),
             crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
             "{err}"
+        );
+        d.put_community_membership_revocation(removal(&h3, ago(10)))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: a founder may leave on their own signature: {e}"));
+        assert!(!active(d, &room).await.contains(&h3));
+    }
+
+    /// **Final check — a conformant room never degrades through the
+    /// replicated door.** A `quorum:2/2` infrastructure room of two founders,
+    /// stored here. A peer offers a supersede carrying a valid proof (both
+    /// founders signed the change) that would turn it `founder_only`, or seat a
+    /// `node` key as a third founder: the replicated entry refuses both,
+    /// `Refused { degrades_conformance }`. A LEGACY room (planted as data under
+    /// `majority`) still syncs the same kind of supersede (`Superseded`).
+    pub async fn replicated_supersede_never_degrades_a_conformant_room(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::{ReplicatedCommunityOutcome as Out, ReplicatedCommunityRefusal};
+        let [h1, h2, n] = ["h1", "h2", "n"].map(|k| format!("{k}-{tag}"));
+        ts::register_hybrid_key_as(d, &h1, &h1, it::USER).await;
+        ts::register_hybrid_key_as(d, &h2, &h2, it::USER).await;
+        ts::register_hybrid_key_as(d, &n, &n, it::NODE).await;
+        let founders2 = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
+        let offer = |room: &str, protocol: &str, members: Vec<CommunityMember>| {
+            let (h1, h2) = (h1.clone(), h2.clone());
+            let room = room.to_owned();
+            let protocol = protocol.to_owned();
+            async move {
+                let prior = d.lookup_community(&room).await.unwrap().expect("stored");
+                let keys: Vec<String> = members.iter().map(|m| m.key_id.clone()).collect();
+                let change = d
+                    .build_membership_change_envelope(
+                        crate::federation::cohort::Cohort::Community,
+                        &room,
+                        &keys,
+                        false,
+                        Some(&protocol),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("build change: {e}"));
+                let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+                let mut signed = ts::sign_community(&h1, infra_room(&room, &protocol, members));
+                signed.supersede_proof = Some(crate::federation::types::GroupSupersedeProof {
+                    prior_persist_row_hash: prior.persist_row_hash,
+                    change_envelope: change,
+                    quorum_signatures: vec![
+                        ts::threshold_sign(&h1, &bytes),
+                        ts::threshold_sign(&h2, &bytes),
+                    ],
+                });
+                d.apply_replicated_community(signed).await
+            }
+        };
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
+        d.put_community(ts::sign_community(
+            &h1,
+            infra_room(&room, "quorum:2/2", founders2()),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: conformant room: {e}"));
+        let mut with_node = founders2();
+        with_node.push(seat(&n, "founder"));
+        for (what, protocol, members) in [
+            ("founder_only", "founder_only", founders2()),
+            ("a node founder", "quorum:3/3", with_node),
+        ] {
+            assert_eq!(
+                offer(&room, protocol, members).await.unwrap(),
+                Out::Refused {
+                    reason: ReplicatedCommunityRefusal::DegradesConformance
+                },
+                "{tag}: {what}: a conformant room does not degrade"
+            );
+            assert_eq!(
+                d.lookup_community(&room)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .consensus_protocol,
+                "quorum:2/2",
+                "{tag}: {what}: nothing changed"
+            );
+        }
+        let legacy = format!("legacy-{tag}");
+        plant_legacy(
+            d,
+            ts::sign_community(&h1, infra_room(&legacy, "majority", founders2())),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
+        assert_eq!(
+            offer(&legacy, "founder_only", founders2()).await.unwrap(),
+            Out::Superseded,
+            "{tag}: a legacy room still syncs"
         );
     }
 
@@ -1381,7 +1488,100 @@ pub mod bodies {
             },
             "{tag}: (C) admitted at 6, the 6-hop chain retires"
         );
+        // (D) the PUB read form every consumer shares re-derives at the ROW's
+        // depth: a legacy-depth (16) row retires, the 5-depth deferred row of
+        // (A) is refused, (C)'s 6-depth row retires.
+        opt_in(crate::federation::MAX_DELEGATION_DEPTH);
+        let (rd, wd) = (uuid(), uuid());
+        put(withdraws(&wd, &rd)).await.unwrap();
+        put(bind(&rd, &sha("d"))).await.unwrap();
+        let get = |id: String| async move { d.get_attestation(&id).await.unwrap().expect("held") };
+        let as_admitted = |row: Attestation| async move {
+            crate::federation::admission::check_withdraws_admission_as_admitted(d, &row).await
+        };
+        assert_eq!(d.withdraws_admission_depth(&wd).await.unwrap(), Some(16));
+        assert_eq!(as_admitted(get(wd.clone()).await).await.unwrap(), Some(3));
+        assert!(matches!(
+            as_admitted(get(wa.clone()).await).await,
+            Err(Error::WithdrawsNotAdmitted { .. })
+        ));
+        assert_eq!(as_admitted(get(wc.clone()).await).await.unwrap(), Some(3));
         opt_in(crate::federation::DEFAULT_DELEGATION_DEPTH);
+    }
+
+    /// A `withdraws` by a fresh issuer naming an absent target (the deferred
+    /// arm): admitted, and recorded at the node's depth.
+    pub async fn deferred_withdraws(d: &dyn FederationDirectory, tag: &str) -> Attestation {
+        let issuer = format!("issuer-{tag}");
+        register(d, &issuer, &[it::USER]).await;
+        let env = serde_json::json!({
+            "references_attestation_id": format!("absent-{tag}"),
+            "withdrawal_reason": "CC 2.3",
+        });
+        let mut w = ts::bare_attestation(&uuid::Uuid::new_v4().to_string(), &issuer, &issuer, &env);
+        w.attestation_type = attestation_type::WITHDRAWS.into();
+        w.cohort_scope = "federation".into();
+        ts::seal_row_in_place(&issuer, &mut w);
+        w
+    }
+
+    /// **Final check — the depth is written with the row, and repaired.** The
+    /// caller breaks the depth store (`break_store`), heals it (`heal_store`)
+    /// and forgets one row's depth (`forget`), in its own dialect:
+    /// - with the depth store broken, the put FAILS and leaves no attestation
+    ///   row (one transaction);
+    /// - healed, the put lands and records the default depth;
+    /// - with that depth forgotten, an identical re-put is `AlreadyHeld` and
+    ///   records it again (idempotent repair).
+    pub async fn withdraws_depth_is_written_with_the_row<B, BF, H, HF, G, GF>(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        break_store: B,
+        heal_store: H,
+        forget: G,
+    ) where
+        B: Fn() -> BF,
+        BF: std::future::Future<Output = ()>,
+        H: Fn() -> HF,
+        HF: std::future::Future<Output = ()>,
+        G: Fn(String) -> GF,
+        GF: std::future::Future<Output = ()>,
+    {
+        let w = deferred_withdraws(d, tag).await;
+        let id = w.attestation_id.clone();
+        break_store().await;
+        d.put_attestation(SignedAttestation {
+            attestation: w.clone(),
+        })
+        .await
+        .expect_err("the depth write fails, so the put fails");
+        assert!(
+            d.get_attestation(&id).await.unwrap().is_none(),
+            "{tag}: one transaction — no row without its depth"
+        );
+        heal_store().await;
+        d.put_attestation(SignedAttestation {
+            attestation: w.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: healed, the put lands: {e}"));
+        assert_eq!(
+            d.withdraws_admission_depth(&id).await.unwrap(),
+            Some(crate::federation::DEFAULT_DELEGATION_DEPTH)
+        );
+        forget(id.clone()).await;
+        assert_eq!(d.withdraws_admission_depth(&id).await.unwrap(), None);
+        assert_eq!(
+            d.put_attestation(SignedAttestation { attestation: w })
+                .await
+                .unwrap(),
+            crate::federation::AttestationOutcome::AlreadyHeld
+        );
+        assert_eq!(
+            d.withdraws_admission_depth(&id).await.unwrap(),
+            Some(crate::federation::DEFAULT_DELEGATION_DEPTH),
+            "{tag}: an identical re-put repairs the missing depth"
+        );
     }
 
     /// **#925 review H3 — Clause A on the doors that REWRITE a key record.**
@@ -1560,6 +1760,7 @@ mod runners {
                 case!(identity_claim_alone_is_not_node_bearing_founder);
                 case!(clause_a_peer_record_is_a_local_mint);
                 case!(infrastructure_founder_count_is_fixed_by_the_record);
+                case!(replicated_supersede_never_degrades_a_conformant_room);
                 case!(clause_a_replicated_insert_admits_a_fused_key);
             }
         };
@@ -1666,6 +1867,98 @@ mod runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+
+    /// Final check — the depth write shares the row's transaction (sqlite).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn withdraws_depth_is_written_with_the_row_sqlite() {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let sql = |q: &'static str| {
+            let b = &b;
+            async move {
+                b.write(move |c| c.execute_batch(q)).await.unwrap();
+            }
+        };
+        super::bodies::withdraws_depth_is_written_with_the_row(
+            &b as &dyn crate::federation::FederationDirectory,
+            &format!("wdepth-{}", suffix()),
+            || sql("ALTER TABLE federation_withdraws_admission_depths RENAME TO broken_depths"),
+            || sql("ALTER TABLE broken_depths RENAME TO federation_withdraws_admission_depths"),
+            |id: String| {
+                let b = &b;
+                async move {
+                    b.write(move |c| {
+                        c.execute(
+                            "DELETE FROM federation_withdraws_admission_depths WHERE attestation_id = ?1",
+                            [id],
+                        )
+                    })
+                    .await
+                    .unwrap();
+                }
+            },
+        )
+        .await;
+    }
+
+    /// Final check — the postgres twin.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn withdraws_depth_is_written_with_the_row_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let sql = |q: &'static str| {
+            let b = &b;
+            async move {
+                b.get_client()
+                    .await
+                    .unwrap()
+                    .batch_execute(q)
+                    .await
+                    .unwrap();
+            }
+        };
+        super::bodies::withdraws_depth_is_written_with_the_row(
+            &b as &dyn crate::federation::FederationDirectory,
+            &format!("wdepth-{}", suffix()),
+            || {
+                sql(
+                    "ALTER TABLE cirislens.federation_withdraws_admission_depths \
+                     RENAME TO broken_depths",
+                )
+            },
+            || {
+                sql("ALTER TABLE cirislens.broken_depths \
+                     RENAME TO federation_withdraws_admission_depths")
+            },
+            |id: String| {
+                let b = &b;
+                async move {
+                    b.get_client()
+                        .await
+                        .unwrap()
+                        .execute(
+                            "DELETE FROM cirislens.federation_withdraws_admission_depths \
+                             WHERE attestation_id = $1",
+                            &[&id],
+                        )
+                        .await
+                        .unwrap();
+                }
+            },
+        )
+        .await;
+    }
 
     /// Review H3 — the rewrite doors are inherent on the SQL backends.
     #[cfg(feature = "sqlite")]

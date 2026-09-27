@@ -7913,6 +7913,27 @@ pub async fn check_withdraws_admission(
     check_withdraws_admission_at(directory, row, directory.withdraws_delegation_depth()).await
 }
 
+/// v50.0.0 (CIRISPersist#928 review H2, final check) — **the READ-time
+/// re-derivation of a STORED `withdraws`**: [`check_withdraws_admission_at`]
+/// at the depth the row was ADMITTED under
+/// ([`FederationDirectory::withdraws_admission_depth`](super::FederationDirectory::withdraws_admission_depth);
+/// nothing recorded = the 16-hop legacy walk). Every consumer that re-derives
+/// a held `withdraws` at read time — persist's bytes-plane fold, a host's
+/// drive, a swarm's revocation check — calls THIS, never
+/// [`check_withdraws_admission`]: the write form walks the node's CURRENT
+/// depth, which would un-retire what a pre-v50 row validly retired, or let a
+/// deferred row retire through a chain its admission never walked.
+pub async fn check_withdraws_admission_as_admitted(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<Option<u8>, Error> {
+    let depth = directory
+        .withdraws_admission_depth(&row.attestation_id)
+        .await?
+        .unwrap_or(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    check_withdraws_admission_at(directory, row, depth).await
+}
+
 /// v50.0.0 (CIRISPersist#928 review H2) — [`check_withdraws_admission`] with
 /// the rule-3/4 proxy walks at `depth`.
 ///
@@ -12221,18 +12242,29 @@ pub async fn check_infrastructure_founders_not_node(
 /// room (replicated data) is not re-judged here — it is non-conformant
 /// already, and the fold's gates apply to it.
 ///
-/// `change` is the member the row adds (with its role) or removes.
+/// `change` is the member the row adds (with its role) or removes;
+/// `self_leave` is a revocation the removed member signed.
 pub async fn check_infrastructure_founder_count_unchanged(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
     member_key_id: &str,
     added_role: Option<&str>,
     is_revocation: bool,
+    self_leave: bool,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     if !is_infrastructure_labeled(community)
         || infrastructure_quorum(&community.consensus_protocol).is_none()
     {
+        return Ok(());
+    }
+    // v49's consent floor (ruled 2026-09-27): a founder removing THEMSELVES
+    // is admitted, as `roster_event_standing` admits any self-leave. N is the
+    // founder count AS ADMITTED; a self-leave may leave the remaining founders
+    // unable to reach M, and the room is then frozen until its conferring
+    // authority re-founds it. The last-founder rule still refuses the last
+    // founder's leave.
+    if is_revocation && self_leave {
         return Ok(());
     }
     let roster = super::authorized_community_roster_at(directory, community, at).await?;
@@ -12281,6 +12313,34 @@ pub async fn check_infrastructure_community_conformance(
     }
     check_infrastructure_consensus_protocol(community)?;
     check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await
+}
+
+/// v50.0.0 (CIRISPersist#925/#927, final check) — **a conformant room never
+/// degrades through the replicated door.** A record received from a peer
+/// that supersedes a STORED infrastructure record which passes
+/// [`check_infrastructure_community_conformance`] must pass it too: a
+/// weakening supersede is rejected (CC 3.2), whatever proof it carries. A
+/// legacy room — nothing stored, or the stored version already
+/// non-conformant — still syncs as data.
+pub async fn check_replicated_supersede_does_not_degrade(
+    directory: &dyn super::FederationDirectory,
+    offered: &super::Community,
+) -> Result<(), Error> {
+    let Some(stored) = directory
+        .lookup_community(&offered.community_key_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)?
+        || !is_infrastructure_labeled(&stored)
+        || check_infrastructure_community_conformance(directory, &stored)
+            .await
+            .is_err()
+    {
+        return Ok(());
+    }
+    check_infrastructure_community_conformance(directory, offered).await
 }
 
 /// v50.0.0 (CIRISPersist#925/#927, review M6 + final check) — the LOCAL

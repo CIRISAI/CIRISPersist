@@ -1654,6 +1654,18 @@ impl MemoryBackend {
             attestation_rows(&state).into_iter(),
         );
         let id_for_stamp = row.attestation_id.clone();
+        // v50.0.0 (review H2, final check, 3d) — a local-tier `withdraws`
+        // (subject-side revocation transit) becomes a federation row in place
+        // at `enter_mesh`, where the bytes-plane fold can see it; record the
+        // node's depth now so it never reads as the 16-hop legacy default.
+        if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS {
+            let depth = self
+                .withdraws_delegation_depth
+                .load(std::sync::atomic::Ordering::Relaxed);
+            state
+                .federation_withdraws_admission_depths
+                .insert(row.attestation_id.clone(), depth);
+        }
         state.federation_attestations.push(row);
         stamp_plane_position(&mut state, PLANE_ATTESTATION, id_for_stamp, admitted_at);
         Ok(attestation_id)
@@ -3598,14 +3610,34 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // fail-open hole. See `src/store/sqlite.rs` put_attestation, AV-76
         // TIER 4b, for the full rationale and the shrunk counterexample.
         if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
-            let state = self.state.lock().expect("memory backend lock");
-            for existing in &state.federation_attestations {
-                if crate::federation::precedence::is_dedup_match(existing, &row) {
-                    // v38.5.0 (#771) — this dedup already existed and already
-                    // returned success; it just could not SAY that the row
-                    // was a duplicate rather than newly stored.
-                    return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+            let mut state = self.state.lock().expect("memory backend lock");
+            let dup = state
+                .federation_attestations
+                .iter()
+                .any(|existing| crate::federation::precedence::is_dedup_match(existing, &row));
+            if dup {
+                // v50.0.0 (review H2, final check) — an identical re-put of a
+                // held `withdraws` whose admission depth is missing records it
+                // now (idempotent repair).
+                let held = state
+                    .federation_attestations
+                    .iter()
+                    .any(|e| e.attestation_id == row.attestation_id);
+                if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+                    && held
+                {
+                    let depth = self
+                        .withdraws_delegation_depth
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    state
+                        .federation_withdraws_admission_depths
+                        .entry(row.attestation_id.clone())
+                        .or_insert(depth);
                 }
+                // v38.5.0 (#771) — this dedup already existed and already
+                // returned success; it just could not SAY that the row
+                // was a duplicate rather than newly stored.
+                return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
             }
         }
 
@@ -3848,8 +3880,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 let stored_hash = existing.persist_row_hash.clone();
                 let offered_hash = row.persist_row_hash.clone();
                 let id = row.attestation_id.clone();
-                drop(state);
                 crate::federation::attestation_reput_verdict(&stored_hash, &offered_hash, &id)?;
+                // v50.0.0 (review H2, final check) — an identical re-put of a
+                // `withdraws` whose admission depth is missing records it now
+                // (idempotent repair).
+                if row.attestation_type == crate::federation::types::attestation_type::WITHDRAWS {
+                    state
+                        .federation_withdraws_admission_depths
+                        .entry(id)
+                        .or_insert(withdraws_depth);
+                }
+                drop(state);
                 return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
             }
 
@@ -6806,12 +6847,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v50.0.0 (review, M1 loophole) — removing a founder of a conformant
         // infrastructure room would leave its declared N stale.
         if let Some(stored) = self.lookup_community(&row.community_key_id).await? {
+            let self_leave = revocation.authority_key_id == row.removed_identity_key_id
+                || revocation
+                    .cosignatures
+                    .iter()
+                    .any(|c| c.authority_key_id == row.removed_identity_key_id);
             crate::federation::admission::check_infrastructure_founder_count_unchanged(
                 self,
                 &stored,
                 &row.removed_identity_key_id,
                 None,
                 true,
+                self_leave,
                 row.effective_at,
             )
             .await?;
@@ -6996,6 +7043,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &stored_for_count,
             &row.member_key_id,
             row.role.as_deref(),
+            false,
             false,
             row.effective_at,
         )
@@ -11179,6 +11227,11 @@ impl MemoryBackend {
         // before any state lock.
         if door == crate::federation::CommunityDoor::Local {
             crate::federation::admission::check_infrastructure_record_admission(self, &row).await?;
+        } else {
+            // v50.0.0 (final check) — a conformant stored room never degrades
+            // through the replicated door.
+            crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
+                .await?;
         }
         crate::federation::admission::check_community_membership_steward_binding(self, &row)
             .await?;
@@ -13691,6 +13744,47 @@ mod tests {
     }
 
     /// Register `owner` (user) + `node` (node-only) + an `agent` recipient.
+    /// v50.0.0 (CIRISPersist#928, final check) — the memory backend writes a
+    /// `withdraws` and its admission depth under ONE lock (so there is no
+    /// half-write to witness); an identical re-put of a row whose depth is
+    /// missing records it again (idempotent repair).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn withdraws_depth_is_repaired_on_an_identical_reput_memory() {
+        use crate::federation::FederationDirectory as _;
+        let backend = MemoryBackend::new();
+        let w = crate::federation::rc5_adopts_invariants::bodies::deferred_withdraws(
+            &backend,
+            "wdepth-mem",
+        )
+        .await;
+        let id = w.attestation_id.clone();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: w.clone(),
+            })
+            .await
+            .expect("deferred withdraws");
+        backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_withdraws_admission_depths
+            .remove(&id);
+        assert_eq!(backend.withdraws_admission_depth(&id).await.unwrap(), None);
+        assert_eq!(
+            backend
+                .put_attestation(SignedAttestation { attestation: w })
+                .await
+                .unwrap(),
+            crate::federation::AttestationOutcome::AlreadyHeld
+        );
+        assert_eq!(
+            backend.withdraws_admission_depth(&id).await.unwrap(),
+            Some(crate::federation::DEFAULT_DELEGATION_DEPTH)
+        );
+    }
+
     /// v50.0.0 (CIRISPersist#925 ask 5) — a fused `{node,agent}` /
     /// `{node,user}` key can no longer be MINTED: CC 3.4.7.3 Clause A refuses
     /// it at `put_public_key`. Clause B exists for the fused keys minted

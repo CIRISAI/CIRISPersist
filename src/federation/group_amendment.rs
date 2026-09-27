@@ -44,8 +44,8 @@ pub enum CommunityDoor {
 }
 
 /// v50.0.0 (CIRISPersist#931) — the typed outcome of
-/// [`FederationDirectory::apply_replicated_community`]. Every arm is `Ok`, so a
-/// replication cursor records it and advances.
+/// [`FederationDirectory::apply_replicated_community`]. The refusals are
+/// typed, so a replication cursor records them and advances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicatedCommunityOutcome {
@@ -71,6 +71,10 @@ pub enum ReplicatedCommunityRefusal {
     /// A differing record under an occupied id with no proof, or a proof over
     /// a prior version this node does not hold ([`Error::Conflict`]).
     ConflictingRecord,
+    /// v50.0.0 (final check) — the record would supersede a CONFORMANT
+    /// stored infrastructure record with a non-conformant one (a weakening
+    /// supersede, CC 3.2).
+    DegradesConformance,
 }
 
 /// What this node held under a replicated record's id before the apply.
@@ -114,6 +118,11 @@ pub(crate) fn replicated_community_outcome(
         Err(Error::Conflict(_)) => Ok(ReplicatedCommunityOutcome::Refused {
             reason: ReplicatedCommunityRefusal::ConflictingRecord,
         }),
+        Err(Error::CommunityConsensusProtocolViolation { .. }) => {
+            Ok(ReplicatedCommunityOutcome::Refused {
+                reason: ReplicatedCommunityRefusal::DegradesConformance,
+            })
+        }
         Err(e) => Err(e),
     }
 }
