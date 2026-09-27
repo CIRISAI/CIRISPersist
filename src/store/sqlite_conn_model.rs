@@ -539,7 +539,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
-    ("put_community", ConnClass::Write),
+    // v50.0.0 (#931) — `put_community` / `apply_replicated_community` delegate here.
+    ("put_community_at_door", ConnClass::Write),
     ("put_community_membership_revocation", ConnClass::Write),
     ("put_community_membership_widening", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
@@ -561,7 +562,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_org_membership", ConnClass::Write),
     ("put_organization", ConnClass::Write),
     ("put_partner_record", ConnClass::Write),
-    ("put_public_key", ConnClass::Write),
+    // v50.0.0 (review M5) — `put_public_key` delegates to this store step.
+    ("put_public_key_at_door", ConnClass::Write),
+    // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
+    ("withdraws_admission_depth", ConnClass::Read),
     ("put_revocation", ConnClass::Write),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),

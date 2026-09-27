@@ -89,15 +89,19 @@ async fn retiring_composer(
             // "this composer does not retire the bytes". The stored column is
             // overwritten with the re-derived one so `retraction_entitled`'s
             // arm 3 sees exactly what was proven now.
-            let rederived = match crate::federation::admission::check_withdraws_admission(
-                directory, &g,
-            )
-            .await
-            {
-                Ok(rule) => rule,
-                Err(Error::WithdrawsNotAdmitted { .. }) => None,
-                Err(e) => return Err(e),
-            };
+            // v50.0.0 (CIRISPersist#928 review H2, V157) — re-derived at the
+            // depth THIS ROW was admitted under, by the one pub read form
+            // every consumer shares (`check_withdraws_admission_as_admitted`).
+            let rederived =
+                match crate::federation::admission::check_withdraws_admission_as_admitted(
+                    directory, &g,
+                )
+                .await
+                {
+                    Ok(rule) => rule,
+                    Err(Error::WithdrawsNotAdmitted { .. }) => None,
+                    Err(e) => return Err(e),
+                };
             // The re-derivation is the ONLY authority here. Rules 1 and 2
             // (the target's own attester / a subject) are among what
             // `check_withdraws_admission` derives, so re-spelling them from

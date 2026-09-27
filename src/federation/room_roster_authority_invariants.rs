@@ -906,6 +906,7 @@ pub mod bodies {
             protocol: consensus_protocol::UNANIMOUS,
             subkind: None,
             policy_blob: None,
+            node_bearing: &crate::federation::NO_NODE_BEARING_SEATS,
         };
         let roster = crate::federation::authorized_roster_at(&record, rules, &[legacy], t1);
         assert_eq!(

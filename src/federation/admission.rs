@@ -6444,10 +6444,16 @@ async fn canonical_binding_hashes_for(
     Ok(out)
 }
 
-/// Depth bound + cycle guard for the rule-3/rule-4 delegation walk.
+/// Depth CEILING + cycle guard for the scoped delegation walks.
 /// Mirrors [`crate::federation::topology::MAX_DELEGATION_DEPTH`] (16);
 /// a `delegates_to` graph deeper than this cannot confer revocation
 /// authority (a pathological chain is refused, not silently admitted).
+///
+/// v50.0.0 (CIRISPersist#928, CC 4.1.1) — a ceiling, not a default: the
+/// rule-3/rule-4 admission walk runs at
+/// [`DEFAULT_DELEGATION_DEPTH`](crate::federation::topology::DEFAULT_DELEGATION_DEPTH)
+/// (5), and a caller that passes a larger `max_depth` to the walk opts in,
+/// up to this bound.
 pub const MAX_WITHDRAWS_DELEGATION_DEPTH: usize = 16;
 
 /// v8.7.0 (CIRISPersist#232) — true iff a `delegates_to` envelope's
@@ -6829,6 +6835,10 @@ struct ScopedReach {
     target_edge_retracted: bool,
     /// Was an edge TO a target skipped because it does not carry `scope_token`?
     target_edge_missing_scope: bool,
+    /// v50.0.0 (CIRISPersist#928, CC 4.1.1) — did a traversable chain reach
+    /// the effective depth cap at a recipient that delegates `scope_token`
+    /// onward? "Too deep" — self_verify only — not "nothing there".
+    beyond_cap: bool,
 }
 
 /// **THE §11.10 scoped-`delegates_to` walk — one BFS, three callers**
@@ -7235,6 +7245,24 @@ async fn scoped_delegation_reach_at(
                 out.hit_target = true;
                 return Ok(out);
             }
+            if !out.beyond_cap
+                && node.depth + 1 == effective_depth
+                && !visited.contains(&r.attested_key_id)
+                && directory
+                    .list_attestations_by(&r.attested_key_id)
+                    .await?
+                    .iter()
+                    .any(|n| {
+                        n.attestation_type == attestation_type::DELEGATES_TO
+                            && lens.admits_edge(n)
+                            && delegation_scope_grants(&n.attestation_envelope, scope_token)
+                    })
+            {
+                // v50.0.0 (CIRISPersist#928) — a recipient AT the cap that
+                // delegates the scope onward: the chain is longer than this
+                // walk may follow (CC 4.1.1: self_verify only).
+                out.beyond_cap = true;
+            }
             if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
                 visited.insert(r.attested_key_id.clone());
                 // v30.8.0 (CIRISPersist#628) — the budget ATTENUATES, exactly as
@@ -7290,13 +7318,33 @@ async fn scoped_delegation_reach_at(
 /// {consent_revocation}`. If a traversable edge's recipient is in
 /// `targets`, return `true`. Cycle-guarded on the granter key and
 /// bounded by [`MAX_WITHDRAWS_DELEGATION_DEPTH`].
-async fn issuer_reaches_target_via_consent_revocation_delegation(
+///
+/// v50.0.0 (CIRISPersist#928) — the `bool` projection of
+/// [`consent_revocation_reach`], which the admission gate reads for its
+/// beyond-cap signal.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) async fn issuer_reaches_target_via_consent_revocation_delegation(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
     targets: &std::collections::HashSet<String>,
     max_depth: usize,
 ) -> Result<bool, Error> {
-    issuer_reaches_target_via_scoped_delegation(
+    Ok(
+        consent_revocation_reach(directory, issuer, targets, max_depth)
+            .await?
+            .hit_target,
+    )
+}
+
+/// v50.0.0 (CIRISPersist#928) — the consent_revocation proxy walk with its
+/// full [`ScopedReach`]: the one body rules 3 and 4 run.
+async fn consent_revocation_reach(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    targets: &std::collections::HashSet<String>,
+    max_depth: usize,
+) -> Result<ScopedReach, Error> {
+    scoped_delegation_reach(
         directory,
         issuer,
         targets,
@@ -7435,6 +7483,12 @@ pub enum ReachabilityVerdict {
     /// The issuer emitted no `delegates_to` edges at all — there is no
     /// trust root to seed the walk from.
     NoTrustRoots,
+    /// v50.0.0 (CIRISPersist#928, CC 4.1.1) — the target was not reached
+    /// within the effective depth cap, and a scope-bearing chain continues
+    /// past it: the chain is too deep to confer (self_verify only), which a
+    /// caller may lift by an explicit deeper `max_depth`. Distinct from
+    /// [`Self::SignerUnreached`], where nothing onward exists.
+    BeyondDepthCap,
 }
 
 /// v10.0.0 (CIRISPersist#272) — the **refusal-reason** companion of
@@ -7539,6 +7593,9 @@ pub async fn reachable_under_scope_with_reasons(
     }
     if !reach.issuer_emitted_delegation {
         return Ok(ReachabilityVerdict::NoTrustRoots);
+    }
+    if reach.beyond_cap {
+        return Ok(ReachabilityVerdict::BeyondDepthCap);
     }
     Ok(ReachabilityVerdict::SignerUnreached)
 }
@@ -7649,6 +7706,27 @@ pub async fn resolve_withdraws_admission_rule(
     issuer: &str,
     target: &super::Attestation,
 ) -> Result<u8, Error> {
+    resolve_withdraws_admission_rule_at(
+        directory,
+        issuer,
+        target,
+        crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
+    )
+    .await
+}
+
+/// v50.0.0 (CIRISPersist#928 review H2) — [`resolve_withdraws_admission_rule`]
+/// with the proxy walks (rules 3/4) at an explicit `depth` (clamped at
+/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`]). The write gate runs at the CC 4.1.1
+/// default; the bytes-plane re-derivation of an ALREADY-ADMITTED row runs at
+/// the ceiling every stored row could have been admitted under (see
+/// [`check_withdraws_admission_at`]).
+pub async fn resolve_withdraws_admission_rule_at(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    target: &super::Attestation,
+    depth: usize,
+) -> Result<u8, Error> {
     // Rule 1 — producer self-revocation (no DB walk).
     if issuer == target.attesting_key_id {
         return Ok(1);
@@ -7698,6 +7776,7 @@ pub async fn resolve_withdraws_admission_rule(
         return Err(Error::WithdrawsNotAdmitted {
             issuer: issuer.to_string(),
             target_attestation_id: target.attestation_id.clone(),
+            beyond_delegation_depth_cap: false,
         });
     }
 
@@ -7726,19 +7805,21 @@ pub async fn resolve_withdraws_admission_rule(
     // Rule 3 — proxy authority: a consent_revocation-scoped
     // `delegates_to` chain from `issuer` reaching ANY subject in
     // `T.subject_key_ids` (§8.1.11.2: any single subject is enough).
+    //
+    // v50.0.0 (CIRISPersist#928, CC 4.1.1) — both proxy walks run at `depth`:
+    // the write gate passes the CC default (5) — it has no caller to opt into
+    // a deeper walk, and a chain past the cap is self_verify only. Such a refusal says so
+    // (`beyond_delegation_depth_cap`), so "too deep" is not read as "no
+    // authority exists".
+    let mut beyond_cap = false;
     if !target.subject_key_ids.is_empty() {
         let subjects: std::collections::HashSet<String> =
             target.subject_key_ids.iter().cloned().collect();
-        if issuer_reaches_target_via_consent_revocation_delegation(
-            directory,
-            issuer,
-            &subjects,
-            MAX_WITHDRAWS_DELEGATION_DEPTH,
-        )
-        .await?
-        {
+        let reach = consent_revocation_reach(directory, issuer, &subjects, depth).await?;
+        if reach.hit_target {
             return Ok(3);
         }
+        beyond_cap |= reach.beyond_cap;
     }
     // Rule 4 — `issuer` holds a valid consent_revocation-scoped
     // `delegates_to` reaching a key that itself satisfies rule 1
@@ -7754,20 +7835,16 @@ pub async fn resolve_withdraws_admission_rule(
         for s in &target.subject_key_ids {
             rule4_targets.insert(s.clone());
         }
-        if issuer_reaches_target_via_consent_revocation_delegation(
-            directory,
-            issuer,
-            &rule4_targets,
-            MAX_WITHDRAWS_DELEGATION_DEPTH,
-        )
-        .await?
-        {
+        let reach = consent_revocation_reach(directory, issuer, &rule4_targets, depth).await?;
+        if reach.hit_target {
             return Ok(4);
         }
+        beyond_cap |= reach.beyond_cap;
     }
     Err(Error::WithdrawsNotAdmitted {
         issuer: issuer.to_string(),
         target_attestation_id: target.attestation_id.clone(),
+        beyond_delegation_depth_cap: beyond_cap,
     })
 }
 
@@ -7830,6 +7907,49 @@ pub async fn resolve_withdraws_admission_rule(
 pub async fn check_withdraws_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
+) -> Result<Option<u8>, Error> {
+    // v50.0.0 (review H2) — the node's configured depth (CC 4.1.1 default
+    // unless the host opted in); the backend records it with the row.
+    check_withdraws_admission_at(directory, row, directory.withdraws_delegation_depth()).await
+}
+
+/// v50.0.0 (CIRISPersist#928 review H2, final check) — **the READ-time
+/// re-derivation of a STORED `withdraws`**: [`check_withdraws_admission_at`]
+/// at the depth the row was ADMITTED under
+/// ([`FederationDirectory::withdraws_admission_depth`](super::FederationDirectory::withdraws_admission_depth);
+/// nothing recorded = the 16-hop legacy walk). Every consumer that re-derives
+/// a held `withdraws` at read time — persist's bytes-plane fold, a host's
+/// drive, a swarm's revocation check — calls THIS, never
+/// [`check_withdraws_admission`]: the write form walks the node's CURRENT
+/// depth, which would un-retire what a pre-v50 row validly retired, or let a
+/// deferred row retire through a chain its admission never walked.
+pub async fn check_withdraws_admission_as_admitted(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<Option<u8>, Error> {
+    let depth = directory
+        .withdraws_admission_depth(&row.attestation_id)
+        .await?
+        .unwrap_or(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    check_withdraws_admission_at(directory, row, depth).await
+}
+
+/// v50.0.0 (CIRISPersist#928 review H2) — [`check_withdraws_admission`] with
+/// the rule-3/4 proxy walks at `depth`.
+///
+/// **Not retroactive.** The WRITE gate ([`check_withdraws_admission`]) takes
+/// the CC 4.1.1 default going forward. A read-time re-derivation of a row that
+/// is ALREADY stored (the bytes-plane fold,
+/// `blob_tombstone::retiring_composer`) passes
+/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`] — the depth every row admitted before
+/// v50 was admitted under — so a withdraws validly decided under the old rule
+/// keeps retiring its target (v49's "past actions validly decided stand").
+/// The re-derivation still re-walks the edges as they stand now, so an edge
+/// withdrawn since stops the retirement (#853); only the depth is held.
+pub async fn check_withdraws_admission_at(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    depth: usize,
 ) -> Result<Option<u8>, Error> {
     if row.attestation_type != attestation_type::WITHDRAWS {
         return Ok(None);
@@ -7911,7 +8031,9 @@ pub async fn check_withdraws_admission(
     // conformant binding MUST name K there — at which point rule 2 would hand
     // K's key the power to shed its owner unilaterally. Gating the admitting
     // branch closes that before the producer change lands, not after.
-    match resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await {
+    match resolve_withdraws_admission_rule_at(directory, &row.attesting_key_id, &target, depth)
+        .await
+    {
         Ok(rule) => {
             // Rule 1 is the producer's own retraction and is never a reclaim.
             // Rules 2/3/4 against a LIVE owner-binding are exactly what rc3
@@ -8029,12 +8151,14 @@ pub const RECONSIDERATION_DIMENSION_PREFIX: &str = "reconsideration:";
 pub const QUARANTINE_DIMENSION_PREFIX: &str = "quarantine:";
 
 /// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10) — the §11.10 delegated-duty
-/// depth bound (§13.3: depth ≤ 5). Distinct from the
-/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`] (16) used by the consent_revocation
-/// proxy walk — moderation chains are short by spec. The walk's
-/// `effective_depth` is `min(this, MAX_WITHDRAWS_DELEGATION_DEPTH)`, so a
-/// chain longer than 5 cannot confer a moderation duty.
-pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
+/// depth bound (§13.3: depth ≤ 5). The walk's `effective_depth` is
+/// `min(this, MAX_WITHDRAWS_DELEGATION_DEPTH)`, so a chain longer than 5
+/// cannot confer a moderation duty.
+///
+/// v50.0.0 (CIRISPersist#928) — this IS the CC 4.1.1 default, so it is the
+/// same constant rather than a second spelling of 5 that could drift.
+pub const MAX_MODERATION_DELEGATION_DEPTH: usize =
+    crate::federation::topology::DEFAULT_DELEGATION_DEPTH;
 
 // ─────────────────────────────────────────────────────────────────────────
 //  #659 — the de-conferral plane binds its SUBJECT
@@ -10679,6 +10803,10 @@ pub async fn check_peer_record_admission(
         consent_role: None,
         additional_scrubs: Vec::new(),
     };
+    // v50.0.0 (CIRISPersist#925 review, H3's fifth door) — CC 3.4.7.3 Clause A:
+    // an operator-added peer record writes a caller-supplied `identity_type`,
+    // so it is a local mint and may not fuse `node` with `agent`/`user`.
+    super::register::check_node_identity_exclusive(&probe)?;
     check_canonical_role_admission(directory, &probe).await?;
     check_infra_attest_role_admission(directory, &probe).await?;
     check_co_steward_role_admission(directory, &probe).await?;
@@ -11963,6 +12091,286 @@ where
         )),
         None => Ok(false),
     }
+}
+
+/// v50.0.0 (CIRISPersist#925/#927) — the `cohort_subkind` CC 3.2 codifies
+/// for a governed trust-root collective.
+pub const COHORT_SUBKIND_INFRASTRUCTURE: &str = "infrastructure";
+
+/// v50.0.0 (CIRISPersist#925) — [`Error::CommunityConsensusProtocolViolation`]
+/// rule: a `node`-bearing key is listed with `role: founder` in an
+/// `infrastructure` community (CC 3.2 "Infrastructure does not vote").
+pub const INFRA_RULE_NODE_BEARING_FOUNDER: &str = "node_bearing_founder";
+/// v50.0.0 (CIRISPersist#927) — [`Error::CommunityConsensusProtocolViolation`]
+/// rule: an `infrastructure` community's `consensus_protocol` is not a
+/// `quorum:M/N` form (CC 3.2 conformance: `founder_only` / `unanimous` / bare
+/// `majority` are non-conformant, and so is every other form).
+pub const INFRA_RULE_PROTOCOL_NOT_QUORUM: &str = "protocol_not_quorum_m_of_n";
+/// v50.0.0 (review) — [`Error::CommunityConsensusProtocolViolation`] rule: an
+/// `infrastructure` community names no founder (no admission quorum at all).
+pub const INFRA_RULE_NO_FOUNDER: &str = "no_founder";
+/// v50.0.0 (review, M1 loophole) — rule: a `quorum:M/N` infrastructure
+/// record's declared `N` is not its founder count, or a roster change would
+/// make it so. The evaluator reads an ABSOLUTE `M`, so `quorum:1/1` over three
+/// founders would let one of them admit alone.
+pub const INFRA_RULE_QUORUM_N_NOT_FOUNDERS: &str = "quorum_n_not_founder_count";
+/// v50.0.0 (merge prep for CIRISPersist#926) — rule: a record that must be
+/// `infrastructure` (e.g. `ciris-canonical`) does not carry that subkind.
+pub const INFRA_RULE_SUBKIND_NOT_INFRASTRUCTURE: &str = "subkind_not_infrastructure";
+/// v50.0.0 (merge prep for #926) — rule: `admission_quorum_basis` is not
+/// `founders` (CC 3.2 `infrastructure_constraint`).
+pub const INFRA_RULE_BASIS_NOT_FOUNDERS: &str = "admission_quorum_basis_not_founders";
+/// v50.0.0 (merge prep for #926) — rule: `consensus_protocol_entrenched` is
+/// not `true` (CC 3.2 conformance).
+pub const INFRA_RULE_NOT_ENTRENCHED: &str = "protocol_not_entrenched";
+/// v50.0.0 (merge prep for #926) — rule: a founder was not conferred on the
+/// ceremony plane (CC 3.2 T2).
+pub const INFRA_RULE_FOUNDER_NOT_CONFERRED: &str = "founder_not_conferred";
+/// v50.0.0 (merge prep for #926) — rule: a supersede changes the record's
+/// trust-root grade (subkind, basis or entrenchment).
+pub const INFRA_RULE_GRADE_CHANGED: &str = "grade_changed";
+
+/// v50.0.0 (CIRISPersist#927, review M1) — THE `infrastructure` quorum parser:
+/// `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC
+/// 3.2: "a single founder must not be able to admit unilaterally";
+/// `quorum:1/1` is the degenerate single-founder case and stays conformant).
+/// `Some((M, N))` when conformant. One parser, shared with #926.
+#[must_use]
+pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
+    let (m, n) = protocol
+        .strip_prefix(super::types::consensus_protocol::QUORUM_PREFIX)?
+        .split_once('/')?;
+    let (m, n) = (m.parse::<u32>().ok()?, n.parse::<u32>().ok()?);
+    (n >= 1 && m >= 1 && m <= n && (n < 2 || m >= 2)).then_some((m, n))
+}
+
+fn is_infrastructure_labeled(community: &super::Community) -> bool {
+    super::community_subkind(community) == Some(COHORT_SUBKIND_INFRASTRUCTURE)
+}
+
+/// v50.0.0 (CIRISPersist#927, CC 3.2 conformance for `infrastructure`) — an
+/// `infrastructure` community's `consensus_protocol` MUST be a `quorum:M/N`
+/// form. Refused as `hard_case:community_consensus_protocol_violation`
+/// (CC 3.4.2), never silently floored: before this gate the label was admitted
+/// with any canonical protocol and the evaluator simply ran it.
+///
+/// Keyed on the LABEL, not on [`is_authorized_infrastructure_community`]: an
+/// unauthorized label gets the stricter treatment everywhere else, and a
+/// conformance rule that an unauthorized label could skip would be the
+/// weaker one.
+pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> Result<(), Error> {
+    if !is_infrastructure_labeled(community) {
+        return Ok(());
+    }
+    let p = community.consensus_protocol.as_str();
+    if let Some((_m, n)) = infrastructure_quorum(p) {
+        let founders = community
+            .members
+            .iter()
+            .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+            .count();
+        if n as usize == founders {
+            return Ok(());
+        }
+        return Err(Error::CommunityConsensusProtocolViolation {
+            community_key_id: community.community_key_id.clone(),
+            rule: INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+            detail: format!(
+                "consensus_protocol {p:?} declares N = {n} over {founders} founder(s): the \
+                 evaluator reads M absolutely, so N must be the founder count"
+            ),
+        });
+    }
+    Err(Error::CommunityConsensusProtocolViolation {
+        community_key_id: community.community_key_id.clone(),
+        rule: INFRA_RULE_PROTOCOL_NOT_QUORUM,
+        detail: format!(
+            "consensus_protocol {p:?} is not a conformant quorum:M/N (1 <= M <= N, and \
+             M >= 2 when N >= 2 — CC 3.2: founder_only / unanimous / bare majority are \
+             non-conformant, and a single founder must not admit unilaterally)"
+        ),
+    })
+}
+
+/// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — no
+/// member of an `infrastructure` community listed with `role: founder` may be
+/// a `node`-bearing key ([`super::is_node_bearing_key`]: its own
+/// `identity_type` contains `node`, or it is an occurrence of an identity
+/// whose does). Such a key joins as `role: member`; its standing is serve,
+/// store, replicate. Refused as `hard_case:community_consensus_protocol_violation`
+/// (CC 3.4.2).
+///
+/// Runs on the community record at `put_community` and at the supersede door,
+/// and on a widening's one-member probe at the widening doors (a widening that
+/// promotes a node key to founder is the `supersedes` of CC 3.2's ceremony).
+/// The fold drops a pre-gate node founder's seat regardless
+/// ([`super::consensus::Seat::node_bearing`]).
+pub async fn check_infrastructure_founders_not_node(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    if !is_infrastructure_labeled(community) {
+        return Ok(());
+    }
+    for m in &community.members {
+        if m.role.as_deref() != Some(MEMBER_ROLE_FOUNDER) {
+            continue;
+        }
+        if super::is_node_bearing_key_at(directory, &m.key_id, at).await? {
+            return Err(Error::CommunityConsensusProtocolViolation {
+                community_key_id: community.community_key_id.clone(),
+                rule: INFRA_RULE_NODE_BEARING_FOUNDER,
+                detail: format!(
+                    "{} is node-bearing and is listed as founder (CC 3.2: a node key joins \
+                     an infrastructure community as role: member and is never counted in \
+                     its consensus_protocol)",
+                    m.key_id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// v50.0.0 (review, M1 loophole) — a roster change (a widening or a
+/// revocation) in a CONFORMANT `infrastructure` room (its stored protocol
+/// parses by [`infrastructure_quorum`]) may not change the founder count: the
+/// record's declared `N` would go stale and the absolute `M` would no longer
+/// be the fraction the founders signed up to. The founder set moves by a
+/// supersede of the record, which re-declares `N`. A legacy non-conformant
+/// room (replicated data) is not re-judged here — it is non-conformant
+/// already, and the fold's gates apply to it.
+///
+/// `change` is the member the row adds (with its role) or removes;
+/// `self_leave` is a revocation the removed member signed.
+pub async fn check_infrastructure_founder_count_unchanged(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+    member_key_id: &str,
+    added_role: Option<&str>,
+    is_revocation: bool,
+    self_leave: bool,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    if !is_infrastructure_labeled(community)
+        || infrastructure_quorum(&community.consensus_protocol).is_none()
+    {
+        return Ok(());
+    }
+    // v49's consent floor (ruled 2026-09-27): a founder removing THEMSELVES
+    // is admitted, as `roster_event_standing` admits any self-leave. N is the
+    // founder count AS ADMITTED; a self-leave may leave the remaining founders
+    // unable to reach M, and the room is then frozen until its conferring
+    // authority re-founds it. The last-founder rule still refuses the last
+    // founder's leave.
+    if is_revocation && self_leave {
+        return Ok(());
+    }
+    let roster = super::authorized_community_roster_at(directory, community, at).await?;
+    let is_founder = |role: Option<&str>| role == Some(MEMBER_ROLE_FOUNDER);
+    let was = roster
+        .iter()
+        .find(|m| m.key_id == member_key_id)
+        .is_some_and(|m| is_founder(m.role.as_deref()));
+    let will = !is_revocation && is_founder(added_role);
+    if was == will {
+        return Ok(());
+    }
+    Err(Error::CommunityConsensusProtocolViolation {
+        community_key_id: community.community_key_id.clone(),
+        rule: INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+        detail: format!(
+            "{member_key_id}: this roster change {} a founder, which would leave the declared \
+             {:?} stale — the founder set changes by a supersede that re-declares N",
+            if will { "adds" } else { "removes" },
+            community.consensus_protocol
+        ),
+    })
+}
+
+/// v50.0.0 (CIRISPersist#925/#927) — both CC 3.2 `infrastructure`
+/// conformance checks over a whole community record, for the record doors
+/// (`put_community`, the supersede door): a founder exists, then the protocol
+/// and its `N` (they read nothing), then the founders' node-bearing.
+pub async fn check_infrastructure_community_conformance(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<(), Error> {
+    if is_infrastructure_labeled(community)
+        && !community
+            .members
+            .iter()
+            .any(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+    {
+        return Err(Error::CommunityConsensusProtocolViolation {
+            community_key_id: community.community_key_id.clone(),
+            rule: INFRA_RULE_NO_FOUNDER,
+            detail: "an infrastructure community must name at least one founder (its \
+                     admission quorum is evaluated over founders, CC 3.2)"
+                .into(),
+        });
+    }
+    check_infrastructure_consensus_protocol(community)?;
+    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await
+}
+
+/// v50.0.0 (CIRISPersist#925/#927, final check) — **a conformant room never
+/// degrades through the replicated door.** A record received from a peer
+/// that supersedes a STORED infrastructure record which passes
+/// [`check_infrastructure_community_conformance`] must pass it too: a
+/// weakening supersede is rejected (CC 3.2), whatever proof it carries. A
+/// legacy room — nothing stored, or the stored version already
+/// non-conformant — still syncs as data.
+pub async fn check_replicated_supersede_does_not_degrade(
+    directory: &dyn super::FederationDirectory,
+    offered: &super::Community,
+) -> Result<(), Error> {
+    let Some(stored) = directory
+        .lookup_community(&offered.community_key_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)?
+        || !is_infrastructure_labeled(&stored)
+        || check_infrastructure_community_conformance(directory, &stored)
+            .await
+            .is_err()
+    {
+        return Ok(());
+    }
+    check_infrastructure_community_conformance(directory, offered).await
+}
+
+/// v50.0.0 (CIRISPersist#925/#927, review M6 + final check) — the LOCAL
+/// `put_community` door's infrastructure gate: full conformance
+/// ([`check_infrastructure_community_conformance`]) for a NEW or CHANGED
+/// record, whoever signed it. An identical re-put (same `persist_row_hash` as
+/// the stored row) settles as the idempotent no-op it always was.
+///
+/// The door, not the signer, tells local from replicated (CIRISPersist#931): an
+/// infrastructure record is normally signed by its HUMAN founder, so a
+/// by-signer test would switch this gate off on every host that knows its own
+/// key. A record received from a peer enters through
+/// [`FederationDirectory::apply_replicated_community`](super::FederationDirectory::apply_replicated_community),
+/// which does not call this: a legacy record is admitted there as data.
+pub async fn check_infrastructure_record_admission(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<(), Error> {
+    if !is_infrastructure_labeled(community) {
+        return Ok(());
+    }
+    if let Some(stored) = directory
+        .lookup_community(&community.community_key_id)
+        .await?
+    {
+        if stored.persist_row_hash == super::types::compute_persist_row_hash(community)? {
+            return Ok(());
+        }
+    }
+    check_infrastructure_community_conformance(directory, community).await
 }
 
 /// v9.0.0 (CC 3.2 "steward-binding gate for non-infrastructure membership"
