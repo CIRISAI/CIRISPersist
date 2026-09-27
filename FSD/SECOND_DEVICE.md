@@ -336,7 +336,7 @@ Three small CC 1.0-rc5 adopts (CIRISConstitution PR #113, read at its head `4b62
 - Agreement (review H1). The occurrence gate admits a row whose signer is the IDENTITY itself (`check_signer_acts_for`), so the occurrence never has to consent. The first cut counted every active occurrence binding, which let any registered `node` key N sign `{identity: N, occurrence: H}` for a human founder H and strip H's vote in every infrastructure fold and every replay.
   - `is_node_bearing_key` now counts an occurrence binding only when the occurrence AGREED (`federation::occurrence_agreed_to`): either a stored signed occurrence row for the pair whose signer is the occurrence, or the occurrence's own live owner-binding naming the identity (`owner_of`).
   - A trusted-local (unsigned) row carries no agreement.
-  - **Follow-up:** #873's principal resolver (`active_identities_for_occurrence`, used by the hold-side audience and write-side principal resolution) has the same unilateral-claim shape. It is left for a follow-up issue, not changed here.
+  - **Follow-up CIRISPersist#932:** #873's principal resolver (`active_identities_for_occurrence`, used by the hold-side audience and write-side principal resolution) has the same unilateral-claim shape. It is not changed here.
   - Witness: `identity_claim_alone_is_not_node_bearing_founder`.
 - Clause A (`register::check_node_identity_exclusive`): run by every backend's `put_public_key` right after `validate_registration_pubkey`, so every mint (`register_federation_key` verifies, then stores through `put_public_key`) and every replicated `Insert` runs it. Typed refusal `Error::NodeIdentityNotExclusive` (`federation_node_identity_not_exclusive`, Python `ValueError`).
 - Refusal type: `Error::CommunityConsensusProtocolViolation { community_key_id, rule, detail }`, `kind()` `federation_community_consensus_protocol_violation`, Display beginning `hard_case:community_consensus_protocol_violation:{community_key_id}`, Python `ValueError`.
@@ -454,7 +454,7 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
   - The widening door judges the new seat at the widening's `effective_at`; the record doors and the quorum-gated supersede judge now.
   - A node-local `admitted_at` is never used. `asserted_at` is signer-chosen and backdatable, which is why H1's agreement rule comes first: with the occurrence's own consent, a backdated claim is the key's statement about itself.
   - Witness `node_bearing_is_judged_at_the_change_instant` (memory, sqlite, postgres), steps (1)–(5) as ruled. `node_founder_seat_does_not_vote` now pins that `second`, admitted before the binding, still stands.
-  - **Residual: occurrence history.** The occurrence plane stores the LATEST assertion per `(identity, occurrence)` (an upsert), so a re-assertion moves a binding's start forward, and an identity re-signing the row replaces the occurrence's agreement row. Either changes what the fold sees for instants before the re-assertion. Final history needs a per-assertion history table, which is a migration; it is not built here. (V157 is #926's, so it would be V158 or later.) The agreement check (`occurrence_agreed_to`) and its owner-binding arm are also current-state reads.
+  - **Final over the assertions the plane keeps — not yet over every assertion.** The fold is final over the assertion the occurrence plane holds for each `(identity, occurrence)`: a later binding never reaches back past that assertion, and an ending never reaches back past its own instant. It is not yet final over every assertion ever made. The plane upserts the LATEST assertion per pair, so a re-assertion moves a binding's start forward, and an identity re-signing the row replaces the occurrence's own agreement row. Either can change an earlier verdict. The agreement check (`occurrence_agreed_to`) and its owner-binding arm are also current-state reads. Follow-up **CIRISPersist#930**: a per-assertion history table, V158+.
 
 **M1 — one infrastructure quorum parser.** `admission::infrastructure_quorum(protocol) -> Option<(M, N)>`: `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC 3.2: "a single founder must not be able to admit unilaterally"). `quorum:1/1` stays conformant. #926 folds onto this parser. An infrastructure record naming no founder is refused (`INFRA_RULE_NO_FOUNDER`). Witnessed: `0/1`, `0/3`, `1/2`, `1/3` refused; `1/1` and `2/3` admitted; no founder refused.
 
@@ -462,7 +462,10 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
 - **Moderation roots.** `root_authority_intervals` cuts the instants a founder bears `node` out of its authority, so it roots no `moderate` chain then. `moderator_roots_at` reads only those intervals, and `founder_candidates` is unchanged because a candidate with no interval roots nothing. An appointment made while the root held authority keeps standing after (v49's no-retroactive-ending ruling), so the witness binds before appointing.
 - **The last-founder rule.** A node-bearing founder is neither a founder that can be lost nor the founder a change leaves behind.
 - **Reverse-quorum duty holders.** A node-bearing founder is excluded.
-- **Witnesses:** `node_bearing_founder_roots_no_moderation` and `node_bearing_founder_holds_no_last_founder_power`, each on memory, sqlite and postgres. **The duty-holder exclusion is NOT witnessed.** It needs a legacy infrastructure record under a `reverse_quorum:` protocol with a steward tier, plus the objection fold, and its mutant (P3) survives. Open.
+- **Witnesses:** `node_bearing_founder_roots_no_moderation`, `node_bearing_founder_holds_no_last_founder_power` and `node_bearing_founder_is_no_reverse_quorum_duty_holder`, each on memory, sqlite and postgres.
+  - The duty-holder witness runs two twin legacy infrastructure rooms (replicated data) under `reverse_quorum:1/7:60+escalate:0:3`. In each, the human removes `x`, one member objects in the window, the second founder UPHOLDS in the steward window, and three members OVERRULE.
+  - Where the second founder is not node-bearing, it is a seated duty-holder: its ruling upholds, escalation never opens, and the removal is reversed.
+  - Where it is node-bearing, nobody is seated: the tier escalates on the passed deadline, the respondents dismiss 3-to-1, and the removal stands. Its uphold counted only as one respondent ballot.
 
 **M3 — `DIRECTORY_ABI_VERSION` 6.** `ReachabilityVerdict::BeyondDepthCap` is a new variant returned by an EXISTING op (`DirectoryOpResult::Reachability`), which is a payload-shape change. The reason is documented at the constant, and `abi_version_pinned_at_6` pins it. The two enum-body digests do not move: the verdict is a payload type outside their sight, as v3's was. `KeyRefusalReason` also grows (below) and rides the same bump.
 
@@ -482,13 +485,18 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
   - B syncs it from A's since-read.
   - A NEW record signed by A's own key is refused, and a supersede is refused.
   - With A's key then set to the record's signer, an identical re-put settles and a changed one is refused.
-- **Residual (authored-here heuristic).** `put_community` is also Edge's replication door, so persist tells local from replicated by the SIGNER. A human-signed record submitted locally through `put_community_json` (with a supplied signature) is therefore treated as data. A distinct local door would close this, and #926's `ciris-canonical` gate may want one.
+- **Residual (authored-here heuristic).** `put_community` is also Edge's replication door, so persist tells local from replicated by the SIGNER. A human-signed record submitted locally through `put_community_json` (with a supplied signature) is therefore treated as data. Follow-up **CIRISPersist#931**: a distinct local community door.
 - **Widening door unchanged.** It still refuses seating a node-bearing founder, whatever the signer, so a replicated legacy widening that seats one does not sync.
 
 **H3 strengthened — `node` never moves on a rewrite.**
 - `adopt_scrub_upgrade`, `supersede_canonical_record` and `adopt_genesis_reanchor` (sqlite, postgres; memory's `adopt_genesis_reanchor`) refuse a rewrite that adds or removes `node` (`Error::NodeIdentityImmutable`, `federation_node_identity_immutable`, `ValueError`). The stored row is unchanged.
 - Witnessed on the upgrade and supersede doors (`clause_a_on_the_rewrite_doors_{sqlite,postgres}`: adding `node` to a `user` key, removing it from a `node` key).
-- **`adopt_genesis_reanchor` is not witnessed.** It re-verifies a holder-quorum-signed genesis bundle before this check, and no real artifact moves `node`. Open.
+- **`adopt_genesis_reanchor`: BELIEVED, not tested.** The check is kept, but it cannot be reached from any lane.
+  - The door runs `verify_bundle_quorum` before the check. That function authenticates the bundle against `effective_accord_holder_records()`, which on every lane this repo certifies is the compiled-in production roster: hardware-held A1/B1/C1 keys whose private halves no test holds.
+  - The only override is the `test-anchor` feature together with verify's runtime `CIRIS_TEST_TRUST_ROOT*` AND-gate. No certify lane compiles that feature, and even under it persist never holds the test root's private key: the harness signs.
+  - Neither real ceremony artifact (`genesis_v2.json`, the canonical seed) moves `node`.
+  - A fabricated bundle would prove a property of the fabrication (the #665-review rule).
+  - The check sits beside the upgrade and supersede doors' identical, witnessed call.
 - Rebind (#864) already refuses any `identity_type` change; its door also runs Clause A.
 
 **LOWs.**
@@ -535,7 +543,7 @@ Committed tree `ce4993be`. Lane: `test(consensus) | test(infrastructure) | test(
 
 ### 8.9 Mutation round 3 (committed `8a3c1e66`)
 
-Lane: the original eight words plus `test(rc5_adopts) | test(abi_version)`, `--features sqlite,postgres` under `scripts/pg_test_db.sh -- cargo nextest run -j 3`. Baseline 163/163, postgres legs against a database. Every mutant was re-run because the fold and the keypairs changed. The script is uniquely named (`rc5s_mut.py`, clean-tree assert). **30/31 killed**; P3 survived (no witness, see M2). None OOM-killed. "×3" = memory, sqlite, postgres.
+Lane: the original eight words plus `test(rc5_adopts) | test(abi_version)`, `--features sqlite,postgres` under `scripts/pg_test_db.sh -- cargo nextest run -j 3`. Baseline 163/163, postgres legs against a database. Every mutant was re-run because the fold and the keypairs changed. The script is uniquely named (`rc5s_mut.py`, clean-tree assert). **30/31 killed at `8a3c1e66`; P3 then gained its witness and is killed at `86fd2b12` — 31/31**. None OOM-killed. "×3" = memory, sqlite, postgres.
 
 | # | Mutant | Failed | Killed by |
 |---|---|---|---|
@@ -562,7 +570,7 @@ Lane: the original eight words plus `test(rc5_adopts) | test(abi_version)`, `--f
 | I5c | interval starts at the read instant (the `admitted_at` shape; `IdentityOccurrence` carries no `admitted_at`, so the node-local instant is emulated by now) | 18 | every occurrence-based witness ×3 |
 | P1 | last-founder rule counts node-bearing founders | 3 | last-founder witness ×3 |
 | P2 | root-authority cut dropped | 3 | moderation-root witness ×3 |
-| P3 | reverse-quorum duty holders keep node-bearing founders | **0 — SURVIVED** | no witness (see M2) |
+| P3 | reverse-quorum duty holders keep node-bearing founders | 0 — survived at `8a3c1e66`; **3 — KILLED** at `86fd2b12` | `node_bearing_founder_is_no_reverse_quorum_duty_holder` ×3 |
 | R1 | ABI back to 5 | 1 | `abi_version_pinned_at_6` |
 | R2 | sqlite replicated insert refuses fused keys | 1 | replicated-insert sqlite |
 | R3 | authored-elsewhere never data | 12 | M6 ×3; the three keyed fold witnesses ×3 |
