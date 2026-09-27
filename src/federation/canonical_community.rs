@@ -1659,7 +1659,8 @@ where
                     &community.community_key_id,
                     super::admission::TRUST_ROOT_RULE_RESIGNATION_BACKDATED,
                     format!(
-                        "{:?}'s resignation is dated {effective_at}, before the head's instant                          {instant}: a resignation cannot reach back over a link",
+                        "{:?}'s resignation is dated {effective_at}, before the head's instant \
+                         {instant}: a resignation cannot reach back over a link",
                         incoming.key_id
                     ),
                 ));
