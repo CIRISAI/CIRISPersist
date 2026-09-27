@@ -214,6 +214,15 @@ pub enum KeyRefusalReason {
     /// body) it is a differing row already held. Either way: fail-closed, the
     /// existing row is untouched, and the record is safe to re-offer.
     StoreConflict,
+    /// v50.0.0 (CIRISPersist#925 review H3/M5) — a replicated `Upgrade` or
+    /// `Supersede` would store a record whose `identity_type` fuses `node`
+    /// with `agent`/`user` (CC 3.4.7.3 Clause A refuses the local rewrite).
+    /// Typed, so the replication cursor advances past it; the stored row is
+    /// untouched and the key re-mints.
+    NodeIdentityFused,
+    /// v50.0.0 (review H3) — a replicated `Upgrade` or `Supersede` would add or
+    /// remove `node` from the stored `identity_type`; `node` is fixed at mint.
+    NodeIdentityChanged,
 }
 
 impl KeyRefusalReason {
@@ -244,6 +253,8 @@ impl KeyRefusalReason {
             Self::OwnerAbsent => "owner_absent",
             Self::OwnerAmbiguous => "owner_ambiguous",
             Self::StoreConflict => "store_conflict",
+            Self::NodeIdentityFused => "node_identity_fused",
+            Self::NodeIdentityChanged => "node_identity_changed",
         }
     }
 
@@ -262,6 +273,8 @@ impl KeyRefusalReason {
         Self::OwnerAbsent,
         Self::OwnerAmbiguous,
         Self::StoreConflict,
+        Self::NodeIdentityFused,
+        Self::NodeIdentityChanged,
     ];
 }
 
@@ -871,6 +884,18 @@ pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
     Ok(())
 }
 
+/// v50.0.0 (CIRISPersist#925 review M5) — which door a key record is being
+/// stored through. Clause A ([`check_node_identity_exclusive`]) gates
+/// [`Self::LocalMint`] only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDoor {
+    /// `put_public_key`: a key minted (registered) on this node.
+    LocalMint,
+    /// The replicated `Insert` arm of `apply_replicated_key_record`: a key
+    /// minted elsewhere, admitted as gated data.
+    ReplicatedInsert,
+}
+
 /// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — **`node` is
 /// exclusive.** A key record whose `identity_type` set contains `node` MUST NOT
 /// also contain `agent` or `user`: a key is substrate or actor, never both
@@ -878,9 +903,10 @@ pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
 /// agent"). Other co-locations on the substrate side (`canonical`, `steward`,
 /// `substrate_persist`, `witness`, …) stay conformant.
 ///
-/// Every door that writes `identity_type` runs it right after
-/// [`validate_registration_pubkey`]: `put_public_key` (every mint and every
-/// replicated `Insert`), `adopt_scrub_upgrade` (the replicated `Upgrade` arm,
+/// Every LOCAL door that writes `identity_type` runs it right after
+/// [`validate_registration_pubkey`]: `put_public_key` (every local mint — NOT
+/// the replicated `Insert`, which admits a key minted elsewhere as gated data,
+/// review M5, [`KeyDoor`]), `adopt_scrub_upgrade` (the replicated `Upgrade` arm,
 /// which CAN change `identity_type`), `supersede_canonical_record` (the
 /// replicated `Supersede` arm), `adopt_genesis_reanchor`,
 /// `seed_genesis_accord_holders`, and the rebind door. A pre-gate fused key is
@@ -894,6 +920,30 @@ pub fn check_node_identity_exclusive(record: &KeyRecord) -> Result<(), Error> {
         return Err(Error::NodeIdentityNotExclusive {
             key_id: record.key_id.clone(),
             identity_type: record.identity_type.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// v50.0.0 (CIRISPersist#925 review H3) — a REWRITE of a stored key record
+/// (`adopt_scrub_upgrade`, `supersede_canonical_record`,
+/// `adopt_genesis_reanchor`) may not add or remove `node` from
+/// `identity_type`. That makes the key's own `node` bearing fixed at mint, which
+/// the as-of node-bearing fold ([`NodeBearingSeats`](crate::federation::NodeBearingSeats))
+/// relies on to read it from current state. The rebind door (#864) already
+/// refuses any `identity_type` change.
+pub fn check_node_identity_unchanged(
+    existing: &KeyRecord,
+    incoming: &KeyRecord,
+) -> Result<(), Error> {
+    use crate::federation::types::identity_type as it;
+    let before = it::set_contains(&existing.identity_type, it::NODE);
+    let after = it::set_contains(&incoming.identity_type, it::NODE);
+    if before != after {
+        return Err(Error::NodeIdentityImmutable {
+            key_id: incoming.key_id.clone(),
+            stored: existing.identity_type.clone(),
+            offered: incoming.identity_type.clone(),
         });
     }
     Ok(())

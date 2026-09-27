@@ -752,24 +752,63 @@ pub struct RosterRules<'a> {
     /// The record's `policy_blob`.
     pub policy_blob: Option<&'a serde_json::Value>,
     /// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — the
-    /// group's `node`-bearing keys, resolved from the roster reads by
-    /// [`community_node_bearing_seats`]. The evaluator drops these seats in an
-    /// `infrastructure` group; it never re-reads the directory itself.
-    pub node_bearing: &'a std::collections::BTreeSet<String>,
+    /// group's `node`-bearing keys WITH the instants they bear `node`,
+    /// resolved from the roster reads by [`community_node_bearing_seats`]. The
+    /// fold asks [`NodeBearingSeats::at`] at each event's `effective_at`; it
+    /// never re-reads the directory itself.
+    pub node_bearing: &'a NodeBearingSeats,
+}
+
+/// A half-open `[start, end)` interval; `None` end = still open.
+pub type InstantInterval = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// v50.0.0 (CIRISPersist#925, review item 5) — which keys bear `node`, and
+/// WHEN. Two sources, judged differently:
+///
+/// - `own`: the key's own `identity_type` contains `node`. Fixed at mint — no
+///   door moves `node` in or out of a stored record (Clause A and the
+///   rewrite-door refusal, review H3) — so it holds at every instant.
+/// - `occurrence`: the key is an occurrence of a `node` identity, by its own
+///   agreement ([`occurrence_agreed_to`]). A binding is a RELATION with a start
+///   (the signed `asserted_at`) and an end (a revocation's `effective_at`, or
+///   `valid_until`), the same kind of thing as a `moderate` delegation, so it
+///   is judged AT THE CHANGE'S INSTANT (v49, `FSD/ROOM_ROSTER_AUTHORITY.md`
+///   §2–§3, I175/I175b: live at the act's instant; no ending is retroactive).
+///   A node-local `admitted_at` is never used: it depends on delivery order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeBearingSeats {
+    /// Keys whose own `identity_type` holds `node`.
+    pub own: std::collections::BTreeSet<String>,
+    /// Per key, the intervals it is an agreed occurrence of a `node` identity.
+    pub occurrence: std::collections::BTreeMap<String, Vec<InstantInterval>>,
+}
+
+impl NodeBearingSeats {
+    /// Does `key` bear `node` at `t`?
+    #[must_use]
+    pub fn at(&self, key: &str, t: chrono::DateTime<chrono::Utc>) -> bool {
+        self.own.contains(key)
+            || self.occurrence.get(key).is_some_and(|ivs| {
+                ivs.iter()
+                    .any(|(start, end)| *start <= t && end.is_none_or(|e| t < e))
+            })
+    }
 }
 
 /// The empty `node`-bearing set: a group whose rules never read it (a family,
 /// or a community that is not `infrastructure`).
-pub static NO_NODE_BEARING_SEATS: std::collections::BTreeSet<String> =
-    std::collections::BTreeSet::new();
+pub static NO_NODE_BEARING_SEATS: NodeBearingSeats = NodeBearingSeats {
+    own: std::collections::BTreeSet::new(),
+    occurrence: std::collections::BTreeMap::new(),
+};
 
 impl<'a> RosterRules<'a> {
     /// The rules a stored community declares, with its `node`-bearing seats
     /// ([`community_node_bearing_seats`]).
-    pub fn of_community(
-        c: &'a Community,
-        node_bearing: &'a std::collections::BTreeSet<String>,
-    ) -> Self {
+    pub fn of_community(c: &'a Community, node_bearing: &'a NodeBearingSeats) -> Self {
         Self {
             protocol: &c.consensus_protocol,
             subkind: community_subkind(c),
@@ -802,48 +841,101 @@ pub fn community_subkind(c: &Community) -> Option<&str> {
 }
 
 /// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — is
-/// `key_id` a `node`-bearing key? True when its own `federation_keys` row's
-/// `identity_type` set contains `node`, or when it is an ACTIVE occurrence of
-/// an identity whose row's set does AND the occurrence AGREED to that binding.
-/// An unresolved key is not `node`-bearing here (it has no record to judge;
-/// the membership doors FK-refuse it).
+/// `key_id` a `node`-bearing key NOW? [`is_node_bearing_key_at`] at the
+/// current instant: the admission doors judge a record being put now.
+pub async fn is_node_bearing_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    is_node_bearing_key_at(directory, key_id, chrono::Utc::now()).await
+}
+
+/// v50.0.0 (CIRISPersist#925, review item 5) — is `key_id` `node`-bearing at
+/// `t`? See [`NodeBearingSeats`] for the two sources and why the occurrence
+/// half is judged at an instant.
+pub async fn is_node_bearing_key_at<F>(
+    directory: &F,
+    key_id: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let (own, intervals) = node_bearing_of(directory, key_id).await?;
+    Ok(own
+        || intervals
+            .iter()
+            .any(|(start, end)| *start <= t && end.is_none_or(|e| t < e)))
+}
+
+/// v50.0.0 (CIRISPersist#925, review H1 + item 5) — `key_id`'s own `node`
+/// bearing and the intervals it is an agreed occurrence of a `node` identity.
 ///
 /// # Agreement (review H1)
 ///
 /// An occurrence row is admitted when its signer is the IDENTITY itself
 /// (`check_signer_acts_for`), so the occurrence never has to consent: any
 /// registered `node` key N could sign `{identity: N, occurrence: H}` for a
-/// human founder H and strip H's vote in every infrastructure fold. So the
-/// occurrence clause counts a binding only when the occurrence itself agreed
-/// to it ([`occurrence_agreed_to`]): a signed occurrence row for
-/// `(identity, key_id)` whose signer is `key_id`, or `key_id`'s own live
-/// owner-binding naming that identity (`owner_of`, the one relation a node
-/// signs through). A trusted-local (unsigned) row carries no agreement and does
-/// not count. #873's principal resolver
+/// human founder H and strip H's vote. So a binding counts only when the
+/// occurrence itself agreed to it ([`occurrence_agreed_to`]). A trusted-local
+/// (unsigned) row carries no agreement. #873's principal resolver
 /// ([`FederationDirectory::active_identities_for_occurrence`]) has the same
 /// unilateral-claim shape and is a follow-up (FSD `SECOND_DEVICE.md` §8.5).
-pub async fn is_node_bearing_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
+///
+/// # The interval (review item 5)
+///
+/// Every stored binding of `key_id` under a `node` identity it agreed to
+/// contributes `[asserted_at, end)`, `end` the earliest of its `valid_until`
+/// and the `effective_at` of any revocation of it that is in force against
+/// this assertion (`effective_at >= asserted_at`, the #421 re-establishment
+/// rule). The occurrence plane stores the LATEST assertion per pair, so a
+/// re-assertion moves the start forward; see FSD §8.5 for that residual.
+pub async fn node_bearing_of<F>(
+    directory: &F,
+    key_id: &str,
+) -> Result<(bool, Vec<InstantInterval>), Error>
 where
     F: FederationDirectory + ?Sized,
 {
     let has_node = |rec: &KeyRecord| {
         types::identity_type::set_contains(&rec.identity_type, types::identity_type::NODE)
     };
-    if let Some(rec) = directory.lookup_public_key(key_id).await? {
-        if has_node(&rec) {
-            return Ok(true);
-        }
+    if directory
+        .lookup_public_key(key_id)
+        .await?
+        .is_some_and(|rec| has_node(&rec))
+    {
+        return Ok((true, Vec::new()));
     }
-    for identity in directory.active_identities_for_occurrence(key_id).await? {
+    let mut intervals = Vec::new();
+    for row in directory
+        .list_identity_occurrences_by_occurrence_key(key_id)
+        .await?
+    {
+        if row.identity_key_id == key_id {
+            continue;
+        }
         let node_identity = directory
-            .lookup_public_key(&identity)
+            .lookup_public_key(&row.identity_key_id)
             .await?
             .is_some_and(|rec| has_node(&rec));
-        if node_identity && occurrence_agreed_to(directory, &identity, key_id).await? {
-            return Ok(true);
+        if !node_identity || !occurrence_agreed_to(directory, &row.identity_key_id, key_id).await? {
+            continue;
         }
+        let revoked = directory
+            .list_identity_occurrence_revocations_for(&row.identity_key_id)
+            .await?
+            .into_iter()
+            .filter(|r| r.occurrence_key_id == key_id && r.effective_at >= row.asserted_at)
+            .map(|r| r.effective_at)
+            .min();
+        let end = match (revoked, row.valid_until) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        intervals.push((row.asserted_at, end));
     }
-    Ok(false)
+    Ok((false, intervals))
 }
 
 /// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself agree to be
@@ -884,11 +976,11 @@ where
 pub async fn community_node_bearing_seats<F>(
     directory: &F,
     community: &Community,
-) -> Result<std::collections::BTreeSet<String>, Error>
+) -> Result<NodeBearingSeats, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = NodeBearingSeats::default();
     if community_subkind(community) != Some(admission::COHORT_SUBKIND_INFRASTRUCTURE) {
         return Ok(out);
     }
@@ -901,8 +993,11 @@ where
         keys.insert(w.member_key_id);
     }
     for k in keys {
-        if is_node_bearing_key(directory, &k).await? {
-            out.insert(k);
+        let (own, intervals) = node_bearing_of(directory, &k).await?;
+        if own {
+            out.own.insert(k);
+        } else if !intervals.is_empty() {
+            out.occurrence.insert(k, intervals);
         }
     }
     Ok(out)
@@ -966,7 +1061,14 @@ pub fn roster_event_standing(
     state: &RosterState,
     e: &RosterEvent,
 ) -> Result<(), (&'static str, String)> {
-    let is_active_founder = |k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER));
+    // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing seat (at this
+    // event's instant) holds no founder power in an infrastructure group,
+    // the last-founder rule included: it is not a founder that could be lost,
+    // and it does not count as the founder a change leaves behind.
+    let is_active_founder = |k: &str| {
+        matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER))
+            && !rules.node_bearing.at(k, e.effective_at)
+    };
     // Standing without the protocol: a legacy row (admitted before signers
     // were stored); a member leaving on their own signature; a named
     // moderator whose appointment was live at this event's instant and was
@@ -984,7 +1086,7 @@ pub fn roster_event_standing(
             .map(|(_, m)| consensus::Seat {
                 key_id: m.key_id.clone(),
                 role: m.role.clone(),
-                node_bearing: rules.node_bearing.contains(&m.key_id),
+                node_bearing: rules.node_bearing.at(&m.key_id, e.effective_at),
             })
             .collect();
         match consensus::evaluate(&consensus::Ballot {
@@ -1019,12 +1121,8 @@ pub fn roster_event_standing(
         && (!e.is_add || e.member.role.as_deref() != Some(admission::MEMBER_ROLE_FOUNDER));
     if loses_founder {
         let founders_after = state
-            .iter()
-            .filter(|(k, (active, m))| {
-                *active
-                    && k.as_str() != e.member.key_id
-                    && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
-            })
+            .keys()
+            .filter(|k| k.as_str() != e.member.key_id && is_active_founder(k))
             .count();
         let others_after = state
             .iter()
@@ -1244,6 +1342,46 @@ fn root_authority_intervals(
     for (k, start) in open {
         out.entry(k).or_default().push((start, None));
     }
+    // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing founder holds
+    // no founder POWER in an infrastructure group: the instants it bears
+    // `node` are cut out of its authority, so it roots no `moderate` chain
+    // then (`moderator_roots_at` reads only these intervals).
+    for (k, ivs) in out.iter_mut() {
+        if rules.node_bearing.own.contains(k) {
+            ivs.clear();
+        } else if let Some(cut) = rules.node_bearing.occurrence.get(k) {
+            *ivs = subtract_intervals(ivs, cut);
+        }
+    }
+    out
+}
+
+/// `ivs` minus every interval in `cut` (all half-open `[start, end)`).
+fn subtract_intervals(ivs: &[InstantInterval], cut: &[InstantInterval]) -> Vec<InstantInterval> {
+    let mut out: Vec<InstantInterval> = ivs.to_vec();
+    for &(cs, ce) in cut {
+        let mut next = Vec::with_capacity(out.len() + 1);
+        for (s, e) in out {
+            // The part before the cut.
+            if s < cs {
+                let end = match e {
+                    Some(e) if e <= cs => Some(e),
+                    _ => Some(cs),
+                };
+                next.push((s, end));
+            }
+            // The part after the cut.
+            if let Some(ce) = ce {
+                if e.is_none_or(|e| e > ce) {
+                    next.push((s.max(ce), e));
+                }
+            }
+        }
+        out = next
+            .into_iter()
+            .filter(|(s, e)| e.is_none_or(|e| *s < e))
+            .collect();
+    }
     out
 }
 
@@ -1398,8 +1536,11 @@ where
         let dir = directory.as_dyn_directory();
         let mut out = std::collections::BTreeSet::new();
         for (k, (active, m)) in &state0 {
+            // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing founder
+            // is no duty-holder.
             if *active
                 && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
+                && !rules.node_bearing.at(k, now)
                 && Box::pin(admission::is_steward_bound(dir, k)).await?
             {
                 out.insert(k.clone());
@@ -1437,7 +1578,7 @@ where
 pub async fn community_roster_events<F>(
     directory: &F,
     community: &Community,
-    node_bearing: &std::collections::BTreeSet<String>,
+    node_bearing: &NodeBearingSeats,
 ) -> Result<Vec<RosterEvent>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -6009,7 +6150,8 @@ pub trait FederationDirectory: Send + Sync {
                     .await?
                     .into_iter()
                     .map(|m| consensus::Seat {
-                        node_bearing: nodes.contains(&m.key_id),
+                        // A quorum-gated supersede happens now.
+                        node_bearing: nodes.at(&m.key_id, chrono::Utc::now()),
                         key_id: m.key_id,
                         role: m.role,
                     })
@@ -9414,7 +9556,8 @@ pub enum Error {
     #[error(
         "withdraws by issuer {issuer:?} against target attestation \
          {target_attestation_id:?} is not admitted: the issuer satisfies none of the \
-         four §3.2.3 admission rules (producer / subject / delegated-proxy authority)"
+         four §3.2.3 admission rules (producer / subject / delegated-proxy authority); \
+         beyond_delegation_depth_cap={beyond_delegation_depth_cap}"
     )]
     WithdrawsNotAdmitted {
         /// The `attesting_key_id` of the refused `withdraws`.
@@ -9923,6 +10066,23 @@ pub enum Error {
         identity_type: String,
     },
 
+    /// v50.0.0 (CIRISPersist#925 review H3) — a rewrite of a stored key record
+    /// would add or remove `node` from its `identity_type`. `node` is fixed at
+    /// mint; the key re-mints. Nothing is stored. Stable `kind()` token
+    /// `federation_node_identity_immutable`.
+    #[error(
+        "key {key_id:?}: a rewrite may not move `node` in or out of identity_type \
+         (stored {stored:?}, offered {offered:?}); node is fixed at mint"
+    )]
+    NodeIdentityImmutable {
+        /// The refused record's `key_id`.
+        key_id: String,
+        /// The stored `identity_type`.
+        stored: String,
+        /// The offered `identity_type`.
+        offered: String,
+    },
+
     /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a `delegates_to`
     /// whose TARGET (`attested_key_id`) resolves to a `user`-role identity was
     /// REFUSED by the CC 3.2 user-target steward-binding gate. "Stewarding a
@@ -10341,6 +10501,7 @@ impl Error {
                 "federation_community_consensus_protocol_violation"
             }
             Error::NodeIdentityNotExclusive { .. } => "federation_node_identity_not_exclusive",
+            Error::NodeIdentityImmutable { .. } => "federation_node_identity_immutable",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
             }

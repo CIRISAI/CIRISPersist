@@ -188,11 +188,19 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — Gates: an infrastructure
     // record must declare quorum:M/N and seat no node-bearing founder; a
     // widening may not seat one. Statements about the caller's row.
-    ("check_infrastructure_community_conformance", Class::Gate),
+    // v50.0.0 (review M6) — the record door's form: conformance for a new or
+    // changed record authored here; replicated data admitted.
+    ("check_infrastructure_record_admission", Class::Gate),
     ("check_infrastructure_founders_not_node", Class::Gate),
     // v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — Gate: refuses a
     // key record fusing `node` with `agent`/`user`.
     ("check_node_identity_exclusive", Class::Gate),
+    // v50.0.0 (review H3) — Gate: a rewrite may not move `node` in or out.
+    ("check_node_identity_unchanged", Class::Gate),
+    // v50.0.0 (review M5) — Delegates: `put_public_key` is the local-mint face
+    // of the one key-record store step; the replicated `Insert` arm reaches
+    // the same helper with the replicated door.
+    ("put_public_key_at_door", Class::Delegates),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),

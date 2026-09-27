@@ -12084,6 +12084,38 @@ pub const INFRA_RULE_NODE_BEARING_FOUNDER: &str = "node_bearing_founder";
 /// `quorum:M/N` form (CC 3.2 conformance: `founder_only` / `unanimous` / bare
 /// `majority` are non-conformant, and so is every other form).
 pub const INFRA_RULE_PROTOCOL_NOT_QUORUM: &str = "protocol_not_quorum_m_of_n";
+/// v50.0.0 (review) — [`Error::CommunityConsensusProtocolViolation`] rule: an
+/// `infrastructure` community names no founder (no admission quorum at all).
+pub const INFRA_RULE_NO_FOUNDER: &str = "no_founder";
+/// v50.0.0 (merge prep for CIRISPersist#926) — rule: a record that must be
+/// `infrastructure` (e.g. `ciris-canonical`) does not carry that subkind.
+pub const INFRA_RULE_SUBKIND_NOT_INFRASTRUCTURE: &str = "subkind_not_infrastructure";
+/// v50.0.0 (merge prep for #926) — rule: `admission_quorum_basis` is not
+/// `founders` (CC 3.2 `infrastructure_constraint`).
+pub const INFRA_RULE_BASIS_NOT_FOUNDERS: &str = "admission_quorum_basis_not_founders";
+/// v50.0.0 (merge prep for #926) — rule: `consensus_protocol_entrenched` is
+/// not `true` (CC 3.2 conformance).
+pub const INFRA_RULE_NOT_ENTRENCHED: &str = "protocol_not_entrenched";
+/// v50.0.0 (merge prep for #926) — rule: a founder was not conferred on the
+/// ceremony plane (CC 3.2 T2).
+pub const INFRA_RULE_FOUNDER_NOT_CONFERRED: &str = "founder_not_conferred";
+/// v50.0.0 (merge prep for #926) — rule: a supersede changes the record's
+/// trust-root grade (subkind, basis or entrenchment).
+pub const INFRA_RULE_GRADE_CHANGED: &str = "grade_changed";
+
+/// v50.0.0 (CIRISPersist#927, review M1) — THE `infrastructure` quorum parser:
+/// `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC
+/// 3.2: "a single founder must not be able to admit unilaterally";
+/// `quorum:1/1` is the degenerate single-founder case and stays conformant).
+/// `Some((M, N))` when conformant. One parser, shared with #926.
+#[must_use]
+pub fn infrastructure_quorum(protocol: &str) -> Option<(u32, u32)> {
+    let (m, n) = protocol
+        .strip_prefix(super::types::consensus_protocol::QUORUM_PREFIX)?
+        .split_once('/')?;
+    let (m, n) = (m.parse::<u32>().ok()?, n.parse::<u32>().ok()?);
+    (n >= 1 && m >= 1 && m <= n && (n < 2 || m >= 2)).then_some((m, n))
+}
 
 fn is_infrastructure_labeled(community: &super::Community) -> bool {
     super::community_subkind(community) == Some(COHORT_SUBKIND_INFRASTRUCTURE)
@@ -12104,22 +12136,16 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
         return Ok(());
     }
     let p = community.consensus_protocol.as_str();
-    let conformant = p
-        .strip_prefix(super::types::consensus_protocol::QUORUM_PREFIX)
-        .and_then(|tail| tail.split_once('/'))
-        .and_then(|(m, n)| Some((m.parse::<u32>().ok()?, n.parse::<u32>().ok()?)))
-        // v50.0.0 (review M1) — `1 ≤ M ≤ N`: `quorum:0/N` would let a change no
-        // founder signed be argued conformant.
-        .is_some_and(|(m, n)| m >= 1 && m <= n);
-    if conformant {
+    if infrastructure_quorum(p).is_some() {
         return Ok(());
     }
     Err(Error::CommunityConsensusProtocolViolation {
         community_key_id: community.community_key_id.clone(),
         rule: INFRA_RULE_PROTOCOL_NOT_QUORUM,
         detail: format!(
-            "consensus_protocol {p:?} is not a quorum:M/N form (CC 3.2: founder_only / \
-             unanimous / bare majority are non-conformant for infrastructure)"
+            "consensus_protocol {p:?} is not a conformant quorum:M/N (1 <= M <= N, and \
+             M >= 2 when N >= 2 — CC 3.2: founder_only / unanimous / bare majority are \
+             non-conformant, and a single founder must not admit unilaterally)"
         ),
     })
 }
@@ -12140,6 +12166,7 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
 pub async fn check_infrastructure_founders_not_node(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     if !is_infrastructure_labeled(community) {
         return Ok(());
@@ -12148,7 +12175,7 @@ pub async fn check_infrastructure_founders_not_node(
         if m.role.as_deref() != Some(MEMBER_ROLE_FOUNDER) {
             continue;
         }
-        if super::is_node_bearing_key(directory, &m.key_id).await? {
+        if super::is_node_bearing_key_at(directory, &m.key_id, at).await? {
             return Err(Error::CommunityConsensusProtocolViolation {
                 community_key_id: community.community_key_id.clone(),
                 rule: INFRA_RULE_NODE_BEARING_FOUNDER,
@@ -12173,7 +12200,62 @@ pub async fn check_infrastructure_community_conformance(
     community: &super::Community,
 ) -> Result<(), Error> {
     check_infrastructure_consensus_protocol(community)?;
-    check_infrastructure_founders_not_node(directory, community).await
+    if is_infrastructure_labeled(community)
+        && !community
+            .members
+            .iter()
+            .any(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+    {
+        return Err(Error::CommunityConsensusProtocolViolation {
+            community_key_id: community.community_key_id.clone(),
+            rule: INFRA_RULE_NO_FOUNDER,
+            detail: "an infrastructure community must name at least one founder (its \
+                     admission quorum is evaluated over founders, CC 3.2)"
+                .into(),
+        });
+    }
+    check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await
+}
+
+/// v50.0.0 (CIRISPersist#925/#927, review M6) — the `put_community` door's
+/// infrastructure gate. Conformance
+/// ([`check_infrastructure_community_conformance`]) applies to a NEW or CHANGED
+/// record AUTHORED HERE; the local supersede doors run it unconditionally.
+///
+/// - An identical re-put (same `persist_row_hash` as the stored row) settles
+///   as the idempotent no-op it always was: it changes nothing, so it is not
+///   re-judged.
+/// - A record authored ELSEWHERE — its `authority_key_id` is not this node's
+///   key ([`FederationDirectory::node_key_id`]) — is replicated DATA: a legacy
+///   infrastructure record is admitted, and the fold's gates apply to it
+///   (a `node`-bearing founder's seat does not vote; the stored protocol is
+///   evaluated over founders). Refusing it would leave a fresh node unable to
+///   sync a record the rest of the mesh holds.
+/// - When this node's key is unknown (a host that never set it), the record is
+///   judged as authored here: the stricter reading.
+pub async fn check_infrastructure_record_admission(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+    authority_key_id: &str,
+) -> Result<(), Error> {
+    if !is_infrastructure_labeled(community) {
+        return Ok(());
+    }
+    if let Some(stored) = directory
+        .lookup_community(&community.community_key_id)
+        .await?
+    {
+        if stored.persist_row_hash == super::types::compute_persist_row_hash(community)? {
+            return Ok(());
+        }
+    }
+    if directory
+        .node_key_id()
+        .is_some_and(|me| me != authority_key_id)
+    {
+        return Ok(());
+    }
+    check_infrastructure_community_conformance(directory, community).await
 }
 
 /// v9.0.0 (CC 3.2 "steward-binding gate for non-infrastructure membership"

@@ -24824,7 +24824,10 @@ impl PyEngine {
     /// snake_case verdict token instead of a bool so a Python consumer
     /// can route a distinct audit entry per refusal reason. Tokens:
     /// `"reachable"`, `"retracted_at_root"`, `"missing_scope"`,
-    /// `"signer_unreached"`, `"substrate_unavailable"`, `"no_trust_roots"`.
+    /// `"signer_unreached"`, `"substrate_unavailable"`, `"no_trust_roots"`,
+    /// and (v50.0.0, CIRISPersist#928) `"beyond_depth_cap"` — a scope-bearing
+    /// chain continues past `max_depth`: too deep to confer (CC 4.1.1
+    /// self_verify), distinct from `"signer_unreached"`.
     fn reachable_under_scope_with_reasons(
         &self,
         py: Python<'_>,
@@ -33112,7 +33115,8 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v50.0.0 (CIRISPersist#925/#927) — a non-conformant infrastructure
         // record and a fused node key are the submitter's to re-mint: 4xx.
         crate::federation::Error::CommunityConsensusProtocolViolation { .. }
-        | crate::federation::Error::NodeIdentityNotExclusive { .. } => PyValueError::new_err(kind),
+        | crate::federation::Error::NodeIdentityNotExclusive { .. }
+        | crate::federation::Error::NodeIdentityImmutable { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused
         // user-target steward-binding (target is a self-sovereign adult / its
         // age is unverified / the granter is not a proven adult user) is a

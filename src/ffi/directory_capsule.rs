@@ -220,6 +220,15 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// says so first. The same version also carries growth that rides free:
 /// [`DirectoryOpResult::AccordEvidenceCarrierRefused`] (CIRISPersist#674).
 ///
+/// v6 (v50.0.0, CIRISPersist#928, review M3) is the payload-type form again:
+/// [`crate::federation::ReachabilityVerdict`] gained `BeyondDepthCap` (CC
+/// 4.1.1: a scope-bearing chain continues past the depth cap — too deep, not
+/// absent), and an EXISTING op returns it inside
+/// `DirectoryOpResult::Reachability`. An older consumer serde-fails on the hot
+/// path (or, with a catch-all arm, misreports it as a substrate fault), so the
+/// load-time gate must say so. The two enum-body digests do not move — the
+/// verdict is a payload type outside their sight, exactly as v3's was.
+///
 /// v3 also carries the v2 break applied to the WHOLE cursor family
 /// (v36.0.0, CIRISPersist#668): every remaining `List*Since` op takes the
 /// `(serve position, resume id)` pair instead of a bare instant, and every
@@ -243,7 +252,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 5;
+pub const DIRECTORY_ABI_VERSION: u32 = 6;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -4751,10 +4760,13 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_5() {
+    fn abi_version_pinned_at_6() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 5,
-            "the RESULT wire gained a variant in v38.5.0 \
+            DIRECTORY_ABI_VERSION, 6,
+            "v50.0.0 (CIRISPersist#928): ReachabilityVerdict, the payload of the \
+             existing Reachability result, gained BeyondDepthCap — a consumer built \
+             against 5 fails to decode it on the hot path. Previous move: the RESULT \
+             wire gained a variant in v38.5.0 \
              (DirectoryOpResult::AttestationOutcome, CIRISPersist#771): a \
              consumer built against 4 decodes `Unit` for put_attestation and \
              would fail to decode the new variant, so the load-time gate must \
@@ -4766,7 +4778,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 5,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 6,
             "the shipped vtable must advertise what consumers pin against"
         );
     }

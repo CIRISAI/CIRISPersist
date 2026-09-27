@@ -69,45 +69,106 @@ pub mod bodies {
         }
     }
 
-    /// The IDENTITY signs `{identity → occurrence}`: a unilateral claim, which
-    /// the occurrence gate admits (the signer is the identity itself) and
-    /// which does NOT make the occurrence node-bearing (review H1).
-    async fn identity_claims(d: &dyn FederationDirectory, identity: &str, occurrence: &str) {
-        let now = chrono::Utc::now();
+    /// The IDENTITY signs `{identity → occurrence}`, asserted at `t`: a
+    /// unilateral claim, which the occurrence gate admits (the signer is the
+    /// identity itself) and which does NOT make the occurrence node-bearing
+    /// (review H1).
+    async fn identity_claims_at(
+        d: &dyn FederationDirectory,
+        identity: &str,
+        occurrence: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) {
         d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(
-                identity,
-                identity,
-                occurrence,
-                now - chrono::Duration::seconds(3),
-            )
-            .await,
+            ts::signed_content_only_occurrence(identity, identity, occurrence, t).await,
         )
         .await
         .expect("the identity's claim is admitted");
     }
 
-    /// The OCCURRENCE signs the same binding itself (its agreement). Admitted
-    /// because the identity's claim already made it an active occurrence.
-    async fn occurrence_agrees(d: &dyn FederationDirectory, identity: &str, occurrence: &str) {
-        let now = chrono::Utc::now();
+    /// The OCCURRENCE signs the same binding itself, asserted at `t` (its
+    /// agreement). Admitted because the identity's claim already made it an
+    /// active occurrence.
+    async fn occurrence_agrees_at(
+        d: &dyn FederationDirectory,
+        identity: &str,
+        occurrence: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) {
         d.put_identity_occurrence(
-            ts::signed_content_only_occurrence(
-                occurrence,
-                identity,
-                occurrence,
-                now - chrono::Duration::seconds(1),
-            )
-            .await,
+            ts::signed_content_only_occurrence(occurrence, identity, occurrence, t).await,
         )
         .await
         .expect("the occurrence's own row is admitted");
     }
 
-    /// Both halves: the key is an occurrence of `identity` by its own consent.
+    async fn identity_claims(d: &dyn FederationDirectory, identity: &str, occurrence: &str) {
+        identity_claims_at(d, identity, occurrence, ago(3)).await;
+    }
+
+    async fn occurrence_agrees(d: &dyn FederationDirectory, identity: &str, occurrence: &str) {
+        occurrence_agrees_at(d, identity, occurrence, ago(1)).await;
+    }
+
+    /// Both halves, the agreement asserted at `t`: the key is an occurrence of
+    /// `identity` by its own consent from `t` on.
+    async fn occurrence_of_at(
+        d: &dyn FederationDirectory,
+        identity: &str,
+        occurrence: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) {
+        identity_claims_at(d, identity, occurrence, t - chrono::Duration::seconds(1)).await;
+        occurrence_agrees_at(d, identity, occurrence, t).await;
+    }
+
+    /// Both halves, now.
     async fn occurrence_of(d: &dyn FederationDirectory, identity: &str, occurrence: &str) {
-        identity_claims(d, identity, occurrence).await;
-        occurrence_agrees(d, identity, occurrence).await;
+        occurrence_of_at(d, identity, occurrence, ago(1)).await;
+    }
+
+    /// `secs` seconds ago (negative: in the future), millisecond-truncated.
+    fn ago(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        let t = chrono::Utc::now() - chrono::Duration::seconds(secs);
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms")
+    }
+
+    fn widening_at(
+        room: &str,
+        member: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> CommunityMembershipWidening {
+        CommunityMembershipWidening {
+            community_key_id: room.to_owned(),
+            member_key_id: member.to_owned(),
+            joined_at: t,
+            effective_at: t,
+            role: Some("member".into()),
+            persist_row_hash: String::new(),
+        }
+    }
+
+    async fn widen_by(
+        d: &dyn FederationDirectory,
+        signer: &str,
+        room: &str,
+        member: &str,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        d.put_community_membership_widening(ts::sign_community_membership_widening(
+            signer,
+            widening_at(room, member, t),
+        ))
+        .await
+    }
+
+    async fn active(d: &dyn FederationDirectory, room: &str) -> Vec<String> {
+        d.active_community_members(room)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect()
     }
 
     /// **#925 review H1 — an identity's claim over a key is not the key's
@@ -212,7 +273,7 @@ pub mod bodies {
                 &human,
                 infra_room(
                     &room,
-                    "quorum:1/2",
+                    "quorum:2/2",
                     vec![seat(&human, "founder"), seat(&install, "founder")],
                 ),
             ))
@@ -243,7 +304,7 @@ pub mod bodies {
                 &human,
                 infra_room(
                     &room_b,
-                    "quorum:1/2",
+                    "quorum:2/2",
                     vec![seat(&human, "founder"), seat(&relay_occ, "founder")],
                 ),
             ))
@@ -274,7 +335,7 @@ pub mod bodies {
                     &human,
                     infra_room(
                         &room,
-                        "quorum:1/2",
+                        "quorum:2/2",
                         vec![seat(&human, "founder"), seat(&install, "founder")],
                     ),
                 ),
@@ -326,12 +387,18 @@ pub mod bodies {
         assert_eq!(founders, vec![human.clone()]);
     }
 
-    /// **#925 — the fold vector.** A room admitted BEFORE its second founder
-    /// became `node`-bearing (the key later agrees to be an occurrence of a
-    /// `node` identity — a pre-gate row). Under `quorum:1/2` over founders
-    /// `{human, node}`, a widening signed by the node alone does NOT admit —
-    /// its seat is dropped, not counted — and the human's signature does.
-    pub async fn node_founder_seat_does_not_vote(d: &dyn FederationDirectory, tag: &str) {
+    /// **#925 — the fold vector** (runs where the room is replicated DATA —
+    /// a legacy `quorum:1/2` record the M1 parser would refuse if authored
+    /// here). Founders `{human, install}`: the install alone widens `second`;
+    /// the install then agrees to be an occurrence of a `node` identity; a
+    /// widening signed by the install alone no longer admits (its seat is
+    /// dropped, not counted), the human's does, and `second` — admitted
+    /// before the binding — still stands.
+    pub async fn node_founder_seat_does_not_vote(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        _host: &str,
+    ) {
         let human = format!("human-{tag}");
         let install = format!("install-{tag}");
         let node_identity = format!("node-id-{tag}");
@@ -353,50 +420,258 @@ pub mod bodies {
             ),
         ))
         .await
-        .unwrap_or_else(|e| panic!("{tag}: the pre-gate room: {e}"));
-
-        let w = |member: &str, day: &str| CommunityMembershipWidening {
-            community_key_id: room.clone(),
-            member_key_id: member.to_owned(),
-            joined_at: at(day),
-            effective_at: at(day),
-            role: Some("member".into()),
-            persist_row_hash: String::new(),
-        };
-        // Control: before the install is node-bearing, its scrub is a founder's.
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
-            &install,
-            w(&second, "2026-02-01T00:00:00Z"),
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: control — a founder's scrub admits: {e}"));
-
-        // Now the install becomes node-bearing.
-        occurrence_of(d, &node_identity, &install).await;
-
-        let err = d
-            .put_community_membership_widening(ts::sign_community_membership_widening(
-                &install,
-                w(&newcomer, "2026-02-02T00:00:00Z"),
-            ))
+        .unwrap_or_else(|e| panic!("{tag}: the legacy room: {e}"));
+        widen_by(d, &install, &room, &second, ago(100))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: control — a founder's scrub admits: {e}"));
+        occurrence_of_at(d, &node_identity, &install, ago(80)).await;
+        let err = widen_by(d, &install, &room, &newcomer, ago(60))
             .await
             .expect_err("#925: the node seat's scrub does not admit under quorum:1/2");
         assert!(
             matches!(err, Error::RosterAuthorityUnauthorized { .. }),
             "refused by the roster standing gate: {err}"
         );
-        assert!(!d
-            .active_community_members(&room)
+        assert!(!active(d, &room).await.contains(&newcomer));
+        widen_by(d, &human, &room, &newcomer, ago(50))
             .await
-            .unwrap()
-            .iter()
-            .any(|m| m.key_id == newcomer));
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+            .unwrap_or_else(|e| panic!("{tag}: the human founder's scrub admits: {e}"));
+        assert!(
+            active(d, &room).await.contains(&second),
+            "{tag}: item 5 — `second`, admitted before the binding, still stands"
+        );
+    }
+
+    /// **#925 review item 5 — node-bearing is judged at the change's
+    /// instant** (v49: live at the act's instant, no ending retroactive). Founders
+    /// `{human, install}`, `quorum:1/2` (replicated data):
+    /// (1) the install alone widens `second` at t1;
+    /// (2) the install is bound to a `node` identity, asserted t2 > t1 —
+    ///     `second` still stands;
+    /// (3) an install-only widening at t3 > t2 is refused, a human-signed one
+    ///     admitted;
+    /// (4) the binding is revoked effective t4 — an install-only widening at t5
+    ///     is admitted, and (3)'s refused row is still absent;
+    /// (5) control: a binding asserted before t1 makes the install's step-1
+    ///     widening fail.
+    pub async fn node_bearing_is_judged_at_the_change_instant(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        _host: &str,
+    ) {
+        let human = format!("human-{tag}");
+        let install = format!("install-{tag}");
+        let install2 = format!("install2-{tag}");
+        let node_identity = format!("node-id-{tag}");
+        let [second, third, refused, fifth] =
+            ["second", "third", "refused", "fifth"].map(|n| format!("{n}-{tag}"));
+        for k in [&human, &second, &third, &refused, &fifth] {
+            ts::register_hybrid_key_as(d, k, k, it::USER).await;
+        }
+        ts::register_hybrid_key_as(d, &install, &install, it::PRIMITIVE).await;
+        ts::register_hybrid_key_as(d, &install2, &install2, it::PRIMITIVE).await;
+        ts::register_hybrid_key_as(d, &node_identity, &node_identity, it::NODE).await;
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
+        d.put_community(ts::sign_community(
             &human,
-            w(&newcomer, "2026-02-03T00:00:00Z"),
+            infra_room(
+                &room,
+                "quorum:1/2",
+                vec![seat(&human, "founder"), seat(&install, "founder")],
+            ),
         ))
         .await
-        .unwrap_or_else(|e| panic!("{tag}: the human founder's scrub admits: {e}"));
+        .unwrap_or_else(|e| panic!("{tag}: the legacy room: {e}"));
+        let (t1, t2, t3, t4, t5) = (ago(200), ago(160), ago(120), ago(80), ago(40));
+        // (1)
+        widen_by(d, &install, &room, &second, t1)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: (1) {e}"));
+        // (2)
+        occurrence_of_at(d, &node_identity, &install, t2).await;
+        assert!(
+            active(d, &room).await.contains(&second),
+            "{tag}: (2) a binding asserted after t1 does not reach back to t1"
+        );
+        // (3)
+        widen_by(d, &install, &room, &refused, t3)
+            .await
+            .expect_err("(3) the install is node-bearing at t3");
+        widen_by(d, &human, &room, &third, t3 + chrono::Duration::seconds(1))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: (3) the human's scrub admits: {e}"));
+        // (4)
+        d.put_identity_occurrence_revocation(
+            ts::signed_occurrence_revocation(&node_identity, &node_identity, &install, t4).await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: (4) the revocation: {e}"));
+        widen_by(d, &install, &room, &fifth, t5)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: (4) the binding ended at t4: {e}"));
+        let now = active(d, &room).await;
+        for k in [&second, &third, &fifth] {
+            assert!(now.contains(k), "{tag}: (4) {k} stands");
+        }
+        assert!(
+            !now.contains(&refused),
+            "{tag}: (4) the ending is not retroactive — (3)'s refusal stands"
+        );
+        // (5) control
+        let room2 = format!("root2-{tag}");
+        authorized_room_key(d, &room2).await;
+        d.put_community(ts::sign_community(
+            &human,
+            infra_room(
+                &room2,
+                "quorum:1/2",
+                vec![seat(&human, "founder"), seat(&install2, "founder")],
+            ),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: the control room: {e}"));
+        occurrence_of_at(d, &node_identity, &install2, ago(240)).await;
+        widen_by(d, &install2, &room2, &second, t1)
+            .await
+            .expect_err("(5) a binding asserted before t1 makes the install node-bearing at t1");
+    }
+
+    /// **#925 review M2 — the last-founder rule.** A `node`-bearing founder is
+    /// not a founder a change leaves behind: with founders `{human, install}`
+    /// and a member, once the install is `node`-bearing the human cannot leave
+    /// (it would leave members and no founder). Control: before the binding,
+    /// the same leave is admitted in a twin room.
+    pub async fn node_bearing_founder_holds_no_last_founder_power(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        _host: &str,
+    ) {
+        let human = format!("human-{tag}");
+        let install = format!("install-{tag}");
+        let node_identity = format!("node-id-{tag}");
+        let member = format!("member-{tag}");
+        ts::register_hybrid_key_as(d, &human, &human, it::USER).await;
+        ts::register_hybrid_key_as(d, &member, &member, it::USER).await;
+        ts::register_hybrid_key_as(d, &install, &install, it::PRIMITIVE).await;
+        ts::register_hybrid_key_as(d, &node_identity, &node_identity, it::NODE).await;
+        let leave = |room: &str, t| {
+            ts::sign_community_membership_revocation(
+                &human,
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: room.to_owned(),
+                    removed_identity_key_id: human.clone(),
+                    removed_at: t,
+                    effective_at: t,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+        for (room, bound) in [
+            (format!("root-{tag}"), true),
+            (format!("twin-{tag}"), false),
+        ] {
+            authorized_room_key(d, &room).await;
+            d.put_community(ts::sign_community(
+                &human,
+                infra_room(
+                    &room,
+                    "quorum:1/2",
+                    vec![
+                        seat(&human, "founder"),
+                        seat(&install, "founder"),
+                        seat(&member, "member"),
+                    ],
+                ),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+            if bound {
+                occurrence_of_at(d, &node_identity, &install, ago(100)).await;
+                let err = d
+                    .put_community_membership_revocation(leave(&room, ago(50)))
+                    .await
+                    .expect_err("M2: the only non-node founder cannot leave");
+                match err {
+                    Error::RosterAuthorityUnauthorized { rule, .. } => {
+                        assert_eq!(rule, crate::federation::ROSTER_LAST_FOUNDER, "{tag}")
+                    }
+                    other => panic!("{tag}: expected the last-founder rule, got {other}"),
+                }
+            } else {
+                // The twin's install is bound too (the binding is per key), so
+                // its control leave is dated BEFORE the binding.
+                d.put_community_membership_revocation(leave(&room, ago(150)))
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag}: control — a founder remains: {e}"));
+            }
+        }
+    }
+
+    /// **#925 review M2 — no moderation root.** A `node`-bearing founder roots
+    /// no `moderate` chain in an infrastructure room. Two twin rooms under
+    /// `quorum:2/2` (so only moderator standing admits a lone deputy): in one
+    /// the appointing founder is `node`-bearing when it appoints, in the other
+    /// it is not. The first deputy's lone widening is refused, the second's
+    /// admitted. (An appointment made while its root held authority keeps
+    /// standing after — v49's no-retroactive-ending ruling — so the binding
+    /// precedes the appointment here.)
+    pub async fn node_bearing_founder_roots_no_moderation(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        _host: &str,
+    ) {
+        let human = format!("human-{tag}");
+        let node_identity = format!("node-id-{tag}");
+        ts::register_hybrid_key_as(d, &human, &human, it::USER).await;
+        ts::register_hybrid_key_as(d, &node_identity, &node_identity, it::NODE).await;
+        for (name, bound) in [("bound", true), ("free", false)] {
+            let install = format!("install-{name}-{tag}");
+            let deputy = format!("deputy-{name}-{tag}");
+            let newcomer = format!("newcomer-{name}-{tag}");
+            ts::register_hybrid_key_as(d, &install, &install, it::USER).await;
+            ts::register_hybrid_key_as(d, &newcomer, &newcomer, it::USER).await;
+            ts::register_hybrid_key_as(d, &deputy, &deputy, it::PRIMITIVE).await;
+            let room = format!("root-{name}-{tag}");
+            authorized_room_key(d, &room).await;
+            d.put_community(ts::sign_community(
+                &human,
+                infra_room(
+                    &room,
+                    "quorum:2/2",
+                    vec![seat(&human, "founder"), seat(&install, "founder")],
+                ),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
+            if bound {
+                occurrence_of_at(d, &node_identity, &install, ago(5)).await;
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut edge = signed_row(
+                &install,
+                &deputy,
+                attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "id": id, "scope": [DELEGATION_SCOPE_MODERATE], "community_id": room,
+                }),
+            );
+            ts::reseal(&mut edge);
+            d.put_attestation(SignedAttestation { attestation: edge })
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: the moderate edge: {e}"));
+            let r = widen_by(d, &deputy, &room, &newcomer, ago(-5)).await;
+            if bound {
+                assert!(
+                    matches!(r, Err(Error::RosterAuthorityUnauthorized { .. })),
+                    "{tag}: M2 — a node-bearing founder roots no moderation chain: {r:?}"
+                );
+            } else {
+                r.unwrap_or_else(|e| panic!("{tag}: control — the founder's deputy admits: {e}"));
+            }
+        }
     }
 
     /// **#927 — an `infrastructure` community declares `quorum:M/N`.** Every
@@ -411,6 +686,9 @@ pub mod bodies {
             // signed: not conformant.
             "quorum:0/1",
             "quorum:0/3",
+            // review M1 — a single founder must not admit unilaterally.
+            "quorum:1/2",
+            "quorum:1/3",
             "founder_only",
             "majority",
             "unanimous",
@@ -450,6 +728,29 @@ pub mod bodies {
         ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: quorum:1/1 is conformant: {e}"));
+        let room3 = format!("root-23-{tag}");
+        authorized_room_key(d, &room3).await;
+        d.put_community(ts::sign_community(
+            &human,
+            infra_room(&room3, "quorum:2/3", vec![seat(&human, "founder")]),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: quorum:2/3 is conformant: {e}"));
+        // An infrastructure community with NO founder has no admission quorum.
+        let none = format!("root-none-{tag}");
+        authorized_room_key(d, &none).await;
+        let err = d
+            .put_community(ts::sign_community(
+                &human,
+                infra_room(&none, "quorum:1/1", vec![seat(&human, "member")]),
+            ))
+            .await
+            .expect_err("no founder");
+        assert_eq!(
+            violation_rule(&err),
+            crate::federation::admission::INFRA_RULE_NO_FOUNDER,
+            "{err}"
+        );
         let err = d
             .supersede_community(
                 ts::sign_community(
@@ -460,6 +761,157 @@ pub mod bodies {
             )
             .await
             .expect_err("#927: a supersede cannot lower the protocol form");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_PROTOCOL_NOT_QUORUM,
+            "{err}"
+        );
+    }
+
+    /// **#925 review M5 — the replicated `Insert` admits a fused key minted
+    /// elsewhere** (gated data: Clause B and the steward gates apply wherever
+    /// it acts), while a local mint of the same shape is refused. Every
+    /// outcome of the replicated door is TYPED (`Ok`), so the caller's
+    /// replication cursor records it and advances — a refusal is never an
+    /// `Err` that would be re-polled: a pubkey swap over the admitted key is
+    /// `Refused { pubkey_swap }`.
+    pub async fn clause_a_replicated_insert_admits_a_fused_key(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::register::{KeyRefusalReason, ReplicatedKeyOutcome};
+        let fused = it::join_set([it::NODE, it::AGENT]);
+        let remote = format!("remote-fused-{tag}");
+        let out = d
+            .apply_replicated_key_record(SignedKeyRecord {
+                record: ts::replicated_key_record(&remote, &fused, &remote, &remote, "n1"),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: M5 — the replicated insert is typed: {e}"));
+        assert_eq!(
+            out,
+            ReplicatedKeyOutcome::Inserted,
+            "{tag}: admitted as data"
+        );
+        assert_eq!(
+            d.lookup_public_key(&remote)
+                .await
+                .unwrap()
+                .unwrap()
+                .identity_type,
+            fused
+        );
+        let mut swapped = ts::replicated_key_record(&remote, &fused, &remote, &remote, "n2");
+        let (other_ed, _) = ts::hybrid_pubkeys(&format!("other-{tag}"));
+        swapped.pubkey_ed25519_base64 = other_ed;
+        let out = d
+            .apply_replicated_key_record(SignedKeyRecord { record: swapped })
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: a refusal is typed, never an Err: {e}"));
+        assert_eq!(
+            out,
+            ReplicatedKeyOutcome::Refused {
+                reason: KeyRefusalReason::PubkeySwap
+            }
+        );
+        let local = format!("local-fused-{tag}");
+        let err = d
+            .put_public_key(SignedKeyRecord {
+                record: ts::replicated_key_record(&local, &fused, &local, &local, "n1"),
+            })
+            .await
+            .expect_err("a LOCAL mint of a fused key is refused");
+        assert!(
+            matches!(err, Error::NodeIdentityNotExclusive { .. }),
+            "{err}"
+        );
+    }
+
+    /// **#925/#927 review M6 — conformance judges records AUTHORED HERE.** On
+    /// node A (its key `host_a`), a legacy `founder_only` infrastructure record
+    /// signed by a human is replicated data: admitted, and an identical re-put
+    /// settles. A fresh node B syncs it from A's signed since-read. A NEW
+    /// record authored by A's own key is refused, and so is a supersede of the
+    /// legacy record to another non-conformant form.
+    pub async fn infrastructure_record_authored_elsewhere_is_data(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+        host_a: &str,
+        rekey_a: &(dyn Fn(String) + Sync),
+    ) {
+        let human = format!("human-{tag}");
+        for d in [a, b] {
+            ts::register_hybrid_key_as(d, &human, &human, it::USER).await;
+        }
+        ts::register_hybrid_key_as(a, host_a, host_a, it::PRIMITIVE).await;
+        let room = format!("legacy-{tag}");
+        let legacy = ts::sign_community(
+            &human,
+            infra_room(&room, "founder_only", vec![seat(&human, "founder")]),
+        );
+        a.put_community(legacy.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: M6 — replicated data is admitted: {e}"));
+        a.put_community(legacy)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: M6 — an identical re-put settles: {e}"));
+        let served = a
+            .list_signed_communities_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.community.community.community_key_id == room)
+            .expect("A serves the legacy record")
+            .community;
+        b.put_community(served)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: M6 — a fresh node syncs it: {e}"));
+        assert!(b.lookup_community(&room).await.unwrap().is_some());
+        let mine = format!("mine-{tag}");
+        let err = a
+            .put_community(ts::sign_community(
+                host_a,
+                infra_room(&mine, "founder_only", vec![seat(&human, "founder")]),
+            ))
+            .await
+            .expect_err("M6 — a NEW record authored here is judged");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_PROTOCOL_NOT_QUORUM,
+            "{err}"
+        );
+        let err = a
+            .supersede_community(
+                ts::sign_community(
+                    &human,
+                    infra_room(&room, "majority", vec![seat(&human, "founder")]),
+                ),
+                None,
+            )
+            .await
+            .expect_err("M6 — a supersede is always judged");
+        assert_eq!(
+            violation_rule(&err),
+            INFRA_RULE_PROTOCOL_NOT_QUORUM,
+            "{err}"
+        );
+        // A's key is now the legacy record's signer: the stored record counts as
+        // authored here. An identical re-put still settles (it changes nothing);
+        // a CHANGED re-put is judged and refused.
+        rekey_a(human.clone());
+        let stored = a.lookup_community(&room).await.unwrap().expect("stored");
+        let mut same = stored.clone();
+        same.persist_row_hash = String::new();
+        a.put_community(ts::sign_community(&human, same.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: M6 — an identical re-put settles: {e}"));
+        let mut changed = same;
+        changed.community_name = "renamed".into();
+        let err = a
+            .put_community(ts::sign_community(&human, changed))
+            .await
+            .expect_err("M6 — a changed record authored here is judged");
         assert_eq!(
             violation_rule(&err),
             INFRA_RULE_PROTOCOL_NOT_QUORUM,
@@ -811,6 +1263,39 @@ pub mod bodies {
             matches!(err, Error::NodeIdentityNotExclusive { .. }),
             "{tag}: the supersede door refuses by the Clause A error: {err}"
         );
+        // Review H3 (strengthened) — `node` never moves on a rewrite: adding it
+        // to a non-node key, or removing it from a node key, is refused on both
+        // doors and nothing is stored.
+        for (name, stored, offered) in [
+            ("adding", it::USER, it::NODE),
+            ("removing", it::NODE, it::PRIMITIVE),
+        ] {
+            let k = format!("{name}-{tag}");
+            ts::register_hybrid_key_as(d, &k, &k, stored).await;
+            let err = upgrade(scrubbed(&k, offered))
+                .await
+                .expect_err("H3: an upgrade cannot move `node`");
+            assert!(
+                matches!(err, Error::NodeIdentityImmutable { .. }),
+                "{tag}: {name} on the upgrade door: {err}"
+            );
+            let err = supersede(scrubbed(&k, offered))
+                .await
+                .expect_err("H3: a supersede cannot move `node`");
+            assert!(
+                matches!(err, Error::NodeIdentityImmutable { .. }),
+                "{tag}: {name} on the supersede door: {err}"
+            );
+            assert_eq!(
+                d.lookup_public_key(&k)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .identity_type,
+                stored,
+                "{tag}: {name}: nothing stored"
+            );
+        }
         let ok = format!("keeping-{tag}");
         ts::register_hybrid_key_as(d, &ok, &ok, it::NODE).await;
         upgrade(scrubbed(&ok, it::NODE))
@@ -890,7 +1375,6 @@ mod runners {
                     };
                 }
                 case!(node_key_cannot_be_infrastructure_founder);
-                case!(node_founder_seat_does_not_vote);
                 case!(infrastructure_protocol_must_be_quorum);
                 case!(clause_a_fused_key_is_not_minted);
                 case!(delegation_graph_defaults_to_five_hops);
@@ -898,12 +1382,90 @@ mod runners {
                 case!(moderation_walk_depth_defaults_to_five_hops);
                 case!(identity_claim_alone_is_not_node_bearing_founder);
                 case!(withdraws_admitted_under_the_old_depth_still_retires);
+                case!(clause_a_replicated_insert_admits_a_fused_key);
+            }
+        };
+    }
+
+    /// Runners whose backend KNOWS its own key (`set_node_key_id`), so a
+    /// record signed by anyone else is replicated data (review M6): the legacy
+    /// `quorum:1/2` rooms the fold witnesses need are admitted that way.
+    macro_rules! keyed_runners {
+        ($modname:ident, $fresh:expr) => {
+            mod $modname {
+                use super::suffix;
+                use crate::federation::FederationDirectory;
+                macro_rules! keyed {
+                    ($name:ident) => {
+                        #[tokio::test]
+                        async fn $name() {
+                            let Some(d) = $fresh.await else { return };
+                            let s = suffix();
+                            let host = format!("host-{s}");
+                            d.set_node_key_id(host.clone());
+                            super::super::bodies::$name(
+                                &d as &dyn FederationDirectory,
+                                &format!("{}-{}", stringify!($name), s),
+                                &host,
+                            )
+                            .await
+                        }
+                    };
+                }
+                keyed!(node_founder_seat_does_not_vote);
+                keyed!(node_bearing_is_judged_at_the_change_instant);
+                keyed!(node_bearing_founder_holds_no_last_founder_power);
+                keyed!(node_bearing_founder_roots_no_moderation);
+                #[tokio::test]
+                async fn infrastructure_record_authored_elsewhere_is_data() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    let s = suffix();
+                    let host_a = format!("host-a-{s}");
+                    a.set_node_key_id(host_a.clone());
+                    b.set_node_key_id(format!("host-b-{s}"));
+                    let rekey = |k: String| a.set_node_key_id(k);
+                    super::super::bodies::infrastructure_record_authored_elsewhere_is_data(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                        &format!("m6-{s}"),
+                        &host_a,
+                        &rekey,
+                    )
+                    .await
+                }
             }
         };
     }
 
     dyn_runners!(memory_dyn, async {
         Some(crate::store::memory::MemoryBackend::new())
+    });
+
+    keyed_runners!(memory_keyed, async {
+        Some(crate::store::memory::MemoryBackend::new())
+    });
+
+    #[cfg(feature = "sqlite")]
+    keyed_runners!(sqlite_keyed, async {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+
+    #[cfg(feature = "postgres")]
+    keyed_runners!(postgres_keyed, async {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
     });
 
     #[cfg(feature = "sqlite")]
