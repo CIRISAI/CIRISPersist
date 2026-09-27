@@ -1205,6 +1205,44 @@ mod tests {
         assert!(e.match_prefix.starts_with("provenance:build_manifest"));
     }
 
+    /// v50.0.0 (CIRISPersist#924) — `lookup` resolves through the ONE
+    /// matcher, and the cases where the old longest-literal-prefix lookup
+    /// answered differently are pinned (mutation M7 of the #924 round
+    /// survived without this): two families sharing a literal stem
+    /// (`credits:`, `provenance:build_manifest:`) used to resolve to whichever
+    /// sorted first; a dimension off every row's arity used to inherit the
+    /// stem's row; an unclaimed leaf under a reserved stem keeps its
+    /// reservation through `authority_for`'s stem fallback.
+    #[test]
+    fn lookup_resolves_through_the_one_matcher_924() {
+        let prefix = |d: &str| lookup(d).map(|e| e.prefix.as_str());
+        assert_eq!(
+            prefix("credits:rust:en:substrate_building:v1"),
+            Some("credits:{domain}:{language}:substrate_building"),
+            "the most literal family wins, not the alphabetically first"
+        );
+        assert_eq!(
+            prefix("credits:rust:en:alice:v1"),
+            Some("credits:{domain}:{language}:{subject}")
+        );
+        assert_eq!(
+            prefix("provenance:build_manifest:agent-3.2.1:locale:en-US:v1"),
+            Some("provenance:build_manifest:{target}:locale:{lang_code}")
+        );
+        assert_eq!(
+            prefix("session:a:b:c:v1"),
+            None,
+            "off every row's arity is open vocabulary, not session:{{kind}}"
+        );
+        let dim = "capacity_assurance:reversible_excluded:financial:v1";
+        assert_eq!(prefix(dim), None, "no row claims the CC 3.4.12 companion");
+        let a = authority_for(dim);
+        assert!(
+            a.reserved.is_some_and(|r| r.cc_ref == "CC 3.4.12"),
+            "the reserved stem's own rule answers, so the reservation is not dropped"
+        );
+    }
+
     #[test]
     fn unknown_dimension_defaults_to_producer_no_reserved() {
         let a = authority_for("totally:made:up:dimension");
