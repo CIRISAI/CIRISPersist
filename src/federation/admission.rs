@@ -7323,7 +7323,7 @@ async fn scoped_delegation_reach_at(
 /// [`consent_revocation_reach`], which the admission gate reads for its
 /// beyond-cap signal.
 #[cfg(test)]
-async fn issuer_reaches_target_via_consent_revocation_delegation(
+pub(crate) async fn issuer_reaches_target_via_consent_revocation_delegation(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
     targets: &std::collections::HashSet<String>,

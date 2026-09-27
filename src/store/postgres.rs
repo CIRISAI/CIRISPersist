@@ -33441,7 +33441,11 @@ mod tests {
                         })
                         .collect(),
                     founded_at: now,
-                    consensus_protocol: "majority".into(),
+                    consensus_protocol:
+                        crate::federation::tier_ingest::test_support::fixture_protocol(
+                            policy.as_ref(),
+                            "majority",
+                        ),
                     policy_blob: policy,
                     persist_row_hash: String::new(),
                 },
@@ -37486,12 +37490,33 @@ mod tests {
                 format!("{},{}", identity_type::NODE, identity_type::AGENT),
             ),
         ] {
+            // v50.0.0 (CIRISPersist#925 ask 5) — Clause A refuses minting the
+            // fused `node,agent` key at `put_public_key`; Clause B guards the
+            // ones minted before it, so that one is planted below the door:
+            // registered as `node`, then its set rewritten.
+            let fused = identity_type::parse_set(&ity).contains(&identity_type::AGENT);
             let mut k = fix_section_i_key(kid, "x", now, true);
-            k.identity_type = ity;
+            k.identity_type = if fused {
+                identity_type::NODE.to_string()
+            } else {
+                ity.clone()
+            };
             backend
                 .put_public_key(crate::federation::SignedKeyRecord { record: k })
                 .await
                 .unwrap();
+            if fused {
+                backend
+                    .get_client()
+                    .await
+                    .unwrap()
+                    .execute(
+                        "UPDATE cirislens.federation_keys SET identity_type = $1 WHERE key_id = $2",
+                        &[&ity, kid],
+                    )
+                    .await
+                    .unwrap();
+            }
         }
         // Dup / whitespace node tokens → still REJECTED + not stored.
         for node in [&node_dup, &node_ws] {

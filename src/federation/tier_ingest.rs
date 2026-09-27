@@ -1551,6 +1551,22 @@ pub mod test_support {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#927, CC 3.2) — the `consensus_protocol` a
+    /// community fixture declares: `otherwise`, unless `policy_blob` labels it
+    /// `infrastructure`, which admits only a `quorum:M/N` form (a one-founder
+    /// fixture's is `quorum:1/1`).
+    pub fn fixture_protocol(policy_blob: Option<&serde_json::Value>, otherwise: &str) -> String {
+        let infra = policy_blob
+            .and_then(|b| b.get("cohort_subkind"))
+            .and_then(|v| v.as_str())
+            == Some(crate::federation::admission::COHORT_SUBKIND_INFRASTRUCTURE);
+        if infra {
+            "quorum:1/1".to_owned()
+        } else {
+            otherwise.to_owned()
+        }
+    }
+
     /// v21.0.0 (CIRISPersist#502 E4) — sign a
     /// [`Community`](crate::federation::types::Community) for submission.
     /// Mirrors [`sign_family`].

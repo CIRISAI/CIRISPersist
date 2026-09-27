@@ -111,3 +111,14 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.3.10.1	CLM-ledger-fold	CIRISPersist	src/ledgers/standard.rs#conservation_fold	ciris-persist@50.0.0
 3.3.10.1	CLM-ledger-fold	CIRISPersist	src/ledgers/standard.rs#fold_canonical_bytes	ciris-persist@50.0.0
 4.5.1.1	CLM-ci-axis	CIRISPersist	src/federation/namespace/supersets.rs#fusion_classification	ciris-persist@50.0.0
+3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/admission.rs#check_infrastructure_founders_not_node	ciris-persist@50.0.0
+3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/consensus.rs#eligible	ciris-persist@50.0.0
+3.2	CLM-infrastructure-does-not-vote	CIRISPersist	src/federation/mod.rs#community_node_bearing_seats	ciris-persist@50.0.0
+3.2	CLM-infrastructure-quorum-m-of-n	CIRISPersist	src/federation/admission.rs#check_infrastructure_consensus_protocol	ciris-persist@50.0.0
+3.4.7.3	CLM-node-exclusive-at-mint	CIRISPersist	src/federation/register.rs#check_node_identity_exclusive	ciris-persist@50.0.0
+3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@50.0.0
+3.2	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#family_quorum_over	ciris-persist@50.0.0
+3.4.7	CLM-family-root-charter	CIRISPersist	src/federation/trust_root.rs#check_family_charter_admission	ciris-persist@50.0.0
+4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/topology.rs#DEFAULT_DELEGATION_DEPTH	ciris-persist@50.0.0
+4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/topology.rs#build_delegation_graph	ciris-persist@50.0.0
+4.1.1	CLM-delegation-depth-default	CIRISPersist	src/federation/admission.rs#resolve_withdraws_admission_rule	ciris-persist@50.0.0

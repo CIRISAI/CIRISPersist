@@ -126,6 +126,9 @@ pub mod listing_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
+/// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
+#[cfg(test)]
+pub mod rc5_adopts_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.

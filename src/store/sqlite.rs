@@ -35685,7 +35685,12 @@ mod tests {
                 })
                 .collect(),
             founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
-            consensus_protocol: consensus_protocol.into(),
+            // v50.0.0 (CIRISPersist#927) — an infrastructure fixture declares
+            // the quorum:M/N form CC 3.2 requires.
+            consensus_protocol: crate::federation::tier_ingest::test_support::fixture_protocol(
+                policy_blob.as_ref(),
+                consensus_protocol,
+            ),
             policy_blob,
             persist_row_hash: String::new(),
         }
@@ -44905,14 +44910,26 @@ mod tests {
             .await
             .unwrap();
         let hybrid_ity = format!("{},{}", identity_type::NODE, identity_type::AGENT);
+        // v50.0.0 (CIRISPersist#925 ask 5) — Clause A refuses minting a fused
+        // key at `put_public_key`; Clause B guards the ones minted before it.
+        // Plant one below the door: register as `node`, rewrite the set.
         backend
             .put_public_key(SignedKeyRecord {
                 record: fed_key_with_identity_type(
                     "node-agent",
                     "hybrid",
                     "node-agent",
-                    &hybrid_ity,
+                    identity_type::NODE,
                 ),
+            })
+            .await
+            .unwrap();
+        backend
+            .write(move |c| {
+                c.execute(
+                    "UPDATE federation_keys SET identity_type = ?1 WHERE key_id = 'node-agent'",
+                    [&hybrid_ity],
+                )
             })
             .await
             .unwrap();

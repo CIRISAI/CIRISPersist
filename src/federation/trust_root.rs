@@ -885,6 +885,14 @@ where
 /// refuses to parse, so it now reads as the whole roster. No stored family can
 /// carry one: `put_family` / `supersede_family` refuse it at
 /// [`check_consensus_protocol_form`](super::check_consensus_protocol_form).
+///
+/// v50.0.0 (CIRISPersist#927) — the floors above are the FAMILY plane's reading
+/// and stay. They are not how an `infrastructure` COMMUNITY's protocol is
+/// judged: CC 3.2 requires `quorum:M/N` there, and a non-conformant protocol is
+/// refused at admission
+/// ([`check_infrastructure_consensus_protocol`](super::admission::check_infrastructure_consensus_protocol))
+/// rather than floored. A family carries no `cohort_subkind`, so no family can
+/// be `infrastructure`.
 pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_size: usize) -> usize {
     use super::types::consensus_protocol as cp;
     let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
@@ -1328,6 +1336,10 @@ pub struct TrustedGrant {
     /// v22.1.0 (CIRISPersist#548) — WHICH conferral plane produced the
     /// candidate. `#[serde(default)]` = `Delegation`, so payloads from
     /// pre-#548 producers deserialize unchanged.
+    ///
+    /// v50.0.0 (CIRISPersist#927) — three wire values, TWO CC planes: see
+    /// [`ConferralPlane`]. `AccordCoScrub` and `FamilyQuorum` are both the
+    /// CC 3.2 T2 ceremony plane; a consumer grouping by CC plane folds them.
     #[serde(default)]
     pub conferral_plane: ConferralPlane,
 }
@@ -1340,6 +1352,28 @@ pub struct TrustedGrant {
 /// is what #548 found: the walk read one plane while the admission-side
 /// effective-role read (`has_accord_conferred_role`) read the other, and a fully
 /// accord-blessed canonical could not receive traces.
+///
+/// # Three wire values, two CC planes (v50.0.0, CIRISPersist#927, CC 3.2 T2 rc5)
+///
+/// CC 3.2 T2 names exactly two planes. Its ceremony plane is "a co-scrub by a
+/// family roster reaching that family's `consensus_protocol` over the
+/// subject's own record … the shipped instance is the 2-of-3 HUMANITY_ACCORD
+/// co-scrub; a keyless constitutional family (root kind *family*) confers on
+/// this plane by the same mechanism, and the plane is named by the row's scrub
+/// set, never by a granter-declared field". So on the wire:
+///
+/// | wire value      | CC 3.2 T2 plane                 |
+/// |-----------------|---------------------------------|
+/// | `Delegation`    | delegation                      |
+/// | `AccordCoScrub` | ceremony (the shipped instance) |
+/// | `FamilyQuorum`  | **ceremony plane, family form** |
+///
+/// `FamilyQuorum` is not a third plane; it is the ceremony plane's general
+/// form, kept as its own value because it names a different root kind (a
+/// family, not the subject key) and renaming a serialized variant buys nothing
+/// but broken deserializers. It is named by the scrub set exactly as the text
+/// requires: [`family_quorum_over`] derives the family from the row's verified
+/// signers against this node's own rosters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ConferralPlane {
     /// A live `delegates_to(root → subject)` grant carried the scope.
@@ -1356,6 +1390,9 @@ pub enum ConferralPlane {
     /// grant carried the scope AND its own scrub set reached the QUORUM of a
     /// constitutional family the granter sits in. The candidate root is that
     /// FAMILY, not the holder who signed.
+    ///
+    /// v50.0.0 (CIRISPersist#927) — **the ceremony plane, family form** (CC
+    /// 3.2 T2 rc5); see the type-level table.
     ///
     /// # The granter semantic, chosen and written down
     ///

@@ -13536,6 +13536,66 @@ mod tests {
     }
 
     /// Register `owner` (user) + `node` (node-only) + an `agent` recipient.
+    /// v50.0.0 (CIRISPersist#925 ask 5) — a fused `{node,agent}` /
+    /// `{node,user}` key can no longer be MINTED: CC 3.4.7.3 Clause A refuses
+    /// it at `put_public_key`. Clause B exists for the fused keys minted
+    /// before that door, so its witnesses plant one BELOW the door: register
+    /// the key as `node`, then rewrite the stored set.
+    async fn plant_pre_clause_a_key(backend: &MemoryBackend, mut rec: KeyRecord) {
+        let fused = std::mem::replace(&mut rec.identity_type, "node".into());
+        let key = rec.key_id.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("register as node");
+        backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_keys
+            .get_mut(&key)
+            .expect("just registered")
+            .identity_type = fused;
+    }
+
+    /// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — `node` is
+    /// exclusive at the key-record door: a `{node,agent}` or `{node,user}` key
+    /// is refused by name and nothing is stored; a substrate-side
+    /// co-location (`canonical`-free here: `node,steward`) stays admissible.
+    #[tokio::test]
+    async fn clause_a_node_key_cannot_carry_an_actor_role_at_mint() {
+        use crate::federation::types::identity_type as it;
+        let backend = MemoryBackend::new();
+        for actor in [it::AGENT, it::USER] {
+            let mut k = fix_key(&format!("fused-{actor}"), "x", &format!("fused-{actor}"));
+            k.identity_type = format!("{actor},{}", it::NODE);
+            let err = backend
+                .put_public_key(SignedKeyRecord { record: k })
+                .await
+                .expect_err("Clause A: a fused node key is not minted");
+            assert!(
+                matches!(
+                    err,
+                    crate::federation::Error::NodeIdentityNotExclusive { .. }
+                ),
+                "refused by the Clause A error, not a neighbouring gate: {err}"
+            );
+            assert!(crate::federation::FederationDirectory::lookup_public_key(
+                &backend,
+                &format!("fused-{actor}")
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+        let mut ok = fix_key("node-steward", "x", "node-steward");
+        ok.identity_type = format!("{},{}", it::NODE, it::STEWARD);
+        backend
+            .put_public_key(SignedKeyRecord { record: ok })
+            .await
+            .expect("node + a substrate-side role is conformant");
+    }
+
     async fn bootstrap_node_agency(backend: &MemoryBackend) {
         backend
             .put_public_key(SignedKeyRecord {
@@ -13610,10 +13670,7 @@ mod tests {
         // A key carrying BOTH roles — the shape a "consolidation" produces.
         let mut hybrid = fix_key("hybrid-key", "hybrid", "registry-steward");
         hybrid.identity_type = format!("{},{}", identity_type::NODE, identity_type::AGENT);
-        backend
-            .put_public_key(SignedKeyRecord { record: hybrid })
-            .await
-            .expect("register hybrid key");
+        plant_pre_clause_a_key(&backend, hybrid).await;
 
         let err = backend
             .put_attestation(SignedAttestation {
@@ -13870,10 +13927,7 @@ mod tests {
             .unwrap();
         let mut hybrid = fix_key("node-agent", "hybrid", "registry-steward");
         hybrid.identity_type = format!("{},{}", identity_type::NODE, identity_type::AGENT);
-        backend
-            .put_public_key(SignedKeyRecord { record: hybrid })
-            .await
-            .unwrap();
+        plant_pre_clause_a_key(&backend, hybrid).await;
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_node_delegates_to(
@@ -18185,7 +18239,10 @@ mod tests {
                         members,
                         founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                         consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                            crate::federation::tier_ingest::test_support::fixture_protocol(
+                                policy_blob.as_ref(),
+                                crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                            ),
                         policy_blob,
                         persist_row_hash: String::new(),
                     },
@@ -20162,7 +20219,10 @@ mod tests {
                     role: Some(MEMBER_ROLE_FOUNDER.into()),
                 }],
                 founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                consensus_protocol: crate::federation::tier_ingest::test_support::fixture_protocol(
+                    policy_blob.as_ref(),
+                    consensus_protocol::FOUNDER_ONLY,
+                ),
                 policy_blob,
                 persist_row_hash: String::new(),
             };
