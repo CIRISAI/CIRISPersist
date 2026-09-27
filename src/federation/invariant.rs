@@ -482,7 +482,11 @@ mod tests {
         },
         ReservedFact {
             family: "capacity_assurance:*",
-            sample_attestation_type: "capacity_assurance:financial:v1",
+            // v50.0.0 (CIRISPersist#924): the registry row's arity
+            // (`capacity_assurance:{level}:{domain}:{band}:{version}`). The old
+            // two-segment sample is an unclaimed leaf under CC's reserved stem,
+            // which R2(b) now refuses before the identity rule is reached.
+            sample_attestation_type: "capacity_assurance:provider:financial:incapacitated:v1",
             required_identity_type: identity_type::WITNESS,
             manifest_marker: identity_type::WITNESS,
         },

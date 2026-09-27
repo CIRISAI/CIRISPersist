@@ -43,7 +43,7 @@ use super::{Error, FederationDirectory};
 
 /// v11.9.0 (CIRISPersist#309, CC 3.4.13 Q1) — the **four-band age
 /// vocabulary** that rides the `{band}` slot of the `age_assurance:{level}:
-/// {band}:v1` / `age_self_declared:{band}:v1` tokens. These are the finer
+/// {band}:v1` / `age_self_declared:band:{band}:v1` tokens. These are the finer
 /// grain ABOVE the unchanged binary `minor`/`adult` wire predicate (CC
 /// 3.4.13 Q1: "the four-band granularity is a policy/vocabulary layer above
 /// the unchanged binary wire predicate, never a replacement of it"). `minor`
@@ -344,7 +344,7 @@ mod tests {
             Some(AgeBandFine::EarlyTeen13_15)
         );
         assert_eq!(
-            parse_age_band_fine_token("age_self_declared:16_17:v1"),
+            parse_age_band_fine_token("age_self_declared:band:16_17:v1"),
             Some(AgeBandFine::OlderTeen16_17)
         );
         assert_eq!(

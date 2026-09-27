@@ -19610,7 +19610,12 @@ mod tests {
         let mut binding = fix_attestation("bind-1", "K", "K", "registry-steward");
         binding.attestation_envelope = serde_json::json!({
             "id": "bind-1",
-            "dimension": format!("identity:canonical_binding:{canonical_h}"),
+            "dimension": format!(
+                "identity:canonical_binding:{}",
+                canonical_h
+                    .strip_prefix(crate::federation::admission::CANONICAL_KEY_ID_PREFIX)
+                    .expect("a canonical key id")
+            ),
             "score": 1.0,
             "confidence": 1.0,
             "witness_relation": "self",
@@ -23105,7 +23110,7 @@ mod tests {
                     "wts-self-minor",
                     "wts-T",
                     "wts-T",
-                    "age_self_declared:minor:v1",
+                    "age_self_declared:band:minor:v1",
                 ),
             })
             .await

@@ -17373,7 +17373,7 @@ mod tests {
         // The subject self-declares MINOR (self rung; attested defaults to
         // the emitter — subject-signed by design).
         let self_minor = crate::federation::EmitAttestationInput::with_envelope(
-            "age_self_declared:minor:v1",
+            "age_self_declared:band:minor:v1",
             crate::federation::envelope::EnvelopeCore::from_value(
                 serde_json::json!({ "id": "wtse-self-minor" }),
             )
@@ -17507,7 +17507,7 @@ mod tests {
             .emit_attestation(
                 &t_signer,
                 crate::federation::EmitAttestationInput::with_envelope(
-                    "age_self_declared:minor:v1",
+                    "age_self_declared:band:minor:v1",
                     crate::federation::envelope::EnvelopeCore::from_value(
                         serde_json::json!({ "id": format!("pgw-self-{run}") }),
                     )

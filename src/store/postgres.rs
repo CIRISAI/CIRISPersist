@@ -38947,7 +38947,12 @@ mod tests {
         // K self-asserts the canonical binding K → H.
         let mut binding = pg_scores_attestation(&k, &k, &k, "identity_binding:v1");
         binding.attestation_envelope = serde_json::json!({
-            "dimension": format!("identity:canonical_binding:{canon}"),
+            "dimension": format!(
+                "identity:canonical_binding:{}",
+                canon
+                    .strip_prefix(crate::federation::admission::CANONICAL_KEY_ID_PREFIX)
+                    .expect("a canonical key id")
+            ),
             "score": 1.0,
             "confidence": 1.0,
             "witness_relation": "self",

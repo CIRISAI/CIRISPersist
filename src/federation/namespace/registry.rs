@@ -994,24 +994,41 @@ mod tests {
 
     /// R2's registration predicate over the real manifest — including the three
     /// families persist itself minted, which is the whole reason #590 exists.
+    ///
+    /// v50.0.0 (CIRISPersist#924): answered by the one matcher, so it is no
+    /// longer first-colon-stem granular. A leaf CC does not name under the
+    /// CLOSED `accord:*`, or an unclaimed leaf under a stem CC 3.4 reserves as
+    /// a whole, is NOT registered (CC 3.1.7 R2(b)/R3) — the two lines that
+    /// used to assert the opposite now sit in the negative list.
     #[test]
     fn is_family_registered_answers_from_the_manifest() {
         for dim in [
             "objection:raised:v1",
             "quarantine:withheld:v1",
             "wa_adjudication:petition:v1",
-            "accord:invoke:halt",
+            "accord:lifecycle:v1",
+            "accord:invoke:notify:n42:v1",
             "capacity:core_identity:v1",
             // open vocabulary WITHIN a registered family stays registered —
-            // this is the traffic R2 explicitly preserves.
+            // this is the traffic R2 explicitly preserves (and a missing
+            // version is the T3 gate's refusal, not R2's).
             "credits:rust:en:someone",
-            "detection:emergent_pattern:novel_signal:v1",
+            "credits:rust:en:someone:v1",
         ] {
             assert!(is_family_registered(dim), "{dim} must be registered");
         }
-        for dim in ["totally:made:up:v1", "", "scores"] {
+        for dim in [
+            "totally:made:up:v1",
+            "",
+            "scores",
+            "accord:invoke:halt",
+            "detection:emergent_pattern:novel_signal:v1",
+        ] {
             assert!(!is_family_registered(dim), "{dim} must NOT be registered");
         }
+        assert!(is_stem_registered("objection:"));
+        assert!(!is_stem_registered("scores:"));
+        assert!(!is_stem_registered(""));
     }
 
     /// **The redundancy `RawFamily` bets on.** Its comment says the manifest's

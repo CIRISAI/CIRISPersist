@@ -1845,12 +1845,22 @@ mod tests {
     /// asserts that too, so an entry cannot be used to hide a live dead
     /// citation (if the symbol is still present, it must satisfy the liveness
     /// bar like everything else).
-    const DELETED_PENDING_REVENDOR: &[(&str, &str)] = &[(
-        "duty_holders_from_signed_subjects",
-        "deleted in v22.0.0 (#543): unioned caller-declared subject_key_ids into the authority \
-         set — the #517 vulnerability. The manifest labels it \"the drift site\"; the row \
-         graduates at the #520 re-vendor.",
-    )];
+    const DELETED_PENDING_REVENDOR: &[(&str, &str)] = &[
+        (
+            "duty_holders_from_signed_subjects",
+            "deleted in v22.0.0 (#543): unioned caller-declared subject_key_ids into the \
+             authority set — the #517 vulnerability. The manifest labels it \"the drift \
+             site\"; the row graduates at the #520 re-vendor.",
+        ),
+        (
+            "is_attestation_ladder_dimension",
+            "deleted in v50.0.0 (#924, CIRISConstitution#112): the attestation-ladder \
+             version carve-out stopped being code — Layer 2b reads CC's \
+             `_meta.case_rule.version_segment.exempt` list through \
+             namespace::matcher::is_version_exempt. The walk's citation graduates at the #520 \
+             re-vendor.",
+        ),
+    ];
 
     const EXPORTED_API_CITATIONS: &[&str] = &[
         // `FederationDirectory` trait method — the consent-SLA watcher a host

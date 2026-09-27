@@ -3304,11 +3304,14 @@ mod subject_retainability_tests {
     /// refused here, or persist has not actually taken ownership of the carve.
     #[test]
     fn edges_denylist_is_covered() {
+        // v50.0.0 (CIRISPersist#924): CC-conformant spellings — an unversioned
+        // or unrowed dimension resolves to NO family through the one matcher
+        // and would pass this test vacuously.
         for dim in [
-            "capacity:composite",
-            "capacity:integrity",
-            "capacity_assurance:rung_3",
-            "moderation:harassment",
+            "capacity:composite:v1",
+            "capacity:integrity:v1",
+            "capacity_assurance:provider:medical:incapacitated:v1",
+            "moderation:harassment:v1",
         ] {
             assert!(
                 !is_subject_retainable(dim),
@@ -3325,7 +3328,7 @@ mod subject_retainability_tests {
         for dim in [
             "trace:complete:v1",
             "trace_manifest:v1",
-            "identity_continuity:relational_anchor",
+            "identity_continuity:relational_anchor:v1",
         ] {
             assert!(
                 is_subject_retainable(dim),

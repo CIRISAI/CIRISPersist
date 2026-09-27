@@ -28991,7 +28991,12 @@ mod tests {
         let mut binding = fed_attestation(&bid, &k, &k, &k);
         binding.attestation_envelope = serde_json::json!({
             "id": bid,
-            "dimension": format!("identity:canonical_binding:{canon}"),
+            "dimension": format!(
+                "identity:canonical_binding:{}",
+                canon
+                    .strip_prefix(crate::federation::admission::CANONICAL_KEY_ID_PREFIX)
+                    .expect("a canonical key id")
+            ),
             "score": 1.0,
             "confidence": 1.0,
             "witness_relation": "self",
@@ -39194,10 +39199,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_put_attestation_admits_novel_detection_subkind_from_lenscore_detector() {
-        // The wildcard grants the SAME novel subkind to a
-        // `lenscore_detector` key — the gate isn't a deny-only net, it
-        // actually admits the emission construction covers.
+    async fn sqlite_put_attestation_detector_admits_registered_leaf_refuses_unclaimed_924() {
+        // The reserved-prefix rule grants a `lenscore_detector` key the
+        // `detection:` space — the gate isn't a deny-only net, it admits the
+        // emission construction covers.
+        //
+        // v50.0.0 (CIRISPersist#924, CC rc5 CC 3.1.7 R3): until this cut the
+        // witness here was a NOVEL subkind (`detection:emergent_pattern:
+        // novel_signal:v1`) admitting from the detector. CC now carries
+        // `detection:` in `_meta.case_rule.reserved_stems`, and an unclaimed
+        // leaf under a reserved stem is `namespace_family_unregistered` — for
+        // ANY emitter, the detector included. So the admit leg moves to a
+        // registered leaf, and the novel subkind becomes the R2(b) leg.
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         // CIRISPersist#543 — `lenscore_detector` is accord-conferred, so the
@@ -39225,6 +39238,25 @@ mod tests {
             "k-a",
             "detector-key",
             "detection:emergent_pattern:novel_signal:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::NamespaceFamilyUnregistered { .. }
+            ),
+            "an unclaimed leaf under CC's reserved `detection:` stem is refused even from the \
+             detector: {err:?}"
+        );
+        let att = scores_attestation_with_dimension(
+            "att-registered-leaf-2",
+            "detector-key",
+            "k-a",
+            "detector-key",
+            "detection:hash_chain_integrity:v1",
         );
         backend
             .put_attestation(SignedAttestation { attestation: att })

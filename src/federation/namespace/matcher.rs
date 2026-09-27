@@ -207,7 +207,8 @@ struct Rules {
     tokens: BTreeMap<String, String>,
     external: BTreeMap<String, Regex>,
     reserved_stems: Vec<String>,
-    /// `(stem, rule, cc_ref)` per `_meta.case_rule.reserved_stems` entry.
+    /// `(stem, rule, cc_ref)` per `_meta.case_rule.reserved_stems` entry of
+    /// `kind: reserved`.
     reserved_stem_rules: Vec<(String, String, String)>,
     families: Vec<Fam>,
     hex: Regex,
@@ -270,6 +271,9 @@ fn parse_rules(root: serde_json::Value) -> Rules {
         .and_then(|v| v.as_array())
         .map(|a| {
             a.iter()
+                // `kind: gated` (`age_self_declared:`) carries an emitter rule
+                // WITHOUT a reservation (CC 3.1.7 R3) — not a reserved rule.
+                .filter(|s| s.get("kind").and_then(|k| k.as_str()) == Some("reserved"))
                 .map(|s| {
                     (
                         str_of(&s["stem"], "reserved stem").to_owned(),
@@ -741,7 +745,10 @@ pub fn reserved_stems() -> impl Iterator<Item = &'static str> {
 }
 
 /// The `(rule, cc_ref)` of the longest `_meta.case_rule.reserved_stems` stem
-/// `dimension` sits under, if any. What a classifier reports for a dimension
+/// of `kind: reserved` that `dimension` sits under, if any. (A `kind: gated`
+/// stem — `age_self_declared:` — states an emitter rule without a
+/// reservation, so it is not a reserved rule; the matcher still refuses its
+/// unclaimed leaves.) What a classifier reports for a dimension
 /// under a reserved stem that no row claims — the reservation covers the
 /// leaves nobody minted yet (CC 3.1.7 R3), so it must not read as open.
 #[must_use]
@@ -768,6 +775,53 @@ pub fn placeholder_values(family: &str, placeholder: &str) -> Option<(&'static [
 pub fn family_leaves(family: &str) -> Option<(&'static [String], bool)> {
     let fam = rules().family(family)?;
     Some((fam.leaves.as_slice(), fam.leaves_closed))
+}
+
+/// A class-conformant sample dimension for `family` — a port of the
+/// reference's `instantiate(fam, with_version=True)`, the same sample CC's
+/// generator round-trips every family through. For tests that need "an
+/// ordinary dimension on this family" (a literal stem such as `"system:"` is
+/// not one: it has an empty segment and is malformed).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn sample_dimension(family: &str) -> Option<String> {
+    let fam = rules().family(family)?;
+    let mut out: Vec<String> = Vec::new();
+    for seg in &fam.segments {
+        let tok = match seg.class {
+            Class::Literal => seg.segment.clone(),
+            Class::Wildcard => "leaf".to_owned(),
+            Class::Vocab => {
+                let t = match &seg.values {
+                    Some(v) if !v.is_empty() => v[0].clone(),
+                    _ if seg.segment == "{version}" => "v1".to_owned(),
+                    _ => "sample".to_owned(),
+                };
+                if seg.multi {
+                    format!("{t}:sub")
+                } else {
+                    t
+                }
+            }
+            Class::External => match seg.name.as_str() {
+                "lang_code" => "en-US".to_owned(),
+                "rating" => "PG-13".to_owned(),
+                _ => "USD".to_owned(),
+            },
+            Class::Value | Class::Hex => match seg.pattern.as_ref().map(Regex::as_str) {
+                Some(p) if p.contains("0-9") && !p.contains("a-f") => "42".to_owned(),
+                Some(p) if p.contains("{64}") => "abcdef0123456789".repeat(4),
+                _ if seg.class == Class::Hex => "ab12".to_owned(),
+                _ if seg.multi => "id1:id2".to_owned(),
+                _ => "id1".to_owned(),
+            },
+        };
+        out.push(tok);
+    }
+    if !fam.ends_version() {
+        out.push("v1".to_owned());
+    }
+    Some(out.join(":"))
 }
 
 /// Refusal lookup by its wire token (the inverse of [`Refusal::as_str`]).
@@ -910,6 +964,27 @@ mod tests {
             },
             "the binds oracle was generated from a different vectors file"
         );
+    }
+
+    /// The reference generator's round-trip gate, replayed: every family's
+    /// class-conformant sample resolves to that family and no other, with no
+    /// refusal (exempt families included: a tail is tolerated). Closed
+    /// wildcard families are skipped exactly as the reference skips them —
+    /// their sample leaf is, by design, unregistered.
+    #[test]
+    fn every_family_sample_round_trips_to_itself() {
+        let mut bad = Vec::new();
+        for fam in families() {
+            if family_leaves(fam).is_some_and(|(_, closed)| closed) && fam.ends_with('*') {
+                continue;
+            }
+            let dim = sample_dimension(fam).unwrap();
+            let got = match_family(&dim);
+            if got.family != Some(fam) || got.refusal.is_some() {
+                bad.push(format!("{fam}: {dim:?} -> {got:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
     }
 
     #[test]

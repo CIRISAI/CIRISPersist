@@ -6357,14 +6357,39 @@ pub const DELEGATED_DUTY_SCOPES: &[&str] = &[
 /// primitive — a reserved `scores` dimension (1+4 preserved).
 pub const IDENTITY_CANONICAL_BINDING_PREFIX: &str = "identity:canonical_binding:";
 
-/// Parse the bound canonical hash `H` out of an
-/// `identity:canonical_binding:{H}` dimension. `None` if the dimension
-/// is not a canonical-binding or carries an empty suffix.
+/// v50.0.0 (CIRISPersist#924) — the registry family a canonical binding
+/// resolves to (CC 3.3.14; `{canonical_hash}` is a `hex` segment, pattern
+/// `^[0-9a-f]{64}$`).
+pub const CANONICAL_BINDING_FAMILY: &str = "identity:canonical_binding:{canonical_hash}";
+
+/// The key-id spelling of a canonical hash (CC 2.3.2.1): a subject is
+/// `canonical:sha256:<64 lowercase hex>`, and that is the string a binding's
+/// hash is compared against in `subject_key_ids`.
+pub const CANONICAL_KEY_ID_PREFIX: &str = "canonical:sha256:";
+
+/// Parse the bound canonical hash `H` (64 lowercase hex) out of an
+/// `identity:canonical_binding:{H}` dimension. `None` unless the one matcher
+/// resolves the dimension to [`CANONICAL_BINDING_FAMILY`] without a refusal.
+///
+/// v50.0.0 (CIRISPersist#924, CC rc5) — **wire break.** The suffix used to be
+/// anything non-empty, and persist's own fixtures bound the KEY-ID spelling
+/// (`identity:canonical_binding:canonical:sha256:<hex>`, five segments). CC's
+/// registry row makes `{canonical_hash}` one `hex` segment of 64 characters,
+/// and version-exempts exactly that family; the five-segment form matches no
+/// row, carries no version, and is refused at the T3 gate. The hash is
+/// re-spelled as a key id ([`CANONICAL_KEY_ID_PREFIX`]) where it meets
+/// `subject_key_ids`. A version tail is tolerated (the family is exempt, not
+/// forbidden).
 #[must_use]
 pub fn parse_canonical_binding_hash(dimension: &str) -> Option<&str> {
+    let m = crate::federation::namespace::matcher::match_family(dimension);
+    if m.family != Some(CANONICAL_BINDING_FAMILY) || m.refusal.is_some() {
+        return None;
+    }
     dimension
-        .strip_prefix(IDENTITY_CANONICAL_BINDING_PREFIX)
-        .filter(|h| !h.is_empty())
+        .strip_prefix(IDENTITY_CANONICAL_BINDING_PREFIX)?
+        .split(':')
+        .next()
 }
 
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG §5.6.8.14) — the set of canonical
@@ -6392,7 +6417,7 @@ async fn canonical_binding_hashes_for(
         if let Some(h) =
             envelope_dimension(&r.attestation_envelope).and_then(parse_canonical_binding_hash)
         {
-            out.insert(h.to_owned());
+            out.insert(format!("{CANONICAL_KEY_ID_PREFIX}{h}"));
         }
     }
     Ok(out)
@@ -15443,7 +15468,7 @@ mod tests {
             "a dotted version (CC v1.2)"
         );
         assert!(
-            missing("detection:correlated_action:v2:rights_asymmetry"),
+            missing("correlated_action:v2:rights_asymmetry"),
             "a MIDDLE :v2: is not the trailing version segment"
         );
         assert!(missing("rights_asymmetry"));
@@ -17051,10 +17076,13 @@ mod tests {
         let mut under_enforced: Vec<String> = Vec::new();
 
         for entry in registry::entries() {
-            // A concrete dimension on this family: the literal stem the
-            // manifest's `{param}`/`*` prefix truncates to, which is exactly
-            // what `authority_for` and the rule table both match against.
-            let dim = &entry.match_prefix;
+            // A concrete dimension on this family. v50.0.0 (CIRISPersist#924):
+            // the literal stem (`system:`) stopped being one — `authority_for`
+            // resolves through the one matcher, which reads an empty segment
+            // as malformed — so the probe is the reference generator's own
+            // class-conformant sample for the row.
+            let dim = &crate::federation::namespace::matcher::sample_dimension(&entry.prefix)
+                .expect("every registry entry has a sample");
             let manifest_reserved = registry::authority_for(dim).reserved.is_some();
             let gated_by_rule = rules.iter().any(|r| dim.starts_with(&r.pattern_prefix));
             let gated_by_arm = HARD_CODED_RESERVED_STEMS.iter().any(|s| dim.starts_with(s));
@@ -17148,7 +17176,6 @@ mod tests {
             "withdraws",
             // open vocabulary INSIDE registered families
             "credits:rust:en:alice",
-            "detection:emergent_pattern:novel_signal:v1",
             "capacity:core_identity:v1",
             "hard_case:moderation_filed:v1",
             "accord:human_dignity:v1",
@@ -17161,6 +17188,24 @@ mod tests {
                 check_namespace_family_registered(dim).is_ok(),
                 "R2(b) must not refuse {dim:?} — refusing conformant traffic and blaming the \
                  producer is the failure mode CIRISPersist#590 was opened to prevent"
+            );
+        }
+        // v50.0.0 (CIRISPersist#924, CC rc5 CC 3.1.7 R3) — the premise this
+        // list held for `detection:emergent_pattern:novel_signal:v1` ("open
+        // vocabulary inside a registered family") is FALSIFIED by CC: a stem
+        // CC 3.4 reserves as a whole is `_meta.case_rule.reserved_stems`, and
+        // an unclaimed leaf beneath it is `namespace_family_unregistered`, never
+        // open vocabulary. Likewise a leaf under the CLOSED `accord:*` that CC
+        // does not name. Refusing these is CC's ruling, not persist blaming a
+        // producer.
+        for dim in [
+            "detection:emergent_pattern:novel_signal:v1",
+            "accord:invoke:halt",
+            "accord:invoke:notify:v1",
+        ] {
+            assert!(
+                check_namespace_family_registered(dim).is_err(),
+                "{dim:?} is an unclaimed leaf under a CC-reserved stem / closed family"
             );
         }
     }
