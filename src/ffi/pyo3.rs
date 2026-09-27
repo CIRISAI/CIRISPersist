@@ -11579,6 +11579,54 @@ impl PyEngine {
         })
     }
 
+    /// v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry:
+    /// admit a `SignedCommunity` received from a peer (the shape the signed
+    /// since-read serves). Distinct from [`Self::put_community_json`], the
+    /// LOCAL door, which runs the full CC 3.2 infrastructure gate whoever
+    /// signed: here a legacy infrastructure record is admitted as data and
+    /// the fold's gates apply. Returns the typed outcome as JSON —
+    /// `"inserted"`, `"unchanged"`, `"superseded"`, or
+    /// `{"refused":{"reason":"conflicting_record"}}`.
+    fn apply_replicated_community_json(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community: crate::federation::SignedCommunity = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("signed community decode: {e}")))?;
+            let backend = self.backend.clone();
+            let outcome = py.detach(move || match &backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    let b = b.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::apply_replicated_community(
+                            &*b, community,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    let b = b.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::apply_replicated_community(
+                            &*b, community,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&outcome)
+                .map_err(|e| PyRuntimeError::new_err(format!("outcome encode: {e}")))
+        })
+    }
+
     // ── #302 (FSD-004) accord live-quorum write-through (CIRISServer#122) ──
     //
     // CIRISServer's Phase-3 runtime writes the verify-core wire objects +

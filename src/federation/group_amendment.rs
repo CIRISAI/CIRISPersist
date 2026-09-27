@@ -30,6 +30,94 @@ use super::cohort::Cohort;
 use super::types::{GroupSupersedeProof, SignedCommunity, SignedFamily};
 use super::{Error, FederationDirectory};
 
+/// v50.0.0 (CIRISPersist#925/#931, review) — which door a community record
+/// entered through. The door, never the signer, decides whether the CC 3.2
+/// infrastructure conformance gate runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityDoor {
+    /// `put_community`: a record authored or submitted on this node. The full
+    /// gate runs, whoever signed.
+    Local,
+    /// `apply_replicated_community`: a record received from a peer. A legacy
+    /// non-conformant record is admitted as data; the fold's gates apply.
+    ReplicatedApply,
+}
+
+/// v50.0.0 (CIRISPersist#931) — the typed outcome of
+/// [`FederationDirectory::apply_replicated_community`]. Every arm is `Ok`, so a
+/// replication cursor records it and advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedCommunityOutcome {
+    /// No record under this id; stored.
+    Inserted,
+    /// The identical record was already held.
+    Unchanged,
+    /// A differing record under an occupied id carried a supersede proof this
+    /// node's own state authorizes; applied as a supersede.
+    Superseded,
+    /// Not admitted; nothing changed.
+    Refused {
+        /// Why.
+        reason: ReplicatedCommunityRefusal,
+    },
+}
+
+/// v50.0.0 (CIRISPersist#931) — why a replicated community record was refused.
+/// Closed, snake_case, APPEND-ONLY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedCommunityRefusal {
+    /// A differing record under an occupied id with no proof, or a proof over
+    /// a prior version this node does not hold ([`Error::Conflict`]).
+    ConflictingRecord,
+}
+
+/// What this node held under a replicated record's id before the apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicatedCommunityPrior {
+    Absent,
+    Identical,
+    Differing,
+}
+
+/// v50.0.0 (#931) — read [`ReplicatedCommunityPrior`] before the store step.
+pub(crate) async fn replicated_community_prior<F>(
+    dir: &F,
+    community: &SignedCommunity,
+) -> Result<ReplicatedCommunityPrior, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let c = &community.community;
+    Ok(match dir.lookup_community(&c.community_key_id).await? {
+        None => ReplicatedCommunityPrior::Absent,
+        Some(stored) if stored.persist_row_hash == super::types::compute_persist_row_hash(c)? => {
+            ReplicatedCommunityPrior::Identical
+        }
+        Some(_) => ReplicatedCommunityPrior::Differing,
+    })
+}
+
+/// v50.0.0 (#931) — the store step's result as a typed outcome: a
+/// [`Error::Conflict`] is a typed refusal; every other error propagates.
+pub(crate) fn replicated_community_outcome(
+    prior: ReplicatedCommunityPrior,
+    stored: Result<(), Error>,
+) -> Result<ReplicatedCommunityOutcome, Error> {
+    match stored {
+        Ok(()) => Ok(match prior {
+            ReplicatedCommunityPrior::Absent => ReplicatedCommunityOutcome::Inserted,
+            ReplicatedCommunityPrior::Identical => ReplicatedCommunityOutcome::Unchanged,
+            ReplicatedCommunityPrior::Differing => ReplicatedCommunityOutcome::Superseded,
+        }),
+        Err(Error::Conflict(_)) => Ok(ReplicatedCommunityOutcome::Refused {
+            reason: ReplicatedCommunityRefusal::ConflictingRecord,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 /// What the replicated door does after the occupied-id decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OccupiedRoute {

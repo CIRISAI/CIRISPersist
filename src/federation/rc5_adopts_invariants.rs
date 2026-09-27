@@ -62,6 +62,21 @@ pub mod bodies {
         ts::register_hybrid_key_as(d, room, room, it::SUBSTRATE_PERSIST).await;
     }
 
+    /// Plant a LEGACY infrastructure record the way a node receives one from a
+    /// peer: through the replicated entry (CIRISPersist#931), which admits it
+    /// as data where the local door would refuse it. Returns the store result
+    /// so call sites read like the door they replace.
+    async fn plant_legacy(
+        d: &dyn FederationDirectory,
+        signed: crate::federation::SignedCommunity,
+    ) -> Result<(), Error> {
+        match d.apply_replicated_community(signed).await? {
+            crate::federation::ReplicatedCommunityOutcome::Inserted
+            | crate::federation::ReplicatedCommunityOutcome::Unchanged => Ok(()),
+            other => Err(Error::Backend(format!("legacy plant: {other:?}"))),
+        }
+    }
+
     fn violation_rule(e: &Error) -> &'static str {
         match e {
             Error::CommunityConsensusProtocolViolation { rule, .. } => rule,
@@ -411,14 +426,17 @@ pub mod bodies {
         ts::register_hybrid_key_as(d, &second, &second, it::USER).await;
         let room = format!("root-{tag}");
         authorized_room_key(d, &room).await;
-        d.put_community(ts::sign_community(
-            &human,
-            infra_room(
-                &room,
-                "quorum:1/2",
-                vec![seat(&human, "founder"), seat(&install, "founder")],
+        plant_legacy(
+            d,
+            ts::sign_community(
+                &human,
+                infra_room(
+                    &room,
+                    "quorum:1/2",
+                    vec![seat(&human, "founder"), seat(&install, "founder")],
+                ),
             ),
-        ))
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: the legacy room: {e}"));
         widen_by(d, &install, &room, &second, ago(100))
@@ -473,14 +491,17 @@ pub mod bodies {
         ts::register_hybrid_key_as(d, &node_identity, &node_identity, it::NODE).await;
         let room = format!("root-{tag}");
         authorized_room_key(d, &room).await;
-        d.put_community(ts::sign_community(
-            &human,
-            infra_room(
-                &room,
-                "quorum:1/2",
-                vec![seat(&human, "founder"), seat(&install, "founder")],
+        plant_legacy(
+            d,
+            ts::sign_community(
+                &human,
+                infra_room(
+                    &room,
+                    "quorum:1/2",
+                    vec![seat(&human, "founder"), seat(&install, "founder")],
+                ),
             ),
-        ))
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: the legacy room: {e}"));
         let (t1, t2, t3, t4, t5) = (ago(200), ago(160), ago(120), ago(80), ago(40));
@@ -521,14 +542,17 @@ pub mod bodies {
         // (5) control
         let room2 = format!("root2-{tag}");
         authorized_room_key(d, &room2).await;
-        d.put_community(ts::sign_community(
-            &human,
-            infra_room(
-                &room2,
-                "quorum:1/2",
-                vec![seat(&human, "founder"), seat(&install2, "founder")],
+        plant_legacy(
+            d,
+            ts::sign_community(
+                &human,
+                infra_room(
+                    &room2,
+                    "quorum:1/2",
+                    vec![seat(&human, "founder"), seat(&install2, "founder")],
+                ),
             ),
-        ))
+        )
         .await
         .unwrap_or_else(|e| panic!("{tag}: the control room: {e}"));
         occurrence_of_at(d, &node_identity, &install2, ago(240)).await;
@@ -574,18 +598,21 @@ pub mod bodies {
             (format!("twin-{tag}"), false),
         ] {
             authorized_room_key(d, &room).await;
-            d.put_community(ts::sign_community(
-                &human,
-                infra_room(
-                    &room,
-                    "quorum:1/2",
-                    vec![
-                        seat(&human, "founder"),
-                        seat(&install, "founder"),
-                        seat(&member, "member"),
-                    ],
+            plant_legacy(
+                d,
+                ts::sign_community(
+                    &human,
+                    infra_room(
+                        &room,
+                        "quorum:1/2",
+                        vec![
+                            seat(&human, "founder"),
+                            seat(&install, "founder"),
+                            seat(&member, "member"),
+                        ],
+                    ),
                 ),
-            ))
+            )
             .await
             .unwrap_or_else(|e| panic!("{tag}: room: {e}"));
             if bound {
@@ -742,14 +769,42 @@ pub mod bodies {
         ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: quorum:1/1 is conformant: {e}"));
+        // Review (M1 loophole) — N is the founder count: M is read absolutely,
+        // so `quorum:1/1` over three founders would let one of them admit
+        // alone, and `quorum:2/3` over two would demand a founder who is not
+        // there.
+        let three = vec![
+            seat(&human, "founder"),
+            seat(&format!("f2-{tag}"), "founder"),
+            seat(&format!("f3-{tag}"), "founder"),
+        ];
+        for (i, (p, founders)) in [
+            ("quorum:1/1", three.clone()),
+            ("quorum:2/3", three[..2].to_vec()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let room = format!("root-n{i}-{tag}");
+            authorized_room_key(d, &room).await;
+            let err = d
+                .put_community(ts::sign_community(&human, infra_room(&room, p, founders)))
+                .await
+                .expect_err("N must be the founder count");
+            assert_eq!(
+                violation_rule(&err),
+                crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+                "{p}: {err}"
+            );
+        }
         let room3 = format!("root-23-{tag}");
         authorized_room_key(d, &room3).await;
         d.put_community(ts::sign_community(
             &human,
-            infra_room(&room3, "quorum:2/3", vec![seat(&human, "founder")]),
+            infra_room(&room3, "quorum:2/3", three),
         ))
         .await
-        .unwrap_or_else(|e| panic!("{tag}: quorum:2/3 is conformant: {e}"));
+        .unwrap_or_else(|e| panic!("{tag}: quorum:2/3 over three founders: {e}"));
         // An infrastructure community with NO founder has no admission quorum.
         let none = format!("root-none-{tag}");
         authorized_room_key(d, &none).await;
@@ -841,59 +896,71 @@ pub mod bodies {
         );
     }
 
-    /// **#925/#927 review M6 — conformance judges records AUTHORED HERE.** On
-    /// node A (its key `host_a`), a legacy `founder_only` infrastructure record
-    /// signed by a human is replicated data: admitted, and an identical re-put
-    /// settles. A fresh node B syncs it from A's signed since-read. A NEW
-    /// record authored by A's own key is refused, and so is a supersede of the
-    /// legacy record to another non-conformant form.
+    /// **#925/#927 review M6 + final check (CIRISPersist#931) — the DOOR, not
+    /// the signer, decides.** Both nodes KNOW their own key (the production
+    /// shape: the Engine always sets it), and every record is signed by a
+    /// HUMAN founder, as infrastructure records normally are.
+    ///
+    /// - On node A, a `founder_only` infrastructure record put through the
+    ///   LOCAL door is refused — whoever signed it.
+    /// - The same record through the REPLICATED entry is admitted as data
+    ///   (`Inserted`); re-applied identically it is `Unchanged`; and an
+    ///   identical re-put through the local door settles too.
+    /// - A changed record through the local door is judged and refused; a
+    ///   supersede is judged and refused.
+    /// - Node B syncs it from A's signed since-read through its replicated
+    ///   entry.
     pub async fn infrastructure_record_authored_elsewhere_is_data(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
         tag: &str,
-        host_a: &str,
-        rekey_a: &(dyn Fn(String) + Sync),
     ) {
+        use crate::federation::ReplicatedCommunityOutcome as Out;
         let human = format!("human-{tag}");
         for d in [a, b] {
             ts::register_hybrid_key_as(d, &human, &human, it::USER).await;
         }
-        ts::register_hybrid_key_as(a, host_a, host_a, it::PRIMITIVE).await;
         let room = format!("legacy-{tag}");
         let legacy = ts::sign_community(
             &human,
             infra_room(&room, "founder_only", vec![seat(&human, "founder")]),
         );
-        a.put_community(legacy.clone())
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: M6 — replicated data is admitted: {e}"));
-        a.put_community(legacy)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: M6 — an identical re-put settles: {e}"));
-        let served = a
-            .list_signed_communities_since(None, u32::MAX)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|r| r.community.community.community_key_id == room)
-            .expect("A serves the legacy record")
-            .community;
-        b.put_community(served)
-            .await
-            .unwrap_or_else(|e| panic!("{tag}: M6 — a fresh node syncs it: {e}"));
-        assert!(b.lookup_community(&room).await.unwrap().is_some());
-        let mine = format!("mine-{tag}");
         let err = a
-            .put_community(ts::sign_community(
-                host_a,
-                infra_room(&mine, "founder_only", vec![seat(&human, "founder")]),
-            ))
+            .put_community(legacy.clone())
             .await
-            .expect_err("M6 — a NEW record authored here is judged");
+            .expect_err("the local door judges a record whoever signed it");
         assert_eq!(
             violation_rule(&err),
             INFRA_RULE_PROTOCOL_NOT_QUORUM,
             "{err}"
+        );
+        assert!(a.lookup_community(&room).await.unwrap().is_none());
+        assert_eq!(
+            a.apply_replicated_community(legacy.clone()).await.unwrap(),
+            Out::Inserted,
+            "{tag}: the replicated entry admits a legacy record as data"
+        );
+        assert_eq!(
+            a.apply_replicated_community(legacy.clone()).await.unwrap(),
+            Out::Unchanged
+        );
+        a.put_community(legacy).await.unwrap_or_else(|e| {
+            panic!("{tag}: an identical re-put settles on the local door: {e}")
+        });
+        let stored = a.lookup_community(&room).await.unwrap().expect("stored");
+        let mut changed = stored.clone();
+        changed.persist_row_hash = String::new();
+        changed.community_name = "renamed".into();
+        let err = a
+            .put_community(ts::sign_community(&human, changed))
+            .await
+            .expect_err("a changed record through the local door is judged");
+        assert!(
+            matches!(
+                err,
+                Error::CommunityConsensusProtocolViolation { .. } | Error::Conflict(_)
+            ),
+            "{tag}: {err}"
         );
         let err = a
             .supersede_community(
@@ -904,31 +971,115 @@ pub mod bodies {
                 None,
             )
             .await
-            .expect_err("M6 — a supersede is always judged");
+            .expect_err("a supersede is always judged");
         assert_eq!(
             violation_rule(&err),
             INFRA_RULE_PROTOCOL_NOT_QUORUM,
             "{err}"
         );
-        // A's key is now the legacy record's signer: the stored record counts as
-        // authored here. An identical re-put still settles (it changes nothing);
-        // a CHANGED re-put is judged and refused.
-        rekey_a(human.clone());
-        let stored = a.lookup_community(&room).await.unwrap().expect("stored");
-        let mut same = stored.clone();
-        same.persist_row_hash = String::new();
-        a.put_community(ts::sign_community(&human, same.clone()))
+        let served = a
+            .list_signed_communities_since(None, u32::MAX)
             .await
-            .unwrap_or_else(|e| panic!("{tag}: M6 — an identical re-put settles: {e}"));
-        let mut changed = same;
-        changed.community_name = "renamed".into();
-        let err = a
-            .put_community(ts::sign_community(&human, changed))
+            .unwrap()
+            .into_iter()
+            .find(|r| r.community.community.community_key_id == room)
+            .expect("A serves the legacy record")
+            .community;
+        assert_eq!(
+            b.apply_replicated_community(served).await.unwrap(),
+            Out::Inserted,
+            "{tag}: a fresh node syncs it through its replicated entry"
+        );
+    }
+
+    /// **#925 review, H3's fifth door — `add_peer_record` is a local mint.**
+    /// An operator-added peer record carries a caller-supplied
+    /// `identity_type`; a `{node,agent}` / `{node,user}` one is refused by the
+    /// Clause A error and nothing is stored.
+    pub async fn clause_a_peer_record_is_a_local_mint(d: &dyn FederationDirectory, tag: &str) {
+        for actor in [it::AGENT, it::USER] {
+            let k = format!("peer-fused-{actor}-{tag}");
+            let (ed, _) = ts::hybrid_pubkeys(&k);
+            let err = d
+                .add_peer_record(&k, &ed, &it::join_set([it::NODE, actor]), None)
+                .await
+                .expect_err("Clause A on the peer door");
+            assert!(
+                matches!(err, Error::NodeIdentityNotExclusive { .. }),
+                "{tag}: {actor}: {err}"
+            );
+            assert!(d.lookup_public_key(&k).await.unwrap().is_none());
+        }
+    }
+
+    /// **Review, M1 loophole — a roster change may not make N stale.** A
+    /// conformant `quorum:2/2` infrastructure room of two founders: a widening
+    /// that adds a third founder, and a revocation that removes one, are
+    /// refused (`INFRA_RULE_QUORUM_N_NOT_FOUNDERS`) even with both founders'
+    /// signatures; a widening that adds a plain member is admitted.
+    pub async fn infrastructure_founder_count_is_fixed_by_the_record(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        let [h1, h2, h3, m] = ["h1", "h2", "h3", "m"].map(|n| format!("{n}-{tag}"));
+        for k in [&h1, &h2, &h3, &m] {
+            ts::register_hybrid_key_as(d, k, k, it::USER).await;
+        }
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
+        d.put_community(ts::sign_community(
+            &h1,
+            infra_room(
+                &room,
+                "quorum:2/2",
+                vec![seat(&h1, "founder"), seat(&h2, "founder")],
+            ),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: conformant room: {e}"));
+        let both = |mut w: crate::federation::SignedCommunityMembershipWidening| {
+            ts::cosign_community_membership_widening(&mut w, &h2);
+            w
+        };
+        let mut founder = widening_at(&room, &h3, ago(30));
+        founder.role = Some("founder".into());
+        let err = d
+            .put_community_membership_widening(both(ts::sign_community_membership_widening(
+                &h1, founder,
+            )))
             .await
-            .expect_err("M6 — a changed record authored here is judged");
+            .expect_err("adding a founder would leave N stale");
         assert_eq!(
             violation_rule(&err),
-            INFRA_RULE_PROTOCOL_NOT_QUORUM,
+            crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+            "{err}"
+        );
+        d.put_community_membership_widening(both(ts::sign_community_membership_widening(
+            &h1,
+            widening_at(&room, &m, ago(20)),
+        )))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: a plain member is admitted: {e}"));
+        let mut rev = ts::sign_community_membership_revocation(
+            &h1,
+            crate::federation::types::CommunityMembershipRevocation {
+                community_key_id: room.clone(),
+                removed_identity_key_id: h2.clone(),
+                removed_at: ago(10),
+                effective_at: ago(10),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_community_membership_revocation(&mut rev, &h2);
+        let err = d
+            .put_community_membership_revocation(rev)
+            .await
+            .expect_err("removing a founder would leave N stale");
+        assert_eq!(
+            violation_rule(&err),
+            crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
             "{err}"
         );
     }
@@ -1125,17 +1276,24 @@ pub mod bodies {
         }
     }
 
-    /// **#928 review H2 — the depth change is not retroactive.** A 6-hop
-    /// `consent_revocation` chain to the subject of a content row binding a
-    /// blob. A `withdraws` already in store (admitted by the deferred arm,
-    /// before its target landed — the read-time position every pre-v50 row
-    /// is in) still retires the bytes: the bytes-plane re-derivation walks at
-    /// the depth ceiling, not the new default. A NEW `withdraws` over the same
-    /// chain, target present, is refused at admission, and says it was too
-    /// deep.
-    pub async fn withdraws_admitted_under_the_old_depth_still_retires(
+    /// **#928 review H2 (final check, V157) — a `withdraws` retires at the
+    /// depth it was ADMITTED under.** A 6-hop `consent_revocation` chain to the
+    /// subject of content rows binding blobs.
+    ///
+    /// - (A) At the default depth (5), a `withdraws` stored by the deferred arm
+    ///   (its target absent at admission) does NOT retire the bytes once the
+    ///   target lands: it is recorded at 5, and the chain is 6 deep.
+    /// - (B) The same shape with the target present is refused at admission,
+    ///   `beyond_delegation_depth_cap = true`.
+    /// - (C) With the host's explicit opt-in to 6, a deferred `withdraws` over
+    ///   the same chain is recorded at 6 and DOES retire.
+    ///
+    /// A row stored before V157 is backfilled at 16 (the migration), and a row
+    /// with nothing recorded reads as 16 — `withdraws_admission_depth_is_backfilled`.
+    pub async fn withdraws_retire_at_their_admission_depth(
         d: &dyn FederationDirectory,
         tag: &str,
+        opt_in: &(dyn Fn(usize) + Sync),
     ) {
         use crate::federation::blob_tombstone::{binding_state, BindingState};
         use sha2::Digest as _;
@@ -1148,10 +1306,10 @@ pub mod bodies {
         .await;
         let author = format!("author-{tag}");
         register(d, &author, &[it::PRIMITIVE]).await;
-        let bind = |id: &str, sha_hex: &str| {
+        let bind = |id: &str, sha: &[u8; 32]| {
             let env = serde_json::json!({
                 "id": id, "dimension": "file:doc:v1", "cohort_scope": "federation",
-                "evidence_refs": [sha_hex]
+                "evidence_refs": [hex::encode(sha)]
             });
             let mut row = ts::bare_attestation(id, &author, &author, &env);
             row.attestation_type = attestation_type::SCORES.into();
@@ -1171,54 +1329,59 @@ pub mod bodies {
             ts::seal_row_in_place(&keys[0], &mut w);
             w
         };
-        let sha: [u8; 32] = sha2::Sha256::digest(format!("old-{tag}")).into();
-        let sha2_: [u8; 32] = sha2::Sha256::digest(format!("new-{tag}")).into();
-        let (r1, w1) = (
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
-        );
-        // The withdraws is stored first (deferred: its target is absent).
-        d.put_attestation(SignedAttestation {
-            attestation: withdraws(&w1, &r1),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: the stored withdraws: {e}"));
-        d.put_attestation(SignedAttestation {
-            attestation: bind(&r1, &hex::encode(sha)),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: the bound row: {e}"));
-        assert_eq!(
-            binding_state(d, &sha).await.unwrap(),
-            BindingState::Withdrawn {
-                attestation_id: r1.clone(),
-                withdraws_id: w1.clone(),
-            },
-            "{tag}: H2 — a stored withdraws over a 6-hop chain keeps retiring the bytes"
-        );
-        // A NEW withdraws over the same chain, target present: refused.
-        let (r2, w2) = (
-            uuid::Uuid::new_v4().to_string(),
-            uuid::Uuid::new_v4().to_string(),
-        );
-        d.put_attestation(SignedAttestation {
-            attestation: bind(&r2, &hex::encode(sha2_)),
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{tag}: the second bound row: {e}"));
-        match d
-            .put_attestation(SignedAttestation {
-                attestation: withdraws(&w2, &r2),
-            })
+        let put = |row: Attestation| async move {
+            d.put_attestation(SignedAttestation { attestation: row })
+                .await
+                .map(|_| ())
+        };
+        let uuid = || uuid::Uuid::new_v4().to_string();
+        let sha = |n: &str| -> [u8; 32] { sha2::Sha256::digest(format!("{n}-{tag}")).into() };
+        // (A) default depth, deferred arm.
+        let (ra, wa, sha_a) = (uuid(), uuid(), sha("a"));
+        put(withdraws(&wa, &ra))
             .await
-        {
+            .unwrap_or_else(|e| panic!("{tag}: (A) the deferred withdraws: {e}"));
+        assert_eq!(
+            d.withdraws_admission_depth(&wa).await.unwrap(),
+            Some(crate::federation::DEFAULT_DELEGATION_DEPTH),
+            "{tag}: (A) recorded at the default"
+        );
+        put(bind(&ra, &sha_a))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: (A) the bound row: {e}"));
+        assert_eq!(
+            binding_state(d, &sha_a).await.unwrap(),
+            BindingState::Live,
+            "{tag}: (A) a 6-hop withdraws admitted at 5 does not retire by arriving first"
+        );
+        // (B) default depth, target present.
+        let (rb, wb, sha_b) = (uuid(), uuid(), sha("b"));
+        put(bind(&rb, &sha_b)).await.unwrap();
+        match put(withdraws(&wb, &rb)).await {
             Err(Error::WithdrawsNotAdmitted {
                 beyond_delegation_depth_cap,
                 ..
-            }) => assert!(beyond_delegation_depth_cap, "{tag}: refused as too deep"),
-            other => panic!("{tag}: a new 6-hop withdraws at admission: {other:?}"),
+            }) => assert!(beyond_delegation_depth_cap, "{tag}: (B) too deep"),
+            other => panic!("{tag}: (B) a 6-hop withdraws at admission: {other:?}"),
         }
-        assert_eq!(binding_state(d, &sha2_).await.unwrap(), BindingState::Live);
+        assert_eq!(binding_state(d, &sha_b).await.unwrap(), BindingState::Live);
+        // (C) the host opts in to 6.
+        opt_in(6);
+        let (rc, wc, sha_c) = (uuid(), uuid(), sha("c"));
+        put(withdraws(&wc, &rc))
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: (C) the deferred withdraws: {e}"));
+        assert_eq!(d.withdraws_admission_depth(&wc).await.unwrap(), Some(6));
+        put(bind(&rc, &sha_c)).await.unwrap();
+        assert_eq!(
+            binding_state(d, &sha_c).await.unwrap(),
+            BindingState::Withdrawn {
+                attestation_id: rc.clone(),
+                withdraws_id: wc.clone(),
+            },
+            "{tag}: (C) admitted at 6, the 6-hop chain retires"
+        );
+        opt_in(crate::federation::DEFAULT_DELEGATION_DEPTH);
     }
 
     /// **#925 review H3 — Clause A on the doors that REWRITE a key record.**
@@ -1395,7 +1558,8 @@ mod runners {
                 case!(withdraws_walk_depth_defaults_to_five_hops);
                 case!(moderation_walk_depth_defaults_to_five_hops);
                 case!(identity_claim_alone_is_not_node_bearing_founder);
-                case!(withdraws_admitted_under_the_old_depth_still_retires);
+                case!(clause_a_peer_record_is_a_local_mint);
+                case!(infrastructure_founder_count_is_fixed_by_the_record);
                 case!(clause_a_replicated_insert_admits_a_fused_key);
             }
         };
@@ -1432,21 +1596,31 @@ mod runners {
                 keyed!(node_bearing_founder_roots_no_moderation);
                 keyed!(node_bearing_founder_is_no_reverse_quorum_duty_holder);
                 #[tokio::test]
+                async fn withdraws_retire_at_their_admission_depth() {
+                    let Some(d) = $fresh.await else { return };
+                    let s = suffix();
+                    d.set_node_key_id(format!("host-{s}"));
+                    let opt_in = |n: usize| d.set_withdraws_delegation_depth(n);
+                    super::super::bodies::withdraws_retire_at_their_admission_depth(
+                        &d as &dyn FederationDirectory,
+                        &format!("wd-{s}"),
+                        &opt_in,
+                    )
+                    .await
+                }
+                #[tokio::test]
                 async fn infrastructure_record_authored_elsewhere_is_data() {
                     let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
                         return;
                     };
                     let s = suffix();
-                    let host_a = format!("host-a-{s}");
-                    a.set_node_key_id(host_a.clone());
+                    // Both nodes know their own key — the production shape.
+                    a.set_node_key_id(format!("host-a-{s}"));
                     b.set_node_key_id(format!("host-b-{s}"));
-                    let rekey = |k: String| a.set_node_key_id(k);
                     super::super::bodies::infrastructure_record_authored_elsewhere_is_data(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
                         &format!("m6-{s}"),
-                        &host_a,
-                        &rekey,
                     )
                     .await
                 }

@@ -7908,12 +7908,9 @@ pub async fn check_withdraws_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<Option<u8>, Error> {
-    check_withdraws_admission_at(
-        directory,
-        row,
-        crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
-    )
-    .await
+    // v50.0.0 (review H2) — the node's configured depth (CC 4.1.1 default
+    // unless the host opted in); the backend records it with the row.
+    check_withdraws_admission_at(directory, row, directory.withdraws_delegation_depth()).await
 }
 
 /// v50.0.0 (CIRISPersist#928 review H2) — [`check_withdraws_admission`] with
@@ -10785,6 +10782,10 @@ pub async fn check_peer_record_admission(
         consent_role: None,
         additional_scrubs: Vec::new(),
     };
+    // v50.0.0 (CIRISPersist#925 review, H3's fifth door) — CC 3.4.7.3 Clause A:
+    // an operator-added peer record writes a caller-supplied `identity_type`,
+    // so it is a local mint and may not fuse `node` with `agent`/`user`.
+    super::register::check_node_identity_exclusive(&probe)?;
     check_canonical_role_admission(directory, &probe).await?;
     check_infra_attest_role_admission(directory, &probe).await?;
     check_co_steward_role_admission(directory, &probe).await?;
@@ -12087,6 +12088,11 @@ pub const INFRA_RULE_PROTOCOL_NOT_QUORUM: &str = "protocol_not_quorum_m_of_n";
 /// v50.0.0 (review) — [`Error::CommunityConsensusProtocolViolation`] rule: an
 /// `infrastructure` community names no founder (no admission quorum at all).
 pub const INFRA_RULE_NO_FOUNDER: &str = "no_founder";
+/// v50.0.0 (review, M1 loophole) — rule: a `quorum:M/N` infrastructure
+/// record's declared `N` is not its founder count, or a roster change would
+/// make it so. The evaluator reads an ABSOLUTE `M`, so `quorum:1/1` over three
+/// founders would let one of them admit alone.
+pub const INFRA_RULE_QUORUM_N_NOT_FOUNDERS: &str = "quorum_n_not_founder_count";
 /// v50.0.0 (merge prep for CIRISPersist#926) — rule: a record that must be
 /// `infrastructure` (e.g. `ciris-canonical`) does not carry that subkind.
 pub const INFRA_RULE_SUBKIND_NOT_INFRASTRUCTURE: &str = "subkind_not_infrastructure";
@@ -12136,8 +12142,23 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
         return Ok(());
     }
     let p = community.consensus_protocol.as_str();
-    if infrastructure_quorum(p).is_some() {
-        return Ok(());
+    if let Some((_m, n)) = infrastructure_quorum(p) {
+        let founders = community
+            .members
+            .iter()
+            .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+            .count();
+        if n as usize == founders {
+            return Ok(());
+        }
+        return Err(Error::CommunityConsensusProtocolViolation {
+            community_key_id: community.community_key_id.clone(),
+            rule: INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+            detail: format!(
+                "consensus_protocol {p:?} declares N = {n} over {founders} founder(s): the \
+                 evaluator reads M absolutely, so N must be the founder count"
+            ),
+        });
     }
     Err(Error::CommunityConsensusProtocolViolation {
         community_key_id: community.community_key_id.clone(),
@@ -12191,15 +12212,59 @@ pub async fn check_infrastructure_founders_not_node(
     Ok(())
 }
 
+/// v50.0.0 (review, M1 loophole) — a roster change (a widening or a
+/// revocation) in a CONFORMANT `infrastructure` room (its stored protocol
+/// parses by [`infrastructure_quorum`]) may not change the founder count: the
+/// record's declared `N` would go stale and the absolute `M` would no longer
+/// be the fraction the founders signed up to. The founder set moves by a
+/// supersede of the record, which re-declares `N`. A legacy non-conformant
+/// room (replicated data) is not re-judged here — it is non-conformant
+/// already, and the fold's gates apply to it.
+///
+/// `change` is the member the row adds (with its role) or removes.
+pub async fn check_infrastructure_founder_count_unchanged(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+    member_key_id: &str,
+    added_role: Option<&str>,
+    is_revocation: bool,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error> {
+    if !is_infrastructure_labeled(community)
+        || infrastructure_quorum(&community.consensus_protocol).is_none()
+    {
+        return Ok(());
+    }
+    let roster = super::authorized_community_roster_at(directory, community, at).await?;
+    let is_founder = |role: Option<&str>| role == Some(MEMBER_ROLE_FOUNDER);
+    let was = roster
+        .iter()
+        .find(|m| m.key_id == member_key_id)
+        .is_some_and(|m| is_founder(m.role.as_deref()));
+    let will = !is_revocation && is_founder(added_role);
+    if was == will {
+        return Ok(());
+    }
+    Err(Error::CommunityConsensusProtocolViolation {
+        community_key_id: community.community_key_id.clone(),
+        rule: INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
+        detail: format!(
+            "{member_key_id}: this roster change {} a founder, which would leave the declared \
+             {:?} stale — the founder set changes by a supersede that re-declares N",
+            if will { "adds" } else { "removes" },
+            community.consensus_protocol
+        ),
+    })
+}
+
 /// v50.0.0 (CIRISPersist#925/#927) — both CC 3.2 `infrastructure`
 /// conformance checks over a whole community record, for the record doors
-/// (`put_community`, the supersede door). The protocol check runs first: it
-/// reads nothing.
+/// (`put_community`, the supersede door): a founder exists, then the protocol
+/// and its `N` (they read nothing), then the founders' node-bearing.
 pub async fn check_infrastructure_community_conformance(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<(), Error> {
-    check_infrastructure_consensus_protocol(community)?;
     if is_infrastructure_labeled(community)
         && !community
             .members
@@ -12214,29 +12279,25 @@ pub async fn check_infrastructure_community_conformance(
                 .into(),
         });
     }
+    check_infrastructure_consensus_protocol(community)?;
     check_infrastructure_founders_not_node(directory, community, chrono::Utc::now()).await
 }
 
-/// v50.0.0 (CIRISPersist#925/#927, review M6) — the `put_community` door's
-/// infrastructure gate. Conformance
-/// ([`check_infrastructure_community_conformance`]) applies to a NEW or CHANGED
-/// record AUTHORED HERE; the local supersede doors run it unconditionally.
+/// v50.0.0 (CIRISPersist#925/#927, review M6 + final check) — the LOCAL
+/// `put_community` door's infrastructure gate: full conformance
+/// ([`check_infrastructure_community_conformance`]) for a NEW or CHANGED
+/// record, whoever signed it. An identical re-put (same `persist_row_hash` as
+/// the stored row) settles as the idempotent no-op it always was.
 ///
-/// - An identical re-put (same `persist_row_hash` as the stored row) settles
-///   as the idempotent no-op it always was: it changes nothing, so it is not
-///   re-judged.
-/// - A record authored ELSEWHERE — its `authority_key_id` is not this node's
-///   key ([`FederationDirectory::node_key_id`]) — is replicated DATA: a legacy
-///   infrastructure record is admitted, and the fold's gates apply to it
-///   (a `node`-bearing founder's seat does not vote; the stored protocol is
-///   evaluated over founders). Refusing it would leave a fresh node unable to
-///   sync a record the rest of the mesh holds.
-/// - When this node's key is unknown (a host that never set it), the record is
-///   judged as authored here: the stricter reading.
+/// The door, not the signer, tells local from replicated (CIRISPersist#931): an
+/// infrastructure record is normally signed by its HUMAN founder, so a
+/// by-signer test would switch this gate off on every host that knows its own
+/// key. A record received from a peer enters through
+/// [`FederationDirectory::apply_replicated_community`](super::FederationDirectory::apply_replicated_community),
+/// which does not call this: a legacy record is admitted there as data.
 pub async fn check_infrastructure_record_admission(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
-    authority_key_id: &str,
 ) -> Result<(), Error> {
     if !is_infrastructure_labeled(community) {
         return Ok(());
@@ -12248,12 +12309,6 @@ pub async fn check_infrastructure_record_admission(
         if stored.persist_row_hash == super::types::compute_persist_row_hash(community)? {
             return Ok(());
         }
-    }
-    if directory
-        .node_key_id()
-        .is_some_and(|me| me != authority_key_id)
-    {
-        return Ok(());
     }
     check_infrastructure_community_conformance(directory, community).await
 }

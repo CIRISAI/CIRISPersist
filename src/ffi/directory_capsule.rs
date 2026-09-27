@@ -1043,6 +1043,16 @@ pub enum DirectoryOp {
         /// The identity the TRANSPORT authenticated — never the row's claim.
         authenticated_peer_key_id: String,
     },
+    /// v50.0.0 (CIRISPersist#925/#931) —
+    /// [`FederationDirectory::apply_replicated_community`], the REPLICATED
+    /// community entry: a legacy infrastructure record is admitted as data,
+    /// where [`DirectoryOp::PutCommunity`] (the local door) runs the full CC
+    /// 3.2 gate. A replication bridge sends this. Result rides
+    /// `ReplicatedCommunityOutcome`. APPEND-ONLY (Growth).
+    ApplyReplicatedCommunity {
+        /// The signed community row received from a peer.
+        community: SignedCommunity,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1286,6 +1296,10 @@ pub enum DirectoryOpResult {
     ReplicatedAttestationOutcome(
         crate::federation::attestation_apply::ReplicatedAttestationOutcome,
     ),
+    /// v50.0.0 (CIRISPersist#931) — `apply_replicated_community`: the typed
+    /// community-plane outcome. A `Refused` carries its reason here, never
+    /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
+    ReplicatedCommunityOutcome(crate::federation::ReplicatedCommunityOutcome),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -2009,6 +2023,12 @@ pub async fn dispatch_directory_op(
             Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::ApplyReplicatedCommunity { community } => {
+            match dir.apply_replicated_community(community).await {
+                Ok(o) => DirectoryOpResult::ReplicatedCommunityOutcome(o),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -2606,6 +2626,23 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#931) — the replicated community entry, proxied.
+    async fn apply_replicated_community(
+        &self,
+        community: SignedCommunity,
+    ) -> Result<crate::federation::ReplicatedCommunityOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedCommunity { community })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedCommunityOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4344,6 +4381,67 @@ mod tests {
         (dir, directory)
     }
 
+    /// v50.0.0 (CIRISPersist#931) — the capsule carries BOTH community doors:
+    /// `PutCommunity` (local) refuses a human-signed legacy `founder_only`
+    /// infrastructure record; `ApplyReplicatedCommunity` admits it as data
+    /// (`Inserted`), and a re-apply is `Unchanged`.
+    #[test]
+    fn apply_replicated_community_op_is_the_replicated_door() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(ts::register_hybrid_key_as(
+            dir.as_ref(),
+            "capsule-human",
+            "capsule-human",
+            crate::federation::types::identity_type::USER,
+        ));
+        let community = ts::sign_community(
+            "capsule-human",
+            crate::federation::types::Community {
+                community_key_id: "capsule-legacy-root".into(),
+                community_name: "legacy".into(),
+                members: vec![crate::federation::types::CommunityMember {
+                    key_id: "capsule-human".into(),
+                    joined_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                    role: Some("founder".into()),
+                }],
+                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "founder_only".into(),
+                policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+                persist_row_hash: String::new(),
+            },
+        );
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::PutCommunity {
+                community: community.clone(),
+            },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.contains("hard_case:community_consensus_protocol_violation"),
+                "{e}"
+            ),
+            other => panic!("the local door must refuse: {other:?}"),
+        }
+        for want in [
+            crate::federation::ReplicatedCommunityOutcome::Inserted,
+            crate::federation::ReplicatedCommunityOutcome::Unchanged,
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::ApplyReplicatedCommunity {
+                    community: community.clone(),
+                },
+            ) {
+                DirectoryOpResult::ReplicatedCommunityOutcome(o) => assert_eq!(o, want),
+                other => panic!("the replicated door: {other:?}"),
+            }
+        }
+    }
+
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -4847,7 +4945,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "6611b3942471f85226d49d6702b3bc07880eb7f8fe0acd940b5f02d79f5c8d0d",
+            "cbe589af49192f7b64b28f6e838039a6b600eb8facdc9d515d8b94e9096fb42b",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4881,11 +4979,16 @@ mod tests {
     /// `ApplyReplicatedAttestation` and `ApplyReplicatedAttestationSynced` ops
     /// and the `ReplicatedAttestationOutcome` result APPENDED, nothing
     /// existing touched. [`DIRECTORY_ABI_VERSION`] stays 5.
+    ///
+    /// Re-pinned again in v50.0.0 (CIRISPersist#931) — GROWTH on both halves:
+    /// the `ApplyReplicatedCommunity` op and the `ReplicatedCommunityOutcome`
+    /// result APPENDED. The version is 6 for #928's payload change
+    /// (`ReachabilityVerdict::BeyondDepthCap`), not for this.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "457dad6209a9ba4fd0b322e3a24feb8b3163c6172e6f38afedd48665a8b47aec",
+            "f94a6793f9558acb7414d155ba9192468b109ffc7de4a7a8f29f4e78cc97f55c",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

@@ -603,6 +603,9 @@ class Engine:
     def apply_replicated_attestation(self, signed_attestation_json: str) -> str:
         """(derived) deontic — v36.0.0 (CIRISPersist#624) — typed, pre-write replicated Attestation-plane apply. FFI mirror of [Engine::apply_replicated_attestation](crate::engin..."""
 
+    def apply_replicated_community_json(self, payload_json: str) -> str:
+        """(derived) deontic — v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry: admit a SignedCommunity received from a peer (the shape the signed since-read ser..."""
+
     def apply_replicated_key_grant(self, signed_key_grant_json: str) -> str:
         """(derived) deontic — CIRISPersist#848 (BLOB_REPLICATION.md §12–§13) — admit a replicated KeyGrant set and project every wrap. FFI mirror of [Engine::apply_replicated_ke..."""
 

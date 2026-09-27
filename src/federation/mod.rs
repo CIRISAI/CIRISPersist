@@ -530,6 +530,7 @@ pub use replication::hold::{
 // `Error::ConsentGateRefused` carries these, so a consumer must not have to
 // name a path into `admission` to match on the error it was handed.
 pub use admission::{ConsentGateRefused, ConsentGatedClaim, ConsentGatedFamily};
+pub use group_amendment::{CommunityDoor, ReplicatedCommunityOutcome, ReplicatedCommunityRefusal};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,
@@ -877,7 +878,7 @@ where
 /// (`check_signer_acts_for`), so the occurrence never has to consent: any
 /// registered `node` key N could sign `{identity: N, occurrence: H}` for a
 /// human founder H and strip H's vote. So a binding counts only when the
-/// occurrence itself agreed to it ([`occurrence_agreed_to`]). A trusted-local
+/// occurrence itself signed its binding ([`occurrence_agreed_to`]). A trusted-local
 /// (unsigned) row carries no agreement. #873's principal resolver
 /// ([`FederationDirectory::active_identities_for_occurrence`]) has the same
 /// unilateral-claim shape and is a follow-up (FSD `SECOND_DEVICE.md` §8.5).
@@ -939,9 +940,9 @@ where
 }
 
 /// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself agree to be
-/// an occurrence of `identity`? Yes when a stored SIGNED occurrence row for the
-/// pair was signed by `occurrence`, or when `occurrence`'s live owner-binding
-/// names `identity`. An identity's unilateral claim over a key is not agreement.
+/// an occurrence of `identity`? Yes only when a stored SIGNED occurrence row for
+/// the pair was signed by `occurrence`. An identity's unilateral claim over a
+/// key is not agreement.
 pub async fn occurrence_agreed_to<F>(
     directory: &F,
     identity: &str,
@@ -958,14 +959,11 @@ where
             s.identity_occurrence.occurrence_key_id == occurrence
                 && s.attesting_key_id == occurrence
         });
-    if signed_by_occurrence {
-        return Ok(true);
-    }
-    match admission::owner_of(directory, occurrence).await {
-        Ok(owner) => Ok(owner.as_deref() == Some(identity)),
-        Err(Error::AmbiguousNodeOwner { .. }) => Ok(false),
-        Err(e) => Err(e),
-    }
+    // v50.0.0 (review, final check) — no owner-binding arm. An owner-binding
+    // is signed by the OWNER over the key, so it is the identity's own claim
+    // again; it could only fire for a pre-gate fused identity, where it would
+    // be unilateral exactly as H1's row is.
+    Ok(signed_by_occurrence)
 }
 
 /// v50.0.0 (CIRISPersist#925) — the `node`-bearing keys among every key that
@@ -2337,6 +2335,27 @@ pub trait FederationDirectory: Send + Sync {
     /// invent one.
     fn node_key_id(&self) -> Option<String> {
         None
+    }
+
+    /// v50.0.0 (CIRISPersist#928, review H2) — the delegation depth this
+    /// node's `withdraws` write gate walks rules 3/4 at: the CC 4.1.1 default
+    /// unless the host opted in (backends: `set_withdraws_delegation_depth`),
+    /// never past the 16 ceiling.
+    fn withdraws_delegation_depth(&self) -> usize {
+        topology::DEFAULT_DELEGATION_DEPTH
+    }
+
+    /// v50.0.0 (CIRISPersist#928, review H2, V157) — the depth a stored
+    /// `withdraws` was admitted under, as recorded at admission. `None` when
+    /// nothing was recorded: a row stored before V157 (backfilled with 16) or
+    /// by a door that records nothing, which the read-time re-derivation takes
+    /// as the 16 ceiling — the only depth such a row can have been admitted at.
+    async fn withdraws_admission_depth(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<usize>, Error> {
+        let _ = attestation_id;
+        Ok(None)
     }
 
     /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated
@@ -4254,6 +4273,25 @@ pub trait FederationDirectory: Send + Sync {
     /// is false for `community`) — read paths federate community
     /// content normally.
     async fn put_community(&self, community: SignedCommunity) -> Result<(), Error>;
+
+    /// v50.0.0 (CIRISPersist#925/#931, review) — the REPLICATED community
+    /// entry, distinct from the local [`Self::put_community`] door. A record
+    /// received from a peer: an identical re-put is `Unchanged`; a legacy
+    /// non-conformant `infrastructure` record is admitted as DATA (the fold's
+    /// gates apply — a `node`-bearing founder's seat does not vote); an
+    /// occupied id with a supersede proof routes through the amendment checks.
+    /// The local door runs the full CC 3.2 infrastructure gate whoever signed;
+    /// this one does not. Every outcome is typed `Ok` except a hard error.
+    /// Default: [`Error::Unsupported`]; the backends and the capsule override.
+    async fn apply_replicated_community(
+        &self,
+        community: types::SignedCommunity,
+    ) -> Result<ReplicatedCommunityOutcome, Error> {
+        let _ = community;
+        Err(Error::Unsupported {
+            method: "apply_replicated_community",
+        })
+    }
 
     /// v4.0 — fetch a single community by `community_key_id`. Returns
     /// `None` if absent. Structural mirror of [`Self::lookup_family`].

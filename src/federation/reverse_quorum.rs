@@ -4009,8 +4009,8 @@ pub(crate) mod test_support {
 
     /// v50.0.0 (CIRISPersist#925 review M2/P3) — **a `node`-bearing founder
     /// is no reverse-quorum duty-holder.** Two twin legacy infrastructure rooms
-    /// (replicated data — the caller's backend knows a key that signed
-    /// neither) under `reverse_quorum:1/7:60+escalate:0:3`, founders
+    /// (planted through the replicated entry, `apply_replicated_community`,
+    /// which admits them as data) under `reverse_quorum:1/7:60+escalate:0:3`, founders
     /// `{human, second}`. In each, the human removes `x`; a member objects in
     /// the window; the second founder UPHOLDS the objection in the steward
     /// window; three members OVERRULE it.
@@ -4073,20 +4073,30 @@ pub(crate) mod test_support {
             for k in [&objector, &x].into_iter().chain(overrulers.iter()) {
                 members.push(member(k, "member"));
             }
-            dir.put_community(ts::sign_community(
-                &human,
-                Community {
-                    community_key_id: room.clone(),
-                    community_name: "legacy infrastructure commons".into(),
-                    members,
-                    founded_at: founded,
-                    consensus_protocol: "reverse_quorum:1/7:60+escalate:0:3".into(),
-                    policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
-                    persist_row_hash: String::new(),
-                },
-            ))
-            .await
-            .unwrap_or_else(|e| panic!("({suffix}) P3: the legacy room is replicated data: {e}"));
+            let planted = dir
+                .apply_replicated_community(ts::sign_community(
+                    &human,
+                    Community {
+                        community_key_id: room.clone(),
+                        community_name: "legacy infrastructure commons".into(),
+                        members,
+                        founded_at: founded,
+                        consensus_protocol: "reverse_quorum:1/7:60+escalate:0:3".into(),
+                        policy_blob: Some(
+                            serde_json::json!({ "cohort_subkind": "infrastructure" }),
+                        ),
+                        persist_row_hash: String::new(),
+                    },
+                ))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("({suffix}) P3: the legacy room is replicated data: {e}")
+                });
+            assert_eq!(
+                planted,
+                crate::federation::ReplicatedCommunityOutcome::Inserted,
+                "({suffix}) P3: the replicated entry admits the legacy room as data"
+            );
             dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
                 &human,
                 crate::federation::types::CommunityMembershipRevocation {

@@ -3660,6 +3660,41 @@ mod tests {
     /// the other spelling. Asserted over [`KeyRefusalReason::ALL`], so a NEW
     /// variant is covered the moment it is declared rather than the moment
     /// someone remembers to extend a list.
+    /// v50.0.0 (CIRISPersist#925 review H3) — the pure predicate every
+    /// rewrite door runs (`adopt_scrub_upgrade`, `supersede_canonical_record`,
+    /// `adopt_genesis_reanchor`): `node` may neither appear nor disappear;
+    /// anything else may change.
+    #[test]
+    fn check_node_identity_unchanged_refuses_only_a_node_move() {
+        use crate::federation::types::identity_type as it;
+        let rec = |set: &str| {
+            let mut r = crate::federation::tier_ingest::test_support::replicated_key_record(
+                "k-unchanged",
+                set,
+                "k-unchanged",
+                "k-unchanged",
+                "n",
+            );
+            r.identity_type = set.to_owned();
+            r
+        };
+        for (stored, offered, refused) in [
+            (it::NODE, it::NODE, false),
+            (it::NODE, "canonical,node", false),
+            ("node,steward", it::NODE, false),
+            (it::USER, it::PRIMITIVE, false),
+            (it::USER, it::NODE, true),
+            (it::NODE, it::PRIMITIVE, true),
+            ("canonical,node", "canonical", true),
+        ] {
+            let got = check_node_identity_unchanged(&rec(stored), &rec(offered));
+            assert_eq!(got.is_err(), refused, "{stored:?} -> {offered:?}: {got:?}");
+            if refused {
+                assert!(matches!(got, Err(Error::NodeIdentityImmutable { .. })));
+            }
+        }
+    }
+
     #[test]
     fn refusal_reason_tokens_match_serde() {
         for reason in KeyRefusalReason::ALL {

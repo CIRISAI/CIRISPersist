@@ -192,6 +192,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // changed record authored here; replicated data admitted.
     ("check_infrastructure_record_admission", Class::Gate),
     ("check_infrastructure_founders_not_node", Class::Gate),
+    // v50.0.0 (review, M1 loophole) — Gate: a roster change may not move the
+    // founder count of a conformant infrastructure room.
+    ("check_infrastructure_founder_count_unchanged", Class::Gate),
     // v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — Gate: refuses a
     // key record fusing `node` with `agent`/`user`.
     ("check_node_identity_exclusive", Class::Gate),
@@ -201,6 +204,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // of the one key-record store step; the replicated `Insert` arm reaches
     // the same helper with the replicated door.
     ("put_public_key_at_door", Class::Delegates),
+    // v50.0.0 (review, CIRISPersist#931) — Delegates: `put_community` and
+    // `apply_replicated_community` are the two doors of this one store step.
+    ("put_community_at_door", Class::Delegates),
+    // v50.0.0 (#931) — Plumbing: reads what is held under the offered id to
+    // name the typed outcome; it refuses nothing about the caller's input.
+    ("replicated_community_prior", Class::Plumbing),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
