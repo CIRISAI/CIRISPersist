@@ -804,9 +804,24 @@ pub fn community_subkind(c: &Community) -> Option<&str> {
 /// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — is
 /// `key_id` a `node`-bearing key? True when its own `federation_keys` row's
 /// `identity_type` set contains `node`, or when it is an ACTIVE occurrence of
-/// an identity whose row's set does ([`FederationDirectory::active_identities_for_occurrence`]).
+/// an identity whose row's set does AND the occurrence AGREED to that binding.
 /// An unresolved key is not `node`-bearing here (it has no record to judge;
 /// the membership doors FK-refuse it).
+///
+/// # Agreement (review H1)
+///
+/// An occurrence row is admitted when its signer is the IDENTITY itself
+/// (`check_signer_acts_for`), so the occurrence never has to consent: any
+/// registered `node` key N could sign `{identity: N, occurrence: H}` for a
+/// human founder H and strip H's vote in every infrastructure fold. So the
+/// occurrence clause counts a binding only when the occurrence itself agreed
+/// to it ([`occurrence_agreed_to`]): a signed occurrence row for
+/// `(identity, key_id)` whose signer is `key_id`, or `key_id`'s own live
+/// owner-binding naming that identity (`owner_of`, the one relation a node
+/// signs through). A trusted-local (unsigned) row carries no agreement and does
+/// not count. #873's principal resolver
+/// ([`FederationDirectory::active_identities_for_occurrence`]) has the same
+/// unilateral-claim shape and is a follow-up (FSD `SECOND_DEVICE.md` §8.5).
 pub async fn is_node_bearing_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -820,13 +835,45 @@ where
         }
     }
     for identity in directory.active_identities_for_occurrence(key_id).await? {
-        if let Some(rec) = directory.lookup_public_key(&identity).await? {
-            if has_node(&rec) {
-                return Ok(true);
-            }
+        let node_identity = directory
+            .lookup_public_key(&identity)
+            .await?
+            .is_some_and(|rec| has_node(&rec));
+        if node_identity && occurrence_agreed_to(directory, &identity, key_id).await? {
+            return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself agree to be
+/// an occurrence of `identity`? Yes when a stored SIGNED occurrence row for the
+/// pair was signed by `occurrence`, or when `occurrence`'s live owner-binding
+/// names `identity`. An identity's unilateral claim over a key is not agreement.
+pub async fn occurrence_agreed_to<F>(
+    directory: &F,
+    identity: &str,
+    occurrence: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let signed_by_occurrence = directory
+        .list_signed_identity_occurrences_for(identity)
+        .await?
+        .iter()
+        .any(|s| {
+            s.identity_occurrence.occurrence_key_id == occurrence
+                && s.attesting_key_id == occurrence
+        });
+    if signed_by_occurrence {
+        return Ok(true);
+    }
+    match admission::owner_of(directory, occurrence).await {
+        Ok(owner) => Ok(owner.as_deref() == Some(identity)),
+        Err(Error::AmbiguousNodeOwner { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// v50.0.0 (CIRISPersist#925) — the `node`-bearing keys among every key that

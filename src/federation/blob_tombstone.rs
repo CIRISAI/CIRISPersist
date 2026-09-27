@@ -89,8 +89,15 @@ async fn retiring_composer(
             // "this composer does not retire the bytes". The stored column is
             // overwritten with the re-derived one so `retraction_entitled`'s
             // arm 3 sees exactly what was proven now.
-            let rederived = match crate::federation::admission::check_withdraws_admission(
-                directory, &g,
+            // v50.0.0 (CIRISPersist#928 review H2) — re-derived at the depth
+            // CEILING, not the new 5-hop default: every stored row was
+            // admitted under a walk of up to 16 hops, and re-walking it at 5
+            // would un-retire bytes a withdraws validly retired before v50.
+            // The WRITE gate takes the default; the read never shrinks it.
+            let rederived = match crate::federation::admission::check_withdraws_admission_at(
+                directory,
+                &g,
+                crate::federation::admission::MAX_WITHDRAWS_DELEGATION_DEPTH,
             )
             .await
             {

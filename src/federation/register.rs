@@ -591,6 +591,9 @@ pub(crate) async fn prepare_rebind<D: FederationDirectory + ?Sized>(
     let mut incoming = record.record;
     super::canonical_at_rest::canonicalize_in_place(&mut incoming.registration_envelope)?;
     validate_registration_pubkey(&incoming)?;
+    // v50.0.0 (CIRISPersist#925 review H3) — Clause A on the rebind door too:
+    // it stores a whole record, identity_type included.
+    check_node_identity_exclusive(&incoming)?;
     if incoming.scrub_key_id != incoming.key_id {
         return Err(Error::InvalidArgument(
             "store_rebound_key_record requires a self-signed record (scrub_key_id == key_id)"
@@ -875,13 +878,14 @@ pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
 /// agent"). Other co-locations on the substrate side (`canonical`, `steward`,
 /// `substrate_persist`, `witness`, …) stay conformant.
 ///
-/// The key-record door: every backend's `put_public_key` runs it right after
-/// [`validate_registration_pubkey`], so every mint (`register_federation_key`
-/// verifies, then stores through `put_public_key`) and every replicated
-/// `Insert` (which stores through `put_public_key`) runs it. It is NOT run by
-/// the replicated upgrade / rebind / supersede arms over an EXISTING row: those
-/// do not mint a key, and a pre-gate fused key is Clause B's to gate, not a
-/// row this door can un-store. Clause B ([`check_node_agency_admission`](super::admission::check_node_agency_admission))
+/// Every door that writes `identity_type` runs it right after
+/// [`validate_registration_pubkey`]: `put_public_key` (every mint and every
+/// replicated `Insert`), `adopt_scrub_upgrade` (the replicated `Upgrade` arm,
+/// which CAN change `identity_type`), `supersede_canonical_record` (the
+/// replicated `Supersede` arm), `adopt_genesis_reanchor`,
+/// `seed_genesis_accord_holders`, and the rebind door. A pre-gate fused key is
+/// therefore refused any rewrite of its record — it re-mints — while Clause B
+/// still gates it wherever it already sits. Clause B ([`check_node_agency_admission`](super::admission::check_node_agency_admission))
 /// is unchanged: it still gates fused keys that pre-date this door.
 pub fn check_node_identity_exclusive(record: &KeyRecord) -> Result<(), Error> {
     use crate::federation::types::identity_type as it;

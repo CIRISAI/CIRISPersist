@@ -1229,6 +1229,9 @@ impl MemoryBackend {
         for sr in records {
             let mut row = sr.record.clone();
             crate::federation::register::validate_registration_pubkey(&row)?;
+            // v50.0.0 (CIRISPersist#925 ask 5, review H3) — CC 3.4.7.3 Clause A on
+            // every door that writes `identity_type`, not only the insert.
+            crate::federation::register::check_node_identity_exclusive(&row)?;
             if row.algorithm != crate::federation::types::algorithm::HYBRID {
                 return Err(crate::federation::Error::InvalidArgument(format!(
                     "genesis seed algorithm must be 'hybrid' (got '{}')",
@@ -2966,6 +2969,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         crate::federation::admission::lift_envelope_attested_roles(&mut row);
         crate::federation::register::validate_registration_pubkey(&row)?;
+        // v50.0.0 (CIRISPersist#925 ask 5, review H3) — CC 3.4.7.3 Clause A on
+        // every door that writes `identity_type`, not only the insert.
+        crate::federation::register::check_node_identity_exclusive(&row)?;
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
         crate::federation::admission::check_co_steward_role_admission(self, &row).await?;

@@ -7706,6 +7706,27 @@ pub async fn resolve_withdraws_admission_rule(
     issuer: &str,
     target: &super::Attestation,
 ) -> Result<u8, Error> {
+    resolve_withdraws_admission_rule_at(
+        directory,
+        issuer,
+        target,
+        crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
+    )
+    .await
+}
+
+/// v50.0.0 (CIRISPersist#928 review H2) — [`resolve_withdraws_admission_rule`]
+/// with the proxy walks (rules 3/4) at an explicit `depth` (clamped at
+/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`]). The write gate runs at the CC 4.1.1
+/// default; the bytes-plane re-derivation of an ALREADY-ADMITTED row runs at
+/// the ceiling every stored row could have been admitted under (see
+/// [`check_withdraws_admission_at`]).
+pub async fn resolve_withdraws_admission_rule_at(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    target: &super::Attestation,
+    depth: usize,
+) -> Result<u8, Error> {
     // Rule 1 — producer self-revocation (no DB walk).
     if issuer == target.attesting_key_id {
         return Ok(1);
@@ -7785,12 +7806,11 @@ pub async fn resolve_withdraws_admission_rule(
     // `delegates_to` chain from `issuer` reaching ANY subject in
     // `T.subject_key_ids` (§8.1.11.2: any single subject is enough).
     //
-    // v50.0.0 (CIRISPersist#928, CC 4.1.1) — both proxy walks run at the CC
-    // default depth (5): this gate has no caller to opt into a deeper walk,
-    // and a chain past the cap is self_verify only. Such a refusal says so
+    // v50.0.0 (CIRISPersist#928, CC 4.1.1) — both proxy walks run at `depth`:
+    // the write gate passes the CC default (5) — it has no caller to opt into
+    // a deeper walk, and a chain past the cap is self_verify only. Such a refusal says so
     // (`beyond_delegation_depth_cap`), so "too deep" is not read as "no
     // authority exists".
-    let depth = crate::federation::topology::DEFAULT_DELEGATION_DEPTH;
     let mut beyond_cap = false;
     if !target.subject_key_ids.is_empty() {
         let subjects: std::collections::HashSet<String> =
@@ -7888,6 +7908,31 @@ pub async fn check_withdraws_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<Option<u8>, Error> {
+    check_withdraws_admission_at(
+        directory,
+        row,
+        crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
+    )
+    .await
+}
+
+/// v50.0.0 (CIRISPersist#928 review H2) — [`check_withdraws_admission`] with
+/// the rule-3/4 proxy walks at `depth`.
+///
+/// **Not retroactive.** The WRITE gate ([`check_withdraws_admission`]) takes
+/// the CC 4.1.1 default going forward. A read-time re-derivation of a row that
+/// is ALREADY stored (the bytes-plane fold,
+/// `blob_tombstone::retiring_composer`) passes
+/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`] — the depth every row admitted before
+/// v50 was admitted under — so a withdraws validly decided under the old rule
+/// keeps retiring its target (v49's "past actions validly decided stand").
+/// The re-derivation still re-walks the edges as they stand now, so an edge
+/// withdrawn since stops the retirement (#853); only the depth is held.
+pub async fn check_withdraws_admission_at(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    depth: usize,
+) -> Result<Option<u8>, Error> {
     if row.attestation_type != attestation_type::WITHDRAWS {
         return Ok(None);
     }
@@ -7968,7 +8013,9 @@ pub async fn check_withdraws_admission(
     // conformant binding MUST name K there — at which point rule 2 would hand
     // K's key the power to shed its owner unilaterally. Gating the admitting
     // branch closes that before the producer change lands, not after.
-    match resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await {
+    match resolve_withdraws_admission_rule_at(directory, &row.attesting_key_id, &target, depth)
+        .await
+    {
         Ok(rule) => {
             // Rule 1 is the producer's own retraction and is never a reclaim.
             // Rules 2/3/4 against a LIVE owner-binding are exactly what rc3
@@ -12061,7 +12108,9 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
         .strip_prefix(super::types::consensus_protocol::QUORUM_PREFIX)
         .and_then(|tail| tail.split_once('/'))
         .and_then(|(m, n)| Some((m.parse::<u32>().ok()?, n.parse::<u32>().ok()?)))
-        .is_some_and(|(m, n)| n > 0 && m <= n);
+        // v50.0.0 (review M1) — `1 ≤ M ≤ N`: `quorum:0/N` would let a change no
+        // founder signed be argued conformant.
+        .is_some_and(|(m, n)| m >= 1 && m <= n);
     if conformant {
         return Ok(());
     }

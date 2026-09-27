@@ -1551,6 +1551,71 @@ pub mod test_support {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#925 review H1) — a SIGNED content-only
+    /// occurrence row `{identity → occurrence}` whose signer is `signer`
+    /// (registered with [`hybrid_pubkeys`]`(signer)`), asserted at
+    /// `asserted_at` (truncated to the millisecond, as the gate requires). The
+    /// same envelope `key_grant::publish_signed_content_only_occurrence` builds.
+    pub async fn signed_content_only_occurrence(
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        let asserted_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(asserted_at.timestamp_millis())
+                .expect("ms instant");
+        let x_pub = ciris_crypto::x25519::public_from_secret(&seed_for(occurrence));
+        let (_sk, ml_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
+        let enc = crate::federation::EncryptionPubkeys {
+            x25519_base64: B64.encode(x_pub),
+            ml_kem_768_base64: B64.encode(&ml_pub),
+        };
+        let envelope = serde_json::json!({
+            "attesting_key_id": signer,
+            "identity_key_id": identity,
+            "occurrence_key_id": occurrence,
+            "device_class": crate::federation::types::device_class::SERVER,
+            "encryption_pubkeys": {
+                "x25519_base64": enc.x25519_base64,
+                "ml_kem_768_base64": enc.ml_kem_768_base64,
+            },
+            "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "valid_until": serde_json::Value::Null,
+            "hardware_attestation": serde_json::Value::Null,
+        });
+        let id = Box::new(
+            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
+                signer,
+                ed_signer(signer),
+                *mldsa_signer(signer),
+            ),
+        );
+        let (signed_envelope, signature) =
+            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+                id.as_ref(),
+                envelope,
+            )
+            .await
+            .expect("sign occurrence envelope");
+        crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: identity.to_owned(),
+                occurrence_key_id: occurrence.to_owned(),
+                device_class: crate::federation::types::device_class::SERVER.to_owned(),
+                hardware_attestation: None,
+                asserted_at,
+                valid_until: None,
+                encryption_pubkeys: Some(enc),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            },
+            attesting_key_id: signer.to_owned(),
+            signed_envelope,
+            signature,
+        }
+    }
+
     /// v50.0.0 (CIRISPersist#927, CC 3.2) — the `consensus_protocol` a
     /// community fixture declares: `otherwise`, unless `policy_blob` labels it
     /// `infrastructure`, which admits only a `quorum:M/N` form (a one-founder
