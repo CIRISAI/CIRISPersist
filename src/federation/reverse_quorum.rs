@@ -4007,6 +4007,186 @@ pub(crate) mod test_support {
         .expect("put_community");
     }
 
+    /// v50.0.0 (CIRISPersist#925 review M2/P3) — **a `node`-bearing founder
+    /// is no reverse-quorum duty-holder.** Two twin legacy infrastructure rooms
+    /// (replicated data — the caller's backend knows a key that signed
+    /// neither) under `reverse_quorum:1/7:60+escalate:0:3`, founders
+    /// `{human, second}`. In each, the human removes `x`; a member objects in
+    /// the window; the second founder UPHOLDS the objection in the steward
+    /// window; three members OVERRULE it.
+    ///
+    /// - Where the second founder is NOT `node`-bearing it is a seated
+    ///   duty-holder: its ruling upholds (a strict majority of one), escalation
+    ///   never opens, the objection counts, and the removal is REVERSED — `x`
+    ///   is back.
+    /// - Where it IS `node`-bearing (it agreed to be an occurrence of a `node`
+    ///   identity) it is no duty-holder: nobody is seated, the tier escalates
+    ///   on the passed deadline, the respondent pool dismisses the objection
+    ///   3-to-1, and the removal STANDS — its uphold counted only as one
+    ///   respondent ballot.
+    pub(crate) async fn exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support as ts;
+        let node_identity = format!("p3node-{suffix}");
+        ts::register_hybrid_key_as(
+            dir,
+            &node_identity,
+            &node_identity,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        for (leg, bound) in [("bound", true), ("free", false)] {
+            let name = |n: &str| format!("p3{n}-{leg}-{suffix}");
+            let (human, second, objector, x) =
+                (name("human"), name("second"), name("objector"), name("x"));
+            let overrulers = [name("m1"), name("m2"), name("m3")];
+            let room = name("room");
+            for k in [&human, &second, &objector, &x]
+                .into_iter()
+                .chain(overrulers.iter())
+            {
+                register_user_key(dir, k).await;
+            }
+            let t = Utc::now() - Duration::seconds(300);
+            if bound {
+                for (signer, at) in [
+                    (&node_identity, t - Duration::seconds(20)),
+                    (&second, t - Duration::seconds(10)),
+                ] {
+                    dir.put_identity_occurrence(
+                        ts::signed_content_only_occurrence(signer, &node_identity, &second, at)
+                            .await,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("({suffix}) P3: the binding: {e}"));
+                }
+            }
+            let founded = t - Duration::seconds(3600);
+            let member = |k: &String, role: &str| CommunityMember {
+                key_id: k.clone(),
+                joined_at: founded,
+                role: Some(role.to_owned()),
+            };
+            let mut members = vec![member(&human, "founder"), member(&second, "founder")];
+            for k in [&objector, &x].into_iter().chain(overrulers.iter()) {
+                members.push(member(k, "member"));
+            }
+            dir.put_community(ts::sign_community(
+                &human,
+                Community {
+                    community_key_id: room.clone(),
+                    community_name: "legacy infrastructure commons".into(),
+                    members,
+                    founded_at: founded,
+                    consensus_protocol: "reverse_quorum:1/7:60+escalate:0:3".into(),
+                    policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) P3: the legacy room is replicated data: {e}"));
+            dir.put_community_membership_revocation(ts::sign_community_membership_revocation(
+                &human,
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: room.clone(),
+                    removed_identity_key_id: x.clone(),
+                    removed_at: t,
+                    effective_at: t,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) P3 {leg}: the human's removal lands: {e}"));
+            let row_hash = dir
+                .list_community_membership_revocations_for(&room)
+                .await
+                .expect("revocations")
+                .into_iter()
+                .find(|r| r.removed_identity_key_id == x)
+                .expect("stored")
+                .persist_row_hash;
+            let action = ActionRef {
+                actor_key_id: &human,
+                action_id: &row_hash,
+                asserted_at: t,
+            };
+            let o = signed_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &objector,
+                &human,
+                objection_envelope(Cohort::Community, &room, &row_hash, "not so"),
+                t + Duration::seconds(10),
+                &[],
+            );
+            assert!(
+                matches!(
+                    record_objection_against(dir, &o, action)
+                        .await
+                        .expect("objection"),
+                    ObjectionOutcome::Admitted
+                ),
+                "({suffix}) P3 {leg}: the objection is recorded"
+            );
+            let ballot = |author: &String, upholds: bool, at: DateTime<Utc>| {
+                signed_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    author,
+                    &human,
+                    ballot_envelope(
+                        Cohort::Community,
+                        &room,
+                        &row_hash,
+                        &o.attestation_id,
+                        upholds,
+                        "ruling",
+                    ),
+                    at,
+                    &[],
+                )
+            };
+            let mut ballots = vec![ballot(&second, true, t + Duration::seconds(20))];
+            for m in &overrulers {
+                ballots.push(ballot(m, false, t + Duration::seconds(30)));
+            }
+            for b in &ballots {
+                assert!(
+                    matches!(
+                        record_objection_ballot_against(dir, b, action)
+                            .await
+                            .expect("ballot"),
+                        ObjectionOutcome::Admitted
+                    ),
+                    "({suffix}) P3 {leg}: ballot by {} recorded",
+                    b.attesting_key_id
+                );
+            }
+            let active: Vec<String> = dir
+                .active_community_members(&room)
+                .await
+                .expect("active")
+                .into_iter()
+                .map(|m| m.key_id)
+                .collect();
+            if bound {
+                assert!(
+                    !active.contains(&x),
+                    "({suffix}) P3: a node-bearing founder's uphold is no duty-holder ruling — \
+                     the respondents dismiss the objection and the removal stands"
+                );
+            } else {
+                assert!(
+                    active.contains(&x),
+                    "({suffix}) P3 control: a seated duty-holder's uphold keeps the objection — \
+                     the removal is reversed"
+                );
+            }
+        }
+    }
+
     /// v49.0.0 — **I181: a reverse-quorum roster removal is protective and
     /// undoable** (FSD §2 `reverse_quorum` row). One member's signature lands
     /// a removal; `m` distinct in-window objections against the revocation's

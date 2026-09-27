@@ -674,6 +674,20 @@ pub mod bodies {
         }
     }
 
+    /// **#925 review M2/P3** — `node_bearing_founder_is_no_reverse_quorum_duty_holder`:
+    /// the body lives beside the reverse-quorum fold's own witnesses (it needs
+    /// their signed-row and objection helpers).
+    pub async fn node_bearing_founder_is_no_reverse_quorum_duty_holder(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        _host: &str,
+    ) {
+        crate::federation::reverse_quorum::test_support::exercise_node_bearing_founder_is_no_reverse_quorum_duty_holder(
+            d, tag,
+        )
+        .await;
+    }
+
     /// **#927 — an `infrastructure` community declares `quorum:M/N`.** Every
     /// other canonical form is refused at the record door (and at the
     /// supersede door), not floored; the same forms stay admissible for a
@@ -1416,6 +1430,7 @@ mod runners {
                 keyed!(node_bearing_is_judged_at_the_change_instant);
                 keyed!(node_bearing_founder_holds_no_last_founder_power);
                 keyed!(node_bearing_founder_roots_no_moderation);
+                keyed!(node_bearing_founder_is_no_reverse_quorum_duty_holder);
                 #[tokio::test]
                 async fn infrastructure_record_authored_elsewhere_is_data() {
                     let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
