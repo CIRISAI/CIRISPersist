@@ -209,6 +209,21 @@ where
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
         return Ok(OccupiedRoute::Insert);
     };
+    // v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — a trust-root row is
+    // applied by its CHAIN, not by the one-hop proof below: version by version
+    // from the one this node holds (or, over a squat that never passed the
+    // door, from the accord birth). The door already judged the whole chain.
+    if super::canonical_community::is_trust_root_grade(c)
+        || super::canonical_community::is_trust_root_grade(&stored)
+    {
+        return Ok(
+            if super::canonical_community::apply_trust_root_chain(dir, community).await? {
+                OccupiedRoute::Settled
+            } else {
+                OccupiedRoute::Insert
+            },
+        );
+    }
     let offer = Offer {
         cohort: Cohort::Community,
         kind: "community",
@@ -411,6 +426,9 @@ where
         &new.community,
     )
     .await?;
+    // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified
+    // founders' link of the held version, and is stored carrying its chain.
+    let new = super::canonical_community::prepare_trust_root_supersede(dir, new).await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",

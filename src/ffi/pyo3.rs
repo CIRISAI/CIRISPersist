@@ -11535,6 +11535,24 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
             let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
                 extract_authority_fields(&value);
+            // v50.0.0 (CIRISPersist#926) — the co-signatures a trust-root row
+            // carries (a JSON list of `{authority_key_id,
+            // scrub_signature_classical, scrub_signature_pqc}` over the same
+            // signing envelope). Absent = none; malformed is refused, never
+            // read as none.
+            let cosignatures: Vec<crate::federation::RosterCosignature> =
+                match value.get("cosignatures") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                        PyValueError::new_err(format!("community cosignatures decode: {e}"))
+                    })?,
+                };
+            if authority_key_id.is_empty() && !cosignatures.is_empty() {
+                return Err(PyValueError::new_err(
+                    "community cosignatures need the authority signature they sit beside \
+                     (authority_key_id is empty)",
+                ));
+            }
             // v21.0.0 (#502 E4 followup) — self-sign when the caller supplies
             // no authority signature: this is the NODE creating a community it
             // is the authority for (a local wheel API, not a wire path), so the
@@ -11570,6 +11588,8 @@ impl PyEngine {
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
                                 supersede_proof: None,
+                                cosignatures,
+                                lineage: Vec::new(),
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -12086,6 +12106,150 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("community serialize: {e}")))
                 })
                 .transpose()
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — CC 4.4.3.2.4 `resolve_community`: the
+    /// folded founders (eligible only) and members of `community_key_id`, its
+    /// subkind, protocol and entrenchment, as JSON `ResolvedCommunity`; `None`
+    /// when no row is stored or a trust-root id holds a row that is not rooted.
+    /// Wraps [`crate::federation::canonical_community::resolve_community`].
+    fn resolve_community_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            py.detach(move || {
+                let out = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::resolve_community(
+                                &*backend,
+                                &community_key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::resolve_community(
+                                &*backend,
+                                &community_key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                out.map(|r| {
+                    serde_json::to_string(&r).map_err(|e| {
+                        PyValueError::new_err(format!("resolved community serialize: {e}"))
+                    })
+                })
+                .transpose()
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (`GET
+    /// /v1/trust-root/bundle`): the compiled-in GenesisBundle with this node's
+    /// rooted `ciris-canonical` row beside it, as JSON
+    /// `TrustRootBundleResponse`. Wraps
+    /// [`crate::federation::canonical_community::trust_root_bundle_response`].
+    fn trust_root_bundle_response_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+
+            py.detach(move || {
+                let out = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::trust_root_bundle_response(
+                                &*backend,
+                                crate::federation::genesis::canonical_genesis_bundle(),
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::trust_root_bundle_response(
+                                &*backend,
+                                crate::federation::genesis::canonical_genesis_bundle(),
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&out).map_err(|e| {
+                    PyValueError::new_err(format!("trust-root response serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin
+    /// `ciris-canonical` from ONE `TrustRootBundleResponse` JSON (the bundle's
+    /// quorum verified against this node's own roster, the key records and the
+    /// community admitted through the ordinary doors). Returns JSON
+    /// `PinnedTrust`. Wraps
+    /// [`crate::federation::canonical_community::pin_trust_from_bundle_response`].
+    fn pin_trust_from_bundle_response_json(
+        &self,
+        py: Python<'_>,
+        response_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let response: crate::federation::canonical_community::TrustRootBundleResponse =
+                serde_json::from_str(response_json).map_err(|e| {
+                    PyValueError::new_err(format!("trust-root response decode: {e}"))
+                })?;
+            py.detach(move || {
+                let out = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::pin_trust_from_bundle_response(
+                                &*backend, &response,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::pin_trust_from_bundle_response(
+                                &*backend, &response,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&out)
+                    .map_err(|e| PyValueError::new_err(format!("pinned trust serialize: {e}")))
             })
         })
     }
@@ -23860,6 +24024,8 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
+                lineage: Vec::new(),
             }),
             _ => None,
         };
@@ -24155,6 +24321,8 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
+                lineage: Vec::new(),
             }),
             _ => None,
         };

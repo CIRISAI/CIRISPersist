@@ -481,15 +481,26 @@ pub async fn verify_community_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let envelope = signed.community.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.community.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v50.0.0 (CIRISPersist#926) — the co-signatures a trust-root row carries
+    // are verified at the door exactly as a roster row's are: one that does
+    // not verify is refused, never stored as decoration.
+    verify_roster_cosignatures(
+        directory,
+        "community",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — verify a
@@ -1724,6 +1735,8 @@ pub mod test_support {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         }
     }
 

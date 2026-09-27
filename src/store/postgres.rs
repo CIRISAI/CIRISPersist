@@ -287,6 +287,18 @@ impl PostgresBackend {
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family).
         crate::federation::verify_community_admission(self, &community).await?;
+        // v50.0.0 (CIRISPersist#926) — the trust-root door, ONE predicate on
+        // both doors: the reserved `ciris-canonical` id and any
+        // `infrastructure_constraint` row are admitted only as a chain from an
+        // accord birth (caps, shape, founders, links). The replicated door may
+        // keep another id's non-conformant record as data (it reads NotRooted);
+        // the reserved id never. `true` = an authorized infrastructure room.
+        let trust_root = crate::federation::canonical_community::check_trust_root_at_door(
+            self,
+            &community,
+            door == crate::federation::CommunityDoor::ReplicatedApply,
+        )
+        .await?;
         let row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission.
@@ -311,8 +323,10 @@ impl PostgresBackend {
             crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
                 .await?;
         }
-        crate::federation::admission::check_community_membership_steward_binding(self, &row)
-            .await?;
+        if !trust_root {
+            crate::federation::admission::check_community_membership_steward_binding(self, &row)
+                .await?;
+        }
         // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
         // is a no-op, a proof-carrying amendment this node's own state
         // authorizes is applied as a supersede, anything else is refused (the
@@ -323,6 +337,8 @@ impl PostgresBackend {
             scrub_signature_classical: community.scrub_signature_classical,
             scrub_signature_pqc: community.scrub_signature_pqc,
             supersede_proof: community.supersede_proof,
+            cosignatures: community.cosignatures,
+            lineage: community.lineage,
         };
         if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
             == crate::federation::group_amendment::OccupiedRoute::Settled
@@ -332,6 +348,12 @@ impl PostgresBackend {
         let community = offered;
         let mut row = community.community;
         let supersede_proof_value = pg_supersede_proof_value(community.supersede_proof.as_ref())?;
+        // v50.0.0 (CIRISPersist#926, V158) — persisted beside the authority
+        // signature, so the served row re-derives its quorum and its chain.
+        let cosignatures_value = serde_json::to_value(&community.cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
+        let lineage_value = serde_json::to_value(&community.lineage)
+            .map_err(|e| crate::federation::Error::Backend(format!("lineage encode: {e}")))?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_value = serde_json::to_value(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -363,8 +385,8 @@ impl PostgresBackend {
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, supersede_proof\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                    admitted_at, supersede_proof, cosignatures, lineage\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
                  ON CONFLICT DO NOTHING",
                 &[
                     &row.community_key_id,
@@ -381,6 +403,8 @@ impl PostgresBackend {
                     // v49.0.0 (#910.5) — a first copy of an amended version
                     // keeps its proof, so the next peer can apply it.
                     &supersede_proof_value,
+                    &cosignatures_value,
+                    &lineage_value,
                 ],
             )
             .await
@@ -810,6 +834,8 @@ pub struct PostgresBackend {
     /// *this* backend so a Postgres engine never serves an entry a prior
     /// SQLite engine wrote and `reset_engine` drops it with the backend.
     scoring_factors_cache: std::sync::Arc<crate::ceg::aggregates::scoring::ScoringFactorsCache>,
+    /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
+    trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
 }
 
 /// v43.0.0 (§11.4, I27) — **the community's serialization boundary.** Every
@@ -1136,6 +1162,7 @@ impl PostgresBackend {
             perceptual_hash_matcher: std::sync::RwLock::new(None),
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+            trust_root_standing_cache: Default::default(),
         })
     }
 
@@ -1183,6 +1210,7 @@ impl PostgresBackend {
             perceptual_hash_matcher: std::sync::RwLock::new(None),
             repo_stats_cache: std::sync::Arc::new(crate::cache::Cache::new()),
             scoring_factors_cache: std::sync::Arc::new(crate::cache::Cache::new()),
+            trust_root_standing_cache: Default::default(),
         }
     }
 
@@ -8068,10 +8096,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_signature_classical,
                     scrub_signature_pqc,
                     supersede_proof,
+                    cosignatures,
+                    lineage,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
                 })?;
                 let proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
+                // v50.0.0 (#926, V158) — the co-signatures travel with the
+                // authority signature they sit beside.
+                let cosignatures_value = serde_json::to_value(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
+                let lineage_value = serde_json::to_value(&lineage)
+                    .map_err(|e| Error::Backend(format!("lineage encode: {e}")))?;
                 new_comm.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_comm)?;
                 let members_value = serde_json::to_value(&new_comm.members)
@@ -8138,7 +8174,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
                         scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13 \
+                        supersede_proof = $13, cosignatures = $14, lineage = $15 \
                      WHERE community_key_id = $1",
                     &[
                         &new_comm.community_key_id,
@@ -8155,6 +8191,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &scrub_signature_pqc,
                         &admitted_at,
                         &proof_value,
+                        &cosignatures_value,
+                        &lineage_value,
                     ],
                 )
                 .await
@@ -8357,6 +8395,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .put_community_at_door(community, crate::federation::CommunityDoor::ReplicatedApply)
             .await;
         crate::federation::group_amendment::replicated_community_outcome(prior, stored)
+    }
+
+    fn trust_root_standing_cache(
+        &self,
+    ) -> Option<&crate::federation::canonical_community::StandingCache> {
+        Some(&self.trust_root_standing_cache)
+    }
+
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::SignedCommunity>, crate::federation::Error> {
+        // v50.0.0 (CIRISPersist#926) — the point twin of the signed since-read.
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT * FROM cirislens.federation_communities WHERE community_key_id = $1 \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> ''",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup signed community: {e}"))
+            })?;
+        row.map(pg_row_to_signed_community).transpose()
     }
 
     async fn lookup_community(
@@ -21566,6 +21632,13 @@ fn pg_row_to_signed_community(
         row.safe_get_with("scrub_signature_classical", mk_err)?;
     let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
     let supersede_proof = pg_supersede_proof(&row)?;
+    // v50.0.0 (CIRISPersist#926, V158) — same codec as the roster rows' V153.
+    let cosignatures = pg_roster_cosignatures(&row)?;
+    // v50.0.0 (CIRISPersist#926, V158) — the row's chain.
+    let lineage_v: serde_json::Value =
+        row.safe_get_with("lineage", crate::federation::Error::Backend)?;
+    let lineage = serde_json::from_value(lineage_v)
+        .map_err(|e| crate::federation::Error::Backend(format!("lineage deserialize: {e}")))?;
     let community = pg_row_to_community(row)?;
     Ok(crate::federation::SignedCommunity {
         community,
@@ -21573,6 +21646,8 @@ fn pg_row_to_signed_community(
         scrub_signature_classical,
         scrub_signature_pqc,
         supersede_proof,
+        cosignatures,
+        lineage,
     })
 }
 

@@ -3430,6 +3430,8 @@ impl Engine {
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         };
         match &self.backend {
             #[cfg(feature = "postgres")]

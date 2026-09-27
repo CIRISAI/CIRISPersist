@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 104 delegations, generated. Every one: fault first, then delegate.
+// 105 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -911,6 +911,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.lookup_public_key(key_id).await
+    }
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<SignedCommunity>, Error> {
+        if let Some(e) = self.faulted("lookup_signed_community") {
+            return Err(e);
+        }
+        self.inner.lookup_signed_community(community_key_id).await
     }
     async fn lookup_signed_record_by_content_hash(
         &self,

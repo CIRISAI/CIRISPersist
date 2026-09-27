@@ -693,3 +693,390 @@ Lane: round 4's, plus `test(withdraws_depth) | test(withdraws_admission_depth_op
 | N7 | roster founder-count guard dropped (re-run) | 3 | founder-count witness ×3 |
 
 The id-collision repair path for a `withdraws` is reachable only when the structural-composer dedup does not match first. For an identical re-put, the dedup always matches first, so a mutant of that second repair would be equivalent. It is kept as a belt, and not claimed as witnessed.
+
+## 9. #926 — the ciris-canonical community row (ruling b)
+
+**The ruling (operator, 2026-09-27): (b).** The `ciris-canonical` community row is a post-genesis `community` Contribution. It is signed 2-of-3 by the accord holders, admitted under the accord's quorum, and served beside the bundle on the CC 5.3.4 route. The pinned GenesisBundle is untouched: its bytes, `authorization_digest` and `verify_bundle_quorum` do not change, and `verify_bundle_quorum` stays the only root authority. The community row adds a roster, not a second root.
+
+**Review ruling (2026-09-27, from CC 3.2; flagged to the operator): birth by the accord, amendment by the founders.** The accord holders' 2-of-3 is the row's BIRTH. On the ceremony plane it is also the conferral of each founder. After birth the row changes only by its FOUNDERS' quorum: its own entrenched `quorum:2/3` over the `founder` seats. This holds on every door:
+- the local `supersede_community_with_quorum`;
+- the replicated `put_community` of an amended version, which the receiver verifies as a chain link from the version it holds (or from the birth).
+
+No door re-demands the accord count for an amendment. No door lets an amendment change the grade, `admission_quorum_basis`, `cohort_subkind` or the entrenched protocol. Every founder on every version is still accord-conferred, human and not node-bearing. A founder added by amendment needs its accord conferral to exist already.
+
+**Second ruling (2026-09-27, re-check HIGH-3): founder seats move ONLY through the record.** The roster planes refuse every founder-seat change of a trust-root community, whoever signs it, the full founders' quorum included: seating a founder, re-roling one, revoking one. A founder enters by a founders' amendment. A founder exits by a founders' amendment, or by the accord withdrawing the conferral, which already stops the key counting. The planes admit and remove MEMBERS only. The reason: a fresh node verifies from the lineage alone, so the record must be the one source of who counts. Before this ruling the planes moved FOLDED seats that the record could never follow, so a founder revoked on the plane kept signing counted amendments and a plane-seated founder never could.
+
+**Shape (CC 3.2).** The `Community` record has no `cohort_subkind` or entrenchment columns. `cohort_subkind` already lived in `policy_blob`, so the rest of the CC 3.2 fields sit beside it:
+
+```
+policy_blob: {
+  cohort_subkind: "infrastructure",
+  cohort_subkind_payload: { infrastructure_constraint: { service_class: "canonical", admission_quorum_basis: "founders" } },
+  consensus_protocol_entrenched: true
+}
+consensus_protocol: "quorum:2/3"
+members: founders (role: founder) = accord-conferred human steward keys; serve nodes (role: member)
+```
+
+**Grade and reservation.** A row is held to the trust-root grade if its id is exactly the bytes `ciris-canonical` or if it declares `infrastructure_constraint`. The reservation is an exact byte match: `CIRIS-Canonical`, `ciris-canonical ` and other spellings are ordinary ids, not the reserved one.
+
+**The door** (`canonical_community::check_trust_root_community_admission`). Every backend's `put_community` runs it after the authority scrub and every co-signature verify, and before any write.
+1. **Shape.** `cohort_subkind` is `infrastructure`, `admission_quorum_basis` is `founders`, the protocol is `quorum:M/N` with 1 ≤ M ≤ N, `consensus_protocol_entrenched` is true, and the row names at least one founder. A failure is `InvalidArgument` carrying `hard_case:community_consensus_protocol_violation:{id}` (CC 3.4.2).
+2. **Founders.** Every founder is a human key: `user` is in its `identity_type` and `node` is not (#925). Every founder is also an accord-conferred `steward` whose role has not been withdrawn (`has_accord_conferred_role_over_roster`).
+3. **The chain (re-check HIGH-A).** The offered row travels with its `lineage`: the accord-born version, then every founders' amendment, in order. The door first re-judges what is already stored at the id (`stored_standing`, below).
+   - **Nothing rooted there** (absent, or a row that never passed this door): the WHOLE chain must verify (`verify_chain`). Its first version is a BIRTH: it carries no proof, is conformant, and its scrub set (authority plus `SignedCommunity::cosignatures`, all over `Community::signing_envelope`) reaches the HUMANITY_ACCORD family's threshold, counted by the charter plane's own body (`family_quorum_holders_over_envelope`). Every later version is a verified founders' link, and every version's founders are eligible now. So a fresh node admits an amended row, and it never admits the latest version on its own proof.
+   - **A rooted row, identical content:** the #758 no-op.
+   - **A rooted row, different content:** the offered chain must EXTEND the held version (it appears in the chain), and every link after it must verify. A node that missed an intermediate version walks from what it holds. A chain that does not contain the held version (a re-birth, a fork) is refused. The accord count is not re-demanded.
+   - A short birth gets `RosterAuthorityUnauthorized { rule: roster_consensus_insufficient }`, and so does a link short of the founders'.
+   - `true` means an authorized infrastructure community, so the non-infrastructure steward-binding precondition is skipped (a serve node is a member without a steward, CC 3.2).
+
+**A founders' link** (`verify_founders_link`) is verified from the PRIOR version alone, never from what the node happens to store:
+- the proof names the prior version's content hash;
+- the immutables hold: grade, basis, subkind and the entrenched protocol. The founder set MAY change: that is where founder seats move;
+- the change envelope, bound by `canonical_community::bind_next_version` before the founders sign, carries three things:
+  - every role the version records, so the founders the envelope names are exactly the version's, even when the founder set moves;
+  - `next_persist_row_hash`, the version's content hash, so one proof admits exactly ONE body (re-check MEDIUM-B). Name, instants, non-founder roles and every `policy_blob` field are all bound;
+  - `amended_at`, the link's signed instant. It is not before the previous link's instant or the prior version's `founded_at`, and not more than 60 s in the future (`COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS`, the substrate's one future-skew bound);
+- the verified signers meet the prior version's protocol over its founder seats. A signer counts only if it is one of the prior version's RECORDED founders and counts at `amended_at`: human, accord-conferred, and not withdrawn before that instant. Each is hybrid-verified against this node's pinned pubkeys;
+- the version's authority is one of those counted founders, and its signature over the version verifies. Every lineage entry is judged this way.
+
+The node-bearing half of "human" is the private `founder_key_is_human` until the #925 fold; the site is marked `FOLD(#925)`.
+
+**Applying a chain.** The occupied-id route (`apply_trust_root_chain`) applies the offered chain VERSION BY VERSION through `supersede_group_row`, so every stored version is one a proof names exactly and the version history stays whole:
+- from a rooted held version: the later links;
+- over a squat: from the birth, recorded as `accord_birth_replaces_unrooted`;
+- over nothing: the caller inserts the offered row with its `lineage`.
+
+The local door (`prepare_trust_root_supersede`, in `supersede_community_signed`) requires the new version to be a verified founders' link of the held one, and stores it carrying the held version's chain. The `lineage` is persisted in V157 (`federation_communities.lineage`), served by the point read and the signed since-read, and never part of `signing_envelope()`.
+
+**Chain caps.** At the door, before any signature is checked, a chain is refused if it has more than `MAX_LINEAGE_LEN` = 1024 versions (the violation token) or a `lineage` over `MAX_LINEAGE_BYTES` = 32 MiB (`Error::EnvelopeTooLarge`). The byte cap is sized so the LENGTH cap binds first, at about 15–20 KB per version. Past 1024 versions the chain restarts by compaction: the founders resign or the accord withdraws their conferrals, the row stalls, and an accord re-birth begins a new chain.
+
+**Key rotation.** In persist a rotation is a NEW `key_id`: the old founder's steward conferral is withdrawn with `superseded_by` naming the successor. The old key record is kept, since founder key records are never deleted. A withdrawal un-counts a founder only for links whose `amended_at` is AFTER it, so the historical links that key signed keep verifying against its record. The bundle response serves the key record of every key the CHAIN names — every version's members, its authority and its proof signers — so a fresh node verifies historical links whose signers have since left.
+
+**The withdrawal instant is node-independent (re-check MEDIUM-W).** A withdrawal un-counts a founder from the SIGNED `window_until` of the accord proposal it re-tallied. That instant is the same on every node; it is not `withdrawn_at`, the local clock at which each node recorded the row.
+- A withdrawal whose proposal this node does not hold un-counts the key at every instant. That is fail-secure: a bare trusted-local write roots nothing it cannot prove.
+- The bundle response carries the accord evidence (proposal plus participations) of every steward withdrawal of a chain-named key, together with the co-signer key records. `pin_trust_from_bundle_response` admits that evidence through the ORDINARY evidence door (`apply_replicated_accord_evidence`, re-tallied against the consumer's own roster) and re-derives the withdrawals (`project_role_withdrawal_for_key`) before it admits the row.
+- So a fresh consumer judges a retired-key fork exactly as the mesh does. A link signed after the window by a quorum that needs the retired key falls short, whenever the consumer happened to learn of the withdrawal.
+
+Residuals, stated:
+- `amended_at` is signer-chosen. A quorum of RETIRED founder keys could backdate a link to before the window. The link must still extend a version the node holds, or walk from the birth, with non-decreasing instants and prior's quorum. A node already holding the head refuses any fork that does not extend it; only a node that sees the backdated fork FIRST can be split.
+- `window_until` is server-issued. A proposal with a long window keeps the retired key counting for links dated within it.
+- An unsigned-freshness ROLLBACK is CC's freshness rule to write; #926 parked it. That is a server serving an older but valid prefix of the chain to a fresh consumer.
+
+**Two rosters, on purpose.** A founder's conferral is judged against the COMPILED accord holder roster (`accord_holder_roster_key_ids`), the ceremony plane every key-plane conferral uses. The row's birth quorum is judged against the stored accord family's revocation-folded roster, the same roster the charter plane counts. These agree while no holder is removed from the family. A removed holder stops counting for a birth at once. It also stops counting for a conferral, but only once the compiled roster changes.
+
+**Co-signatures.** Co-signatures on any community row are verified at the door, as a roster row's are (`verify_roster_cosignatures`: one that does not verify, or a doubled co-signer, is refused). They are persisted in V157 (`federation_communities.cosignatures`: pg JSONB, sqlite TEXT, default `'[]'`). Backends read them with the new point read `lookup_signed_community` and serve them on the signed since-read.
+
+**A stored row is re-judged on every read (review MEDIUM-4, re-checks).** `stored_standing` answers `Rooted` only when:
+- the signed row conforms in shape;
+- its CHAIN (stored `lineage` plus the row) verifies from an accord birth, every link re-verified. There is no proof-only arm;
+- EVERY RECORDED founder counts now.
+
+If the chain verifies but a recorded founder no longer counts (a withdrawn or rotated conferral, or a resignation), the answer is `Stalled`. A stalled row is not resolved, served or trusted, but it is still the version the founders amend from: a founders' amendment retiring that seat roots it again.
+
+**Recovery (re-check ruling).** An accord RE-BIRTH replaces a STALLED row: a chain whose first version is a birth reaching the accord quorum, founded LATER than the held chain's birth. The route records it as `accord_rebirth_replaces_stalled`. This is how a trust root whose founders can no longer reach their quorum comes back (two compromised or rotated founders, resignations). A re-birth NEVER replaces a ROOTED row. The accord's lever over live founders is withdrawing their conferrals, which stalls the row first; it has no override of a live record.
+
+**The consent floor: a founder resigns.** A founder's OWN plane revocation, signed by that founder alone, is admitted as a RESIGNATION. It does not move the record. From its `effective_at` the founder no longer counts and is no longer a seat in any link or in the row's standing. The row stalls, the remaining founders amend the seat out, and if resignations make the quorum unreachable, the accord re-birth is the way out.
+
+The trade, stated: ONE founder can stall the default trust root. That is consent over availability, v49's floor. Dropping the seat does not change a `quorum:M/N` threshold, because M is absolute. It keeps the seat set honest for any count-relative protocol.
+
+**Stated plainly: a single holder revocation un-roots the mesh's default trust root on every node until the accord re-signs.** The birth's accord quorum is re-derived now, so a revocation that drops the family's count below quorum un-roots every accord-born row on every node. This is CC T4 behaviour and loud by design.
+
+**Cost (re-check MEDIUM-C).** Standing is cached per directory. Each real backend holds a `StandingCache`, reached by `FederationDirectory::trust_root_standing_cache`, and it is never shared across directories. The key is a digest of every input the verdict reads:
+- the stored signed row with its lineage;
+- the accord family record and its active roster;
+- the key record and steward withdrawal of every holder and of every key the chain names;
+- the community's folded roster.
+
+Any change to those inputs is a new key; a holder revocation, a founder withdrawal or rotation, a plane change and an amendment all are. A read with unchanged inputs verifies no signature: the cache key costs only directory reads. Within one computation, each founder's conferral co-scrub is verified once (`Memo`). The cache drops everything past 256 entries.
+
+Otherwise it answers `NotRooted { reason }`, for a pre-v50 squat, an unsigned row or a non-conformant row. A `NotRooted` row resolves to nothing. The route serves it as `community: null` with `community_withheld: <reason>`. It is not a `trust:accepts` subject and it is not a community root. An accord BIRTH replaces it: the occupied-id route applies the birth as a new version and records `accord_birth_replaces_unrooted: <prior hash>`. That row was never admissible, so it has no version to amend.
+
+Correction to round 2: round 2's `stored_standing` accepted ONE eligible founder plus ANY unverified stored proof, and its residual note wrongly said "all founders". A v49 squat naming one real steward and two squatter founders with a squatter-signed proof would have read as rooted, and the birth could never have replaced it. The chain rule closes that: such a row's chain does not start at an accord birth. I190 (j) plants exactly that row.
+
+**Supersede (CC 3.2).** `prepare_trust_root_supersede` runs in `supersede_community_signed` (every local supersede door). For a rooted or stalled row it requires a verified founders' link and founders who all count now. For anything else it refuses promotion into the grade: only a birth chain through `put_community` founds a trust root.
+
+**Roster planes (HIGH-2, then the HIGH-3 ruling).** Both room roster doors, on every backend, run `check_community_roster_authority`, which calls `check_trust_root_roster_change` for a trust-root community. Any row that seats, re-roles or revokes a recorded or folded founder is refused, whoever signs. Rows about non-founder members follow the ordinary rule. The widening door's steward-binding probe honours a ROOTED trust root, so a serve node joins through the plane with no steward. The check is judged from the stored row, never the probe's label.
+
+**Forks, stated plainly.** Where two versions extend the same held version, a node keeps the first it admits: a chain that does not contain the held version is refused, and a re-birth over a ROOTED row is refused. Re-birth over a STALLED row is the recovery: the losing side of a fork, and any root whose founders cannot reach their quorum, stall first. Since the content hash is bound (MEDIUM-B), only founder EQUIVOCATION can fork: the founders signing two different next versions.
+
+**Trust (CC 3.2 T3, review MEDIUM-3).** `check_attested_subject_admission` now also knows a stored, ROOTED trust-root community. Before this cut the consumer's pin edge `delegates_to(consumer → ciris-canonical, trust:accepts:v1)` was unstorable. The widening applies to EVERY attestation type whose `attested_key_id` names such a community (a charter, a score, a delegation), not only `trust:accepts`. What a row may SAY about the community is still each type's own door's business. Any other community is still not a subject.
+
+`trust_root_valid` gains `RootKind::Community` (a wire-visible enum variant, part of the v50.0.0 MAJOR):
+- the user's edge names the community;
+- the charter quorum, recovery, drill, halt and holder-hardware legs are the accord FAMILY's;
+- the arm applies only while the community row is rooted.
+
+So the community root is valid iff the family root is valid AND the row is rooted and conformant. With the family unchartered it is not valid. Withdrawing the one `trust:accepts:v1` row makes it not accepted, and the community row is untouched (trust ≠ membership).
+
+**Resolve (CC 4.4.3.2.4).** `canonical_community::resolve_community` returns the folded roster, and for a trust-root id its founders are the RECORD's. For a trust-root id it applies only while the row is rooted. The founders it lists are the ELIGIBLE ones: a founder whose steward conferral was withdrawn, or who is not human, is not listed.
+
+**Serve route (CC 5.3.4).** `GET /v1/trust-root/bundle` and `GET /v1/steward-key` are one handler on persist's axum router (`server` feature). The body is `TrustRootBundleResponse { bundle, authorization_digest, charter_root_key_id, community, community_withheld?, community_member_records }`:
+- the bundle is the compiled-in artifact as carried;
+- the rooted signed row sits beside it, never inside;
+- the member key records travel with it.
+
+The read is a point lookup. A failure returns a generic 500 body (`{"detail":"trust-root bundle unavailable"}`), and the detail is logged, not served. Persist did not serve these paths before this cut.
+
+**The alias body differs from the registry's.** CIRISRegistry's v3 `/v1/steward-key` body is `{bundle, bundle_fingerprint, charter_root_key_id, served_by{node_key_id, accepts_this_root}}`. Persist's is the body above. It has no `served_by` or `bundle_fingerprint`, and it carries `authorization_digest`, `community`, `community_withheld` and `community_member_records`. The registry adopting persist's body, or not, is outside persist. The CI pre-flight reads the `bundle` key both bodies share.
+
+**Consumer pin.** `pin_trust_from_bundle_response` works from one response:
+1. `verify_bundle_quorum` against the consumer's OWN roster;
+2. the member key records through the key door;
+3. the row through the community door, which re-derives the accord quorum against the consumer's own pins;
+4. resolve.
+
+The records go in BEFORE the community because the door judges founders from this node's records. Each record passes the key door on its own terms (a founder's co-scrub is re-verified here; a serve node's record is a self-registration anyone may submit). A refused community therefore leaves behind only records this node would admit from anyone: never a community, never a conferral the accord did not sign.
+
+**Host reach (review MEDIUM-5).** `put_community_json` takes a `cosignatures` list. A malformed list is refused with `ValueError`, and co-signatures without an authority signature are refused. There are three new bindings, classified in `scripts/ffi_taxonomy.tsv`, with `.pyi` stubs and `evidence/ffi_classification.tsv` regenerated:
+- `resolve_community_json`: deontic;
+- `trust_root_bundle_response_json`: empirical;
+- `pin_trust_from_bundle_response_json`: deontic.
+
+`put_community_json` hard-codes `supersede_proof: None` and an empty `lineage`. A Python host therefore relays a founders' amendment through `supersede_community_with_quorum`, and a chain through `pin_trust_from_bundle_response_json`, not through the plain put.
+
+Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_surface_926`, run against a `maturin develop --features pyo3,sqlite` wheel: 45 passed, 10 skipped for the whole `tests/python` suite. On a genesis-seeded fresh engine the pin passes the REAL bundle's 2-of-3 and is then refused because nothing sits beside it. NOT proven through the wheel: the POSITIVE co-signature path (a quorate row put over Python). The witness shows only that a malformed list is refused and that a well-formed list reaches the door, because the genesis-seeded engine holds the real holder pubkeys and a test cannot sign as them.
+
+**Fixture vs real row, stated plainly.** No real `ciris-canonical` row exists. `canonical_seed.json` still carries zero community rows, and a production node resolves `ciris-canonical` to nothing until the real row is admitted. The real row, and the `registry-steward-*` key records its founders need (accord-conferred `user,steward`), require one holder signing session. That session is outside persist. I190's fixture stands the trust root up on a bare directory with test-held keys under the genesis holder ids (`register_genesis_accord_roster`). It is the path a fresh install takes once the real row is signed. It is not that row.
+
+**#809.** The Rust-side consumer gate was already a gate (`verify_bundle_quorum`), and I190 (f) witnesses it through the pin. The REPORTED-not-gated assertion #809 tracked was the release pre-flight in `.github/workflows/ci.yml`. It is now `scripts/preflight_trust_root.py` and GATED: an unparseable `consensus_protocol` is refused, and so are distinct seated authorizations short of M. The step runs a 12-fixture self-test first, including #809's `authorizations: []` row, which now exits 1. The live registry passed it on 2026-09-26 (2 ≥ 2; `accepts_this_root=false` warned). It counts authorizations and does not verify their signatures.
+
+**Invariant I190** (memory, sqlite, postgres, 55 tests):
+- (a) the fixture row admits under a 2-of-3 accord co-scrub, resolves, and its co-signature is served byte-exact;
+- (b) 1-of-3, a founder co-signature and founders alone are refused; a forged co-scrub is refused even beside a quorum, and so is a doubled co-signer;
+- (c) a node-bearing founder (#925), a self-declared steward, each shape clause, and a squatted reserved id are refused;
+- (d) the community root is invalid while the family is unchartered, VALID (`RootKind::Community`, charter quorum met) once it is, and not accepted after the one-row un-trust; the row is untouched;
+- (e) the response carries the row beside the bundle, a fresh consumer pins from that one response, and a genuinely fresh consumer given a row stripped of its co-signature gets the typed `RosterAuthorityUnauthorized` and pins nothing;
+- (f) a bundle with 1 or 0 authorizations is refused, and the CI pre-flight gates it (from disk, script executed);
+- (g) a supersede cannot rename without the founders' quorum; lifting entrenchment and moving the protocol are refused even under the founders' quorum; a room cannot be promoted into the grade;
+- (h) node `a` amends twice by the founders' quorum: v2 adds a serve node; v3 adds another AND swaps a founder through the record (h′):
+  - v3 carries its chain;
+  - a FRESH node refuses v3 without its chain, a chain that skips v2, and a chain whose lineage authority signature is forged; it then pins v3 from `a`'s one response;
+  - peer `b`, holding v1 and never shown v2, walks to v3 and applies v2 then v3;
+  - refused on the local door: a single founder, a protocol move, an unconferred added founder;
+  - refused on peer `c`: a short proof, a protocol move under a genuine proof, a BODY VARIANT under a genuine proof, a body keeping a founder the envelope demoted, a moved founder set the envelope does not bind, a proof-less version, an authority that is not a counted founder;
+  - (h″) a proof counting a founder whose conferral was withdrawn before the link falls short; the founders then retire that founder through the record and the row is rooted again;
+- (i) the roster planes admit and remove members only: a serve node joins with no steward; seating a founder (even an eligible one, even under every founder's signature), re-roling one, revoking one, and a founder leaving are all refused; a founder is then seated through the record; a moderator a founder appointed seats a member but never a founder (sqlite/postgres builds);
+- (k) every recorded founder must count: a withdrawn conferral STALLS the row, naming the founder, and a founders' amendment retiring the seat roots it again;
+- (l) a founder key rotation: F2 co-signs v2, F2 rotates to a successor, v3 seats the successor; node `a` still reads its chain rooted and a fresh node walks v1 → v3 with F2's record served beside the row;
+- (m) a second read with unchanged inputs recomputes nothing; a holder revocation in the accord family recomputes and un-roots the accord-born row;
+- (n) a chain over 1024 versions, or over 32 MiB, is refused at the door;
+- (k′) two conferrals withdrawn through the accord stall the row:
+  - the lone founder's amendment falls short;
+  - a re-birth over the ROOTED row, and one not founded later, are refused;
+  - the accord re-birth replaces the stalled row (`accord_rebirth_replaces_stalled`), and it is rooted again;
+- (o) a founder resigns by their own plane revocation: the row stalls, a later link counting them falls short, and the others retire the seat through the record;
+- (p) a withdrawal through the accord with a short signed window:
+  - the response carries its evidence;
+  - a fresh consumer re-tallies it and REFUSES a retired-key fork signed after the window, although it recorded the withdrawal after the fork was signed;
+  - a second fresh consumer pins through `pin_trust_from_bundle_response` and re-derives the withdrawal;
+- (h) additionally: a link with `amended_at` before the version it follows, or in the future, is refused; (e) the birth's co-signer record travels with the row;
+- (j) three rows planted below the door on each backend: a non-conformant squat, a conformant row one founder signed alone, and one real steward plus two squatter founders with a squatter-signed "proof". Each resolves to nothing, is served as null with a named reason, is not a trust subject, and is replaced by the accord's birth chain, after which the consumer's root is valid.
+
+Plus the server route test on both paths.
+
+**Deviations.**
+- Entrenchment, `cohort_subkind` and `infrastructure_constraint` live in `policy_blob`, not as record columns. `Community` has no such fields, and adding them would move every community's `persist_row_hash`.
+- V157 is a new migration for the co-signatures and, since the re-check, the `lineage`. It was extended in place because it has not shipped, and its checksum rows were re-pinned. `v50-rc5-small` takes no migration, so V157 is uncontested.
+- The chain grows with every amendment: each served row carries every prior version. That is linear in the amendment count and bounded by how often the founders amend.
+- Founder seats of a trust-root community move only through the record (the HIGH-3 ruling). A LEGACY plane row that seated a founder before v50 does not count: links count recorded founders, and resolve lists recorded founders.
+- The trust-root grade requires the HUMANITY_ACCORD's quorum for ANY row declaring `infrastructure_constraint`. An operator-minted infrastructure root under its own family is therefore not admissible by this door yet. Deriving the admitting family from the signer set is the follow-up.
+- `is_authorized_infrastructure_community` still reads only the `substrate_persist` community key, so the read-time DEK Commons-plaintext opt-out and the moderator/federate re-checks treat an accord-admitted row as non-infrastructure. That is the stricter side. The admission-time and roster-plane steward-binding checks honour a rooted trust root.
+- #925's founder predicate is a private helper here, marked `// FOLD(#925)` at its sites. At the rebase it keeps its `user` half and takes `federation::is_node_bearing_key` for the `node` half, which also catches a key that is an active occurrence of a node identity. The shape and founder refusals move onto `v50-rc5-small`'s typed `Error::CommunityConsensusProtocolViolation { community_key_id, rule, detail }`.
+- The first-round witnesses were written after the door, not RED first. The mutation rounds below are the RED evidence.
+- `evidence_cc_impl_rows_pin_the_current_crate_version`'s exact count moved from 80 to 86.
+
+**Lanes (full, not filtered), on the last commit of each round.**
+- Round 1 (00662bcd): `cargo nextest run -j 3 --features pyo3,sqlite --no-fail-fast` 3431/3431; `scripts/pg_test_db.sh -- cargo nextest run -j 3 --features postgres,sqlite --no-fail-fast` 3361/3361; `cargo test -q --features postgres,pyo3,server --lib` 2446 passed, 0 failed; `RUSTFLAGS="-D warnings" cargo test --no-run` with `server` and with `test-anchor,sqlite` both exit 0.
+- Round 2 (90199b98): `pyo3,sqlite` 3443/3443; `postgres,sqlite` under `pg_test_db.sh` 3373/3373; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. `cargo test -q --features postgres,pyo3,server --lib` ran on d790d5ca: 2454 passed, 0 failed. 90199b98 changes only the sqlite connection-model table, which that lane does not compile. The first `pyo3,sqlite` and `postgres,sqlite` runs of round 2, on d790d5ca, each had ONE red: `every_connection_touching_fn_in_sqlite_rs_is_classified`, the new sqlite point read being unclassified. 90199b98 classifies it. The `tests/python` suite against a `maturin develop --features pyo3,sqlite` wheel: 45 passed, 10 skipped.
+- Round 3, the chain (59d402cf): `pyo3,sqlite` 3446/3446; `postgres,sqlite` under `pg_test_db.sh` 3376/3376; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2456 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt for round 3: no pyo3 signature changed, and `put_community_json` passes an empty `lineage`.
+- Round 4, the second ruling (2e1ba7e0): `pyo3,sqlite` 3455/3455; `postgres,sqlite` under `pg_test_db.sh` 3385/3385; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2462 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt: no pyo3 signature changed.
+- Round 5, recovery and resignation (b97978ce): `pyo3,sqlite` 3464/3464; `postgres,sqlite` under `pg_test_db.sh` 3394/3394; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2468 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt: no pyo3 signature changed; the response gained an additive field.
+
+**Mutation table, round 1 (#926).** The round ran on 34fe6df5, with M12 re-run on dc2fa151.
+- **Lane:** `test(i190) | test(canonical) | test(genesis) | test(bundle) | test(trust_root) | test(conferral)`, `--features sqlite,postgres`, under `scripts/pg_test_db.sh`.
+- **Baseline:** 270/270 passed.
+- **Result:** 12/12 killed.
+- **M12 first survived.** (b)'s forged co-scrub was also short of the quorum, so the count refused it and the door's co-signature check was never measured. (b) gained a quorate row padded with one bad co-scrub, plus a doubled co-signer, and M12 was then killed.
+
+**Mutation table, round 2 (review fixes).** The round ran on 455d541b, with survivors re-run on d790d5ca.
+- **Lane:** the same.
+- **Baseline:** 282/282 passed.
+- **Discipline:** each mutant was reverted before the next, and no mutant was OOM-killed.
+- **Result:** 23 of the 25 mutants below are killed outright, all 13 of the new ones included.
+- **N2 and N3 are equivalent by design.** They are two layers of one rule, each covering the other. Killing both together (N2+N3) fails I190 (h) ×3.
+- **N4 is equivalent to the pre-existing #910 rule.** A different version with no `supersede_proof` is refused by `admit_amendment` itself.
+- **Four mutants first survived and were killed after d790d5ca:** N2 and N3 (now together), N11 and N13.
+- **M4's first mutant did not compile** (a type annotation). It was re-written and killed.
+
+| # | Mutant | Tests failed | Killed by |
+|---|---|---|---|
+| M1 | accord quorum check dropped (birth) | 6 | I190 (b), (e) ×3 |
+| M2 | 1-of-3 admitted (birth) | 6 | I190 (b), (e) ×3 |
+| M3 | entrenchment not required | 6 | I190 (c), (g) ×3 |
+| M4 | the route serves no community | 3 | I190 (e) ×3 |
+| M5 | #809 CI gate reverted to report | 1 | `i190_f_ci_preflight_gates_the_bundle_quorum` |
+| M6 | founder human-key rule (#925) skipped | 6 | I190 (c), (i) ×3 |
+| M7 | founder accord-conferral skipped | 9 | I190 (c), (h), (i) ×3 |
+| M8 | local supersede without the founders' proof | 3 | I190 (g) ×3 |
+| M9 | `ciris-canonical` not reserved | 6 | I190 (c) ×3, (j) ×3 |
+| M10 | trust-root community not a `trust:accepts` subject | 6 | I190 (d) ×3, (j) ×3 |
+| M11 | the consumer pin skips `verify_bundle_quorum` | 3 | I190 (f) ×3 |
+| M12 | community co-signatures not verified at the door | 3 | I190 (b) ×3 |
+| N1 | a peer re-demands the accord count on a founders' amendment | 3 | I190 (h) ×3 |
+| N2 | the route's trust-root supersede check removed (`group_amendment.rs`) | 0 | equivalent alone: the gate's immutables cover it |
+| N3 | the gate's amendment immutables removed | 0 | equivalent alone: the route's check covers it |
+| N2+N3 | both layers removed | 3 | I190 (h) ×3 (a peer applies a protocol move under a genuine founders' proof) |
+| N4 | the gate does not require a proof on an amendment | 0 | equivalent: `admit_amendment` (#910) refuses a proof-less different version |
+| N5 | the roster-plane guard dropped | 6 | I190 (i), (i) moderator ×3 |
+| N6 | roster-plane founder eligibility dropped | 3 | I190 (i) ×3 |
+| N7 | roster-plane founders' quorum dropped (a moderator seats a founder) | 3 | I190 (i) moderator ×3 |
+| N8 | the steward-binding probe ignores the accord door | 3 | I190 (i) ×3 |
+| N9 | `resolve_community` does not re-judge the stored row | 3 | I190 (j) ×3 |
+| N10 | read-side shape re-check dropped | 3 | I190 (j) ×3 |
+| N11 | read-side accord re-check dropped | 0, then 3 | first round: none (the planted squat also failed its shape); after d790d5ca: I190 (j) ×3 (a conformant never-born row) |
+| N12 | an accord birth does not replace a squat | 3 | I190 (j) ×3 |
+| N13 | the community root is valid without its family | 0, then 3 | first form (only `root_self_declares` relaxed) was masked by the recovery leg and survived; rewritten to skip every family leg for a community root: I190 (d) ×3 (invalid before the accord is chartered) |
+
+**Mutation table, round 3 (the chain).** The round ran on 242d1402. C2b and C5b were re-run on 59d402cf.
+- **Lane:** the same.
+- **Baseline:** 285/285 passed.
+- **Discipline:** each mutant was reverted before the next, and no mutant was OOM-killed.
+- **Result:** 31 mutants, all killed.
+- **C2b and C5b first survived.** The chain skip had only been offered to a node whose stored version caught it through the backend's stale-proof check, and no record member's plane role differed from its recorded role. (h) gained a fresh node refusing a skipping chain, and (i) gained a plane demotion before an amendment.
+- **Round 2's N1–N4 and N11–N12 are retired.** Their code (the one-hop amendment route and the proof-only arm) no longer exists. R1, C6 and C9 take their places.
+- **An aborted first attempt at this round.** Its driver was stopped after M2 because the builder's role binding changed. The results below are from the full re-run.
+
+| # | Mutant | Tests failed | Killed by |
+|---|---|---|---|
+| M1 | accord quorum check dropped (birth) | 9 | I190 (b), (e) ×3, (j) ×3 |
+| M2 | 1-of-3 admitted (birth) | 6 | I190 (b), (e) ×3 |
+| M3 | entrenchment not required | 6 | I190 (c), (g) ×3 |
+| M4 | the route serves no community | 6 | I190 (e), (h) ×3 |
+| M5 | #809 CI gate reverted to report | 1 | `i190_f_ci_preflight_gates_the_bundle_quorum` |
+| M6 | founder human-key rule (#925) skipped | 6 | I190 (c), (i) ×3 |
+| M7 | founder accord-conferral skipped | 9 | I190 (c), (i), (k) ×3 |
+| M8 | the local door skips the founders' link | 6 | I190 (g), (h) ×3 |
+| M9 | `ciris-canonical` not reserved | 6 | I190 (c) ×3, (j) ×3 |
+| M10 | trust-root community not a `trust:accepts` subject | 6 | I190 (d) ×3, (j) ×3 |
+| M11 | the consumer pin skips `verify_bundle_quorum` | 3 | I190 (f) ×3 |
+| M12 | community co-signatures not verified at the door | 3 | I190 (b) ×3 |
+| N5 | roster-plane guard dropped | 6 | I190 (i), (i) moderator ×3 |
+| N6 | roster-plane founder eligibility dropped | 3 | I190 (i) ×3 |
+| N7 | roster-plane founders' quorum dropped (a moderator seats a founder) | 3 | I190 (i) moderator ×3 |
+| N8 | the steward-binding probe ignores the accord door | 3 | I190 (i) ×3 |
+| N9 | `resolve_community` does not re-judge the row | 6 | I190 (j) ×3, (k) ×3 |
+| N10 | read-side shape re-check dropped | 3 | I190 (j) ×3 |
+| N13 | the community root is valid without its family | 3 | I190 (d) ×3 |
+| R1 | a peer re-demands the accord count on an amendment | 3 | I190 (h) ×3 |
+| C1 | chain walk skipped: a fresh node admits the latest version on its own proof | 3 | I190 (h) ×3 |
+| C2 | a link's signers not verified (founders' quorum) | 3 | I190 (h) ×3 |
+| C2b | a link's prior hash not checked | 0, then 3 | first round: none; after 59d402cf: I190 (h) ×3 (a fresh node given a skipping chain) |
+| C3 | founder-set immutability dropped | 3 | I190 (h) ×3 (a demotion the founders themselves signed) |
+| C4 | envelope role binding not checked | 3 | I190 (h) ×3 (a body keeping a founder the envelope demoted) |
+| C5 | the builder does not bind roles | 6 | I190 (h), (i) ×3 |
+| C5b | the builder binds the folded roster's roles, not the record's | 0, then 3 | first round: none; after 59d402cf: I190 (i) ×3 (a plane demotion before an amendment) |
+| C6 | `stored_standing` proof-only arm | 3 | I190 (j) ×3 (one steward, two squatters, a squatter "proof") |
+| C7 | `stored_standing` drops every-founder eligibility | 3 | I190 (k) ×3 |
+| C8 | multi-hop apply skips intermediate versions | 3 | I190 (h) ×3 (a peer at v1 receiving v3) |
+| C9 | a squat is not replaced by the birth chain | 3 | I190 (j) ×3 |
+
+**Mutation table, round 4 (the second ruling).** The round ran on 2e1ba7e0.
+- **Lane:** the same.
+- **Baseline:** 294/294 passed.
+- **Discipline:** each mutant was reverted before the next, and no mutant was OOM-killed.
+- **Result:** 37 mutants, all killed on the first run.
+- **Retired:** N6 and N7 (their plane quorum path is gone), C3 (founder-set immutability, lifted by the ruling), and C5 and C5b (the builder no longer binds roles; `bind_next_version` does).
+
+| # | Mutant | Failed | Killed by (I190 arm) |
+|---|---|---|---|
+| M1 | accord quorum check dropped (birth) | 12 | (b), (e), (j), (m) |
+| M2 | 1-of-3 admitted (birth) | 9 | (b), (e), (m) |
+| M3 | entrenchment not required | 6 | (c), (g) |
+| M4 | the route serves no community | 9 | (e), (h), (l) |
+| M5 | #809 CI gate reverted to report | 1 | CI witness |
+| M6 | founder human-key rule skipped at the door | 3 | (c) |
+| M7 | founder accord-conferral skipped at the door | 6 | (c), (h) |
+| M8 | the local door skips the founders' link | 6 | (g), (h) |
+| M9 | `ciris-canonical` not reserved | 6 | (c), (j) |
+| M10 | trust-root community not a `trust:accepts` subject | 6 | (d), (j) |
+| M11 | the pin skips `verify_bundle_quorum` | 3 | (f) |
+| M12 | co-signatures not verified at the door | 3 | (b) |
+| N5 | roster-plane guard dropped | 6 | (i), (i) moderator |
+| N8 | the steward-binding probe ignores the accord door | 3 | (i) |
+| N9 | resolve does not re-judge the row | 9 | (j), (k), (m) |
+| N10 | read-side shape re-check dropped | 3 | (j) |
+| N13 | the community root is valid without its family | 3 | (d) |
+| R1 | a peer re-demands the accord count | 3 | (h) |
+| C1 | chain walk skipped on a fresh node | 3 | (h) |
+| C2 | a link's founders' quorum not required | 3 | (h) |
+| C2b | a link's prior hash not checked | 3 | (h) |
+| C4 | envelope role binding not checked | 3 | (h) |
+| C6 | `stored_standing` proof-only arm | 3 | (j) |
+| C7 | every-recorded-founder counting dropped | 3 | (k) |
+| C8 | multi-hop apply skips intermediate versions | 3 | (h) |
+| C9 | a squat not replaced by the birth chain | 3 | (j) |
+| P1 | the plane admits a founder-seat change | 6 | (i), (i) moderator |
+| P2 | role binding skipped when the founder set moves | 3 | (h) |
+| P3 | a link counts a withdrawn record founder | 6 | (h), (k) |
+| P4 | the next-content hash binding dropped | 3 | (h) (a body variant) |
+| P5 | the authority need not be a counted founder | 3 | (h) |
+| P6 | a link's authority signature not verified | 3 | (h) (a forged lineage entry) |
+| P7 | the standing cache keyed on the row alone | 6 | (k), (m) |
+| P8 | lineage length cap dropped | 3 | (n) |
+| P9 | lineage byte cap dropped | 3 | (n) |
+| P10 | a rotation un-counts historical signatures | 9 | (h), (k), (l) |
+| P11 | the bundle response serves only the current version's keys | 3 | (l) |
+
+**Mutation table, round 5 (recovery, resignation, node-independent withdrawal).** The round ran on b97978ce.
+- **Lane:** the same.
+- **Baseline:** 303/303 passed.
+- **Discipline:** each mutant was reverted before the next, and no mutant was OOM-killed.
+- **Result:** 49 mutants. 48 killed. O3 survived, and it is EQUIVALENT: dropping a resigned seat from the link's seats cannot change a `quorum:M/N` verdict, because M is absolute. The only protocols a trust-root row admits are `quorum:M/N`. The seat drop is kept for honesty of the seat set, not for any verdict it changes today.
+- **P3 and P10** were re-pointed at the new withdrawal-instant comparison.
+- **Previously killed mutants re-run** (killed by):
+  - M1 → (b), (e), (j), (m)
+  - M2 → (b), (e), (m)
+  - M3 → (c), (g)
+  - M4 → (e), (h), (l), (p)
+  - M5 → CI witness
+  - M6 → (c)
+  - M7 → (c), (h)
+  - M8 → (g), (h)
+  - M9 → (c), (j)
+  - M10 → (d), (j)
+  - M11 → (f)
+  - M12 → (b)
+  - N5 → (i), (i) moderator
+  - N8 → (i)
+  - N9 → (j), (k), (m)
+  - N10 → (j)
+  - N13 → (d)
+  - R1 → (h)
+  - C1 → (h), (p)
+  - C2 → (h), (o), (p)
+  - C2b, C4, C8 → (h)
+  - C6, C9 → (j)
+  - C7 → (k), (k′), (o)
+  - P1 → (i), (i) moderator
+  - P2, P4, P5, P6 → (h)
+  - P3 → (h), (k), (k′), (p)
+  - P7 → (k), (k′), (m)
+  - P8, P9 → (n)
+  - P10 → (h), (k), (k′), (l), (p)
+  - P11 → (l)
+
+| # | New mutant | Failed | Killed by |
+|---|---|---|---|
+| K1 | re-birth refused over a stalled row | 3 | (k′) |
+| K2 | re-birth replaces a ROOTED row | 3 | (k′) |
+| K3 | re-birth need not be founded later | 3 | (k′) |
+| O1 | resignation ignored in `founder_counts` | 3 | (o) |
+| O2 | resignation refused on the plane | 3 | (o) |
+| O3 | a resigned seat kept in the link seats | 0 | equivalent (see above) |
+| W1 | withdrawal instant from the local clock | 3 | (p) |
+| W2 | the response omits the withdrawal evidence | 3 | (p) |
+| W3 | the pin does not admit the withdrawal evidence | 3 | (p) |
+| W4 | co-signer records not served | 3 | (e) |
+| A1 | `amended_at` floor dropped | 3 | (h) |
+| A2 | `amended_at` future bound dropped | 3 | (h) |

@@ -731,3 +731,11 @@ ScoringFactorStream	__next__	structural
 ScoringFactorStream	summary	epistemic	
 Engine	consent_peers_by_principals	deontic	
 Engine	resolve_scoped_consent_by_principals	deontic	
+# v50.0.0 (CIRISPersist#926) — `resolve_community_json` and
+# `pin_trust_from_bundle_response_json` are DEONTIC: a wrong entry names the
+# founders a consumer trusts (or admits a row its accord did not found), which
+# is a security finding. `trust_root_bundle_response_json` is EMPIRICAL: it
+# serves this node's stored state, re-derivable by re-reading it.
+Engine	resolve_community_json	deontic	
+Engine	trust_root_bundle_response_json	empirical	
+Engine	pin_trust_from_bundle_response_json	deontic	

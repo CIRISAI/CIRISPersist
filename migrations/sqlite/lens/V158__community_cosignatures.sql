@@ -1,0 +1,32 @@
+-- V158 — a community row's co-signatures and lineage (the ciris-canonical chain)
+-- v50.0.0 (CIRISPersist#926, FSD SECOND_DEVICE.md §9)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V158__community_cosignatures.sql
+--
+-- # Why
+--
+-- Operator ruling (b) on #926: the `ciris-canonical` community row is born as
+-- a post-genesis Contribution admitted under the HUMANITY_ACCORD's own quorum
+-- (2-of-3), and after birth amends by its FOUNDERS' quorum. A community row
+-- carried ONE authority signature, so a 2-of-3 co-scrub over the row had
+-- nowhere to live (the roster rows solved the same problem in V153 with a
+-- `cosignatures` column), and an amended version carried no way back to the
+-- accord-born version that makes it a trust root.
+--
+-- # What changes
+--
+-- `federation_communities.cosignatures` — a JSON array of
+-- `{authority_key_id, scrub_signature_classical, scrub_signature_pqc}` over
+-- the SAME signing envelope the authority signed. `'[]'` for every existing
+-- and every single-signed row.
+--
+-- `federation_communities.lineage` — a JSON array of the row's prior SIGNED
+-- versions, oldest first (the accord-born version, then each founders'
+-- amendment), so a node that holds nothing walks the chain from the birth.
+-- `'[]'` for every existing row and every non-trust-root community.
+--
+-- Both are served with the authority signature, so a peer re-derives the
+-- birth quorum and every link (a preimage field that is not persisted is
+-- verifiable once, then never).
+ALTER TABLE federation_communities ADD COLUMN cosignatures TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE federation_communities ADD COLUMN lineage TEXT NOT NULL DEFAULT '[]';

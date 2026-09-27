@@ -54,6 +54,9 @@ pub mod blobs;
 pub mod bootstrap_admission;
 pub mod canonical_at_rest;
 pub mod capacity;
+// v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted
+// under the accord's quorum, served beside the GenesisBundle (CC 3.2 / 5.3.4).
+pub mod canonical_community;
 pub mod cohort;
 pub mod consensus;
 // CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
@@ -161,6 +164,9 @@ mod device_readd_invariants;
 // v50.0.0 (CIRISPersist#917) — I189, the attributed sync door's typed outcome.
 #[cfg(test)]
 mod synced_door_invariants;
+// v50.0.0 (CIRISPersist#926) — I190, the ciris-canonical community row (ruling b).
+#[cfg(test)]
+pub(crate) mod canonical_community_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -1842,6 +1848,20 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
+    // v50.0.0 (CIRISPersist#926, HIGH-3 ruling) — a trust-root community's
+    // founder seats move ONLY through the record (a founders' amendment); the
+    // planes admit and remove members only, whoever signs.
+    if canonical_community::is_trust_root_grade(&community) {
+        Box::pin(canonical_community::check_trust_root_roster_change(
+            directory,
+            &community,
+            signers,
+            &incoming,
+            is_revocation,
+            effective_at,
+        ))
+        .await?;
+    }
     let nodes = Box::pin(community_node_bearing_seats(directory, &community)).await?;
     let events = Box::pin(community_roster_events(directory, &community, &nodes)).await?;
     let roots = founder_candidates(
@@ -4297,6 +4317,31 @@ pub trait FederationDirectory: Send + Sync {
     /// `None` if absent. Structural mirror of [`Self::lookup_family`].
     async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error>;
 
+    /// v50.0.0 (CIRISPersist#926 re-check, MEDIUM-C) — this directory's
+    /// cache of trust-root standings
+    /// ([`canonical_community::stored_standing`]), keyed on a digest of every
+    /// input the verdict reads. `None` (no caching) by default; each real
+    /// backend holds its own — never one shared across directories.
+    fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
+        None
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — one community's SIGNED row as this node
+    /// stores it (authority signature, co-signatures, supersede proof), by
+    /// point read. `None` when absent or stored unsigned. The trust-root reads
+    /// ([`canonical_community`]) re-derive the accord quorum from it. Default
+    /// `Unsupported`; every real backend overrides (a caller falls back to the
+    /// signed since-plane).
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<SignedCommunity>, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "lookup_signed_community",
+        })
+    }
+
     /// v4.0 — list every community that `member_identity_key_id`
     /// belongs to. Structural mirror of
     /// [`Self::list_families_for_member`]; the §4.3 community-scope
@@ -6443,6 +6488,10 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Family => Role::Founder,
             _ => Role::Member,
         };
+        // v50.0.0 (CIRISPersist#926) — for a trust-root community the caller
+        // then binds the envelope to the ONE version it authorizes
+        // ([`canonical_community::bind_next_version`]: every recorded role, the
+        // next content hash, the link's instant) before the founders sign.
         Ok(ciris_verify_core::accord_genesis::build_membership_change(
             &prior_envelope,
             new_member_key_ids,
