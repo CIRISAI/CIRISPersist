@@ -498,7 +498,10 @@ pub mod bodies {
     /// the target's subject: the admission gate (which runs at the default)
     /// refuses with `beyond_delegation_depth_cap: true`; the walk at an
     /// explicit 6 reaches. An issuer with no chain is refused with `false`.
-    pub async fn withdraws_walk_defaults_to_five_hops(d: &dyn FederationDirectory, tag: &str) {
+    pub async fn withdraws_walk_depth_defaults_to_five_hops(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
         let keys = chain(
             d,
             &format!("{tag}-w6"),
@@ -557,7 +560,10 @@ pub mod bodies {
 
     /// **#928 — the moderation walk.** Its bound IS the CC default; a 6-hop
     /// `moderate` chain is `BeyondDepthCap` at it and `Reachable` at 6.
-    pub async fn moderation_walk_defaults_to_five_hops(d: &dyn FederationDirectory, tag: &str) {
+    pub async fn moderation_walk_depth_defaults_to_five_hops(
+        d: &dyn FederationDirectory,
+        tag: &str,
+    ) {
         assert_eq!(MAX_MODERATION_DELEGATION_DEPTH, DEFAULT_DELEGATION_DEPTH);
         let keys = chain(d, &format!("{tag}-m6"), 6, DELEGATION_SCOPE_MODERATE).await;
         let at_default = admission::reachable_under_scope_with_reasons(
@@ -628,8 +634,8 @@ mod runners {
                 case!(infrastructure_protocol_must_be_quorum);
                 case!(clause_a_fused_key_is_not_minted);
                 case!(delegation_graph_defaults_to_five_hops);
-                case!(withdraws_walk_defaults_to_five_hops);
-                case!(moderation_walk_defaults_to_five_hops);
+                case!(withdraws_walk_depth_defaults_to_five_hops);
+                case!(moderation_walk_depth_defaults_to_five_hops);
             }
         };
     }
