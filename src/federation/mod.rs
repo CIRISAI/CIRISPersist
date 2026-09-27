@@ -323,6 +323,39 @@ pub struct ConsentSweepReport {
     /// this cut it replicated exactly like `share`. Each is logged by id.
     #[serde(default)]
     pub declined_by_principle: u64,
+    /// v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — rows a live grant's
+    /// PREFIX covers but whose dimension the CC 3.1.7 R3 grammar refuses
+    /// (`consent_grammar::covers` requires a refusal-free
+    /// [`match_family`](namespace::matcher::match_family)). Typically a row
+    /// stored before v50 on a pre-rc5 shape (`capacity:composite` with no
+    /// version, an uppercase leaf, a closed-leaf `accord:` spelling). The sweep
+    /// never promotes or widens such a row — consent only ever NARROWS onto
+    /// the grammar — so it is counted here rather than silently passed over.
+    #[serde(default)]
+    pub skipped_unmatched_dimension: u64,
+    /// Up to [`ConsentSweepReport::UNMATCHED_EXAMPLES`] of those dimensions,
+    /// verbatim, first seen first, so an operator can see WHICH shapes were
+    /// stranded.
+    #[serde(default)]
+    pub unmatched_dimension_examples: Vec<String>,
+}
+
+impl ConsentSweepReport {
+    /// The cap on [`Self::unmatched_dimension_examples`].
+    pub const UNMATCHED_EXAMPLES: usize = 8;
+
+    /// Count a row a grant's prefix covers but the grammar refuses.
+    pub fn note_unmatched_dimension(&mut self, dimension: &str) {
+        self.skipped_unmatched_dimension += 1;
+        if self.unmatched_dimension_examples.len() < Self::UNMATCHED_EXAMPLES
+            && !self
+                .unmatched_dimension_examples
+                .iter()
+                .any(|d| d == dimension)
+        {
+            self.unmatched_dimension_examples.push(dimension.to_owned());
+        }
+    }
 }
 
 pub mod register;

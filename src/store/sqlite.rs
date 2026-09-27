@@ -50884,6 +50884,32 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         }
     }
 
+    impl SqliteBackend {
+        /// v50.0.0 (CIRISPersist#924) — simulate a row STORED BEFORE v50 on a
+        /// shape v50's door now refuses: rewrite a stored row's envelope
+        /// `dimension` directly (the door would refuse the shape, so the seam
+        /// reaches the connection, as `downgrade_to_v30` does).
+        pub(crate) fn rewrite_dimension_for_test(&self, attestation_id: &str, dimension: &str) {
+            let conn = self.conn.lock();
+            let envelope: String = conn
+                .query_row(
+                    "SELECT attestation_envelope FROM federation_attestations \
+                     WHERE attestation_id = ?1",
+                    rusqlite::params![attestation_id],
+                    |r| r.get(0),
+                )
+                .expect("row exists");
+            let mut v: serde_json::Value = serde_json::from_str(&envelope).expect("json");
+            v["dimension"] = serde_json::json!(dimension);
+            conn.execute(
+                "UPDATE federation_attestations SET attestation_envelope = ?2 \
+                 WHERE attestation_id = ?1",
+                rusqlite::params![attestation_id, serde_json::to_string(&v).expect("json")],
+            )
+            .expect("rewrite dimension");
+        }
+    }
+
     /// v31.0.0 (CIRISPersist#650) — the recursive load-bearing walk over a
     /// CYCLIC graph, sqlite arm. Shared exercise body with memory + postgres.
     #[tokio::test]
