@@ -1013,6 +1013,27 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
+    /// v50.0.0 (CIRISPersist#917) —
+    /// [`FederationDirectory::apply_replicated_attestation`], the typed
+    /// unattributed door. The far side runs the whole plan-then-write body
+    /// against its own backend, so the outcome is decided where the stored
+    /// row is. Result rides `ReplicatedAttestationOutcome`. APPEND-ONLY
+    /// (Growth).
+    ApplyReplicatedAttestation {
+        /// The signed row.
+        attestation: SignedAttestation,
+    },
+    /// v50.0.0 (CIRISPersist#917) —
+    /// [`FederationDirectory::put_attestation_synced`], the typed attributed
+    /// door. [`DirectoryOp::PutAttestationSynced`] stays the untyped
+    /// stored-write door for consumers built before v50. Result rides
+    /// `ReplicatedAttestationOutcome`. APPEND-ONLY (Growth).
+    ApplyReplicatedAttestationSynced {
+        /// The signed row.
+        attestation: SignedAttestation,
+        /// The identity the TRANSPORT authenticated — never the row's claim.
+        authenticated_peer_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1249,6 +1270,13 @@ pub enum DirectoryOpResult {
     /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
     /// APPEND-ONLY (Growth).
     SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
+    /// v50.0.0 (CIRISPersist#917) — `apply_replicated_attestation` and
+    /// `put_attestation_synced`: the typed Attestation-plane outcome. A
+    /// `Refused` is a policy outcome carried HERE with its reason, never
+    /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
+    ReplicatedAttestationOutcome(
+        crate::federation::attestation_apply::ReplicatedAttestationOutcome,
+    ),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1604,11 +1632,20 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        // v50.0.0 (CIRISPersist#917) — the pre-v50 op keeps its contract: the
+        // stored-write door under the Sync origin, answering
+        // `AttestationOutcome`, for consumers built before the typed door. A
+        // v50 proxy sends `ApplyReplicatedAttestationSynced` instead.
         DirectoryOp::PutAttestationSynced {
             attestation,
             authenticated_peer_key_id,
         } => match dir
-            .put_attestation_synced(attestation, &authenticated_peer_key_id)
+            .put_attestation_with_origin(
+                attestation,
+                crate::federation::replication::admission::WriteOrigin::Sync {
+                    peer_key_id: authenticated_peer_key_id,
+                },
+            )
             .await
         {
             Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
@@ -1945,6 +1982,22 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ApplyReplicatedAttestation { attestation } => {
+            match dir.apply_replicated_attestation(attestation).await {
+                Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ApplyReplicatedAttestationSynced {
+            attestation,
+            authenticated_peer_key_id,
+        } => match dir
+            .put_attestation_synced(attestation, &authenticated_peer_key_id)
+            .await
+        {
+            Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
     }
 }
 
@@ -3581,6 +3634,50 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#917) — the typed unattributed door crosses whole.
+    /// The trait default would plan on THIS side, where `get_attestation` is
+    /// `Unsupported`, and fall back to plan-free apply over the untyped
+    /// `PutAttestation` op — reporting a re-offer of a held row as `Inserted`
+    /// and a conflict as an untyped backend error.
+    async fn apply_replicated_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<crate::federation::attestation_apply::ReplicatedAttestationOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedAttestation { attestation })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedAttestationOutcome(o) => Ok(o),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#917) — the typed attributed door crosses whole,
+    /// for the reason [`Self::apply_replicated_attestation`] gives. The peer
+    /// travels so the far side meters it exactly as a direct call would.
+    async fn put_attestation_synced(
+        &self,
+        attestation: SignedAttestation,
+        authenticated_peer_key_id: &str,
+    ) -> Result<crate::federation::attestation_apply::ReplicatedAttestationOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedAttestationSynced {
+                attestation,
+                authenticated_peer_key_id: authenticated_peer_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedAttestationOutcome(o) => Ok(o),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v49.0.0 (CIRISPersist#912) — the listing since-read, proxied like the
     /// widening planes': a capsule consumer converges the 19th kind from it.
     async fn list_signed_community_membership_listings_since(
@@ -4736,7 +4833,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "78bc01eff2751ddbb5a202e8e63c3833c425f3a3797efb8c6840d304ec0e99b3",
+            "6611b3942471f85226d49d6702b3bc07880eb7f8fe0acd940b5f02d79f5c8d0d",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4765,11 +4862,16 @@ mod tests {
     /// 3: this gate reads the enum body only, so a payload-type's own shape
     /// is the version pin's job, not the digest's. All v36 breaks share the
     /// one 2 → 3 bump.
+    ///
+    /// Re-pinned in v50.0.0 (CIRISPersist#917) — GROWTH on both halves: the
+    /// `ApplyReplicatedAttestation` and `ApplyReplicatedAttestationSynced` ops
+    /// and the `ReplicatedAttestationOutcome` result APPENDED, nothing
+    /// existing touched. [`DIRECTORY_ABI_VERSION`] stays 5.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "11ef765f51d36e2cf6cb72c9f38906fde813eec6e6af8b20c87451f3e25d687a",
+            "457dad6209a9ba4fd0b322e3a24feb8b3163c6172e6f38afedd48665a8b47aec",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

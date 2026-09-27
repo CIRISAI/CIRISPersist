@@ -271,14 +271,133 @@ pub(crate) fn plan_replicated_attestation_apply(
     // so equal hashes mean the CLAIM is identical; the producer pair pins WHO
     // made it. Split from the conflict because the remedies differ: a
     // duplicate needs nothing, a conflict needs a duplicity/convergence look.
+    //
+    // v50.0.0 (CIRISPersist#917 review) — the incoming hash is a CLAIM until
+    // its envelope is hashed. Nothing upstream of the plan has verified it (a
+    // settled row never reaches the write door's hybrid verify), so a peer
+    // could copy the stored row's hash and producer pair onto a different
+    // envelope and be booked a quiet duplicate. The stored row's hash was
+    // verified against its envelope at admission; requiring the incoming
+    // envelope to hash to the same value makes "same claim" a fact.
     if existing.original_content_hash == incoming.original_content_hash
         && existing.attesting_key_id == incoming.attesting_key_id
         && existing.scrub_key_id == incoming.scrub_key_id
+        && envelope_content_hash(&incoming.attestation_envelope)? == incoming.original_content_hash
     {
         return Ok(refused(AttestationRefusalReason::AlreadyPresentIdentical));
     }
 
     Ok(refused(AttestationRefusalReason::ConflictingAttestation))
+}
+
+/// The SHA-256 (hex) of `envelope`'s CEG canonical bytes — what a row's
+/// `original_content_hash` must equal, computed exactly as the federation-tier
+/// verify computes it.
+fn envelope_content_hash(envelope: &serde_json::Value) -> Result<String, Error> {
+    use sha2::Digest as _;
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
+        .map_err(|e| Error::InvalidArgument(format!("envelope canonicalize: {e}")))?;
+    Ok(hex::encode(sha2::Sha256::digest(&canonical)))
+}
+
+/// v50.0.0 (CIRISPersist#917) — **the one body both typed Attestation-plane
+/// doors run**: fetch the stored row, run
+/// [`plan_replicated_attestation_apply`], act on the plan, and write an
+/// admitted row through the stored-write door under `origin`.
+///
+/// [`apply_replicated_attestation`](super::FederationDirectory::apply_replicated_attestation)
+/// passes [`WriteOrigin::Wire`](super::replication::admission::WriteOrigin::Wire);
+/// [`put_attestation_synced`](super::FederationDirectory::put_attestation_synced)
+/// passes [`WriteOrigin::Sync`](super::replication::admission::WriteOrigin::Sync)
+/// naming the authenticated peer. Origin changes WHICH budget a fresh row is
+/// metered against (the cohort question stays inside the write door) and
+/// nothing else, so the same bytes classify to the same outcome on both
+/// doors by construction — before #917 the synced door ran a binary
+/// `persist_row_hash` verdict instead and booked a decoration-only
+/// re-delivery as `Error::Conflict` while this body booked it as a duplicate.
+pub(crate) async fn apply_planned<D>(
+    dir: &D,
+    attestation: super::SignedAttestation,
+    origin: super::replication::admission::WriteOrigin,
+) -> Result<ReplicatedAttestationOutcome, Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    use super::precedence;
+    use ReplicatedAttestationOutcome as Outcome;
+    use ReplicatedAttestationPlan as Plan;
+    let incoming = &attestation.attestation;
+    let attestation_id = incoming.attestation_id.clone();
+    // v50.0.0 (CIRISPersist#916) — an owner-binding is the moment a minter
+    // learns a member has a device; read before the row is moved.
+    let binding = super::owner_binding_of(incoming);
+    // The §6.1 silent-no-op door only exists for structural composers
+    // that actually carry a references target — precompute the predicate
+    // while `incoming` is still borrowed.
+    let dedup_possible = precedence::is_structural_composer(&incoming.attestation_type)
+        && precedence::references_attestation_id_from_envelope(&incoming.attestation_envelope)
+            .is_some();
+    let planned = match dir.get_attestation(&attestation_id).await {
+        Ok(existing) => {
+            // v50.0.0 (CIRISPersist#917 review) — bound the plan's own work. A
+            // row the plan SETTLES (the id is held) never reaches the write
+            // door, whose quota and size gate bound every other
+            // canonicalization; without this a replay of a held id with a huge
+            // envelope would be canonicalized for free. Only then: a fresh id
+            // goes to the write door, which meters it BEFORE its own size gate,
+            // and that order is the quota's to keep.
+            if existing.is_some() {
+                super::admission::check_envelope_size_admission(&incoming.attestation_envelope)?;
+            }
+            Some(plan_replicated_attestation_apply(
+                existing.as_ref(),
+                incoming,
+            )?)
+        }
+        // The #603 arm: this directory cannot answer, so apply plan-free.
+        Err(Error::Unsupported { .. }) => None,
+        // Every other failure is *could not ask*, which is never *absent*.
+        Err(e) => return Err(e),
+    };
+    match planned {
+        Some(Plan::Unchanged) => return Ok(Outcome::Unchanged),
+        Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
+        Some(Plan::Insert) | None => {}
+    }
+    match dir.put_attestation_with_origin(attestation, origin).await {
+        Ok(stored) => {
+            // §6.1: a structural-composer replay is a silent `Ok` with NO
+            // row written. Ask the store what it actually did, so
+            // `Inserted` keeps meaning inserted. Skipped on the plan-free
+            // fallback (this directory cannot be asked).
+            if dedup_possible
+                && planned.is_some()
+                && dir.get_attestation(&attestation_id).await?.is_none()
+            {
+                return Ok(Outcome::Deduplicated);
+            }
+            // v50.0.0 (CIRISPersist#917 review) — the store's own verdict,
+            // not `Ok(_)`: `AlreadyHeld` means a byte-identical row landed
+            // between the plan and the write (a lost race), or the plan-free
+            // fallback re-offered one — nothing changed, so not `Inserted`.
+            match stored {
+                super::AttestationOutcome::Inserted => {
+                    // v50.0.0 (CIRISPersist#916, #917) — the ONE re-wrap site
+                    // for both typed doors: a row the store actually
+                    // inserted, never a settled or already-held one.
+                    if let Some((owner, device)) = binding {
+                        super::rewrap_after_admission(dir, &owner, &device).await;
+                    }
+                    Ok(Outcome::Inserted)
+                }
+                super::AttestationOutcome::AlreadyHeld => Ok(Outcome::Unchanged),
+            }
+        }
+        Err(e) if e.is_duplicate_key() => Ok(Outcome::Refused {
+            reason: AttestationRefusalReason::StoreConflict,
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -709,14 +828,37 @@ mod tests {
             author,
             envelope("identity_binding:v1", serde_json::json!({})),
         );
-        dir.apply_replicated_attestation(SignedAttestation { attestation: first })
-            .await
-            .expect("first apply");
+        dir.apply_replicated_attestation(SignedAttestation {
+            attestation: first.clone(),
+        })
+        .await
+        .expect("first apply");
 
         let planless = crate::federation::directory_double::FaultInjectingDirectory::new(
             dir.clone() as std::sync::Arc<dyn FederationDirectory>,
         )
         .unsupported("get_attestation");
+        // v50.0.0 (CIRISPersist#917 review) — the held row re-offered where no
+        // plan can run: the store answers `AlreadyHeld`, the same answer a lost
+        // plan/act race gets, and that is `Unchanged` on both typed doors —
+        // never `Inserted`, which would claim a state change that did not
+        // happen.
+        assert_eq!(
+            planless
+                .apply_replicated_attestation(SignedAttestation {
+                    attestation: first.clone(),
+                })
+                .await
+                .expect("plan-free re-offer"),
+            ReplicatedAttestationOutcome::Unchanged
+        );
+        assert_eq!(
+            planless
+                .put_attestation_synced(SignedAttestation { attestation: first }, author)
+                .await
+                .expect("plan-free synced re-offer"),
+            ReplicatedAttestationOutcome::Unchanged
+        );
         // A rival mint of the same id: the plan cannot run, the store's
         // uniqueness fires, and the outcome is the typed store conflict.
         let rival = sealed_row(
