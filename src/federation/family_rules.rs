@@ -528,6 +528,15 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "hardware_custody:",
+        "v50.0.0 (CIRISPersist#924) — `hardware_attestation::HARDWARE_CUSTODY_FAMILY` \
+         NAMES the registry row so a test can read its closed `{platform}` values \
+         and hold `HardwareTypePlatform::as_platform` equal to them. Persist states \
+         no emitter or composition rule of its own on the family: the closed \
+         vocabulary is CC's (the row's `segments[].values`), enforced by the one \
+         matcher at the case gate like every other enumeration.",
+    ),
+    (
         "canonical:",
         "a KEY-ID ENCODING prefix (`canonical:sha256:<64 hex>`), not a dimension \
          family: it names how an identifier was derived, never what a row is \
