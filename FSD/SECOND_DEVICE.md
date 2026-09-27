@@ -407,6 +407,16 @@ Lane (`--features sqlite,postgres --lib` under `scripts/pg_test_db.sh`, `-j 3`):
 
 17/17 killed on the final tree; three needed a witness written first.
 
+**Review round (HIGH-1, MEDIUM-3) on 86440f47**, lane above plus `test(grammar_refuses)`, baseline 210/210:
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M18 | minors gate skips SUPERSEDES (a widening is not re-checked) | KILLED (3) | `minor_owner_binding_at_federation_is_refused_q5` ×3 backends (the widening leg) |
+| M19 | sweep's stranded-dimension accounting dropped | KILLED (1) | `sweep_counts_grant_covered_rows_the_grammar_refuses_924` |
+| M9 (re-run) | minors refusal dropped | KILLED (3) | minors ×3 |
+| M12 (re-run) | `covers` without the grammar check | KILLED (2) | covers test, the sweep witness |
+| M16 (re-run) | minors gate removed from the promotion stack | KILLED (3) | minors ×3 |
+
 ### 10.6 For adopters at the tag (computed from the vendored files)
 
 **Constants.** `VENDORED_N_FAMILIES` 116 → **145**. `VENDORED_CC_VERSION` stays `1.0-rc5`. `VENDORED_SOURCE_SHA256` `87aede50…b9a9f5` → `f05682512c85c65c3f502e1ca81dfb032a6e6d24ab4206658fbf36ccaa702a75`. New: `VENDORED_REGISTRY_SHA256 = d6c87945ea08d72cc1f83820e35f0e3fb72cce47ea49f2ed3321d43219642ea6`, `VENDORED_CC_COMMIT = 4b624513458f2c9b236caf289dc2cd62aa048c24`. `supersets::VENDORED_MANIFEST_VERSION` stays **`0.3.0`**: it versions the supersets walk (`namespace_supersets.json`), which this cut did not re-vendor. Its seed pin (`VENDORED_SEED_REGISTRY_SHA256`) still names the rc2 registry, and that lag is declared.
