@@ -2790,6 +2790,25 @@ pub mod test_support {
             Some(minor.as_str())
         );
 
+        // (2b) "admission MUST refuse the PROMOTION" — the promote door's own
+        // stack asks the same question of the row as it would be stored
+        // (a `local` row admitted before the owner's band resolved minor
+        // must not cross). Asked of the stack directly: mutation M16 of the
+        // #924 round showed the put doors alone did not witness it.
+        let promoted = binding(&minor, &node_a, cohort_scope::FEDERATION).attestation;
+        let err = crate::federation::admission::check_promotion_admission(dir, &promoted, None)
+            .await
+            .expect_err("the promotion stack refuses a minor's federation owner-binding");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
+                )
+            ),
+            "({suffix}) CC 5.4.6 at the promote door, got {err:?}"
+        );
+
         // (3) An owner with no age proof announces freely (presumption of
         // sovereignty, CC 1.15.6) — the gate keys on the MINOR band, not on
         // the absence of an adult one.
