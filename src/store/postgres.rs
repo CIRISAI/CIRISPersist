@@ -6292,6 +6292,33 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("withdraws admission depth: {e}"))
             })?;
         }
+        // v51.0.0 (CIRISPersist#933) — the three projections run INSIDE the
+        // transaction, before the commit: a failed projection rolls the row
+        // back, never leaves a committed row unprojected.
+        // v17.4.0 (V106) — maintain the subject projection (federation tier).
+        pg_project_attestation_subjects(
+            &*tx,
+            &row,
+            &row.attestation_id,
+            crate::federation::types::attestation_tier::FEDERATION,
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
+        })?;
+        // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+        // projection (grant upsert / withdraws-revocation fold). v51.0.0
+        // (CIRISPersist#933): INSIDE the row's transaction — it ran after the
+        // commit as an autocommit statement, so a failed projection left a
+        // committed `withdraws` whose revocation was never folded, and a retry
+        // dedups to `AlreadyHeld` without re-projecting (fail-open on "cease
+        // replicating on revoke"). sqlite always ran it inside.
+        pg_project_consent_peer_set(&*tx, &row).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
+        })?;
+        // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+        // `blob_renditions` projection on the same client.
+        pg_project_rendition_row(&*tx, &row).await?;
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attestation commit: {e}")))?;
@@ -6358,28 +6385,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.attestation_id,
                 )])
             });
-        // v17.4.0 (V106) — maintain the subject projection (federation tier).
-        pg_project_attestation_subjects(
-            &**client,
-            &row,
-            &row.attestation_id,
-            crate::federation::types::attestation_tier::FEDERATION,
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
-        })?;
-        // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
-        // projection (grant upsert / withdraws-revocation fold), same
-        // client/transaction as the insert above.
-        pg_project_consent_peer_set(&**client, &row)
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
-            })?;
-        // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
-        // `blob_renditions` projection on the same client.
-        pg_project_rendition_row(&**client, &row).await?;
         drop(client);
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`

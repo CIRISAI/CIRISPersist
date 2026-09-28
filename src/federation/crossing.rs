@@ -1029,7 +1029,7 @@ fn differs_in_covers(entry: &str, member: &str) -> bool {
 /// Envelope members a widening never touches and never lists in
 /// `differs_in`: the identity of the claim, the signed instants, the mirror,
 /// and the widening's own bookkeeping.
-pub const WIDENING_PROTECTED_MEMBERS: [&str; 7] = [
+pub const WIDENING_PROTECTED_MEMBERS: [&str; 8] = [
     paths::DIMENSION,
     "trace_id",
     paths::ROW,
@@ -1037,6 +1037,12 @@ pub const WIDENING_PROTECTED_MEMBERS: [&str; 7] = [
     paths::EXPIRES_AT,
     paths::REFERENCES_ATTESTATION_ID,
     paths::DIFFERS_IN,
+    // v51.0.0 (CIRISPersist#929, CC 5.4.6) — the CC 2.4.1.2 purpose marker
+    // (`delegation_purpose: owner_binding`) is what a receiving peer that does
+    // not hold the prior reads to know a widening announces an owner-binding;
+    // a widening that strips it would announce a minor's binding at
+    // federation scope past the minors gate on every peer lacking the prior.
+    "delegation_purpose",
 ];
 
 /// Position in the closed widening order [`cohort_scope::ALL`] — THE ordering

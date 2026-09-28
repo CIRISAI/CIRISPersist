@@ -7,6 +7,31 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [51.0.0] - UNRELEASED
+
+**MAJOR — the release adopters take ("no one adopts 50"): the rc6 security set, the sealed descriptor, the released-registry row for Edge, CIRISVerify 18.** Built directly on v50.0.0; every slice witnessed RED first on memory, sqlite and postgres, mutation-tested on a committed tree, and reviewed against its FSD before merge.
+
+### Added — the rc6 trust-root security set (CIRISPersist#937 / #938 / #939; CC 3.2 T4a / T6 / T7 on branch `rc6`; FSD `TRUST_ROOT_RC6.md`)
+_(filled at the merge: `LineageHeadCosign` under `ciris.lineage_head_cosign.v1`, V159, the cosign door and its eight refusals, the witnessed-head fold with the `ever_witnessed` exception, `hard_case:lineage_equivocation`, attach freshness `trust_root_head_stale` with `attach_window_secs` / `witness_cadence_secs` / `witness_quorum` as charter members (ENVELOPE_VOCABULARY_SHA256 re-pins), the liveness margin `Rooted { live }` with `hard_case:community_liveness_stalled/restored`, N ≥ M+1 at founding, floors that raise M refused, the restore discipline.)_
+
+### Changed — the description inside the seal (CIRISPersist#922 / #923; CIRISConstitution#114; FSD `MEDIA_SOURCE.md` §9)
+_(filled at the merge: `media.sealed_descriptor`; `format` REQUIRED iff no seal; one description; `MediaSource.format: Option<String>`; `Engine::seal_descriptor_for_blob` / `open_descriptor_for_blob` under the blob's DEK with AAD `ciris.sealed_descriptor.v1 ‖ sha256`; I121–I124.)_
+
+### Changed — the registry of record carries Edge's relay-delivery row (CIRISConstitution#129; CIRISPersist#924 re-vendor)
+_(filled when CC#129 lands: the vendored commit, `VENDORED_*`, the vector count, the matcher's answer for the ruled spelling — noted on CIRISEdge#702.)_
+
+### Changed — CIRISVerify 18.0.0 (CIRISVerify#296 / #297 / #295)
+The six verify-crate pins move to `v18.0.0` (`version = "18"`), the wheel's `Requires-Dist` to `ciris-verify>=18.0.0,<19`. Verify now emits `hardware_custody:{platform}:v1` with the registry's 13 platform tokens and the lowercase `accord:invoke:constitutional:{halt_id}:v1`; both admit under the vendored rc5 registry (replayed through the matcher in the re-pin witness). v50's "do not store 17.1.0's `hardware_custody` entries" note is lifted for 18.
+
+### Fixed — postgres projections run inside the attestation transaction (CIRISPersist#933)
+On postgres, `put_attestation`'s three projections (subjects, `consent_peer_set`, renditions) ran as autocommit statements AFTER the row's transaction committed; a failed `consent_peer_set` projection on a `withdraws` left a committed revocation never folded into the peer set, and a retry dedupped to `AlreadyHeld` without re-projecting — fail-open on CC's "cease replicating on revoke". They now run inside the transaction, before the commit; a failed projection rolls the row back. sqlite always ran them inside. _(witness: a projection fault leaves no row — filled at the merge)_
+
+### Fixed — a widening never strips the owner-binding purpose marker (CIRISPersist#929; CC 5.4.6)
+`delegation_purpose` joins `WIDENING_PROTECTED_MEMBERS` (8): a federation-scope `supersedes` that strips the CC 2.4.1.2 marker is refused as malformed, so a receiving peer that does not hold the self-scope prior can still see that a widening announces an owner-binding and run the minors gate on it. _(witness filled at the merge)_
+
+### Pins moved
+_(filled at the tag: `ENVELOPE_VOCABULARY_SHA256` old → new (#937 charter members); both capsule digests (appended ops); V159; the verify pins; `VENDORED_*` on the CC#129 re-vendor.)_
+
 ## [50.0.0] - 2026-09-26
 
 **MAJOR.** CIRISServer's second-device flow was blocked three ways in persist, and CIRISEdge's attributed sync door booked a duplicate as a refusal. Each interpretation below was checked against CC RC5, the FSDs and shipped code before building, and each turned out to be already decided there (FSD `SECOND_DEVICE.md` §0). Every slice was built by one agent and reviewed by another against the FSD before merge; most reviews changed the slice materially.
