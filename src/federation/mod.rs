@@ -4417,6 +4417,19 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — **the lineage-head cosign
+    /// door**: [`lineage_witness::admit_lineage_head_cosign`] over this
+    /// directory at the door's one clock read. A trait method so the capsule
+    /// proxies it (a replication bridge forwards cosigns) and every backend
+    /// runs the same door; the default body IS the door — no backend
+    /// overrides it.
+    async fn put_lineage_head_cosign(
+        &self,
+        cosign: lineage_witness::LineageHeadCosign,
+    ) -> Result<lineage_witness::LineageCosignOutcome, Error> {
+        lineage_witness::admit_lineage_head_cosign(self, &cosign, chrono::Utc::now()).await
+    }
+
     /// v51.0.0 (CIRISPersist#938) — every cosign held for `lineage_key_id`,
     /// ordered by `signed_at` then witness. Read by the witnessed-head fold and
     /// the bundle response. Default `Unsupported`; every real backend overrides.

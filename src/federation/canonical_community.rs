@@ -1612,7 +1612,7 @@ where
 
 /// v51.0.0 (CIRISPersist#938) — what the witness plane says about a chain this
 /// node holds (FSD `TRUST_ROOT_RC6.md` §3.2–§3.3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WitnessedHead {
     /// The chain index the standing is judged at: the latest witnessed
     /// version, or the fork point under equivocation. `None` when the lineage
@@ -1627,7 +1627,7 @@ pub struct WitnessedHead {
 }
 
 /// Two witnessed heads for one lineage (T6): the evidence object.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Equivocation {
     /// This node's witnessed head.
     pub held_head_digest: String,
@@ -2586,6 +2586,29 @@ pub struct ResolvedCommunity {
     pub consensus_protocol: String,
     /// `policy_blob.consensus_protocol_entrenched`.
     pub consensus_protocol_entrenched: bool,
+    /// v51.0.0 (CIRISPersist#939, CC 3.2 T7) — for a trust-root community:
+    /// live at ≥ M + 1 active founders; `false` = stalled (valid, non-admitting).
+    /// `true` for an ordinary room.
+    #[serde(default)]
+    pub live: bool,
+    /// v51.0.0 (CIRISPersist#938, T6) — the served head is a WITNESSED version
+    /// (`false` for a lineage the witness plane has never cosigned, which is
+    /// judged as before rc6, and for an ordinary room).
+    #[serde(default)]
+    pub witnessed: bool,
+    /// v51.0.0 (#938) — versions this node holds past the witnessed head, held
+    /// and not adopted.
+    #[serde(default)]
+    pub unwitnessed_tail: usize,
+    /// v51.0.0 (#938) — the lineage is frozen at the last common ancestor of
+    /// two witnessed heads; the evidence object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivocation: Option<Equivocation>,
+    /// v51.0.0 (#938 §3.2) — the latest cosign instant when it is older than
+    /// the charter's `witness_cadence_secs`: SILENT, a liveness signal, never a
+    /// validity leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_silent_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Resolve `community_key_id` from THIS node's state. `None` when no row is
@@ -2606,14 +2629,22 @@ where
         return Ok(None);
     };
     let trust_root = is_trust_root_grade(&community);
-    if trust_root
-        && !matches!(
-            stored_standing(directory, community_key_id).await?,
-            StoredStanding::Rooted(_)
-        )
-    {
-        return Ok(None);
+    let now = chrono::Utc::now();
+    let mut rooted_head: Option<Community> = None;
+    if trust_root {
+        match stored_standing_at(directory, community_key_id, now).await? {
+            StoredStanding::Rooted(signed) => rooted_head = Some(signed.community.clone()),
+            _ => return Ok(None),
+        }
     }
+    // v51.0.0 (#938) — a trust root resolves to its WITNESSED head (the
+    // judged version), which may be an ancestor of the stored row.
+    let community = rooted_head.unwrap_or(community);
+    let witness = if trust_root {
+        lineage_witness_view(directory, community_key_id, now).await?
+    } else {
+        None
+    };
     let roster = super::effective_roster(directory, &community).await?;
     let recorded: Vec<String> = founders(&community)
         .into_iter()
@@ -2649,6 +2680,31 @@ where
         cohort_subkind: policy_str(&community, "cohort_subkind").map(str::to_owned),
         consensus_protocol: community.consensus_protocol.clone(),
         consensus_protocol_entrenched: declares_entrenched(&community),
+        live: if trust_root {
+            let m = super::admission::infrastructure_quorum(&community.consensus_protocol)
+                .map(|(m, _)| m as usize)
+                .unwrap_or(usize::MAX);
+            founders(&community).len() >= m.saturating_add(1)
+        } else {
+            true
+        },
+        witnessed: witness.as_ref().is_some_and(|w| w.judged.is_some()),
+        unwitnessed_tail: witness.as_ref().map_or(0, |w| w.unwitnessed_tail),
+        equivocation: witness.as_ref().and_then(|w| w.equivocation.clone()),
+        witness_silent_since: match &witness {
+            Some(w) => {
+                let cadence = charter_members_for(directory, community_key_id)
+                    .await?
+                    .and_then(|c| c.witness_cadence_secs);
+                match (w.latest_cosign_at, cadence) {
+                    (Some(at), Some(c)) if now > at + chrono::Duration::seconds(c as i64) => {
+                        Some(at)
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
+        },
     }))
 }
 

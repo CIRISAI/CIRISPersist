@@ -6367,6 +6367,56 @@ impl Engine {
         }
     }
 
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6; `TRUST_ROOT_RC6.md` §2.1) —
+    /// **the lineage-head cosign door**: admit one witness's cosignature over a
+    /// conferring lineage's head (`ciris.lineage_head_cosign.v1`). The eight
+    /// typed refusals of the door come back as `Refused { reason }`; a cosign
+    /// for a head this node does not hold is stored as evidence
+    /// (`HeldForUnknownHead`). Nothing is ever deleted.
+    pub async fn put_lineage_head_cosign(
+        &self,
+        cosign: crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<crate::federation::lineage_witness::LineageCosignOutcome, crate::federation::Error>
+    {
+        use crate::federation::lineage_witness::admit_lineage_head_cosign;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                admit_lineage_head_cosign(arc.as_ref(), &cosign, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                admit_lineage_head_cosign(arc.as_ref(), &cosign, now).await
+            }
+        }
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held
+    /// trust-root lineage: the judged (witnessed) index, the unwitnessed tail,
+    /// any equivocation, the latest cosign instant. `None` when no signed row
+    /// is held.
+    pub async fn lineage_head(
+        &self,
+        community_key_id: &str,
+    ) -> Result<
+        Option<crate::federation::canonical_community::WitnessedHead>,
+        crate::federation::Error,
+    > {
+        use crate::federation::canonical_community::lineage_witness_view;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                lineage_witness_view(arc.as_ref(), community_key_id, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                lineage_witness_view(arc.as_ref(), community_key_id, now).await
+            }
+        }
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114; `MEDIA_SOURCE.md`
     /// §9.3) — **seal a small descriptor under an existing blob's DEK.** The
     /// caller is authorized exactly as [`read_blob_as`](Self::read_blob_as)

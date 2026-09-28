@@ -1075,6 +1075,12 @@ class Engine:
     def read_blob_range_as(self, at_rest_sha256_hex: str, viewer_key_id: str, start: int, end_inclusive: int, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (BLOB_ENCRYPTION_AT_REST.md §12.4) — the decrypting range read. Plaintext bytes [start, end_inclusive] of any blob as viewer_key_id, base64-en..."""
 
+    def put_lineage_head_cosign_json(self, payload_json: str) -> str:
+        """(derived) deontic — v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6; TRUST_ROOT_RC6.md §2.1) — the lineage-head cosign door: payload_json is a ciris.lineage_head_cosign.v1 object (lineage_key_id, head_digest_sha256_hex, head_asserted_at, prior_head_digest_sha256_hex?, signed_at, witness_key_id, signature_classical, signature_pqc). Returns the typed outcome as JSON ({"outcome": "inserted" | "unchanged" | "held_for_unknown_head" | "refused", "reason"?: witness_not_registered | witness_not_witness_type | witness_is_founder | signature_invalid | head_instant_mismatch | prior_not_ancestor | skew | malformed}). A witness that is a founder of the lineage is refused (independence); nothing is ever deleted (a competing head's cosign is the equivocation evidence)."""
+
+    def lineage_head_json(self, community_key_id: str) -> str:
+        """(derived) epistemic — v51.0.0 (CIRISPersist#938) — the witness plane's view of a held trust-root lineage as JSON: judged (the witnessed chain index the standing is judged at; null = never witnessed), unwitnessed_tail, equivocation (both digests, fork, cosign sets) and latest_cosign_at; null when no signed row is held."""
+
     def seal_descriptor_for_blob(self, at_rest_sha256_hex: str, key_id: str, plaintext_b64: str) -> str:
         """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114; MEDIA_SOURCE.md §9.3) — seal a descriptor ({name, format, codec?} as JCS, base64 in, ≤ the descriptor cap) under an EXISTING blob's DEK as key_id: authorized like read_blob_as (blob_not_granted for a non-member), the DEK is the blob's (no edge-derived key), AAD = ciris.sealed_descriptor.v1 ‖ sha256. A plaintext-tier row raises ValueError (nothing to seal under). Returns the base64 at-rest envelope for media.sealed_descriptor."""
 

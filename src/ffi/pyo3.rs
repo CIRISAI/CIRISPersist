@@ -11656,6 +11656,95 @@ impl PyEngine {
         })
     }
 
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — **the lineage-head cosign
+    /// door**: `payload_json` is a `ciris.lineage_head_cosign.v1` object
+    /// (`lineage_key_id`, `head_digest_sha256_hex`, `head_asserted_at`,
+    /// `prior_head_digest_sha256_hex?`, `signed_at`, `witness_key_id`,
+    /// `signature_classical`, `signature_pqc`). Returns the typed outcome as
+    /// JSON: `{"outcome": "inserted" | "unchanged" | "held_for_unknown_head" |
+    /// "refused", "reason"?: <rule>}`. Nothing is ever deleted.
+    fn put_lineage_head_cosign_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let cosign: crate::federation::lineage_witness::LineageHeadCosign =
+                serde_json::from_str(payload_json).map_err(|e| {
+                    PyValueError::new_err(format!("lineage head cosign decode: {e}"))
+                })?;
+            let backend = self.backend.clone();
+            let outcome = py.detach(move || {
+                let now = chrono::Utc::now();
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::lineage_witness::admit_lineage_head_cosign(
+                                &*b, &cosign, now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::lineage_witness::admit_lineage_head_cosign(
+                                &*b, &cosign, now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })
+                    }
+                }
+            })?;
+            serde_json::to_string(&outcome)
+                .map_err(|e| PyRuntimeError::new_err(format!("outcome encode: {e}")))
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held
+    /// trust-root lineage as JSON (`judged`, `unwitnessed_tail`,
+    /// `equivocation`, `latest_cosign_at`), or `null` when no signed row is held.
+    fn lineage_head_json(&self, py: Python<'_>, community_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let id = community_key_id.to_owned();
+            let backend = self.backend.clone();
+            let view = py.detach(move || {
+                let now = chrono::Utc::now();
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::lineage_witness_view(
+                                &*b, &id, now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::lineage_witness_view(
+                                &*b, &id, now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })
+                    }
+                }
+            })?;
+            serde_json::to_string(&view)
+                .map_err(|e| PyRuntimeError::new_err(format!("view encode: {e}")))
+        })
+    }
+
     // ── #302 (FSD-004) accord live-quorum write-through (CIRISServer#122) ──
     //
     // CIRISServer's Phase-3 runtime writes the verify-core wire objects +
