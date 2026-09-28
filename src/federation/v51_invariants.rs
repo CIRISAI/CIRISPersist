@@ -251,7 +251,7 @@ mod descriptor {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod owner_withdraw {
     use crate::federation::admission::resolve_withdraws_admission_rule;
     use crate::federation::admission::steward_liveness_test_support::{register, signed_row};
