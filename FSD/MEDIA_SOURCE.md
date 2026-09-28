@@ -346,3 +346,12 @@ take the same vectors).
   ruling; bundling it here would hold the cut Edge is waiting on. It is
   filed for the cut after v51 with the CC ask.
 - The disclosure store (#914): its own FSD.
+
+### 9.7 Mutation round (v51.0.0)
+
+| # | Mutant | Verdict | Killed by |
+|---|---|---|---|
+| S1 | one-description rule dropped | KILLED | media_source::tests::a_sealed_descriptor_is_one_description_and_never_opened |
+| S2 | descriptor AAD dropped at the seal | KILLED | v51_invariants::descriptor::postgres::i122, v51_invariants::descriptor::sqlite::i122 |
+
+S3 (a plaintext row sealable) is not a clean single-site mutant: the plaintext arm is one `match` arm whose only alternative is the refusal I122 asserts on both doors.

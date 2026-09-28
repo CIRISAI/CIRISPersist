@@ -136,3 +136,29 @@ Domain label dropped (STH cosign accepted as lineage cosign); founder-witness ad
 - Server#693 serves the cosign route and the head beside the bundle; Edge attaches through `pin_trust_from_bundle_response`; the canonical node re-commits both lineages at least once per cadence (Server).
 - Residual: the witness set's own standing is judged by `identity_type` and non-foundership only; a witness's revocation un-counts its cosigns from its `revoked_after` (every instant keyed, `valid_until`-bounded).
 - Residual: `witness_quorum` default 1 is persist's choice pending CC text; a charter may raise it.
+
+### 6.1 Mutation round (v51.0.0, on the committed tree; lane = rc6 + v51 + I190 + media + #929 witnesses on memory, sqlite, postgres)
+
+| # | Mutant | Verdict | Killed by |
+|---|---|---|---|
+| W1 | witness type check dropped | KILLED | memory::i191, postgres::i191, sqlite::i191 |
+| W2 | founder may witness | KILLED | memory::i191, postgres::i191, sqlite::i191 |
+| W3 | signature not verified | KILLED | memory::i191, postgres::i191, sqlite::i191 |
+| W4 | skew unchecked | KILLED | memory::i191, postgres::i191, sqlite::i191 |
+| W5 | head instant unchecked | KILLED | postgres_dyn::i190_o3, postgres_dyn::i190_o4, postgres_dyn::i190_p, postgres_dyn::i190_q, postgres_dyn::i190_r, postgres_dyn::i190_t, postgres_dyn::i190_u, postgres_dyn::i190_v |
+| W6 | prior ancestry unchecked | KILLED | memory::i191, postgres::i191, postgres::i193, postgres::i195b, postgres::i196, sqlite::i191, v51_invariants::descriptor::postgres::i122, v51_invariants::postgres::i125_a_failed_projection_rolls_the_row_back_on_postgres |
+| W7 | domain label dropped from the envelope | KILLED | lineage_witness::tests::the_domain_label_is_a_signed_member |
+| W8 | quorum ignored (any count witnesses) | KILLED | lineage_witness::tests::witnessed_counts_distinct_independent_witnesses |
+| W9 | founders count as witnesses | KILLED | lineage_witness::tests::witnessed_counts_distinct_independent_witnesses |
+| F1 | unwitnessed tail adopted | KILLED | memory::i192, postgres::i192, sqlite::i192 |
+| F2 | ever_witnessed exception widened (always unwitnessed = judged at birth) | KILLED | memory_dyn::i190_h, memory_dyn::i190_i, memory_dyn::i190_k, memory_dyn::i190_l, memory_dyn::i190_o, memory_dyn::i190_o3, memory_dyn::i190_o4, memory_dyn::i190_p |
+| F3 | equivocation freeze skipped | KILLED | memory::i193, postgres::i193, sqlite::i193 |
+| F4 | restore discipline dropped | KILLED | memory::i196, postgres::i196, sqlite::i196 |
+| F5 | liveness transition never emitted | KILLED | memory::i195, postgres::i195, sqlite::i195 |
+| A1 | stale head attaches | KILLED | memory::i194, postgres::i194, sqlite::i194 |
+| A2 | gate never armed | KILLED | memory::i194, postgres::i194, sqlite::i194 |
+| A3 | unwitnessed head attaches | KILLED | memory::i194, postgres::i194, sqlite::i194 |
+| A4 | any head digest accepted | KILLED | memory::i194, postgres::i194, sqlite::i194 |
+| L1 | founding floor at N >= M | KILLED | memory::i195b, postgres::i195b, sqlite::i195b |
+
+Every mutant reverted with `git checkout --` before the next; a `signal: 9` lane is re-run alone (none occurred). Rows marked NOT-APPLIED had a stale pattern and were re-run after the fix (their later row stands).

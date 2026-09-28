@@ -1561,3 +1561,9 @@ Lane (`--features sqlite,postgres --lib` under `scripts/pg_test_db.sh`, `-j 3`):
 ### 10.8 v51.0.0 — re-vendored at CIRISConstitution `651140a` (branch `rc6`; CIRISConstitution#129)
 
 The ruling that registers Edge's `capacity:relay_delivery` (CC 3.1.4 edge-owned, CC 3.4.5 reserved: no-self-emit + `analyze` consent; never a factor of `capacity:composite`) landed on `rc6` at `651140a`. Persist pins `namespace_registry.json` + `namespace_match_vectors.json` at exactly that commit (byte-identical; `cmp`): 149 families, 968 vectors, `registry_sha256 c22dc0874b4c…`, `source_sha256 fbb6c32e…`, `cc_version 1.0-rc6`, `VENDORED_CC_COMMIT 651140a2…`. CC's reference matcher is unchanged since the rc5 tag (no port). **Recipe change:** CC's grammar hash (`tools/build_cc_namespace.py`) now excludes `cc_version` from the preimage ("a bump is not a grammar change"); persist's recomputation test follows it — the recipe moves with the bytes it hashes. `VENDORED_FAMILY_PREFIXES` gains the row. Witness: the replay asserts `capacity:relay_delivery:v1` admits, `:V1` case-malformed, the bare stem missing-version, `capacity:made_up:v1` unregistered. `rc6` is a branch: persist re-vendors the tag when rc6 is cut; until then the ruling's landing commit is the registry of record for this row (maintainer's sequence, CIRISEdge#702).
+
+### 10.9 v51.0.0 — #929 (a widening never strips `delegation_purpose`)
+
+| # | Mutant | Verdict | Killed by |
+|---|---|---|---|
+| P1 | delegation_purpose unprotected | KILLED |  |
