@@ -5483,6 +5483,15 @@ impl PyEngine {
             // v47.0.0 (CIRISPersist#797) — waiting on a roster, not skipped.
             dict.set_item("awaiting_roster", report.awaiting_roster)?;
             dict.set_item("skipped", report.skipped)?;
+            // v50.0.0 (CIRISPersist#924) — grant-covered rows the grammar refuses.
+            dict.set_item(
+                "skipped_unmatched_dimension",
+                report.skipped_unmatched_dimension,
+            )?;
+            dict.set_item(
+                "unmatched_dimension_examples",
+                report.unmatched_dimension_examples.clone(),
+            )?;
             Ok(dict)
         })
     }

@@ -4989,6 +4989,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
             .await?;
 
+        // v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+        // owner-binding is never ANNOUNCED: refused at `cohort_scope:
+        // federation`. Backend-symmetric; verify-before-mutation.
+        crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
+
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
         // gate: a node has AT MOST ONE responsible steward, so a second,
         // distinct-owner owner-binding `delegates_to(U → node)` is rejected. Runs
@@ -29349,7 +29354,12 @@ mod tests {
         let mut binding = fed_attestation(&bid, &k, &k, &k);
         binding.attestation_envelope = serde_json::json!({
             "id": bid,
-            "dimension": format!("identity:canonical_binding:{canon}"),
+            "dimension": format!(
+                "identity:canonical_binding:{}",
+                canon
+                    .strip_prefix(crate::federation::admission::CANONICAL_KEY_ID_PREFIX)
+                    .expect("a canonical key id")
+            ),
             "score": 1.0,
             "confidence": 1.0,
             "witness_relation": "self",
@@ -39560,10 +39570,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_put_attestation_admits_novel_detection_subkind_from_lenscore_detector() {
-        // The wildcard grants the SAME novel subkind to a
-        // `lenscore_detector` key — the gate isn't a deny-only net, it
-        // actually admits the emission construction covers.
+    async fn sqlite_put_attestation_detector_admits_registered_leaf_refuses_unclaimed_924() {
+        // The reserved-prefix rule grants a `lenscore_detector` key the
+        // `detection:` space — the gate isn't a deny-only net, it admits the
+        // emission construction covers.
+        //
+        // v50.0.0 (CIRISPersist#924, CC rc5 CC 3.1.7 R3): until this cut the
+        // witness here was a NOVEL subkind (`detection:emergent_pattern:
+        // novel_signal:v1`) admitting from the detector. CC now carries
+        // `detection:` in `_meta.case_rule.reserved_stems`, and an unclaimed
+        // leaf under a reserved stem is `namespace_family_unregistered` — for
+        // ANY emitter, the detector included. So the admit leg moves to a
+        // registered leaf, and the novel subkind becomes the R2(b) leg.
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         // CIRISPersist#543 — `lenscore_detector` is accord-conferred, so the
@@ -39591,6 +39609,25 @@ mod tests {
             "k-a",
             "detector-key",
             "detection:emergent_pattern:novel_signal:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::NamespaceFamilyUnregistered { .. }
+            ),
+            "an unclaimed leaf under CC's reserved `detection:` stem is refused even from the \
+             detector: {err:?}"
+        );
+        let att = scores_attestation_with_dimension(
+            "att-registered-leaf-2",
+            "detector-key",
+            "k-a",
+            "detector-key",
+            "detection:hash_chain_integrity:v1",
         );
         backend
             .put_attestation(SignedAttestation { attestation: att })
@@ -41180,6 +41217,18 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::tier_ingest::test_support::exercise_node_speaks_for_owner(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+    /// owner-binding is never announced, sqlite arm.
+    #[tokio::test]
+    async fn minor_owner_binding_at_federation_is_refused_q5_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::tier_ingest::test_support::exercise_minor_owner_binding_is_not_announced(
             &backend, "sqlite",
         )
         .await;
@@ -45785,7 +45834,7 @@ mod tests {
         }
         for token in [
             "capacity_assurance:panel:financial:incapacitated:v1",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         ] {
             backend
                 .put_attestation(SignedAttestation {
@@ -45849,7 +45898,7 @@ mod tests {
             .unwrap();
         for token in [
             "capacity_assurance:panel:financial:incapacitated:v1",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         ] {
             backend
                 .put_attestation(SignedAttestation {
@@ -51256,6 +51305,32 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
                 )
             })()
             .expect("downgrade_to_v30 update");
+        }
+    }
+
+    impl SqliteBackend {
+        /// v50.0.0 (CIRISPersist#924) — simulate a row STORED BEFORE v50 on a
+        /// shape v50's door now refuses: rewrite a stored row's envelope
+        /// `dimension` directly (the door would refuse the shape, so the seam
+        /// reaches the connection, as `downgrade_to_v30` does).
+        pub(crate) fn rewrite_dimension_for_test(&self, attestation_id: &str, dimension: &str) {
+            let conn = self.conn.lock();
+            let envelope: String = conn
+                .query_row(
+                    "SELECT attestation_envelope FROM federation_attestations \
+                     WHERE attestation_id = ?1",
+                    rusqlite::params![attestation_id],
+                    |r| r.get(0),
+                )
+                .expect("row exists");
+            let mut v: serde_json::Value = serde_json::from_str(&envelope).expect("json");
+            v["dimension"] = serde_json::json!(dimension);
+            conn.execute(
+                "UPDATE federation_attestations SET attestation_envelope = ?2 \
+                 WHERE attestation_id = ?1",
+                rusqlite::params![attestation_id, serde_json::to_string(&v).expect("json")],
+            )
+            .expect("rewrite dimension");
         }
     }
 

@@ -982,6 +982,94 @@ mod run {
         );
     }
 
+    /// **v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — a grant-covered row on
+    /// a shape the CC 3.1.7 R3 grammar refuses is COUNTED, not silently
+    /// passed over.** One local row on a pre-rc5 shape (`trace:complete`, no
+    /// version segment) and one conformant sibling, both under a `share`
+    /// grant on `trace:`: the conformant row crosses, the old-shape row stays
+    /// local and the report names it. Consent only ever narrows onto the
+    /// grammar; this is what makes the narrowing visible.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweep_counts_grant_covered_rows_the_grammar_refuses_924() {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        use crate::federation::FederationDirectory;
+        let run = suffix();
+        let engine =
+            crate::Engine::with_signer(ts::local_signer(&format!("u924-{run}")), "sqlite::memory:")
+                .await
+                .unwrap();
+        let node = engine
+            .register_self_federation_key("primitive", "ref", None, serde_json::json!({}), vec![])
+            .await
+            .unwrap();
+        let sq = engine.sqlite_backend().unwrap().clone();
+        let local = |dim: &str, tag: &str| crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: node.clone(),
+            attested_key_id: None,
+            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "dimension": dim, "trace_id": format!("u924-{tag}-{run}"),
+                    "agent_id_hash": "agent-hash-u924", "trace": {},
+                }),
+            )
+            .unwrap(),
+            subject_key_ids: vec![node.clone()],
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        // A row stored BEFORE v50 on a pre-rc5 shape: v50's own local door
+        // refuses the unversioned shape, so the row is written conformant and
+        // its stored dimension rewritten underneath, as a v49 store holds it.
+        let old_id = sq
+            .attestation_insert_local(local("trace:complete:v1", "old"))
+            .await
+            .unwrap();
+        sq.rewrite_dimension_for_test(&old_id, "trace:complete");
+        let new_id = sq
+            .attestation_insert_local(local("trace:complete:v1", "new"))
+            .await
+            .unwrap();
+        let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "subject_key_ids": [format!("u924-peer-{run}")],
+            "payload": {"grants": "replication", "attestation_prefixes": ["trace:"],
+                        "audience": "federation", "principle": "share"},
+            "subject_kind": "consent_replication",
+        }))
+        .unwrap();
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            envelope,
+            cohort_scope::FEDERATION,
+        );
+        input.subject_key_ids = vec![format!("u924-peer-{run}")];
+        engine.emit_attestation_self(input).await.unwrap();
+
+        let report = engine.promote_consented_backlog().await.unwrap();
+        assert_eq!(report.skipped_unmatched_dimension, 1, "{report:?}");
+        assert_eq!(
+            report.unmatched_dimension_examples,
+            vec!["trace:complete".to_owned()]
+        );
+        assert_eq!(
+            sq.get_attestation(&old_id).await.unwrap().unwrap().tier,
+            attestation_tier::LOCAL,
+            "the old-shape row is not promoted"
+        );
+        assert_eq!(
+            sq.get_attestation(&new_id).await.unwrap().unwrap().tier,
+            attestation_tier::FEDERATION,
+            "its conformant sibling is"
+        );
+    }
+
     /// **I109 — the sweep records a lapsed grant as `consent:state:expired`
     /// with its edge, signed by the node, once.**
     #[cfg(feature = "sqlite")]

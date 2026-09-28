@@ -14,11 +14,11 @@
 //!   incapacitated}`. Witness-RESERVED (`witness ∈ attesting_key.identity_type`)
 //!   AND the subject MUST NOT self-emit — enforced at admission (see
 //!   [`super::admission::check_reserved_prefix_admission`]).
-//! - `capacity_assurance:reversible_excluded:{domain}` — the mandatory
+//! - `capacity_assurance:reversible_excluded:{domain}:{version}` — the mandatory
 //!   companion: delirium / infection-confusion / depression / polypharmacy
 //!   have been ruled out for `{domain}` (the genuine restoration path and the
 //!   most-abused mis-attribution). Required for any *continuing* binding.
-//! - `capacity_assurance:reversible_pending:{domain}` — ACUTE-WINDOW ONLY:
+//! - `capacity_assurance:reversible_pending:{domain}:{version}` — ACUTE-WINDOW ONLY:
 //!   exclusion in progress; admissible solely for the T1 emergency-necessity
 //!   tier and MUST resolve to `reversible_excluded` or the binding lapses.
 //!
@@ -63,12 +63,72 @@ pub mod capacity_band {
 
 /// The reversible-cause exclusion companion sub-prefixes (CC 3.4.12).
 pub mod reversible {
-    /// `capacity_assurance:reversible_excluded:{domain}` — reversible mimics
-    /// ruled out for the domain (mandatory for a continuing binding).
+    /// `capacity_assurance:reversible_excluded:{domain}:{version}` — reversible
+    /// mimics ruled out for the domain (mandatory for a continuing binding).
     pub const EXCLUDED_PREFIX: &str = "capacity_assurance:reversible_excluded:";
-    /// `capacity_assurance:reversible_pending:{domain}` — exclusion in
-    /// progress (T1 acute-window only).
+    /// `capacity_assurance:reversible_pending:{domain}:{version}` — exclusion
+    /// in progress (T1 acute-window only).
     pub const PENDING_PREFIX: &str = "capacity_assurance:reversible_pending:";
+    /// The released CC rc5 registry rows for the two companions
+    /// (CIRISConstitution#117, vendored at c60d0a6).
+    pub const EXCLUDED_FAMILY: &str = "capacity_assurance:reversible_excluded:{domain}:{version}";
+    /// See [`EXCLUDED_FAMILY`].
+    pub const PENDING_FAMILY: &str = "capacity_assurance:reversible_pending:{domain}:{version}";
+
+    /// v50.0.0 (CIRISPersist#924) — why a companion namespace is malformed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CompanionShapeError {
+        /// The dimension resolves to a companion ROW but breaks its grammar
+        /// (`Financial`, `v1beta`) — `namespace_dimension_case_malformed`.
+        CaseMalformed,
+        /// Under a companion prefix but not a well-formed companion: no
+        /// version tail, extra depth, or a shape the matcher gives another row.
+        Unregistered,
+    }
+
+    /// v50.0.0 (CIRISPersist#924) — the ONE parse of a CC 3.4.12 companion,
+    /// through the one matcher: the dimension must resolve to its registry
+    /// row ([`EXCLUDED_FAMILY`] / [`PENDING_FAMILY`], CIRISConstitution#117)
+    /// with no refusal — one lowercase `{domain}` and the trailing version.
+    /// `Ok(None)` for a namespace under neither prefix;
+    /// `Ok(Some((prefix, domain)))` for a well-formed companion.
+    ///
+    /// Before the released rc5 the registry had no row for these, so this was
+    /// a hand check standing in for the grammar beside an R2(b) carve-out.
+    /// The rows now carry the grammar; the parse reads the matcher's answer,
+    /// and R2(b) still refuses whatever it rejects on the `attestation_type`
+    /// surface (the case gate reads only the envelope dimension), so a
+    /// malformed companion can neither be admitted nor counted by the fold.
+    pub fn parse_companion(
+        namespace: &str,
+    ) -> Result<Option<(&'static str, &str)>, CompanionShapeError> {
+        use crate::federation::namespace::matcher::{match_family, Refusal};
+        let Some((prefix, rest)) = [EXCLUDED_PREFIX, PENDING_PREFIX]
+            .into_iter()
+            .find_map(|p| namespace.strip_prefix(p).map(|r| (p, r)))
+        else {
+            return Ok(None);
+        };
+        let row = if prefix == EXCLUDED_PREFIX {
+            EXCLUDED_FAMILY
+        } else {
+            PENDING_FAMILY
+        };
+        let m = match_family(namespace);
+        match (m.family, m.refusal) {
+            (Some(f), None) if f == row => {
+                // The row is `{domain}:{version}` below the prefix, so the
+                // domain is the first segment of the remainder.
+                Ok(Some((prefix, rest.split(':').next().unwrap_or(rest))))
+            }
+            (Some(f), Some(Refusal::CaseMalformed | Refusal::VocabValueUnregistered))
+                if f == row =>
+            {
+                Err(CompanionShapeError::CaseMalformed)
+            }
+            _ => Err(CompanionShapeError::Unregistered),
+        }
+    }
 }
 
 /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — **T2 periodic-review cadence**:
@@ -341,12 +401,10 @@ pub async fn incapacity_facts(
                     .incapacity_attesters
                     .insert(r.attesting_key_id.clone());
             }
-        } else if let Some(d) = at.strip_prefix(reversible::EXCLUDED_PREFIX) {
-            if !d.is_empty() {
+        } else if let Ok(Some((prefix, d))) = reversible::parse_companion(at) {
+            if prefix == reversible::EXCLUDED_PREFIX {
                 facts.reversible_excluded_domains.insert(d.to_owned());
-            }
-        } else if let Some(d) = at.strip_prefix(reversible::PENDING_PREFIX) {
-            if !d.is_empty() {
+            } else {
                 facts.reversible_pending_domains.insert(d.to_owned());
             }
         }

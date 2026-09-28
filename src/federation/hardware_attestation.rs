@@ -1226,12 +1226,232 @@ pub fn record_ed25519(row: &crate::federation::types::KeyRecord) -> Option<Vec<u
         .filter(|k| k.len() == 32)
 }
 
+// ── v50.0.0 (CIRISPersist#924) — the hardware vocabulary (CC 3.1.2 / 4.2.2) ──
+
+/// The registry family whose `{platform}` is the custody MECHANISM a key runs
+/// on (CC 3.1.2): a CLOSED lowercase vocabulary generated from
+/// [`HardwareType`] (CIRISConstitution#107 / #112).
+pub const HARDWARE_CUSTODY_FAMILY: &str = "hardware_custody:{platform}";
+
+/// Every [`HardwareType`], in its declaration order. Completeness is pinned by
+/// `tests::hardware_type_list_is_complete` against the exhaustive
+/// [`HardwareTypePlatform::as_platform`] match.
+pub const HARDWARE_TYPES: [HardwareType; 13] = [
+    HardwareType::AndroidKeystore,
+    HardwareType::AndroidStrongbox,
+    HardwareType::IosSecureEnclave,
+    HardwareType::MacOsSecureEnclave,
+    HardwareType::TpmDiscrete,
+    HardwareType::TpmFirmware,
+    HardwareType::IntelSgx,
+    HardwareType::SoftwareOnly,
+    HardwareType::AwsCloudHsm,
+    HardwareType::AzureHsm,
+    HardwareType::GcpCloudHsm,
+    HardwareType::YubiHsm,
+    HardwareType::ExternalSecureElement,
+];
+
+/// v50.0.0 (CIRISPersist#924, CC 3.1.2) — the `hardware_custody:{platform}`
+/// token of a [`HardwareType`]: its snake_case, exactly as the registry
+/// enumerates it. `ciris_keyring` carries no such spelling (its `Debug` name
+/// `TpmDiscrete` lowercases to `tpmdiscrete`, which CC names as the refused
+/// shape), so persist supplies it here and
+/// `tests::hardware_type_platforms_equal_registry_values_107` holds it equal to
+/// the vendored registry's closed `{platform}` values.
+pub trait HardwareTypePlatform {
+    /// The registry spelling.
+    fn as_platform(&self) -> &'static str;
+}
+
+impl HardwareTypePlatform for HardwareType {
+    fn as_platform(&self) -> &'static str {
+        // Exhaustive on purpose: a new keyring variant is a compile error
+        // here, which is where its spelling must be decided.
+        match self {
+            HardwareType::AndroidKeystore => "android_keystore",
+            HardwareType::AndroidStrongbox => "android_strongbox",
+            HardwareType::IosSecureEnclave => "ios_secure_enclave",
+            HardwareType::MacOsSecureEnclave => "mac_os_secure_enclave",
+            HardwareType::TpmDiscrete => "tpm_discrete",
+            HardwareType::TpmFirmware => "tpm_firmware",
+            HardwareType::IntelSgx => "intel_sgx",
+            HardwareType::SoftwareOnly => "software_only",
+            HardwareType::AwsCloudHsm => "aws_cloud_hsm",
+            HardwareType::AzureHsm => "azure_hsm",
+            HardwareType::GcpCloudHsm => "gcp_cloud_hsm",
+            HardwareType::YubiHsm => "yubi_hsm",
+            HardwareType::ExternalSecureElement => "external_secure_element",
+        }
+    }
+}
+
+/// The [`HardwareType`] a `hardware_custody:{platform}` token names, or `None`
+/// for anything outside the closed vocabulary (`tpm`, `tpmdiscrete`,
+/// `TpmDiscrete` — refused, never folded).
+#[must_use]
+pub fn hardware_type_from_platform(platform: &str) -> Option<HardwareType> {
+    HARDWARE_TYPES
+        .into_iter()
+        .find(|h| h.as_platform() == platform)
+}
+
+/// CC 4.2.2 — `(hardware_class, trust multiplier, the custody platforms it
+/// runs on)`. `hardware_class` is the holder's certified-class CLAIM, a JSON
+/// property on the key record and inside `attestation_evidence` — never a
+/// dimension, never a column, never a value of `{platform}`.
+pub const HARDWARE_CLASS_TABLE: &[(&str, f64, &[&str])] = &[
+    (
+        "HSM_FIPS_140_3_L3",
+        1.0,
+        &["aws_cloud_hsm", "azure_hsm", "gcp_cloud_hsm", "yubi_hsm"],
+    ),
+    (
+        "Apple_Secure_Enclave",
+        0.95,
+        &["ios_secure_enclave", "mac_os_secure_enclave"],
+    ),
+    ("YubiKey_5_FIPS", 0.95, &["external_secure_element"]),
+    ("TPM_2_0", 0.9, &["tpm_discrete", "tpm_firmware"]),
+    ("placeholder_pending_provisioning", 0.0, &[]),
+    ("software_hsm_development", 0.0, &["software_only"]),
+];
+
+/// CC 4.2.2 — the recommended trust multiplier for a `hardware_class`. **A
+/// class the table does not list carries 0.0** — "an unlisted class is a
+/// claim nobody rated, not a claim rated by its own spelling" (so `YubiKey_5`,
+/// `Nitrokey`, `Android_TEE`, … are 0.0 until a CC row rates them). Compared
+/// byte-exactly: the class is outside R3 and its stored spelling stands.
+#[must_use]
+pub fn hardware_class_multiplier(hardware_class: &str) -> f64 {
+    HARDWARE_CLASS_TABLE
+        .iter()
+        .find(|(c, _, _)| *c == hardware_class)
+        .map_or(0.0, |(_, m, _)| *m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ciris_keyring::{
         AndroidAttestation, ExternalSecureElementAttestation, IosAttestation, SoftwareAttestation,
     };
+
+    /// v50.0.0 (CIRISPersist#924, CIRISConstitution#107) — the
+    /// `HardwareType::as_platform()` set IS the registry's closed
+    /// `hardware_custody:{platform}` enumeration, both ways, and each token
+    /// resolves through the one matcher without refusal.
+    #[test]
+    fn hardware_type_platforms_equal_registry_values_107() {
+        use crate::federation::namespace::matcher::{match_family, placeholder_values, Refusal};
+        let (values, open) = placeholder_values(HARDWARE_CUSTODY_FAMILY, "{platform}")
+            .expect("rc5 enumerates hardware_custody:{platform}");
+        assert!(!open, "CC closes the platform vocabulary");
+        let registry: std::collections::BTreeSet<&str> =
+            values.iter().map(String::as_str).collect();
+        let ours: std::collections::BTreeSet<&str> = HARDWARE_TYPES
+            .iter()
+            .map(HardwareTypePlatform::as_platform)
+            .collect();
+        assert_eq!(ours.len(), 13, "as_platform is injective over 13 variants");
+        assert_eq!(ours, registry);
+        for h in HARDWARE_TYPES {
+            let dim = format!("hardware_custody:{}:v1", h.as_platform());
+            let m = match_family(&dim);
+            assert_eq!(
+                (m.family, m.refusal),
+                (Some(HARDWARE_CUSTODY_FAMILY), None),
+                "{dim}"
+            );
+            assert_eq!(hardware_type_from_platform(h.as_platform()), Some(h));
+        }
+        for legacy in [
+            "tpm",
+            "android",
+            "software_fallback",
+            "tpmdiscrete",
+            "TpmDiscrete",
+        ] {
+            assert_eq!(hardware_type_from_platform(legacy), None, "{legacy}");
+            assert!(
+                match_family(&format!("hardware_custody:{legacy}:v1"))
+                    .refusal
+                    .is_some_and(|r| matches!(
+                        r,
+                        Refusal::VocabValueUnregistered | Refusal::CaseMalformed
+                    )),
+                "{legacy} is refused, never folded"
+            );
+        }
+    }
+
+    /// Every [`HardwareType`] is in [`HARDWARE_TYPES`] exactly once. The
+    /// exhaustive `as_platform` match forces a new variant to get a spelling;
+    /// this forces it into the list the vocabulary test walks.
+    #[test]
+    fn hardware_type_list_is_complete() {
+        const fn index(h: HardwareType) -> usize {
+            match h {
+                HardwareType::AndroidKeystore => 0,
+                HardwareType::AndroidStrongbox => 1,
+                HardwareType::IosSecureEnclave => 2,
+                HardwareType::MacOsSecureEnclave => 3,
+                HardwareType::TpmDiscrete => 4,
+                HardwareType::TpmFirmware => 5,
+                HardwareType::IntelSgx => 6,
+                HardwareType::SoftwareOnly => 7,
+                HardwareType::AwsCloudHsm => 8,
+                HardwareType::AzureHsm => 9,
+                HardwareType::GcpCloudHsm => 10,
+                HardwareType::YubiHsm => 11,
+                HardwareType::ExternalSecureElement => 12,
+            }
+        }
+        let mut seen = [false; 13];
+        for h in HARDWARE_TYPES {
+            assert!(!std::mem::replace(&mut seen[index(h)], true), "{h:?} twice");
+        }
+        assert!(seen.iter().all(|s| *s));
+    }
+
+    /// CC 4.2.2 — the class table's multipliers, its class→mechanism mapping
+    /// stays inside the registry's platform vocabulary, and an UNLISTED class
+    /// is 0.0 (including every class code has minted beyond the table).
+    #[test]
+    fn hardware_type_class_multipliers_follow_cc_4_2_2_unlisted_is_zero() {
+        assert_eq!(hardware_class_multiplier("HSM_FIPS_140_3_L3"), 1.0);
+        assert_eq!(hardware_class_multiplier("Apple_Secure_Enclave"), 0.95);
+        assert_eq!(hardware_class_multiplier("YubiKey_5_FIPS"), 0.95);
+        assert_eq!(hardware_class_multiplier("TPM_2_0"), 0.9);
+        assert_eq!(
+            hardware_class_multiplier("placeholder_pending_provisioning"),
+            0.0
+        );
+        assert_eq!(hardware_class_multiplier("software_hsm_development"), 0.0);
+        for unlisted in [
+            "YubiKey_5",
+            "Nitrokey",
+            "ExternalToken_Generic",
+            "Passkey_Synced",
+            "Android_Software",
+            "Android_TEE",
+            "Android_StrongBox",
+            "Apple_AppAttest",
+            "SoftwareOnly_TEST",
+            "yubikey_5_fips",
+            "",
+        ] {
+            assert_eq!(hardware_class_multiplier(unlisted), 0.0, "{unlisted:?}");
+        }
+        for (class, _, platforms) in HARDWARE_CLASS_TABLE {
+            for p in *platforms {
+                assert!(
+                    hardware_type_from_platform(p).is_some(),
+                    "{class} maps to {p:?}, which is not a hardware_custody platform"
+                );
+            }
+        }
+    }
 
     fn android_full() -> PlatformAttestation {
         PlatformAttestation::Android(AndroidAttestation {

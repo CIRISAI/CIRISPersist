@@ -3728,6 +3728,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
             .await?;
 
+        // v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+        // owner-binding is never ANNOUNCED: refused at `cohort_scope:
+        // federation`. Backend-symmetric; verify-before-mutation.
+        crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
+
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
         // gate: a node has AT MOST ONE responsible steward, so a second,
         // distinct-owner owner-binding `delegates_to(U → node)` is rejected. This
@@ -13427,6 +13432,17 @@ mod tests {
         .await;
     }
 
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+    /// owner-binding is never announced, memory arm.
+    #[tokio::test]
+    async fn minor_owner_binding_at_federation_is_refused_q5() {
+        let backend = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::exercise_minor_owner_binding_is_not_announced(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     /// v38.2.0 (CIRISPersist#757) — owner-signed community row, memory arm.
     #[tokio::test]
     async fn owner_signed_community_row_memory_757() {
@@ -20074,7 +20090,12 @@ mod tests {
         let mut binding = fix_attestation("bind-1", "K", "K", "registry-steward");
         binding.attestation_envelope = serde_json::json!({
             "id": "bind-1",
-            "dimension": format!("identity:canonical_binding:{canonical_h}"),
+            "dimension": format!(
+                "identity:canonical_binding:{}",
+                canonical_h
+                    .strip_prefix(crate::federation::admission::CANONICAL_KEY_ID_PREFIX)
+                    .expect("a canonical key id")
+            ),
             "score": 1.0,
             "confidence": 1.0,
             "witness_relation": "self",
@@ -23572,7 +23593,7 @@ mod tests {
                     "wts-self-minor",
                     "wts-T",
                     "wts-T",
-                    "age_self_declared:minor:v1",
+                    "age_self_declared:band:minor:v1",
                 ),
             })
             .await
@@ -23918,7 +23939,7 @@ mod tests {
             "aic-fin-rex",
             "ai-assessor",
             "ai-A",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         )
         .await;
 
@@ -24072,7 +24093,7 @@ mod tests {
             "t1c-pend",
             "t1-assessor",
             "t1-A",
-            "capacity_assurance:reversible_pending:medical",
+            "capacity_assurance:reversible_pending:medical:v1",
         )
         .await;
 
@@ -24133,7 +24154,7 @@ mod tests {
             "pdc-rex",
             "pd-assessor",
             "pd-A",
-            "capacity_assurance:reversible_excluded:voting",
+            "capacity_assurance:reversible_excluded:voting:v1",
         )
         .await;
         let e = backend
@@ -24176,7 +24197,7 @@ mod tests {
             "cfc-rex",
             "cf-assessor",
             "cf-A",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         )
         .await;
         // petitioner == the assessor → conflicted.
@@ -24220,7 +24241,7 @@ mod tests {
             "flc-rex",
             "fl-assessor",
             "fl-A",
-            "capacity_assurance:reversible_excluded:financial",
+            "capacity_assurance:reversible_excluded:financial:v1",
         )
         .await;
         // Admit a binding whose valid_until is ALREADY in the past (structurally

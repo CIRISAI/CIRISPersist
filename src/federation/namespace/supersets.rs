@@ -1738,7 +1738,7 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         // One number, stated once: the message reads it, so it cannot go stale.
-        const EXPECTED: usize = 97;
+        const EXPECTED: usize = 111;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
@@ -1847,12 +1847,22 @@ mod tests {
     /// asserts that too, so an entry cannot be used to hide a live dead
     /// citation (if the symbol is still present, it must satisfy the liveness
     /// bar like everything else).
-    const DELETED_PENDING_REVENDOR: &[(&str, &str)] = &[(
-        "duty_holders_from_signed_subjects",
-        "deleted in v22.0.0 (#543): unioned caller-declared subject_key_ids into the authority \
-         set — the #517 vulnerability. The manifest labels it \"the drift site\"; the row \
-         graduates at the #520 re-vendor.",
-    )];
+    const DELETED_PENDING_REVENDOR: &[(&str, &str)] = &[
+        (
+            "duty_holders_from_signed_subjects",
+            "deleted in v22.0.0 (#543): unioned caller-declared subject_key_ids into the \
+             authority set — the #517 vulnerability. The manifest labels it \"the drift \
+             site\"; the row graduates at the #520 re-vendor.",
+        ),
+        (
+            "is_attestation_ladder_dimension",
+            "deleted in v50.0.0 (#924, CIRISConstitution#112): the attestation-ladder \
+             version carve-out stopped being code — Layer 2b reads CC's \
+             `_meta.case_rule.version_segment.exempt` list through \
+             namespace::matcher::is_version_exempt. The walk's citation graduates at the #520 \
+             re-vendor.",
+        ),
+    ];
 
     const EXPORTED_API_CITATIONS: &[&str] = &[
         // `FederationDirectory` trait method — the consent-SLA watcher a host
@@ -2176,7 +2186,7 @@ mod tests {
             .filter(|p| {
                 // `foo:*` → the family stem `foo:`.
                 let stem = p.trim_end_matches('*');
-                !super::super::registry::is_family_registered(stem)
+                !super::super::registry::is_stem_registered(stem)
             })
             .collect();
         let declared: std::collections::BTreeSet<&str> =
@@ -2193,7 +2203,7 @@ mod tests {
         );
         let resolved: Vec<&&str> = STILL_UNREGISTERED_COVERAGE_GAP
             .iter()
-            .filter(|p| super::super::registry::is_family_registered(p.trim_end_matches('*')))
+            .filter(|p| super::super::registry::is_stem_registered(p.trim_end_matches('*')))
             .collect();
         assert!(
             resolved.is_empty(),
@@ -3252,7 +3262,7 @@ mod tests {
                  it — the record describes nothing. Remove it here and from the R2 exception list."
             );
             assert!(
-                !registry::is_family_registered(stem),
+                !registry::is_stem_registered(stem),
                 "{stem:?} is recorded as uncatalogued but the vendored registry now REGISTERS it \
                  ({tracked} landed) — delete the line here and in UNREGISTERED_GATED_FAMILIES so \
                  CC 3.1.7 R2 judges it like every other family"

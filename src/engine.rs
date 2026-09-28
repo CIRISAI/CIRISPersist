@@ -873,6 +873,35 @@ struct RowPlacement {
     strip: Vec<String>,
 }
 
+/// v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — a row the grants' PREFIXES
+/// cover but whose dimension the one matcher refuses: counted and sampled on
+/// the report, never promoted or widened.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn note_if_grammar_stranded(
+    prefixes: &[String],
+    row: &crate::federation::Attestation,
+    report: &mut crate::federation::ConsentSweepReport,
+) {
+    let Some(dimension) =
+        crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+    else {
+        return;
+    };
+    if prefixes.iter().any(|p| dimension.starts_with(p.as_str()))
+        && crate::federation::namespace::matcher::match_family(dimension)
+            .refusal
+            .is_some()
+    {
+        tracing::debug!(
+            attestation_id = %row.attestation_id,
+            dimension,
+            "consent sweep: a grant's prefix covers this row but the CC 3.1.7 R3 grammar refuses \
+             its dimension; not promoted (CIRISPersist#924)"
+        );
+        report.note_unmatched_dimension(dimension);
+    }
+}
+
 /// Resolve a row's placement under the live egress grants. `None` when no
 /// grant covers its dimension. Audience: the covering grants' common audience;
 /// if they disagree, `federation` when every one says so, else the first by
@@ -3968,6 +3997,7 @@ impl Engine {
             cursor = page.last().map(|r| r.attestation_id.clone());
             for row in &page {
                 let Some(placement) = resolve_row_placement(&active, &prefixes, row) else {
+                    note_if_grammar_stranded(&prefixes, row, &mut report);
                     continue;
                 };
                 if self.sweep_enter(row, &placement, &mut report).await {
@@ -3985,10 +4015,21 @@ impl Engine {
             cursor = page.last().map(|r| r.attestation_id.clone());
             for row in &page {
                 let Some(placement) = resolve_row_placement(&active, &prefixes, row) else {
+                    note_if_grammar_stranded(&prefixes, row, &mut report);
                     continue;
                 };
                 self.sweep_widen(row, &placement, &mut report).await;
             }
+        }
+        if report.skipped_unmatched_dimension > 0 {
+            tracing::warn!(
+                count = report.skipped_unmatched_dimension,
+                examples = ?report.unmatched_dimension_examples,
+                "consent sweep: rows a live grant's prefix covers were NOT promoted or widened \
+                 because their dimension fails the CC 3.1.7 R3 grammar (typically stored before \
+                 v50.0.0 on a pre-rc5 shape; CIRISPersist#924). Re-emit them on the conformant \
+                 dimension."
+            );
         }
         Ok(report)
     }
@@ -17202,7 +17243,7 @@ mod tests {
             ),
             (
                 "ward-A",
-                "capacity_assurance:reversible_excluded:financial",
+                "capacity_assurance:reversible_excluded:financial:v1",
                 "sbi-a-rev",
             ),
         ] {
@@ -17375,7 +17416,7 @@ mod tests {
         // The subject self-declares MINOR (self rung; attested defaults to
         // the emitter — subject-signed by design).
         let self_minor = crate::federation::EmitAttestationInput::with_envelope(
-            "age_self_declared:minor:v1",
+            "age_self_declared:band:minor:v1",
             crate::federation::envelope::EnvelopeCore::from_value(
                 serde_json::json!({ "id": "wtse-self-minor" }),
             )
@@ -17509,7 +17550,7 @@ mod tests {
             .emit_attestation(
                 &t_signer,
                 crate::federation::EmitAttestationInput::with_envelope(
-                    "age_self_declared:minor:v1",
+                    "age_self_declared:band:minor:v1",
                     crate::federation::envelope::EnvelopeCore::from_value(
                         serde_json::json!({ "id": format!("pgw-self-{run}") }),
                     )

@@ -5993,6 +5993,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
             .await?;
 
+        // v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+        // owner-binding is never ANNOUNCED: refused at `cohort_scope:
+        // federation`. Backend-symmetric; verify-before-mutation.
+        crate::federation::admission::check_minor_owner_binding_not_announced(self, &row).await?;
+
         // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
         // gate: a node has AT MOST ONE responsible steward, so a second,
         // distinct-owner owner-binding `delegates_to(U → node)` is rejected.
@@ -36716,6 +36721,26 @@ mod tests {
         .await;
     }
 
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CC 3.4.13 Q5) — a minor's
+    /// owner-binding is never announced, postgres arm.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn minor_owner_binding_at_federation_is_refused_q5_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        crate::store::backend::Backend::run_migrations(&backend)
+            .await
+            .unwrap();
+        let suffix = uuid_like();
+        crate::federation::tier_ingest::test_support::exercise_minor_owner_binding_is_not_announced(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v38.2.0 (CIRISPersist#757) — owner-signed community row, postgres arm.
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -39353,7 +39378,12 @@ mod tests {
         // K self-asserts the canonical binding K → H.
         let mut binding = pg_scores_attestation(&k, &k, &k, "identity_binding:v1");
         binding.attestation_envelope = serde_json::json!({
-            "dimension": format!("identity:canonical_binding:{canon}"),
+            "dimension": format!(
+                "identity:canonical_binding:{}",
+                canon
+                    .strip_prefix(crate::federation::admission::CANONICAL_KEY_ID_PREFIX)
+                    .expect("a canonical key id")
+            ),
             "score": 1.0,
             "confidence": 1.0,
             "witness_relation": "self",

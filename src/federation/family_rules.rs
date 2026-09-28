@@ -23,8 +23,13 @@
 //! CIRISPersist#590 built the first slice of it — [`RULES_NOT_ON_THE_ROW`]'s
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
-//! the whole exposure. Measured on the vendored rc3 cut, the minted set is **4
-//! of 21** (three from #590, plus `mesh_config:` — CIRISPersist#570 ask 1). The
+//! the whole exposure. Measured on the vendored rc5 @ 4b624513 cut, the minted
+//! set is **4 of 20** (three from #590, plus `mesh_config:` — CIRISPersist#570
+//! ask 1). v50.0.0 (CIRISPersist#924): CC's `_meta.case_rule.reserved_stems`
+//! now states the `capacity:` and `detection:` rules at the FAMILY (the
+//! CIRISConstitution#67 ask), so those two pins retired, and `licensure:`
+//! joined (CC made the row an open emitter; persist still rules on the
+//! delegated path). The
 //! inventory gained `duty:` and lost `session:` in the same cut (v42.0.0): CC
 //! rc5 registered `session:{kind}` WITH its `substrate-self-report` rule, so
 //! the gap it recorded is closed and the pin is retired; `duty:{kind}` landed
@@ -253,6 +258,27 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  inheritance at admission and the registry row should say so rather than \
                  implying the resolver does it (CIRISPersist#814 part 1).",
     },
+    // v50.0.0 (CIRISPersist#924) — CC rc5 @ 4b624513 made `licensure:
+    // {authority_id}` an open emitter (`reserved: false`, no rule), which is
+    // the posture persist already took at v42.0.0 (#814). What persist still
+    // rules on is the DELEGATED path — the one refusal on the `license`
+    // scope — and that rule lives in CC prose (CC 3.3.9 / 4.4.3.4.3), not on
+    // the row. Until rc5 the row carried a co-stewarded reservation, so this
+    // scan classified the prefix "CC states a rule"; the re-vendor falsified
+    // that and the scan named it.
+    PersistFamilyRule {
+        prefix: "licensure:",
+        rule: "a key emitting `licensure:{A}` under a delegated `license` scope must have \
+               that delegation chain resolve to `A` itself — `B` lending authority it does \
+               not hold is refused (`licensure_delegator_not_authority`); a key signing \
+               `licensure:{itself}` passes trivially",
+        enforced_at: &["federation::admission::check_licensure_delegator_is_authority"],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#112 (rc5 @ 4b624513 rules `licensure:{authority_id}` an \
+                 open emitter; the delegated-chain rule of CC 3.3.9 / CC 4.4.3.4.3 is prose, \
+                 not a row field)",
+    },
      // v38.0.0 (CIRISPersist#754) — CC 3.3.10.1 in-grammar ledgers, STAGED on
     // CIRISConstitution#92. Two rules ride the one prefix: the staging latch
     // (R2(b) refuses the whole family at federation tier until the CC row
@@ -446,16 +472,6 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
                  `audit_chain:hash_continuity` alone)",
     },
     PersistFamilyRule {
-        prefix: "capacity:",
-        rule: "no self-emission — attester != attested, for the WHOLE family (CC 3.4.5)",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
-        gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
-        minted_by_persist: false,
-        cc_ask: "CIRISConstitution#67 (CC 3.4.5 is written about the family; the manifest states \
-                 it only on the catalogued factors, so a novel capacity factor resolves to no \
-                 rule)",
-    },
-    PersistFamilyRule {
         prefix: "corpus_health:",
         rule: "substrate_persist-only emitter, for the WHOLE family (CC 3.4.3 \
                substrate-self-report)",
@@ -463,17 +479,6 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
         gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
         minted_by_persist: false,
         cc_ask: "CIRISConstitution#67 (family-level rule)",
-    },
-    PersistFamilyRule {
-        prefix: "detection:",
-        rule: "detector-only (identity_type contains lenscore_detector) for EVERY subkind, \
-               including ones CC has not catalogued yet",
-        enforced_at: &["federation::admission::check_reserved_prefix_admission"],
-        gap: RowRuleGap::RuleOnCataloguedLeavesOnly,
-        minted_by_persist: false,
-        cc_ask: "CIRISConstitution#67 (CIRISPersist#379 already fixed this from the enforcement \
-                 side; the manifest still enumerates leaves, so a novel subkind classifies as \
-                 open)",
     },
     PersistFamilyRule {
         prefix: "federation_directory:",
@@ -522,6 +527,15 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// [`tests::not_a_family_rule_entries_are_not_secretly_ruled`], so the
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
+    (
+        "hardware_custody:",
+        "v50.0.0 (CIRISPersist#924) — `hardware_attestation::HARDWARE_CUSTODY_FAMILY` \
+         NAMES the registry row so a test can read its closed `{platform}` values \
+         and hold `HardwareTypePlatform::as_platform` equal to them. Persist states \
+         no emitter or composition rule of its own on the family: the closed \
+         vocabulary is CC's (the row's `segments[].values`), enforced by the one \
+         matcher at the case gate like every other enumeration.",
+    ),
     (
         "canonical:",
         "a KEY-ID ENCODING prefix (`canonical:sha256:<64 hex>`), not a dimension \
@@ -783,6 +797,10 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // #590 lesson, which is why this scan reads MINT SITES rather
                 // than the module that holds the inventory.
                 admission::DUTY_DIMENSION_PREFIX,
+                // v50.0.0 (CIRISPersist#924) — the delegated-license-chain
+                // refusal (`check_licensure_delegator_is_authority`), read at
+                // the const the fold and the gate share.
+                crate::federation::licensure::LICENSURE_DIMENSION_PREFIX,
             ]
             .into_iter()
             .map(str::to_owned),
@@ -1074,9 +1092,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            21,
+            20,
             "the inventory now has {} entries; this module's doc says the minted set is \"4 of \
-             21\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             20\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );

@@ -1304,3 +1304,194 @@ Plus the server route test on both paths.
 | H1b, sub-arm (b) alone | the same, with (z′)'s first sub-arm skipped (a test edit, to measure the second on its own) | 3 | (z′) sub-arm (b): "v2's authority signature: the row stays Rooted on its next re-judgement" |
 
 - Round 11 changed no code. The full lanes run on the merged release SHA. This round ran only the I190 and mutation lane (380/380 on memory, sqlite and postgres).
+## 10. #924 — the dimension grammar is manifest data (CC 1.0-rc5, released at c60d0a6)
+
+**Why in this cut.** CIRISConstitution#112 (operator decision 2026-09-26) makes parsing and casing one rule across CC and every consumer, carried as data in the registry, and rides the wire break on the domain-label version. Persist ran four dimension matchers that disagreed with CC and with each other; v50.0.0 is the MAJOR that can absorb it.
+
+**Inputs, vendored byte-for-byte** from CIRISConstitution commit `c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f` ("Cut CC 1.0-rc5, released as guidance (#125)" on `main`; the `v1.0-rc5` tag names this commit; `origin/main` at `3a2eaea` changed only the CHANGELOG since, so its manifests are byte-identical). Read with `git show`, never checked out:
+`manifests/namespace_registry.json` → `src/federation/namespace/namespace_registry.json` (148 families, `_meta.registry_sha256 = 07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb`, `source_sha256 = 4f675532029663469f9c67694fb68d5d13742deb701d8337f1929ae8f6b7a907`) and `manifests/namespace_match_vectors.json` → `…/namespace_match_vectors.json` (962 vectors). CC ships no supersets file; `namespace_supersets.json` is not re-vendored by this slice. `namespace_match_binds.json` is persist-generated from the same commit (below). JSON has no comments, so the "header" is `registry.rs`'s `VENDORED_CC_COMMIT` / `VENDORED_REGISTRY_SHA256` doc. `vendored_registry_sha256_pins_the_cc_file` recomputes the grammar hash over the vendored bytes exactly as `tools/build_cc_namespace.py` does (Python `json.dumps(sort_keys, compact, ensure_ascii)` over `_meta` minus the two hashes plus `families`). `ACCORD_HEARTBEAT_DIMENSION` stays `accord:lifecycle:v1` (it resolves to the `accord:lifecycle` leaf).
+
+**Re-vendor history.** The slice first vendored PR #113's unmerged head `4b624513458f2c9b236caf289dc2cd62aa048c24` (145 families, `registry_sha256 d6c87945…`, `source_sha256 f0568251…`, 785 vectors). CC then released rc5 from `main` with three more families, a closed `consent:{kind}`, full-match semantics and a moved reference matcher (§10.7). The released files replaced the pre-release ones byte-for-byte; nothing below describes the pre-release cut except where it says so.
+
+### 10.1 Four matchers to one
+
+| Site (v49) | What it did | v50 |
+|---|---|---|
+| `load_bearing::prefix_match_score` | arity-exact literal scoring over the SUPERSETS families | **deleted**; `family_for_dimension` = `match_family` → the registry family, then NAMED in the supersets vocabulary (identical key, else the `stem:*` it sits under; open vocabulary only to a supersets stem the registry registers nothing under). A refused dimension resolves to no family (Unknown = load-bearing; not retainable). |
+| `registry::lookup` | longest literal prefix (`match_prefix`) | `match_family(...).family` → its entry, attributed even when refused. `match_prefix` is data only. |
+| `registry::is_family_registered` | first-colon stem membership | family resolved and not `namespace_family_unregistered`; the stem question is the new `is_stem_registered`. |
+| `consent_grammar::covers` | raw `starts_with` | grant prefix `starts_with` AND `match_family` refuses nothing (the prefix half stays byte-exact: it is the signed grant's own scoping string under `CONSENT_GRAMMAR_HASH`, which does not move). |
+| `admission::contains_version_segment` (`:vN` anywhere), `schema_resolver::is_version_segment` (`^v[0-9]+$`), the ledger gate's `strip_prefix('v')` | three version parsers | **one**: `matcher::is_version_segment` / `trailing_version` / `is_version_exempt`, read from `_meta.case_rule.version_segment` (`pattern`, trailing, `required`, `exempt`). `is_attestation_ladder_dimension` and the canonical-binding probe in Layer 2b are deleted — the exempt list replaces both. |
+
+`namespace::matcher::match_family(dimension) -> FamilyMatch { family, binds, refusal }` is a port of `tools/cc_namespace_match.py`: segments byte-exact, version tail stripped unless the family ends `{version}`, closed enumerations → `namespace_vocab_value_unregistered`, closed leaves and reserved stems → `namespace_family_unregistered`, a malformed form of a registered family (case-folded stem, uppercase/duplicated tail) → `namespace_dimension_case_malformed`, `multi` placeholders, variadic `*`, `external_standards`, Private Use. Every token is read from the manifest.
+
+**Replay.** `namespace_match_vectors_replay` checks all 962 vectors two ways: CC's contract (family and refusal exact; the released vectors name exactly what the reference answers, CIRISConstitution#116 — the pre-release contract's "best-effort attribution" on case_malformed is gone), and the reference's own exact `(family, binds, refusal)` from `namespace_match_binds.json`, generated by `scripts/gen_namespace_match_binds.py <CC repo> c60d0a6` (runs the reference tool from the pinned commit over the vendored files, refuses unless both are byte-identical to CC's and every vector's family and refusal equal the reference's; `--check` re-verifies). The vectors carry no binds, which is why the second leg exists. `every_family_sample_round_trips_to_itself` replays the generator's own round-trip gate, skipping closed families (a wildcard, or a vocab-ended parent closed in its leaves) as the reference does. `reference_edges_beyond_the_vectors` pins eight reference answers no vector reaches (§10.7).
+
+**Full match (`_meta.case_rule.match_semantics`).** `matcher::compile` wraps every manifest pattern as `^(?:p)$`, so an unanchored pattern cannot partial-match and a `$` never admits a trailing newline (`compile_is_a_full_match`). The manifest's declaration is asserted present and starting `full-match` (`the_manifest_declares_full_match_semantics`, and the registry drift gate). The reference's two hard-coded detectors (`VERSION_LIKE`, `VERSION_ATTEMPT`) are applied with Python `re.match` there, whose `$` tolerates one trailing newline; the port compiles them verbatim with `\n?\z` so a detector refuses exactly what the reference's does.
+
+**The gates.** `check_dimension_case_rule` refuses the matcher's `case_malformed` and `vocab_value_unregistered` (so variadic tails are case-checked: `variadic_tail_segments_are_case_checked`). R2(b) (`check_namespace_family_registered`) refuses the matcher's `family_unregistered` in addition to persist's governed-but-rowless stems. Layer 2b refuses `missing_version_segment` unless the resolved family is exempt.
+
+### 10.2 What moved (findings the re-vendor surfaced)
+
+- **Families.** 116 → 145 at the pre-release cut (148 released, §10.7): 30 added (the six `accord:*` leaves, eight `consent:*` rows, media wildcards, `event:*`, `identity:canonical_binding:{canonical_hash}`, `topical_relation:{kind}`, …); `age_self_declared:{band}:{version}` retired → `age_self_declared:band:{band}:{version}` (moved to `RETIRED_FAMILIES`, as CC's generator lists it). `licensure:{authority_id}` is now `reserved: false` (CC ruling; persist already treated it open since v42 — its delegated-license-chain rule joins `RULES_NOT_ON_THE_ROW`). `session:{kind}` carries `occurrence-self-report` (CC 3.1.3.1).
+- **Reserved stems close their leaves.** `detection:emergent_pattern:novel_signal:v1` and `accord:invoke:halt` were "open vocabulary inside a registered family" in v49's tests; CC now refuses both. The detector admit witness moved to a registered leaf.
+- **`capacity:` / `detection:` rule pins retired** — CC's `reserved_stems` states them at the family (the CIRISConstitution#67 ask); `authority_for` answers a `kind: reserved` stem's rule for an unclaimed leaf rather than dropping the reservation.
+- **Canonical binding (wire break).** CC: `identity:canonical_binding:{canonical_hash}`, one 64-lowercase-hex segment, version-exempt. Persist's fixtures bound the key-id spelling (`…:canonical:sha256:<hex>`, five segments), which now matches no row and fails T3. `parse_canonical_binding_hash` resolves through the matcher; the hash is re-spelled `canonical:sha256:<hex>` where it meets `subject_key_ids`.
+- **Accord.** `accord:invoke:CONSTITUTIONAL:halt_id_42:v1` → `accord:invoke:constitutional:halt_id_42:v1`; `accord_invoke_old_uppercase_shape_fails_loudly` witnesses the old spelling refused `case_malformed` at the matcher and the case gate. Persist holds no `ciris.accord_invoke` canonical bytes (verify-core signs; the v17.1.0 pin still carries `.v1` / `CONSTITUTIONAL`), so the signature-level "old signature fails" witness is verify's.
+- **Hardware.** `HardwareTypePlatform::as_platform` (exhaustive over the 13 keyring variants) equals the registry's closed `{platform}` set both ways (`hardware_type_platforms_equal_registry_values_107`); `hardware_class_multiplier` is CC 4.2.2's table, unlisted ⇒ 0.0; `hardware_class` stays a JSON property.
+- **Minors (CC 5.4.6 / #111).** `check_minor_owner_binding_not_announced`: an owner-purpose `delegates_to` at `cohort_scope: federation` whose granter resolves `minor` refuses `WriteScopeRefused(MinorOwnerBindingAtFederation)` (`scope_minor_owner_binding_at_federation`), at every backend's put door and in the promotion stack. Invariant `exercise_minor_owner_binding_is_not_announced` beside `exercise_node_speaks_for_owner`, on memory/sqlite/postgres.
+- **Polarity census.** The five `+1.0 only` accord leaves map to `[1.0, 1.0]` and join `PINNING_FAMILIES` (the contrast was 134 / 8 of 145 at the pre-release cut; 136 / 8 of 148 released, §10.7).
+- **Manifest readers.** `every_manifest_family_column_has_a_reader_724` now accounts `_meta`, `_meta.case_rule`, `version_segment` and the per-segment keys; `reserved_prefix_rules_match_manifest_leaves` holds every hand-spelled reserved-rule prefix to a literal leaf of a vendored family or a CC reserved stem.
+- `regex` is a direct, non-optional dependency (already in every build via `jsonschema`).
+
+### 10.3 Deviations
+
+1. **CC gap closed: the capacity companions are rows.** The pre-release rc5 registered no row for the CC 3.4.12 companions, and `CC_TEXT_LEAVES_WITHOUT_ROWS` stood R2(b) aside for their two prefixes behind a build-failing sentinel. The released rc5 registers `capacity_assurance:reversible_excluded:{domain}:{version}` and `…:reversible_pending:{domain}:{version}` (CIRISConstitution#117). The sentinel fired for the right reason (the rows resolve), and the carve-out is deleted. `capacity::reversible::parse_companion` now reads the one matcher (the row, no refusal) instead of hand-checking the grammar. R2(b) keeps refusing whatever the matcher rejects under a companion prefix, because companions ride `attestation_type`, which the case gate (envelope dimension only) never reads. Witness: `capacity_companions_resolve_to_their_cc_rows_117`.
+2. **Evidence decimals.** Rows are keyed on CC's staged claim ids and THEIR decimals (`CLM-version-segment-suffix` 3.1.7, `CLM-reserved-leaves-closed` 3.4.1, `CLM-accord-invoke-lowercase` 4.2.1.1, `CLM-hardware-custody-vocabulary` 3.1.2, `CLM-minor-no-federation-binding` 5.4.6), not the 3.1.1 / 3.1.9 / 4.2.2 the brief listed. `CLM-device-roster-announced` is not claimed: persist does not implement the stranger-view `nodes_owned_by` projection.
+3. **Edges no vector reaches.** The pre-release deviation "Rust `$` is stricter than Python `re.match`" is gone: the released reference uses `fullmatch` for every manifest pattern, so both refuse a trailing newline, and the port reproduces the detectors' `re.match` tolerance (§10.1). What remains: whitespace for the strip check is Unicode `White_Space` plus `\x1c`–`\x1f` (Python's `isspace`), and `str.lower()` / `to_lowercase()` agree on ASCII (every registered stem) but not on every non-ASCII code point, which only moves a DETECTION of a case-mutated stem.
+4. **The ledger version** uses the one parser to recognise the segment, then still requires an integer (`v1.2` refuses): CC 3.3.10.1's id derivation keys on the version number.
+5. **`registry::case_rule()` is deleted** (and the hand-implemented vocab-pattern test with it): the matcher compiles the manifest's patterns directly.
+
+### 10.4 Adopter note (wire breaks — what a consumer must change)
+
+- Dimensions are judged by the CC grammar at the door: an unversioned registered dimension (`capacity:composite`) fails T3; a version-shaped segment anywhere but last is no longer the version; `usd` for `{currency}` is malformed (`USD`); closed vocabularies refuse unlisted values (`hardware_custody:tpm:v1`); unnamed leaves under `accord:*` and unclaimed leaves under CC's reserved stems (`accord:`, `detection:`, `capacity:`, `age_assurance:`, `capacity_assurance:`, `transparency_log:cosigned:`, `age_self_declared:`) are `namespace_family_unregistered`.
+- Emit `accord:invoke:{constitutional|notify|drill}:{id}:v1` (lowercase, with the id); sign invocations under `ciris.accord_invoke.v2` (verify-side).
+- Emit `age_self_declared:band:{band}:v1`, `identity:canonical_binding:<64 hex>` (no `canonical:sha256:` inside the dimension), `hardware_custody:{snake_case HardwareType}:v1`.
+- A minor's owner-binding must be held at `cohort_scope: self`. At `federation` it refuses `federation_write_scope_refused: scope_minor_owner_binding_at_federation`, and so does WIDENING it there (`widen_audience`'s `supersedes`, including the sweep's widening step and the pyo3 widen — review HIGH-1).
+- **Follow-up, CIRISPersist#929 (minors × widening, peer side).** The gate recognises an announce by the widening's own body or by the prior it names. A receiving peer that does NOT hold the self-scope prior (usually: `self` is undiscoverable) can check only the body. If the prior is a purpose-only owner-binding (no `dimension`) and the widening stripped `delegation_purpose`, that peer would admit it. The origin's door refuses it, so the row needs a forgery written straight to a peer by the minor's own key.
+- **Capacity companions are CC rows and carry the version tail** (CIRISConstitution#117, released rc5). Emit `capacity_assurance:reversible_excluded:{domain}:v1` / `capacity_assurance:reversible_pending:{domain}:v1`. Companions ride `attestation_type`, which T3 and the case gate (envelope dimension only) never read, so R2(b) (`check_namespace_family_registered`) is their only grammar gate, and its wire error is what an emitter sees:
+  - the versionless v49 spelling: the matcher answers `missing_version_segment`, and R2(b) refuses `NamespaceFamilyUnregistered` with reason `family_unregistered`;
+  - `…:Financial:v1`: the matcher answers `namespace_dimension_case_malformed`, and R2(b) refuses `InvalidArgument` carrying that token;
+  - `…:a:b:c:v1` and `…:a:b:v1`: R2(b) refuses `NamespaceFamilyUnregistered` / `family_unregistered`. The matcher answers `namespace_dimension_case_malformed` for the first. For the second it answers `namespace_vocab_value_unregistered`: it used to be admitted as the rung row with `{level}` = `reversible_excluded`, but the released rc5 closes the rung row's `{level}` ∈ {provider, panel, government} and `{band}` ∈ {capacitated, incapacitated} (CLM-capacity-companion-rows: "neither reads as a level").
+- **`consent:{kind}` is closed in its leaves (wire break).** The released rc5 lists ten consent leaves (`consent:community_trust`, `decay:{stage}`, `deletion_complete`, `deletion_sla:{days}`, `partnership_accept`, `partnership_grant`, `replication:{version}`, `scope:{kind}`, `state:{stance}`, `stream:{kind}`) and closes the parent. An unlisted kind that the open `{kind}` admitted before (`consent:made_up:v1`) now refuses `namespace_family_unregistered` at R2(b), and so does any unmatched descendant under `consent:` (`consent:totally:new:v1`). No consent grant covers either. CIRISAgent's live trace-capture grant `consent:community_trust:v1` keeps admitting, now on its own row (`consent_community_trust_admits_under_the_closed_consent_leaves`). Every consent spelling persist itself emits is a listed leaf.
+- **Open vocabulary owes its version tail (wire change).** A dimension no row claims is still judged by R3's global version grammar: `no_such_family:leaf` refuses `missing_version_segment` (the manifest token, and persist's wire reason), `…:leaf:V1` / `…:leaf:v1beta` / `…:v1:v2` / a lone `v1` refuse `namespace_dimension_case_malformed`. A `v1beta` in last place on a registered family is malformed too.
+- **Canonical BCP 47 locales.** `provenance:build_manifest:{target}:locale:{lang_code}` now takes canonical-cased RFC 5646 without extlang. Refused now (`case_malformed`): `en-us`, `EN`, `zh-hans-cn`, `zh-cmn-Hans-CN`, `sgn-BE-FR`. Admitted now: private use (`x-private`) and the five grandfathered tags without a preferred value (`i-default`, `i-enochian`, `i-mingo`, `cel-gaulish`, `zh-min`). `en-US` is unchanged (`provenance_locale_is_canonical_bcp47`).
+- **CIRISVerify emits three `hardware_custody` dimensions v50 refuses** (no persist legacy arm; rc5 says refuse; the verify checklist item is filed by the release lead):
+  | emitted today | refusal | emit instead |
+  |---|---|---|
+  | `hardware_custody:android` | `namespace_vocab_value_unregistered` (and no version tail) | `hardware_custody:android_keystore:v1` or `hardware_custody:android_strongbox:v1`, per the `HardwareType` the chain proves |
+  | `hardware_custody:ios_secure_enclave` | `missing_version_segment` (token is legal) | `hardware_custody:ios_secure_enclave:v1` |
+  | `hardware_custody:tpm` | `namespace_vocab_value_unregistered` (and no version tail) | `hardware_custody:tpm_discrete:v1` or `hardware_custody:tpm_firmware:v1` |
+- **Stored rows are judged by the same grammar, and every consequence NARROWS (never widens).** A row stored before v50 on a pre-rc5 shape: (i) is covered by no consent grant (`covers` requires a refusal-free match), so `promote_consented_backlog` neither promotes nor widens it — it is now counted as `ConsentSweepReport::skipped_unmatched_dimension` with up to 8 `unmatched_dimension_examples` and a `warn` summary (review MEDIUM-3); (ii) resolves to no supersets family (`family_for_dimension` → None: `LoadBearing::Unknown`, treated as load-bearing; not subject-retainable); (iii) under `authority_for` resolves either to its family (attributed even when refused) or, off every row, to a reserved stem's rule or `ProducerSteward` — for an unrowed leaf under a non-reserved stem that is narrower than v49's literal-prefix attribution. None of these makes a row more visible, more transferable or more authoritative.
+- **Canonical binding has no legacy arm** (review LOW-5, for the CHANGELOG wire-break list): a STORED `identity:canonical_binding:canonical:sha256:<hex>` row now parses to `None`, so `canonical_binding_hashes_for` drops it and the binding no longer widens its key's `withdraws` authority (rule 2). Fail-closed — authority is lost, never gained. No emitter of that shape was found outside persist's own tests; a holder re-emits `identity:canonical_binding:<64 hex>`.
+- Rust API (clean break): `registry::case_rule` removed; `is_family_registered` is match-based (stems → `is_stem_registered`); `consent_grammar::covers` refuses malformed dimensions; `ScopeRefusalReason` gains `MinorOwnerBindingAtFederation`. Pin `VENDORED_REGISTRY_SHA256`. No hash outside the manifest moved (`REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `ENVELOPE_VOCABULARY_SHA256`, capsule digests unchanged).
+
+### 10.5 Mutation table (#924)
+
+Lane (`--features sqlite,postgres --lib` under `scripts/pg_test_db.sh`, `-j 3`): the brief's filter `test(namespace) | test(matcher) | test(vector) | test(version_segment) | test(case_malformed) | test(hardware_type) | test(minor) | test(accord_invoke) | test(manifest)` widened with `test(variadic) | test(case_rule) | test(r2b) | test(covers) | test(dimension_resolves) | test(reserved_prefix) | test(canonical_binding) | test(retainab)` (the brief's filter matches none of the case-gate tests by name). Baseline 207/207 passed on 529aec0d; 209/209 after the three witnesses the round forced. Each mutant was applied to a committed tree and reverted before the next. No mutant was OOM-killed.
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M1 | version tail KEPT on a `{version}`-less family | KILLED (16) | case-gate ×2, r2b, variadic, covers, hardware vocab, dimension_resolves, replay, … |
+| M2 | closed leaf admitted | KILLED (5) | replay, accord_invoke, r2b, covers, is_family_registered |
+| M3 | closed-vocabulary value admitted | KILLED (3) | replay, variadic (hardware_custody:tpm), hardware vocab |
+| M4 | reserved stem admitted | KILLED (2) | replay, r2b |
+| M5 | `version_segment.exempt` dropped | KILLED (6) | replay, version_segment ×2, canonical_binding_widens ×3 backends |
+| M6 | variadic tail uncased | KILLED (3) | replay, variadic, accord_invoke |
+| M7 | old longest-literal-prefix `lookup` reinstated | **SURVIVED**, then KILLED (1) after `lookup_resolves_through_the_one_matcher_924` | that test |
+| M8 | `as_platform` off by one token (`yubihsm`) | KILLED (2) | hardware vocab, class mapping |
+| M9 | minors refusal dropped | KILLED (3) | `minor_owner_binding_at_federation_is_refused_q5` ×3 backends |
+| M10 | replay compares FAMILY only (both legs) + vocab refusal spelled case_malformed | KILLED (1) | variadic (token assertion) — the weakened replay alone would not have |
+| M11 | case gate stops refusing `vocab_value_unregistered` | KILLED (1) | variadic |
+| M12 | `covers` without the grammar check | KILLED (1) | `covers_refuses_what_the_grammar_refuses_924` |
+| M13 | `family_for_dimension` ignores refusals | KILLED (1) | dimension_resolves |
+| M14 | `trailing_version` accepts a version anywhere (the v49 scan) | KILLED (2) | version_segment ×2 |
+| M15 | canonical-binding parse accepts any suffix | **SURVIVED**, then KILLED (1) after `canonical_binding_parse_goes_through_the_matcher_924` | that test |
+| M16 | minors gate removed from the PROMOTION stack only | **SURVIVED**, then KILLED (3) after the invariant asked `check_promotion_admission` | minors ×3 backends |
+| M17 | `authority_for` reserved-stem fallback removed | KILLED (1) | lookup_resolves |
+
+17/17 killed on the final tree; three needed a witness written first.
+
+**Review round (HIGH-1, MEDIUM-3) on 86440f47**, lane above plus `test(grammar_refuses)`, baseline 210/210:
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M18 | minors gate skips SUPERSEDES (a widening is not re-checked) | KILLED (3) | `minor_owner_binding_at_federation_is_refused_q5` ×3 backends (the widening leg) |
+| M19 | sweep's stranded-dimension accounting dropped | KILLED (1) | `sweep_counts_grant_covered_rows_the_grammar_refuses_924` |
+| M9 (re-run) | minors refusal dropped | KILLED (3) | minors ×3 |
+| M12 (re-run) | `covers` without the grammar check | KILLED (2) | covers test, the sweep witness |
+| M16 (re-run) | minors gate removed from the promotion stack | KILLED (3) | minors ×3 |
+
+**Review closure on ed13d7e5** (lane plus `test(cc_text_leaves) | test(capacity)`; baseline included in the mutant's 237):
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M20 | companion carve-out ignores `parse_companion` (a malformed shape under the prefix is excused) | KILLED (1) | `cc_text_leaves_without_rows_are_still_rowless` |
+
+(M20 measured a carve-out the released re-vendor deleted; M32 in §10.7 is its successor.)
+
+### 10.6 For adopters at the tag (computed from the vendored files)
+
+**Constants.** `VENDORED_N_FAMILIES` 116 → **148**. `VENDORED_CC_VERSION` stays `1.0-rc5`. `VENDORED_SOURCE_SHA256` `87aede50…b9a9f5` → `4f675532029663469f9c67694fb68d5d13742deb701d8337f1929ae8f6b7a907`. New: `VENDORED_REGISTRY_SHA256 = 07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb`, `VENDORED_CC_COMMIT = c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f`. (The pre-release slice pinned 145 / `f0568251…` / `d6c87945…` / `4b624513…`; none of those shipped.) `supersets::VENDORED_MANIFEST_VERSION` stays **`0.3.0`**: it versions the supersets walk (`namespace_supersets.json`), which this cut did not re-vendor. Its seed pin (`VENDORED_SEED_REGISTRY_SHA256`) still names the rc2 registry, and that lag is declared.
+
+**Field-processor matrix and transform algebra: no shape change.** `TRANSFORM_ALGEBRA_HASH` is `b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b` at `ea14c27f` and at the tag. `transform_algebra_hash_is_pinned` recomputes it and passed in both full lanes on `6c731b25`: `pyo3,sqlite` started 2026-09-27 01:00:04 CDT (3432 passed) and `postgres,sqlite` started 01:09:08 CDT (3362 passed). `transform.rs` and `namespace_supersets.json` are byte-unchanged in this cut, so no processor kind or transform op was added, removed or re-typed. The only change in `supersets.rs` is a `DELETED_PENDING_REVENDOR` entry for the deleted `is_attestation_ladder_dimension` citation. The registry itself carries no processor column.
+
+**Family diff, v49 → the pre-release cut** (`python3 scripts/manifest_diff.py ea14c27f d10c56b8`; committed so the next re-vendor reruns it). The released cut adds §10.7's diff on top: 148 families at the tag.
+
+- **(a) Added: 30** (net +29). `accord:human_dignity`, `accord:invoke:constitutional:{halt_id}`, `accord:invoke:drill:{drill_id}`, `accord:invoke:notify:{notify_id}`, `accord:lifecycle`, `accord:lifecycle:active`, `age_self_declared:band:{band}:{version}`, `audio:*`, `blog:*`, `chat:*`, `consent:decay:{stage}`, `consent:deletion_complete`, `consent:deletion_sla:{days}`, `consent:partnership_accept`, `consent:partnership_grant`, `consent:replication:{version}`, `consent:scope:{kind}`, `consent:state:{stance}`, `consent:stream:{kind}`, `encyclopedia:*`, `event:attendance`, `event:lifecycle:{state}`, `event:rsvp_count`, `film:*`, `identity:canonical_binding:{canonical_hash}`, `image:*`, `model_3d:*`, `news:*`, `topical_relation:{kind}`, `video:*`.
+- **(b) Removed or renamed: 1.** `age_self_declared:{band}:{version}` was renamed to `age_self_declared:band:{band}:{version}`. CC's generator lists it in `RETIRED_FAMILIES`, and persist's `RETIRED_FAMILIES` does too.
+- **(c) Existing families that changed: 23.**
+  - **Variadic wildcards:** `variadic: true` added on the `*` segment of `accord:*`, `dma:csdma:*`, `dma:dsdma:{domain}:*`, `dma:idma:*`, `dma:pdma:*` and `system:*`.
+  - **Leaves:** the same six families gained `leaves` / `leaves_closed`. Only `accord:*` is closed, with the six leaves above. The dma and system families carry `[]` / `false`.
+  - **Closed enumerations:** `age_assurance:{level}:{band}:{version}` `{level}` ∈ {provider, government} and `{band}` ∈ {minor, adult, under_13, 13_15, 16_17}; `hardware_custody:{platform}` ∈ the 13 `HardwareType` tokens.
+  - **Open enumerations** (canonical values only):
+    - `benchmark:he300:…` `{version}` {v1.0, v1.1, v1.2}
+    - `detection:distributive:access:{resource_type}` {compute}
+    - `fidelity:explainability_sla:{tier}` {l1_summary, l2_reasoning_trace, l3_full_dma_chain, l4_attested_chain}
+    - `goal:{scale}` {self}
+    - `locality:decision:{scale}` {local, regional, national, federation}
+    - `moderation:{allegation_type}` {rogue_vote}
+    - `multilateral_participation:{forum}:{kind}` {membership, voting, proposal_filing, observer_status}
+    - `regime:{artifact}:{version}` {manifest}
+  - **Patterns and standards:**
+    - `bond_posted:{currency}` `^[A-Z]{3}$` (ISO 4217)
+    - `provenance:build_manifest:{target}:locale:{lang_code}` (BCP 47 pattern)
+    - `transparency_log:cosigned:{tree_size}` `^[0-9]+$`
+    - `content_rating:{scheme}:{rating}` (standard named, no pattern)
+  - **`multi` placeholders:** `detection:correlated_action:{axis}`, `provenance:skill_import:{source}`.
+  - **Reserved rules:** `licensure:{authority_id}` went `reserved: true` (co-stewarded, CC 3.4.9) → `false`, with no rule. `session:{kind}`'s rule went `substrate-self-report` (CC 3.4.3) → `occurrence-self-report` (CC 3.1.3.1).
+  - **Prose only** (on top of the grammar changes above): `age_assurance`, `benchmark:he300` and `hardware_custody` descriptions.
+- **(d) `_meta.case_rule` gained** `external_standards`, `refusal_tokens`, `reserved_stems`, `version_segment` and `wildcard_rule`; `classes` and `placeholder_classes` changed. `reserved_stems` has six stems of `kind: reserved` (`accord:`, `transparency_log:cosigned:`, `detection:`, `capacity:`, `age_assurance:`, `capacity_assurance:`) and one of `kind: gated` (`age_self_declared:`). `version_segment` is: pattern `^v[0-9]+(\.[0-9]+)*$`, trailing, required, and exempt for the five attestation-ladder families plus `identity:canonical_binding:{canonical_hash}`. `_meta` also gained `registry_sha256`, and `n_families` / `per_component` moved.
+
+### 10.7 The released rc5 re-vendor (4b624513 → c60d0a6)
+
+**Family diff** (`python3 scripts/manifest_diff.py d10c56b8 <tag>`): 145 → 148, net +3.
+
+- **(a) Added: 3.** `capacity_assurance:reversible_excluded:{domain}:{version}`, `capacity_assurance:reversible_pending:{domain}:{version}` (both `signed`, reserved, CC 3.4.12 "witness-reserved, subject-not-self, attester != steward", owner CIRISVerify/attestation), `consent:community_trust` (`positive-only`, reserved CC 3.4.5, owner CIRISAgent/accord-agent).
+- **(b) Removed: 0.**
+- **(c) Changed: 4.** `capacity_assurance:{level}:{domain}:{band}:{version}` closes `{level}` ∈ {provider, panel, government} and `{band}` ∈ {capacitated, incapacitated}. `consent:{kind}` gains the ten `leaves` and `leaves_closed: true`. `delivery_receipt:{stream_id}`'s rule moves from "substrate-self-report" (CC 3.4.3) to "subscriber-only (attesting_key_id is a current subscriber/member of the named stream; not a substrate self-report)" (CC 3.4.6); persist keys no gate on that rule text, `authority_for` reports it, and persist's receipts already verify the subscriber's signature. `provenance:build_manifest:{target}:locale:{lang_code}`'s pattern becomes canonical-cased RFC 5646 (§10.4).
+- **(d) `_meta`.** `case_rule.match_semantics` added ("full-match: … a `$` anchor does not admit a trailing newline (CIRISConstitution#116)"); `case_rule.external_standards.lang_code` rewritten; `n_families` 145 → 148; `per_component` `accord-agent` 28 → 29, `attestation` 19 → 21.
+- **Vectors:** 785 → 962. The contract is now exact on the family (#116).
+
+**The reference matcher moved too, and the port moved with it** (`tools/cc_namespace_match.py`, 4b624513 → c60d0a6): every pattern `fullmatch`; `closed_stems` (a closed wildcard's prefix, or a closed vocab parent's first segment) fence unmatched descendants as reserved stems do; a closed parameterized parent (`consent:{kind}`) admits only its leaves; `VERSION_ATTEMPT` (`v1beta`, `V1x`) in last place is malformed, in `_resolve` (any absorbing class), the variadic tail and malformed detection; open vocabulary owes its version tail and refuses a duplicated tail or a lone version; a case-mutated fenced stem is malformed; a refused hit is re-attributed to the clean row it mutates (`detect_malformed(clean_only)`); a `multi` value's components take no version-shape test. All 962 vectors replayed on the first port; `reference_edges_beyond_the_vectors` pins eight further reference answers.
+
+**What each hash pins (checked at the tag).** No discrepancy at `v1.0-rc5`, so there is no erratum to record. The tag's recipe is in `tools/build_cc_namespace.py`.
+- `_meta.registry_sha256` (`07e0c725…60b7fb`) is not a file hash. It is SHA-256 over `json.dumps({"_meta": _meta minus source_sha256 and registry_sha256, "families": …}, sort_keys, compact, ensure_ascii)`. `vendored_registry_sha256_pins_the_cc_file` recomputes exactly that over the vendored bytes and holds it equal to both the meta value and `VENDORED_REGISTRY_SHA256`.
+- `_meta.source_sha256` (`4f675532…a907`) equals the SHA-256 of `constitution/part_3_the_namespace.md` at c60d0a6, recomputed here. `VENDORED_SOURCE_SHA256` pins it.
+- The whole-file byte hash is `17ba3ad7916c16dbf25cf24bd1b24a2890fc534ba0b18f8c3f21b99339e13a3a`. No constant pins it. Byte identity with the tag is checked by `scripts/gen_namespace_match_binds.py … --check`, which needs the CC checkout.
+- CC has announced a post-tag "registry-hash fix". Persist vendors the TAG bytes and does not follow `main`. If CC re-tags with a different recipe, the recomputation test fails on re-vendor, and the recipe moves with the bytes.
+
+**Unchanged.** `VENDORED_CC_VERSION` (`1.0-rc5`), `supersets::VENDORED_MANIFEST_VERSION` (`0.3.0`) and `TRANSFORM_ALGEBRA_HASH` (`b7bd7794…`): `namespace_supersets.json` and `transform.rs` are byte-unchanged, so the supersets walk did not move. `CONSENT_GRAMMAR_HASH`, `REPLICATION_POLICY_HASH`, `ENVELOPE_VOCABULARY_SHA256` and capsule digests are unchanged.
+
+**Measured contrast.** `retaining_the_contradiction_count_pins_almost_the_whole_registry`: 136 / 8 of 148 (was 134 / 8 of 145). The two `signed` companions join the retained side. `consent:community_trust` is `positive-only`, like its sibling consent leaves, and pins on neither.
+
+**Evidence.** `evidence/cc_impl.tsv` gains four rows for two claims CC stages on CIRISPersist#924 at c60d0a6: `CLM-capacity-companion-rows` (3.4.12: `capacity.rs#parse_companion`, `admission.rs#check_namespace_family_registered`) and `CLM-match-full-semantics` (3.1.7: `matcher.rs#compile`, `matcher.rs#match_family`). The exact-count gate moves 90 → 94. `CLM-consent-community-trust` (3.3.1) is staged on CIRISPersist#935 and claims the fold (owner-or-node emitter, positive-only, withdraws is a hard stop); this slice only admits the leaf, so it adds no row for it.
+
+**Mutation round** on 83c4a5c5. Lane: `scripts/pg_test_db.sh -- cargo nextest run -j 3 --features sqlite,postgres --lib --no-fail-fast -E 'test(namespace) | test(matcher) | test(vector) | test(consent_grammar) | test(case_rule) | test(capacity)'`. Baseline 203/203 passed. Each mutant was applied to the committed tree and reverted with `git checkout -- .` before the next. No mutant was OOM-killed.
+
+| # | Mutant | Result | Killed by |
+|---|---|---|---|
+| M21 | `compile` drops the `^(?:p)$` anchor | KILLED (1) | `compile_is_a_full_match` (the manifest's own patterns carry anchors, so only the unanchored probe sees it) |
+| M22 | the manifest's `match_semantics` key removed | KILLED (4) | `the_manifest_declares_full_match_semantics`, registry drift gate, column accounting (stale pin), `vendored_registry_sha256_pins_the_cc_file` |
+| M23 | closed-leaf check wildcard-only again (consent leaves reopened) | KILLED (3) | replay, `consent_community_trust_admits…`, `reference_edges_beyond_the_vectors` |
+| M24 | `consent:community_trust` row removed from the registry | KILLED (42) | `consent_community_trust_admits…` (`(consent:{kind}, FamilyUnregistered)` instead of the row), replay, the registry count and sha gates, and every capacity/R2(b) store test that loads the registry |
+| M25 | `VENDORED_REGISTRY_SHA256` stale (the pre-release `d6c87945…`) | KILLED (2) | `vendored_registry_sha256_pins_the_cc_file`, `vendored_vectors_name_the_vendored_grammar` |
+| M26 | `parse_companion` admits a companion missing `{version}` | KILLED (1) | `capacity_companions_resolve_to_their_cc_rows_117` |
+| M27 | closed-family stems no longer fence descendants | KILLED (2) | replay, `consent_community_trust_admits…` (`consent:totally:new:v1`) |
+| M28 | open vocabulary no longer owes its version tail | KILLED (2) | replay, `reference_edges_beyond_the_vectors` |
+| M29 | a refused hit is not re-attributed to the clean row it mutates | KILLED (1) | replay (the exact-family leg) |
+| M30 | `VERSION_ATTEMPT` never matches | KILLED (2) | replay, `reference_edges_beyond_the_vectors` |
+| M31 | the detectors lose Python `re.match`'s trailing-newline tolerance | KILLED (1) | `reference_edges_beyond_the_vectors` only; the 962 vectors alone would not have killed it, which is why that witness was written before the round |
+| M32 | R2(b) stands aside for every companion shape (the carve-out, reborn) | KILLED (1) | `capacity_companions_resolve_to_their_cc_rows_117` |
+
+12/12 killed on the final tree.

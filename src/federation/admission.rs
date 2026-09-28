@@ -757,7 +757,7 @@ pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[];
 /// deliberately REFUSED at every federation-tier door until the Constitution
 /// registers it. Nothing here needs flipping on graduation — the moment the
 /// CC row lands and the vendored `namespace_registry.json` is re-vendored,
-/// `is_family_registered` answers true and R2(b) stands aside. The staged
+/// `is_stem_registered` answers true and R2(b) stands aside. The staged
 /// line is then a stale latch, and
 /// [`tests::staged_families_are_still_unregistered_and_tracked`] fails until
 /// it is deleted — the same self-deleting discipline as the exceptions list.
@@ -961,12 +961,19 @@ pub fn check_ledger_binding_admission(
         ["ledger", "promotion", v] => (None, *v),
         _ => return reject(),
     };
-    let Some(digits) = version.strip_prefix('v') else {
-        return reject();
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // v50.0.0 (CIRISPersist#924) — the one version parser, from the manifest;
+    // the ledger id derivation keys on the version NUMBER (the text after
+    // `v`), and CC 3.3.10.1 ledgers are integer-versioned, so a dotted
+    // version (legal elsewhere under `version_segment.pattern`) refuses here.
+    if !crate::federation::namespace::matcher::is_version_segment(version) {
         return reject();
     }
+    let Some(digits) = version
+        .strip_prefix('v')
+        .filter(|d| d.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return reject();
+    };
     let Some(declared) = envelope.get("ledger_id").and_then(|v| v.as_str()) else {
         return reject();
     };
@@ -1168,14 +1175,55 @@ fn is_governed_family(namespace: &str) -> bool {
 /// R2 registers *families*, so `credits:rust:en:alice` is registered because
 /// `credits:{domain}:{language}:{subject}` is, and the `{param}` vocabulary
 /// inside a registered family is never the thing refused.
+///
+/// # v50.0.0 (CIRISPersist#924, CC rc5) — CC's own R2(b) through the one matcher
+///
+/// A second refusal arm joins the governed-stem one: whatever
+/// [`match_family`](crate::federation::namespace::matcher::match_family)
+/// refuses `namespace_family_unregistered` — a leaf under a `leaves_closed`
+/// reserved family CC does not name (`accord:invoke:halt`), or a leaf under a
+/// stem CC 3.4 reserves as a whole that no row claims
+/// (`detection:emergent_pattern:novel_signal:v1`). CC made both of these data
+/// (`leaves`/`leaves_closed`, `_meta.case_rule.reserved_stems`), so persist no
+/// longer needs to govern a stem for its reservation to bind.
 pub fn check_namespace_family_registered(namespace: &str) -> Result<(), Error> {
+    use crate::federation::namespace::matcher::{match_family, Refusal};
     use crate::federation::namespace::registry;
     let stem = registry::family_stem(namespace);
-    if stem.is_empty()
-        || !is_governed_family(namespace)
-        || registry::is_family_registered(namespace)
-        || UNREGISTERED_GATED_FAMILIES.contains(&stem)
-    {
+    if stem.is_empty() || UNREGISTERED_GATED_FAMILIES.contains(&stem) {
+        return Ok(());
+    }
+    // CC 3.4.12 capacity companions ride `attestation_type`, which the case
+    // gate (envelope dimension only) never reads — so R2(b) is their grammar
+    // gate. The released rc5 registers their rows (CIRISConstitution#117), and
+    // `parse_companion` reads the one matcher: a well-formed companion passes
+    // R2(b) on its row like any other family; a malformed one is refused here.
+    match crate::federation::capacity::reversible::parse_companion(namespace) {
+        Ok(_) => {}
+        Err(crate::federation::capacity::reversible::CompanionShapeError::CaseMalformed) => {
+            return Err(Error::InvalidArgument(format!(
+                "{}: {namespace:?} is a CC 3.4.12 capacity companion whose {{domain}} is not a \
+                 lowercase CC vocabulary token — refused, never folded",
+                Refusal::CaseMalformed
+            )));
+        }
+        // Under a companion prefix but not a well-formed companion. Admitted
+        // only as whatever registered row it resolves to cleanly; any refusal
+        // the matcher raises (`…:financial` owes its version, `…:a:b:c:v1`
+        // is malformed, `…:a:b:v1` names no `{level}` rc5 lists) refuses.
+        Err(crate::federation::capacity::reversible::CompanionShapeError::Unregistered) => {
+            if match_family(namespace).refusal.is_some() {
+                return Err(Error::NamespaceFamilyUnregistered {
+                    namespace: namespace.to_owned(),
+                    family_stem: stem.to_owned(),
+                    reason: NamespaceConformanceReason::FamilyUnregistered.as_str(),
+                });
+            }
+        }
+    }
+    let cc_refuses = match_family(namespace).refusal == Some(Refusal::FamilyUnregistered);
+    let governed_unrowed = is_governed_family(namespace) && !registry::is_stem_registered(stem);
+    if !cc_refuses && !governed_unrowed {
         return Ok(());
     }
     Err(Error::NamespaceFamilyUnregistered {
@@ -1335,42 +1383,33 @@ impl DimensionAdmissionPolicy {
             }
         }
 
-        // Layer 2b — T3 version-pinning. Every accepted dimension
-        // must contain at least one `:v[0-9]+` segment so any
-        // past verdict can be re-checked against the rule version
-        // it ran against. Implementation is a manual scan rather
-        // than a regex compile per call — keeps the hot path zero-
-        // alloc and avoids pulling `regex` into a dep tree that
-        // doesn't have it.
+        // Layer 2b — T3 version-pinning. Every accepted scored dimension
+        // carries ONE trailing version segment, so any past verdict can be
+        // re-checked against the rule version it ran against.
         //
-        // CEG 0.2 §5.2 + §8.1.9 carve-out: the attestation-ladder
-        // dimensions (canonical `attestation:{mechanism}` and the
-        // deprecated `attestation:l{N}:*` shape during the 0.1→0.2
-        // transition) are mechanism-naming rather than versioned-
-        // mechanism-naming. The wire shape names the verification
-        // mechanism the producer ran (`self_verify`,
-        // `hardware_rooted`, `registry_consensus`, `license_validity`,
-        // `agent_integrity`); the L1-L5 ladder ordering happens
-        // consumer-side per §8.1.9 Policy I. Version-pinning of
-        // these mechanisms lives in the attesting binary's commit
-        // (CIRISVerify's own SLSA-stamped build) and the
-        // calibration package's version, not the wire prefix.
-        //
-        // CEG 1.0-RC5 §5.6.8.14 carve-out: the canonical-binding dimension
-        // `identity:canonical_binding:{H}` is a structural identity claim
-        // (K asserts it is the federation identity behind canonical hash H)
-        // — the suffix is the bound hash, not a versioned mechanism, so it
-        // carries no `:vN`. Like the attestation ladder it is exempt from
-        // T3 version-pinning.
-        if self.require_version_segment
-            && !contains_version_segment(dim)
-            && !Self::is_attestation_ladder_dimension(dim)
-            && parse_canonical_binding_hash(dim).is_none()
-        {
-            return Err(Error::DimensionRejected {
-                dimension: dim.to_string(),
-                reason: DimensionRejectionReason::MissingVersionSegment.as_str(),
-            });
+        // v50.0.0 (CIRISPersist#924, CC 3.1.7 R3 `version_segment`) — one
+        // parser, read from the manifest: the LAST segment must match
+        // `_meta.case_rule.version_segment.pattern` (`v1`, `v2`, `v1.2`), and
+        // the families in its `exempt` list carry none (the five
+        // mechanism-named attestation-ladder families, CEG 0.2 §5.2 / §8.1.9,
+        // whose version lives in the attesting binary; and
+        // `identity:canonical_binding:{canonical_hash}`, whose suffix IS the
+        // bound hash — CEG 1.0-RC5 §5.6.8.14). Both carve-outs used to be
+        // code (`is_attestation_ladder_dimension`, a `parse_canonical_binding_
+        // hash` probe) beside a byte scan that accepted a `:vN` ANYWHERE
+        // (`foo:v1:bar`); they are now the manifest's list, and the version
+        // is trailing, as CC states it.
+        if self.require_version_segment {
+            use crate::federation::namespace::matcher;
+            let exempt = matcher::match_family(dim)
+                .family
+                .is_some_and(matcher::is_version_exempt);
+            if !exempt && matcher::trailing_version(dim).is_none() {
+                return Err(Error::DimensionRejected {
+                    dimension: dim.to_string(),
+                    reason: DimensionRejectionReason::MissingVersionSegment.as_str(),
+                });
+            }
         }
 
         Ok(())
@@ -1461,25 +1500,6 @@ impl DimensionAdmissionPolicy {
             Placement::Commons => Ok(()),
         }
     }
-
-    /// True iff `dim` is one of the CEG 0.2 §5.2 attestation-ladder
-    /// dimensions — the canonical mechanism form
-    /// ([`ATTESTATION_LADDER_MECHANISMS`]), and ONLY that form as of
-    /// v37.0.0.
-    ///
-    /// The carve-out this answers is the Layer 2b version-segment
-    /// exemption: a ladder dimension names the verification MECHANISM
-    /// the producer ran, so it carries no `:v[0-9]+`.
-    ///
-    /// The deprecated CEG 0.1 shape `attestation:l{N}:*` used to
-    /// return `true` here under the dual-accept transition policy.
-    /// It no longer reaches this function at all — Layer 1d refuses it
-    /// with [`super::Error::DeprecatedAttestationLadderForm`] before
-    /// the version gate runs, so the exemption question never arises
-    /// for it. CEG §13.1 records the deprecation.
-    fn is_attestation_ladder_dimension(dim: &str) -> bool {
-        ATTESTATION_LADDER_MECHANISMS.contains(&dim)
-    }
 }
 
 /// The REMOVED CEG 0.1 attestation-ladder prefix (`attestation:l<N>:…`).
@@ -1518,34 +1538,6 @@ fn is_deprecated_attestation_ladder_prefix(dim: &str) -> bool {
         return false;
     }
     true
-}
-
-/// Returns true iff `dim` contains at least one segment of the
-/// form `:v` followed by one-or-more ASCII digits, terminated by a
-/// `:` or end-of-string. Equivalent to the regex
-/// `:v[0-9]+(:|$)`, hand-rolled to avoid pulling the `regex` crate.
-fn contains_version_segment(dim: &str) -> bool {
-    let bytes = dim.as_bytes();
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        // Look for `:v` prefix.
-        if bytes[i] == b':' && bytes[i + 1] == b'v' && bytes[i + 2].is_ascii_digit() {
-            // Consume the digits.
-            let mut j = i + 2;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            // Terminator must be `:` or end-of-string.
-            if j == bytes.len() || bytes[j] == b':' {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    // Tail case: the dimension may end with `:v[0-9]+` exactly
-    // (no trailing `:`). The loop above handles that via the
-    // `j == bytes.len()` check; nothing additional needed.
-    false
 }
 
 /// Pull the `dimension` field out of an attestation envelope as a
@@ -2670,6 +2662,12 @@ pub async fn check_promotion_admission(
     // only as minor-guardianship.
     check_user_target_steward_binding_admission(directory, row).await?;
 
+    // CC 5.4.6 / CC 3.4.13 Q5 — a minor's owner-binding is never announced
+    // (v50.0.0, CIRISPersist#924). Re-run here because "admission MUST refuse
+    // the PROMOTION": the owner's age band is directory state that can have
+    // changed since the local write.
+    check_minor_owner_binding_not_announced(directory, row).await?;
+
     // CC 4.5.4 / §11.11 — a federation apply step keyed on a moderator-less
     // community. Tier-sensitive, and now reached for the first time.
     check_no_moderator_federate_apply(directory, row).await?;
@@ -3335,87 +3333,46 @@ pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(
 /// and never reaches the floor. The floor stays byte-exact because nothing
 /// malformed survives to it.
 ///
-/// An UNCATALOGUED dimension is not judged here — it has no segment classes,
-/// and inventing them would be the section-walk heuristic CC 3.1.7 R2 forbids.
-/// Such rows are governed by the family gates that already cover them.
+/// # v50.0.0 (CIRISPersist#924, CC rc5) — the one matcher decides
+///
+/// The gate no longer zips a dimension against a family it found by literal
+/// prefix (which judged only the family's own arity, so a variadic tail below
+/// `dma:pdma:*` was never case-checked, and a case-folded LOOKUP was needed to
+/// find `audit_chain:Hash_continuity`'s family at all). It asks
+/// [`match_family`](crate::federation::namespace::matcher::match_family) and
+/// refuses its two grammar refusals:
+///
+/// - `namespace_dimension_case_malformed` — a segment off its class (including
+///   every variadic-tail segment), an external token off its standard's syntax
+///   (`usd`), an uppercase or duplicated version tail, a case-mutated
+///   registered stem (CC's detect-by-folding, never admit-by-folding);
+/// - `namespace_vocab_value_unregistered` — a value outside a CLOSED
+///   `segments[].values` enumeration (`hardware_custody:tpm:v1`).
+///
+/// `namespace_family_unregistered` is R2's refusal
+/// ([`check_namespace_family_registered`]) and `missing_version_segment` the
+/// T3 layer's ([`DimensionAdmissionPolicy::check`]); the Private Use range is
+/// tier-scoped ([`check_private_use_not_federatable`]). An UNCATALOGUED
+/// dimension the grammar has nothing to say about is open vocabulary and
+/// passes — exactly as CC's reference matcher answers it.
 pub fn check_dimension_case_rule(row: &super::Attestation) -> Result<(), Error> {
+    use crate::federation::namespace::matcher::{match_family, Refusal};
     let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
         return Ok(());
     };
-    let Some((vocab_pattern, refusal_token)) = crate::federation::namespace::registry::case_rule()
+    let m = match_family(dimension);
+    let Some(refusal @ (Refusal::CaseMalformed | Refusal::VocabValueUnregistered)) = m.refusal
     else {
         return Ok(());
     };
-    // The `literal` half of R3, and it must run BEFORE the lookup — CC's ruling
-    // says this check "stays as is", and the reason is structural: a dimension
-    // whose STEM is capitalised matches no catalogued family at all, so it has
-    // no `segments[]` to judge and would sail through the per-segment pass
-    // below. `Config:admission:v1` is exactly that shape. The generator
-    // guarantees every catalogued stem is lowercase, so any uppercase here is a
-    // family nobody catalogued, imitating one somebody did.
-    let stem = crate::federation::namespace::registry::family_stem(dimension);
-    if stem.chars().any(|c| c.is_ascii_uppercase()) {
-        return Err(Error::InvalidArgument(format!(
-            "{refusal_token}: dimension {dimension:?} has a non-lowercase family stem \
-             {stem:?}. CC 3.1.7 R3 classes a stem `literal` and the CC generator refuses to \
-             build if any catalogued stem is not lowercase — so this matches no family, and \
-             would evade every family gate while looking like the family it imitates."
-        )));
-    }
-    // v42.0.0 (review, P2) — identify the family CASE-INSENSITIVELY before
-    // judging it. A byte-exact lookup fails on `audit_chain:Hash_continuity`
-    // precisely BECAUSE a later literal segment is miscased, so returning Ok on
-    // a lookup miss let every such imitation through — the exact family-imitation
-    // gap this gate exists to close, one segment further in than the stem check
-    // catches. Matching folds case only to FIND the candidate family; the
-    // enforcement below is still byte-exact against its declared classes, and
-    // nothing else in the substrate case-folds.
-    let entry = match crate::federation::namespace::registry::lookup(dimension) {
-        Some(e) => e,
-        None => {
-            let lowered = dimension.to_ascii_lowercase();
-            match crate::federation::namespace::registry::lookup(&lowered) {
-                // Not a catalogued family in any casing — not this gate's to
-                // judge; inventing classes would be the section-walk heuristic
-                // CC 3.1.7 R2 forbids.
-                None => return Ok(()),
-                Some(e) => e,
-            }
-        }
-    };
-    use crate::federation::namespace::registry::SegmentClass as SC;
-    for (seg, (_, class)) in dimension.split(':').zip(entry.segments.iter()) {
-        let bad = match *class {
-            // Lowercase alphanumerics plus `_ . -`, per the manifest's own
-            // pattern. Checked structurally rather than by pulling in a regex
-            // engine for one expression; `vocab_pattern` is asserted to BE this
-            // shape by `the_vocab_pattern_is_the_one_this_gate_implements_815`,
-            // so the manifest and this check cannot drift apart silently.
-            SC::Vocab | SC::Literal => {
-                seg.is_empty()
-                    || !seg
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                    || !seg.chars().all(|c| {
-                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-')
-                    })
-            }
-            SC::Hex => seg.chars().any(|c| c.is_ascii_uppercase()),
-            // Caller data and outside standards keep their case.
-            SC::Value | SC::External | SC::Wildcard => false,
-        };
-        if bad {
-            return Err(Error::InvalidArgument(format!(
-                "{refusal_token}: dimension {dimension:?} segment {seg:?} is classed \
-                 {class:?} by CC 3.1.7 R3 and must match {vocab_pattern:?}. A dimension is a \
-                 case-sensitive byte string and NOTHING case-folds, so a segment breaking its \
-                 rule is malformed rather than a sibling — it would otherwise reach the family \
-                 gate while evading the leaf checks that key on the exact spelling."
-            )));
-        }
-    }
-    Ok(())
+    let family = m.family.unwrap_or("<no row: a malformed form of none>");
+    Err(Error::InvalidArgument(format!(
+        "{refusal}: dimension {dimension:?} does not conform to its family {family:?} under CC \
+         3.1.7 R3 — segment classes, closed enumerations and the version tail are manifest \
+         DATA, compared byte-exactly; NOTHING case-folds, so a dimension breaking its grammar \
+         is malformed rather than a sibling, and would otherwise reach the family gates while \
+         evading the leaf checks that key on the exact spelling."
+    )))
 }
 
 /// v42.0.0 (CIRISPersist#814 part 3, CC 3.4.5.1) — **live self-reports for a
@@ -6403,14 +6360,39 @@ pub const DELEGATED_DUTY_SCOPES: &[&str] = &[
 /// primitive — a reserved `scores` dimension (1+4 preserved).
 pub const IDENTITY_CANONICAL_BINDING_PREFIX: &str = "identity:canonical_binding:";
 
-/// Parse the bound canonical hash `H` out of an
-/// `identity:canonical_binding:{H}` dimension. `None` if the dimension
-/// is not a canonical-binding or carries an empty suffix.
+/// v50.0.0 (CIRISPersist#924) — the registry family a canonical binding
+/// resolves to (CC 3.3.14; `{canonical_hash}` is a `hex` segment, pattern
+/// `^[0-9a-f]{64}$`).
+pub const CANONICAL_BINDING_FAMILY: &str = "identity:canonical_binding:{canonical_hash}";
+
+/// The key-id spelling of a canonical hash (CC 2.3.2.1): a subject is
+/// `canonical:sha256:<64 lowercase hex>`, and that is the string a binding's
+/// hash is compared against in `subject_key_ids`.
+pub const CANONICAL_KEY_ID_PREFIX: &str = "canonical:sha256:";
+
+/// Parse the bound canonical hash `H` (64 lowercase hex) out of an
+/// `identity:canonical_binding:{H}` dimension. `None` unless the one matcher
+/// resolves the dimension to [`CANONICAL_BINDING_FAMILY`] without a refusal.
+///
+/// v50.0.0 (CIRISPersist#924, CC rc5) — **wire break.** The suffix used to be
+/// anything non-empty, and persist's own fixtures bound the KEY-ID spelling
+/// (`identity:canonical_binding:canonical:sha256:<hex>`, five segments). CC's
+/// registry row makes `{canonical_hash}` one `hex` segment of 64 characters,
+/// and version-exempts exactly that family; the five-segment form matches no
+/// row, carries no version, and is refused at the T3 gate. The hash is
+/// re-spelled as a key id ([`CANONICAL_KEY_ID_PREFIX`]) where it meets
+/// `subject_key_ids`. A version tail is tolerated (the family is exempt, not
+/// forbidden).
 #[must_use]
 pub fn parse_canonical_binding_hash(dimension: &str) -> Option<&str> {
+    let m = crate::federation::namespace::matcher::match_family(dimension);
+    if m.family != Some(CANONICAL_BINDING_FAMILY) || m.refusal.is_some() {
+        return None;
+    }
     dimension
-        .strip_prefix(IDENTITY_CANONICAL_BINDING_PREFIX)
-        .filter(|h| !h.is_empty())
+        .strip_prefix(IDENTITY_CANONICAL_BINDING_PREFIX)?
+        .split(':')
+        .next()
 }
 
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG §5.6.8.14) — the set of canonical
@@ -6438,7 +6420,7 @@ async fn canonical_binding_hashes_for(
         if let Some(h) =
             envelope_dimension(&r.attestation_envelope).and_then(parse_canonical_binding_hash)
         {
-            out.insert(h.to_owned());
+            out.insert(format!("{CANONICAL_KEY_ID_PREFIX}{h}"));
         }
     }
     Ok(out)
@@ -13933,6 +13915,79 @@ pub async fn check_node_agency_admission(
 /// attested fiduciary binding (and re-asserts `target_is_self_sovereign` when
 /// no live incapacity is attested — the presumption of capacity).
 ///
+/// v50.0.0 (CIRISPersist#924, CC 5.4.6 — CIRISConstitution#111, ruled) —
+/// **a minor's owner-binding is never announced.**
+///
+/// CC 5.4.6: a person's public device roster is *exactly* the set of their
+/// nodes whose owner-binding is carried at `cohort_scope: federation` — that is
+/// what "announced" means. A federation-scope owner-binding makes its owner
+/// contactable and discoverable by unconnected adults, which the CC 3.4.13 Q5
+/// hard floor forbids for a minor, so "a node whose owner resolves to the
+/// `minor` band MUST NOT carry a federation-scope owner-binding, admission
+/// MUST refuse the promotion, and such a person is reachable only on the
+/// derived plane".
+///
+/// Refuses an owner-purpose `delegates_to`
+/// ([`is_owner_binding_envelope`]) at [`cohort_scope::FEDERATION`] — or a
+/// `supersedes` WIDENING one to federation (`widen_audience`: the owner
+/// re-signing the binding at that audience, which is what CC calls
+/// announcing) — whose
+/// GRANTER (`attesting_key_id` — the owner signs owner → node) resolves to
+/// [`AgeBand::Minor`](super::age::AgeBand::Minor) under
+/// [`super::age::age_band`]. An unknown band is not refused here (presumption
+/// of sovereignty, CC 1.15.6 — the same reading the steward-binding gate
+/// takes); every other scope is untouched, and the same binding at `self` is
+/// the lawful shape. Wired at every backend's `put_attestation` beside the
+/// steward-binding gate AND in the promotion stack, because the owner's band
+/// is directory state a local row can outlive.
+pub async fn check_minor_owner_binding_not_announced(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use super::age::{age_band, AgeBand};
+    if row.cohort_scope != super::types::cohort_scope::FEDERATION {
+        return Ok(());
+    }
+    let announces_an_owner_binding = if row.attestation_type == attestation_type::DELEGATES_TO {
+        is_owner_binding_envelope(&row.attestation_envelope)
+    } else if row.attestation_type == attestation_type::SUPERSEDES {
+        // v50.0.0 review (HIGH-1) — CC's own reading: "announcing = the owner
+        // re-signing the binding at that audience", which is exactly
+        // `widen_audience`: a `supersedes` at a wider `cohort_scope` over the
+        // SAME body. Every widening path (the explicit widen, the sweep's
+        // widening step, the pyo3 widen) writes that row through a put door,
+        // so this is the one site they all cross. Judged on the body carried
+        // AND on the prior it names — a widening whose body stripped the
+        // purpose marker still announces the binding it supersedes.
+        is_owner_binding_envelope(&row.attestation_envelope)
+            || match row
+                .attestation_envelope
+                .get(crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID)
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(prior_id) => directory
+                    .get_attestation(prior_id)
+                    .await?
+                    .is_some_and(|prior| {
+                        prior.attestation_type == attestation_type::DELEGATES_TO
+                            && is_owner_binding_envelope(&prior.attestation_envelope)
+                    }),
+                None => false,
+            }
+    } else {
+        false
+    };
+    if !announces_an_owner_binding {
+        return Ok(());
+    }
+    if age_band(directory, &row.attesting_key_id).await? == AgeBand::Minor {
+        return Err(Error::WriteScopeRefused(
+            crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation,
+        ));
+    }
+    Ok(())
+}
+
 /// Verify-before-mutation (AV-9): wired into every backend's
 /// `put_attestation` immediately AFTER [`check_node_agency_admission`], so a
 /// rejected emission leaves no trace. Backend-agnostic — resolution uses the
@@ -14825,23 +14880,100 @@ mod tests {
         }
     }
 
-    /// v42.0.0 (CIRISPersist#815) — the manifest's `vocab_pattern` IS the shape
-    /// `check_dimension_case_rule` implements structurally.
+    /// v50.0.0 (CIRISPersist#924, CC 3.1.7 R3 — CIRISConstitution#108/#112)
+    /// — **a variadic tail is case-checked too.**
     ///
-    /// The gate checks the pattern by hand rather than pulling in a regex
-    /// engine for one expression, so this pins the two together: if CC ever
-    /// widens or narrows the pattern, this reds instead of the gate silently
-    /// enforcing the old shape against a manifest that says something else.
+    /// The v42 gate zipped a dimension against its family's OWN arity, so the
+    /// segments below a `*` (`dma:pdma:{leaf}`, `dma:dsdma:{domain}:*`) were
+    /// never judged: `dma:pdma:Principled_Evaluation:v1` sailed through while
+    /// its lowercase sibling was the leaf the fold keyed on. CC classes every
+    /// segment below a wildcard `vocab` unless a leaf row says otherwise, and a
+    /// version-shaped token there is a malformed (uppercase or duplicated)
+    /// version tail.
     #[test]
-    fn the_vocab_pattern_is_the_one_this_gate_implements_815() {
-        let (pattern, token) = crate::federation::namespace::registry::case_rule()
-            .expect("the rc5 manifest carries _meta.case_rule");
-        assert_eq!(
-            pattern, "^[a-z0-9][a-z0-9_.-]*$",
-            "the gate implements this pattern structurally; if CC changed it, the \
-             gate must change with it rather than enforce a stale shape"
+    fn variadic_tail_segments_are_case_checked() {
+        let mk = |dim: &str| {
+            let now = chrono::Utc::now();
+            crate::federation::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: "k".to_owned(),
+                attested_key_id: "k".to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({ "dimension": dim }),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: "k".to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            }
+        };
+        for (dim, refused, why) in [
+            (
+                "dma:pdma:principled_evaluation:v1",
+                false,
+                "a conformant leaf",
+            ),
+            (
+                "dma:pdma:Principled_Evaluation:v1",
+                true,
+                "an uppercase variadic-tail segment — the v42 gate never judged it",
+            ),
+            (
+                "dma:dsdma:medical:triage:Urgent:v1",
+                true,
+                "a miscased segment several levels below the wildcard",
+            ),
+            (
+                "dma:dsdma:medical:triage:urgent:v1",
+                false,
+                "the same depth, conformant",
+            ),
+            (
+                "dma:csdma:plausibility:V2:v1",
+                true,
+                "a version-shaped token in the tail is a malformed version tail, never a leaf",
+            ),
+            (
+                "hardware_custody:tpm:v1",
+                true,
+                "a closed-vocabulary value outside the enumeration \
+                 (namespace_vocab_value_unregistered)",
+            ),
+            (
+                "hardware_custody:tpm_discrete:v1",
+                false,
+                "a listed platform",
+            ),
+        ] {
+            let got = check_dimension_case_rule(&mk(dim));
+            assert_eq!(
+                got.is_err(),
+                refused,
+                "{dim:?} should be {} — {why}. got {got:?}",
+                if refused { "REFUSED" } else { "admitted" }
+            );
+        }
+        let err = check_dimension_case_rule(&mk("hardware_custody:tpm:v1")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("namespace_vocab_value_unregistered"),
+            "the closed-vocabulary refusal names ITS token, not the case token: {err}"
         );
-        assert_eq!(token, "namespace_dimension_case_malformed");
+        let err = check_dimension_case_rule(&mk("dma:pdma:Principled_Evaluation:v1")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("namespace_dimension_case_malformed"));
     }
 
     /// v42.0.0 (CIRISPersist#814 part 1) — the duty/permission reach table.
@@ -15545,10 +15677,14 @@ mod tests {
     #[test]
     fn admission_rejects_accord_dimension_from_agent() {
         let p = default_policy();
+        // v50.0.0 (CIRISPersist#924): CC 3.1.1's leaf is
+        // `accord:invoke:constitutional:{halt_id}` — lowercase, R3 (`accord:*`
+        // is `leaves_closed`). The uppercase fixture this used to carry is the
+        // old shape `accord_invoke_old_uppercase_shape_fails_loudly` refuses.
         let err = p
             .check(
                 attestation_type::SCORES,
-                Some("accord:invoke:CONSTITUTIONAL:halt_id_42:v1"),
+                Some("accord:invoke:constitutional:halt_id_42:v1"),
                 identity_type::AGENT,
             )
             .unwrap_err();
@@ -15556,6 +15692,81 @@ mod tests {
             err,
             Error::AccordDimensionRequiresAccordHolder { .. }
         ));
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CC 3.1.1 + CC 4.2.1.1 `ciris.accord_invoke.v2`)
+    /// — **the old invocation shape fails loudly, never by accident.**
+    ///
+    /// CC lowercased the accord invocation kinds and moved the canonical-bytes
+    /// domain label to `.v2` so an old signature cannot verify. Persist holds
+    /// no invocation canonical bytes (verify-core signs and verifies them), so
+    /// the persist-side witness is the DIMENSION: the old
+    /// `accord:invoke:CONSTITUTIONAL:…` spelling is refused
+    /// `namespace_dimension_case_malformed` at the case gate on every row, the
+    /// new leaf resolves to its own CC row, and a leaf CC does not name under
+    /// the closed `accord:*` is `namespace_family_unregistered`.
+    #[test]
+    fn accord_invoke_old_uppercase_shape_fails_loudly() {
+        use crate::federation::namespace::matcher::{match_family, Refusal};
+        let old = match_family("accord:invoke:CONSTITUTIONAL:halt_id_42:v1");
+        assert_eq!(old.refusal, Some(Refusal::CaseMalformed), "{old:?}");
+        let new = match_family("accord:invoke:constitutional:halt_id_42:v1");
+        assert_eq!(
+            new.family,
+            Some("accord:invoke:constitutional:{halt_id}"),
+            "{new:?}"
+        );
+        assert_eq!(new.refusal, None);
+        assert_eq!(
+            new.binds.get("halt_id").map(String::as_str),
+            Some("halt_id_42")
+        );
+        for (kind, leaf) in [
+            ("notify", "accord:invoke:notify:{notify_id}"),
+            ("drill", "accord:invoke:drill:{drill_id}"),
+        ] {
+            let m = match_family(&format!("accord:invoke:{kind}:x1:v1"));
+            assert_eq!((m.family, m.refusal), (Some(leaf), None));
+        }
+        let unnamed = match_family("accord:invoke:halt:x1:v1");
+        assert_eq!(unnamed.refusal, Some(Refusal::FamilyUnregistered));
+
+        // …and at the door: the case gate refuses the old shape by its token.
+        let now = chrono::Utc::now();
+        let mut row = crate::federation::Attestation {
+            attestation_id: "a".into(),
+            attesting_key_id: "k".into(),
+            attested_key_id: "k".into(),
+            attestation_type: attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "accord:invoke:CONSTITUTIONAL:halt_id_42:v1"
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k".into(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::SELF.into(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.into(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        let err = check_dimension_case_rule(&row).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("namespace_dimension_case_malformed"),
+            "{err}"
+        );
+        row.attestation_envelope =
+            serde_json::json!({ "dimension": "accord:invoke:constitutional:halt_id_42:v1" });
+        check_dimension_case_rule(&row).unwrap();
     }
 
     #[test]
@@ -15867,25 +16078,83 @@ mod tests {
         }
     }
 
-    // ── Helper: contains_version_segment edge cases ────────────────
+    // ── The one version parser (v50.0.0, CIRISPersist#924) ─────────
+
+    /// CC 3.1.7 R3 `version_segment` — trailing, required, read from the
+    /// manifest, with the manifest's `exempt` list as the only carve-outs.
+    /// The v49 byte scan admitted a `:vN` anywhere (`...:v2:rights_asymmetry`)
+    /// and knew nothing of dotted versions; both answers flip here.
+    /// v50.0.0 (CIRISPersist#924) — `parse_canonical_binding_hash` goes
+    /// through the one matcher: only CC's `identity:canonical_binding:{64
+    /// lowercase hex}` (an optional version tail tolerated) yields a hash; the
+    /// pre-v50 key-id spelling, uppercase, a short digest and trailing junk do
+    /// not (mutation M15 of the #924 round survived without this).
+    #[test]
+    fn canonical_binding_parse_goes_through_the_matcher_924() {
+        let h = "ab".repeat(32);
+        assert_eq!(
+            parse_canonical_binding_hash(&format!("identity:canonical_binding:{h}")),
+            Some(h.as_str())
+        );
+        assert_eq!(
+            parse_canonical_binding_hash(&format!("identity:canonical_binding:{h}:v1")),
+            Some(h.as_str()),
+            "the family is version-exempt, not version-forbidden"
+        );
+        for bad in [
+            format!("identity:canonical_binding:canonical:sha256:{h}"),
+            format!("identity:canonical_binding:{}", h.to_uppercase()),
+            "identity:canonical_binding:abcd".to_owned(),
+            format!("identity:canonical_binding:{h}:junk"),
+            "identity:canonical_binding:".to_owned(),
+        ] {
+            assert_eq!(parse_canonical_binding_hash(&bad), None, "{bad}");
+        }
+    }
 
     #[test]
-    fn version_segment_terminal_and_middle() {
-        // Terminal `:v1`.
-        assert!(contains_version_segment("accord:human_dignity:v1"));
-        // Middle `:v2:`.
-        assert!(contains_version_segment(
-            "detection:correlated_action:v2:rights_asymmetry"
-        ));
-        // Multi-digit version.
-        assert!(contains_version_segment("a:v123"));
-        // No version segment at all.
-        assert!(!contains_version_segment("rights_asymmetry"));
-        // `:v` followed by a non-digit (`:variant:`) does NOT
-        // count — we're looking for `:v[0-9]+`.
-        assert!(!contains_version_segment("a:variant:b"));
-        // `v1` without leading colon doesn't count.
-        assert!(!contains_version_segment("v1_only"));
+    fn version_segment_is_trailing_and_read_from_the_manifest() {
+        let policy = DimensionAdmissionPolicy::default();
+        let check = |dim: &str| policy.check(attestation_type::SCORES, Some(dim), "agent");
+        let missing = |dim: &str| {
+            matches!(
+                check(dim),
+                Err(Error::DimensionRejected { reason, .. })
+                    if reason == DimensionRejectionReason::MissingVersionSegment.as_str()
+            )
+        };
+        assert!(!missing("objection:raised:v1"), "terminal :v1");
+        assert!(!missing("a:v123"), "multi-digit");
+        assert!(
+            !missing("benchmark:he300:ethics:v1.2"),
+            "a dotted version (CC v1.2)"
+        );
+        assert!(
+            missing("correlated_action:v2:rights_asymmetry"),
+            "a MIDDLE :v2: is not the trailing version segment"
+        );
+        assert!(missing("rights_asymmetry"));
+        assert!(missing("a:variant:b"));
+        assert!(missing("v1_only"));
+        // The manifest's exempt list — and only it.
+        for exempt in [
+            "attestation:self_verify",
+            "attestation:hardware_rooted",
+            "attestation:agent_integrity",
+            "attestation:license_validity",
+            "attestation:registry_consensus",
+        ] {
+            assert!(!missing(exempt), "{exempt} is version-exempt (the ladder)");
+        }
+        let h = "a".repeat(64);
+        assert!(
+            !missing(&format!("identity:canonical_binding:{h}")),
+            "the canonical-binding hash is exempt"
+        );
+        assert!(
+            missing("attestation:self_verify_but_not_really"),
+            "exemption is by FAMILY, not by a shared prefix"
+        );
     }
 
     // ── Error::kind() stability ────────────────────────────────────
@@ -17241,7 +17510,7 @@ mod tests {
         let undeclared: Vec<&String> = stems
             .iter()
             .filter(|s| {
-                !registry::is_family_registered(s)
+                !registry::is_stem_registered(s)
                     && !UNREGISTERED_GATED_FAMILIES.contains(&&***s)
                     && !STAGED_GOVERNED_FAMILIES
                         .iter()
@@ -17265,7 +17534,7 @@ mod tests {
         use crate::federation::namespace::registry;
         for stem in UNREGISTERED_GATED_FAMILIES {
             assert!(
-                !registry::is_family_registered(stem),
+                !registry::is_stem_registered(stem),
                 "{stem:?} is declared in UNREGISTERED_GATED_FAMILIES but CC now REGISTERS it — \
                  delete the line so the family goes through the real R2 gate"
             );
@@ -17279,6 +17548,126 @@ mod tests {
                  not govern that family, so the line excuses nothing"
             );
         }
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112 ask 2) — **every
+    /// reserved-rule prefix in code is a manifest leaf, byte for byte.**
+    ///
+    /// `default_reserved_prefix_rules` and `HARD_CODED_RESERVED_STEMS` are
+    /// hand-spelled `starts_with` prefixes. A prefix spelled differently from
+    /// the registry (a case slip, `detection:distributive_access:`, a stem CC
+    /// renamed) gates NOTHING — every conformant dimension misses it — and no
+    /// other test would notice, because the rule still "works" on its own
+    /// fixture. So each must be a run of literal segments some registry family
+    /// starts with (or a CC `_meta.case_rule.reserved_stems` stem).
+    #[test]
+    fn reserved_prefix_rules_match_manifest_leaves() {
+        use crate::federation::namespace::matcher::{is_literal_family_prefix, reserved_stems};
+        let prefixes: Vec<String> = default_reserved_prefix_rules()
+            .into_iter()
+            .map(|r| r.pattern_prefix)
+            .chain(HARD_CODED_RESERVED_STEMS.iter().map(|s| (*s).to_owned()))
+            .collect();
+        assert!(prefixes.len() >= 10, "vacuous: {prefixes:?}");
+        let stems: Vec<&str> = reserved_stems().collect();
+        let bad: Vec<&String> = prefixes
+            .iter()
+            .filter(|p| !is_literal_family_prefix(p) && !stems.contains(&p.as_str()))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "reserved-rule prefix(es) {bad:?} are not a literal leaf of any vendored family nor \
+             a CC reserved stem — a rule spelled off the registry gates nothing"
+        );
+        // And the check bites: a near-miss spelling is not a leaf.
+        assert!(!is_literal_family_prefix("detection:distributive_access:"));
+        assert!(!is_literal_family_prefix("Detection:"));
+        assert!(!is_literal_family_prefix("detection:correlated_action"));
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CIRISConstitution#117) — **the CC 3.4.12
+    /// capacity companions resolve to their own registry rows.**
+    ///
+    /// The pre-release rc5 had no row for them and a carve-out stood R2(b)
+    /// aside; its build-failing sentinel fired when the released rc5
+    /// (c60d0a6) registered `capacity_assurance:reversible_{excluded|pending}:
+    /// {domain}:{version}`, and the carve-out was deleted. What this pins now:
+    /// the well-formed companion (WITH its `{version}` tail) resolves to its
+    /// row and passes R2(b); the versionless v49 spelling, a case-mutated
+    /// domain, extra depth and an unminted sibling all refuse on the
+    /// `attestation_type` surface, where R2(b) is the only grammar gate.
+    #[test]
+    fn capacity_companions_resolve_to_their_cc_rows_117() {
+        use crate::federation::capacity::reversible::{
+            parse_companion, CompanionShapeError, EXCLUDED_FAMILY, EXCLUDED_PREFIX, PENDING_FAMILY,
+            PENDING_PREFIX,
+        };
+        use crate::federation::namespace::matcher::{match_family, Refusal};
+        for (prefix, row) in [
+            (EXCLUDED_PREFIX, EXCLUDED_FAMILY),
+            (PENDING_PREFIX, PENDING_FAMILY),
+        ] {
+            assert!(
+                crate::federation::namespace::matcher::families().any(|f| f == row),
+                "{row} is a vendored registry row"
+            );
+            assert!(row.ends_with(":{version}"), "the row carries the tail");
+            let ok = format!("{prefix}financial:v1");
+            let m = match_family(&ok);
+            assert_eq!((m.family, m.refusal), (Some(row), None), "{ok}");
+            assert_eq!(m.binds.get("domain").map(String::as_str), Some("financial"));
+            assert_eq!(parse_companion(&ok), Ok(Some((prefix, "financial"))));
+            check_namespace_family_registered(&ok).expect("the well-formed companion");
+
+            // The versionless v49 spelling: the row owes its `{version}`.
+            let bare = format!("{prefix}financial");
+            assert_eq!(
+                match_family(&bare).refusal,
+                Some(Refusal::MissingVersionSegment),
+                "{bare}"
+            );
+            assert_eq!(
+                parse_companion(&bare),
+                Err(CompanionShapeError::Unregistered)
+            );
+            assert!(
+                check_namespace_family_registered(&bare).is_err(),
+                "{bare}: the trailing version is required"
+            );
+
+            let bad_case = format!("{prefix}Financial:v1");
+            assert_eq!(
+                parse_companion(&bad_case),
+                Err(CompanionShapeError::CaseMalformed)
+            );
+            let err = check_namespace_family_registered(&bad_case).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("namespace_dimension_case_malformed"),
+                "{bad_case}: {err}"
+            );
+
+            for deep in [format!("{prefix}a:b:c:v1"), format!("{prefix}a:b:v1")] {
+                assert_eq!(
+                    parse_companion(&deep),
+                    Err(CompanionShapeError::Unregistered),
+                    "{deep}"
+                );
+                assert!(
+                    matches!(
+                        check_namespace_family_registered(&deep),
+                        Err(Error::NamespaceFamilyUnregistered { .. })
+                    ),
+                    "{deep}: extra depth is no companion, and rc5 closed `{{level}}`"
+                );
+            }
+        }
+        let sibling = "capacity_assurance:reversible_imagined:financial:v1";
+        assert_eq!(
+            match_family(sibling).refusal,
+            Some(Refusal::FamilyUnregistered)
+        );
+        assert!(check_namespace_family_registered(sibling).is_err());
     }
 
     /// v38.0.0 (CIRISPersist#721) — every trust-plane op is CLASSIFIED, and
@@ -17319,7 +17708,7 @@ mod tests {
                 "{stem:?} must name the tracking issue that graduates it"
             );
             assert!(
-                !registry::is_family_registered(stem),
+                !registry::is_stem_registered(stem),
                 "{stem:?} GRADUATED — the vendored registry now carries its row, so admission \
                  is open and this staged line is a stale latch. Delete it."
             );
@@ -17438,10 +17827,13 @@ mod tests {
         let mut under_enforced: Vec<String> = Vec::new();
 
         for entry in registry::entries() {
-            // A concrete dimension on this family: the literal stem the
-            // manifest's `{param}`/`*` prefix truncates to, which is exactly
-            // what `authority_for` and the rule table both match against.
-            let dim = &entry.match_prefix;
+            // A concrete dimension on this family. v50.0.0 (CIRISPersist#924):
+            // the literal stem (`system:`) stopped being one — `authority_for`
+            // resolves through the one matcher, which reads an empty segment
+            // as malformed — so the probe is the reference generator's own
+            // class-conformant sample for the row.
+            let dim = &crate::federation::namespace::matcher::sample_dimension(&entry.prefix)
+                .expect("every registry entry has a sample");
             let manifest_reserved = registry::authority_for(dim).reserved.is_some();
             let gated_by_rule = rules.iter().any(|r| dim.starts_with(&r.pattern_prefix));
             let gated_by_arm = HARD_CODED_RESERVED_STEMS.iter().any(|s| dim.starts_with(s));
@@ -17535,7 +17927,6 @@ mod tests {
             "withdraws",
             // open vocabulary INSIDE registered families
             "credits:rust:en:alice",
-            "detection:emergent_pattern:novel_signal:v1",
             "capacity:core_identity:v1",
             "hard_case:moderation_filed:v1",
             "accord:human_dignity:v1",
@@ -17548,6 +17939,24 @@ mod tests {
                 check_namespace_family_registered(dim).is_ok(),
                 "R2(b) must not refuse {dim:?} — refusing conformant traffic and blaming the \
                  producer is the failure mode CIRISPersist#590 was opened to prevent"
+            );
+        }
+        // v50.0.0 (CIRISPersist#924, CC rc5 CC 3.1.7 R3) — the premise this
+        // list held for `detection:emergent_pattern:novel_signal:v1` ("open
+        // vocabulary inside a registered family") is FALSIFIED by CC: a stem
+        // CC 3.4 reserves as a whole is `_meta.case_rule.reserved_stems`, and
+        // an unclaimed leaf beneath it is `namespace_family_unregistered`, never
+        // open vocabulary. Likewise a leaf under the CLOSED `accord:*` that CC
+        // does not name. Refusing these is CC's ruling, not persist blaming a
+        // producer.
+        for dim in [
+            "detection:emergent_pattern:novel_signal:v1",
+            "accord:invoke:halt",
+            "accord:invoke:notify:v1",
+        ] {
+            assert!(
+                check_namespace_family_registered(dim).is_err(),
+                "{dim:?} is an unclaimed leaf under a CC-reserved stem / closed family"
             );
         }
     }

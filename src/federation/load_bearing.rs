@@ -426,55 +426,54 @@ impl LoadBearing {
 /// bounding.
 pub const MAX_DEPENDENCIES_REPORTED: usize = 16;
 
-/// The manifest family prefix a claim `dimension` belongs to, or `None` if it
-/// matches no declared family.
+/// The supersets-manifest family a claim `dimension` belongs to, or `None`.
 ///
-/// Matching mirrors the manifest's own prefix grammar: a literal segment must
-/// match exactly, a `{placeholder}` segment matches any ONE segment, and a
-/// trailing `*` matches the remaining segments. The MOST SPECIFIC match wins
-/// (most literal segments, then longest), the same longest-prefix discipline
-/// [`crate::federation::namespace::registry::lookup`] uses — so
-/// `dma:pdma:principled_evaluation` resolves to `dma:pdma:*` rather than to a
-/// broader `dma:*` if both were declared.
+/// v50.0.0 (CIRISPersist#924) — resolved through the ONE matcher. The
+/// dimension is first matched to its CC registry family by
+/// [`match_family`](crate::federation::namespace::matcher::match_family)
+/// (CC 3.1.7 R3); that family is then NAMED in the supersets walk's own
+/// vocabulary, which is a translation between two manifests' family names and
+/// not a second dimension matcher:
+///
+/// - the supersets family spelled identically (`dma:pdma:*`, `capacity:composite`);
+/// - else the supersets `stem:*` wildcard the registry family sits under
+///   (`consent:replication:{version}` → `consent:*`, `trust:{job}:{version}` →
+///   `trust:*`) — the walk predates the registry's finer rows;
+/// - a dimension NO registry row claims (open vocabulary) resolves only to a
+///   supersets `stem:*` family whose stem the registry registers nothing
+///   under (`scores:*`, `trace_manifest:*`) — the walk's own families.
+///
+/// A dimension the grammar REFUSES (malformed, missing its version, a closed
+/// leaf nobody named) resolves to no family: its declared predicate is
+/// unknowable, which [`LoadBearing::Unknown`] treats as load-bearing and
+/// [`crate::federation::namespace::is_subject_retainable`] as not retainable —
+/// fail-secure on both axes. The old `prefix_match_score` (arity-exact literal
+/// scoring) is deleted.
 #[must_use]
 pub fn family_for_dimension(dimension: &str) -> Option<&'static str> {
-    let mut best: Option<(usize, usize, &'static str)> = None;
-    for family in super::namespace::supersets::family_prefixes() {
-        let Some(literals) = prefix_match_score(family, dimension) else {
-            continue;
-        };
-        let key = (literals, family.len(), family);
-        if best.is_none_or(|b| key > b) {
-            best = Some(key);
+    use crate::federation::namespace::{matcher, registry, supersets};
+    let m = matcher::match_family(dimension);
+    if m.refusal.is_some() {
+        return None;
+    }
+    let keys = supersets::family_prefixes();
+    fn wildcard_stem(k: &str) -> Option<&str> {
+        k.strip_suffix('*').filter(|s| s.ends_with(':'))
+    }
+    match m.family {
+        Some(family) => keys.iter().copied().find(|k| *k == family).or_else(|| {
+            keys.iter()
+                .copied()
+                .filter(|k| wildcard_stem(k).is_some_and(|stem| family.starts_with(stem)))
+                .max_by_key(|k| k.len())
+        }),
+        None => {
+            let stem = registry::family_stem(dimension);
+            keys.iter()
+                .copied()
+                .find(|k| wildcard_stem(k) == Some(stem) && !registry::is_stem_registered(stem))
         }
     }
-    best.map(|(_, _, f)| f)
-}
-
-/// `Some(number_of_literal_segments_matched)` iff `family` matches
-/// `dimension`; `None` otherwise. The literal count is the specificity score.
-fn prefix_match_score(family: &str, dimension: &str) -> Option<usize> {
-    let fam: Vec<&str> = family.split(':').collect();
-    let dim: Vec<&str> = dimension.split(':').collect();
-    let mut literals = 0usize;
-    for (i, seg) in fam.iter().enumerate() {
-        if *seg == "*" {
-            // A trailing `*` consumes the remainder — but only if there IS a
-            // remainder (`consent:*` describes `consent:replication:v1`, not a
-            // bare `consent`).
-            return if dim.len() > i { Some(literals) } else { None };
-        }
-        let d = dim.get(i)?;
-        if seg.starts_with('{') && seg.ends_with('}') {
-            continue; // a placeholder matches exactly one segment
-        }
-        if seg != d {
-            return None;
-        }
-        literals += 1;
-    }
-    // No wildcard consumed the tail: the arities must match exactly.
-    (fam.len() == dim.len()).then_some(literals)
 }
 
 /// v24.2.0 (CIRISPersist#564 stage 1) — **is `object` load-bearing on this
@@ -1888,8 +1887,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
-    /// The family resolver honours the manifest's prefix grammar: literal,
-    /// `{placeholder}`, and trailing `*`.
+    /// The family resolver goes through the ONE matcher (CC 3.1.7 R3) and then
+    /// names the supersets family the registry family sits under.
     #[test]
     fn dimension_resolves_to_its_manifest_family() {
         assert_eq!(
@@ -1899,16 +1898,35 @@ mod tests {
         assert_eq!(family_for_dimension("trust:accepts:v1"), Some("trust:*"));
         assert_eq!(family_for_dimension("trace:complete:v1"), Some("trace:*"));
         assert_eq!(
-            family_for_dimension("capacity:composite"),
+            family_for_dimension("capacity:composite:v1"),
             Some("capacity:composite"),
             "an exact literal family matches with no wildcard"
         );
-        // A `{placeholder}` consumes exactly one segment.
         assert_eq!(
-            family_for_dimension("bond_posted:usd"),
+            family_for_dimension("bond_posted:USD:v1"),
             Some("bond_posted:{currency}")
         );
-        // A bare prefix with nothing after it is NOT the wildcard family.
+        assert_eq!(
+            family_for_dimension("dma:pdma:principled_evaluation:v1"),
+            Some("dma:pdma:*"),
+            "a variadic tail below the wildcard"
+        );
+        // Open vocabulary resolves only to the walk's own stem families.
+        assert_eq!(
+            family_for_dimension("trace_manifest:bundle:v1"),
+            Some("trace_manifest:*")
+        );
+        // The grammar's refusals resolve to NO family (fail-secure: Unknown).
+        assert_eq!(
+            family_for_dimension("capacity:composite"),
+            None,
+            "missing_version_segment"
+        );
+        assert_eq!(
+            family_for_dimension("bond_posted:usd:v1"),
+            None,
+            "usd is malformed"
+        );
         assert_eq!(family_for_dimension("consent"), None);
         assert_eq!(
             family_for_dimension("definitely:not:a:real:family:xyzzy"),

@@ -328,7 +328,8 @@ impl<B: BlobStorage + 'static> SchemaResolver for BlobBackedSchemaResolver<B> {
 ///
 /// # Rule
 ///
-/// The axis is the **last segment that does NOT match `:v[0-9]+`**.
+/// The axis is the **last segment that is not a version segment** (the
+/// manifest's `version_segment.pattern`, v50.0.0).
 /// Segments are split by `:`. Whitespace-trimmed.
 ///
 /// # Worked examples (per FSD-002 §4.9.1)
@@ -355,21 +356,12 @@ pub fn axis_from_dimension(dimension: &str) -> Option<&str> {
         if seg.is_empty() {
             continue;
         }
-        if is_version_segment(seg) {
+        if crate::federation::namespace::matcher::is_version_segment(seg) {
             continue;
         }
         last_non_version = Some(seg);
     }
     last_non_version
-}
-
-/// True iff `seg` matches `^v[0-9]+$` exactly.
-fn is_version_segment(seg: &str) -> bool {
-    let bytes = seg.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'v' {
-        return false;
-    }
-    bytes[1..].iter().all(|b| b.is_ascii_digit())
 }
 
 /// v2.5.0 (CIRISPersist#102 Ask 4) — validate an `attestation_envelope`
@@ -501,10 +493,11 @@ mod tests {
         );
     }
 
-    // ── is_version_segment edge cases ───────────────────────────────
+    // ── the one version parser, as the axis extractor sees it ───────
 
     #[test]
     fn version_segment_matcher() {
+        use crate::federation::namespace::matcher::is_version_segment;
         assert!(is_version_segment("v0"));
         assert!(is_version_segment("v1"));
         assert!(is_version_segment("v12345"));
@@ -515,6 +508,13 @@ mod tests {
         assert!(!is_version_segment("V1")); // uppercase
         assert!(!is_version_segment(""));
         assert!(!is_version_segment("1"));
+        // v50.0.0 (CIRISPersist#924): dotted versions are versions (CC v1.2),
+        // so the axis of `benchmark:he300:ethics:v1.2` is `ethics`.
+        assert!(is_version_segment("v1.2"));
+        assert_eq!(
+            axis_from_dimension("benchmark:he300:ethics:v1.2"),
+            Some("ethics")
+        );
     }
 
     // ── NoOpSchemaResolver ───────────────────────────────────────────
