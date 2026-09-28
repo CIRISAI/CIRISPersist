@@ -1075,6 +1075,12 @@ class Engine:
     def read_blob_range_as(self, at_rest_sha256_hex: str, viewer_key_id: str, start: int, end_inclusive: int, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (BLOB_ENCRYPTION_AT_REST.md §12.4) — the decrypting range read. Plaintext bytes [start, end_inclusive] of any blob as viewer_key_id, base64-en..."""
 
+    def seal_descriptor_for_blob(self, at_rest_sha256_hex: str, key_id: str, plaintext_b64: str) -> str:
+        """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114; MEDIA_SOURCE.md §9.3) — seal a descriptor ({name, format, codec?} as JCS, base64 in, ≤ the descriptor cap) under an EXISTING blob's DEK as key_id: authorized like read_blob_as (blob_not_granted for a non-member), the DEK is the blob's (no edge-derived key), AAD = ciris.sealed_descriptor.v1 ‖ sha256. A plaintext-tier row raises ValueError (nothing to seal under). Returns the base64 at-rest envelope for media.sealed_descriptor."""
+
+    def open_descriptor_for_blob(self, at_rest_sha256_hex: str, viewer_key_id: str, sealed_b64: str) -> str:
+        """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114; MEDIA_SOURCE.md §9.3) — open a media.sealed_descriptor as viewer_key_id under the BLOB's DEK: the same authorization as read_blob_as (blob_not_granted for a stranger; a withdrawn blob refuses); AAD = ciris.sealed_descriptor.v1 ‖ sha256, so a descriptor sealed for another blob (or the blob's own ciphertext) fails AFTER authorization as a backend/crypto error, never blob_not_granted. Returns the base64 plaintext ({name, format, codec?} as JCS)."""
+
     def read_stream_chunk_as(self, stream_id: str, seq: int, viewer_key_id: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — #838 (§12.10) — read one chunk of a stream by POSITION as viewer_key_id, base64-encoded. The DVR / catch-up read: the row at (stream_id, seq) autho..."""
 

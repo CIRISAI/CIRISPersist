@@ -1946,4 +1946,42 @@ mod tests {
         let v = serde_json::to_value(&ev).unwrap();
         p.check("k1", None, Some(&v), Utc::now()).unwrap();
     }
+
+    /// v51.0.0 (CIRISVerify v18.0.0 re-pin, CIRISVerify#296/#297) — the
+    /// spellings verify's OWN emitter produces admit under the vendored rc5
+    /// registry: every platform token in `ciris_keyring::HardwareType::ALL_PLATFORMS`
+    /// through `federation_provenance::dim::hardware_custody`, and the lowercase
+    /// accord invocation. Read from verify's constants, not retyped here, so a
+    /// verify re-pin that moves a spelling turns this RED before an adopter does.
+    #[test]
+    fn verify_18_emits_spellings_the_vendored_registry_admits() {
+        use crate::federation::namespace::matcher::match_family;
+        let all = ciris_keyring::HardwareType::ALL_PLATFORMS;
+        assert_eq!(all.len(), 13, "the 13-token hardware vocabulary (CC 3.1.2)");
+        for tok in all {
+            let dim = ciris_verify_core::federation_provenance::dim::hardware_custody(tok);
+            let m = match_family(&dim);
+            assert_eq!(
+                m.family,
+                Some("hardware_custody:{platform}"),
+                "{dim}: {m:?}"
+            );
+            assert!(m.refusal.is_none(), "{dim}: refused {:?}", m.refusal);
+        }
+        // the pre-18 spellings persist 50 refused stay refused
+        for old in [
+            "hardware_custody:tpm:v1",
+            "hardware_custody:android:v1",
+            "hardware_custody:tpm",
+        ] {
+            assert!(match_family(old).refusal.is_some(), "{old} admitted");
+        }
+        let accord = "accord:invoke:constitutional:halt-001:v1";
+        let m = match_family(accord);
+        assert_eq!(m.family, Some("accord:invoke:constitutional:{halt_id}"));
+        assert!(m.refusal.is_none(), "{accord}: {:?}", m.refusal);
+        assert!(match_family("accord:invoke:CONSTITUTIONAL:halt-001:v1")
+            .refusal
+            .is_some());
+    }
 }

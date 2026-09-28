@@ -1310,18 +1310,17 @@ pub mod orchestrate {
             .await
     }
 
-    /// The decrypt half of [`read_for_community_viewer`], for a caller that
-    /// has ALREADY authorized the viewer and parsed the envelope. The
-    /// destroyed-epoch refusal lives here — i.e. strictly after
-    /// authorization — so it can name the epoch to a grantee without
-    /// disclosing the binding to anyone else.
-    pub async fn read_for_community_viewer_sealed<B>(
+    /// v51.0.0 (CIRISPersist#923) — the epoch DEK a COMMUNITY row's bytes were
+    /// sealed under, for `viewer_key_id`, WITHOUT touching the body: the
+    /// resolver [`read_for_community_viewer_sealed`] has always used, factored
+    /// so the sealed-descriptor doors share it ("may open the descriptor" ⇔
+    /// "may open the bytes"). The caller has authorized the viewer by tier; the
+    /// member-grant check here is defense in depth, as before.
+    pub(crate) async fn community_dek_for_viewer<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
-        envelope: &AtRestEnvelope,
-        aad: Option<&[u8]>,
-    ) -> Result<Vec<u8>, BlobError>
+    ) -> Result<[u8; DEK_LEN], BlobError>
     where
         B: BlobStorage + Sync,
     {
@@ -1360,6 +1359,25 @@ pub mod orchestrate {
             },
             other => other,
         })?;
+        Ok(dek)
+    }
+
+    /// The decrypt half of [`read_for_community_viewer`], for a caller that
+    /// has ALREADY authorized the viewer and parsed the envelope. The
+    /// destroyed-epoch refusal lives here — i.e. strictly after
+    /// authorization — so it can name the epoch to a grantee without
+    /// disclosing the binding to anyone else.
+    pub async fn read_for_community_viewer_sealed<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        envelope: &AtRestEnvelope,
+        aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let dek = community_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await?;
         open(&dek, envelope, aad).map_err(crate::federation::at_rest_cascade::open_err(
             at_rest_sha256,
             map_at_rest_err,

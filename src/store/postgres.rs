@@ -6313,6 +6313,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // committed `withdraws` whose revocation was never folded, and a retry
         // dedups to `AlreadyHeld` without re-projecting (fail-open on "cease
         // replicating on revoke"). sqlite always ran it inside.
+        #[cfg(test)]
+        self.test_hooks()
+            .fail_if_armed("pg_project_consent_peer_set")?;
         pg_project_consent_peer_set(&*tx, &row).await.map_err(|e| {
             crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
         })?;

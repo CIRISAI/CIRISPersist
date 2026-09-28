@@ -81,10 +81,11 @@ pub const SIZE_MEMBER: &str = "size";
 
 /// Every member the struct may carry, in declaration order. Anything else is
 /// refused by name.
-pub const KNOWN_MEMBERS: [&str; 14] = [
+pub const KNOWN_MEMBERS: [&str; 15] = [
     "digest",
     "size",
     "format",
+    "sealed_descriptor",
     "codec",
     "width",
     "height",
@@ -140,8 +141,18 @@ pub struct MediaSource {
     pub digest: String,
     /// The blob's byte length, > 0. The puller's read cap (CC 5.3.2.5).
     pub size: u64,
-    /// RFC 6838 essence, lowercase `type/subtype`, no parameters.
-    pub format: String,
+    /// RFC 6838 essence, lowercase `type/subtype`, no parameters. `None` iff
+    /// the description is sealed (`sealed_descriptor`, v51.0.0 #922 —
+    /// CC 3.3.13's two-hash case puts `name`/`format`/`codec` inside the seal).
+    pub format: Option<String>,
+    /// v51.0.0 (CIRISPersist#922, CIRISConstitution#114) — standard base64 of an
+    /// `AtRestEnvelope` (magic ‖ nonce ‖ ciphertext‖tag) over the JCS bytes of
+    /// `{name, format, codec?}`, AES-256-GCM under the BLOB's DEK with AAD
+    /// `ciris.sealed_descriptor.v1 ‖ sha256` ([`crate::federation::at_rest_cascade`]).
+    /// Persist never opens it (no DEK on the row plane) and never sniffs. Exactly
+    /// one description: a struct carries `format` (+`codec`) in clear XOR this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_descriptor: Option<String>,
     /// RFC 6381-family codec token; required iff [`CODEC_REQUIRED_FORMATS`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
@@ -481,6 +492,46 @@ fn check_placeholder(s: &str) -> Result<(), MediaSourceError> {
     Ok(())
 }
 
+/// v51.0.0 (CIRISPersist#922) — the SHAPE of a `sealed_descriptor`: standard
+/// base64 of an [`crate::federation::at_rest_cascade::AtRestEnvelope`] whose
+/// ciphertext has room for the GCM tag, and not larger than a descriptor
+/// (`{name, format, codec?}` — [`SEALED_DESCRIPTOR_MAX_BYTES`]). Nothing here
+/// opens it: the DEK is the blob's, and it lives where the bytes decrypt.
+pub fn check_sealed_descriptor_shape(sealed: &str) -> Result<(), MediaSourceError> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(sealed)
+        .map_err(|e| refuse("sealed_descriptor", format!("must be standard base64: {e}")))?;
+    if bytes.len() > SEALED_DESCRIPTOR_MAX_BYTES {
+        return Err(refuse(
+            "sealed_descriptor",
+            format!(
+                "decodes to {} bytes, over the {SEALED_DESCRIPTOR_MAX_BYTES}-byte descriptor cap \
+                 (a seal over `{{name, format, codec?}}`, not a payload)",
+                bytes.len()
+            ),
+        ));
+    }
+    let envelope =
+        crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
+            refuse(
+                "sealed_descriptor",
+                format!("is not an at-rest envelope: {e}"),
+            )
+        })?;
+    if envelope.ciphertext.len() < 16 {
+        return Err(refuse(
+            "sealed_descriptor",
+            "envelope body is shorter than an AES-GCM tag: nothing was sealed",
+        ));
+    }
+    Ok(())
+}
+
+/// The decoded-size cap on a `sealed_descriptor` (v51.0.0, #922): the envelope
+/// header plus a JCS `{name, format, codec?}` — 4 KiB is generous.
+pub const SEALED_DESCRIPTOR_MAX_BYTES: usize = 4096;
+
 /// Parse the struct. See the module documentation for the grammar. Members
 /// are checked in this order, and the FIRST failure is the refusal: the
 /// CC 3.3.13 MUST-NOT list, then unknown members, then each declared member
@@ -538,19 +589,51 @@ pub fn parse_media_source(value: &Value) -> Result<MediaSource, MediaSourceError
         "required (CC 3.3.13 / 5.3.2.5): the blob's byte length as a positive integer — \
          the cheaper check that runs before the digest",
     )?;
-    let format = required_str(
-        obj,
-        "format",
-        "required: the RFC 6838 media essence, lowercase `type/subtype` with no parameters",
-    )?;
-    if !is_media_essence(format) {
-        return Err(refuse(
+    // v51.0.0 (CIRISPersist#922, CIRISConstitution#114) — ONE description:
+    // `format` (+`codec`) in clear XOR `sealed_descriptor`. The seal is checked
+    // for SHAPE only (base64 of an at-rest envelope with room for a tag);
+    // persist holds no DEK on the row plane and never opens or sniffs it.
+    let sealed_descriptor = optional_str(obj, "sealed_descriptor")?;
+    if let Some(sealed) = sealed_descriptor {
+        check_sealed_descriptor_shape(sealed)?;
+        for clear in ["format", "codec"] {
+            if obj.contains_key(clear) {
+                return Err(refuse(
+                    "sealed_descriptor",
+                    format!(
+                        "one description: `{clear}` in clear beside a seal (CC 3.3.13 two-hash \
+                         case — the description lives inside the seal, or in clear, never both)"
+                    ),
+                ));
+            }
+        }
+        if obj.contains_key("name") {
+            return Err(refuse(
+                "name",
+                "the name lives inside the seal (CC 3.3.13 two-hash case): a sealed \
+                 description carries no clear `name`",
+            ));
+        }
+    }
+    let format = match sealed_descriptor {
+        Some(_) => None,
+        None => Some(required_str(
+            obj,
             "format",
-            format!(
-                "must be an RFC 6838 essence — lowercase `type/subtype`, each side \
-                 `[a-z0-9][a-z0-9!#$&^_.+-]{{0,126}}`, no parameters, no whitespace — got `{format}`"
-            ),
-        ));
+            "required: the RFC 6838 media essence, lowercase `type/subtype` with no parameters \
+             (or a `sealed_descriptor` carrying it inside the seal, v51.0.0)",
+        )?),
+    };
+    if let Some(format) = format {
+        if !is_media_essence(format) {
+            return Err(refuse(
+                "format",
+                format!(
+                    "must be an RFC 6838 essence — lowercase `type/subtype`, each side \
+                     `[a-z0-9][a-z0-9!#$&^_.+-]{{0,126}}`, no parameters, no whitespace — got `{format}`"
+                ),
+            ));
+        }
     }
     let codec = optional_str(obj, "codec")?;
     if let Some(c) = codec {
@@ -563,13 +646,16 @@ pub fn parse_media_source(value: &Value) -> Result<MediaSource, MediaSourceError
                 ),
             ));
         }
-    } else if CODEC_REQUIRED_FORMATS.contains(&format) {
-        return Err(refuse(
-            "codec",
-            format!(
-                "required when format is `{format}`: the container does not say what is inside it"
-            ),
-        ));
+    } else if let Some(format) = format {
+        if CODEC_REQUIRED_FORMATS.contains(&format) {
+            return Err(refuse(
+                "codec",
+                format!(
+                    "required when format is `{format}`: the container does not say what is \
+                     inside it"
+                ),
+            ));
+        }
     }
     let width = optional_layout_hint(obj, "width")?;
     let height = optional_layout_hint(obj, "height")?;
@@ -607,7 +693,8 @@ pub fn parse_media_source(value: &Value) -> Result<MediaSource, MediaSourceError
     Ok(MediaSource {
         digest: digest.to_owned(),
         size,
-        format: format.to_owned(),
+        format: format.map(str::to_owned),
+        sealed_descriptor: sealed_descriptor.map(str::to_owned),
         codec: codec.map(str::to_owned),
         width,
         height,
@@ -732,6 +819,84 @@ mod tests {
             .member
     }
 
+    /// v51.0.0 (CIRISPersist#922, CIRISConstitution#114) — I121 at the parser:
+    /// the four shapes. (2) a seal with no clear description is admitted and
+    /// `format` is `None`; (3) neither is refused by `format` (today's token);
+    /// (4) a seal beside clear `format`/`codec` is refused by
+    /// `sealed_descriptor`, a clear `name` beside a seal by `name`; a seal that
+    /// is not base64, not an at-rest envelope, shorter than a tag, or over the
+    /// descriptor cap is refused by `sealed_descriptor`. Persist never opens it.
+    #[test]
+    fn a_sealed_descriptor_is_one_description_and_never_opened() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let env = crate::federation::at_rest_cascade::AtRestEnvelope {
+            nonce: [7u8; 12],
+            ciphertext: vec![9u8; 48],
+        };
+        let sealed = b64(&env.to_bytes());
+        // (2) sealed, nothing in clear
+        let m =
+            parse_media_source(&json!({"digest": DIGEST, "size": 10, "sealed_descriptor": sealed}))
+                .expect("a sealed description is admitted");
+        assert_eq!(m.format, None);
+        assert_eq!(m.sealed_descriptor.as_deref(), Some(sealed.as_str()));
+        // (3) neither — today's refusal, today's member
+        assert_eq!(member_of(json!({"digest": DIGEST, "size": 10})), "format");
+        // (4) both, and a clear name beside the seal
+        assert_eq!(
+            member_of(
+                json!({"digest": DIGEST, "size": 10, "sealed_descriptor": sealed, "format": "image/jpeg"})
+            ),
+            "sealed_descriptor"
+        );
+        assert_eq!(
+            member_of(
+                json!({"digest": DIGEST, "size": 10, "sealed_descriptor": sealed, "codec": "avc1.42E01E"})
+            ),
+            "sealed_descriptor"
+        );
+        assert_eq!(
+            member_of(
+                json!({"digest": DIGEST, "size": 10, "sealed_descriptor": sealed, "name": "cat.jpg"})
+            ),
+            "name"
+        );
+        // shape: not base64; not an envelope; shorter than a tag; over the cap
+        for bad in [
+            json!("not*base64"),
+            json!(b64(b"no magic here at all, just bytes and more bytes")),
+            json!(b64(&crate::federation::at_rest_cascade::AtRestEnvelope {
+                nonce: [0; 12],
+                ciphertext: vec![1; 8]
+            }
+            .to_bytes())),
+            json!(b64(&crate::federation::at_rest_cascade::AtRestEnvelope {
+                nonce: [0; 12],
+                ciphertext: vec![1; SEALED_DESCRIPTOR_MAX_BYTES]
+            }
+            .to_bytes())),
+        ] {
+            assert_eq!(
+                member_of(json!({"digest": DIGEST, "size": 10, "sealed_descriptor": bad})),
+                "sealed_descriptor",
+                "{bad}"
+            );
+        }
+        // (1) clear, unchanged
+        assert_eq!(
+            parse_media_source(&good_media()).unwrap().format.as_deref(),
+            Some("image/jpeg")
+        );
+        // the member is closed-listed, so an unknown neighbour is still refused by name
+        assert_eq!(
+            member_of(
+                json!({"digest": DIGEST, "size": 10, "sealed_descriptor": sealed, "sealed": true})
+            ),
+            "sealed"
+        );
+    }
+
     #[test]
     fn a_well_formed_struct_parses_to_its_members() {
         let m = parse_media_source(&good_media()).unwrap();
@@ -740,7 +905,8 @@ mod tests {
             MediaSource {
                 digest: DIGEST.into(),
                 size: 4096,
-                format: "image/jpeg".into(),
+                format: Some("image/jpeg".into()),
+                sealed_descriptor: None,
                 codec: None,
                 width: Some(64),
                 height: Some(48),

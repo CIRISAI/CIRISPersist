@@ -14142,6 +14142,99 @@ impl PyEngine {
         })
     }
 
+    /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — **seal a descriptor
+    /// under an existing blob's DEK** as `key_id`: `plaintext_b64` (the JCS
+    /// `{name, format, codec?}`, ≤ the descriptor cap) → the base64 at-rest
+    /// envelope for `media.sealed_descriptor`. Authorized like `read_blob_as`
+    /// (`blob_not_granted` for a stranger); a plaintext row raises
+    /// `ValueError` (nothing to seal under).
+    fn seal_descriptor_for_blob(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        key_id: &str,
+        plaintext_b64: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let key = key_id.to_owned();
+            let plaintext = B64
+                .decode(plaintext_b64)
+                .map_err(|e| PyValueError::new_err(format!("plaintext_b64: {e}")))?;
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::seal_descriptor_for_blob;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            seal_descriptor_for_blob(backend.as_ref(), &sha, &key, &plaintext).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            seal_descriptor_for_blob(backend.as_ref(), &sha, &key, &plaintext).await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#923) — **open a `sealed_descriptor`** as
+    /// `viewer_key_id`: `sealed_b64` (the struct member) → the base64 plaintext.
+    /// Same authorization as `read_blob_as`; a descriptor sealed for another
+    /// blob fails after authorization as a backend/crypto error, never
+    /// `blob_not_granted`.
+    fn open_descriptor_for_blob(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        sealed_b64: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let sealed = B64
+                .decode(sealed_b64)
+                .map_err(|e| PyValueError::new_err(format!("sealed_b64: {e}")))?;
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::open_descriptor_for_blob;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            open_descriptor_for_blob(backend.as_ref(), &sha, &viewer, &sealed).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            open_descriptor_for_blob(backend.as_ref(), &sha, &viewer, &sealed).await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
     /// #832 (`BLOB_ENCRYPTION_AT_REST.md` §12.4) — **the decrypting range
     /// read.** Plaintext bytes `[start, end_inclusive]` of any blob as
     /// `viewer_key_id`, base64-encoded. Authorizes by the row's tier first; a

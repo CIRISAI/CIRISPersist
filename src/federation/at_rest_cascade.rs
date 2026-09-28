@@ -2472,6 +2472,128 @@ pub mod orchestrate {
         })
     }
 
+    /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — the associated
+    /// data a sealed descriptor is bound to: persist-framed, domain-separated
+    /// from the bytes' own AAD, so a descriptor lifted onto another blob (or
+    /// the blob's ciphertext presented as a descriptor) does not open.
+    pub fn sealed_descriptor_aad(at_rest_sha256: &[u8; 32]) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(SEALED_DESCRIPTOR_DOMAIN.len() + 32);
+        aad.extend_from_slice(SEALED_DESCRIPTOR_DOMAIN);
+        aad.extend_from_slice(at_rest_sha256);
+        aad
+    }
+
+    /// The domain label of [`sealed_descriptor_aad`].
+    pub const SEALED_DESCRIPTOR_DOMAIN: &[u8] = b"ciris.sealed_descriptor.v1";
+
+    /// The plaintext cap on a descriptor (`{name, format, codec?}` as JCS —
+    /// never a payload): [`crate::federation::media_source::SEALED_DESCRIPTOR_MAX_BYTES`]
+    /// minus the envelope header and tag.
+    pub const SEALED_DESCRIPTOR_PLAINTEXT_MAX: usize =
+        crate::federation::media_source::SEALED_DESCRIPTOR_MAX_BYTES
+            - AT_REST_ENVELOPE_MAGIC.len()
+            - NONCE_LEN
+            - 16;
+
+    /// **The descriptor's DEK is the blob's** (#923): authorize `viewer_key_id`
+    /// exactly as [`read_any_for_viewer`] does (the row's recorded tier, then
+    /// the withdrawn check — a stranger is `NotGranted` and learns nothing) and
+    /// recover the DEK the BYTES were sealed under through the tier's own
+    /// resolver, WITHOUT touching the body. A plaintext row is
+    /// `InvalidArgument`: its description is in clear by construction, there is
+    /// nothing to seal under. "May open the descriptor" ⇔ "may open the bytes"
+    /// by construction — one resolver per tier, shared with the bytes read.
+    pub(crate) async fn descriptor_dek_for_viewer<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+    ) -> Result<[u8; DEK_LEN], BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let Some(head) = backend.blob_head(at_rest_sha256).await? else {
+            return Err(refuse_missing_row(backend, at_rest_sha256, viewer_key_id).await?);
+        };
+        let tier = head.crypto_tier;
+        authorize_viewer_by_tier(backend, at_rest_sha256, tier, viewer_key_id).await?;
+        refuse_if_withdrawn(backend, at_rest_sha256).await?;
+        match tier {
+            CryptoTier::Plaintext => Err(BlobError::InvalidArgument(format!(
+                "blob {} is recorded at the plaintext tier: its description is in clear by \
+                 construction, there is no DEK to seal a descriptor under (CC 3.3.13 two-hash \
+                 case applies to sealed bytes only)",
+                hex::encode(at_rest_sha256)
+            ))),
+            CryptoTier::InvisibleEncrypted => {
+                recover_blob_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await
+            }
+            CryptoTier::CommunityDek => {
+                crate::federation::community_dek::orchestrate::community_dek_for_viewer(
+                    backend,
+                    at_rest_sha256,
+                    viewer_key_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// `Engine::seal_descriptor_for_blob` (#923): AES-256-GCM `plaintext` under
+    /// the blob's DEK with [`sealed_descriptor_aad`]; returns the on-disk
+    /// [`AtRestEnvelope`] bytes (the producer base64s them into
+    /// `media.sealed_descriptor`). The caller must be able to open the bytes.
+    pub async fn seal_descriptor_for_blob<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        key_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        if plaintext.len() > SEALED_DESCRIPTOR_PLAINTEXT_MAX {
+            return Err(BlobError::InvalidArgument(format!(
+                "descriptor plaintext is {} bytes, over the {SEALED_DESCRIPTOR_PLAINTEXT_MAX}-byte \
+                 cap: a sealed descriptor is `{{name, format, codec?}}`, not a payload",
+                plaintext.len()
+            )));
+        }
+        let dek = descriptor_dek_for_viewer(backend, at_rest_sha256, key_id).await?;
+        let aad = sealed_descriptor_aad(at_rest_sha256);
+        let envelope = seal_aad(&dek, Some(&aad), plaintext).map_err(map_at_rest_err)?;
+        Ok(envelope.to_bytes())
+    }
+
+    /// `Engine::open_descriptor_for_blob` (#923): the reverse — the same
+    /// authorization as the bytes read; a descriptor sealed for another blob
+    /// (or the blob's own ciphertext) fails the AAD after authorization as a
+    /// crypto-class error, never `NotGranted` (the viewer WAS authorized).
+    pub async fn open_descriptor_for_blob<B>(
+        backend: &B,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        sealed: &[u8],
+    ) -> Result<Vec<u8>, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        if sealed.len() > crate::federation::media_source::SEALED_DESCRIPTOR_MAX_BYTES {
+            return Err(BlobError::InvalidArgument(format!(
+                "sealed descriptor is {} bytes, over the {}-byte cap",
+                sealed.len(),
+                crate::federation::media_source::SEALED_DESCRIPTOR_MAX_BYTES
+            )));
+        }
+        let dek = descriptor_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await?;
+        let envelope = AtRestEnvelope::from_bytes(sealed).map_err(|e| {
+            BlobError::InvalidArgument(format!("sealed descriptor is not an at-rest envelope: {e}"))
+        })?;
+        let aad = sealed_descriptor_aad(at_rest_sha256);
+        open_aad(&dek, Some(&aad), &envelope)
+            .map_err(super::open_err(at_rest_sha256, map_at_rest_err))
+    }
+
     /// v43.0.0 (`FSD/BLOB_ENCRYPTION_AT_REST.md` §10) — **read any blob as a
     /// viewer, without the caller knowing how it was stored.**
     ///
