@@ -2003,6 +2003,85 @@ pub(crate) mod bodies {
         }
     }
 
+    /// (z′) — round 11: a CORRECT extension whose offered prefix carries
+    /// corrupted signature bytes is admitted, and the node stores the chain it
+    /// HOLDS, never the offered prefix. `same_version` compares content,
+    /// authority and the founders' proof, not the authority or co-signature
+    /// bytes, and the door walks only the links after the held version. So
+    /// storing the offered prefix would keep bytes nobody verified, and the
+    /// next re-judgement would recount them: the birth short of the accord
+    /// quorum, or a link whose authority signature fails, reads NotRooted.
+    /// (a) v3 offered over a prefix whose birth co-signature is corrupted;
+    /// (b) v4 offered over a prefix whose v2 authority signature is corrupted.
+    /// Each is admitted, the row stays Rooted, and the stored lineage is the
+    /// held chain byte for byte.
+    pub async fn z2_a_corrupted_prefix_is_never_stored(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        for n in ["zc-serve-node", "zc2-serve-node", "zc3-serve-node"] {
+            ts::register_hybrid_key_as(d, n, n, identity_type::NODE).await;
+        }
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        let mut body = with_member(canonical_row(&FOUNDERS), "zc-serve-node", "member");
+        founders_supersede(d, body.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("v2");
+        type Corrupt = fn(&mut Vec<SignedCommunity>);
+        let corruptions: [(&str, Corrupt); 2] = [
+            ("the birth's co-signature", |lineage| {
+                lineage[0].cosignatures[0].scrub_signature_classical = "Y29ycnVwdA==".to_owned();
+            }),
+            ("v2's authority signature", |lineage| {
+                lineage[1].scrub_signature_classical = "Y29ycnVwdA==".to_owned();
+            }),
+        ];
+        for ((what, corrupt), serve) in corruptions
+            .into_iter()
+            .zip(["zc2-serve-node", "zc3-serve-node"])
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let held = cc::lookup_signed_community(d, CANON)
+                .await
+                .unwrap()
+                .unwrap();
+            body = with_member(body, serve, "member");
+            let mut offered = hand_proof(
+                d,
+                body.clone(),
+                &[FOUNDERS[0], FOUNDERS[1]],
+                FOUNDERS[0],
+                |_| {},
+            )
+            .await;
+            corrupt(&mut offered.lineage);
+            assert_ne!(
+                serde_json::to_value(&offered.lineage).unwrap(),
+                serde_json::to_value(cc::chain_of(&held)).unwrap(),
+                "{what}: the offered prefix differs from the held chain in its bytes"
+            );
+            d.put_community(offered)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: a correct extension is admitted: {e}"));
+            assert!(
+                matches!(
+                    cc::stored_standing(d, CANON).await.unwrap(),
+                    cc::StoredStanding::Rooted(_)
+                ),
+                "{what}: the row stays Rooted on its next re-judgement"
+            );
+            let stored = cc::lookup_signed_community(d, CANON)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&stored.lineage).unwrap(),
+                serde_json::to_value(cc::chain_of(&held)).unwrap(),
+                "{what}: the stored lineage is the held chain, byte for byte"
+            );
+        }
+    }
+
     /// Review TOCTOU: `supersede_community_with_quorum` skips the generic
     /// quorum when a trust root's chain holds, and `prepare_trust_root_supersede`
     /// re-reads the standing. If the chain stopped holding in between (here: a
@@ -3213,6 +3292,14 @@ mod run {
                         &b as &dyn FederationDirectory,
                         &a as &dyn FederationDirectory,
                         &c as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_z2() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::z2_a_corrupted_prefix_is_never_stored(
+                        &d as &dyn FederationDirectory,
                     )
                     .await
                 }
