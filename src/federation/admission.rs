@@ -12180,14 +12180,9 @@ pub const TRUST_ROOT_RULE_LINEAGE_CAP: &str = "trust_root_lineage_cap";
 /// record.
 pub const TRUST_ROOT_RULE_FOUNDER_SEAT_ON_PLANE: &str = "founder_seat_on_plane";
 /// v50.0.0 (CIRISPersist#926, review MEDIUM-R) — rule: a founder's resignation
-/// is dated before the stored head's link instant (it would un-count a link
-/// the founder co-signed).
+/// is not dated strictly after the stored head's instant (it would un-count a
+/// link the founder co-signed).
 pub const TRUST_ROOT_RULE_RESIGNATION_BACKDATED: &str = "resignation_backdated";
-
-/// v50.0.0 (CIRISPersist#926, final review R2) — rule: a founders' link still
-/// records a founder carried from the prior version after that founder's
-/// resignation (a resignation never lapses; the seat is amended out).
-pub const TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD: &str = "resignation_carried_forward";
 
 /// v50.0.0 (CIRISPersist#927, review M1) — THE `infrastructure` quorum parser:
 /// `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC

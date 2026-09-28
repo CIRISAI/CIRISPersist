@@ -994,6 +994,45 @@ where
         Err(Error::Unsupported { .. }) => Vec::new(),
         Err(e) => return Err(e),
     };
+    Ok(family_quorum_holders_over_roster(directory, envelope, scrubs, family, roster).await)
+}
+
+/// v50.0.0 (CIRISPersist#926 round 9) — [`family_quorum_holders_over_envelope`]
+/// with the family's revocation-folded roster taken at `as_of`
+/// ([`authorized_family_roster_at`](super::authorized_family_roster_at), the
+/// fold `active_family_members` runs at the wall clock) instead of at the wall
+/// clock: the trust-root standing is judged at an explicit instant, so its
+/// cache can say how long the verdict holds.
+pub(crate) async fn family_quorum_holders_over_envelope_at<F>(
+    directory: &F,
+    envelope: &serde_json::Value,
+    scrubs: &[super::types::ScrubSig],
+    family: &super::types::Family,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<(CharterQuorum, std::collections::BTreeSet<String>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let roster: Vec<String> =
+        match super::authorized_family_roster_at(directory, family, as_of).await {
+            Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
+            Err(Error::Unsupported { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+    Ok(family_quorum_holders_over_roster(directory, envelope, scrubs, family, roster).await)
+}
+
+/// The one count body behind both roster readings above.
+async fn family_quorum_holders_over_roster<F>(
+    directory: &F,
+    envelope: &serde_json::Value,
+    scrubs: &[super::types::ScrubSig],
+    family: &super::types::Family,
+    roster: Vec<String>,
+) -> (CharterQuorum, std::collections::BTreeSet<String>)
+where
+    F: FederationDirectory + ?Sized,
+{
     let required = family_charter_threshold(family, roster.len());
 
     // v24.3.0 (CIRISPersist#574) — the count itself lives in
@@ -1010,7 +1049,7 @@ where
         required,
         roster_size: roster.len(),
     };
-    Ok((quorum, counted))
+    (quorum, counted)
 }
 
 /// v18.2.0 (CIRISPersist#481) — the trust-root graph predicate.

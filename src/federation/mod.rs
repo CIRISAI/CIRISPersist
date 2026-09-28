@@ -868,11 +868,32 @@ pub async fn is_node_bearing_key_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    Ok(node_bearing_at_with_next(directory, key_id, t).await?.0)
+}
+
+/// v50.0.0 (CIRISPersist#926 round 9) — [`is_node_bearing_key_at`] plus the
+/// earliest interval edge STRICTLY after `t` (an `asserted_at`, a `valid_until`
+/// or a revocation `effective_at`): the instant at which the answer at `t`
+/// may next change. A verdict cached from `t` holds only until then.
+pub async fn node_bearing_at_with_next<F>(
+    directory: &F,
+    key_id: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let (own, intervals) = node_bearing_of(directory, key_id).await?;
-    Ok(own
+    let bearing = own
         || intervals
             .iter()
-            .any(|(start, end)| *start <= t && end.is_none_or(|e| t < e)))
+            .any(|(start, end)| *start <= t && end.is_none_or(|e| t < e));
+    let next = intervals
+        .iter()
+        .flat_map(|(start, end)| std::iter::once(*start).chain(*end))
+        .filter(|edge| *edge > t)
+        .min();
+    Ok((bearing, next))
 }
 
 /// v50.0.0 (CIRISPersist#925, review H1 + item 5) — `key_id`'s own `node`

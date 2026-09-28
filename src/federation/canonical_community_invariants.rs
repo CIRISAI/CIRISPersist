@@ -1111,27 +1111,9 @@ pub(crate) mod bodies {
         window_until: chrono::DateTime<chrono::Utc>,
     ) {
         use crate::federation::accord_quorum::test_fixtures::signed_participation;
-        use ciris_verify_core::accord_live_quorum::{AccordAction, AccordProposal, Vote};
-        let op = crate::federation::admission::op_withdraw_role(identity_type::STEWARD);
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let proposal = AccordProposal {
-            family_key_id: cc::accord_family_key_id().to_owned(),
-            action: AccordAction::RosterChange,
-            nonce: nonce.clone(),
-            window_until: crate::federation::admission::truncate_to_substrate_resolution(
-                window_until,
-            )
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            prior_family_digest: "prior-family-digest".to_owned(),
-            payload_sha256: crate::federation::admission::canonical_withdrawal_payload_sha256(
-                &op, key, None,
-            )
-            .unwrap(),
-        };
-        d.issue_accord_nonce(cc::accord_family_key_id(), &nonce)
-            .await
-            .unwrap();
-        d.put_accord_proposal(proposal.clone(), None).await.unwrap();
+        use ciris_verify_core::accord_live_quorum::Vote;
+        let proposal = withdrawal_proposal(key, window_until);
+        store_proposal(d, &proposal).await;
         let roster: Vec<ciris_verify_core::threshold::ThresholdMember> = ["A1", "B1", "C1"]
             .iter()
             .map(|k| ops::Identity::new(k).member())
@@ -1153,6 +1135,41 @@ pub(crate) mod bodies {
         )
         .await
         .expect("the accord withdraws the conferral");
+    }
+
+    /// An accord proposal to withdraw `key`'s steward conferral, its window
+    /// ending at `window_until` (not stored).
+    fn withdrawal_proposal(
+        key: &str,
+        window_until: chrono::DateTime<chrono::Utc>,
+    ) -> ciris_verify_core::accord_live_quorum::AccordProposal {
+        use ciris_verify_core::accord_live_quorum::{AccordAction, AccordProposal};
+        let op = crate::federation::admission::op_withdraw_role(identity_type::STEWARD);
+        AccordProposal {
+            family_key_id: cc::accord_family_key_id().to_owned(),
+            action: AccordAction::RosterChange,
+            nonce: uuid::Uuid::new_v4().simple().to_string(),
+            window_until: crate::federation::admission::truncate_to_substrate_resolution(
+                window_until,
+            )
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            prior_family_digest: "prior-family-digest".to_owned(),
+            payload_sha256: crate::federation::admission::canonical_withdrawal_payload_sha256(
+                &op, key, None,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Store `proposal` on `d` (its nonce issued first).
+    async fn store_proposal(
+        d: &dyn FederationDirectory,
+        proposal: &ciris_verify_core::accord_live_quorum::AccordProposal,
+    ) {
+        d.issue_accord_nonce(cc::accord_family_key_id(), &proposal.nonce)
+            .await
+            .unwrap();
+        d.put_accord_proposal(proposal.clone(), None).await.unwrap();
     }
 
     /// (k′) — the recovery ruling: two withdrawn conferrals stall the row and
@@ -1306,15 +1323,18 @@ pub(crate) mod bodies {
         assert!(cc::resolve_community(d, CANON).await.unwrap().is_some());
     }
 
-    /// (o″) — final review R2: a resignation does not LAPSE after one more
-    /// version. F2 resigns; the other founders' v6 that still records F2 is
-    /// refused on the local door and the replicated door
-    /// (`resignation_carried_forward`); the correct v6 amends F2 out; and F2
-    /// with F0 then produces no v7 (F2 is no founder of v6), on either door.
+    /// (o″) — the counting rule (round 9 ruling) and the lapse trace. F2
+    /// resigns at t1, after the birth. The other founders' v6 that still
+    /// RECORDS F2 is admitted on the replicated chain door: F2 counts as
+    /// nothing, so the row reads Stalled, naming F2. v6 → v7: F2's resignation
+    /// lies in (seated_since(F2) = the birth, t7], so F2 with F0 produces no v7
+    /// on either door — the resignation did not lapse although v6's instant is
+    /// after it. F0 + F1 amend F2 out (Rooted), then RE-SEAT F2, so
+    /// seated_since(F2) = t8 > t1: F2 counts again and co-signs a later link.
     pub async fn o3_a_resignation_does_not_lapse(d: &dyn FederationDirectory) {
         let holders = stand_up(d).await;
         put_conferred(d, &holders, "rr-steward", "user,steward").await;
-        for n in ["rr-serve-node", "rr2-serve-node"] {
+        for n in ["rr-serve-node", "rr2-serve-node", "rr3-serve-node"] {
             ts::register_hybrid_key_as(d, n, n, identity_type::NODE).await;
         }
         d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
@@ -1324,35 +1344,31 @@ pub(crate) mod bodies {
             .await
             .expect("F2 resigns");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let keeps = with_member(canonical_row(&FOUNDERS), "rr-serve-node", "member");
-        let e = founders_supersede(d, keeps.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+        let v6 = with_member(canonical_row(&FOUNDERS), "rr-serve-node", "member");
+        let offered = hand_proof(
+            d,
+            v6.clone(),
+            &[FOUNDERS[0], FOUNDERS[1]],
+            FOUNDERS[0],
+            |_| {},
+        )
+        .await;
+        d.put_community(offered)
             .await
-            .expect_err("local: a version still recording the resigned founder");
-        assert_violation(
-            &e,
-            crate::federation::admission::TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD,
-        );
-        let offered = hand_proof(d, keeps, &[FOUNDERS[0], FOUNDERS[1]], FOUNDERS[0], |_| {}).await;
-        let e = d
-            .put_community(offered)
-            .await
-            .expect_err("replicated chain: a version still recording the resigned founder");
-        assert_violation(
-            &e,
-            crate::federation::admission::TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD,
-        );
-        let v6 = swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "rr-steward");
-        founders_supersede(d, v6.clone(), &[FOUNDERS[0], FOUNDERS[1]])
-            .await
-            .expect("the founders amend the resigned seat out");
-        assert!(matches!(
-            cc::stored_standing(d, CANON).await.unwrap(),
-            cc::StoredStanding::Rooted(_)
-        ));
+            .expect("a later version MAY still record the resigned founder");
+        match cc::stored_standing(d, CANON).await.unwrap() {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains(FOUNDERS[2]), "{reason}")
+            }
+            other => panic!("a version recording a resigned founder is Stalled: {other:?}"),
+        }
+        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The lapse: v6's instant is after F2's resignation, but F2 was seated
+        // at the birth, so the resignation still un-counts F2 on v6 → v7.
         for v7 in [
-            swapped(v6.clone(), "rr-steward", FOUNDERS[2]),
             with_member(v6.clone(), "rr2-serve-node", "member"),
+            swapped(v6.clone(), FOUNDERS[2], "rr-steward"),
         ] {
             assert!(
                 founders_supersede(d, v7.clone(), &[FOUNDERS[2], FOUNDERS[0]])
@@ -1366,17 +1382,40 @@ pub(crate) mod bodies {
                 "replicated: F2 and F0 produce no v7"
             );
         }
+        founders_supersede(
+            d,
+            swapped(v6.clone(), FOUNDERS[2], "rr-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("the others amend the resigned seat out");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(d, v6.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("the others re-seat F2 through the record");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            d,
+            with_member(v6, "rr3-serve-node", "member"),
+            &[FOUNDERS[2], FOUNDERS[0]],
+        )
+        .await
+        .expect("after the re-seat F2 counts again");
         assert_eq!(
             cc::resolve_community(d, CANON)
                 .await
                 .unwrap()
                 .unwrap()
                 .founders,
-            vec![
-                FOUNDERS[0].to_owned(),
-                FOUNDERS[1].to_owned(),
-                "rr-steward".to_owned()
-            ]
+            FOUNDERS.to_vec()
         );
     }
 
@@ -1420,6 +1459,281 @@ pub(crate) mod bodies {
             other => panic!("the second resignation stalls the row: {other:?}"),
         }
         assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+    }
+
+    /// F2 resigns, the others retire F2 and re-seat F2 through the record:
+    /// a Rooted row whose folded roster already excludes F2 (the shape in
+    /// which a new resignation moved nothing but its own instant).
+    async fn resigned_retired_reseated(d: &dyn FederationDirectory, successor: &str) {
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, successor, "user,steward").await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+            .await
+            .expect("F2 resigns");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            d,
+            swapped(canonical_row(&FOUNDERS), FOUNDERS[2], successor),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("the founders retire F2");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(d, canonical_row(&FOUNDERS), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("the founders re-seat F2");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+    }
+
+    /// (u) — round 9, 2a: a cached verdict holds only until the earliest
+    /// time-dependent boundary after the instant it was judged at. F2 resigns,
+    /// is retired and re-seated (Rooted), then signs a SECOND resignation
+    /// dated r = now + 50 s, inside the plane's 60 s skew. Judged at r − 1 s:
+    /// Rooted, and a second read there is a cache hit. Judged at r + 1 s:
+    /// Stalled, naming F2 — no input changed, so only `valid_until` can make
+    /// the cache miss.
+    pub async fn u_a_future_resignation_bounds_the_cache(d: &dyn FederationDirectory) {
+        resigned_retired_reseated(d, "us-steward").await;
+        let r = chrono::Utc::now() + chrono::Duration::seconds(50);
+        d.put_community_membership_revocation(founder_revocation_at(
+            &[FOUNDERS[2]],
+            FOUNDERS[2],
+            r,
+        ))
+        .await
+        .expect("a resignation dated inside the plane's future skew is admitted");
+        let cache = d
+            .trust_root_standing_cache()
+            .expect("every real backend holds a standing cache");
+        let before = r - chrono::Duration::seconds(1);
+        assert!(matches!(
+            cc::stored_standing_at(d, CANON, before).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        let n = cache.computations();
+        assert!(matches!(
+            cc::stored_standing_at(d, CANON, before).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        assert_eq!(
+            cache.computations(),
+            n,
+            "before the resignation: a cache hit"
+        );
+        match cc::stored_standing_at(d, CANON, r + chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+        {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains(FOUNDERS[2]), "{reason}")
+            }
+            other => panic!("after the resignation's instant the row stalls: {other:?}"),
+        }
+        assert!(
+            cache.computations() > n,
+            "the resignation's instant passed: the cache must miss"
+        );
+    }
+
+    /// (v) — round 9, 2b: F2 self-signs its agreement to be an occurrence of
+    /// a `node` identity with a FUTURE `asserted_at` (inside the occurrence
+    /// plane's 5-minute skew). Judged before it: Rooted, and cached. Judged
+    /// after it: Stalled, naming F2 — the interval's start bounds the verdict.
+    pub async fn v_a_future_occurrence_bounds_the_cache(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        ts::register_hybrid_key_as(d, "vn-node-id", "vn-node-id", identity_type::NODE).await;
+        let t = chrono::Utc::now() + chrono::Duration::seconds(120);
+        for (signer, when) in [
+            ("vn-node-id", t),
+            (FOUNDERS[2], t + chrono::Duration::seconds(1)),
+        ] {
+            d.put_identity_occurrence(
+                ts::signed_content_only_occurrence(signer, "vn-node-id", FOUNDERS[2], when).await,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("future-dated occurrence row by {signer}: {e}"));
+        }
+        let cache = d
+            .trust_root_standing_cache()
+            .expect("every real backend holds a standing cache");
+        let before = t - chrono::Duration::seconds(1);
+        assert!(matches!(
+            cc::stored_standing_at(d, CANON, before).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        let n = cache.computations();
+        assert!(matches!(
+            cc::stored_standing_at(d, CANON, before).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        assert_eq!(cache.computations(), n, "before the binding: a cache hit");
+        match cc::stored_standing_at(d, CANON, t + chrono::Duration::seconds(3))
+            .await
+            .unwrap()
+        {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains(FOUNDERS[2]), "{reason}")
+            }
+            other => panic!("after the binding's instant F2 is node-bearing: {other:?}"),
+        }
+        assert!(
+            cache.computations() > n,
+            "the binding's instant passed: the cache must miss"
+        );
+    }
+
+    /// (w) — round 9, 2c: a withdrawal whose accord proposal this node does
+    /// not hold is dated MIN (fail-secure), so F2's signature on v2 stops
+    /// counting and the row is NotRooted. When the proposal lands, its signed
+    /// `window_until` (after v2) is a changed input: the next read recomputes
+    /// and the row is Rooted — F2 was already amended out at v3.
+    pub async fn w_a_landed_proposal_is_a_changed_input(d: &dyn FederationDirectory) {
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, "ws-steward", "user,steward").await;
+        ts::register_hybrid_key_as(d, "ws-serve-node", "ws-serve-node", identity_type::NODE).await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        let v2 = with_member(canonical_row(&FOUNDERS), "ws-serve-node", "member");
+        founders_supersede(d, v2.clone(), &[FOUNDERS[0], FOUNDERS[2]])
+            .await
+            .expect("F0 and F2 co-sign v2");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            d,
+            swapped(v2, FOUNDERS[2], "ws-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("the founders amend F2 out");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        let proposal =
+            withdrawal_proposal(FOUNDERS[2], chrono::Utc::now() + chrono::Duration::hours(1));
+        d.record_role_withdrawal(
+            identity_type::STEWARD,
+            FOUNDERS[2],
+            None,
+            &proposal.digest(),
+        )
+        .await
+        .expect("a trusted-local withdrawal, its proposal not held");
+        match cc::stored_standing(d, CANON).await.unwrap() {
+            cc::StoredStanding::NotRooted { .. } => {}
+            other => panic!("a withdrawal with no proposal dates MIN: {other:?}"),
+        }
+        let cache = d
+            .trust_root_standing_cache()
+            .expect("every real backend holds a standing cache");
+        let n = cache.computations();
+        store_proposal(d, &proposal).await;
+        assert!(
+            matches!(
+                cc::stored_standing(d, CANON).await.unwrap(),
+                cc::StoredStanding::Rooted(_)
+            ),
+            "the proposal landed: F2's signature on v2 precedes its window"
+        );
+        assert!(cache.computations() > n, "the landed proposal is a new key");
+    }
+
+    /// (x) — the reviewer's split (4a), converged by the counting rule,
+    /// through the real doors on two nodes. Node `a` holds the birth H1 (t1).
+    /// Node `b` holds H2 (t2), signed by F0 + F1 and still recording F2. F2
+    /// resigns at t_r, t1 < t_r ≤ t2, having NOT signed H2: `a` admits the
+    /// resignation (after its head) and `b` refuses it (`resignation_backdated`).
+    /// `a` then ADMITS H2, F2 counting as nothing: `a` Stalled, `b` Rooted.
+    /// H3 amends F2 out on `b`; `a` admits it; both read Rooted on H3. No
+    /// re-birth.
+    pub async fn x_a_resignation_split_converges(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+    ) {
+        for d in [a, b] {
+            let holders = stand_up(d).await;
+            put_conferred(d, &holders, "xs-steward", "user,steward").await;
+            ts::register_hybrid_key_as(d, "xs-serve-node", "xs-serve-node", identity_type::NODE)
+                .await;
+            d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+                .await
+                .unwrap();
+        }
+        let t_r = chrono::Utc::now() - chrono::Duration::seconds(2);
+        a.put_community_membership_revocation(founder_revocation_at(
+            &[FOUNDERS[2]],
+            FOUNDERS[2],
+            t_r,
+        ))
+        .await
+        .expect("a: the resignation is after a's head (the birth)");
+        let h2_body = with_member(canonical_row(&FOUNDERS), "xs-serve-node", "member");
+        founders_supersede(b, h2_body.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("b: F0 and F1 sign H2, still recording F2");
+        let e = b
+            .put_community_membership_revocation(founder_revocation_at(
+                &[FOUNDERS[2]],
+                FOUNDERS[2],
+                t_r,
+            ))
+            .await
+            .expect_err("b: the resignation is not after b's head H2");
+        assert_violation(
+            &e,
+            crate::federation::admission::TRUST_ROOT_RULE_RESIGNATION_BACKDATED,
+        );
+        let h2 = cc::lookup_signed_community(b, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        a.put_community(h2)
+            .await
+            .expect("a admits H2: F2 counts as nothing, F0 and F1 are the quorum");
+        match cc::stored_standing(a, CANON).await.unwrap() {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains(FOUNDERS[2]), "{reason}")
+            }
+            other => panic!("a holds H2 with a resigned founder recorded: {other:?}"),
+        }
+        assert!(matches!(
+            cc::stored_standing(b, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            b,
+            swapped(h2_body, FOUNDERS[2], "xs-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("b: H3 amends F2 out");
+        let h3 = cc::lookup_signed_community(b, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        a.put_community(h3.clone())
+            .await
+            .expect("a admits H3 from its stalled H2");
+        for d in [a, b] {
+            match cc::stored_standing(d, CANON).await.unwrap() {
+                cc::StoredStanding::Rooted(held) => assert_eq!(
+                    held.community.persist_row_hash, h3.community.persist_row_hash,
+                    "both nodes hold H3"
+                ),
+                other => panic!("both nodes converge Rooted on H3: {other:?}"),
+            }
+        }
     }
 
     /// Review TOCTOU: `supersede_community_with_quorum` skips the generic
@@ -2071,7 +2385,10 @@ pub(crate) mod bodies {
     /// (m) — MEDIUM-C: a second read with every input unchanged verifies no
     /// signature (the directory's standing cache serves it); a holder
     /// revocation in the accord family is a changed input, recomputes, and
-    /// un-roots the accord-born row (CC T4: loud by design).
+    /// un-roots the accord-born row (CC T4: loud by design). Round 9: the
+    /// revocation is dated 30 s ahead, so the row is still Rooted judged just
+    /// before its instant, and the family fold's boundary makes the cache miss
+    /// just after it.
     pub async fn m_standing_is_cached_per_directory(d: &dyn FederationDirectory) {
         stand_up(d).await;
         d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
@@ -2093,8 +2410,9 @@ pub(crate) mod bodies {
             after_first,
             "unchanged inputs: zero recomputations (zero signature verifications)"
         );
-        // A holder revocation: B1 leaves the accord family (A1 + C1 sign).
-        let t = chrono::Utc::now();
+        // A holder revocation: B1 leaves the accord family (A1 + C1 sign),
+        // effective 30 s from now.
+        let t = chrono::Utc::now() + chrono::Duration::seconds(30);
         let mut rev = ts::sign_family_membership_revocation(
             "A1",
             crate::federation::types::FamilyMembershipRevocation {
@@ -2112,12 +2430,31 @@ pub(crate) mod bodies {
             .await
             .expect("the accord's 2-of-3 revokes a holder");
         assert!(
-            cc::resolve_community(d, CANON).await.unwrap().is_none(),
+            matches!(
+                cc::stored_standing_at(d, CANON, t - chrono::Duration::seconds(1))
+                    .await
+                    .unwrap(),
+                cc::StoredStanding::Rooted(_)
+            ),
+            "before its instant the revocation does not fold B1 out"
+        );
+        let before = cache.computations();
+        assert!(
+            before > after_first,
+            "a holder revocation is a changed input"
+        );
+        assert!(
+            matches!(
+                cc::stored_standing_at(d, CANON, t + chrono::Duration::seconds(1))
+                    .await
+                    .unwrap(),
+                cc::StoredStanding::NotRooted { .. }
+            ),
             "the birth no longer reaches the accord quorum: un-rooted until a re-birth"
         );
         assert!(
-            cache.computations() > after_first,
-            "a holder revocation invalidates"
+            cache.computations() > before,
+            "the revocation's instant passed: the cache must miss"
         );
     }
 
@@ -2553,6 +2890,41 @@ mod run {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::o4_a_second_resignation_counts(
                         &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_u() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::u_a_future_resignation_bounds_the_cache(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_v() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::v_a_future_occurrence_bounds_the_cache(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_w() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::w_a_landed_proposal_is_a_changed_input(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_x() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::x_a_resignation_split_converges(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
                     )
                     .await
                 }

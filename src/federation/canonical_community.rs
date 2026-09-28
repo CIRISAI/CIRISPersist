@@ -206,19 +206,23 @@ pub fn check_trust_root_shape(community: &Community) -> Result<(), Error> {
 /// founder of a trust-root community is a HUMAN key at `at`: `user` in its own
 /// `identity_type` set, and NOT node-bearing by #925's one predicate
 /// ([`is_node_bearing_key_at`](super::is_node_bearing_key_at) — its own set,
-/// or an agreed occurrence of a `node` identity at `at`).
+/// or an agreed occurrence of a `node` identity at `at`). Also returns the
+/// earliest occurrence-interval edge after `at`, where the answer may change
+/// ([`node_bearing_at_with_next`](super::node_bearing_at_with_next)).
 async fn founder_is_human_at<F>(
     directory: &F,
     record: &KeyRecord,
     at: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, Error>
+) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    Ok(
-        identity_type::set_contains(&record.identity_type, identity_type::USER)
-            && !super::is_node_bearing_key_at(directory, &record.key_id, at).await?,
-    )
+    let (node_bearing, next_edge) =
+        super::node_bearing_at_with_next(directory, &record.key_id, at).await?;
+    Ok((
+        identity_type::set_contains(&record.identity_type, identity_type::USER) && !node_bearing,
+        next_edge,
+    ))
 }
 
 /// One founder is eligible: a key record here, human (#925), and an
@@ -237,6 +241,7 @@ pub async fn check_founder_eligible<F>(
     directory: &F,
     community_key_id: &str,
     founder: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
@@ -248,7 +253,7 @@ where
             format!("founder {founder:?} has no key record on this node"),
         ));
     };
-    if !founder_is_human_at(directory, &record, chrono::Utc::now()).await? {
+    if !founder_is_human_at(directory, &record, now).await?.0 {
         return Err(violation(
             community_key_id,
             super::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
@@ -280,17 +285,21 @@ where
     Ok(())
 }
 
-/// Every founder the record names is eligible ([`check_founder_eligible`]).
+/// Every founder the record names is eligible at `now` ([`check_founder_eligible`]).
 ///
 /// # Errors
 ///
 /// The first founder's refusal.
-pub async fn check_founders_eligible<F>(directory: &F, community: &Community) -> Result<(), Error>
+pub async fn check_founders_eligible<F>(
+    directory: &F,
+    community: &Community,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
     for founder in founders(community) {
-        check_founder_eligible(directory, &community.community_key_id, founder).await?;
+        check_founder_eligible(directory, &community.community_key_id, founder, now).await?;
     }
     Ok(())
 }
@@ -335,19 +344,67 @@ pub async fn accord_quorum_over_community<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    accord_quorum_at(directory, signed, &mut Memo::at(chrono::Utc::now())).await
+}
+
+/// [`accord_quorum_over_community`] with the family roster folded at
+/// `memo.now`. The fold applies each holder widening and revocation whose
+/// `effective_at` is at or before that instant, so the earliest such instant
+/// AFTER it bounds how long the count holds (`Memo::bound`).
+async fn accord_quorum_at<F>(
+    directory: &F,
+    signed: &SignedCommunity,
+    memo: &mut Memo,
+) -> Result<super::trust_root::CharterQuorum, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let Some(family) =
         super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
     else {
         return Err(insufficient(signed));
     };
-    let (quorum, _) = super::trust_root::family_quorum_holders_over_envelope(
+    for t in family_event_instants(directory, &family.family_key_id).await? {
+        memo.bound(t);
+    }
+    let (quorum, _) = super::trust_root::family_quorum_holders_over_envelope_at(
         directory,
         &signed.community.signing_envelope(),
         &community_scrubs(signed),
         &family,
+        memo.now,
     )
     .await?;
     Ok(quorum)
+}
+
+/// Every holder widening and revocation instant of the family's roster plane
+/// (the events the family fold applies by `effective_at`).
+async fn family_event_instants<F>(
+    directory: &F,
+    family_key_id: &str,
+) -> Result<Vec<chrono::DateTime<chrono::Utc>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Vec::new();
+    match directory
+        .list_family_membership_widenings_for(family_key_id)
+        .await
+    {
+        Ok(ws) => out.extend(ws.into_iter().map(|w| w.effective_at)),
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    match directory
+        .list_family_membership_revocations_for(family_key_id)
+        .await
+    {
+        Ok(rs) => out.extend(rs.into_iter().map(|r| r.effective_at)),
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(out)
 }
 
 fn insufficient(signed: &SignedCommunity) -> Error {
@@ -473,8 +530,16 @@ fn envelope_founders(change_envelope: &serde_json::Value) -> std::collections::B
 
 /// Per-call memo of the expensive founder questions (the conferral co-scrub
 /// verification), so one read or one door judges each key once.
-#[derive(Default)]
+///
+/// It also carries the verdict's `now` (#926 round 9): nothing under a
+/// verdict reads the wall clock. Every comparison against `now` registers the
+/// input's instant with [`Memo::bound`], and `valid_until` ends up as the
+/// EARLIEST such instant strictly after `now`: the moment the same inputs may
+/// give a different verdict. The standing cache serves an entry only before
+/// it.
 struct Memo {
+    now: chrono::DateTime<chrono::Utc>,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
     records: std::collections::HashMap<String, Option<KeyRecord>>,
     conferred: std::collections::HashMap<String, bool>,
     /// Per community: every self-signed resignation instant of each key,
@@ -487,6 +552,24 @@ struct Memo {
 }
 
 impl Memo {
+    fn at(now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            now,
+            valid_until: None,
+            records: std::collections::HashMap::new(),
+            conferred: std::collections::HashMap::new(),
+            resignations: std::collections::HashMap::new(),
+        }
+    }
+
+    /// An input compared against `now` changes its answer at `t`: a verdict
+    /// judged at `now` holds only until the earliest such `t` after it.
+    fn bound(&mut self, t: chrono::DateTime<chrono::Utc>) {
+        if t > self.now {
+            self.valid_until = Some(self.valid_until.map_or(t, |v| v.min(t)));
+        }
+    }
+
     async fn record<F>(&mut self, directory: &F, key_id: &str) -> Result<Option<KeyRecord>, Error>
     where
         F: FederationDirectory + ?Sized,
@@ -524,19 +607,15 @@ impl Memo {
         Ok(c)
     }
 
-    /// Whether `key_id` resigned from `community_key_id` (its own plane
-    /// revocation, signed by that founder alone) at an instant in
-    /// `(after, until]` — `after` inclusive when `inclusive`. Read once per
+    /// Every resignation instant of `key_id` from `community_key_id` (its own
+    /// plane revocation, signed by that founder alone). Read once per
     /// community per call.
-    async fn resigned_within<F>(
+    async fn resignations_of<F>(
         &mut self,
         directory: &F,
         community_key_id: &str,
         key_id: &str,
-        after: Option<chrono::DateTime<chrono::Utc>>,
-        inclusive: bool,
-        until: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool, Error>
+    ) -> Result<Vec<chrono::DateTime<chrono::Utc>>, Error>
     where
         F: FederationDirectory + ?Sized,
     {
@@ -563,11 +642,28 @@ impl Memo {
         }
         Ok(self.resignations[community_key_id]
             .get(key_id)
-            .is_some_and(|all| {
-                all.iter().any(|r| {
-                    *r <= until && after.is_none_or(|a| if inclusive { *r >= a } else { *r > a })
-                })
-            }))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Whether `key_id` resigned from `community_key_id` at an instant in
+    /// `(after, until]`.
+    async fn resigned_within<F>(
+        &mut self,
+        directory: &F,
+        community_key_id: &str,
+        key_id: &str,
+        after: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error>
+    where
+        F: FederationDirectory + ?Sized,
+    {
+        Ok(self
+            .resignations_of(directory, community_key_id, key_id)
+            .await?
+            .iter()
+            .any(|r| *r > after && *r <= until))
     }
 
     /// When the withdrawal of `key_id`'s steward conferral took effect — a
@@ -599,7 +695,7 @@ impl Memo {
     }
 
     /// Does `key_id` count as a founder of `community_key_id` at `at` (`None`
-    /// = now)? A human key at that instant (#925's
+    /// = the verdict's `now`)? A human key at that instant (#925's
     /// [`is_node_bearing_key_at`](super::is_node_bearing_key_at)),
     /// accord-conferred as a steward, not resigned by its own signature, and
     /// not withdrawn — or, for a link instant, withdrawn only AFTER it (a
@@ -607,20 +703,24 @@ impl Memo {
     /// retired). A withdrawal whose successor is the key itself is a rotate-in
     /// and never un-counts.
     ///
-    /// A resignation applies only when its `effective_at` is LATER than
-    /// `resignation_floor` and at or before `at`. The floor is the instant of
-    /// the version being judged: for a link, the PRIOR version's instant, so a
-    /// resignation never invalidates a link that follows a version predating it
-    /// (review MEDIUM-R (b)); for the head's founders, the instant of the
-    /// version that (re-)seated the key, so a resignation older than a re-seat
-    /// is cleared — the re-seat is the founders' quorum speaking later (LOW-1).
+    /// **The counting rule (#926 round 9 ruling).** A resignation applies when
+    /// its `effective_at` is in `(seated_since, at]`: `seated_since` is the
+    /// instant of the version that (re-)seated the key (the birth, or the link
+    /// whose prior did not name it a founder). The same rule judges a link
+    /// (`at` = its `amended_at`, `seated_since` over the chain up to its prior)
+    /// and the head (`at` = now). Every resignation is kept; a later version
+    /// MAY still record a resigned founder, who then counts as nothing until
+    /// the record amends them out or re-seats them.
+    ///
+    /// Judged at `now` (`at` = `None`), the node-bearing interval edges and the
+    /// resignation instants after `now` bound the verdict ([`Memo::bound`]).
     async fn founder_counts<F>(
         &mut self,
         directory: &F,
         community_key_id: &str,
         key_id: &str,
         at: Option<chrono::DateTime<chrono::Utc>>,
-        resignation_floor: Option<chrono::DateTime<chrono::Utc>>,
+        seated_since: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Error>
     where
         F: FederationDirectory + ?Sized,
@@ -628,21 +728,24 @@ impl Memo {
         let Some(rec) = self.record(directory, key_id).await? else {
             return Ok(false);
         };
-        let when = at.unwrap_or_else(chrono::Utc::now);
-        if !founder_is_human_at(directory, &rec, when).await?
-            || !self.conferred(directory, key_id).await?
-        {
+        let when = at.unwrap_or(self.now);
+        let (human, next_edge) = founder_is_human_at(directory, &rec, when).await?;
+        if at.is_none() {
+            if let Some(t) = next_edge {
+                self.bound(t);
+            }
+            for r in self
+                .resignations_of(directory, community_key_id, key_id)
+                .await?
+            {
+                self.bound(r);
+            }
+        }
+        if !human || !self.conferred(directory, key_id).await? {
             return Ok(false);
         }
         if self
-            .resigned_within(
-                directory,
-                community_key_id,
-                key_id,
-                resignation_floor,
-                false,
-                when,
-            )
+            .resigned_within(directory, community_key_id, key_id, seated_since, when)
             .await?
         {
             return Ok(false);
@@ -678,35 +781,39 @@ impl Memo {
 /// - its signed `amended_at` is not before the previous link's, and not in the
 ///   future;
 /// - its verified signers — `prior`'s RECORDED founders that count at
-///   `amended_at` (human, accord-conferred, not withdrawn before it), each
-///   hybrid-verified against this node's pinned pubkeys (founder key records
-///   are never deleted) — meet `prior`'s protocol over its founder seats;
+///   `amended_at` (human, accord-conferred, not withdrawn before it, and no
+///   resignation in `(seated_since, amended_at]`, `seated_since` taken over
+///   `chain`, the counting rule of #926 round 9), each hybrid-verified against
+///   this node's pinned pubkeys (founder key records are never deleted) — meet
+///   `prior`'s protocol over its founder seats;
 /// - `next`'s authority is one of those counted founders, and its signature
 ///   over `next` verifies.
 ///
+/// `chain` is the chain up to and including `prior` (its last entry), oldest
+/// first: the link reads `prior` and each founder's `seated_since` from it.
 /// Returns the link's instant.
 ///
 /// # Errors
 ///
 /// [`Error::CommunityConsensusProtocolViolation`] for a structural clause;
 /// [`Error::RosterAuthorityUnauthorized`] (`roster_consensus_insufficient`)
-/// short of the founders' quorum.
+/// short of the founders' quorum; [`Error::InvalidArgument`] for an empty
+/// `chain`.
 pub async fn verify_founders_link<F>(
     directory: &F,
-    prior: &Community,
-    prior_instant: Option<chrono::DateTime<chrono::Utc>>,
+    chain: &[SignedCommunity],
     next: &SignedCommunity,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<chrono::DateTime<chrono::Utc>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    verify_founders_link_memo(directory, prior, prior_instant, next, &mut Memo::default()).await
+    verify_founders_link_memo(directory, chain, next, &mut Memo::at(now)).await
 }
 
 async fn verify_founders_link_memo<F>(
     directory: &F,
-    prior: &Community,
-    prior_instant: Option<chrono::DateTime<chrono::Utc>>,
+    chain: &[SignedCommunity],
     next: &SignedCommunity,
     memo: &mut Memo,
 ) -> Result<chrono::DateTime<chrono::Utc>, Error>
@@ -714,6 +821,13 @@ where
     F: FederationDirectory + ?Sized,
 {
     use ciris_verify_core::threshold::ThresholdMember;
+    let Some(prior_signed) = chain.last() else {
+        return Err(Error::InvalidArgument(
+            "a founders' link needs the chain up to its prior version".into(),
+        ));
+    };
+    let prior = &prior_signed.community;
+    let prior_instant = link_instant(prior_signed);
     let id = next.community.community_key_id.as_str();
     let Some(proof) = next.supersede_proof.as_ref() else {
         return Err(needs_founders_quorum(id));
@@ -775,9 +889,11 @@ where
             )
         })?;
     let floor = prior_instant.unwrap_or(prior.founded_at);
-    if amended_at < floor
-        || amended_at > chrono::Utc::now() + chrono::Duration::seconds(AMENDED_AT_SKEW_SECS)
-    {
+    // The future bound compares against `now`: a link refused as too far
+    // ahead is admissible from `amended_at - skew` on.
+    let skew = chrono::Duration::seconds(AMENDED_AT_SKEW_SECS);
+    memo.bound(amended_at - skew);
+    if amended_at < floor || amended_at > memo.now + skew {
         return Err(violation(
             id,
             super::admission::TRUST_ROOT_RULE_CHAIN,
@@ -788,29 +904,11 @@ where
         ));
     }
     let prior_founders = founders(prior);
-    // Review R2: a resignation does not LAPSE. A link that still records a
-    // founder carried from the prior version, whose resignation falls at or
-    // after the prior's instant and at or before this link's, is refused: the
-    // other founders must amend the seat out, so no later version records a
-    // resigned founder and the prior-instant floor stays sound. A founder the
-    // link newly seats is a re-seat — the founders' quorum speaking later —
-    // and clears an older resignation (LOW-1).
-    for f in founders(&next.community) {
-        if prior_founders.contains(&f)
-            && memo
-                .resigned_within(directory, id, f, Some(floor), true, amended_at)
-                .await?
-        {
-            return Err(violation(
-                id,
-                super::admission::TRUST_ROOT_RULE_RESIGNATION_CARRIED_FORWARD,
-                format!(
-                    "the version still records {f:?} as a founder after their resignation; the \
-                     founders must amend the seat out"
-                ),
-            ));
-        }
-    }
+    // The counting rule (#926 round 9 ruling): a prior founder counts on this
+    // link iff no resignation of theirs falls in (seated_since, amended_at].
+    // A version MAY still record a resigned founder; they count as nothing
+    // here, so the link needs the others' quorum, and the row reads Stalled
+    // until the record amends them out or re-seats them.
     let bytes =
         ciris_verify_core::accord_genesis::accord_family_signing_bytes(&proof.change_envelope)
             .map_err(|e| Error::InvalidArgument(format!("founders' change envelope: {e}")))?;
@@ -819,7 +917,13 @@ where
         if !prior_founders.contains(&sig.member_id.as_str())
             || signers.contains(&sig.member_id)
             || !memo
-                .founder_counts(directory, id, &sig.member_id, Some(amended_at), Some(floor))
+                .founder_counts(
+                    directory,
+                    id,
+                    &sig.member_id,
+                    Some(amended_at),
+                    seated_since(chain, &sig.member_id),
+                )
                 .await?
         {
             continue;
@@ -852,7 +956,13 @@ where
         let is_founder = m.role.as_deref() == Some(super::admission::MEMBER_ROLE_FOUNDER);
         if is_founder
             && !memo
-                .founder_counts(directory, id, &m.key_id, Some(amended_at), Some(floor))
+                .founder_counts(
+                    directory,
+                    id,
+                    &m.key_id,
+                    Some(amended_at),
+                    seated_since(chain, &m.key_id),
+                )
                 .await?
         {
             continue;
@@ -926,24 +1036,39 @@ fn link_instant(v: &SignedCommunity) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|t| t.with_timezone(&chrono::Utc))
 }
 
-/// Walk `chain` from `chain[0]`, TRUSTING `chain[0]` (the version this node
-/// already holds and has judged rooted): every later version must be a
-/// verified founders' link of the one before it.
+/// Walk `chain` from `chain[start]`, TRUSTING `chain[..=start]` (the birth,
+/// or the version this node already holds with the chain it holds it by):
+/// every later version must be a verified founders' link of the one before
+/// it. Each link reads its founders' `seated_since` from the chain before it.
 async fn verify_links_from<F>(
     directory: &F,
     chain: &[SignedCommunity],
+    start: usize,
     memo: &mut Memo,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let mut instant = chain.first().and_then(link_instant);
-    for w in chain.windows(2) {
-        instant = Some(
-            verify_founders_link_memo(directory, &w[0].community, instant, &w[1], memo).await?,
-        );
+    for i in start..chain.len().saturating_sub(1) {
+        verify_founders_link_memo(directory, &chain[..=i], &chain[i + 1], memo).await?;
     }
     Ok(())
+}
+
+/// The chain a node walks from a version it HOLDS: the held version's own
+/// chain (what this node verified), then the offered versions after the held
+/// one. The offered lineage before the held version is never read, so an
+/// offered prefix cannot move a founder's `seated_since`. Returns the walk and
+/// the held version's index in it.
+fn walk_from_held(
+    held: &SignedCommunity,
+    offered: &[SignedCommunity],
+    pos: usize,
+) -> (Vec<SignedCommunity>, usize) {
+    let mut walk = chain_of(held);
+    let at = walk.len() - 1;
+    walk.extend(offered[pos + 1..].iter().cloned());
+    (walk, at)
 }
 
 /// **The whole chain** (CIRISPersist#926 re-check, HIGH-A): `chain[0]` is an
@@ -956,11 +1081,15 @@ where
 /// # Errors
 ///
 /// The refusal of the first clause that fails.
-pub async fn verify_chain<F>(directory: &F, chain: &[SignedCommunity]) -> Result<(), Error>
+pub async fn verify_chain<F>(
+    directory: &F,
+    chain: &[SignedCommunity],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    verify_chain_memo(directory, chain, &mut Memo::default()).await
+    verify_chain_memo(directory, chain, &mut Memo::at(now)).await
 }
 
 async fn verify_chain_memo<F>(
@@ -997,7 +1126,7 @@ where
                 id,
                 f,
                 Some(birth.community.founded_at),
-                Some(birth.community.founded_at),
+                birth.community.founded_at,
             )
             .await?
         {
@@ -1008,10 +1137,10 @@ where
             ));
         }
     }
-    if !accord_quorum_over_community(directory, birth).await?.met() {
+    if !accord_quorum_at(directory, birth, memo).await?.met() {
         return Err(insufficient(birth));
     }
-    verify_links_from(directory, chain, memo).await
+    verify_links_from(directory, chain, 0, memo).await
 }
 
 /// Is `e` a verdict about the row (it does not verify), as opposed to a
@@ -1070,17 +1199,38 @@ impl StoredStanding {
 /// held by each real backend and reached through
 /// [`FederationDirectory::trust_root_standing_cache`](super::FederationDirectory::trust_root_standing_cache).
 ///
-/// Keyed on a digest of EVERY input the verdict reads — the stored signed row
-/// with its lineage, the accord family's record and active roster, the key
-/// record and steward withdrawal of every holder and every founder or signer
-/// the chain names, and the community's folded roster — so any change to them
-/// (a holder revocation, a founder key rotation or withdrawal, a plane change,
-/// an amendment) is a different key. Never process-global: two directories
-/// never share one.
+/// Keyed on a digest of EVERY input the verdict reads, as stored — the signed
+/// row with its lineage, the accord family's record and raw roster plane, the
+/// key record, steward withdrawal (with its proposal's signed `window_until`)
+/// and node-bearing intervals of every holder and every key the chain names,
+/// and the community's resignation instants — so any change to them (a holder
+/// revocation, a founder key rotation or withdrawal, a resignation, an
+/// amendment) is a different key. The key holds no value evaluated against
+/// the clock. Instead each entry carries the instant it was judged at and
+/// `valid_until`, the earliest time-dependent boundary after it
+/// ([`Memo::bound`]), and is served only between the two (#926 round 9).
+/// Never process-global: two directories never share one.
 #[derive(Debug, Default)]
 pub struct StandingCache {
-    entries: std::sync::Mutex<std::collections::HashMap<String, StoredStanding>>,
+    entries: std::sync::Mutex<std::collections::HashMap<String, CachedStanding>>,
     computations: std::sync::atomic::AtomicU64,
+}
+
+/// One cached verdict and the span of instants it holds for.
+#[derive(Debug, Clone)]
+struct CachedStanding {
+    standing: StoredStanding,
+    judged_at: chrono::DateTime<chrono::Utc>,
+    valid_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl CachedStanding {
+    /// The verdict judged at `judged_at` still holds at `now`: no input the
+    /// verdict compares against the clock changes its answer in
+    /// `[judged_at, now]`.
+    fn holds_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.judged_at <= now && self.valid_until.is_none_or(|v| now < v)
+    }
 }
 
 impl StandingCache {
@@ -1109,21 +1259,39 @@ where
     };
     feed("row", &serde_json::to_value(signed).unwrap_or_default());
     let family_id = accord_family_key_id();
+    let family = directory.lookup_family(family_id).await.ok().flatten();
+    feed("family", &serde_json::to_value(&family).unwrap_or_default());
+    // The family's roster plane AS STORED (every widening and revocation, and
+    // their signers), not the roster folded at the clock: the fold's answer
+    // at the verdict's instant is bounded by `valid_until` instead.
+    let widenings = directory
+        .list_family_membership_widenings_for(family_id)
+        .await
+        .unwrap_or_default();
+    let revocations = directory
+        .list_family_membership_revocations_for(family_id)
+        .await
+        .unwrap_or_default();
+    let signers = directory
+        .family_roster_signers(family_id)
+        .await
+        .unwrap_or_default();
     feed(
-        "family",
-        &serde_json::to_value(directory.lookup_family(family_id).await.ok().flatten())
-            .unwrap_or_default(),
+        "family_plane",
+        &serde_json::json!({
+            "w": serde_json::to_value(&widenings).unwrap_or_default(),
+            "r": serde_json::to_value(&revocations).unwrap_or_default(),
+            "s": serde_json::to_value(&signers).unwrap_or_default(),
+        }),
     );
-    let roster: Vec<String> = match directory.active_family_members(family_id).await {
-        Ok(m) => m.into_iter().map(|m| m.key_id).collect(),
-        Err(_) => Vec::new(),
-    };
-    feed("roster", &serde_json::json!(roster));
     let mut keys: std::collections::BTreeSet<String> =
         super::admission::accord_holder_roster_key_ids()
             .into_iter()
             .collect();
-    keys.extend(roster);
+    if let Some(f) = &family {
+        keys.extend(f.members.iter().map(|m| m.key_id.clone()));
+    }
+    keys.extend(widenings.iter().map(|w| w.member().key_id));
     for v in chain_of(signed) {
         keys.extend(v.community.members.iter().map(|m| m.key_id.clone()));
         keys.insert(v.authority_key_id.clone());
@@ -1140,9 +1308,24 @@ where
         let w = directory
             .lookup_role_withdrawal(identity_type::STEWARD, k)
             .await?;
+        // The withdrawal's instant is its proposal's signed `window_until`,
+        // or MIN while this node holds no proposal (`Memo::withdrawal_instant`):
+        // the proposal landing is a changed input (#926 round 9, 2c).
+        let window = match &w {
+            Some(w) => match directory
+                .get_accord_proposal(&w.authority_decision_digest)
+                .await
+            {
+                Ok(Some(p)) => serde_json::json!(p.proposal.window_until),
+                Ok(None) | Err(Error::Unsupported { .. }) => serde_json::json!("no-proposal"),
+                Err(e) => return Err(e),
+            },
+            None => serde_json::Value::Null,
+        };
         // #925's node-bearing inputs (own set, agreed occurrence bindings of a
-        // `node` identity): a founder later bound as an occurrence of a node
-        // is a different key, never a stale Rooted verdict.
+        // `node` identity) as stored intervals: a founder later bound as an
+        // occurrence of a node is a different key; the interval's value at the
+        // verdict's instant is bounded by `valid_until`.
         let (own_node, node_intervals) = super::node_bearing_of(directory, k).await?;
         feed(
             "key",
@@ -1150,22 +1333,15 @@ where
                 "k": k,
                 "rec": rec,
                 "w": serde_json::to_value(&w).unwrap_or_default(),
+                "window_until": window,
                 "node": own_node,
                 "node_intervals": format!("{node_intervals:?}"),
             }),
         );
     }
-    let folded: Vec<(String, Option<String>)> =
-        super::effective_roster(directory, &signed.community)
-            .await?
-            .into_iter()
-            .map(|m| (m.key_id, m.role))
-            .collect();
-    feed("folded", &serde_json::json!(folded));
-    // Every self-signed resignation instant (`Memo::resigned_within` reads
-    // these). The fold alone is not enough: a re-seated founder's SECOND
-    // resignation leaves the folded roster unchanged — the first one already
-    // folded them out — so a key without it served a stale Rooted verdict.
+    // Every self-signed resignation instant (`Memo::resignations_of` reads
+    // these), past or future: a re-seated founder's SECOND resignation leaves
+    // the folded roster unchanged, so only the instants themselves key it.
     let mut resignations: Vec<(String, String)> = match directory
         .community_roster_signers(&signed.community.community_key_id)
         .await
@@ -1187,13 +1363,8 @@ where
     Ok(hex::encode(h.finalize()))
 }
 
-/// Re-judge the row stored at `community_key_id` (see the module doc). Called
-/// by every read side and by the doors before deciding what an offered row
-/// extends. ROOTED ⇔ the stored row conforms, its CHAIN (stored `lineage` plus
-/// the row) verifies from an accord birth ([`verify_chain`], every link's proof
-/// re-verified — there is no proof-only arm), and EVERY recorded founder
-/// counts now. Served from this directory's [`StandingCache`] while every
-/// input is unchanged.
+/// [`stored_standing_at`] at the wall clock: the one clock read, taken by the
+/// caller's door.
 ///
 /// # Errors
 ///
@@ -1201,6 +1372,29 @@ where
 pub async fn stored_standing<F>(
     directory: &F,
     community_key_id: &str,
+) -> Result<StoredStanding, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    stored_standing_at(directory, community_key_id, chrono::Utc::now()).await
+}
+
+/// Re-judge the row stored at `community_key_id` AT `now` (see the module
+/// doc). Called by every read side and by the doors before deciding what an
+/// offered row extends. ROOTED ⇔ the stored row conforms, its CHAIN (stored
+/// `lineage` plus the row) verifies from an accord birth ([`verify_chain`],
+/// every link's proof re-verified — there is no proof-only arm), and EVERY
+/// recorded founder counts at `now`. Nothing under it reads the wall clock.
+/// Served from this directory's [`StandingCache`] while every input is
+/// unchanged and `now` is before the entry's `valid_until`.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn stored_standing_at<F>(
+    directory: &F,
+    community_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<StoredStanding, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1222,10 +1416,12 @@ where
     };
     if let (Some(c), Some(k)) = (cache, key.as_ref()) {
         if let Some(hit) = c.entries.lock().expect("standing cache").get(k) {
-            return Ok(hit.clone());
+            if hit.holds_at(now) {
+                return Ok(hit.standing.clone());
+            }
         }
     }
-    let standing = compute_standing(directory, signed).await?;
+    let (standing, valid_until) = compute_standing(directory, signed, now).await?;
     if let (Some(c), Some(k)) = (cache, key) {
         c.computations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1233,33 +1429,52 @@ where
         if entries.len() >= STANDING_CACHE_CAP {
             entries.clear();
         }
-        entries.insert(k, standing.clone());
+        entries.insert(
+            k,
+            CachedStanding {
+                standing: standing.clone(),
+                judged_at: now,
+                valid_until,
+            },
+        );
     }
     Ok(standing)
 }
 
+/// The verdict at `now`, and the earliest instant after `now` at which the
+/// same inputs may give a different one (`None`: none do).
 async fn compute_standing<F>(
     directory: &F,
     signed: SignedCommunity,
-) -> Result<StoredStanding, Error>
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(StoredStanding, Option<chrono::DateTime<chrono::Utc>>), Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    let not = |reason: String| Ok(StoredStanding::NotRooted { reason });
     if let Err(e) = check_trust_root_shape(&signed.community) {
-        return not(format!("non-conformant: {e}"));
+        return Ok((
+            StoredStanding::NotRooted {
+                reason: format!("non-conformant: {e}"),
+            },
+            None,
+        ));
     }
-    let mut memo = Memo::default();
-    match verify_chain_memo(directory, &chain_of(&signed), &mut memo).await {
+    let mut memo = Memo::at(now);
+    let chain = chain_of(&signed);
+    match verify_chain_memo(directory, &chain, &mut memo).await {
         Ok(()) => {}
         Err(e) if is_row_verdict(&e) => {
-            return not(format!(
-                "not accord-born: its chain does not verify from an accord birth ({e})"
+            return Ok((
+                StoredStanding::NotRooted {
+                    reason: format!(
+                        "not accord-born: its chain does not verify from an accord birth ({e})"
+                    ),
+                },
+                memo.valid_until,
             ))
         }
         Err(e) => return Err(e),
     }
-    let chain = chain_of(&signed);
     for f in founders(&signed.community) {
         if !memo
             .founder_counts(
@@ -1267,21 +1482,24 @@ where
                 &signed.community.community_key_id,
                 f,
                 None,
-                Some(seated_since(&chain, f)),
+                seated_since(&chain, f),
             )
             .await?
         {
             let reason = format!(
-                "founder {f:?} is not eligible now (human, accord-conferred, not withdrawn); a \
-                 founders' amendment that retires it roots the row again"
+                "founder {f:?} is not eligible now (human, accord-conferred, not withdrawn, not \
+                 resigned since seated); a founders' amendment that retires it roots the row again"
             );
-            return Ok(StoredStanding::Stalled {
-                held: Box::new(signed),
-                reason,
-            });
+            return Ok((
+                StoredStanding::Stalled {
+                    held: Box::new(signed),
+                    reason,
+                },
+                memo.valid_until,
+            ));
         }
     }
-    Ok(StoredStanding::Rooted(Box::new(signed)))
+    Ok((StoredStanding::Rooted(Box::new(signed)), memo.valid_until))
 }
 
 /// `Some(accord family id)` when `community_key_id` is a ROOTED trust-root
@@ -1421,17 +1639,22 @@ where
     }
     check_lineage_caps(signed)?;
     check_trust_root_shape(community)?;
-    check_founders_eligible(directory, community).await?;
+    // The door's one clock read; everything below judges at it.
+    let now = chrono::Utc::now();
+    check_founders_eligible(directory, community, now).await?;
     let chain = chain_of(signed);
-    let mut memo = Memo::default();
-    let standing = stored_standing(directory, &community.community_key_id).await?;
+    let mut memo = Memo::at(now);
+    let standing = stored_standing_at(directory, &community.community_key_id, now).await?;
     if let Some(held) = standing.held() {
         let held_hash = row_hash(&held.community)?;
         if row_hash(community)? == held_hash {
             return Ok(true);
         }
         match extends_at(&chain, &held_hash)? {
-            Some(pos) => verify_links_from(directory, &chain[pos..], &mut memo).await?,
+            Some(pos) => {
+                let (walk, at) = walk_from_held(held, &chain, pos);
+                verify_links_from(directory, &walk, at, &mut memo).await?;
+            }
             None if is_rebirth_over_stalled(&standing, &chain) => {
                 verify_chain_memo(directory, &chain, &mut memo).await?
             }
@@ -1539,10 +1762,11 @@ pub async fn apply_trust_root_chain<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let chain = chain_of(offered);
+    let mut chain = chain_of(offered);
     let id = offered.community.community_key_id.as_str();
-    let mut memo = Memo::default();
-    let standing = stored_standing(directory, id).await?;
+    let now = chrono::Utc::now();
+    let mut memo = Memo::at(now);
+    let standing = stored_standing_at(directory, id, now).await?;
     let (start, replaces) = match (&standing, standing.held()) {
         (StoredStanding::Absent, _) => return Ok(false),
         (_, Some(held)) => {
@@ -1552,8 +1776,11 @@ where
             }
             match extends_at(&chain, &held_hash)? {
                 Some(pos) => {
-                    verify_links_from(directory, &chain[pos..], &mut memo).await?;
-                    (pos + 1, None)
+                    // Walk, and store, from the chain this node holds.
+                    let (walk, at) = walk_from_held(held, &chain, pos);
+                    verify_links_from(directory, &walk, at, &mut memo).await?;
+                    chain = walk;
+                    (at + 1, None)
                 }
                 None if is_rebirth_over_stalled(&standing, &chain) => {
                     verify_chain_memo(directory, &chain, &mut memo).await?;
@@ -1644,11 +1871,12 @@ where
     F: FederationDirectory + ?Sized,
 {
     let id = new.community.community_key_id.clone();
-    let standing = stored_standing(directory, &id).await?;
+    let now = chrono::Utc::now();
+    let standing = stored_standing_at(directory, &id, now).await?;
     match standing.held() {
         Some(held) => {
-            verify_founders_link(directory, &held.community, link_instant(held), &new).await?;
-            check_founders_eligible(directory, &new.community).await?;
+            verify_founders_link(directory, &chain_of(held), &new, now).await?;
+            check_founders_eligible(directory, &new.community, now).await?;
             new.lineage = chain_of(held);
             check_lineage_caps(&new)?;
             Ok(new)
