@@ -1160,6 +1160,75 @@ mod tests {
         assert!(ms.starts_with("full-match"), "{ms:?}");
     }
 
+    /// Edges no published vector reaches, answered by the released reference
+    /// (`tools/cc_namespace_match.py` at c60d0a6, run over the vendored
+    /// registry): a newline-carrying version-like segment (the detectors are
+    /// Python `re.match`, whose `$` tolerates one trailing newline), a closed
+    /// parameterized parent's unlisted and case-mutated kinds, and a version
+    /// ATTEMPT on a companion row and on open vocabulary.
+    #[test]
+    fn reference_edges_beyond_the_vectors() {
+        /// `(dimension, family, binds, refusal)` as the reference answers.
+        type Edge = (
+            &'static str,
+            Option<&'static str>,
+            &'static [(&'static str, &'static str)],
+            Refusal,
+        );
+        let cases: [Edge; 8] = [
+            ("no_such_family:v1\n:v2", None, &[], Refusal::CaseMalformed),
+            ("no_such_family:V1\n:v2", None, &[], Refusal::CaseMalformed),
+            (
+                "consent:made_up:v1",
+                Some("consent:{kind}"),
+                &[("kind", "made_up")],
+                Refusal::FamilyUnregistered,
+            ),
+            (
+                "consent:Made:v1",
+                Some("consent:{kind}"),
+                &[("kind", "Made")],
+                Refusal::CaseMalformed,
+            ),
+            (
+                "Consent:made_up:v1",
+                Some("consent:{kind}"),
+                &[],
+                Refusal::CaseMalformed,
+            ),
+            (
+                "capacity_assurance:reversible_excluded:financial:v1beta",
+                Some("capacity_assurance:reversible_excluded:{domain}:{version}"),
+                &[("domain", "financial"), ("version", "v1beta")],
+                Refusal::CaseMalformed,
+            ),
+            (
+                "no_such_family:leaf:v1beta",
+                None,
+                &[],
+                Refusal::CaseMalformed,
+            ),
+            (
+                "system:foo:v1beta\n:v1",
+                Some("system:*"),
+                &[("*", "foo:v1beta\n")],
+                Refusal::CaseMalformed,
+            ),
+        ];
+        for (dim, family, binds, refusal) in cases {
+            let got = match_family(dim);
+            let want: BTreeMap<String, String> = binds
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            assert_eq!(
+                (got.family, got.binds, got.refusal),
+                (family, want, Some(refusal)),
+                "{dim:?}"
+            );
+        }
+    }
+
     /// The released rc5 rewrote `{lang_code}` to canonical-cased RFC 5646
     /// (no extlang; private use and the five grandfathered tags without a
     /// preferred value admitted literally). The provenance-locale witness
