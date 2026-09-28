@@ -123,6 +123,11 @@ pub struct MemoryBackend {
 }
 
 struct State {
+    /// v51.0.0 (#938) — the witness plane, keyed (lineage, head, witness).
+    lineage_head_cosigns: std::collections::BTreeMap<
+        (String, String, String),
+        crate::federation::lineage_witness::LineageHeadCosign,
+    >,
     /// Inserted `trace_events` rows, keyed by dedup tuple
     /// (THREAT_MODEL.md AV-9). See [`DedupKey`].
     events: HashMap<DedupKey, (i64, TraceEventRow)>,
@@ -908,6 +913,7 @@ impl Default for MemoryBackend {
     fn default() -> Self {
         Self {
             state: Mutex::new(State {
+                lineage_head_cosigns: Default::default(),
                 events: HashMap::new(),
                 llm_calls: Vec::new(),
                 next_event_id: 1,
@@ -6261,6 +6267,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
     ) -> Option<&crate::federation::canonical_community::StandingCache> {
         Some(&self.trust_root_standing_cache)
+    }
+
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, crate::federation::Error> {
+        // v51.0.0 (#938) — insert-or-hold, never delete (evidence).
+        let mut state = self.state.lock().expect("memory backend lock");
+        let key = (
+            cosign.lineage_key_id.clone(),
+            cosign.head_digest_sha256_hex.clone(),
+            cosign.witness_key_id.clone(),
+        );
+        if state.lineage_head_cosigns.contains_key(&key) {
+            return Ok(false);
+        }
+        state.lineage_head_cosigns.insert(key, cosign.clone());
+        Ok(true)
+    }
+
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<crate::federation::lineage_witness::LineageHeadCosign>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<_> = state
+            .lineage_head_cosigns
+            .values()
+            .filter(|c| c.lineage_key_id == lineage_key_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.signed_at
+                .cmp(&b.signed_at)
+                .then_with(|| a.witness_key_id.cmp(&b.witness_key_id))
+        });
+        Ok(out)
     }
 
     async fn lookup_signed_community(

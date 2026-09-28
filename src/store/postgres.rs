@@ -8470,6 +8470,94 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Some(&self.trust_root_standing_cache)
     }
 
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, crate::federation::Error> {
+        // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
+        let parse = |s: &str, what: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    crate::federation::Error::InvalidArgument(format!("{what}: not RFC 3339: {e}"))
+                })
+        };
+        let head_at = parse(&cosign.head_asserted_at, "head_asserted_at")?;
+        let signed_at = parse(&cosign.signed_at, "signed_at")?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.federation_lineage_head_cosigns \
+                 (lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
+                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+                &[
+                    &cosign.lineage_key_id,
+                    &cosign.head_digest_sha256_hex,
+                    &cosign.witness_key_id,
+                    &head_at,
+                    &cosign.prior_head_digest_sha256_hex,
+                    &signed_at,
+                    &cosign.signature_classical,
+                    &cosign.signature_pqc,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("store lineage head cosign: {e}"))
+            })?;
+        Ok(n == 1)
+    }
+
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<crate::federation::lineage_witness::LineageHeadCosign>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
+                        prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc \
+                 FROM cirislens.federation_lineage_head_cosigns WHERE lineage_key_id = $1 \
+                 ORDER BY signed_at ASC, witness_key_id ASC",
+                &[&lineage_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list lineage head cosigns: {e}"))
+            })?;
+        let col = |e: tokio_postgres::Error| crate::federation::Error::Backend(e.to_string());
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::federation::lineage_witness::LineageHeadCosign {
+                    lineage_key_id: r.try_get("lineage_key_id").map_err(col)?,
+                    head_digest_sha256_hex: r.try_get("head_digest_sha256_hex").map_err(col)?,
+                    witness_key_id: r.try_get("witness_key_id").map_err(col)?,
+                    head_asserted_at: r
+                        .try_get::<_, chrono::DateTime<chrono::Utc>>("head_asserted_at")
+                        .map_err(col)?
+                        .to_rfc3339(),
+                    prior_head_digest_sha256_hex: r
+                        .try_get("prior_head_digest_sha256_hex")
+                        .map_err(col)?,
+                    signed_at: r
+                        .try_get::<_, chrono::DateTime<chrono::Utc>>("signed_at")
+                        .map_err(col)?
+                        .to_rfc3339(),
+                    signature_classical: r.try_get("signature_classical").map_err(col)?,
+                    signature_pqc: r.try_get("signature_pqc").map_err(col)?,
+                })
+            })
+            .collect()
+    }
+
     async fn lookup_signed_community(
         &self,
         community_key_id: &str,

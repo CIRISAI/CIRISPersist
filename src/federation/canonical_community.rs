@@ -1022,7 +1022,7 @@ fn seated_since(chain: &[SignedCommunity], founder: &str) -> chrono::DateTime<ch
 
 /// The instant a stored head speaks at: its link's `amended_at`, or the
 /// birth's `founded_at`.
-fn head_instant(head: &SignedCommunity) -> chrono::DateTime<chrono::Utc> {
+pub(crate) fn head_instant(head: &SignedCommunity) -> chrono::DateTime<chrono::Utc> {
     link_instant(head).unwrap_or(head.community.founded_at)
 }
 

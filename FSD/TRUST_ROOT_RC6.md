@@ -35,7 +35,8 @@ LineageHeadCosign {
   signature_classical       base64     Ed25519 over the domain-labelled canonical bytes
   signature_pqc             base64?    ML-DSA-65 over canonical ‖ ed25519_sig (hybrid-Strict as everywhere)
 }
-canonical bytes = "ciris.lineage_head_cosign.v1" ‖ 0x00 ‖ JCS({lineage_key_id, head_digest_sha256_hex, head_asserted_at, prior_head_digest_sha256_hex?, signed_at, witness_key_id})
+signed bytes = JCS({domain: "ciris.lineage_head_cosign.v1", lineage_key_id, head_digest_sha256_hex, head_asserted_at, prior_head_digest_sha256_hex?, signed_at, witness_key_id})
+  — the domain label is a SIGNED MEMBER of the envelope (persist's `verify_envelope_hybrid_signature` over JCS, as every signed object), so an STH cosign (no such member) never verifies here and vice versa. Server#693's route signs the same envelope.
 ```
 The domain label is distinct from `ciris.sth_cosign.v1` (persist's `witness` module is the STH witness; this object never verifies there and vice versa — pinned by a witness that feeds each object to the other verifier).
 

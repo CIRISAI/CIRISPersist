@@ -1,6 +1,12 @@
 //! v51.0.0 invariants that need a real backend door (the parser-level and
 //! engine-level ones live beside their code):
 //!
+//! - **I122 (CIRISPersist#923)** — the sealed-descriptor doors: "may open the
+//!   descriptor" ⇔ "may open the bytes" — member opens, stranger is
+//!   `NotGranted`, a plaintext row is `InvalidArgument`, a descriptor sealed for
+//!   another blob (or the blob's own ciphertext) fails after authorization, the
+//!   plaintext cap holds. On sqlite and postgres over the two-node community
+//!   ladder (#876's fixture).
 //! - **I125 (CIRISPersist#933)** — on postgres, `put_attestation`'s three
 //!   projections run INSIDE the row's transaction: a projection that fails
 //!   rolls the row back (no committed, unprojected `withdraws`), and the
@@ -78,4 +84,165 @@ mod postgres {
         );
         assert!(d.get_attestation(&id).await.unwrap().is_some());
     }
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod descriptor {
+    use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
+    use crate::federation::types::cohort_scope::{CryptoTier, COMMUNITY, FEDERATION};
+    use crate::federation::{BlobBody, BlobError, BlobStorage, FederationDirectory};
+
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    }
+
+    /// I122 — see the module doc.
+    pub(crate) async fn i122_the_descriptor_opens_for_whoever_opens_the_bytes<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        let r = e
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"the room's bytes", None, None)
+            .await
+            .expect("A seals a community blob");
+        assert_eq!(r.tier, CryptoTier::CommunityDek);
+        let sha = r.at_rest_sha256;
+        let plaintext = br#"{"format":"image/jpeg","name":"cat.jpg"}"#;
+
+        // the minter's node seals and opens
+        let sealed = e
+            .seal_descriptor_for_blob(&sha, &l.node_a, plaintext)
+            .await
+            .expect("the sealer of the bytes seals the descriptor");
+        assert_eq!(
+            e.open_descriptor_for_blob(&sha, &l.node_a, &sealed)
+                .await
+                .unwrap(),
+            plaintext,
+            "round trip"
+        );
+        // the producer's own shape check admits what the door produced
+        {
+            use base64::Engine as _;
+            crate::federation::media_source::check_sealed_descriptor_shape(
+                &base64::engine::general_purpose::STANDARD.encode(&sealed),
+            )
+            .expect("the struct member's shape");
+        }
+        // a member's node (bob's, granted A's epoch on A — I188's precondition) opens it too
+        assert_eq!(
+            e.open_descriptor_for_blob(&sha, &l.node_b, &sealed)
+                .await
+                .unwrap(),
+            plaintext,
+            "a member who may open the bytes may open the descriptor"
+        );
+        // a stranger is NotGranted on both doors and learns nothing
+        let stranger = format!("em-stranger-{run}");
+        assert!(
+            matches!(
+                e.open_descriptor_for_blob(&sha, &stranger, &sealed).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "a stranger cannot open the descriptor"
+        );
+        assert!(
+            matches!(
+                e.seal_descriptor_for_blob(&sha, &stranger, plaintext).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "a stranger cannot seal one either"
+        );
+        // a plaintext row has nothing to seal under
+        let p = e
+            .put_blob_scoped(FEDERATION, None, b"public bytes", None, None)
+            .await
+            .expect("a plaintext blob");
+        assert_eq!(p.tier, CryptoTier::Plaintext);
+        assert!(
+            matches!(
+                e.seal_descriptor_for_blob(&p.at_rest_sha256, &l.node_a, plaintext)
+                    .await,
+                Err(BlobError::InvalidArgument(_))
+            ),
+            "a plaintext row is InvalidArgument at the seal door"
+        );
+        assert!(
+            matches!(
+                e.open_descriptor_for_blob(&p.at_rest_sha256, &l.node_a, &sealed)
+                    .await,
+                Err(BlobError::InvalidArgument(_))
+            ),
+            "and at the open door"
+        );
+        // a descriptor sealed for blob 1 does not open against blob 2 (AAD), and the
+        // refusal is AFTER authorization — never NotGranted
+        let r2 = e
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"other bytes", None, None)
+            .await
+            .unwrap();
+        let cross = e
+            .open_descriptor_for_blob(&r2.at_rest_sha256, &l.node_a, &sealed)
+            .await;
+        assert!(
+            !matches!(cross, Ok(_) | Err(BlobError::NotGranted { .. })),
+            "lifted onto another blob: refused after authorization, got {cross:?}"
+        );
+        // the blob's own ciphertext presented as a descriptor does not open (domain separation)
+        let Some(BlobBody::Inline(body)) = l.ba.get_blob(&sha).await.unwrap() else {
+            panic!("inline body")
+        };
+        let as_descriptor = e.open_descriptor_for_blob(&sha, &l.node_a, &body).await;
+        assert!(
+            !matches!(as_descriptor, Ok(_) | Err(BlobError::NotGranted { .. })),
+            "the bytes' ciphertext is not a descriptor: {as_descriptor:?}"
+        );
+        // the plaintext cap
+        let big = vec![
+            b'x';
+            crate::federation::at_rest_cascade::orchestrate::SEALED_DESCRIPTOR_PLAINTEXT_MAX
+                + 1
+        ];
+        assert!(
+            matches!(
+                e.seal_descriptor_for_blob(&sha, &l.node_a, &big).await,
+                Err(BlobError::InvalidArgument(_))
+            ),
+            "over the descriptor cap"
+        );
+    }
+
+    macro_rules! runners {
+        ($modname:ident, $dsns:expr, $pick:expr) => {
+            mod $modname {
+                use super::*;
+                #[tokio::test]
+                async fn i122() {
+                    let Some((a, b)) = $dsns else { return };
+                    i122_the_descriptor_opens_for_whoever_opens_the_bytes(&a, &b, &suffix(), $pick)
+                        .await
+                }
+            }
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    runners!(
+        sqlite,
+        Some(("sqlite::memory:".to_owned(), "sqlite::memory:".to_owned())),
+        (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+            as Pick<crate::store::sqlite::SqliteBackend>
+    );
+    #[cfg(feature = "postgres")]
+    runners!(
+        postgres,
+        (|| Some((crate::test_pg::empty_dsn()?, crate::test_pg::empty_dsn()?)))(),
+        (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+            as Pick<crate::store::postgres::PostgresBackend>
+    );
 }

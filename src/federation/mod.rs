@@ -67,6 +67,8 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+/// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
+pub mod lineage_witness;
 // CIRISPersist#857 (`FSD/CONSENT_BY_HUMANS.md`) — consent is by humans: the
 // principal walk in the consent doors, one combine rule.
 pub mod consent_by_humans;
@@ -4396,6 +4398,35 @@ pub trait FederationDirectory: Send + Sync {
         let _ = community_key_id;
         Err(Error::Unsupported {
             method: "lookup_signed_community",
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6) — store one admitted lineage-head
+    /// cosign (the witness plane, V159). The DOOR — every refusal of FSD
+    /// `TRUST_ROOT_RC6.md` §2.1 — is [`lineage_witness::admit_lineage_head_cosign`];
+    /// this is the raw store it ends in. Returns `true` when inserted, `false`
+    /// when the identical row was already held. Default `Unsupported`; every
+    /// real backend overrides.
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, Error> {
+        let _ = cosign;
+        Err(Error::Unsupported {
+            method: "store_lineage_head_cosign",
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — every cosign held for `lineage_key_id`,
+    /// ordered by `signed_at` then witness. Read by the witnessed-head fold and
+    /// the bundle response. Default `Unsupported`; every real backend overrides.
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<lineage_witness::LineageHeadCosign>, Error> {
+        let _ = lineage_key_id;
+        Err(Error::Unsupported {
+            method: "list_lineage_head_cosigns_for",
         })
     }
 

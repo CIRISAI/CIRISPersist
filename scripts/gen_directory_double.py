@@ -80,6 +80,8 @@ DELEGATED_DEFAULTS = (
     # v50.0.0 (#926) — defaulted `Unsupported`, overridden by every backend;
     # the trust-root reads re-derive the accord quorum from it.
     "lookup_signed_community",
+    "store_lineage_head_cosign",
+    "list_lineage_head_cosigns_for",
     # v50.0.0 (PR #921 review, F1) — defaulted `None`, overridden by every
     # backend. A SYNC accessor (emitted by name in `render`): the double hands
     # out the INNER backend's cache, so a verdict read through the double is

@@ -7436,6 +7436,68 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Some(&self.trust_root_standing_cache)
     }
 
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, crate::federation::Error> {
+        // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
+        let c = cosign.clone();
+        let admitted_at = chrono::Utc::now().to_rfc3339();
+        self.write(move |conn| -> Result<bool, rusqlite::Error> {
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO federation_lineage_head_cosigns \
+                 (lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
+                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc, \
+                  admitted_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    c.lineage_key_id,
+                    c.head_digest_sha256_hex,
+                    c.witness_key_id,
+                    c.head_asserted_at,
+                    c.prior_head_digest_sha256_hex,
+                    c.signed_at,
+                    c.signature_classical,
+                    c.signature_pqc,
+                    admitted_at,
+                ],
+            )?;
+            Ok(n == 1)
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("store lineage head cosign: {e}")))
+    }
+
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<crate::federation::lineage_witness::LineageHeadCosign>, crate::federation::Error>
+    {
+        let id = lineage_key_id.to_owned();
+        self.read(move |conn| {
+            let mut st = conn.prepare(
+                "SELECT lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
+                        prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc \
+                 FROM federation_lineage_head_cosigns WHERE lineage_key_id = ?1 \
+                 ORDER BY signed_at ASC, witness_key_id ASC",
+            )?;
+            let rows = st.query_map([&id], |r| {
+                Ok(crate::federation::lineage_witness::LineageHeadCosign {
+                    lineage_key_id: r.get(0)?,
+                    head_digest_sha256_hex: r.get(1)?,
+                    witness_key_id: r.get(2)?,
+                    head_asserted_at: r.get(3)?,
+                    prior_head_digest_sha256_hex: r.get(4)?,
+                    signed_at: r.get(5)?,
+                    signature_classical: r.get(6)?,
+                    signature_pqc: r.get(7)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("list lineage head cosigns: {e}")))
+    }
+
     async fn lookup_signed_community(
         &self,
         community_key_id: &str,
