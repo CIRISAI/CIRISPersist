@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "4b624513458f2c9b236caf289dc2cd62aa048c24",
+  "cc_commit": "c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "be6a85610767c857ee0f68f3de1dc3ebeba50cbb81aa12fb6d8cb58b7cbabebd"
+  "vectors_sha256": "63dd444d530290160489ed4fd5c1f117f29b4b10b0456c2ddef11f67525ee291"
  },
  "binds": [
   {
@@ -74,19 +74,21 @@
    "refusal": null
   },
   {
-   "binds": {
-    "*": "human_dignity:V1"
-   },
+   "binds": {},
    "dimension": "accord:human_dignity:V1",
-   "family": "accord:*",
+   "family": "accord:human_dignity",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {
-    "*": "human_dignity:v1"
-   },
+   "binds": {},
    "dimension": "accord:human_dignity:v1:v2",
-   "family": "accord:*",
+   "family": "accord:human_dignity",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:human_dignity:v1beta",
+   "family": "accord:human_dignity",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
@@ -111,19 +113,21 @@
    "refusal": null
   },
   {
-   "binds": {
-    "*": "invoke:constitutional:id1:V1"
-   },
+   "binds": {},
    "dimension": "accord:invoke:constitutional:id1:V1",
-   "family": "accord:*",
+   "family": "accord:invoke:constitutional:{halt_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {
-    "*": "invoke:constitutional:id1:v1"
-   },
+   "binds": {},
    "dimension": "accord:invoke:constitutional:id1:v1:v2",
-   "family": "accord:*",
+   "family": "accord:invoke:constitutional:{halt_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:invoke:constitutional:id1:v1beta",
+   "family": "accord:invoke:constitutional:{halt_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
@@ -150,19 +154,21 @@
    "refusal": null
   },
   {
-   "binds": {
-    "*": "invoke:drill:id1:V1"
-   },
+   "binds": {},
    "dimension": "accord:invoke:drill:id1:V1",
-   "family": "accord:*",
+   "family": "accord:invoke:drill:{drill_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {
-    "*": "invoke:drill:id1:v1"
-   },
+   "binds": {},
    "dimension": "accord:invoke:drill:id1:v1:v2",
-   "family": "accord:*",
+   "family": "accord:invoke:drill:{drill_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:invoke:drill:id1:v1beta",
+   "family": "accord:invoke:drill:{drill_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
@@ -189,19 +195,21 @@
    "refusal": null
   },
   {
-   "binds": {
-    "*": "invoke:notify:id1:V1"
-   },
+   "binds": {},
    "dimension": "accord:invoke:notify:id1:V1",
-   "family": "accord:*",
+   "family": "accord:invoke:notify:{notify_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {
-    "*": "invoke:notify:id1:v1"
-   },
+   "binds": {},
    "dimension": "accord:invoke:notify:id1:v1:v2",
-   "family": "accord:*",
+   "family": "accord:invoke:notify:{notify_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:invoke:notify:id1:v1beta",
+   "family": "accord:invoke:notify:{notify_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
@@ -227,19 +235,21 @@
    "refusal": null
   },
   {
-   "binds": {
-    "*": "lifecycle:V1"
-   },
+   "binds": {},
    "dimension": "accord:lifecycle:V1",
-   "family": "accord:*",
+   "family": "accord:lifecycle",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {
-    "*": "lifecycle:v1"
-   },
+   "binds": {},
    "dimension": "accord:lifecycle:v1:v2",
-   "family": "accord:*",
+   "family": "accord:lifecycle",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:lifecycle:v1beta",
+   "family": "accord:lifecycle",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
@@ -263,19 +273,21 @@
    "refusal": null
   },
   {
-   "binds": {
-    "*": "lifecycle:active:V1"
-   },
+   "binds": {},
    "dimension": "accord:lifecycle:active:V1",
-   "family": "accord:*",
+   "family": "accord:lifecycle:active",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
-   "binds": {
-    "*": "lifecycle:active:v1"
-   },
+   "binds": {},
    "dimension": "accord:lifecycle:active:v1:v2",
-   "family": "accord:*",
+   "family": "accord:lifecycle:active",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "accord:lifecycle:active:v1beta",
+   "family": "accord:lifecycle:active",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
@@ -308,6 +320,12 @@
   {
    "binds": {},
    "dimension": "activity_tier:sample:v1:v2",
+   "family": "activity_tier:{period}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "activity_tier:sample:v1beta",
    "family": "activity_tier:{period}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -356,6 +374,16 @@
   {
    "binds": {},
    "dimension": "age_assurance:provider:minor:v1:v2",
+   "family": "age_assurance:{level}:{band}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "band": "minor",
+    "level": "provider",
+    "version": "v1beta"
+   },
+   "dimension": "age_assurance:provider:minor:v1beta",
    "family": "age_assurance:{level}:{band}:{version}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -419,6 +447,15 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "band": "minor",
+    "version": "v1beta"
+   },
+   "dimension": "age_self_declared:band:minor:v1beta",
+   "family": "age_self_declared:band:{band}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Age_self_declared:band:minor:v1",
    "family": "age_self_declared:band:{band}:{version}",
@@ -474,6 +511,12 @@
   },
   {
    "binds": {},
+   "dimension": "agent_files:sample:sample:v1beta",
+   "family": "agent_files:{kind}:{platform_or_target}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Agent_files:sample:sample:v1",
    "family": "agent_files:{kind}:{platform_or_target}",
    "refusal": "namespace_dimension_case_malformed"
@@ -514,6 +557,12 @@
   {
    "binds": {},
    "dimension": "approach:id1:v1:v2",
+   "family": "approach:{goal_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "approach:id1:v1beta",
    "family": "approach:{goal_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -627,6 +676,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "audio:leaf:v1beta",
+   "family": "audio:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Audio:leaf:v1",
    "family": "audio:*",
@@ -662,6 +719,12 @@
   },
   {
    "binds": {},
+   "dimension": "audit_chain:hash_continuity:v1beta",
+   "family": "audit_chain:hash_continuity",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Audit_chain:hash_continuity:v1",
    "family": "audit_chain:hash_continuity",
    "refusal": "namespace_dimension_case_malformed"
@@ -690,6 +753,12 @@
   {
    "binds": {},
    "dimension": "autonomy:sample:v1:v2",
+   "family": "autonomy:{aspect}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "autonomy:sample:v1beta",
    "family": "autonomy:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -740,6 +809,15 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "category": "sample",
+    "version": "v1beta"
+   },
+   "dimension": "benchmark:he300:sample:v1beta",
+   "family": "benchmark:he300:{category}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Benchmark:he300:sample:v1.0",
    "family": "benchmark:he300:{category}:{version}",
@@ -780,6 +858,12 @@
   {
    "binds": {},
    "dimension": "beneficence:sample:v1:v2",
+   "family": "beneficence:{aspect}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "beneficence:sample:v1beta",
    "family": "beneficence:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -831,6 +915,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "blog:leaf:v1beta",
+   "family": "blog:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Blog:leaf:v1",
    "family": "blog:*",
@@ -862,6 +954,12 @@
   {
    "binds": {},
    "dimension": "bond_posted:USD:v1:v2",
+   "family": "bond_posted:{currency}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "bond_posted:USD:v1beta",
    "family": "bond_posted:{currency}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -910,6 +1008,12 @@
   },
   {
    "binds": {},
+   "dimension": "build:registered:id1:v1beta",
+   "family": "build:registered:{target}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Build:registered:id1:v1",
    "family": "build:registered:{target}",
    "refusal": "namespace_dimension_case_malformed"
@@ -939,6 +1043,12 @@
   {
    "binds": {},
    "dimension": "capacity:composite:v1:v2",
+   "family": "capacity:composite",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:composite:v1beta",
    "family": "capacity:composite",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -976,6 +1086,12 @@
   },
   {
    "binds": {},
+   "dimension": "capacity:core_identity:v1beta",
+   "family": "capacity:core_identity",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Capacity:core_identity:v1",
    "family": "capacity:core_identity",
    "refusal": "namespace_dimension_case_malformed"
@@ -1003,6 +1119,12 @@
   {
    "binds": {},
    "dimension": "capacity:incompleteness_awareness:v1:v2",
+   "family": "capacity:incompleteness_awareness",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:incompleteness_awareness:v1beta",
    "family": "capacity:incompleteness_awareness",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1040,6 +1162,12 @@
   },
   {
    "binds": {},
+   "dimension": "capacity:integrity:v1beta",
+   "family": "capacity:integrity",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Capacity:integrity:v1",
    "family": "capacity:integrity",
    "refusal": "namespace_dimension_case_malformed"
@@ -1067,6 +1195,12 @@
   {
    "binds": {},
    "dimension": "capacity:resilience:v1:v2",
+   "family": "capacity:resilience",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:resilience:v1beta",
    "family": "capacity:resilience",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1104,6 +1238,12 @@
   },
   {
    "binds": {},
+   "dimension": "capacity:sustained_coherence:v1beta",
+   "family": "capacity:sustained_coherence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Capacity:sustained_coherence:v1",
    "family": "capacity:sustained_coherence",
    "refusal": "namespace_dimension_case_malformed"
@@ -1116,58 +1256,192 @@
   },
   {
    "binds": {
-    "band": "sample",
     "domain": "sample",
-    "level": "sample",
     "version": "v1"
    },
-   "dimension": "capacity_assurance:sample:sample:sample:v1",
+   "dimension": "capacity_assurance:reversible_excluded:sample:v1",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "domain": "sample",
+    "version": "V1"
+   },
+   "dimension": "capacity_assurance:reversible_excluded:sample:V1",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity_assurance:reversible_excluded:sample:v1:v2",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "domain": "sample",
+    "version": "v1beta"
+   },
+   "dimension": "capacity_assurance:reversible_excluded:sample:v1beta",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Capacity_assurance:reversible_excluded:sample:v1",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "domain": "sample"
+   },
+   "dimension": "capacity_assurance:reversible_excluded:sample",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "domain": "SAMPLE",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:reversible_excluded:SAMPLE:v1",
+   "family": "capacity_assurance:reversible_excluded:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "domain": "sample",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:reversible_pending:sample:v1",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "domain": "sample",
+    "version": "V1"
+   },
+   "dimension": "capacity_assurance:reversible_pending:sample:V1",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity_assurance:reversible_pending:sample:v1:v2",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "domain": "sample",
+    "version": "v1beta"
+   },
+   "dimension": "capacity_assurance:reversible_pending:sample:v1beta",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Capacity_assurance:reversible_pending:sample:v1",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "domain": "sample"
+   },
+   "dimension": "capacity_assurance:reversible_pending:sample",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "domain": "SAMPLE",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:reversible_pending:SAMPLE:v1",
+   "family": "capacity_assurance:reversible_pending:{domain}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "band": "capacitated",
+    "domain": "sample",
+    "level": "provider",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:provider:sample:capacitated:v1",
    "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
    "refusal": null
   },
   {
    "binds": {
-    "band": "sample",
+    "band": "capacitated",
     "domain": "sample",
-    "level": "sample",
+    "level": "provider",
     "version": "V1"
    },
-   "dimension": "capacity_assurance:sample:sample:sample:V1",
+   "dimension": "capacity_assurance:provider:sample:capacitated:V1",
    "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {},
-   "dimension": "capacity_assurance:sample:sample:sample:v1:v2",
-   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
-   "refusal": "namespace_dimension_case_malformed"
-  },
-  {
-   "binds": {},
-   "dimension": "Capacity_assurance:sample:sample:sample:v1",
+   "dimension": "capacity_assurance:provider:sample:capacitated:v1:v2",
    "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
    "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
-    "band": "sample",
+    "band": "capacitated",
     "domain": "sample",
-    "level": "sample"
+    "level": "provider",
+    "version": "v1beta"
    },
-   "dimension": "capacity_assurance:sample:sample:sample",
+   "dimension": "capacity_assurance:provider:sample:capacitated:v1beta",
+   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Capacity_assurance:provider:sample:capacitated:v1",
+   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "band": "capacitated",
+    "domain": "sample",
+    "level": "provider"
+   },
+   "dimension": "capacity_assurance:provider:sample:capacitated",
    "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
    "refusal": "missing_version_segment"
   },
   {
    "binds": {
-    "band": "sample",
+    "band": "capacitated",
     "domain": "sample",
-    "level": "SAMPLE",
+    "level": "PROVIDER",
     "version": "v1"
    },
-   "dimension": "capacity_assurance:SAMPLE:sample:sample:v1",
+   "dimension": "capacity_assurance:PROVIDER:sample:capacitated:v1",
    "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
    "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "band": "capacitated",
+    "domain": "sample",
+    "level": "not_a_listed_value",
+    "version": "v1"
+   },
+   "dimension": "capacity_assurance:not_a_listed_value:sample:capacitated:v1",
+   "family": "capacity_assurance:{level}:{domain}:{band}:{version}",
+   "refusal": "namespace_vocab_value_unregistered"
   },
   {
    "binds": {
@@ -1187,6 +1461,12 @@
   {
    "binds": {},
    "dimension": "cert_validity:id1:v1:v2",
+   "family": "cert_validity:{authority}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "cert_validity:id1:v1beta",
    "family": "cert_validity:{authority}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1230,6 +1510,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "chat:leaf:v1beta",
+   "family": "chat:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Chat:leaf:v1",
    "family": "chat:*",
@@ -1261,6 +1549,12 @@
   {
    "binds": {},
    "dimension": "coherence_standing:id1:v1:v2",
+   "family": "coherence_standing:{cohort}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "coherence_standing:id1:v1beta",
    "family": "coherence_standing:{cohort}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1301,6 +1595,12 @@
   },
   {
    "binds": {},
+   "dimension": "commitment_fulfillment:id1:v1beta",
+   "family": "commitment_fulfillment:{prior_contribution_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Commitment_fulfillment:id1:v1",
    "family": "commitment_fulfillment:{prior_contribution_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -1331,6 +1631,12 @@
   {
    "binds": {},
    "dimension": "config:sample:v1:v2",
+   "family": "config:{scope}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "config:sample:v1beta",
    "family": "config:{scope}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1378,6 +1684,12 @@
   },
   {
    "binds": {},
+   "dimension": "conscience:coherence:v1beta",
+   "family": "conscience:coherence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Conscience:coherence:v1",
    "family": "conscience:coherence",
    "refusal": "namespace_dimension_case_malformed"
@@ -1405,6 +1717,12 @@
   {
    "binds": {},
    "dimension": "conscience:entropy:v1:v2",
+   "family": "conscience:entropy",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "conscience:entropy:v1beta",
    "family": "conscience:entropy",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1442,6 +1760,12 @@
   },
   {
    "binds": {},
+   "dimension": "conscience:epistemic_humility:v1beta",
+   "family": "conscience:epistemic_humility",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Conscience:epistemic_humility:v1",
    "family": "conscience:epistemic_humility",
    "refusal": "namespace_dimension_case_malformed"
@@ -1474,6 +1798,12 @@
   },
   {
    "binds": {},
+   "dimension": "conscience:optimization_veto:v1beta",
+   "family": "conscience:optimization_veto",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Conscience:optimization_veto:v1",
    "family": "conscience:optimization_veto",
    "refusal": "namespace_dimension_case_malformed"
@@ -1482,6 +1812,44 @@
    "binds": {},
    "dimension": "conscience:optimization_veto",
    "family": "conscience:optimization_veto",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "consent:community_trust:v1",
+   "family": "consent:community_trust",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "consent:community_trust:V1",
+   "family": "consent:community_trust",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:community_trust:v1:v2",
+   "family": "consent:community_trust",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:community_trust:v1beta",
+   "family": "consent:community_trust",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Consent:community_trust:v1",
+   "family": "consent:community_trust",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:community_trust",
+   "family": "consent:community_trust",
    "refusal": "missing_version_segment"
   },
   {
@@ -1502,6 +1870,12 @@
   {
    "binds": {},
    "dimension": "consent:decay:sample:v1:v2",
+   "family": "consent:decay:{stage}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:decay:sample:v1beta",
    "family": "consent:decay:{stage}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1549,6 +1923,12 @@
   },
   {
    "binds": {},
+   "dimension": "consent:deletion_complete:v1beta",
+   "family": "consent:deletion_complete",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Consent:deletion_complete:v1",
    "family": "consent:deletion_complete",
    "refusal": "namespace_dimension_case_malformed"
@@ -1577,6 +1957,12 @@
   {
    "binds": {},
    "dimension": "consent:deletion_sla:42:v1:v2",
+   "family": "consent:deletion_sla:{days}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:deletion_sla:42:v1beta",
    "family": "consent:deletion_sla:{days}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1616,6 +2002,12 @@
   },
   {
    "binds": {},
+   "dimension": "consent:partnership_accept:v1beta",
+   "family": "consent:partnership_accept",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Consent:partnership_accept:v1",
    "family": "consent:partnership_accept",
    "refusal": "namespace_dimension_case_malformed"
@@ -1643,6 +2035,12 @@
   {
    "binds": {},
    "dimension": "consent:partnership_grant:v1:v2",
+   "family": "consent:partnership_grant",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:partnership_grant:v1beta",
    "family": "consent:partnership_grant",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1681,6 +2079,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "version": "v1beta"
+   },
+   "dimension": "consent:replication:v1beta",
+   "family": "consent:replication:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Consent:replication:v1",
    "family": "consent:replication:{version}",
@@ -1711,11 +2117,12 @@
   },
   {
    "binds": {
-    "kind": "sample:sub:v1"
+    "kind": "sample:sub:v1",
+    "version": "v1"
    },
-   "dimension": "consent:scope:sample:sub:v1:v2",
+   "dimension": "consent:scope:sample:sub:v1:v1",
    "family": "consent:scope:{kind}",
-   "refusal": "namespace_dimension_case_malformed"
+   "refusal": null
   },
   {
    "binds": {},
@@ -1757,6 +2164,12 @@
   {
    "binds": {},
    "dimension": "consent:state:granted:v1:v2",
+   "family": "consent:state:{stance}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:state:granted:v1beta",
    "family": "consent:state:{stance}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1813,6 +2226,12 @@
   },
   {
    "binds": {},
+   "dimension": "consent:stream:sample:v1beta",
+   "family": "consent:stream:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Consent:stream:sample:v1",
    "family": "consent:stream:{kind}",
    "refusal": "namespace_dimension_case_malformed"
@@ -1835,46 +2254,96 @@
   },
   {
    "binds": {
-    "kind": "sample",
     "version": "v1"
    },
-   "dimension": "consent:sample:v1",
-   "family": "consent:{kind}",
+   "dimension": "consent:community_trust:v1",
+   "family": "consent:community_trust",
    "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "consent:sample:V1",
-   "family": "consent:{kind}",
-   "refusal": "namespace_dimension_case_malformed"
+   "binds": {
+    "stage": "sample",
+    "version": "v1"
+   },
+   "dimension": "consent:decay:sample:v1",
+   "family": "consent:decay:{stage}",
+   "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "consent:sample:v1:v2",
-   "family": "consent:{kind}",
-   "refusal": "namespace_dimension_case_malformed"
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "consent:deletion_complete:v1",
+   "family": "consent:deletion_complete",
+   "refusal": null
   },
   {
-   "binds": {},
-   "dimension": "Consent:sample:v1",
-   "family": "consent:{kind}",
-   "refusal": "namespace_dimension_case_malformed"
+   "binds": {
+    "days": "42",
+    "version": "v1"
+   },
+   "dimension": "consent:deletion_sla:42:v1",
+   "family": "consent:deletion_sla:{days}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "consent:partnership_accept:v1",
+   "family": "consent:partnership_accept",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "consent:partnership_grant:v1",
+   "family": "consent:partnership_grant",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "consent:replication:v1",
+   "family": "consent:replication:{version}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "kind": "sample:sub",
+    "version": "v1"
+   },
+   "dimension": "consent:scope:sample:sub:v1",
+   "family": "consent:scope:{kind}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "stance": "granted",
+    "version": "v1"
+   },
+   "dimension": "consent:state:granted:v1",
+   "family": "consent:state:{stance}",
+   "refusal": null
+  },
+  {
+   "binds": {
+    "kind": "sample",
+    "version": "v1"
+   },
+   "dimension": "consent:stream:sample:v1",
+   "family": "consent:stream:{kind}",
+   "refusal": null
   },
   {
    "binds": {
     "kind": "sample"
    },
-   "dimension": "consent:sample",
+   "dimension": "consent:sample:v1",
    "family": "consent:{kind}",
-   "refusal": "missing_version_segment"
-  },
-  {
-   "binds": {
-    "kind": "SAMPLE"
-   },
-   "dimension": "consent:SAMPLE:v1",
-   "family": "consent:{kind}",
-   "refusal": "namespace_dimension_case_malformed"
+   "refusal": "namespace_family_unregistered"
   },
   {
    "binds": {
@@ -1894,6 +2363,12 @@
   {
    "binds": {},
    "dimension": "content_class:sample:v1:v2",
+   "family": "content_class:{class}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "content_class:sample:v1beta",
    "family": "content_class:{class}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -1943,6 +2418,12 @@
   },
   {
    "binds": {},
+   "dimension": "content_rating:sample:PG-13:v1beta",
+   "family": "content_rating:{scheme}:{rating}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Content_rating:sample:PG-13:v1",
    "family": "content_rating:{scheme}:{rating}",
    "refusal": "namespace_dimension_case_malformed"
@@ -1987,6 +2468,12 @@
   },
   {
    "binds": {},
+   "dimension": "corpus_health:n_eff_measurable:v1beta",
+   "family": "corpus_health:n_eff_measurable",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Corpus_health:n_eff_measurable:v1",
    "family": "corpus_health:n_eff_measurable",
    "refusal": "namespace_dimension_case_malformed"
@@ -2016,6 +2503,12 @@
   {
    "binds": {},
    "dimension": "credits:sample:sample:substrate_building:v1:v2",
+   "family": "credits:{domain}:{language}:substrate_building",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "credits:sample:sample:substrate_building:v1beta",
    "family": "credits:{domain}:{language}:substrate_building",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2068,6 +2561,12 @@
   },
   {
    "binds": {},
+   "dimension": "credits:sample:sample:id1:v1beta",
+   "family": "credits:{domain}:{language}:{subject}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Credits:sample:sample:id1:v1",
    "family": "credits:{domain}:{language}:{subject}",
    "refusal": "namespace_dimension_case_malformed"
@@ -2110,6 +2609,12 @@
   {
    "binds": {},
    "dimension": "cw_class:sample:v1:v2",
+   "family": "cw_class:{class}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "cw_class:sample:v1beta",
    "family": "cw_class:{class}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2158,6 +2663,12 @@
   },
   {
    "binds": {},
+   "dimension": "delivery:sample:v1beta",
+   "family": "delivery:{class}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Delivery:sample:v1",
    "family": "delivery:{class}",
    "refusal": "namespace_dimension_case_malformed"
@@ -2201,6 +2712,12 @@
   },
   {
    "binds": {},
+   "dimension": "delivery_receipt:id1:v1beta",
+   "family": "delivery_receipt:{stream_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Delivery_receipt:id1:v1",
    "family": "delivery_receipt:{stream_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -2235,6 +2752,12 @@
   },
   {
    "binds": {},
+   "dimension": "detection:conscience_override_rate:v1beta",
+   "family": "detection:conscience_override_rate",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Detection:conscience_override_rate:v1",
    "family": "detection:conscience_override_rate",
    "refusal": "namespace_dimension_case_malformed"
@@ -2264,11 +2787,12 @@
   },
   {
    "binds": {
-    "axis": "sample:sub:v1"
+    "axis": "sample:sub:v1",
+    "version": "v1"
    },
-   "dimension": "detection:correlated_action:sample:sub:v1:v2",
+   "dimension": "detection:correlated_action:sample:sub:v1:v1",
    "family": "detection:correlated_action:{axis}",
-   "refusal": "namespace_dimension_case_malformed"
+   "refusal": null
   },
   {
    "binds": {},
@@ -2314,6 +2838,12 @@
   },
   {
    "binds": {},
+   "dimension": "detection:cross_agent_divergence:v1beta",
+   "family": "detection:cross_agent_divergence",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Detection:cross_agent_divergence:v1",
    "family": "detection:cross_agent_divergence",
    "refusal": "namespace_dimension_case_malformed"
@@ -2342,6 +2872,12 @@
   {
    "binds": {},
    "dimension": "detection:distributive:access:compute:v1:v2",
+   "family": "detection:distributive:access:{resource_type}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "detection:distributive:access:compute:v1beta",
    "family": "detection:distributive:access:{resource_type}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2389,6 +2925,12 @@
   },
   {
    "binds": {},
+   "dimension": "detection:hash_chain_integrity:v1beta",
+   "family": "detection:hash_chain_integrity",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Detection:hash_chain_integrity:v1",
    "family": "detection:hash_chain_integrity",
    "refusal": "namespace_dimension_case_malformed"
@@ -2416,6 +2958,12 @@
   {
    "binds": {},
    "dimension": "detection:intra_agent_consistency:v1:v2",
+   "family": "detection:intra_agent_consistency",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "detection:intra_agent_consistency:v1beta",
    "family": "detection:intra_agent_consistency",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2453,6 +3001,12 @@
   },
   {
    "binds": {},
+   "dimension": "detection:temporal_drift:v1beta",
+   "family": "detection:temporal_drift",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Detection:temporal_drift:v1",
    "family": "detection:temporal_drift",
    "refusal": "namespace_dimension_case_malformed"
@@ -2485,6 +3039,14 @@
     "*": "leaf:v1"
    },
    "dimension": "dma:csdma:leaf:v1:v2",
+   "family": "dma:csdma:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "dma:csdma:leaf:v1beta",
    "family": "dma:csdma:*",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2527,6 +3089,15 @@
     "domain": "sample"
    },
    "dimension": "dma:dsdma:sample:leaf:v1:v2",
+   "family": "dma:dsdma:{domain}:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "leaf:v1beta",
+    "domain": "sample"
+   },
+   "dimension": "dma:dsdma:sample:leaf:v1beta",
    "family": "dma:dsdma:{domain}:*",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2580,6 +3151,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "dma:idma:leaf:v1beta",
+   "family": "dma:idma:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Dma:idma:leaf:v1",
    "family": "dma:idma:*",
@@ -2619,6 +3198,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "dma:pdma:leaf:v1beta",
+   "family": "dma:pdma:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Dma:pdma:leaf:v1",
    "family": "dma:pdma:*",
@@ -2650,6 +3237,12 @@
   {
    "binds": {},
    "dimension": "duty:sample:v1:v2",
+   "family": "duty:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "duty:sample:v1beta",
    "family": "duty:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2701,6 +3294,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "encyclopedia:leaf:v1beta",
+   "family": "encyclopedia:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Encyclopedia:leaf:v1",
    "family": "encyclopedia:*",
@@ -2736,6 +3337,12 @@
   },
   {
    "binds": {},
+   "dimension": "event:attendance:v1beta",
+   "family": "event:attendance",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Event:attendance:v1",
    "family": "event:attendance",
    "refusal": "namespace_dimension_case_malformed"
@@ -2764,6 +3371,12 @@
   {
    "binds": {},
    "dimension": "event:lifecycle:sample:v1:v2",
+   "family": "event:lifecycle:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "event:lifecycle:sample:v1beta",
    "family": "event:lifecycle:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2811,6 +3424,12 @@
   },
   {
    "binds": {},
+   "dimension": "event:rsvp_count:v1beta",
+   "family": "event:rsvp_count",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Event:rsvp_count:v1",
    "family": "event:rsvp_count",
    "refusal": "namespace_dimension_case_malformed"
@@ -2840,6 +3459,12 @@
   {
    "binds": {},
    "dimension": "expertise:sample:sample:v1:v2",
+   "family": "expertise:{domain}:{language}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "expertise:sample:sample:v1beta",
    "family": "expertise:{domain}:{language}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2889,6 +3514,12 @@
   },
   {
    "binds": {},
+   "dimension": "federation_directory:replication_lag:v1beta",
+   "family": "federation_directory:replication_lag",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Federation_directory:replication_lag:v1",
    "family": "federation_directory:replication_lag",
    "refusal": "namespace_dimension_case_malformed"
@@ -2917,6 +3548,12 @@
   {
    "binds": {},
    "dimension": "fidelity:explainability_sla:l1_summary:v1:v2",
+   "family": "fidelity:explainability_sla:{tier}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "fidelity:explainability_sla:l1_summary:v1beta",
    "family": "fidelity:explainability_sla:{tier}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -2960,6 +3597,12 @@
   {
    "binds": {},
    "dimension": "fidelity:sample:v1:v2",
+   "family": "fidelity:{aspect}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "fidelity:sample:v1beta",
    "family": "fidelity:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3011,6 +3654,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "film:leaf:v1beta",
+   "family": "film:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Film:leaf:v1",
    "family": "film:*",
@@ -3042,6 +3693,12 @@
   {
    "binds": {},
    "dimension": "goal:self:v1:v2",
+   "family": "goal:{scale}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "goal:self:v1beta",
    "family": "goal:{scale}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3090,6 +3747,12 @@
   },
   {
    "binds": {},
+   "dimension": "hard_case:sample:v1beta",
+   "family": "hard_case:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Hard_case:sample:v1",
    "family": "hard_case:{kind}",
    "refusal": "namespace_dimension_case_malformed"
@@ -3128,6 +3791,12 @@
   {
    "binds": {},
    "dimension": "hardware_custody:android_keystore:v1:v2",
+   "family": "hardware_custody:{platform}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "hardware_custody:android_keystore:v1beta",
    "family": "hardware_custody:{platform}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3184,6 +3853,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "version": "v1beta"
+   },
+   "dimension": "health:liveness:v1beta",
+   "family": "health:liveness:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Health:liveness:v1",
    "family": "health:liveness:{version}",
@@ -3213,6 +3890,12 @@
   {
    "binds": {},
    "dimension": "holds_bytes:sha256:ab12:v1:v2",
+   "family": "holds_bytes:sha256:{prefix}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "holds_bytes:sha256:ab12:v1beta",
    "family": "holds_bytes:sha256:{prefix}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3269,6 +3952,12 @@
   },
   {
    "binds": {},
+   "dimension": "identity_continuity:relational_anchor:v1beta",
+   "family": "identity_continuity:relational_anchor",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Identity_continuity:relational_anchor:v1",
    "family": "identity_continuity:relational_anchor",
    "refusal": "namespace_dimension_case_malformed"
@@ -3305,6 +3994,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "image:leaf:v1beta",
+   "family": "image:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Image:leaf:v1",
    "family": "image:*",
@@ -3336,6 +4033,12 @@
   {
    "binds": {},
    "dimension": "integrity:sample:v1:v2",
+   "family": "integrity:{aspect}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "integrity:sample:v1beta",
    "family": "integrity:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3384,6 +4087,12 @@
   },
   {
    "binds": {},
+   "dimension": "judge_model:verdict:id1:v1beta",
+   "family": "judge_model:verdict:{model_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Judge_model:verdict:id1:v1",
    "family": "judge_model:verdict:{model_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -3414,6 +4123,12 @@
   {
    "binds": {},
    "dimension": "justice:sample:v1:v2",
+   "family": "justice:{aspect}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "justice:sample:v1beta",
    "family": "justice:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3462,6 +4177,12 @@
   },
   {
    "binds": {},
+   "dimension": "key_boundary:sample:v1beta",
+   "family": "key_boundary:{scope}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Key_boundary:sample:v1",
    "family": "key_boundary:{scope}",
    "refusal": "namespace_dimension_case_malformed"
@@ -3505,6 +4226,12 @@
   },
   {
    "binds": {},
+   "dimension": "licensure:id1:v1beta",
+   "family": "licensure:{authority_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Licensure:id1:v1",
    "family": "licensure:{authority_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -3535,6 +4262,12 @@
   {
    "binds": {},
    "dimension": "locality:decision:local:v1:v2",
+   "family": "locality:decision:{scale}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "locality:decision:local:v1beta",
    "family": "locality:decision:{scale}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3583,6 +4316,12 @@
   },
   {
    "binds": {},
+   "dimension": "manifold_conformity:id1:v1beta",
+   "family": "manifold_conformity:{cohort}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Manifold_conformity:id1:v1",
    "family": "manifold_conformity:{cohort}",
    "refusal": "namespace_dimension_case_malformed"
@@ -3613,6 +4352,12 @@
   {
    "binds": {},
    "dimension": "mesh_config:sample:v1:v2",
+   "family": "mesh_config:{key}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "mesh_config:sample:v1beta",
    "family": "mesh_config:{key}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3657,6 +4402,12 @@
   {
    "binds": {},
    "dimension": "method:id1:sample:v1:v2",
+   "family": "method:{approach_id}:{substrate_rung}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "method:id1:sample:v1beta",
    "family": "method:{approach_id}:{substrate_rung}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3710,6 +4461,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "model_3d:leaf:v1beta",
+   "family": "model_3d:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Model_3d:leaf:v1",
    "family": "model_3d:*",
@@ -3741,6 +4500,12 @@
   {
    "binds": {},
    "dimension": "moderation:rogue_vote:v1:v2",
+   "family": "moderation:{allegation_type}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "moderation:rogue_vote:v1beta",
    "family": "moderation:{allegation_type}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3789,6 +4554,12 @@
   },
   {
    "binds": {},
+   "dimension": "moderation_track_record:id1:v1beta",
+   "family": "moderation_track_record:{community_key_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Moderation_track_record:id1:v1",
    "family": "moderation_track_record:{community_key_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -3820,6 +4591,12 @@
   {
    "binds": {},
    "dimension": "multilateral_participation:id1:membership:v1:v2",
+   "family": "multilateral_participation:{forum}:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "multilateral_participation:id1:membership:v1beta",
    "family": "multilateral_participation:{forum}:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3866,6 +4643,12 @@
   {
    "binds": {},
    "dimension": "need:sample:sample:v1:v2",
+   "family": "need:{domain}:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "need:sample:sample:v1beta",
    "family": "need:{domain}:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3919,6 +4702,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "news:leaf:v1beta",
+   "family": "news:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "News:leaf:v1",
    "family": "news:*",
@@ -3950,6 +4741,12 @@
   {
    "binds": {},
    "dimension": "non_maleficence:sample:v1:v2",
+   "family": "non_maleficence:{aspect}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "non_maleficence:sample:v1beta",
    "family": "non_maleficence:{aspect}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -3993,6 +4790,12 @@
   {
    "binds": {},
    "dimension": "objection:sample:v1:v2",
+   "family": "objection:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "objection:sample:v1beta",
    "family": "objection:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4045,6 +4848,16 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "relation": "sample",
+    "target_kind": "sample",
+    "version": "v1beta"
+   },
+   "dimension": "ownership:sample:sample:v1beta",
+   "family": "ownership:{relation}:{target_kind}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Ownership:sample:sample:v1",
    "family": "ownership:{relation}:{target_kind}:{version}",
@@ -4087,6 +4900,12 @@
   {
    "binds": {},
    "dimension": "partner_role:sample:v1:v2",
+   "family": "partner_role:{role}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "partner_role:sample:v1beta",
    "family": "partner_role:{role}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4135,6 +4954,12 @@
   },
   {
    "binds": {},
+   "dimension": "peer_reachability:sample:v1beta",
+   "family": "peer_reachability:{network}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Peer_reachability:sample:v1",
    "family": "peer_reachability:{network}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4178,6 +5003,12 @@
   },
   {
    "binds": {},
+   "dimension": "progress_measure:id1:v1beta",
+   "family": "progress_measure:{method_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Progress_measure:id1:v1",
    "family": "progress_measure:{method_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4208,6 +5039,12 @@
   {
    "binds": {},
    "dimension": "prohibited:sample:v1:v2",
+   "family": "prohibited:{category}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "prohibited:sample:v1beta",
    "family": "prohibited:{category}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4256,6 +5093,12 @@
   },
   {
    "binds": {},
+   "dimension": "provenance:build_manifest:id1:v1beta",
+   "family": "provenance:build_manifest:{target}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Provenance:build_manifest:id1:v1",
    "family": "provenance:build_manifest:{target}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4292,6 +5135,12 @@
   },
   {
    "binds": {},
+   "dimension": "provenance:build_manifest:id1:locale:en-US:v1beta",
+   "family": "provenance:build_manifest:{target}:locale:{lang_code}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Provenance:build_manifest:id1:locale:en-US:v1",
    "family": "provenance:build_manifest:{target}:locale:{lang_code}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4304,6 +5153,15 @@
    "dimension": "provenance:build_manifest:id1:locale:en-US",
    "family": "provenance:build_manifest:{target}:locale:{lang_code}",
    "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "lang_code": "en-us",
+    "target": "id1"
+   },
+   "dimension": "provenance:build_manifest:id1:locale:en-us:v1",
+   "family": "provenance:build_manifest:{target}:locale:{lang_code}",
+   "refusal": "namespace_dimension_case_malformed"
   },
   {
    "binds": {
@@ -4324,11 +5182,12 @@
   },
   {
    "binds": {
-    "source": "id1:id2:v1"
+    "source": "id1:id2:v1",
+    "version": "v1"
    },
-   "dimension": "provenance:skill_import:id1:id2:v1:v2",
+   "dimension": "provenance:skill_import:id1:id2:v1:v1",
    "family": "provenance:skill_import:{source}",
-   "refusal": "namespace_dimension_case_malformed"
+   "refusal": null
   },
   {
    "binds": {},
@@ -4362,6 +5221,12 @@
   {
    "binds": {},
    "dimension": "provenance:slsa:sample:v1:v2",
+   "family": "provenance:slsa:{level}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "provenance:slsa:sample:v1beta",
    "family": "provenance:slsa:{level}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4410,6 +5275,12 @@
   },
   {
    "binds": {},
+   "dimension": "quarantine:sample:v1beta",
+   "family": "quarantine:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Quarantine:sample:v1",
    "family": "quarantine:{state}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4452,6 +5323,12 @@
   },
   {
    "binds": {},
+   "dimension": "ratchet:flag:coordinated_voting_cluster:v1beta",
+   "family": "ratchet:flag:coordinated_voting_cluster",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Ratchet:flag:coordinated_voting_cluster:v1",
    "family": "ratchet:flag:coordinated_voting_cluster",
    "refusal": "namespace_dimension_case_malformed"
@@ -4480,6 +5357,12 @@
   {
    "binds": {},
    "dimension": "ratchet:flag:counter_rii:sample:v1:v2",
+   "family": "ratchet:flag:counter_rii:{layer}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ratchet:flag:counter_rii:sample:v1beta",
    "family": "ratchet:flag:counter_rii:{layer}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4527,6 +5410,12 @@
   },
   {
    "binds": {},
+   "dimension": "ratchet:flag:density_anomaly:v1beta",
+   "family": "ratchet:flag:density_anomaly",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Ratchet:flag:density_anomaly:v1",
    "family": "ratchet:flag:density_anomaly",
    "refusal": "namespace_dimension_case_malformed"
@@ -4554,6 +5443,12 @@
   {
    "binds": {},
    "dimension": "ratchet:flag:expertise_attestation_anomaly:v1:v2",
+   "family": "ratchet:flag:expertise_attestation_anomaly",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ratchet:flag:expertise_attestation_anomaly:v1beta",
    "family": "ratchet:flag:expertise_attestation_anomaly",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4591,6 +5486,12 @@
   },
   {
    "binds": {},
+   "dimension": "ratchet:flag:harassment_pattern:v1beta",
+   "family": "ratchet:flag:harassment_pattern",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Ratchet:flag:harassment_pattern:v1",
    "family": "ratchet:flag:harassment_pattern",
    "refusal": "namespace_dimension_case_malformed"
@@ -4618,6 +5519,12 @@
   {
    "binds": {},
    "dimension": "ratchet:flag:out_of_distribution_voting:v1:v2",
+   "family": "ratchet:flag:out_of_distribution_voting",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "ratchet:flag:out_of_distribution_voting:v1beta",
    "family": "ratchet:flag:out_of_distribution_voting",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4651,6 +5558,12 @@
   {
    "binds": {},
    "dimension": "reconsideration:sample:v1:v2",
+   "family": "reconsideration:{grounds}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "reconsideration:sample:v1beta",
    "family": "reconsideration:{grounds}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4701,6 +5614,15 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "artifact": "manifest",
+    "version": "v1beta"
+   },
+   "dimension": "regime:manifest:v1beta",
+   "family": "regime:{artifact}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Regime:manifest:v1",
    "family": "regime:{artifact}:{version}",
@@ -4742,6 +5664,12 @@
   {
    "binds": {},
    "dimension": "revocation:sample:sample:v1:v2",
+   "family": "revocation:{entity_type}:{reason}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "revocation:sample:sample:v1beta",
    "family": "revocation:{entity_type}:{reason}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4792,6 +5720,12 @@
   },
   {
    "binds": {},
+   "dimension": "rollback_detected:sample:v1beta",
+   "family": "rollback_detected:{revision_field}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Rollback_detected:sample:v1",
    "family": "rollback_detected:{revision_field}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4835,6 +5769,12 @@
   },
   {
    "binds": {},
+   "dimension": "seed_holder_voting_alignment:id1:v1beta",
+   "family": "seed_holder_voting_alignment:{cell}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Seed_holder_voting_alignment:id1:v1",
    "family": "seed_holder_voting_alignment:{cell}",
    "refusal": "namespace_dimension_case_malformed"
@@ -4865,6 +5805,12 @@
   {
    "binds": {},
    "dimension": "session:sample:v1:v2",
+   "family": "session:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "session:sample:v1beta",
    "family": "session:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4908,6 +5854,12 @@
   {
    "binds": {},
    "dimension": "slashing:sample:v1:v2",
+   "family": "slashing:{outcome}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "slashing:sample:v1beta",
    "family": "slashing:{outcome}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -4959,6 +5911,14 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "system:leaf:v1beta",
+   "family": "system:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "System:leaf:v1",
    "family": "system:*",
@@ -4990,6 +5950,12 @@
   {
    "binds": {},
    "dimension": "testimonial_witness:sample:v1:v2",
+   "family": "testimonial_witness:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "testimonial_witness:sample:v1beta",
    "family": "testimonial_witness:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5033,6 +5999,12 @@
   {
    "binds": {},
    "dimension": "topical_relation:sample:v1:v2",
+   "family": "topical_relation:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "topical_relation:sample:v1beta",
    "family": "topical_relation:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5083,6 +6055,15 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "form": "sample",
+    "version": "v1beta"
+   },
+   "dimension": "trace:sample:v1beta",
+   "family": "trace:{form}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Trace:sample:v1",
    "family": "trace:{form}:{version}",
@@ -5123,6 +6104,12 @@
   {
    "binds": {},
    "dimension": "trace_summary:sample:v1:v2",
+   "family": "trace_summary:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "trace_summary:sample:v1beta",
    "family": "trace_summary:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5170,6 +6157,12 @@
   },
   {
    "binds": {},
+   "dimension": "transparency_log:consistency:v1beta",
+   "family": "transparency_log:consistency",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Transparency_log:consistency:v1",
    "family": "transparency_log:consistency",
    "refusal": "namespace_dimension_case_malformed"
@@ -5198,6 +6191,12 @@
   {
    "binds": {},
    "dimension": "transparency_log:cosigned:42:v1:v2",
+   "family": "transparency_log:cosigned:{tree_size}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "transparency_log:cosigned:42:v1beta",
    "family": "transparency_log:cosigned:{tree_size}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5237,6 +6236,12 @@
   },
   {
    "binds": {},
+   "dimension": "transparency_log:inclusion:v1beta",
+   "family": "transparency_log:inclusion",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Transparency_log:inclusion:v1",
    "family": "transparency_log:inclusion",
    "refusal": "namespace_dimension_case_malformed"
@@ -5265,6 +6270,12 @@
   {
    "binds": {},
    "dimension": "transport:sample:v1:v2",
+   "family": "transport:{kind}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "transport:sample:v1beta",
    "family": "transport:{kind}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5315,6 +6326,15 @@
    "refusal": "namespace_dimension_case_malformed"
   },
   {
+   "binds": {
+    "job": "sample",
+    "version": "v1beta"
+   },
+   "dimension": "trust:sample:v1beta",
+   "family": "trust:{job}:{version}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
    "binds": {},
    "dimension": "Trust:sample:v1",
    "family": "trust:{job}:{version}",
@@ -5360,6 +6380,12 @@
   },
   {
    "binds": {},
+   "dimension": "truth_grounding:id1:v1beta",
+   "family": "truth_grounding:{subject}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Truth_grounding:id1:v1",
    "family": "truth_grounding:{subject}",
    "refusal": "namespace_dimension_case_malformed"
@@ -5394,6 +6420,14 @@
     "*": "leaf:v1"
    },
    "dimension": "video:leaf:v1:v2",
+   "family": "video:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "leaf:v1beta"
+   },
+   "dimension": "video:leaf:v1beta",
    "family": "video:*",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5434,6 +6468,12 @@
   },
   {
    "binds": {},
+   "dimension": "vote:id1:v1beta",
+   "family": "vote:{contribution_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Vote:id1:v1",
    "family": "vote:{contribution_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -5464,6 +6504,12 @@
   {
    "binds": {},
    "dimension": "wa_adjudication:sample:v1:v2",
+   "family": "wa_adjudication:{state}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "wa_adjudication:sample:v1beta",
    "family": "wa_adjudication:{state}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5512,6 +6558,12 @@
   },
   {
    "binds": {},
+   "dimension": "watchlist:id1:v1beta",
+   "family": "watchlist:{id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Watchlist:id1:v1",
    "family": "watchlist:{id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -5547,6 +6599,12 @@
   },
   {
    "binds": {},
+   "dimension": "weighted_aggregate:id1:v1beta",
+   "family": "weighted_aggregate:{contribution_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
    "dimension": "Weighted_aggregate:id1:v1",
    "family": "weighted_aggregate:{contribution_id}",
    "refusal": "namespace_dimension_case_malformed"
@@ -5577,6 +6635,12 @@
   {
    "binds": {},
    "dimension": "witness_diversity:id1:v1:v2",
+   "family": "witness_diversity:{contribution_id}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "witness_diversity:id1:v1beta",
    "family": "witness_diversity:{contribution_id}",
    "refusal": "namespace_dimension_case_malformed"
   },
@@ -5651,6 +6715,106 @@
    "dimension": "no_such_family:leaf:v1",
    "family": null,
    "refusal": null
+  },
+  {
+   "binds": {
+    "scope": "admission\n"
+   },
+   "dimension": "config:admission\n:v1",
+   "family": "config:{scope}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "no_such_family:leaf",
+   "family": null,
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {},
+   "dimension": "no_such_family:leaf:v1:v2",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "no_such_family:leaf:V1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "no_such_family:v1beta:v2",
+   "family": null,
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "v1:v2",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {
+    "*": "totally:new"
+   },
+   "dimension": "accord:totally:new:v1",
+   "family": "accord:*",
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "consent:totally:new:v1",
+   "family": null,
+   "refusal": "namespace_family_unregistered"
+  },
+  {
+   "binds": {},
+   "dimension": "Accord:zz_unminted_leaf:v1",
+   "family": "accord:*",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Transparency_log:cosigned:zz_unminted_leaf:v1",
+   "family": "transparency_log:cosigned:{tree_size}",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Detection:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Capacity:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Age_assurance:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Capacity_assurance:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Age_self_declared:zz_unminted_leaf:v1",
+   "family": null,
+   "refusal": "namespace_dimension_case_malformed"
   }
  ]
 }

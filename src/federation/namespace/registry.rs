@@ -42,10 +42,10 @@ pub const VENDORED_CC_VERSION: &str = "1.0-rc5";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "f05682512c85c65c3f502e1ca81dfb032a6e6d24ab4206658fbf36ccaa702a75";
+    "4f675532029663469f9c67694fb68d5d13742deb701d8337f1929ae8f6b7a907";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 145;
+pub const VENDORED_N_FAMILIES: usize = 148;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,15 +55,18 @@ pub const VENDORED_N_FAMILIES: usize = 145;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (PR #113, rc5 — an UNMERGED CC branch at vendor time), together with
+/// (CC 1.0-rc5 as RELEASED from `main` — the `v1.0-rc5` tag's commit),
+/// together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "d6c87945ea08d72cc1f83820e35f0e3fb72cce47ea49f2ed3321d43219642ea6";
+    "07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb";
 
-/// The CIRISConstitution commit both vendored manifests were copied from
-/// (`claude/backlog-integration-assignment-p3ydh0`, CIRISConstitution PR #113).
-pub const VENDORED_CC_COMMIT: &str = "4b624513458f2c9b236caf289dc2cd62aa048c24";
+/// The CIRISConstitution commit both vendored manifests were copied from:
+/// `c60d0a6` "Cut CC 1.0-rc5, released as guidance (#125)" on `main`, which
+/// the `v1.0-rc5` tag names. (The slice first vendored PR #113's unmerged
+/// head `4b624513`; the released manifests replaced it byte-for-byte.)
+pub const VENDORED_CC_COMMIT: &str = "c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -405,7 +408,7 @@ pub fn authority_for(dimension: &str) -> Authority {
         return e.authority.clone();
     }
     // v50.0.0 (CIRISPersist#924) — a dimension under a stem CC 3.4 reserves
-    // as a whole that no row claims (`capacity_assurance:reversible_excluded:
+    // as a whole that no row claims (`capacity_assurance:reversible_imagined:
     // financial:v1`): the old longest-literal-prefix lookup attributed it to
     // the stem's row and so carried the reservation; the one matcher claims no
     // row for it, and reporting it OPEN would drop the reservation. The stem's
@@ -539,6 +542,8 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "capacity:integrity",
     "capacity:resilience",
     "capacity:sustained_coherence",
+    "capacity_assurance:reversible_excluded:{domain}:{version}",
+    "capacity_assurance:reversible_pending:{domain}:{version}",
     "capacity_assurance:{level}:{domain}:{band}:{version}",
     "cert_validity:{authority}",
     "chat:*",
@@ -550,6 +555,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "conscience:epistemic_humility",
     "conscience:optimization_veto",
     "consent:decay:{stage}",
+    "consent:community_trust",
     "consent:deletion_complete",
     "consent:deletion_sla:{days}",
     "consent:partnership_accept",
@@ -725,6 +731,15 @@ mod tests {
             raw.families.len(),
             VENDORED_N_FAMILIES,
             "families[] length != _meta.n_families"
+        );
+        // CIRISConstitution#116 — the released rc5 declares full-match
+        // semantics for every segment pattern; `matcher::compile` implements it.
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        assert!(
+            root["_meta"]["case_rule"]["match_semantics"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("full-match")),
+            "_meta.case_rule.match_semantics is missing or no longer full-match"
         );
     }
 
@@ -1234,13 +1249,24 @@ mod tests {
             None,
             "off every row's arity is open vocabulary, not session:{{kind}}"
         );
-        let dim = "capacity_assurance:reversible_excluded:financial:v1";
-        assert_eq!(prefix(dim), None, "no row claims the CC 3.4.12 companion");
+        // An unclaimed leaf under a reserved stem: no row, so the stem's own
+        // rule answers and the reservation is not dropped.
+        let dim = "capacity_assurance:reversible_imagined:financial:v1";
+        assert_eq!(prefix(dim), None, "no row claims an unminted leaf");
         let a = authority_for(dim);
         assert!(
             a.reserved.is_some_and(|r| r.cc_ref == "CC 3.4.12"),
             "the reserved stem's own rule answers, so the reservation is not dropped"
         );
+        // The released rc5 registers the CC 3.4.12 companions: the row answers.
+        let companion = "capacity_assurance:reversible_excluded:financial:v1";
+        assert_eq!(
+            prefix(companion),
+            Some("capacity_assurance:reversible_excluded:{domain}:{version}")
+        );
+        assert!(authority_for(companion)
+            .reserved
+            .is_some_and(|r| r.cc_ref == "CC 3.4.12"));
     }
 
     #[test]
@@ -1449,6 +1475,11 @@ mod tests {
                     "wildcard_rule",
                     "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements",
                 ),
+                (
+                    "match_semantics",
+                    "matcher::compile (every pattern wrapped `^(?:p)$`) + \
+                     matcher::tests::the_manifest_declares_full_match_semantics",
+                ),
             ],
             &[
                 (
@@ -1464,7 +1495,7 @@ mod tests {
                 (
                     "compare",
                     "prose (\"byte-exact; consumers MUST NOT case-fold\") — the matcher's \
-                     byte-exact compare IS this rule, replayed by the 785 vectors",
+                     byte-exact compare IS this rule, replayed by the 962 vectors",
                 ),
                 (
                     "placeholder_classes",

@@ -17,7 +17,7 @@
 //!
 //! # Drift control
 //!
-//! CC publishes `manifests/namespace_match_vectors.json` — 785 dimensions with
+//! CC publishes `manifests/namespace_match_vectors.json` — 962 dimensions (released rc5) with
 //! the family each resolves to and the refusal each earns — and requires every
 //! consumer to replay them against its own matcher, "so a matcher that drifts
 //! from this one fails a build, not a card". The file is vendored byte-for-byte
@@ -30,10 +30,18 @@
 //! # Read from the manifest, never re-spelled
 //!
 //! Every pattern, token, stem and exemption below is read from the vendored
-//! manifest. Nothing here restates a CC value; the only literals are the two
-//! the reference itself hard-codes (`HEX_PATTERN` and the `VERSION_LIKE`
-//! detector, which is deliberately looser than the manifest's version pattern
-//! so an uppercase `V1` is *detected* as a malformed version tail).
+//! manifest. Nothing here restates a CC value; the only literals are the three
+//! the reference itself hard-codes (`HEX_PATTERN` and the `VERSION_LIKE` /
+//! `VERSION_ATTEMPT` detectors, which are deliberately looser than the
+//! manifest's version pattern so an uppercase `V1` or a `v1beta` is *detected*
+//! as a malformed version tail).
+//!
+//! # Full match (`_meta.case_rule.match_semantics`, CIRISConstitution#116)
+//!
+//! Every manifest pattern must match the WHOLE segment, and a `$` anchor does
+//! not admit a trailing newline. `compile` makes that structural: it wraps
+//! each pattern as `^(?:p)$`, so a row whose pattern forgot its anchors still
+//! cannot partial-match (`tests::compile_is_a_full_match`).
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -50,7 +58,18 @@ const HEX_PATTERN: &str = "^[0-9a-f]+$";
 
 /// The reference's version-tail DETECTOR — case-insensitive on the `v` so a
 /// `V1` tail is recognised in order to be refused, never admitted.
-const VERSION_LIKE: &str = "^[vV][0-9]+(\\.[0-9]+)*$";
+///
+/// The reference applies its two detectors with Python's `re.match`, whose `$`
+/// also matches before ONE trailing newline; `\n?\z` reproduces that here, so
+/// a detector refuses exactly what the reference's refuses (a detector only
+/// ever adds a refusal). The manifest's own patterns are full-match instead.
+const VERSION_LIKE: &str = "^[vV][0-9]+(?:\\.[0-9]+)*\n?\\z";
+
+/// The reference's `VERSION_ATTEMPT` (rc5 at c60d0a6): a segment that starts
+/// like a version (`v` + digit) but is not one — `v1beta`, `v1.`, `V1x`. In
+/// LAST place it is an attempt at the version tail, so it is malformed. A bare
+/// `vx` is a leaf name (a version begins `v` + digit, R3).
+const VERSION_ATTEMPT: &str = "^[vV][0-9][0-9A-Za-z_.\\-]*\n?\\z";
 
 /// A refusal the grammar names. Each spells the manifest's own token
 /// (`_meta.case_rule.refusal_tokens`) — never a bespoke string; the mapping is
@@ -60,8 +79,9 @@ pub enum Refusal {
     /// A segment breaks its class (R3), a version tail is uppercase or
     /// duplicated, or a registered stem is case-mutated.
     CaseMalformed,
-    /// A leaf under a reserved stem or a closed reserved family that no row
-    /// claims (R2(b), CC 3.4).
+    /// A leaf under a reserved stem, or an unmatched descendant of a closed
+    /// family (a reserved wildcard, or a parameterized parent closed in its
+    /// leaves such as `consent:{kind}`), that no row claims (R2(b), CC 3.4).
     FamilyUnregistered,
     /// A registered, non-exempt family carried no trailing version segment.
     MissingVersionSegment,
@@ -118,9 +138,11 @@ impl std::fmt::Display for Refusal {
 /// matcher's `(family_prefix | None, binds, refusal | None)`.
 ///
 /// `family: None` with `refusal: None` is **open vocabulary** — no row claims
-/// the dimension and the grammar has nothing to say about it. A refusal with a
-/// family names the family the dimension was judged against (on
-/// [`Refusal::CaseMalformed`] that is best-effort attribution, per the CC
+/// the dimension and the grammar has nothing to say about it (it still carries
+/// its one trailing version segment: R3 is global). A refusal with a family
+/// names the family the dimension was judged against — on
+/// [`Refusal::CaseMalformed`], the registered row it mutates where one
+/// resolves cleanly, else the refused hit (exact, per the released rc5
 /// vectors' contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FamilyMatch {
@@ -207,17 +229,32 @@ struct Rules {
     tokens: BTreeMap<String, String>,
     external: BTreeMap<String, Regex>,
     reserved_stems: Vec<String>,
+    /// Stems of CLOSED families: a `leaves_closed` wildcard's prefix minus the
+    /// `*`, or a closed parameterized parent's first segment plus `:`. Any
+    /// unmatched descendant beneath one is unregistered, like a reserved stem.
+    closed_stems: Vec<String>,
     /// `(stem, rule, cc_ref)` per `_meta.case_rule.reserved_stems` entry of
     /// `kind: reserved`.
     reserved_stem_rules: Vec<(String, String, String)>,
     families: Vec<Fam>,
     hex: Regex,
     version_like: Regex,
+    version_attempt: Regex,
 }
 
+/// Compile a manifest pattern with **full-match** semantics
+/// (`_meta.case_rule.match_semantics`): the whole segment must match, and a
+/// `$` never admits a trailing newline (Rust's `$` is end-of-text). The
+/// wrapper makes that hold even for a pattern that forgot its own anchors.
 fn compile(p: &str) -> Regex {
-    Regex::new(p)
+    Regex::new(&format!("^(?:{p})$"))
         .unwrap_or_else(|e| panic!("vendored manifest pattern {p:?} does not compile: {e}"))
+}
+
+/// Compile one of the reference's two hard-coded DETECTORS verbatim (they
+/// carry their own anchors and Python-`re.match` newline tolerance).
+fn compile_detector(p: &str) -> Regex {
+    Regex::new(p).unwrap_or_else(|e| panic!("detector {p:?} does not compile: {e}"))
 }
 
 fn rules() -> &'static Rules {
@@ -289,7 +326,7 @@ fn parse_rules(root: serde_json::Value) -> Rules {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().map(|e| str_of(e, "exempt").to_owned()).collect())
         .unwrap_or_default();
-    let families = root["families"]
+    let families: Vec<Fam> = root["families"]
         .as_array()
         .expect("families[]")
         .iter()
@@ -342,6 +379,20 @@ fn parse_rules(root: serde_json::Value) -> Rules {
             }
         })
         .collect();
+    // The reference's `closed_stems`: sorted, de-duplicated.
+    let closed_stems: Vec<String> = families
+        .iter()
+        .filter(|f| f.leaves_closed)
+        .map(|f| {
+            if f.last_class() == Some(Class::Wildcard) {
+                f.prefix[..f.prefix.len() - 1].to_owned()
+            } else {
+                format!("{}:", f.prefix.split(':').next().unwrap_or_default())
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     Rules {
         vocab: compile(str_of(&cr["vocab_pattern"], "vocab_pattern")),
         private: str_of(&meta["private_use_prefix"], "private_use_prefix").to_owned(),
@@ -352,9 +403,11 @@ fn parse_rules(root: serde_json::Value) -> Rules {
         external,
         reserved_stems,
         reserved_stem_rules,
+        closed_stems,
         families,
         hex: compile(HEX_PATTERN),
-        version_like: compile(VERSION_LIKE),
+        version_like: compile_detector(VERSION_LIKE),
+        version_attempt: compile_detector(VERSION_ATTEMPT),
     }
 }
 
@@ -441,13 +494,10 @@ fn match_segments(
             let span = &parts[pi..pi + 1 + extra];
             pi += 1 + extra;
             for got in span {
-                // a version-like sub-segment is a stray version tail, never
-                // part of the value
-                refusal = refusal.or_else(|| check_seg(seg, got, r)).or_else(|| {
-                    r.version_like
-                        .is_match(got)
-                        .then_some(Refusal::CaseMalformed)
-                });
+                // Every component of a multi-segment value is verbatim —
+                // `registry:v1` is a source id — so no version-shape test
+                // applies inside the span (rc5 reference, #113 review).
+                refusal = refusal.or_else(|| check_seg(seg, got, r));
             }
             binds.insert(seg.name.clone(), span.join(":"));
             continue;
@@ -464,11 +514,17 @@ fn match_segments(
         binds.insert(seg.name.clone(), got.to_owned());
     }
     let tail = &parts[pi..];
-    for got in tail {
+    for (k, got) in tail.iter().enumerate() {
         // Segments below a variadic tail. A version-like token here is an
         // uppercase or duplicated version tail — the real version was stripped
-        // before matching — so it is malformed, never a leaf.
-        if got.is_empty() || !r.vocab.is_match(got) || r.version_like.is_match(got) {
+        // before matching — so it is malformed, never a leaf; so is a version
+        // attempt (`v1beta`) in last place.
+        let last = pi + k == parts.len() - 1;
+        if got.is_empty()
+            || !r.vocab.is_match(got)
+            || r.version_like.is_match(got)
+            || (last && r.version_attempt.is_match(got))
+        {
             refusal = refusal.or(Some(Refusal::CaseMalformed));
         }
     }
@@ -512,6 +568,12 @@ struct Resolved<'r> {
     has_version: bool,
 }
 
+/// A last segment shaped like a version tail but not one: uppercase
+/// (`V1`) or an attempt (`v1beta`) — the reference's `_mutated_tail`.
+fn mutated_tail(r: &Rules, seg: &str) -> bool {
+    (r.version_like.is_match(seg) && !r.version.is_match(seg)) || r.version_attempt.is_match(seg)
+}
+
 /// The best candidate family for `parts`, or `None`.
 fn resolve<'r>(r: &'r Rules, parts: &[&str]) -> Option<Resolved<'r>> {
     let versioned = parts.last().is_some_and(|p| r.version.is_match(p));
@@ -531,12 +593,13 @@ fn resolve<'r>(r: &'r Rules, parts: &[&str]) -> Option<Resolved<'r>> {
                 true,
             );
         } else if ends_version || !versioned {
-            offer(
-                &mut best,
-                fam,
-                match_segments(&fam.segments, parts, r),
-                ends_version,
-            );
+            let found = match_segments(&fam.segments, parts, r).map(|(binds, refusal)| {
+                // An unversioned input whose last segment is a MUTATED version
+                // tail (`V1`, `v1beta`) is malformed whatever class absorbed it.
+                let mutated = !versioned && parts.last().is_some_and(|p| mutated_tail(r, p));
+                (binds, refusal.or(mutated.then_some(Refusal::CaseMalformed)))
+            });
+            offer(&mut best, fam, found, ends_version);
         } else if parts.len() > 1 {
             // The trailing version segment is the version — never a value or
             // a wildcard tail.
@@ -570,9 +633,10 @@ fn resolve<'r>(r: &'r Rules, parts: &[&str]) -> Option<Resolved<'r>> {
 }
 
 /// A dimension no row claims may still be a MALFORMED form of a registered
-/// family — a case-mutated stem, an uppercase or duplicated version tail. Fold
-/// and strip only to DETECT, never to admit.
-fn detect_malformed(r: &Rules, parts: &[&str]) -> Option<&'static str> {
+/// family — a case-mutated stem, an uppercase, attempted or duplicated version
+/// tail. Fold and strip only to DETECT, never to admit. With `clean_only` the
+/// variant must resolve WITHOUT a refusal.
+fn detect_malformed(r: &Rules, parts: &[&str], clean_only: bool) -> Option<&'static str> {
     let low: Vec<String> = parts.iter().map(|p| p.to_lowercase()).collect();
     let low: Vec<&str> = low.iter().map(String::as_str).collect();
     let mut variants: Vec<&[&str]> = Vec::new();
@@ -580,7 +644,8 @@ fn detect_malformed(r: &Rules, parts: &[&str]) -> Option<&'static str> {
         variants.push(&low);
     }
     let n = parts.len();
-    if n > 1 && r.version_like.is_match(parts[n - 1]) {
+    if n > 1 && (r.version_like.is_match(parts[n - 1]) || r.version_attempt.is_match(parts[n - 1]))
+    {
         variants.push(&parts[..n - 1]);
         variants.push(&low[..n - 1]);
         if n > 2 && r.version_like.is_match(parts[n - 2]) {
@@ -588,9 +653,11 @@ fn detect_malformed(r: &Rules, parts: &[&str]) -> Option<&'static str> {
             variants.push(&low[..n - 2]);
         }
     }
-    variants
-        .into_iter()
-        .find_map(|v| resolve(r, v).map(|hit| hit.fam.prefix))
+    variants.into_iter().find_map(|v| {
+        resolve(r, v)
+            .filter(|hit| hit.refusal.is_none() || !clean_only)
+            .map(|hit| hit.fam.prefix)
+    })
 }
 
 /// Python's `str.strip()` whitespace: Unicode `White_Space` plus the four
@@ -629,21 +696,42 @@ pub fn match_family(dimension: &str) -> FamilyMatch {
     if parts.iter().any(|p| p.is_empty()) {
         return FamilyMatch::bare(Some(Refusal::CaseMalformed));
     }
+    let malformed_as = |family: &'static str| FamilyMatch {
+        family: Some(family),
+        binds: BTreeMap::new(),
+        refusal: Some(Refusal::CaseMalformed),
+    };
     let Some(hit) = resolve(r, &parts) else {
-        if let Some(mutated) = detect_malformed(r, &parts) {
-            return FamilyMatch {
-                family: Some(mutated),
-                binds: BTreeMap::new(),
-                refusal: Some(Refusal::CaseMalformed),
-            };
+        if let Some(mutated) = detect_malformed(r, &parts, false) {
+            return malformed_as(mutated);
         }
-        // A stem CC 3.4 reserves as a whole: an unclaimed leaf beneath it is
-        // unregistered, never open vocabulary.
-        if r.reserved_stems
-            .iter()
-            .any(|stem| dimension.starts_with(stem.as_str()))
-        {
+        // A stem CC 3.4 reserves as a whole, or the stem of a CLOSED family:
+        // an unclaimed leaf or an unmatched descendant beneath it
+        // (`consent:totally:new:v1`) is unregistered, never open vocabulary.
+        let fenced = || r.reserved_stems.iter().chain(&r.closed_stems);
+        if fenced().any(|stem| dimension.starts_with(stem.as_str())) {
             return FamilyMatch::bare(Some(Refusal::FamilyUnregistered));
+        }
+        // A case-mutated reserved or closed stem (`Capacity:zz:v1`) is
+        // malformed, never a bypass: fold only to DETECT the fence.
+        let low = dimension.to_lowercase();
+        if low != dimension && fenced().any(|stem| low.starts_with(stem.as_str())) {
+            return FamilyMatch::bare(Some(Refusal::CaseMalformed));
+        }
+        // Open vocabulary: no row claims it — but R3's version grammar is
+        // global: exactly one trailing version segment.
+        let last = parts[parts.len() - 1];
+        if r.version_required && !r.version.is_match(last) {
+            return FamilyMatch::bare(Some(if mutated_tail(r, last) {
+                Refusal::CaseMalformed
+            } else {
+                Refusal::MissingVersionSegment
+            }));
+        }
+        // A duplicated tail (`third_party:signal:v1:v2`), or a version with no
+        // family segment before it (`v1`), is malformed.
+        if parts.len() < 2 || r.version_like.is_match(parts[parts.len() - 2]) {
+            return FamilyMatch::bare(Some(Refusal::CaseMalformed));
         }
         return FamilyMatch::bare(None);
     };
@@ -659,11 +747,23 @@ pub fn match_family(dimension: &str) -> FamilyMatch {
         refusal,
     };
     if refusal.is_some() {
+        // A refused hit may be a MALFORMED form of a different row that
+        // resolves cleanly once folded or stripped — a leaf under a wildcard
+        // parent (`accord:lifecycle:V1`), or a companion row hidden by an
+        // arity-exact sibling (`capacity_assurance:reversible_excluded:
+        // medical:v1:v2`). The clean row is the family it mutates (#116).
+        if let Some(mutated) = detect_malformed(r, &parts, true) {
+            if mutated != fam.prefix {
+                return malformed_as(mutated);
+            }
+        }
         return with(binds, refusal);
     }
     let versioned = parts.last().is_some_and(|p| r.version.is_match(p));
-    // Closed reserved leaves: a wildcard family only admits the leaves CC names.
-    if fam.last_class() == Some(Class::Wildcard) && fam.leaves_closed {
+    // Closed leaves: a wildcard family — or a parameterized parent whose row
+    // is closed in its leaves (`consent:{kind}`) — only admits the leaves CC
+    // names.
+    if fam.leaves_closed && matches!(fam.last_class(), Some(Class::Wildcard | Class::Vocab)) {
         let leaf_parts = if versioned && has_version {
             &parts[..parts.len() - 1]
         } else {
@@ -874,21 +974,24 @@ mod tests {
     /// the reference's `(family, binds, refusal)`.**
     ///
     /// Two checks per vector. (1) CC's own contract against the published
-    /// vector: the refusal is exact, and so is the family — except on a
-    /// `namespace_dimension_case_malformed` refusal, where CC says the family
-    /// is best-effort attribution (the reference itself names a different
-    /// family than the vector on 12 of them) and only requires one. (2) The
-    /// port against the REFERENCE's own output (`namespace_match_binds.json`):
-    /// family, binds and refusal all exact — so a porting defect in the
-    /// attribution or the binds cannot hide behind the looser contract.
+    /// vector: family and refusal exact. (Before rc5's release the family was
+    /// best-effort on a `namespace_dimension_case_malformed` refusal; the
+    /// released vectors name exactly what the reference answers,
+    /// CIRISConstitution#116.) (2) The port against the REFERENCE's own output
+    /// (`namespace_match_binds.json`): family, binds and refusal all exact —
+    /// the vectors carry no binds, so a porting defect in the binds would
+    /// otherwise pass.
     #[test]
     fn namespace_match_vectors_replay() {
         let vs = vectors();
-        assert_eq!(vs.len(), 785, "the rc5 vectors file carries 785 vectors");
+        assert_eq!(
+            vs.len(),
+            962,
+            "the released rc5 vectors file (c60d0a6) carries 962 vectors"
+        );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();
         assert_eq!(oracle.len(), vs.len(), "one oracle entry per vector");
-        let malformed = Refusal::CaseMalformed.as_str();
         let mut bad = Vec::new();
         for (v, o) in vs.iter().zip(oracle) {
             let dim = v["dimension"].as_str().unwrap();
@@ -897,9 +1000,7 @@ mod tests {
             let got_refusal = got.refusal.map(Refusal::as_str);
             // (1) CC's contract against the published vector.
             let want_refusal = v["refusal"].as_str();
-            let family_ok = got.family == v["family"].as_str()
-                || (want_refusal == Some(malformed) && got.family.is_some());
-            if !family_ok || got_refusal != want_refusal {
+            if got.family != v["family"].as_str() || got_refusal != want_refusal {
                 bad.push(format!(
                     "{dim:?}: vector wants ({:?}, {want_refusal:?}) got ({:?}, {got_refusal:?})",
                     v["family"].as_str(),
@@ -996,13 +1097,17 @@ mod tests {
     /// The reference generator's round-trip gate, replayed: every family's
     /// class-conformant sample resolves to that family and no other, with no
     /// refusal (exempt families included: a tail is tolerated). Closed
-    /// wildcard families are skipped exactly as the reference skips them —
-    /// their sample leaf is, by design, unregistered.
+    /// families — a wildcard, or since the released rc5 a parameterized
+    /// parent closed in its leaves (`consent:{kind}`) — are skipped exactly as
+    /// the reference skips them: their sample leaf is, by design, unregistered
+    /// (each listed leaf round-trips on its own row).
     #[test]
     fn every_family_sample_round_trips_to_itself() {
+        let r = rules();
         let mut bad = Vec::new();
         for fam in families() {
-            if family_leaves(fam).is_some_and(|(_, closed)| closed) && fam.ends_with('*') {
+            let f = r.family(fam).unwrap();
+            if f.leaves_closed && matches!(f.last_class(), Some(Class::Wildcard | Class::Vocab)) {
                 continue;
             }
             let dim = sample_dimension(fam).unwrap();
@@ -1012,6 +1117,47 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    /// `_meta.case_rule.match_semantics` (CIRISConstitution#116) — the
+    /// full-match half made structural. `compile` anchors every manifest
+    /// pattern, so an UNANCHORED pattern cannot partial-match, and a `$` never
+    /// admits a trailing newline.
+    #[test]
+    fn compile_is_a_full_match() {
+        let unanchored = compile("[a-z]+");
+        assert!(unanchored.is_match("abc"));
+        for partial in ["abc1", "1abc", "ab-c", "abc\n", ""] {
+            assert!(
+                !unanchored.is_match(partial),
+                "unanchored pattern partial-matched {partial:?}"
+            );
+        }
+        let anchored = compile("^[a-z]+$");
+        assert!(
+            !anchored.is_match("abc\n"),
+            "`$` admitted a trailing newline"
+        );
+        // Through the matcher: a segment carrying a newline fails its pattern
+        // (the rc5 vector `config:admission\n:v1`), and so does the version.
+        assert_eq!(
+            match_family("config:admission\n:v1").refusal,
+            Some(Refusal::CaseMalformed)
+        );
+        assert!(!is_version_segment("v1\n"));
+        assert!(!is_vocab_token("abc\n"));
+    }
+
+    /// The manifest DECLARES full-match semantics — a re-vendor that drops the
+    /// declaration (or changes its meaning) must be looked at, not absorbed.
+    #[test]
+    fn the_manifest_declares_full_match_semantics() {
+        let root: serde_json::Value =
+            serde_json::from_str(super::super::registry::REGISTRY_JSON).unwrap();
+        let ms = root["_meta"]["case_rule"]["match_semantics"]
+            .as_str()
+            .expect("_meta.case_rule.match_semantics is present");
+        assert!(ms.starts_with("full-match"), "{ms:?}");
     }
 
     #[test]

@@ -872,6 +872,52 @@ mod tests {
         assert!(covers(&prefixes, "accord:lifecycle:v1"), "a named leaf");
     }
 
+    /// v50.0.0 (CIRISPersist#924, the released CC rc5 at c60d0a6) — **the
+    /// consent leaves are closed, and CIRISAgent's live trace-capture grant
+    /// still admits.** `consent:{kind}` is `leaves_closed: true` with the ten
+    /// catalogued leaves; `consent:community_trust` is one of them (its own
+    /// row). Before the release, `consent:community_trust:v1` admitted as OPEN
+    /// vocabulary under `consent:{kind}`; it must keep admitting — now on its
+    /// row — while an unlisted kind, which the open `{kind}` used to admit,
+    /// is `namespace_family_unregistered` (a wire break).
+    #[test]
+    fn consent_community_trust_admits_under_the_closed_consent_leaves() {
+        use crate::federation::admission::check_namespace_family_registered;
+        use crate::federation::namespace::matcher::{family_leaves, match_family, Refusal};
+        let (leaves, closed) = family_leaves("consent:{kind}").unwrap();
+        assert!(closed, "rc5 closes consent:{{kind}} in its leaves");
+        assert!(leaves.iter().any(|l| l == "consent:community_trust"));
+
+        let live = "consent:community_trust:v1";
+        let m = match_family(live);
+        assert_eq!(
+            (m.family, m.refusal),
+            (Some("consent:community_trust"), None)
+        );
+        check_namespace_family_registered(live).expect("the agent's live grant admits");
+        assert!(covers(&["consent:".to_string()], live));
+
+        for unlisted in ["consent:made_up:v1", "consent:totally:new:v1"] {
+            assert_eq!(
+                match_family(unlisted).refusal,
+                Some(Refusal::FamilyUnregistered),
+                "{unlisted}"
+            );
+            assert!(
+                matches!(
+                    check_namespace_family_registered(unlisted),
+                    Err(crate::federation::Error::NamespaceFamilyUnregistered { .. })
+                ),
+                "{unlisted}: R2(b) refuses an unlisted consent kind"
+            );
+            assert!(!covers(&["consent:".to_string()], unlisted));
+        }
+        assert_eq!(
+            match_family("consent:made_up:v1").family,
+            Some("consent:{kind}")
+        );
+    }
+
     // ─────────────────── #510 P1: the closed grammar ────────────────
 
     /// The gating manifest-hash witness (mirrors

@@ -5,7 +5,7 @@ CIRISPersist#924 (CIRISConstitution#112). CC publishes
 `manifests/namespace_match_vectors.json` with each dimension's expected
 (family, refusal) but NOT the placeholder binds, and on a
 `namespace_dimension_case_malformed` refusal its family is only best-effort
-attribution (the reference itself may name a different one). Persist's replay
+attribution before rc5's release (exact since c60d0a6). Persist's replay
 (`federation::namespace::matcher::tests::namespace_match_vectors_replay`)
 compares binds too, and holds the port to the reference's EXACT family, so this script runs the CC REFERENCE matcher
 (`tools/cc_namespace_match.py`, read from the pinned CIRISConstitution commit
@@ -57,12 +57,10 @@ def main(argv):
     }
     for v in json.loads(vectors_bytes)["vectors"]:
         fam, binds, refusal = ref.match_family(rules, v["dimension"])
-        # CC's contract (cc_namespace_match.self_test): on a case_malformed
-        # refusal the family is best-effort attribution, so the vector's family
-        # may differ from the reference's own; every other field is exact.
-        family_ok = fam == v["family"] or (v["refusal"] == rules.tokens["case_malformed"]
-                                           and fam is not None)
-        if not family_ok or refusal != v["refusal"]:
+        # CC's contract since rc5 at c60d0a6 (cc_namespace_match.self_test,
+        # CIRISConstitution#116): every vector names the family the reference
+        # itself answers — exact, including on a case_malformed refusal.
+        if fam != v["family"] or refusal != v["refusal"]:
             sys.stderr.write("reference disagrees with its own vector: %r\n" % v["dimension"])
             return 1
         out["binds"].append({"dimension": v["dimension"], "family": fam, "binds": binds,

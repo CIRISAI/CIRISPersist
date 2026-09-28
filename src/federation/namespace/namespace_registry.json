@@ -17,8 +17,8 @@
           "standard": "ISO 4217 alphabetic code"
         },
         "lang_code": {
-          "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$",
-          "standard": "BCP 47 language tag"
+          "pattern": "^(?:[a-z]{2,3}(-[A-Z][a-z]{3})?(-(?:[A-Z]{2}|[0-9]{3}))?(-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))*(-[a-wy-z0-9](-[a-z0-9]{2,8})+)*(-x(-[a-z0-9]{1,8})+)?|x(-[a-z0-9]{1,8})+|i-default|i-enochian|i-mingo|cel-gaulish|zh-min)$",
+          "standard": "BCP 47 language tag \u2014 RFC 5646 langtag without extlang, or privateuse, canonical casing; extlang and grandfathered forms with a \u00a74.5 preferred value are written as that value; the five grandfathered tags without one (i-default, i-enochian, i-mingo, cel-gaulish, zh-min) are admitted literally"
         },
         "rating": {
           "pattern": null,
@@ -30,6 +30,7 @@
         }
       },
       "literal_pattern": "^[a-z0-9][a-z0-9_]*$",
+      "match_semantics": "full-match: a segment pattern (vocab_pattern, literal_pattern, version_segment.pattern, segments[].pattern, external_standards[].pattern) must match the WHOLE segment; a `$` anchor does not admit a trailing newline (CIRISConstitution#116)",
       "placeholder_classes": {
         "allegation_type": "vocab",
         "approach_id": "value",
@@ -178,11 +179,11 @@
     "generator": "tools/build_cc_namespace.py",
     "n_components": 9,
     "n_components_normative": 8,
-    "n_families": 145,
+    "n_families": 148,
     "per_component": {
-      "accord-agent": 28,
+      "accord-agent": 29,
       "anti-sybil": 6,
-      "attestation": 19,
+      "attestation": 21,
       "cirisbench": 1,
       "lens": 15,
       "node": 48,
@@ -191,9 +192,9 @@
       "transport-delivery": 5
     },
     "private_use_prefix": "x_private:",
-    "registry_sha256": "d6c87945ea08d72cc1f83820e35f0e3fb72cce47ea49f2ed3321d43219642ea6",
+    "registry_sha256": "07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb",
     "source": "constitution/part_3_the_namespace.md",
-    "source_sha256": "f05682512c85c65c3f502e1ca81dfb032a6e6d24ab4206658fbf36ccaa702a75"
+    "source_sha256": "4f675532029663469f9c67694fb68d5d13742deb701d8337f1929ae8f6b7a907"
   },
   "families": [
     {
@@ -952,6 +953,68 @@
     },
     {
       "cc_section": "3.1.2",
+      "description": "Reversible-cause exclusion companion (CC 3.4.12): the assessor attests that delirium, infection-confusion, depression and polypharmacy are ruled out for the domain.",
+      "owning_component": "attestation",
+      "owning_repo": "CIRISVerify",
+      "polarity": "signed",
+      "prefix": "capacity_assurance:reversible_excluded:{domain}:{version}",
+      "reserved": true,
+      "reserved_rule": {
+        "cc_ref": "CC 3.4.12",
+        "rule": "witness-reserved, subject-not-self, attester != steward"
+      },
+      "segments": [
+        {
+          "class": "literal",
+          "segment": "capacity_assurance"
+        },
+        {
+          "class": "literal",
+          "segment": "reversible_excluded"
+        },
+        {
+          "class": "vocab",
+          "segment": "{domain}"
+        },
+        {
+          "class": "vocab",
+          "segment": "{version}"
+        }
+      ]
+    },
+    {
+      "cc_section": "3.1.2",
+      "description": "Acute-window companion (CC 3.4.12): exclusion in progress, not skipped; admissible for the T1 emergency-necessity tier only, and the binding MUST lapse unless it resolves to reversible_excluded within its valid_until.",
+      "owning_component": "attestation",
+      "owning_repo": "CIRISVerify",
+      "polarity": "signed",
+      "prefix": "capacity_assurance:reversible_pending:{domain}:{version}",
+      "reserved": true,
+      "reserved_rule": {
+        "cc_ref": "CC 3.4.12",
+        "rule": "witness-reserved, subject-not-self, attester != steward"
+      },
+      "segments": [
+        {
+          "class": "literal",
+          "segment": "capacity_assurance"
+        },
+        {
+          "class": "literal",
+          "segment": "reversible_pending"
+        },
+        {
+          "class": "vocab",
+          "segment": "{domain}"
+        },
+        {
+          "class": "vocab",
+          "segment": "{version}"
+        }
+      ]
+    },
+    {
+      "cc_section": "3.1.2",
       "description": "Witness rung of the adult decision-capacity ladder (CC 3.4.12): a registered qualified assessor attests a per-domain band; the subject cannot self-emit it and the proposed steward cannot be the attester.",
       "owning_component": "attestation",
       "owning_repo": "CIRISVerify",
@@ -969,7 +1032,13 @@
         },
         {
           "class": "vocab",
-          "segment": "{level}"
+          "open": false,
+          "segment": "{level}",
+          "values": [
+            "provider",
+            "panel",
+            "government"
+          ]
         },
         {
           "class": "vocab",
@@ -977,7 +1046,12 @@
         },
         {
           "class": "vocab",
-          "segment": "{band}"
+          "open": false,
+          "segment": "{band}",
+          "values": [
+            "capacitated",
+            "incapacitated"
+          ]
         },
         {
           "class": "vocab",
@@ -1160,6 +1234,29 @@
         {
           "class": "literal",
           "segment": "optimization_veto"
+        }
+      ]
+    },
+    {
+      "cc_section": "3.1.5",
+      "description": "Catalogue row (CC 3.1.7 R1); a node owner's standing grant that the node's sealed reasoning traces may be captured for the community-trust plane, CC 3.3.1.",
+      "owning_component": "accord-agent",
+      "owning_repo": "CIRISAgent",
+      "polarity": "positive-only",
+      "prefix": "consent:community_trust",
+      "reserved": true,
+      "reserved_rule": {
+        "cc_ref": "CC 3.4.5",
+        "rule": "reserved (see table)"
+      },
+      "segments": [
+        {
+          "class": "literal",
+          "segment": "consent"
+        },
+        {
+          "class": "literal",
+          "segment": "community_trust"
         }
       ]
     },
@@ -1405,6 +1502,19 @@
     {
       "cc_section": "3.1.5",
       "description": "Subject-side consent authority over Contributions naming the subject in subject_key_ids, plus the producer-side and substrate-side leaves that close its lifecycle.",
+      "leaves": [
+        "consent:community_trust",
+        "consent:decay:{stage}",
+        "consent:deletion_complete",
+        "consent:deletion_sla:{days}",
+        "consent:partnership_accept",
+        "consent:partnership_grant",
+        "consent:replication:{version}",
+        "consent:scope:{kind}",
+        "consent:state:{stance}",
+        "consent:stream:{kind}"
+      ],
+      "leaves_closed": true,
       "owning_component": "accord-agent",
       "owning_repo": "CIRISAgent",
       "polarity": "per-leaf (CC 3.3.1)",
@@ -1596,8 +1706,8 @@
       "prefix": "delivery_receipt:{stream_id}",
       "reserved": true,
       "reserved_rule": {
-        "cc_ref": "CC 3.4.3",
-        "rule": "substrate-self-report"
+        "cc_ref": "CC 3.4.6",
+        "rule": "subscriber-only (attesting_key_id is a current subscriber/member of the named stream; not a substrate self-report)"
       },
       "segments": [
         {
@@ -2839,9 +2949,9 @@
         },
         {
           "class": "external",
-          "pattern": "^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$",
+          "pattern": "^(?:[a-z]{2,3}(-[A-Z][a-z]{3})?(-(?:[A-Z]{2}|[0-9]{3}))?(-(?:[a-z0-9]{5,8}|[0-9][a-z0-9]{3}))*(-[a-wy-z0-9](-[a-z0-9]{2,8})+)*(-x(-[a-z0-9]{1,8})+)?|x(-[a-z0-9]{1,8})+|i-default|i-enochian|i-mingo|cel-gaulish|zh-min)$",
           "segment": "{lang_code}",
-          "standard": "BCP 47 language tag"
+          "standard": "BCP 47 language tag \u2014 RFC 5646 langtag without extlang, or privateuse, canonical casing; extlang and grandfathered forms with a \u00a74.5 preferred value are written as that value; the five grandfathered tags without one (i-default, i-enochian, i-mingo, cel-gaulish, zh-min) are admitted literally"
         }
       ]
     },
