@@ -1737,11 +1737,14 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 134 of the registry's 145
+    /// Retaining the contradiction count pins 136 of the registry's 148
     /// families; withholding it pins 8. (107 of 114 before the v42.0.0 rc3 →
     /// rc5 re-vendor; 109 of 116 / 3 until the v50.0.0 rc5 @ 4b624513
     /// re-vendor, whose 29 net new families added 25 to the retained side and
-    /// the five `+1.0 only` accord leaves to the withheld side.) That two-number contrast is the whole
+    /// the five `+1.0 only` accord leaves to the withheld side; 134 of 145 / 8
+    /// until the released rc5 @ c60d0a6, whose two `signed` capacity companions
+    /// joined the retained side while `consent:community_trust`, `positive-only`
+    /// like its sibling consent leaves, pins on neither.) That two-number contrast is the whole
     /// argument for what the reserved token's retained set must be, and a
     /// paragraph asserting it would rot — so it is measured.
     #[test]
@@ -1750,11 +1753,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (134, 8),
+            (136, 8),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 145);
+        assert_eq!(vendored_family_polarities().len(), 148);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is
