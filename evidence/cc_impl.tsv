@@ -121,3 +121,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.2	CLM-hardware-custody-vocabulary	CIRISPersist	src/federation/hardware_attestation.rs#HardwareTypePlatform	ciris-persist@50.0.0
 3.1.2	CLM-hardware-custody-vocabulary	CIRISPersist	src/federation/hardware_attestation.rs#hardware_class_multiplier	ciris-persist@50.0.0
 5.4.6	CLM-minor-no-federation-binding	CIRISPersist	src/federation/admission.rs#check_minor_owner_binding_not_announced	ciris-persist@50.0.0
+3.4.12	CLM-capacity-companion-rows	CIRISPersist	src/federation/capacity.rs#parse_companion	ciris-persist@50.0.0
+3.4.12	CLM-capacity-companion-rows	CIRISPersist	src/federation/admission.rs#check_namespace_family_registered	ciris-persist@50.0.0
+3.1.7	CLM-match-full-semantics	CIRISPersist	src/federation/namespace/matcher.rs#compile	ciris-persist@50.0.0
+3.1.7	CLM-match-full-semantics	CIRISPersist	src/federation/namespace/matcher.rs#match_family	ciris-persist@50.0.0

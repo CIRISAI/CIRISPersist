@@ -1738,8 +1738,8 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         assert_eq!(
-            checked, 90,
-            "checked {checked} version-pinned persist src/ rows, expected 90. \
+            checked, 94,
+            "checked {checked} version-pinned persist src/ rows, expected 94. \
              If you ADDED evidence rows, update this number in the same commit. \
              If you did not, a parse change just silently emptied this test."
         );

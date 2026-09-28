@@ -1160,6 +1160,38 @@ mod tests {
         assert!(ms.starts_with("full-match"), "{ms:?}");
     }
 
+    /// The released rc5 rewrote `{lang_code}` to canonical-cased RFC 5646
+    /// (no extlang; private use and the five grandfathered tags without a
+    /// preferred value admitted literally). The provenance-locale witness
+    /// (`en-US`) still holds; these are the spellings whose answer MOVED.
+    #[test]
+    fn provenance_locale_is_canonical_bcp47() {
+        let dim = |tag: &str| format!("provenance:build_manifest:agent-3.2.1:locale:{tag}:v1");
+        let family = Some("provenance:build_manifest:{target}:locale:{lang_code}");
+        for ok in [
+            "en-US",
+            "en",
+            "zh-Hans-CN",
+            "es-419",
+            "de-CH-1996",
+            "x-private",
+            "i-default",
+        ] {
+            let m = match_family(&dim(ok));
+            assert_eq!((m.family, m.refusal), (family, None), "{ok}");
+        }
+        // Admitted by the pre-release pattern, refused now: non-canonical
+        // casing and extlang forms (written as their preferred value).
+        for bad in ["en-us", "EN", "zh-hans-cn", "zh-cmn-Hans-CN", "sgn-BE-FR"] {
+            let m = match_family(&dim(bad));
+            assert_eq!(
+                (m.family, m.refusal),
+                (family, Some(Refusal::CaseMalformed)),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn version_segment_parser_reads_the_manifest_pattern() {
         for ok in ["v1", "v2", "v10", "v1.2", "v1.2.3"] {
