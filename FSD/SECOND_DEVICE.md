@@ -751,7 +751,7 @@ members: founders (role: founder) = accord-conferred human steward keys; serve n
 The node-bearing half of "human" is #925's `is_node_bearing_key_at`, at the link's `amended_at`, at both sites (the door and `founder_counts`). A link's seats and the roster seats drop a founder that is node-bearing or does not count. Each seat carries `consensus::Seat.node_bearing`.
 
 **Applying a chain.** The occupied-id route (`apply_trust_root_chain`) applies the offered chain VERSION BY VERSION through `supersede_group_row`, so every stored version is one a proof names exactly and the version history stays whole:
-- from a rooted held version: the later links. The held version is located by POSITION and PROOF, not by content (`extends`, round 10): it sits at index `held.lineage.len()`, and the offered chain up to that index must be the held chain version for version (`same_version`: content hash, authority and founders' proof). The walk, and the lineage each applied version is stored with, is the chain this node HOLDS followed by the offered versions after the held one (`walk_from_held`, round 9). The door (`check_trust_root_community_admission`) decides the same way. An offered chain whose head has the held content is the #758 no-op;
+- from a rooted held version: the later links. The held version is located by POSITION and PROOF, not by content (`extends`, round 10): it sits at index `held.lineage.len()`, and the offered chain up to that index must be the held chain version for version (`same_version`: content hash, authority and founders' proof). The walk, and the lineage each applied version is stored with, is the chain this node HOLDS followed by the offered versions after the held one (`walk_from_held`, round 9). Storing the held versions is load-bearing: `same_version` does not compare signature bytes, so an offered prefix may carry bytes nobody verified (round 11, I190 (z′)). The door (`check_trust_root_community_admission`) decides the same way. An offered chain whose head has the held content is the #758 no-op;
 - over a squat: from the birth, recorded as `accord_birth_replaces_unrooted`;
 - over nothing: the caller inserts the offered row with its `lineage`.
 
@@ -895,7 +895,7 @@ Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_su
 
 **#809.** The Rust-side consumer gate was already a gate (`verify_bundle_quorum`), and I190 (f) witnesses it through the pin. The REPORTED-not-gated assertion #809 tracked was the release pre-flight in `.github/workflows/ci.yml`. It is now `scripts/preflight_trust_root.py` and GATED: an unparseable `consensus_protocol` is refused, and so are distinct seated authorizations short of M. The step runs a 12-fixture self-test first, including #809's `authorizations: []` row, which now exits 1. The live registry passed it on 2026-09-26 (2 ≥ 2; `accepts_this_root=false` warned). It counts authorizations and does not verify their signatures.
 
-**Invariant I190** (memory, sqlite, postgres, 91 tests):
+**Invariant I190** (memory, sqlite, postgres, 94 tests):
 - (a) the fixture row admits under a 2-of-3 accord co-scrub, resolves, and its co-signature is served byte-exact;
 - (b) 1-of-3, a founder co-signature and founders alone are refused; a forged co-scrub is refused even beside a quorum, and so is a doubled co-signer;
 - (c) a node-bearing founder (#925), a self-declared steward, each shape clause, and a squatted reserved id are refused;
@@ -930,6 +930,7 @@ Witness: `tests/python/test_sqlite_engine.py::test_ciris_canonical_trust_root_su
 - (x) two nodes, the review's 4a split: `a` admits F2's resignation, `b` refuses it as backdated; `a` admits `b`'s H2 (still recording F2) and is Stalled while `b` is Rooted; H3 amends F2 out and both are Rooted on H3;
 - (y) an offered lineage that reaches the held content by another signed path, re-seating F2 after the resignation, does not extend the held version (`does not extend`), whoever signs v4; over the held chain, v4 by F2 + F0 falls short and v4 by F0 + F1 is admitted and stored on the chain the node holds;
 - (z) round 10, three nodes: `b` retires F2 (v2), re-seats F2 back to the birth's content (v3), and F2 + F0 sign v4; replica `c`, holding v3 (the LAST occurrence of that content), admits v4; `a`, holding the birth (the FIRST occurrence) and never shown v2 or v3, walks every link and admits v4; all three are Rooted on v4 with the whole chain stored;
+- (z′) round 11: a correct extension over an offered prefix whose bytes are corrupted, (a) a birth co-signature, (b) a link's authority signature, is admitted; the row stays Rooted on its next re-judgement, and the stored lineage is the held chain byte for byte;
 - (t) the TOCTOU arm: `prepare_trust_root_supersede` flagged as having skipped the generic quorum refuses over a NotRooted constraint row; unflagged it passes;
 - (r) #925's node-bearing half on its own: a `user,steward` founder that becomes an agreed occurrence of a `node` identity stalls a Rooted row whose standing was already cached (naming the founder), and a birth naming such a founder is refused with `node_bearing_founder`;
 - (q) both doors, one predicate: a reserved-id squat, a short birth, a body variant under a genuine proof and a role-binding replay are refused on `put_community` (the typed rule, via `assert_violation`) and on `apply_replicated_community` (`Refused { DegradesConformance }`, or the propagated insufficient-quorum error), and nothing moves; the accord birth is `Inserted`, its re-offer `Unchanged`, and a genuine founders' link `Superseded` through the replicated entry; another id's unverifying constraint row is refused locally and kept as data on the replicated entry (`NotRooted`, never resolved), and one founder of its `quorum:2/3` cannot supersede it into a plain room on the local door (the generic quorum still holds there);
@@ -1278,7 +1279,7 @@ Plus the server route test on both paths.
 | B2′ | B2 re-derived: the link's `seated_since` floor dropped, so every resignation counts, even one before a re-seat | 6 | (o), (o″) |
 | E3 | the standing cache key omits the resignations | 9 | (o′), (o‴), (u) |
 | H1 | the door walks the offered prefix, not the held chain | 0 | equivalent alone: the apply route re-walks the held chain and refuses |
-| H1b | the apply route walks, and stores, the offered prefix | 3 | (y) (the stored lineage is the offered one). Equivalent from round 10 on: see below |
+| H1b | the apply route walks, and stores, the offered prefix | 3 | (y) (the stored lineage is the offered one). Round 10 judged it equivalent; that was wrong, and round 11 kills it with (z′) |
 | H1 + H1b | both layers walk the offered prefix | 3 | (y) (F2 + F0 over a forged re-seat is admitted) |
 
 - **B2's meaning, re-derived.** Before round 9, B2 measured the prior-instant floor. That floor is gone, and S1 now measures putting it back. B2′ drops the floor altogether; (o) kills it, because the re-seated founder's older resignation would un-count their later link.
@@ -1291,6 +1292,15 @@ Plus the server route test on both paths.
 |---|---|---|---|
 | R1 | the held version found as the FIRST offered index with its content (round 9's `extends_at`) | 6 | (z) arm 1: "the link's amended_at … is before the version it follows", the reviewer's trace; and (y) |
 | R2 | the held version found as the LAST offered index with its content (`rposition`) | 6 | (z) arm 2: `roster_consensus_insufficient`, the stale `seated_since`; and (y) |
-| H1b | the apply route walks, and stores, the offered prefix | 0 | equivalent: the position-and-proof match makes the offered prefix the held chain version for version, so the stored lineage is the same versions |
+| H1b | the apply route walks, and stores, the offered prefix | 0 | survived round 10's lane; NOT equivalent (round 11 review). Killed in round 11 by (z′) |
 
-- `walk_from_held` is kept though H1b is now equivalent. It stores the versions this node verified, and it costs one vector.
+- **Correction (round 11 review).** Round 10 called H1b equivalent and `walk_from_held` redundant. Both were wrong. `same_version` compares content, authority and the founders' proof (its `quorum_signatures` included), but not the authority scrub signature bytes or the co-signatures. The door walks only the links after the held version, so it never reads the offered prefix's signature bytes. If the apply route stored the offered prefix, one peer could flip bytes in it (a birth co-signature, a link's authority signature). The next `stored_standing` recounts them: the birth falls short of the accord quorum, or `verify_community_admission` fails on the link, and the row reads NotRooted, so any accord birth replaces it. The real code is safe because `walk_from_held` stores the HELD versions. It is load-bearing.
+
+**Mutation round 11 (the stored prefix).** Run on 7d27fad6, whose lane baseline is 380/380, on round 6's lane under `scripts/pg_test_db.sh`. Every run had a database; no leg ran at 0.00 s and none was OOM-killed. Each mutant was reverted with `git checkout --` before the next. Both runs were killed. The first H1b run was taken on the same test code while it was staged but not committed (a clippy refusal of the commit); it was re-run on the committed tree, and the result below is that re-run.
+
+| # | Mutant | Failed | Killed by (I190 arm) |
+|---|---|---|---|
+| H1b | the apply route walks, and stores, the offered prefix | 3 | (z′) sub-arm (a): "the birth's co-signature: the row stays Rooted on its next re-judgement" |
+| H1b, sub-arm (b) alone | the same, with (z′)'s first sub-arm skipped (a test edit, to measure the second on its own) | 3 | (z′) sub-arm (b): "v2's authority signature: the row stays Rooted on its next re-judgement" |
+
+- Round 11 changed no code. The full lanes run on the merged release SHA. This round ran only the I190 and mutation lane (380/380 on memory, sqlite and postgres).
