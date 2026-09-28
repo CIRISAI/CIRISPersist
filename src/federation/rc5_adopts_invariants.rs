@@ -1917,19 +1917,21 @@ pub mod bodies {
     /// changes nothing, so the outcome is `Unchanged`: an insert that lost
     /// the race is not `Inserted`, a supersede that lost it is not
     /// `Superseded`.
-    pub async fn f3_a_the_outcome_is_what_the_write_did(
+    pub(crate) async fn f3_a_the_outcome_is_what_the_write_did(
         d: &dyn FederationDirectory,
         tag: &str,
-        arm_rival: &(dyn Fn(crate::federation::SignedCommunity) + Sync),
+        arm_rival: &(dyn Fn(crate::store::test_hooks::RivalPoint, crate::federation::SignedCommunity)
+              + Sync),
     ) {
         use crate::federation::ReplicatedCommunityOutcome as Out;
+        use crate::store::test_hooks::RivalPoint;
         let [h1, h2] = ["h1", "h2"].map(|k| format!("{k}-{tag}"));
         ts::register_hybrid_key_as(d, &h1, &h1, it::USER).await;
         ts::register_hybrid_key_as(d, &h2, &h2, it::USER).await;
         let founders = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
         let room = format!("race-{tag}");
         let v1 = ts::sign_community(&h1, infra_room(&room, "majority", founders()));
-        arm_rival(v1.clone());
+        arm_rival(RivalPoint::DoorStart, v1.clone());
         assert_eq!(
             d.apply_replicated_community(v1.clone()).await.unwrap(),
             Out::Unchanged,
@@ -1940,7 +1942,7 @@ pub mod bodies {
             Out::Unchanged
         );
         let v2 = founders_supersede_offer(d, &room, "founder_only", founders(), [&h1, &h2]).await;
-        arm_rival(v2.clone());
+        arm_rival(RivalPoint::DoorStart, v2.clone());
         assert_eq!(
             d.apply_replicated_community(v2.clone()).await.unwrap(),
             Out::Unchanged,
@@ -1953,6 +1955,25 @@ pub mod bodies {
                 .unwrap()
                 .consensus_protocol,
             "founder_only"
+        );
+        // The rival lands INSIDE the write: after the occupied-id decision
+        // said "insert" (the insert then finds the row), and after the proof
+        // was admitted against the prior (the supersede's own re-check then
+        // finds the offered version already held).
+        let room3 = format!("inner-{tag}");
+        let u1 = ts::sign_community(&h1, infra_room(&room3, "majority", founders()));
+        arm_rival(RivalPoint::BeforeInsert, u1.clone());
+        assert_eq!(
+            d.apply_replicated_community(u1).await.unwrap(),
+            Out::Unchanged,
+            "{tag}: the insert lost to a rival insert of the same record"
+        );
+        let u2 = founders_supersede_offer(d, &room3, "founder_only", founders(), [&h1, &h2]).await;
+        arm_rival(RivalPoint::BeforeSupersede, u2.clone());
+        assert_eq!(
+            d.apply_replicated_community(u2).await.unwrap(),
+            Out::Unchanged,
+            "{tag}: the supersede lost to a rival supersede of the same record"
         );
         // Without a rival, each outcome is still reported.
         let room2 = format!("solo-{tag}");
@@ -2157,7 +2178,7 @@ mod runners {
                 #[tokio::test]
                 async fn f3_a_the_outcome_is_what_the_write_did() {
                     let Some(d) = $fresh.await else { return };
-                    let arm = |rival| d.test_hooks().arm_rival_community_write(rival);
+                    let arm = |at, rival| d.test_hooks().arm_rival_community_write(at, rival);
                     super::super::bodies::f3_a_the_outcome_is_what_the_write_did(
                         &d as &dyn FederationDirectory,
                         &format!("f3a-{}", suffix()),

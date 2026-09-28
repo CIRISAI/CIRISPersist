@@ -1016,6 +1016,26 @@ impl MemoryBackend {
         &self.test_hooks
     }
 
+    /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
+    /// (see [`crate::store::test_hooks`]), applied through this backend's own
+    /// replicated door. Never armed outside a test.
+    #[cfg(test)]
+    async fn test_rival_at(
+        &self,
+        at: crate::store::test_hooks::RivalPoint,
+    ) -> Result<(), crate::federation::Error> {
+        if let Some(rival) = self.test_hooks.take_rival_at(at) {
+            Box::pin(
+                self.put_community_at_door(
+                    rival,
+                    crate::federation::CommunityDoor::ReplicatedApply,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// v44.7.0 (CIRISPersist#864) — the trait default is first-seen-wins with
     /// no plan (it cannot run one over an unsized `Self`). This backend runs
     /// the ONE key plan first, exactly as the sqlite/postgres applies do, and
@@ -5899,6 +5919,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
+        // Test-only (PR #921 review, F3): a rival supersede of the same
+        // community lands here, before this one re-checks its prior.
+        #[cfg(test)]
+        if matches!(cohort, crate::federation::cohort::Cohort::Community) {
+            self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeSupersede)
+                .await?;
+        }
         use crate::federation::cohort::{Cohort, GroupVersion};
         use crate::federation::Error;
         // CC 4.4.3.2.8 / #308: `affiliations` keys its version history under its
@@ -11338,15 +11365,8 @@ impl MemoryBackend {
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
         #[cfg(test)]
-        if let Some(rival) = self.test_hooks.take_rival_community_write() {
-            Box::pin(
-                self.put_community_at_door(
-                    rival,
-                    crate::federation::CommunityDoor::ReplicatedApply,
-                ),
-            )
+        self.test_rival_at(crate::store::test_hooks::RivalPoint::DoorStart)
             .await?;
-        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family). Hybrid-Strict vs the
         // authority's registered pubkeys.
@@ -11419,6 +11439,11 @@ impl MemoryBackend {
         }
         let community = offered;
         let mut row = community.community;
+        // Test-only (PR #921 review, F3): a rival insert lands after the
+        // occupied-id decision said "insert", before this insert.
+        #[cfg(test)]
+        self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeInsert)
+            .await?;
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
             // v48.0.0 (CIRISPersist#860) — a room is a KEYLESS identifier (as

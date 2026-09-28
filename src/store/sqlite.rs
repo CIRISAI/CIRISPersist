@@ -286,6 +286,26 @@ impl SqliteBackend {
         &self.test_hooks
     }
 
+    /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
+    /// (see [`crate::store::test_hooks`]), applied through this backend's own
+    /// replicated door. Never armed outside a test.
+    #[cfg(test)]
+    async fn test_rival_at(
+        &self,
+        at: crate::store::test_hooks::RivalPoint,
+    ) -> Result<(), crate::federation::Error> {
+        if let Some(rival) = self.test_hooks.take_rival_at(at) {
+            Box::pin(
+                self.put_community_at_door(
+                    rival,
+                    crate::federation::CommunityDoor::ReplicatedApply,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// #840 (I44) — normalise a V070 history row written by v43.0.0–v44.1.0.
     ///
     /// Those releases shipped V070 with one word changed inside a comment,
@@ -6931,6 +6951,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
+        // Test-only (PR #921 review, F3): a rival supersede of the same
+        // community lands here, before this one re-checks its prior.
+        #[cfg(test)]
+        if matches!(cohort, crate::federation::cohort::Cohort::Community) {
+            self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeSupersede)
+                .await?;
+        }
         use crate::federation::cohort::Cohort;
         use crate::federation::Error;
         let now = chrono::Utc::now().to_rfc3339();
@@ -25786,15 +25813,8 @@ impl SqliteBackend {
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
         #[cfg(test)]
-        if let Some(rival) = self.test_hooks.take_rival_community_write() {
-            Box::pin(
-                self.put_community_at_door(
-                    rival,
-                    crate::federation::CommunityDoor::ReplicatedApply,
-                ),
-            )
+        self.test_rival_at(crate::store::test_hooks::RivalPoint::DoorStart)
             .await?;
-        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family).
         crate::federation::verify_community_admission(self, &community).await?;
@@ -25895,6 +25915,11 @@ impl SqliteBackend {
         let id_for_msg = row.community_key_id.clone();
         let community_key_id = row.community_key_id.clone();
         let offered_hash = row.persist_row_hash.clone();
+        // Test-only (PR #921 review, F3): a rival insert lands after the
+        // occupied-id decision said "insert", before this insert.
+        #[cfg(test)]
+        self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeInsert)
+            .await?;
         let outcome = self
             .write(move |conn| -> Result<Option<String>, rusqlite::Error> {
                 // v36.0.0 (#668) — THIS node's serve position (V130).

@@ -18,15 +18,29 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+/// Where in a community write a rival lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RivalPoint {
+    /// The door's first line: after anything the caller read, before the
+    /// door's gates and its occupied-id decision.
+    DoorStart,
+    /// After the occupied-id decision said "insert", before the insert.
+    BeforeInsert,
+    /// A community supersede's first line: after the proof was admitted
+    /// against the version the route read, before the backend re-checks the
+    /// prior under its write serialization.
+    BeforeSupersede,
+}
+
 /// The per-backend hook table. Default: nothing armed, no behaviour change.
 #[derive(Default)]
 pub(crate) struct TestHooks {
     /// Method name → how many more calls fail with a generic backend error.
     fail: Mutex<BTreeMap<&'static str, u32>>,
     /// A community record the backend applies to ITSELF through the
-    /// replicated door at the start of its next community write, before that
-    /// write's own gates and reads — a rival that won the race.
-    rival_community_write: Mutex<Option<crate::federation::SignedCommunity>>,
+    /// replicated door when its next community write reaches `RivalPoint` —
+    /// a rival that won the race at exactly that point.
+    rival_community_write: Mutex<Option<(RivalPoint, crate::federation::SignedCommunity)>>,
 }
 
 impl TestHooks {
@@ -52,16 +66,25 @@ impl TestHooks {
         }
     }
 
-    /// Arm a rival write: the next community write applies `rival` first.
-    pub(crate) fn arm_rival_community_write(&self, rival: crate::federation::SignedCommunity) {
-        *self.rival_community_write.lock().expect("test hooks") = Some(rival);
+    /// Arm a rival write: when the next community write reaches `at`, the
+    /// backend applies `rival` first.
+    pub(crate) fn arm_rival_community_write(
+        &self,
+        at: RivalPoint,
+        rival: crate::federation::SignedCommunity,
+    ) {
+        *self.rival_community_write.lock().expect("test hooks") = Some((at, rival));
     }
 
-    /// Taken (once) by the backend at the start of a community write.
-    pub(crate) fn take_rival_community_write(&self) -> Option<crate::federation::SignedCommunity> {
-        self.rival_community_write
-            .lock()
-            .expect("test hooks")
-            .take()
+    /// Taken (once) by the backend at `at`: the rival armed for that point.
+    pub(crate) fn take_rival_at(
+        &self,
+        at: RivalPoint,
+    ) -> Option<crate::federation::SignedCommunity> {
+        let mut armed = self.rival_community_write.lock().expect("test hooks");
+        match armed.as_ref() {
+            Some((p, _)) if *p == at => armed.take().map(|(_, r)| r),
+            _ => None,
+        }
     }
 }

@@ -67,6 +67,26 @@ impl PostgresBackend {
         &self.test_hooks
     }
 
+    /// v50.0.0 (PR #921 review) — the test-only rival write armed for `at`
+    /// (see [`crate::store::test_hooks`]), applied through this backend's own
+    /// replicated door. Never armed outside a test.
+    #[cfg(test)]
+    async fn test_rival_at(
+        &self,
+        at: crate::store::test_hooks::RivalPoint,
+    ) -> Result<(), crate::federation::Error> {
+        if let Some(rival) = self.test_hooks.take_rival_at(at) {
+            Box::pin(
+                self.put_community_at_door(
+                    rival,
+                    crate::federation::CommunityDoor::ReplicatedApply,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn put_public_key_at_door(
         &self,
         record: crate::federation::SignedKeyRecord,
@@ -295,15 +315,8 @@ impl PostgresBackend {
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
         #[cfg(test)]
-        if let Some(rival) = self.test_hooks.take_rival_community_write() {
-            Box::pin(
-                self.put_community_at_door(
-                    rival,
-                    crate::federation::CommunityDoor::ReplicatedApply,
-                ),
-            )
+        self.test_rival_at(crate::store::test_hooks::RivalPoint::DoorStart)
             .await?;
-        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family).
         crate::federation::verify_community_admission(self, &community).await?;
@@ -384,6 +397,11 @@ impl PostgresBackend {
         let authority_key_id = community.authority_key_id;
         let scrub_signature_classical = community.scrub_signature_classical;
         let scrub_signature_pqc = community.scrub_signature_pqc;
+        // Test-only (PR #921 review, F3): a rival insert lands after the
+        // occupied-id decision said "insert", before this insert.
+        #[cfg(test)]
+        self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeInsert)
+            .await?;
         let client = self
             .get_client()
             .await
@@ -7986,6 +8004,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         new_snapshot: serde_json::Value,
         authorization: Option<serde_json::Value>,
     ) -> Result<u32, crate::federation::Error> {
+        // Test-only (PR #921 review, F3): a rival supersede of the same
+        // community lands here, before this one re-checks its prior.
+        #[cfg(test)]
+        if matches!(cohort, crate::federation::cohort::Cohort::Community) {
+            self.test_rival_at(crate::store::test_hooks::RivalPoint::BeforeSupersede)
+                .await?;
+        }
         use crate::federation::cohort::Cohort;
         use crate::federation::Error;
         match cohort {
