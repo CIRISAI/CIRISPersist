@@ -2802,6 +2802,55 @@ pub(crate) mod bodies {
         }
     }
 
+    /// (f1), second phase: the genesis holders and three conferred founders,
+    /// but NO accord family. Returns the canonical row (2-of-3 co-scrubbed),
+    /// for the runner to plant below the door.
+    pub(crate) async fn f1_b_stand_up_without_the_family(
+        d: &dyn FederationDirectory,
+    ) -> SignedCommunity {
+        let holders = ops::register_genesis_accord_roster(d)
+            .await
+            .expect("genesis accord roster");
+        for f in FOUNDERS {
+            put_conferred(d, &holders, f, "user,steward").await;
+        }
+        signed(canonical_row(&FOUNDERS), &["A1", "B1"])
+    }
+
+    /// (f1), second phase — the absent family is a real answer (`NotRooted`,
+    /// cached); a failed read of it is not. With `lookup_family` failing the
+    /// read returns the error, never the cached `NotRooted`.
+    pub(crate) async fn f1_b_a_failed_family_read_never_serves_a_cached_verdict(
+        inner: std::sync::Arc<dyn FederationDirectory>,
+    ) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        let d = inner.as_ref();
+        assert!(d
+            .lookup_family(cc::accord_family_key_id())
+            .await
+            .unwrap()
+            .is_none());
+        let cache = d.trust_root_standing_cache().expect("a standing cache");
+        let now = chrono::Utc::now();
+        assert!(
+            matches!(
+                cc::stored_standing_at(d, CANON, now).await.unwrap(),
+                cc::StoredStanding::NotRooted { .. }
+            ),
+            "no accord family: the planted row is not rooted"
+        );
+        let computed = cache.computations();
+        assert!(computed >= 1, "the verdict was cached");
+        let failing = FaultInjectingDirectory::new(inner.clone()).erroring("lookup_family");
+        match cc::stored_standing_at(&failing, CANON, now).await {
+            Err(Error::Backend(m)) => assert!(m.contains("lookup_family"), "{m}"),
+            other => panic!(
+                "a failed family read is not the absent family: expected the error, got {other:?}"
+            ),
+        }
+        assert_eq!(cache.computations(), computed, "nothing computed");
+    }
+
     /// (m) — MEDIUM-C: a second read with every input unchanged verifies no
     /// signature (the directory's standing cache serves it); a holder
     /// revocation in the accord family is a changed input, recomputes, and
@@ -3498,6 +3547,143 @@ mod run {
         ]
     }
 
+    /// A row planted BELOW the sqlite door (the shape a pre-gate squat or a
+    /// replicated legacy row leaves in the table).
+    #[cfg(feature = "sqlite")]
+    async fn plant_sqlite(
+        d: &crate::store::sqlite::SqliteBackend,
+        squat: crate::federation::SignedCommunity,
+    ) {
+        let members = serde_json::to_string(&squat.community.members).unwrap();
+        let policy = squat
+            .community
+            .policy_blob
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap());
+        let hash = crate::federation::types::compute_persist_row_hash(&squat.community).unwrap();
+        let proof = squat
+            .supersede_proof
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap());
+        d.write(move |c| {
+            c.execute(
+                "INSERT INTO federation_communities (community_key_id, community_name, \
+                 members, founded_at, consensus_protocol, policy_blob, persist_row_hash, \
+                 authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
+                 admitted_at, supersede_proof) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?4, ?11)",
+                rusqlite::params![
+                    squat.community.community_key_id,
+                    squat.community.community_name,
+                    members,
+                    squat.community.founded_at.to_rfc3339(),
+                    squat.community.consensus_protocol,
+                    policy,
+                    hash,
+                    squat.authority_key_id,
+                    squat.scrub_signature_classical,
+                    squat.scrub_signature_pqc,
+                    proof,
+                ],
+            )
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The postgres twin of [`plant_sqlite`].
+    #[cfg(feature = "postgres")]
+    async fn plant_postgres(
+        d: &crate::store::postgres::PostgresBackend,
+        squat: crate::federation::SignedCommunity,
+    ) {
+        let members = serde_json::to_value(&squat.community.members).unwrap();
+        let hash = crate::federation::types::compute_persist_row_hash(&squat.community).unwrap();
+        d.get_client()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO cirislens.federation_communities (community_key_id, \
+                 community_name, members, founded_at, consensus_protocol, policy_blob, \
+                 persist_row_hash, authority_key_id, scrub_signature_classical, \
+                 scrub_signature_pqc, admitted_at, supersede_proof) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $4, $11)",
+                &[
+                    &squat.community.community_key_id,
+                    &squat.community.community_name,
+                    &members,
+                    &squat.community.founded_at,
+                    &squat.community.consensus_protocol,
+                    &squat.community.policy_blob,
+                    &hash,
+                    &squat.authority_key_id,
+                    &squat.scrub_signature_classical,
+                    &squat.scrub_signature_pqc,
+                    &squat
+                        .supersede_proof
+                        .as_ref()
+                        .map(|p| serde_json::to_value(p).unwrap()),
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// (f1), second phase — PR #921 review (Codex F1): with NO accord family
+    /// stored, a planted row reads `NotRooted` and that verdict is cached; a
+    /// FAILED family read must not key like the absent family and be served
+    /// it. Every backend.
+    async fn f1_b_setup(
+        d: &dyn crate::federation::FederationDirectory,
+    ) -> crate::federation::SignedCommunity {
+        super::bodies::f1_b_stand_up_without_the_family(d).await
+    }
+
+    #[tokio::test]
+    async fn i190_f1_b_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        let row = f1_b_setup(&d).await;
+        d.plant_community_below_the_door(row);
+        super::bodies::f1_b_a_failed_family_read_never_serves_a_cached_verdict(
+            std::sync::Arc::new(d),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i190_f1_b_sqlite() {
+        use crate::store::Backend as _;
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        let row = f1_b_setup(&d).await;
+        plant_sqlite(&d, row).await;
+        super::bodies::f1_b_a_failed_family_read_never_serves_a_cached_verdict(
+            std::sync::Arc::new(d),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i190_f1_b_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        let row = f1_b_setup(&d).await;
+        plant_postgres(&d, row).await;
+        super::bodies::f1_b_a_failed_family_read_never_serves_a_cached_verdict(
+            std::sync::Arc::new(d),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn i190_j_memory() {
         for (setup, reason) in variants() {
@@ -3519,41 +3705,7 @@ mod run {
                 .unwrap();
             d.run_migrations().await.unwrap();
             let squat = setup(&d).await;
-            let members = serde_json::to_string(&squat.community.members).unwrap();
-            let policy = squat
-                .community
-                .policy_blob
-                .as_ref()
-                .map(|v| serde_json::to_string(v).unwrap());
-            let hash =
-                crate::federation::types::compute_persist_row_hash(&squat.community).unwrap();
-            let proof = squat
-                .supersede_proof
-                .as_ref()
-                .map(|p| serde_json::to_string(p).unwrap());
-            d.write(move |c| {
-                c.execute(
-                    "INSERT INTO federation_communities (community_key_id, community_name, \
-                     members, founded_at, consensus_protocol, policy_blob, persist_row_hash, \
-                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                     admitted_at, supersede_proof) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?4, ?11)",
-                    rusqlite::params![
-                        squat.community.community_key_id,
-                        squat.community.community_name,
-                        members,
-                        squat.community.founded_at.to_rfc3339(),
-                        squat.community.consensus_protocol,
-                        policy,
-                        hash,
-                        squat.authority_key_id,
-                        squat.scrub_signature_classical,
-                        squat.scrub_signature_pqc,
-                        proof,
-                    ],
-                )
-            })
-            .await
-            .unwrap();
+            plant_sqlite(&d, squat).await;
             super::bodies::j_a_squat_is_never_honoured(&d, &format!("j{}", &suffix()[..8]), reason)
                 .await;
         }
@@ -3572,37 +3724,7 @@ mod run {
                 .unwrap();
             d.run_migrations().await.unwrap();
             let squat = setup(&d).await;
-            let members = serde_json::to_value(&squat.community.members).unwrap();
-            let hash =
-                crate::federation::types::compute_persist_row_hash(&squat.community).unwrap();
-            d.get_client()
-                .await
-                .unwrap()
-                .execute(
-                    "INSERT INTO cirislens.federation_communities (community_key_id, \
-                     community_name, members, founded_at, consensus_protocol, policy_blob, \
-                     persist_row_hash, authority_key_id, scrub_signature_classical, \
-                     scrub_signature_pqc, admitted_at, supersede_proof) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $4, $11)",
-                    &[
-                        &squat.community.community_key_id,
-                        &squat.community.community_name,
-                        &members,
-                        &squat.community.founded_at,
-                        &squat.community.consensus_protocol,
-                        &squat.community.policy_blob,
-                        &hash,
-                        &squat.authority_key_id,
-                        &squat.scrub_signature_classical,
-                        &squat.scrub_signature_pqc,
-                        &squat
-                            .supersede_proof
-                            .as_ref()
-                            .map(|p| serde_json::to_value(p).unwrap()),
-                    ],
-                )
-                .await
-                .unwrap();
+            plant_postgres(&d, squat).await;
             super::bodies::j_a_squat_is_never_honoured(&d, &format!("j{}", &suffix()[..8]), reason)
                 .await;
         }
