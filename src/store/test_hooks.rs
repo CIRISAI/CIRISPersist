@@ -43,6 +43,10 @@ pub(crate) struct TestHooks {
     rival_community_write: Mutex<Option<(RivalPoint, crate::federation::SignedCommunity)>>,
 }
 
+// The witnesses that arm these are cfg'd on a database feature; under the
+// `server`-only axis the hooks are compiled but unarmed, and `-D warnings` must
+// not read that as dead code (v50.0.0, the gate's server axis).
+#[allow(dead_code)]
 impl TestHooks {
     /// The next `times` calls of `method` fail.
     pub(crate) fn fail_next(&self, method: &'static str, times: u32) {
