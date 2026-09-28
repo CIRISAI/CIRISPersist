@@ -7,6 +7,10 @@
 //!   another blob (or the blob's own ciphertext) fails after authorization, the
 //!   plaintext cap holds. On sqlite and postgres over the two-node community
 //!   ladder (#876's fixture).
+//! - **I126 (CIRISPersist#941)** — the live owner of a NODE may withdraw a
+//!   row that node attested (rule 1 lifted to the producer's principal, CC
+//!   3.4.7.3) — but only a row produced while the issuer already owned the
+//!   node; a stranger is refused. On memory, sqlite and postgres.
 //! - **I125 (CIRISPersist#933)** — on postgres, `put_attestation`'s three
 //!   projections run INSIDE the row's transaction: a projection that fails
 //!   rolls the row back (no committed, unprojected `withdraws`), and the
@@ -245,4 +249,118 @@ mod descriptor {
         (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
             as Pick<crate::store::postgres::PostgresBackend>
     );
+}
+
+#[cfg(test)]
+pub(crate) mod owner_withdraw {
+    use crate::federation::admission::resolve_withdraws_admission_rule;
+    use crate::federation::admission::steward_liveness_test_support::{register, signed_row};
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{attestation_type, identity_type as it, SignedAttestation};
+    use crate::federation::{Error, FederationDirectory};
+
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    }
+
+    /// I126 — see the module doc.
+    pub(crate) async fn i126_the_owner_withdraws_its_nodes_row(d: &dyn FederationDirectory) {
+        let s = suffix();
+        let (owner, node, stranger, subject) = (
+            format!("ow-owner-{s}"),
+            format!("ow-node-{s}"),
+            format!("ow-stranger-{s}"),
+            format!("ow-subject-{s}"),
+        );
+        register(d, &owner, &[it::USER]).await;
+        register(d, &node, &[it::NODE]).await;
+        register(d, &stranger, &[it::USER]).await;
+        register(d, &subject, &[it::USER]).await;
+        d.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(&format!("ob-{s}"), &owner, &node),
+        })
+        .await
+        .expect("the owner binds the node");
+        // a row the node produced AFTER the binding (signed_row stamps now)
+        let after = signed_row(
+            &node,
+            &subject,
+            attestation_type::SCORES,
+            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
+        );
+        assert_eq!(
+            resolve_withdraws_admission_rule(d, &owner, &after)
+                .await
+                .unwrap(),
+            1,
+            "the node's live owner withdraws the node's row (rule 1, the producer's principal)"
+        );
+        assert!(
+            matches!(
+                resolve_withdraws_admission_rule(d, &stranger, &after).await,
+                Err(Error::WithdrawsNotAdmitted { .. })
+            ),
+            "a stranger is refused"
+        );
+        // a row the node produced BEFORE the owner's binding (2026-05-01)
+        let mut before = signed_row(
+            &node,
+            &subject,
+            attestation_type::SCORES,
+            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
+        );
+        before.asserted_at = "2026-04-01T00:00:00Z".parse().unwrap();
+        ts::reseal(&mut before);
+        assert!(
+            matches!(
+                resolve_withdraws_admission_rule(d, &owner, &before).await,
+                Err(Error::WithdrawsNotAdmitted { .. })
+            ),
+            "the owner did not own the node when that row was produced"
+        );
+        // the node itself still withdraws its own rows (rule 1 unchanged)
+        assert_eq!(
+            resolve_withdraws_admission_rule(d, &node, &before)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    macro_rules! runners {
+        ($modname:ident, $fresh:expr) => {
+            mod $modname {
+                #[tokio::test]
+                async fn i126() {
+                    let Some(d) = $fresh.await else { return };
+                    super::i126_the_owner_withdraws_its_nodes_row(
+                        &d as &dyn crate::federation::FederationDirectory,
+                    )
+                    .await
+                }
+            }
+        };
+    }
+    runners!(memory, async {
+        Some(crate::store::memory::MemoryBackend::new())
+    });
+    #[cfg(feature = "sqlite")]
+    runners!(sqlite, async {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+    #[cfg(feature = "postgres")]
+    runners!(postgres, async {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
 }

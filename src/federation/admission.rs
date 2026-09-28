@@ -7749,6 +7749,22 @@ pub async fn resolve_withdraws_admission_rule_at(
     if issuer == target.attesting_key_id {
         return Ok(1);
     }
+    // Rule 1, lifted to the producer's PRINCIPAL — v51.0.0 (CIRISPersist#941,
+    // CIRISEdge#675/#708; CC 3.4.7.3: a node acts for its single responsible
+    // owner, [`admission_identity_for_writer`]'s owner-binding axis). The live
+    // owner of the NODE that attested `T` may withdraw `T`: a file written on
+    // the owner's laptop before Edge authored files as the person is still the
+    // person's to retract from their phone. Recorded as rule 1 (the producer's
+    // own retraction, not a subject consent event — the consent folds read
+    // 2..=4). Guards, so a node's CURRENT owner cannot reach into another
+    // owner's era: the issuer is the node's single live owner NOW
+    // ([`owner_of`], fail-closed on ambiguity), AND an owner-binding the issuer
+    // signed for that node was asserted at or before `T` — the issuer owned the
+    // node when `T` was produced (a later buyer of a used node retracts
+    // nothing from the seller's time).
+    if issuer_owned_the_producer_when(directory, issuer, target).await? {
+        return Ok(1);
+    }
 
     // v21.11.0 (CIRISPersist#528), RATIFIED at **CC 2.4.1.1** as the
     // anti-Goodhart retraction dual — for the scored families whose
@@ -7864,6 +7880,31 @@ pub async fn resolve_withdraws_admission_rule_at(
         target_attestation_id: target.attestation_id.clone(),
         beyond_delegation_depth_cap: beyond_cap,
     })
+}
+
+/// v51.0.0 (CIRISPersist#941) — `issuer` is the single live owner of the node
+/// that attested `target` NOW, and held an owner-binding over that node that
+/// was asserted at or before `target`. See rule 1's principal lift in
+/// [`resolve_withdraws_admission_rule_at`]. An ambiguous owner is not a
+/// principal (`owner_of` errors → no lift, the other rules still run).
+async fn issuer_owned_the_producer_when(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    target: &super::Attestation,
+) -> Result<bool, Error> {
+    let node = target.attesting_key_id.as_str();
+    match owner_of(directory, node).await {
+        Ok(Some(owner)) if owner == issuer => {}
+        Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let bindings = directory.list_attestations_for(node).await?;
+    Ok(bindings.iter().any(|b| {
+        b.attesting_key_id == issuer
+            && b.attestation_type == super::types::attestation_type::DELEGATES_TO
+            && is_owner_binding_envelope(&b.attestation_envelope)
+            && b.asserted_at <= target.asserted_at
+    }))
 }
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
