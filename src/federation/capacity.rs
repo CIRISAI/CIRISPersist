@@ -14,11 +14,11 @@
 //!   incapacitated}`. Witness-RESERVED (`witness ∈ attesting_key.identity_type`)
 //!   AND the subject MUST NOT self-emit — enforced at admission (see
 //!   [`super::admission::check_reserved_prefix_admission`]).
-//! - `capacity_assurance:reversible_excluded:{domain}` — the mandatory
+//! - `capacity_assurance:reversible_excluded:{domain}:{version}` — the mandatory
 //!   companion: delirium / infection-confusion / depression / polypharmacy
 //!   have been ruled out for `{domain}` (the genuine restoration path and the
 //!   most-abused mis-attribution). Required for any *continuing* binding.
-//! - `capacity_assurance:reversible_pending:{domain}` — ACUTE-WINDOW ONLY:
+//! - `capacity_assurance:reversible_pending:{domain}:{version}` — ACUTE-WINDOW ONLY:
 //!   exclusion in progress; admissible solely for the T1 emergency-necessity
 //!   tier and MUST resolve to `reversible_excluded` or the binding lapses.
 //!
