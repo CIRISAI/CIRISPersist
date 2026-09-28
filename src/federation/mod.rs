@@ -8792,6 +8792,17 @@ pub enum Error {
         detail: String,
     },
 
+    /// v51.0.0 (CIRISPersist#937, CC 3.2 T4a rc6) — an acceptance edge
+    /// (`trust:accepts:v1`) presented a lineage head that is stale (older than
+    /// the root's charter `attach_window_secs`) or unwitnessed, or presented
+    /// none: ATTACHING is gated on freshness; attached never is.
+    #[error("trust root head stale: attaching {root_key_id} refused — {detail}")]
+    TrustRootHeadStale {
+        /// The root being attached.
+        root_key_id: String,
+        /// The rule that refused, in words.
+        detail: String,
+    },
     /// v19.0.0 (CIRISPersist#488, CRITICAL — the KERI lesson) — a root
     /// charter (`delegates_to(root → root, infra:*)`) failed the recovery
     /// admission gate: missing/malformed pre-rotation commitment, or a
@@ -10605,6 +10616,7 @@ impl Error {
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
+            Error::TrustRootHeadStale { .. } => "trust_root_head_stale",
             Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
             Error::NoConstitutionalRootYet { .. } => "federation_no_constitutional_root_yet",
             Error::ConstitutionalFamilyReserved { .. } => {

@@ -5043,6 +5043,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.attestation_envelope,
         )
         .await?;
+        // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
+        // witnessed lineage head inside the root's attach window.
+        crate::federation::canonical_community::check_attach_freshness(
+            self,
+            &row.attestation_type,
+            &row.attested_key_id,
+            &row.attestation_envelope,
+            chrono::Utc::now(),
+        )
+        .await?;
         // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
         // must be signed by that family's QUORUM. Sits beside the key-charter
         // gate above and refuses the same class of row for the same reason: a
@@ -19547,6 +19557,19 @@ impl SqliteBackend {
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
             &envelope_value,
+        )
+        .await?;
+        // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
+        // witnessed lineage head inside the root's attach window.
+        crate::federation::canonical_community::check_attach_freshness(
+            self,
+            &input.attestation_type,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+            &envelope_value,
+            chrono::Utc::now(),
         )
         .await?;
         // The (occurrence, dimension) key + the gate axis. Required.

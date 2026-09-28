@@ -102,6 +102,19 @@ pub mod kind {
     /// bare token; the suffix only tells a reader *which* op without forcing
     /// them to parse `detail`.
     pub const ADMIN_ACTION_PREFIX: &str = "admin_action:";
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — two witnessed heads for one
+    /// conferring lineage: `hard_case:lineage_equivocation:{lineage_key_id}`.
+    /// The substrate emits it (CC 3.4.2, `identity_type = substrate_persist`);
+    /// the payload carries both head digests, their instants and cosign sets —
+    /// the evidence object for adjudication. The lineage is frozen at their
+    /// last common ancestor until then.
+    pub const LINEAGE_EQUIVOCATION: &str = "lineage_equivocation";
+    /// v51.0.0 (CIRISPersist#939, CC 3.2 T7 rc6) — a trust-root-grade community
+    /// whose active founder set fell to ≤ M: valid but non-admitting, declared
+    /// at the transition (`hard_case:community_liveness_stalled:{community_key_id}`).
+    pub const COMMUNITY_LIVENESS_STALLED: &str = "community_liveness_stalled";
+    /// v51.0.0 (CIRISPersist#939) — the reverse transition.
+    pub const COMMUNITY_LIVENESS_RESTORED: &str = "community_liveness_restored";
 }
 
 /// Named-here canonical `admin_action:{op}` suffixes (CIRISPersist#570). Open

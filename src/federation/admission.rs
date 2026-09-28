@@ -12181,6 +12181,13 @@ pub const INFRA_RULE_NOT_ENTRENCHED: &str = "protocol_not_entrenched";
 /// v50.0.0 (merge prep for #926) — rule: a founder was not conferred on the
 /// ceremony plane (CC 3.2 T2).
 pub const INFRA_RULE_FOUNDER_NOT_CONFERRED: &str = "founder_not_conferred";
+/// v51.0.0 (CIRISPersist#939, CC 3.2 T7 rc6) — a trust-root-grade `infrastructure`
+/// row founded at N ≤ M active founders: every remaining founder is a veto from
+/// birth. N ≥ M + 1 is the conformance floor.
+pub const INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING: &str = "liveness_margin_at_founding";
+/// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — the witness plane knows a head
+/// this node does not hold: fetch before extending (restore discipline).
+pub const TRUST_ROOT_RULE_BEHIND_WITNESS: &str = "lineage_head_behind_witness";
 /// v50.0.0 (merge prep for #926) — rule: a supersede changes the record's
 /// trust-root grade (subkind, basis or entrenchment).
 pub const INFRA_RULE_GRADE_CHANGED: &str = "grade_changed";
@@ -12242,6 +12249,24 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
             .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
             .count();
         if n as usize == founders {
+            // v51.0.0 (CIRISPersist#939, CC 3.2 T7) — the liveness margin at
+            // founding: a TRUST-ROOT-GRADE row needs N ≥ M + 1, or one exit
+            // makes every remaining founder a veto (stalled from birth).
+            // Ordinary infrastructure rooms keep #927's M ≥ 2 rule only.
+            if super::canonical_community::is_trust_root_grade(community)
+                && founders < _m as usize + 1
+            {
+                return Err(Error::CommunityConsensusProtocolViolation {
+                    community_key_id: community.community_key_id.clone(),
+                    rule: INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING,
+                    detail: format!(
+                        "consensus_protocol {p:?} over {founders} founder(s): a trust-root-grade \
+                         community is live only at M + 1 = {} active founders (CC 3.2 T7 rc6, \
+                         CIRISPersist#939); founded at N ≤ M it is stalled from birth",
+                        _m + 1
+                    ),
+                });
+            }
             return Ok(());
         }
         return Err(Error::CommunityConsensusProtocolViolation {
