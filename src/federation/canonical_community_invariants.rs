@@ -1736,6 +1736,149 @@ pub(crate) mod bodies {
         }
     }
 
+    /// A founders' link `prior` → `next` built by hand: the envelope bound to
+    /// `next` at `amended_at`, signed by `signers`, the version signed by
+    /// `authority` and carrying `lineage`.
+    async fn link_by_hand(
+        d: &dyn FederationDirectory,
+        prior: &SignedCommunity,
+        lineage: Vec<SignedCommunity>,
+        next: Community,
+        signers: &[&str],
+        authority: &str,
+    ) -> SignedCommunity {
+        let change = bound_envelope(d, &next, chrono::Utc::now(), |_| {}).await;
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        let mut offered = ts::sign_community(authority, next);
+        offered.lineage = lineage;
+        offered.supersede_proof = Some(crate::federation::types::GroupSupersedeProof {
+            prior_persist_row_hash: crate::federation::types::compute_persist_row_hash(
+                &prior.community,
+            )
+            .unwrap(),
+            change_envelope: change,
+            quorum_signatures: signers
+                .iter()
+                .map(|k| ts::threshold_sign(k, &bytes))
+                .collect(),
+        });
+        offered
+    }
+
+    /// (y) — round 9: a node walking from a version it HOLDS reads each
+    /// founder's `seated_since` from the chain it holds, never from the
+    /// offered lineage before that version. `a` holds v1 → v3 (v3 still
+    /// records F2, who resigned after v1: Stalled). The founders also signed
+    /// another path to the SAME content: v1 → v2b (F2 out) → v3′ (F2 back,
+    /// content equal to v3), which would date F2's seat after the
+    /// resignation. v4, signed by F2 and F0 over that path, is refused: on
+    /// the chain `a` holds, F2 has been seated since the birth and counts as
+    /// nothing. The same v4 signed by F0 and F1 is admitted and stored on the
+    /// chain `a` holds.
+    pub async fn y_an_offered_prefix_cannot_reseat(d: &dyn FederationDirectory) {
+        let holders = stand_up(d).await;
+        put_conferred(d, &holders, "ys-steward", "user,steward").await;
+        for n in ["ys-serve-node", "ys2-serve-node"] {
+            ts::register_hybrid_key_as(d, n, n, identity_type::NODE).await;
+        }
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        let v1 = cc::lookup_signed_community(d, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+            .await
+            .expect("F2 resigns after the birth");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let v3_body = with_member(canonical_row(&FOUNDERS), "ys-serve-node", "member");
+        founders_supersede(d, v3_body.clone(), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("v3 still records F2");
+        let held = cc::lookup_signed_community(d, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Stalled { .. }
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let v2b = link_by_hand(
+            d,
+            &v1,
+            vec![],
+            swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "ys-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+            FOUNDERS[0],
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let v3b = link_by_hand(
+            d,
+            &v2b,
+            vec![],
+            v3_body.clone(),
+            &[FOUNDERS[0], FOUNDERS[1]],
+            FOUNDERS[0],
+        )
+        .await;
+        assert_eq!(
+            crate::federation::types::compute_persist_row_hash(&v3b.community).unwrap(),
+            held.community.persist_row_hash,
+            "the other path reaches the content this node holds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let v4_body = with_member(v3_body, "ys2-serve-node", "member");
+        let forged_prefix = vec![v1.clone(), v2b.clone(), v3b.clone()];
+        let by_f2 = link_by_hand(
+            d,
+            &v3b,
+            forged_prefix.clone(),
+            v4_body.clone(),
+            &[FOUNDERS[2], FOUNDERS[0]],
+            FOUNDERS[0],
+        )
+        .await;
+        let e = d
+            .put_community(by_f2)
+            .await
+            .expect_err("the offered prefix cannot move F2's seat past the resignation");
+        assert!(
+            matches!(e, Error::RosterAuthorityUnauthorized { .. }),
+            "{e:?}"
+        );
+        let by_others = link_by_hand(
+            d,
+            &v3b,
+            forged_prefix,
+            v4_body,
+            &[FOUNDERS[0], FOUNDERS[1]],
+            FOUNDERS[0],
+        )
+        .await;
+        d.put_community(by_others)
+            .await
+            .expect("the others' v4 extends the held v3");
+        let stored = cc::lookup_signed_community(d, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .lineage
+                .iter()
+                .map(|v| v.community.persist_row_hash.clone())
+                .collect::<Vec<_>>(),
+            cc::chain_of(&held)
+                .iter()
+                .map(|v| v.community.persist_row_hash.clone())
+                .collect::<Vec<_>>(),
+            "v4 is stored on the chain this node holds"
+        );
+    }
+
     /// Review TOCTOU: `supersede_community_with_quorum` skips the generic
     /// quorum when a trust root's chain holds, and `prepare_trust_root_supersede`
     /// re-reads the standing. If the chain stopped holding in between (here: a
@@ -2925,6 +3068,14 @@ mod run {
                     super::super::bodies::x_a_resignation_split_converges(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_y() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::y_an_offered_prefix_cannot_reseat(
+                        &d as &dyn FederationDirectory,
                     )
                     .await
                 }
