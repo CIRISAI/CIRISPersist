@@ -1012,6 +1012,7 @@ impl MemoryBackend {
     /// v50.0.0 (PR #921 review) — the test-only hook table (see
     /// [`crate::store::test_hooks`]).
     #[cfg(test)]
+    #[allow(dead_code)] // unarmed under the `server`-only axis
     pub(crate) fn test_hooks(&self) -> &crate::store::test_hooks::TestHooks {
         &self.test_hooks
     }
