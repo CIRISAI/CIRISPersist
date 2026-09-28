@@ -481,15 +481,26 @@ pub async fn verify_community_admission<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let envelope = signed.community.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.community.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v50.0.0 (CIRISPersist#926) — the co-signatures a trust-root row carries
+    // are verified at the door exactly as a roster row's are: one that does
+    // not verify is refused, never stored as decoration.
+    verify_roster_cosignatures(
+        directory,
+        "community",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — verify a
@@ -1551,6 +1562,164 @@ pub mod test_support {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#925 review H1) — a SIGNED content-only
+    /// occurrence row `{identity → occurrence}` whose signer is `signer`
+    /// (registered with [`hybrid_pubkeys`]`(signer)`), asserted at
+    /// `asserted_at` (truncated to the millisecond, as the gate requires). The
+    /// same envelope `key_grant::publish_signed_content_only_occurrence` builds.
+    pub async fn signed_content_only_occurrence(
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        let asserted_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(asserted_at.timestamp_millis())
+                .expect("ms instant");
+        let x_pub = ciris_crypto::x25519::public_from_secret(&seed_for(occurrence));
+        let (_sk, ml_pub) = ciris_crypto::ml_kem::generate_keypair().expect("ml-kem keypair");
+        let enc = crate::federation::EncryptionPubkeys {
+            x25519_base64: B64.encode(x_pub),
+            ml_kem_768_base64: B64.encode(&ml_pub),
+        };
+        let envelope = serde_json::json!({
+            "attesting_key_id": signer,
+            "identity_key_id": identity,
+            "occurrence_key_id": occurrence,
+            "device_class": crate::federation::types::device_class::SERVER,
+            "encryption_pubkeys": {
+                "x25519_base64": enc.x25519_base64,
+                "ml_kem_768_base64": enc.ml_kem_768_base64,
+            },
+            "asserted_at": asserted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "valid_until": serde_json::Value::Null,
+            "hardware_attestation": serde_json::Value::Null,
+        });
+        let id = Box::new(
+            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
+                signer,
+                ed_signer(signer),
+                *mldsa_signer(signer),
+            ),
+        );
+        let (signed_envelope, signature) =
+            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+                id.as_ref(),
+                envelope,
+            )
+            .await
+            .expect("sign occurrence envelope");
+        crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: identity.to_owned(),
+                occurrence_key_id: occurrence.to_owned(),
+                device_class: crate::federation::types::device_class::SERVER.to_owned(),
+                hardware_attestation: None,
+                asserted_at,
+                valid_until: None,
+                encryption_pubkeys: Some(enc),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            },
+            attesting_key_id: signer.to_owned(),
+            signed_envelope,
+            signature,
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#925 review item 5) — a SIGNED revocation of the
+    /// binding `{identity → occurrence}`, signed by `signer` (the identity or an
+    /// active occurrence of it), taking effect at `effective_at`.
+    pub async fn signed_occurrence_revocation(
+        signer: &str,
+        identity: &str,
+        occurrence: &str,
+        effective_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::federation::SignedIdentityOccurrenceRevocation {
+        let ms = |t: chrono::DateTime<chrono::Utc>| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(t.timestamp_millis())
+                .expect("ms instant")
+        };
+        let effective_at = ms(effective_at);
+        let revoked_at = effective_at;
+        let envelope = serde_json::json!({
+            "attesting_key_id": signer,
+            "identity_key_id": identity,
+            "occurrence_key_id": occurrence,
+            "revoked_at": revoked_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "effective_at": effective_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        });
+        let id = Box::new(
+            ciris_verify_core::self_at_login::HybridSigningIdentity::new(
+                signer,
+                ed_signer(signer),
+                *mldsa_signer(signer),
+            ),
+        );
+        let (signed_envelope, signature) =
+            ciris_verify_core::transport_binding::produce_signed_identity_occurrence(
+                id.as_ref(),
+                envelope,
+            )
+            .await
+            .expect("sign revocation envelope");
+        crate::federation::SignedIdentityOccurrenceRevocation {
+            identity_occurrence_revocation: crate::federation::IdentityOccurrenceRevocation {
+                identity_key_id: identity.to_owned(),
+                occurrence_key_id: occurrence.to_owned(),
+                revoked_at,
+                effective_at,
+                reason: None,
+                witness_set: vec![signer.to_owned()],
+                persist_row_hash: String::new(),
+            },
+            attesting_key_id: signer.to_owned(),
+            signed_envelope,
+            signature,
+        }
+    }
+
+    /// v50.0.0 (review) — `members` plus, when `policy_blob` labels the
+    /// fixture `infrastructure`, one founder (an unregistered human seat): an
+    /// infrastructure record with no founder is refused
+    /// (`INFRA_RULE_NO_FOUNDER`), and these fixtures test other things.
+    pub fn fixture_members(
+        policy_blob: Option<&serde_json::Value>,
+        mut members: Vec<crate::federation::types::CommunityMember>,
+    ) -> Vec<crate::federation::types::CommunityMember> {
+        let infra = policy_blob
+            .and_then(|b| b.get("cohort_subkind"))
+            .and_then(|v| v.as_str())
+            == Some(crate::federation::admission::COHORT_SUBKIND_INFRASTRUCTURE);
+        let has_founder = members
+            .iter()
+            .any(|m| m.role.as_deref() == Some(crate::federation::admission::MEMBER_ROLE_FOUNDER));
+        if infra && !has_founder {
+            members.push(crate::federation::types::CommunityMember {
+                key_id: "fixture-infrastructure-founder".into(),
+                joined_at: "2026-01-01T00:00:00Z".parse().expect("rfc3339"),
+                role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+            });
+        }
+        members
+    }
+
+    /// v50.0.0 (CIRISPersist#927, CC 3.2) — the `consensus_protocol` a
+    /// community fixture declares: `otherwise`, unless `policy_blob` labels it
+    /// `infrastructure`, which admits only a `quorum:M/N` form (a one-founder
+    /// fixture's is `quorum:1/1`).
+    pub fn fixture_protocol(policy_blob: Option<&serde_json::Value>, otherwise: &str) -> String {
+        let infra = policy_blob
+            .and_then(|b| b.get("cohort_subkind"))
+            .and_then(|v| v.as_str())
+            == Some(crate::federation::admission::COHORT_SUBKIND_INFRASTRUCTURE);
+        if infra {
+            "quorum:1/1".to_owned()
+        } else {
+            otherwise.to_owned()
+        }
+    }
+
     /// v21.0.0 (CIRISPersist#502 E4) — sign a
     /// [`Community`](crate::federation::types::Community) for submission.
     /// Mirrors [`sign_family`].
@@ -1566,6 +1735,8 @@ pub mod test_support {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         }
     }
 
@@ -2684,6 +2855,173 @@ pub mod test_support {
             "({suffix}) #765: a withdrawn owner-binding must stop lifting the node — \
              a decommissioned instrument keeps nothing"
         );
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CC 5.4.6 / CIRISConstitution#111) — **the
+    /// roster invariant beside [`exercise_node_speaks_for_owner`]: a minor is
+    /// never announced.**
+    ///
+    /// A person's public device roster is exactly their nodes whose
+    /// owner-binding is carried at `cohort_scope: federation`. For an owner in
+    /// the `minor` band that is refused (CC 3.4.13 Q5 — no steward, guardian
+    /// or stacked consent lifts it); the same binding at `self` lands, so the
+    /// minor's node stays on the derived plane, owned and reachable by the
+    /// minor's own nodes. An ADULT-unknown owner (no age proof) announces
+    /// freely — presumption of sovereignty. Run through the real
+    /// `put_attestation` door on every backend.
+    pub(crate) async fn exercise_minor_owner_binding_is_not_announced(
+        dir: &dyn crate::federation::FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::types::{
+            attestation_type, cohort_scope, delegation_scope as ds, owner_binding,
+        };
+        let minor = format!("minor-924-{suffix}");
+        let adult = format!("adult-924-{suffix}");
+        let node_a = format!("node-a-924-{suffix}");
+        let node_b = format!("node-b-924-{suffix}");
+        let node_c = format!("node-c-924-{suffix}");
+        register_user_role_key(dir, &minor).await;
+        register_user_role_key(dir, &adult).await;
+        for k in [&node_a, &node_b, &node_c] {
+            register_hybrid_key(dir, k).await;
+        }
+        // The owner self-declares MINOR (the subject-signed self rung, CC
+        // 3.4.11; CC rc5's `age_self_declared:band:{band}:{version}` arity).
+        let decl_id = uuid::Uuid::new_v4().to_string();
+        let mut decl = bare_attestation(
+            &decl_id,
+            &minor,
+            &minor,
+            &serde_json::json!({ "id": decl_id }),
+        );
+        decl.attestation_type = "age_self_declared:band:minor:v1".to_owned();
+        seal_row_in_place(&minor, &mut decl);
+        dir.put_attestation(crate::federation::SignedAttestation { attestation: decl })
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) self-declared minor: {e}"));
+        assert_eq!(
+            crate::federation::age::age_band(dir, &minor).await.unwrap(),
+            crate::federation::age::AgeBand::Minor
+        );
+
+        let binding = |owner: &str, node: &str, scope: &str| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut b = bare_attestation(
+                &id,
+                owner,
+                node,
+                &serde_json::json!({
+                    "id": id,
+                    "kind": "delegates_to",
+                    "dimension": owner_binding::DIMENSION,
+                    "delegation_purpose": owner_binding::PURPOSE,
+                    "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                }),
+            );
+            b.attestation_type = attestation_type::DELEGATES_TO.to_owned();
+            b.cohort_scope = scope.to_owned();
+            seal_row_in_place(owner, &mut b);
+            crate::federation::SignedAttestation { attestation: b }
+        };
+
+        // (1) ANNOUNCED — the minor's federation-scope owner-binding refuses,
+        // by its own typed reason, and nothing is stored.
+        let err = dir
+            .put_attestation(binding(&minor, &node_a, cohort_scope::FEDERATION))
+            .await
+            .expect_err("a minor's owner-binding at cohort_scope federation must refuse");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
+                )
+            ),
+            "({suffix}) CC 5.4.6: refused as the announce of a minor, got {err:?}"
+        );
+        assert!(
+            crate::federation::admission::owner_of(dir, &node_a)
+                .await
+                .unwrap()
+                .is_none(),
+            "({suffix}) the refused binding left nothing behind"
+        );
+
+        // (2) The DERIVED plane — the same binding at `self` lands, and the
+        // node is the minor's.
+        let self_binding = binding(&minor, &node_b, cohort_scope::SELF);
+        let self_binding_id = self_binding.attestation.attestation_id.clone();
+        dir.put_attestation(self_binding)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) a minor's self-scope owner-binding: {e}"));
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node_b)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(minor.as_str())
+        );
+
+        // (2b) "admission MUST refuse the PROMOTION" — the promote door's own
+        // stack asks the same question of the row as it would be stored
+        // (a `local` row admitted before the owner's band resolved minor
+        // must not cross). Asked of the stack directly: mutation M16 of the
+        // #924 round showed the put doors alone did not witness it.
+        let promoted = binding(&minor, &node_a, cohort_scope::FEDERATION).attestation;
+        let err = crate::federation::admission::check_promotion_admission(dir, &promoted, None)
+            .await
+            .expect_err("the promotion stack refuses a minor's federation owner-binding");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
+                )
+            ),
+            "({suffix}) CC 5.4.6 at the promote door, got {err:?}"
+        );
+
+        // (2c) ANNOUNCING = the owner re-signing the binding at federation
+        // (CC 5.4.6, CLM-device-roster-announced) — i.e. `widen_audience`,
+        // the one widening path. The minor's self-scope binding does not
+        // widen (v50.0.0 review HIGH-1: a gate on `delegates_to` alone never
+        // saw the `supersedes` a widening writes).
+        let stored = dir
+            .get_attestation(&self_binding_id)
+            .await
+            .unwrap()
+            .expect("the self-scope binding is stored");
+        let err = widen(dir, &stored, crate::federation::Audience::Federation, &[])
+            .await
+            .expect_err("widening a minor's owner-binding to federation must refuse");
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::WriteScopeRefused(
+                    crate::scope::ScopeRefusalReason::MinorOwnerBindingAtFederation
+                )
+            ),
+            "({suffix}) CC 5.4.6 at the widening door, got {err:?}"
+        );
+
+        // (3) An owner with no age proof announces freely (presumption of
+        // sovereignty, CC 1.15.6) — the gate keys on the MINOR band, not on
+        // the absence of an adult one — both directly and by widening.
+        dir.put_attestation(binding(&adult, &node_c, cohort_scope::FEDERATION))
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) an unknown-band owner announces: {e}"));
+        let node_d = format!("node-d-924-{suffix}");
+        register_hybrid_key(dir, &node_d).await;
+        let adult_self = binding(&adult, &node_d, cohort_scope::SELF);
+        let adult_self_id = adult_self.attestation.attestation_id.clone();
+        dir.put_attestation(adult_self)
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) adult self-scope binding: {e}"));
+        let stored = dir.get_attestation(&adult_self_id).await.unwrap().unwrap();
+        widen(dir, &stored, crate::federation::Audience::Federation, &[])
+            .await
+            .unwrap_or_else(|e| panic!("({suffix}) a non-minor's binding widens: {e}"));
     }
 
     /// v38.2.0 — register `key_id` with real hybrid pubkeys as a USER-role

@@ -77,12 +77,9 @@ fn parse_member(v: &Value) -> Result<Option<BlobPointerRef>, PointerError> {
     let Some(o) = v.as_object() else {
         return Ok(None);
     };
-    let Some(sha) = o.get("content_sha256").and_then(Value::as_str) else {
+    let Some(sha) = pointer_sha(o) else {
         return Ok(None);
     };
-    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Ok(None);
-    }
     let Some(community) = o.get("community_key_id") else {
         return Ok(None);
     };
@@ -119,6 +116,48 @@ fn parse_member(v: &Value) -> Result<Option<BlobPointerRef>, PointerError> {
         tier,
         epoch,
     }))
+}
+
+/// The pointer discriminator's digest half: a `content_sha256` of 64 hex
+/// characters.
+fn pointer_sha(o: &serde_json::Map<String, Value>) -> Option<&str> {
+    o.get("content_sha256")
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// v50.0.0 (CIRISPersist#919) — the pointer's OWNER SLOT: the non-empty
+/// `community_key_id` of a pointer-shaped member (the discriminator of
+/// [`parse_member`]), i.e. the room the bytes are held in. Reads only the two
+/// discriminating members, so a pointer whose tier or epoch is unreadable
+/// still names its room.
+fn pointer_owner(v: &Value) -> Option<&str> {
+    let o = v.as_object()?;
+    pointer_sha(o)?;
+    o.get("community_key_id")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+}
+
+/// v50.0.0 (CIRISPersist#919) — **does a blob pointer in `envelope` name the
+/// room its bytes are held in?** The same scan as [`pointer_for`] (every
+/// top-level member, and the items of an array member), asking only for a
+/// non-empty owner slot.
+///
+/// This is how a self FILE row says where it lives: Edge writes it with no
+/// top-level cohort target (a self room has no `cohort_target_field`) and
+/// the owner only in `content.community_key_id`, which is exactly what its
+/// self-room file read keys on. A row whose bytes are held in a room was
+/// placed in that room ([`super::admission::envelope_names_cohort_target`]).
+#[must_use]
+pub fn names_pointer_owner(envelope: &Value) -> bool {
+    envelope.as_object().is_some_and(|members| {
+        members.values().any(|v| {
+            pointer_owner(v).is_some()
+                || v.as_array()
+                    .is_some_and(|items| items.iter().any(|i| pointer_owner(i).is_some()))
+        })
+    })
 }
 
 /// **The pointer in `envelope` that names `sha256_hex`, if any.** Scans

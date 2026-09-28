@@ -220,6 +220,15 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// says so first. The same version also carries growth that rides free:
 /// [`DirectoryOpResult::AccordEvidenceCarrierRefused`] (CIRISPersist#674).
 ///
+/// v6 (v50.0.0, CIRISPersist#928, review M3) is the payload-type form again:
+/// [`crate::federation::ReachabilityVerdict`] gained `BeyondDepthCap` (CC
+/// 4.1.1: a scope-bearing chain continues past the depth cap — too deep, not
+/// absent), and an EXISTING op returns it inside
+/// `DirectoryOpResult::Reachability`. An older consumer serde-fails on the hot
+/// path (or, with a catch-all arm, misreports it as a substrate fault), so the
+/// load-time gate must say so. The two enum-body digests do not move — the
+/// verdict is a payload type outside their sight, exactly as v3's was.
+///
 /// v3 also carries the v2 break applied to the WHOLE cursor family
 /// (v36.0.0, CIRISPersist#668): every remaining `List*Since` op takes the
 /// `(serve position, resume id)` pair instead of a bare instant, and every
@@ -243,7 +252,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 5;
+pub const DIRECTORY_ABI_VERSION: u32 = 6;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -1013,6 +1022,46 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
+    /// v50.0.0 (CIRISPersist#917) —
+    /// [`FederationDirectory::apply_replicated_attestation`], the typed
+    /// unattributed door. The far side runs the whole plan-then-write body
+    /// against its own backend, so the outcome is decided where the stored
+    /// row is. Result rides `ReplicatedAttestationOutcome`. APPEND-ONLY
+    /// (Growth).
+    ApplyReplicatedAttestation {
+        /// The signed row.
+        attestation: SignedAttestation,
+    },
+    /// v50.0.0 (CIRISPersist#917) —
+    /// [`FederationDirectory::put_attestation_synced`], the typed attributed
+    /// door. [`DirectoryOp::PutAttestationSynced`] stays the untyped
+    /// stored-write door for consumers built before v50. Result rides
+    /// `ReplicatedAttestationOutcome`. APPEND-ONLY (Growth).
+    ApplyReplicatedAttestationSynced {
+        /// The signed row.
+        attestation: SignedAttestation,
+        /// The identity the TRANSPORT authenticated — never the row's claim.
+        authenticated_peer_key_id: String,
+    },
+    /// v50.0.0 (CIRISPersist#925/#931) —
+    /// [`FederationDirectory::apply_replicated_community`], the REPLICATED
+    /// community entry: a legacy infrastructure record is admitted as data,
+    /// where [`DirectoryOp::PutCommunity`] (the local door) runs the full CC
+    /// 3.2 gate. A replication bridge sends this. Result rides
+    /// `ReplicatedCommunityOutcome`. APPEND-ONLY (Growth).
+    ApplyReplicatedCommunity {
+        /// The signed community row received from a peer.
+        community: SignedCommunity,
+    },
+    /// v50.0.0 (CIRISPersist#928, final check) —
+    /// [`FederationDirectory::withdraws_admission_depth`]: the depth a stored
+    /// `withdraws` was admitted under, so a capsule consumer re-deriving it at
+    /// read time walks the ROW's depth instead of guessing. Result rides
+    /// `WithdrawsAdmissionDepth`. APPEND-ONLY (Growth).
+    WithdrawsAdmissionDepth {
+        /// The `withdraws` row's id.
+        attestation_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -1249,6 +1298,21 @@ pub enum DirectoryOpResult {
     /// v49.0.0 (CIRISPersist#912) — `list_signed_community_membership_listings_since`.
     /// APPEND-ONLY (Growth).
     SignedCommunityMembershipListings(Vec<crate::federation::ServedCommunityMembershipListing>),
+    /// v50.0.0 (CIRISPersist#917) — `apply_replicated_attestation` and
+    /// `put_attestation_synced`: the typed Attestation-plane outcome. A
+    /// `Refused` is a policy outcome carried HERE with its reason, never
+    /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
+    ReplicatedAttestationOutcome(
+        crate::federation::attestation_apply::ReplicatedAttestationOutcome,
+    ),
+    /// v50.0.0 (CIRISPersist#931) — `apply_replicated_community`: the typed
+    /// community-plane outcome. A `Refused` carries its reason here, never
+    /// flattened to [`Self::Err`]. APPEND-ONLY (Growth).
+    ReplicatedCommunityOutcome(crate::federation::ReplicatedCommunityOutcome),
+    /// v50.0.0 (CIRISPersist#928) — `withdraws_admission_depth`: `None` when
+    /// nothing was recorded (a pre-V157 row reads as the 16-hop walk).
+    /// APPEND-ONLY (Growth).
+    WithdrawsAdmissionDepth(Option<u32>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1604,11 +1668,20 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        // v50.0.0 (CIRISPersist#917) — the pre-v50 op keeps its contract: the
+        // stored-write door under the Sync origin, answering
+        // `AttestationOutcome`, for consumers built before the typed door. A
+        // v50 proxy sends `ApplyReplicatedAttestationSynced` instead.
         DirectoryOp::PutAttestationSynced {
             attestation,
             authenticated_peer_key_id,
         } => match dir
-            .put_attestation_synced(attestation, &authenticated_peer_key_id)
+            .put_attestation_with_origin(
+                attestation,
+                crate::federation::replication::admission::WriteOrigin::Sync {
+                    peer_key_id: authenticated_peer_key_id,
+                },
+            )
             .await
         {
             Ok(outcome) => DirectoryOpResult::AttestationOutcome(outcome),
@@ -1705,7 +1778,9 @@ pub async fn dispatch_directory_op(
             match crate::federation::topology::build_delegation_graph(
                 dir,
                 &from_key,
-                max_depth as usize,
+                // The op always names a depth: an explicit caller choice
+                // (CC 4.1.1 opt-in), clamped at the ceiling.
+                Some(max_depth as usize),
             )
             .await
             {
@@ -1942,6 +2017,36 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedCommunityMembershipListings(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ApplyReplicatedAttestation { attestation } => {
+            match dir.apply_replicated_attestation(attestation).await {
+                Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ApplyReplicatedAttestationSynced {
+            attestation,
+            authenticated_peer_key_id,
+        } => match dir
+            .put_attestation_synced(attestation, &authenticated_peer_key_id)
+            .await
+        {
+            Ok(o) => DirectoryOpResult::ReplicatedAttestationOutcome(o),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ApplyReplicatedCommunity { community } => {
+            match dir.apply_replicated_community(community).await {
+                Ok(o) => DirectoryOpResult::ReplicatedCommunityOutcome(o),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::WithdrawsAdmissionDepth { attestation_id } => {
+            match dir.withdraws_admission_depth(&attestation_id).await {
+                Ok(d) => DirectoryOpResult::WithdrawsAdmissionDepth(
+                    d.map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
+                ),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -2542,6 +2647,45 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#928, final check) — the recorded admission depth
+    /// of a stored `withdraws`, proxied: the proxy never guesses 16.
+    async fn withdraws_admission_depth(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<usize>, Error> {
+        match self
+            .run_op(&DirectoryOp::WithdrawsAdmissionDepth {
+                attestation_id: attestation_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::WithdrawsAdmissionDepth(d) => {
+                Ok(d.map(|d| usize::try_from(d).unwrap_or(usize::MAX)))
+            }
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#931) — the replicated community entry, proxied.
+    async fn apply_replicated_community(
+        &self,
+        community: SignedCommunity,
+    ) -> Result<crate::federation::ReplicatedCommunityOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedCommunity { community })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedCommunityOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -3581,6 +3725,50 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    /// v50.0.0 (CIRISPersist#917) — the typed unattributed door crosses whole.
+    /// The trait default would plan on THIS side, where `get_attestation` is
+    /// `Unsupported`, and fall back to plan-free apply over the untyped
+    /// `PutAttestation` op — reporting a re-offer of a held row as `Inserted`
+    /// and a conflict as an untyped backend error.
+    async fn apply_replicated_attestation(
+        &self,
+        attestation: SignedAttestation,
+    ) -> Result<crate::federation::attestation_apply::ReplicatedAttestationOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedAttestation { attestation })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedAttestationOutcome(o) => Ok(o),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#917) — the typed attributed door crosses whole,
+    /// for the reason [`Self::apply_replicated_attestation`] gives. The peer
+    /// travels so the far side meters it exactly as a direct call would.
+    async fn put_attestation_synced(
+        &self,
+        attestation: SignedAttestation,
+        authenticated_peer_key_id: &str,
+    ) -> Result<crate::federation::attestation_apply::ReplicatedAttestationOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedAttestationSynced {
+                attestation,
+                authenticated_peer_key_id: authenticated_peer_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedAttestationOutcome(o) => Ok(o),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     /// v49.0.0 (CIRISPersist#912) — the listing since-read, proxied like the
     /// widening planes': a capsule consumer converges the 19th kind from it.
     async fn list_signed_community_membership_listings_since(
@@ -4236,6 +4424,113 @@ mod tests {
         (dir, directory)
     }
 
+    /// v50.0.0 (CIRISPersist#928, final check) — the proxy forwards the
+    /// recorded admission depth of a stored `withdraws` (never guessing 16):
+    /// a deferred `withdraws` admitted at the default reads back 5 through the
+    /// op; an id with nothing recorded reads `None`.
+    #[test]
+    fn withdraws_admission_depth_op_forwards_the_recorded_depth() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(ts::register_hybrid_key_as(
+            dir.as_ref(),
+            "capsule-issuer",
+            "capsule-issuer",
+            crate::federation::types::identity_type::USER,
+        ));
+        let env = serde_json::json!({
+            "references_attestation_id": "not-yet-held",
+            "withdrawal_reason": "CC 2.3",
+        });
+        let wid = uuid::Uuid::new_v4().to_string();
+        let mut w = ts::bare_attestation(&wid, "capsule-issuer", "capsule-issuer", &env);
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        w.cohort_scope = "federation".into();
+        ts::seal_row_in_place("capsule-issuer", &mut w);
+        rt.block_on(dir.put_attestation(crate::federation::SignedAttestation { attestation: w }))
+            .expect("a deferred withdraws is admitted");
+        for (id, want) in [
+            (
+                wid.as_str(),
+                Some(crate::federation::DEFAULT_DELEGATION_DEPTH as u32),
+            ),
+            ("no-such-row", None),
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::WithdrawsAdmissionDepth {
+                    attestation_id: id.to_owned(),
+                },
+            ) {
+                DirectoryOpResult::WithdrawsAdmissionDepth(d) => assert_eq!(d, want, "{id}"),
+                other => panic!("{id}: {other:?}"),
+            }
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#931) — the capsule carries BOTH community doors:
+    /// `PutCommunity` (local) refuses a human-signed legacy `founder_only`
+    /// infrastructure record; `ApplyReplicatedCommunity` admits it as data
+    /// (`Inserted`), and a re-apply is `Unchanged`.
+    #[test]
+    fn apply_replicated_community_op_is_the_replicated_door() {
+        use crate::federation::tier_ingest::test_support as ts;
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(ts::register_hybrid_key_as(
+            dir.as_ref(),
+            "capsule-human",
+            "capsule-human",
+            crate::federation::types::identity_type::USER,
+        ));
+        let community = ts::sign_community(
+            "capsule-human",
+            crate::federation::types::Community {
+                community_key_id: "capsule-legacy-root".into(),
+                community_name: "legacy".into(),
+                members: vec![crate::federation::types::CommunityMember {
+                    key_id: "capsule-human".into(),
+                    joined_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                    role: Some("founder".into()),
+                }],
+                founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: "founder_only".into(),
+                policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+                persist_row_hash: String::new(),
+            },
+        );
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::PutCommunity {
+                community: community.clone(),
+            },
+        ) {
+            DirectoryOpResult::Err(e) => assert!(
+                e.contains("hard_case:community_consensus_protocol_violation"),
+                "{e}"
+            ),
+            other => panic!("the local door must refuse: {other:?}"),
+        }
+        for want in [
+            crate::federation::ReplicatedCommunityOutcome::Inserted,
+            crate::federation::ReplicatedCommunityOutcome::Unchanged,
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::ApplyReplicatedCommunity {
+                    community: community.clone(),
+                },
+            ) {
+                DirectoryOpResult::ReplicatedCommunityOutcome(o) => assert_eq!(o, want),
+                other => panic!("the replicated door: {other:?}"),
+            }
+        }
+    }
+
     fn test_runtime() -> Arc<tokio::runtime::Runtime> {
         Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -4652,10 +4947,13 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_5() {
+    fn abi_version_pinned_at_6() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 5,
-            "the RESULT wire gained a variant in v38.5.0 \
+            DIRECTORY_ABI_VERSION, 6,
+            "v50.0.0 (CIRISPersist#928): ReachabilityVerdict, the payload of the \
+             existing Reachability result, gained BeyondDepthCap — a consumer built \
+             against 5 fails to decode it on the hot path. Previous move: the RESULT \
+             wire gained a variant in v38.5.0 \
              (DirectoryOpResult::AttestationOutcome, CIRISPersist#771): a \
              consumer built against 4 decodes `Unit` for put_attestation and \
              would fail to decode the new variant, so the load-time gate must \
@@ -4667,7 +4965,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 5,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 6,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
@@ -4736,7 +5034,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "78bc01eff2751ddbb5a202e8e63c3833c425f3a3797efb8c6840d304ec0e99b3",
+            "be22e2dc22c75b7c88cc236bfb5ea2c6613c8d3933b4efc554f9980b350731aa",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -4765,11 +5063,22 @@ mod tests {
     /// 3: this gate reads the enum body only, so a payload-type's own shape
     /// is the version pin's job, not the digest's. All v36 breaks share the
     /// one 2 → 3 bump.
+    ///
+    /// Re-pinned in v50.0.0 (CIRISPersist#917) — GROWTH on both halves: the
+    /// `ApplyReplicatedAttestation` and `ApplyReplicatedAttestationSynced` ops
+    /// and the `ReplicatedAttestationOutcome` result APPENDED, nothing
+    /// existing touched. [`DIRECTORY_ABI_VERSION`] stays 5.
+    ///
+    /// Re-pinned again in v50.0.0 (CIRISPersist#931) — GROWTH on both halves:
+    /// the `ApplyReplicatedCommunity` and `WithdrawsAdmissionDepth` ops and the
+    /// `ReplicatedCommunityOutcome` and `WithdrawsAdmissionDepth` results
+    /// APPENDED. The version is 6 for #928's payload change
+    /// (`ReachabilityVerdict::BeyondDepthCap`), not for this.
     #[test]
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "11ef765f51d36e2cf6cb72c9f38906fde813eec6e6af8b20c87451f3e25d687a",
+            "dccdb0994c22284eea288d333bb0160eaed3ed4dd1f0d19039368046bcf0d930",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );
@@ -5398,7 +5707,7 @@ mod tests {
             .block_on(crate::federation::topology::build_delegation_graph(
                 dir.as_ref(),
                 "root-key",
-                3,
+                Some(3),
             ))
             .expect("direct build_delegation_graph");
         match res {
@@ -5413,6 +5722,67 @@ mod tests {
             other => panic!("expected DelegationGraph, got {other:?}"),
         }
 
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    /// PR #921 review (Codex, F4) — `max_depth: 0` through the op: a root
+    /// that delegates is past a zero cap (`BeyondCapSelfVerify`, no edges); a
+    /// root that delegates nothing is `WithinCap`. The op passes 0 through
+    /// (the cap is the caller's explicit choice); it is not rejected.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn build_delegation_graph_op_reports_a_zero_cap() {
+        use crate::federation::admission::steward_liveness_test_support::{register, signed_row};
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, identity_type as it};
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(async {
+            register(dir.as_ref(), "zc-root", &[it::USER]).await;
+            register(dir.as_ref(), "zc-next", &[it::PRIMITIVE]).await;
+            register(dir.as_ref(), "zc-lone", &[it::USER]).await;
+            let mut row = signed_row(
+                "zc-root",
+                "zc-next",
+                attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "scope": ["infra:serve"],
+                    "sub_delegation": true
+                }),
+            );
+            ts::reseal(&mut row);
+            dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .expect("edge");
+        });
+        for (root, want) in [
+            (
+                "zc-root",
+                crate::federation::DelegationDepthOutcome::BeyondCapSelfVerify,
+            ),
+            (
+                "zc-lone",
+                crate::federation::DelegationDepthOutcome::WithinCap,
+            ),
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::BuildDelegationGraph {
+                    from_key: root.into(),
+                    max_depth: 0,
+                },
+            ) {
+                DirectoryOpResult::DelegationGraph(g) => {
+                    assert_eq!(g.max_depth, 0, "{root}");
+                    assert!(g.edges.is_empty(), "{root}: a zero cap follows nothing");
+                    assert_eq!(g.depth_outcome, want, "{root}");
+                }
+                other => panic!("{root}: expected DelegationGraph, got {other:?}"),
+            }
+        }
         // SAFETY: single-drop, matched vtable.
         unsafe { (directory.vtable.drop)(directory.data) };
     }

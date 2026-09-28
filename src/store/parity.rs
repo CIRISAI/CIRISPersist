@@ -185,6 +185,45 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // it names.
     ("check_licensure_delegator_is_authority", Class::Gate),
     ("check_community_membership_steward_binding", Class::Gate),
+    // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — Gates: an infrastructure
+    // record must declare quorum:M/N and seat no node-bearing founder; a
+    // widening may not seat one. Statements about the caller's row.
+    // v50.0.0 (review M6) — the record door's form: conformance for a new or
+    // changed record authored here; replicated data admitted.
+    ("check_infrastructure_record_admission", Class::Gate),
+    ("check_infrastructure_founders_not_node", Class::Gate),
+    // v50.0.0 (review, M1 loophole) — Gate: a roster change may not move the
+    // founder count of a conformant infrastructure room.
+    ("check_infrastructure_founder_count_unchanged", Class::Gate),
+    // v50.0.0 (final check) — Gate: a conformant stored room never degrades
+    // through the replicated door.
+    ("check_replicated_supersede_does_not_degrade", Class::Gate),
+    // v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — Gate: refuses a
+    // key record fusing `node` with `agent`/`user`.
+    ("check_node_identity_exclusive", Class::Gate),
+    // v50.0.0 (review H3) — Gate: a rewrite may not move `node` in or out.
+    ("check_node_identity_unchanged", Class::Gate),
+    // v50.0.0 (review M5) — Delegates: `put_public_key` is the local-mint face
+    // of the one key-record store step; the replicated `Insert` arm reaches
+    // the same helper with the replicated door.
+    ("put_public_key_at_door", Class::Delegates),
+    // v50.0.0 (review, CIRISPersist#931) — Delegates: `put_community` and
+    // `apply_replicated_community` are the two doors of this one store step.
+    ("put_community_at_door", Class::Delegates),
+    // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` one-shot fault a
+    // witness arms inside a backend door (`store::test_hooks`); never armed
+    // outside a test, and it judges nothing about the caller's input.
+    ("fail_if_armed", Class::Plumbing),
+    // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` rival write a
+    // witness arms at a fixed point of a community write
+    // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
+    // adds nothing to a door's production sequence.
+    ("test_rival_at", Class::Plumbing),
+    // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
+    // row (the reserved `ciris-canonical` id, or one declaring
+    // `infrastructure_constraint`) whose shape, founders or chain fails — the
+    // one predicate on the local and the replicated community door.
+    ("check_trust_root_at_door", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),
@@ -261,6 +300,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // policy question about the caller's input rather than a substrate one.
     ("attestation_reput_verdict", Class::Gate),
     ("check_single_node_owner_admission", Class::Gate),
+    // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
+    // refused at `cohort_scope: federation`.
+    ("check_minor_owner_binding_not_announced", Class::Gate),
     ("check_skew_and_payment", Class::Gate),
     ("check_trace_dimension_admission", Class::Gate),
     ("check_trust_charter_admission", Class::Gate),
@@ -312,6 +354,21 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("list_org_memberships_for", Class::Delegates),
     ("list_partner_records_for", Class::Delegates),
     ("load_or_init_content_master", Class::Delegates),
+    // v50.0.0 (#920) — the content-master row load/init that
+    // `load_or_init_content_master` now resolves; the same door, split.
+    ("load_or_init_content_master_row", Class::Delegates),
+    // v50.0.0 (#920 review) — POSTGRES ONLY: the postgres
+    // `load_or_init_content_master_row` runs `content_master_key(true)` on the
+    // blocking pool (§11.8); tokio-postgres already requires a runtime, so a
+    // bare `spawn_blocking` there is sound. PLUMBING: its only failure is the
+    // join (a panicked or cancelled task), the runtime's terms, never a
+    // question about the caller's input. SQLite never calls it — it uses
+    // `sqlite_conn_model::dispatch_blocking`, which returns the value (no
+    // propagated error) and runs inline with no runtime (#158); a bare
+    // `spawn_blocking` reappearing in a sqlite door is a regression of that,
+    // which this row would NOT catch — `sqlite_conn_model`'s module header is
+    // the rule.
+    ("spawn_blocking", Class::Plumbing),
     // #848 — the recipient-decrypt path: the identity floor is another door
     // (it mints on first call, first-write-wins), and unsealing our OWN
     // sealed private halves fails only on corrupt material — the substrate's

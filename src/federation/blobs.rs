@@ -2129,6 +2129,19 @@ pub trait BlobStorage: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
+    /// v50.0.0 (CIRISPersist#920) — the persisted content-master ROW
+    /// (`key_kind`, `master_key_b64`, `descriptor`), initialised exactly as
+    /// [`load_or_init_content_master`](Self::load_or_init_content_master)
+    /// initialises it on a node that has sealed nothing yet (hardware root
+    /// if reachable, else a fresh software master recorded as software;
+    /// concurrent first-callers converge on the PK). The row is returned
+    /// unresolved: `load_or_init_content_master` resolves it to the key, and
+    /// `Engine::open_mls_state` reads its KIND to pick the MLS-state root.
+    fn load_or_init_content_master_row(
+        &self,
+    ) -> impl Future<Output = Result<crate::federation::at_rest_cascade::ContentMasterRow, BlobError>>
+           + Send;
+
     /// v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) — load this node's
     /// **content-KEM identity** (the content-encryption keypair role of
     /// the [`LocalIdentityAggregate`](crate::federation::LocalIdentityAggregate)),
@@ -2430,6 +2443,10 @@ pub trait BlobStorage: Send + Sync {
     /// Idempotent on `(community_key_id, epoch, member_key_id)`.
     ///
     /// #848 — keyed `(community, minter, epoch, member)`.
+    ///
+    /// v50.0.0 (CIRISPersist#916) — returns whether THIS call inserted the
+    /// row (`false`: it was already there), so a caller racing another
+    /// writer reports what it did rather than what it meant to do.
     fn community_dek_put_member_grant(
         &self,
         community_key_id: &str,
@@ -2438,7 +2455,7 @@ pub trait BlobStorage: Send + Sync {
         member_key_id: &str,
         wrap_algorithm: &str,
         wrapped_dek: &str,
-    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
 
     /// #848 (§13, `Projection::KeyGrants`) — **write every wrap of an
     /// admitted epoch-axis `KeyGrant` set, in ONE transaction, as a UNION**:
@@ -2531,6 +2548,18 @@ pub trait BlobStorage: Send + Sync {
         epoch: u64,
         viewer_key_id: &str,
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **what a member
+    /// holds**: every `(minter_key_id, epoch)` of `community_key_id` on which
+    /// at least one of `member_key_ids` (the member's occurrences) holds a
+    /// grant, DISTINCT and ordered by `(minter_key_id, epoch)` — every minter's
+    /// epochs (#848). The input of the device re-wrap: a new device receives
+    /// exactly this set. An empty `member_key_ids` holds nothing.
+    fn community_dek_member_grant_epochs(
+        &self,
+        community_key_id: &str,
+        member_key_ids: &[String],
+    ) -> impl Future<Output = Result<Vec<(String, u64)>, BlobError>> + Send;
 
     /// v46.0.0 (CIRISPersist#876, `FSD/EPOCH_MINTER.md` §3) — **the
     /// repair.** Rebind every `federation_community_blob_epoch` row at

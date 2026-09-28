@@ -297,6 +297,7 @@ mod tests {
             protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY,
             subkind: None,
             policy_blob: None,
+            node_bearing: &crate::federation::NO_NODE_BEARING_SEATS,
         };
         let spans = authorized_roster_spans_at(&record, rules, &events, at("2026-04-01T00:00:00Z"));
         assert_eq!(

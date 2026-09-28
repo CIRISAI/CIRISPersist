@@ -380,6 +380,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     // v46.0.0 (#876) — the derivation input is a plain SELECT on the reader
     // path; the repair is a single guarded UPDATE on the writer's.
     ("community_dek_minters_granting", ConnClass::Read),
+    // v50.0.0 (#916) — what a member holds: a plain SELECT on the reader path.
+    ("community_dek_member_grant_epochs", ConnClass::Read),
     ("rebind_stranded_blob_epochs", ConnClass::Write),
     // v46.3.0 (#884) — the content-axis half of `minter_of_blob` is one
     // SELECT on the reader path (the community half delegates to
@@ -476,7 +478,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_witness_peer_ids", ConnClass::Read),
     ("load_content_kem_private_halves", ConnClass::Read),
     ("load_or_init_content_kem_identity", ConnClass::Write),
-    ("load_or_init_content_master", ConnClass::Write),
+    // v50.0.0 (#920) — the row load/init moved out of
+    // `load_or_init_content_master`, which now only resolves it.
+    ("load_or_init_content_master_row", ConnClass::Write),
     ("lookup_canonical_withdrawal", ConnClass::Read),
     ("lookup_community", ConnClass::Read),
     ("lookup_family", ConnClass::Read),
@@ -490,6 +494,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_public_key", ConnClass::Read),
     ("lookup_role_withdrawal", ConnClass::Read),
     ("lookup_shared_instance_lease", ConnClass::Read),
+    ("lookup_signed_community", ConnClass::Read),
     ("lookup_signed_record_by_content_hash", ConnClass::Read),
     ("lookup_trust", ConnClass::Read),
     ("mark_ack_received", ConnClass::Write),
@@ -535,7 +540,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
-    ("put_community", ConnClass::Write),
+    // v50.0.0 (#931) — `put_community` / `apply_replicated_community` delegate here.
+    ("put_community_at_door", ConnClass::Write),
     ("put_community_membership_revocation", ConnClass::Write),
     ("put_community_membership_widening", ConnClass::Write),
     ("put_family_membership_widening", ConnClass::Write),
@@ -557,7 +563,10 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_org_membership", ConnClass::Write),
     ("put_organization", ConnClass::Write),
     ("put_partner_record", ConnClass::Write),
-    ("put_public_key", ConnClass::Write),
+    // v50.0.0 (review M5) — `put_public_key` delegates to this store step.
+    ("put_public_key_at_door", ConnClass::Write),
+    // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
+    ("withdraws_admission_depth", ConnClass::Read),
     ("put_revocation", ConnClass::Write),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),
@@ -1214,6 +1223,33 @@ mod witnesses {
             .await
             .expect("write with no runtime");
             assert!(lease.is_some(), "first acquire wins");
+        });
+    }
+
+    /// v50.0.0 (#920 review) — the content-master row init derives the root
+    /// through `dispatch_blocking`, so a first-ever row init polled with NO
+    /// tokio runtime on the thread completes rather than panicking (a bare
+    /// `spawn_blocking` panics there).
+    #[test]
+    fn the_content_master_row_init_runs_with_no_tokio_runtime_on_the_thread() {
+        use crate::federation::BlobStorage as _;
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "premise: this test must run with no runtime current"
+        );
+        let path = temp_db_path("no-runtime-content-master");
+        block_on_without_a_runtime(async {
+            let backend = SqliteBackend::open(&path).await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let row = backend
+                .load_or_init_content_master_row()
+                .await
+                .expect("row init with no runtime");
+            assert!(
+                row.key_kind == "software" || row.key_kind == "hardware",
+                "got {:?}",
+                row.key_kind
+            );
         });
     }
 

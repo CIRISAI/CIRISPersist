@@ -48,6 +48,9 @@ pub mod sqlite;
 /// `FSD/SQLITE_CONNECTION_MODEL.md`.
 #[cfg(feature = "sqlite")]
 pub mod sqlite_conn_model;
+/// v50.0.0 (PR #921 review) — test-only hooks inside a backend's own door.
+#[cfg(test)]
+pub(crate) mod test_hooks;
 pub mod types;
 
 pub use backend::{Backend, InsertReport, PublicKeySample};

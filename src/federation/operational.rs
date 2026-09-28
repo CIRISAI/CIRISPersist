@@ -3518,7 +3518,7 @@ pub mod test_support {
     /// its deterministic `sign_envelope` pubkeys ([`register_typed_key`]), since
     /// both federation-tier ingest and the family-quorum count resolve each
     /// scrub key from the DIRECTORY.
-    fn co_signed_trust_attestation(
+    pub(crate) fn co_signed_trust_attestation(
         id: &str,
         attester: &str,
         attested: &str,
@@ -4663,7 +4663,7 @@ pub mod test_support {
     /// The un-trust lever and the TTL contributor in one row: this is the edge
     /// a withdrawal tombstones and the edge whose `expires_at` bounds the
     /// cached verdict.
-    async fn emit_trust_edge(
+    pub(crate) async fn emit_trust_edge(
         directory: &dyn crate::federation::FederationDirectory,
         from: &str,
         root: &str,
@@ -4696,7 +4696,7 @@ pub mod test_support {
 
     /// v24.1.0 (CIRISPersist#561) — tombstone `attestation_id` with a
     /// `withdraws` composer authored by `attester` (the CEG un-trust act).
-    async fn withdraw_attestation(
+    pub(crate) async fn withdraw_attestation(
         directory: &dyn crate::federation::FederationDirectory,
         attester: &str,
         subject: &str,

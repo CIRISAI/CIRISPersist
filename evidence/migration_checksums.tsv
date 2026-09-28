@@ -299,3 +299,7 @@ sqlite	155	group_supersede_proof	6245808473797147341
 postgres	155	group_supersede_proof	1139871493860484940
 sqlite	156	community_membership_listings	13268194549044074155
 postgres	156	community_membership_listings	3786676817650541590
+sqlite	157	withdraws_admission_depth	12156340618215052621
+postgres	157	withdraws_admission_depth	12463337010685569261
+sqlite	158	community_cosignatures	213348730017454975
+postgres	158	community_cosignatures	10172012065790018845

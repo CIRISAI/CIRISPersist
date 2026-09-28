@@ -54,6 +54,9 @@ pub mod blobs;
 pub mod bootstrap_admission;
 pub mod canonical_at_rest;
 pub mod capacity;
+// v50.0.0 (CIRISPersist#926) — the `ciris-canonical` community row: admitted
+// under the accord's quorum, served beside the GenesisBundle (CC 3.2 / 5.3.4).
+pub mod canonical_community;
 pub mod cohort;
 pub mod consensus;
 // CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
@@ -126,6 +129,9 @@ pub mod listing_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
+/// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
+#[cfg(test)]
+pub mod rc5_adopts_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
@@ -136,12 +142,31 @@ pub mod room_roster_invariants;
 pub mod scope_classifier_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+/// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
+#[cfg(test)]
+pub mod sweep_placement_invariants;
 /// v47.3.0 (CIRISPersist#901) — I154–I158: a root is as attested as its holders.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod trust_root_hardware_invariants;
 // v49.0.0 (CIRISPersist#915) — I185, Android generation custody.
 #[cfg(test)]
 mod android_custody_invariants;
+// v50.0.0 (CIRISPersist#920) — I187, the MLS-state root follows the content
+// master, through `Engine::open_mls_state` on every backend that has the row.
+#[cfg(all(test, feature = "encrypted-kv"))]
+mod mls_state_root_invariants;
+// v50.0.0 (CIRISPersist#916) — I188, a member's new device gets what the member holds.
+// sqlite and postgres only: the memory backend has no community DEK plane, so a
+// build with neither feature (the `server` axis) has no runner and the bodies
+// would be dead code under `-D warnings`.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod device_readd_invariants;
+// v50.0.0 (CIRISPersist#917) — I189, the attributed sync door's typed outcome.
+#[cfg(test)]
+mod synced_door_invariants;
+// v50.0.0 (CIRISPersist#926) — I190, the ciris-canonical community row (ruling b).
+#[cfg(test)]
+pub(crate) mod canonical_community_invariants;
 // (CIRISPersist#612) — the `content_class:*` flag-plane read predicate. The
 // write door is open by constitutional decision (#571 / CC 3.3.12); this is
 // where the discrimination lives.
@@ -307,6 +332,39 @@ pub struct ConsentSweepReport {
     /// this cut it replicated exactly like `share`. Each is logged by id.
     #[serde(default)]
     pub declined_by_principle: u64,
+    /// v50.0.0 (CIRISPersist#924 review, MEDIUM-3) — rows a live grant's
+    /// PREFIX covers but whose dimension the CC 3.1.7 R3 grammar refuses
+    /// (`consent_grammar::covers` requires a refusal-free
+    /// [`match_family`](namespace::matcher::match_family)). Typically a row
+    /// stored before v50 on a pre-rc5 shape (`capacity:composite` with no
+    /// version, an uppercase leaf, a closed-leaf `accord:` spelling). The sweep
+    /// never promotes or widens such a row — consent only ever NARROWS onto
+    /// the grammar — so it is counted here rather than silently passed over.
+    #[serde(default)]
+    pub skipped_unmatched_dimension: u64,
+    /// Up to [`ConsentSweepReport::UNMATCHED_EXAMPLES`] of those dimensions,
+    /// verbatim, first seen first, so an operator can see WHICH shapes were
+    /// stranded.
+    #[serde(default)]
+    pub unmatched_dimension_examples: Vec<String>,
+}
+
+impl ConsentSweepReport {
+    /// The cap on [`Self::unmatched_dimension_examples`].
+    pub const UNMATCHED_EXAMPLES: usize = 8;
+
+    /// Count a row a grant's prefix covers but the grammar refuses.
+    pub fn note_unmatched_dimension(&mut self, dimension: &str) {
+        self.skipped_unmatched_dimension += 1;
+        if self.unmatched_dimension_examples.len() < Self::UNMATCHED_EXAMPLES
+            && !self
+                .unmatched_dimension_examples
+                .iter()
+                .any(|d| d == dimension)
+        {
+            self.unmatched_dimension_examples.push(dimension.to_owned());
+        }
+    }
 }
 
 pub mod register;
@@ -511,6 +569,7 @@ pub use replication::hold::{
 // `Error::ConsentGateRefused` carries these, so a consumer must not have to
 // name a path into `admission` to match on the error it was handed.
 pub use admission::{ConsentGateRefused, ConsentGatedClaim, ConsentGatedFamily};
+pub use group_amendment::{CommunityDoor, ReplicatedCommunityOutcome, ReplicatedCommunityRefusal};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,
@@ -542,9 +601,10 @@ pub use tier_ingest::{
     verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
 };
 pub use topology::{
-    build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
-    DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
-    WithdrawalEntry, MAX_DELEGATION_DEPTH,
+    build_delegation_graph, build_trust_topology, effective_delegation_depth, AuditChainEntry,
+    AuditChainProof, DelegationDepthOutcome, DelegationEdge, DelegationGraph, EdgeType,
+    FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology, WithdrawalEntry,
+    DEFAULT_DELEGATION_DEPTH, MAX_DELEGATION_DEPTH,
 };
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
@@ -685,6 +745,36 @@ pub const ROSTER_CONSENSUS_UNEVALUABLE: &str = "roster_consensus_unevaluable";
 /// with other active members and no active founder.
 pub const ROSTER_LAST_FOUNDER: &str = "roster_last_founder";
 
+/// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the device carries
+/// no live owner-binding here: nobody is responsible for it, so no member's
+/// history can be handed to it. RETRYABLE: the out-of-order case — the owner's
+/// binding may not have replicated to this node yet.
+pub const DEVICE_REKEY_RULE_UNBOUND: &str = "device_rekey_unbound";
+/// v50.0.0 (CIRISPersist#916) — the device's live owner-binding names someone
+/// other than the member: another person's machine.
+pub const DEVICE_REKEY_RULE_OWNER_MISMATCH: &str = "device_rekey_owner_mismatch";
+/// v50.0.0 (CIRISPersist#916) — the offered authority is not the device's
+/// owner: the binding speaks for the human, and only the human adds a device.
+pub const DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER: &str = "device_rekey_authority_not_owner";
+/// v50.0.0 (CIRISPersist#916 review) — the device is not an ACTIVE identity
+/// occurrence of the member: a node the member owns but does not speak through
+/// (infrastructure operated for others) is not their device and receives none
+/// of their history. RETRYABLE: the occurrence may not have replicated yet.
+pub const DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE: &str = "device_rekey_not_an_occurrence";
+/// v50.0.0 (CIRISPersist#916 review, N1) — the backend does not know this
+/// node's own key (`node_key_id()` unset: a host that never told it), so it
+/// cannot tell its own epochs from a peer's. Refused rather than misreported;
+/// RETRYABLE once the host sets the key (every `Engine` constructor and
+/// PyEngine's init do).
+pub const DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN: &str = "device_rekey_node_key_unknown";
+/// v50.0.0 (CIRISPersist#916) — the member is not on the room's authorized
+/// roster at the call's instant: a removed member's new device gets nothing.
+pub const DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE: &str = "device_rekey_member_not_active";
+/// v50.0.0 (CIRISPersist#916) — the device has no valid content-KEM
+/// `encryption_pubkeys`: there is nothing to wrap to, and there is no
+/// plaintext fallback (§10.1.4).
+pub const DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS: &str = "device_rekey_no_encryption_pubkeys";
+
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
 /// state a standing question is asked against: each key that has appeared, and
 /// whether its latest applied event left it active.
@@ -701,19 +791,69 @@ pub struct RosterRules<'a> {
     pub subkind: Option<&'a str>,
     /// The record's `policy_blob`.
     pub policy_blob: Option<&'a serde_json::Value>,
+    /// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — the
+    /// group's `node`-bearing keys WITH the instants they bear `node`,
+    /// resolved from the roster reads by [`community_node_bearing_seats`]. The
+    /// fold asks [`NodeBearingSeats::at`] at each event's `effective_at`; it
+    /// never re-reads the directory itself.
+    pub node_bearing: &'a NodeBearingSeats,
 }
 
+/// A half-open `[start, end)` interval; `None` end = still open.
+pub type InstantInterval = (
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// v50.0.0 (CIRISPersist#925, review item 5) — which keys bear `node`, and
+/// WHEN. Two sources, judged differently:
+///
+/// - `own`: the key's own `identity_type` contains `node`. Fixed at mint — no
+///   door moves `node` in or out of a stored record (Clause A and the
+///   rewrite-door refusal, review H3) — so it holds at every instant.
+/// - `occurrence`: the key is an occurrence of a `node` identity, by its own
+///   agreement ([`occurrence_agreed_to`]). A binding is a RELATION with a start
+///   (the signed `asserted_at`) and an end (a revocation's `effective_at`, or
+///   `valid_until`), the same kind of thing as a `moderate` delegation, so it
+///   is judged AT THE CHANGE'S INSTANT (v49, `FSD/ROOM_ROSTER_AUTHORITY.md`
+///   §2–§3, I175/I175b: live at the act's instant; no ending is retroactive).
+///   A node-local `admitted_at` is never used: it depends on delivery order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeBearingSeats {
+    /// Keys whose own `identity_type` holds `node`.
+    pub own: std::collections::BTreeSet<String>,
+    /// Per key, the intervals it is an agreed occurrence of a `node` identity.
+    pub occurrence: std::collections::BTreeMap<String, Vec<InstantInterval>>,
+}
+
+impl NodeBearingSeats {
+    /// Does `key` bear `node` at `t`?
+    #[must_use]
+    pub fn at(&self, key: &str, t: chrono::DateTime<chrono::Utc>) -> bool {
+        self.own.contains(key)
+            || self.occurrence.get(key).is_some_and(|ivs| {
+                ivs.iter()
+                    .any(|(start, end)| *start <= t && end.is_none_or(|e| t < e))
+            })
+    }
+}
+
+/// The empty `node`-bearing set: a group whose rules never read it (a family,
+/// or a community that is not `infrastructure`).
+pub static NO_NODE_BEARING_SEATS: NodeBearingSeats = NodeBearingSeats {
+    own: std::collections::BTreeSet::new(),
+    occurrence: std::collections::BTreeMap::new(),
+};
+
 impl<'a> RosterRules<'a> {
-    /// The rules a stored community declares.
-    pub fn of_community(c: &'a Community) -> Self {
+    /// The rules a stored community declares, with its `node`-bearing seats
+    /// ([`community_node_bearing_seats`]).
+    pub fn of_community(c: &'a Community, node_bearing: &'a NodeBearingSeats) -> Self {
         Self {
             protocol: &c.consensus_protocol,
-            subkind: c
-                .policy_blob
-                .as_ref()
-                .and_then(|b| b.get("cohort_subkind"))
-                .and_then(|v| v.as_str()),
+            subkind: community_subkind(c),
             policy_blob: c.policy_blob.as_ref(),
+            node_bearing,
         }
     }
 
@@ -726,8 +866,199 @@ impl<'a> RosterRules<'a> {
             protocol: &f.consensus_protocol,
             subkind: None,
             policy_blob: None,
+            node_bearing: &NO_NODE_BEARING_SEATS,
         }
     }
+}
+
+/// A community's `policy_blob.cohort_subkind`, if any.
+#[must_use]
+pub fn community_subkind(c: &Community) -> Option<&str> {
+    c.policy_blob
+        .as_ref()
+        .and_then(|b| b.get("cohort_subkind"))
+        .and_then(|v| v.as_str())
+}
+
+/// v50.0.0 (CIRISPersist#925, CC 3.2 "Infrastructure does not vote") — is
+/// `key_id` a `node`-bearing key NOW? [`is_node_bearing_key_at`] at the
+/// current instant: the admission doors judge a record being put now.
+pub async fn is_node_bearing_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    is_node_bearing_key_at(directory, key_id, chrono::Utc::now()).await
+}
+
+/// v50.0.0 (CIRISPersist#925, review item 5) — is `key_id` `node`-bearing at
+/// `t`? See [`NodeBearingSeats`] for the two sources and why the occurrence
+/// half is judged at an instant.
+pub async fn is_node_bearing_key_at<F>(
+    directory: &F,
+    key_id: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(node_bearing_at_with_next(directory, key_id, t).await?.0)
+}
+
+/// v50.0.0 (CIRISPersist#926 round 9) — [`is_node_bearing_key_at`] plus the
+/// earliest interval edge STRICTLY after `t` (an `asserted_at`, a `valid_until`
+/// or a revocation `effective_at`): the instant at which the answer at `t`
+/// may next change. A verdict cached from `t` holds only until then.
+pub async fn node_bearing_at_with_next<F>(
+    directory: &F,
+    key_id: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let (own, intervals) = node_bearing_of(directory, key_id).await?;
+    let bearing = own
+        || intervals
+            .iter()
+            .any(|(start, end)| *start <= t && end.is_none_or(|e| t < e));
+    let next = intervals
+        .iter()
+        .flat_map(|(start, end)| std::iter::once(*start).chain(*end))
+        .filter(|edge| *edge > t)
+        .min();
+    Ok((bearing, next))
+}
+
+/// v50.0.0 (CIRISPersist#925, review H1 + item 5) — `key_id`'s own `node`
+/// bearing and the intervals it is an agreed occurrence of a `node` identity.
+///
+/// # Agreement (review H1)
+///
+/// An occurrence row is admitted when its signer is the IDENTITY itself
+/// (`check_signer_acts_for`), so the occurrence never has to consent: any
+/// registered `node` key N could sign `{identity: N, occurrence: H}` for a
+/// human founder H and strip H's vote. So a binding counts only when the
+/// occurrence itself signed its binding ([`occurrence_agreed_to`]). A trusted-local
+/// (unsigned) row carries no agreement. #873's principal resolver
+/// ([`FederationDirectory::active_identities_for_occurrence`]) has the same
+/// unilateral-claim shape and is a follow-up (FSD `SECOND_DEVICE.md` §8.5).
+///
+/// # The interval (review item 5)
+///
+/// Every stored binding of `key_id` under a `node` identity it agreed to
+/// contributes `[asserted_at, end)`, `end` the earliest of its `valid_until`
+/// and the `effective_at` of any revocation of it that is in force against
+/// this assertion (`effective_at >= asserted_at`, the #421 re-establishment
+/// rule). The occurrence plane stores the LATEST assertion per pair, so a
+/// re-assertion moves the start forward; see FSD §8.5 for that residual.
+pub async fn node_bearing_of<F>(
+    directory: &F,
+    key_id: &str,
+) -> Result<(bool, Vec<InstantInterval>), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let has_node = |rec: &KeyRecord| {
+        types::identity_type::set_contains(&rec.identity_type, types::identity_type::NODE)
+    };
+    if directory
+        .lookup_public_key(key_id)
+        .await?
+        .is_some_and(|rec| has_node(&rec))
+    {
+        return Ok((true, Vec::new()));
+    }
+    let mut intervals = Vec::new();
+    for row in directory
+        .list_identity_occurrences_by_occurrence_key(key_id)
+        .await?
+    {
+        if row.identity_key_id == key_id {
+            continue;
+        }
+        let node_identity = directory
+            .lookup_public_key(&row.identity_key_id)
+            .await?
+            .is_some_and(|rec| has_node(&rec));
+        if !node_identity || !occurrence_agreed_to(directory, &row.identity_key_id, key_id).await? {
+            continue;
+        }
+        let revoked = directory
+            .list_identity_occurrence_revocations_for(&row.identity_key_id)
+            .await?
+            .into_iter()
+            .filter(|r| r.occurrence_key_id == key_id && r.effective_at >= row.asserted_at)
+            .map(|r| r.effective_at)
+            .min();
+        let end = match (revoked, row.valid_until) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        intervals.push((row.asserted_at, end));
+    }
+    Ok((false, intervals))
+}
+
+/// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself agree to be
+/// an occurrence of `identity`? Yes only when a stored SIGNED occurrence row for
+/// the pair was signed by `occurrence`. An identity's unilateral claim over a
+/// key is not agreement.
+pub async fn occurrence_agreed_to<F>(
+    directory: &F,
+    identity: &str,
+    occurrence: &str,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let signed_by_occurrence = directory
+        .list_signed_identity_occurrences_for(identity)
+        .await?
+        .iter()
+        .any(|s| {
+            s.identity_occurrence.occurrence_key_id == occurrence
+                && s.attesting_key_id == occurrence
+        });
+    // v50.0.0 (review, final check) — no owner-binding arm. An owner-binding
+    // is signed by the OWNER over the key, so it is the identity's own claim
+    // again; it could only fire for a pre-gate fused identity, where it would
+    // be unilateral exactly as H1's row is.
+    Ok(signed_by_occurrence)
+}
+
+/// v50.0.0 (CIRISPersist#925) — the `node`-bearing keys among every key that
+/// is ever a member of `community` (the record's members and every widened
+/// member), for [`RosterRules::node_bearing`]. Empty — and no read is made —
+/// unless the community is `infrastructure`: the rule is CC 3.2's, scoped to
+/// that subkind.
+pub async fn community_node_bearing_seats<F>(
+    directory: &F,
+    community: &Community,
+) -> Result<NodeBearingSeats, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = NodeBearingSeats::default();
+    if community_subkind(community) != Some(admission::COHORT_SUBKIND_INFRASTRUCTURE) {
+        return Ok(out);
+    }
+    let mut keys: std::collections::BTreeSet<String> =
+        community.members.iter().map(|m| m.key_id.clone()).collect();
+    for w in directory
+        .list_community_membership_widenings_for(&community.community_key_id)
+        .await?
+    {
+        keys.insert(w.member_key_id);
+    }
+    for k in keys {
+        let (own, intervals) = node_bearing_of(directory, &k).await?;
+        if own {
+            out.own.insert(k);
+        } else if !intervals.is_empty() {
+            out.occurrence.insert(k, intervals);
+        }
+    }
+    Ok(out)
 }
 
 /// v49.0.0 (CIRISPersist#910) — a family roster entry in the fold's member
@@ -788,7 +1119,14 @@ pub fn roster_event_standing(
     state: &RosterState,
     e: &RosterEvent,
 ) -> Result<(), (&'static str, String)> {
-    let is_active_founder = |k: &str| matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER));
+    // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing seat (at this
+    // event's instant) holds no founder power in an infrastructure group,
+    // the last-founder rule included: it is not a founder that could be lost,
+    // and it does not count as the founder a change leaves behind.
+    let is_active_founder = |k: &str| {
+        matches!(state.get(k), Some((true, m)) if m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER))
+            && !rules.node_bearing.at(k, e.effective_at)
+    };
     // Standing without the protocol: a legacy row (admitted before signers
     // were stored); a member leaving on their own signature; a named
     // moderator whose appointment was live at this event's instant and was
@@ -806,6 +1144,7 @@ pub fn roster_event_standing(
             .map(|(_, m)| consensus::Seat {
                 key_id: m.key_id.clone(),
                 role: m.role.clone(),
+                node_bearing: rules.node_bearing.at(&m.key_id, e.effective_at),
             })
             .collect();
         match consensus::evaluate(&consensus::Ballot {
@@ -840,12 +1179,8 @@ pub fn roster_event_standing(
         && (!e.is_add || e.member.role.as_deref() != Some(admission::MEMBER_ROLE_FOUNDER));
     if loses_founder {
         let founders_after = state
-            .iter()
-            .filter(|(k, (active, m))| {
-                *active
-                    && k.as_str() != e.member.key_id
-                    && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
-            })
+            .keys()
+            .filter(|k| k.as_str() != e.member.key_id && is_active_founder(k))
             .count();
         let others_after = state
             .iter()
@@ -1065,6 +1400,46 @@ fn root_authority_intervals(
     for (k, start) in open {
         out.entry(k).or_default().push((start, None));
     }
+    // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing founder holds
+    // no founder POWER in an infrastructure group: the instants it bears
+    // `node` are cut out of its authority, so it roots no `moderate` chain
+    // then (`moderator_roots_at` reads only these intervals).
+    for (k, ivs) in out.iter_mut() {
+        if rules.node_bearing.own.contains(k) {
+            ivs.clear();
+        } else if let Some(cut) = rules.node_bearing.occurrence.get(k) {
+            *ivs = subtract_intervals(ivs, cut);
+        }
+    }
+    out
+}
+
+/// `ivs` minus every interval in `cut` (all half-open `[start, end)`).
+fn subtract_intervals(ivs: &[InstantInterval], cut: &[InstantInterval]) -> Vec<InstantInterval> {
+    let mut out: Vec<InstantInterval> = ivs.to_vec();
+    for &(cs, ce) in cut {
+        let mut next = Vec::with_capacity(out.len() + 1);
+        for (s, e) in out {
+            // The part before the cut.
+            if s < cs {
+                let end = match e {
+                    Some(e) if e <= cs => Some(e),
+                    _ => Some(cs),
+                };
+                next.push((s, end));
+            }
+            // The part after the cut.
+            if let Some(ce) = ce {
+                if e.is_none_or(|e| e > ce) {
+                    next.push((s.max(ce), e));
+                }
+            }
+        }
+        out = next
+            .into_iter()
+            .filter(|(s, e)| e.is_none_or(|e| *s < e))
+            .collect();
+    }
     out
 }
 
@@ -1219,8 +1594,11 @@ where
         let dir = directory.as_dyn_directory();
         let mut out = std::collections::BTreeSet::new();
         for (k, (active, m)) in &state0 {
+            // v50.0.0 (CIRISPersist#925 review M2) — a `node`-bearing founder
+            // is no duty-holder.
             if *active
                 && m.role.as_deref() == Some(admission::MEMBER_ROLE_FOUNDER)
+                && !rules.node_bearing.at(k, now)
                 && Box::pin(admission::is_steward_bound(dir, k)).await?
             {
                 out.insert(k.clone());
@@ -1258,6 +1636,7 @@ where
 pub async fn community_roster_events<F>(
     directory: &F,
     community: &Community,
+    node_bearing: &NodeBearingSeats,
 ) -> Result<Vec<RosterEvent>, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -1295,7 +1674,7 @@ where
         cohort::Cohort::Community,
         id,
         &community.members,
-        RosterRules::of_community(community),
+        RosterRules::of_community(community, node_bearing),
         stored,
         &signers,
         Some(&roots),
@@ -1399,8 +1778,9 @@ pub async fn authorized_community_roster_spans_at<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let events = Box::pin(community_roster_events(directory, community)).await?;
-    let rules = RosterRules::of_community(community);
+    let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
+    let events = Box::pin(community_roster_events(directory, community, &nodes)).await?;
+    let rules = RosterRules::of_community(community, &nodes);
     let spans = authorized_roster_spans_at(&community.members, rules, &events, as_of);
     Ok(
         authorized_roster_at(&community.members, rules, &events, as_of)
@@ -1425,10 +1805,11 @@ where
 {
     // Boxed: the replay nests the moderator walk and the reverse-quorum
     // fold; a caller's future must not inline all of it (2 MiB worker stacks).
-    let events = Box::pin(community_roster_events(directory, community)).await?;
+    let nodes = Box::pin(community_node_bearing_seats(directory, community)).await?;
+    let events = Box::pin(community_roster_events(directory, community, &nodes)).await?;
     Ok(authorized_roster_at(
         &community.members,
-        RosterRules::of_community(community),
+        RosterRules::of_community(community, &nodes),
         &events,
         as_of,
     ))
@@ -1521,7 +1902,22 @@ where
     let Some(community) = directory.lookup_community(community_key_id).await? else {
         return Ok(());
     };
-    let events = Box::pin(community_roster_events(directory, &community)).await?;
+    // v50.0.0 (CIRISPersist#926, HIGH-3 ruling) — a trust-root community's
+    // founder seats move ONLY through the record (a founders' amendment); the
+    // planes admit and remove members only, whoever signs.
+    if canonical_community::is_trust_root_grade(&community) {
+        Box::pin(canonical_community::check_trust_root_roster_change(
+            directory,
+            &community,
+            signers,
+            &incoming,
+            is_revocation,
+            effective_at,
+        ))
+        .await?;
+    }
+    let nodes = Box::pin(community_node_bearing_seats(directory, &community)).await?;
+    let events = Box::pin(community_roster_events(directory, &community, &nodes)).await?;
     let roots = founder_candidates(
         &community,
         &directory
@@ -1532,7 +1928,7 @@ where
         directory,
         community_key_id,
         &community.members,
-        RosterRules::of_community(&community),
+        RosterRules::of_community(&community, &nodes),
         events,
         Some(roots),
         primary,
@@ -1634,6 +2030,34 @@ where
         Ok(v) => Ok(v),
         Err(Error::InvalidArgument(_)) => Ok(community.members.clone()),
         Err(e) => Err(e),
+    }
+}
+
+/// v50.0.0 (CIRISPersist#916) — `(owner, device)` when `row` is an owner-binding
+/// `delegates_to(owner → device)`, the row a receive door re-wraps on.
+pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
+    (row.attestation_type == types::attestation_type::DELEGATES_TO
+        && admission::is_owner_binding_envelope(&row.attestation_envelope)
+        && !row.attested_key_id.is_empty())
+    .then(|| (row.attesting_key_id.clone(), row.attested_key_id.clone()))
+}
+
+/// v50.0.0 (CIRISPersist#916) — run
+/// [`FederationDirectory::rewrap_own_epochs_for_device`] after a receive door
+/// admitted its row. The row stands whatever happens here: a failure is
+/// logged and the pending-`KeyGrant` sweep retries the walk.
+pub(crate) async fn rewrap_after_admission<F>(directory: &F, owner: &str, device: &str)
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Err(e) = directory.rewrap_own_epochs_for_device(owner, device).await {
+        tracing::warn!(
+            error = %e,
+            owner = %owner,
+            device = %device,
+            "admitted; re-wrap of this node's epochs to the device failed and is left to the \
+             pending-KeyGrant sweep (#916)"
+        );
     }
 }
 
@@ -1985,6 +2409,27 @@ pub trait FederationDirectory: Send + Sync {
     /// invent one.
     fn node_key_id(&self) -> Option<String> {
         None
+    }
+
+    /// v50.0.0 (CIRISPersist#928, review H2) — the delegation depth this
+    /// node's `withdraws` write gate walks rules 3/4 at: the CC 4.1.1 default
+    /// unless the host opted in (backends: `set_withdraws_delegation_depth`),
+    /// never past the 16 ceiling.
+    fn withdraws_delegation_depth(&self) -> usize {
+        topology::DEFAULT_DELEGATION_DEPTH
+    }
+
+    /// v50.0.0 (CIRISPersist#928, review H2, V157) — the depth a stored
+    /// `withdraws` was admitted under, as recorded at admission. `None` when
+    /// nothing was recorded: a row stored before V157 (backfilled with 16) or
+    /// by a door that records nothing, which the read-time re-derivation takes
+    /// as the 16 ceiling — the only depth such a row can have been admitted at.
+    async fn withdraws_admission_depth(
+        &self,
+        attestation_id: &str,
+    ) -> Result<Option<usize>, Error> {
+        let _ = attestation_id;
+        Ok(None)
     }
 
     /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated
@@ -2355,6 +2800,26 @@ pub trait FederationDirectory: Send + Sync {
             .await
     }
 
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **re-wrap this
+    /// node's own community-DEK epochs to `device`, a device of `owner`**.
+    /// The receive doors call it after admitting what makes a device a
+    /// member's — an owner-binding
+    /// ([`apply_replicated_attestation`](Self::apply_replicated_attestation),
+    /// [`put_attestation_synced`](Self::put_attestation_synced)) or a signed
+    /// occurrence (`put_identity_occurrence`) — so every host reaches it
+    /// without a signer: it writes grant rows only, and each written grant
+    /// leaves its epoch DIRTY in the V146 emission ledger, which the
+    /// pending-`KeyGrant` loop every host runs signs and emits.
+    ///
+    /// The default is a no-op: a directory with no community-DEK plane has no
+    /// epochs to re-wrap. The sqlite and postgres backends run
+    /// [`at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices`](crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices)
+    /// under their node key (none set: nothing is theirs to re-wrap).
+    async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
+        let _ = (owner, device);
+        Ok(())
+    }
+
     /// v41.0.0 (CIRISPersist#804) — **the privileged SYNC door**: admit a row
     /// delivered over a session the transport authenticated as
     /// `authenticated_peer_key_id`.
@@ -2378,12 +2843,49 @@ pub trait FederationDirectory: Send + Sync {
     /// Not safe to expose across a wire: reaching this means in-process code
     /// on this node, the same boundary that lets that code write to storage
     /// directly.
+    ///
+    /// # v50.0.0 (CIRISPersist#917) — BREAKING: the typed pre-write outcome
+    ///
+    /// Returns [`attestation_apply::ReplicatedAttestationOutcome`] — the SAME
+    /// enum [`Self::apply_replicated_attestation`] returns, decided by the
+    /// SAME body ([`attestation_apply::apply_planned`]) over
+    /// `(existing, incoming)`, so the same bytes yield the same variant on
+    /// both doors:
+    ///
+    /// - absent id ⇒ `Inserted` (or `Deduplicated`, the §6.1 composer replay);
+    /// - byte-identical re-delivery ⇒ `Unchanged`;
+    /// - same signed assertion and producer, different unsigned decoration ⇒
+    ///   `Refused { AlreadyPresentIdentical }` — a duplicate, never a
+    ///   conflict;
+    /// - a different signed row under the id ⇒
+    ///   `Refused { ConflictingAttestation }`;
+    /// - a lost plan/act race ⇒ `Refused { StoreConflict }` (transient).
+    ///
+    /// The previous shape — `Ok(AttestationOutcome::AlreadyHeld)` for equal
+    /// `persist_row_hash`, a bare `Err(Error::Conflict)` for everything else
+    /// under an occupied id — is REMOVED (clean break). That verdict could
+    /// not tell decoration from disagreement, so CIRISEdge booked a
+    /// decoration-only re-delivery as a refusal on this door and as a
+    /// duplicate on the unattributed one.
+    ///
+    /// The peer and its metering are unchanged: an admitted fresh row is
+    /// written through [`Self::put_attestation_with_origin`] with
+    /// `WriteOrigin::Sync`, which decides the cohort question as above and
+    /// refuses a stranger over budget with the same
+    /// [`Error::RateLimited`] as before. A row the plan resolves against the
+    /// stored one (`Unchanged` / `Refused`) is decided before that door and
+    /// charges no budget — exactly as on the unattributed door, which any
+    /// caller already reaches.
+    ///
+    /// [`AttestationOutcome`] stays the return of the local doors
+    /// ([`Self::put_attestation`], [`Self::put_attestation_authored`]).
     async fn put_attestation_synced(
         &self,
         attestation: SignedAttestation,
         authenticated_peer_key_id: &str,
-    ) -> Result<AttestationOutcome, Error> {
-        self.put_attestation_with_origin(
+    ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
+        attestation_apply::apply_planned(
+            self,
             attestation,
             replication::admission::WriteOrigin::Sync {
                 peer_key_id: authenticated_peer_key_id.to_owned(),
@@ -2436,52 +2938,12 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         attestation: SignedAttestation,
     ) -> Result<attestation_apply::ReplicatedAttestationOutcome, Error> {
-        use attestation_apply::{
-            plan_replicated_attestation_apply, AttestationRefusalReason,
-            ReplicatedAttestationOutcome as Outcome, ReplicatedAttestationPlan as Plan,
-        };
-        let incoming = &attestation.attestation;
-        let attestation_id = incoming.attestation_id.clone();
-        // The §6.1 silent-no-op door only exists for structural composers
-        // that actually carry a references target — precompute the predicate
-        // while `incoming` is still borrowed.
-        let dedup_possible = precedence::is_structural_composer(&incoming.attestation_type)
-            && precedence::references_attestation_id_from_envelope(&incoming.attestation_envelope)
-                .is_some();
-        let planned = match self.get_attestation(&attestation_id).await {
-            Ok(existing) => Some(plan_replicated_attestation_apply(
-                existing.as_ref(),
-                incoming,
-            )?),
-            // The #603 arm: this directory cannot answer, so apply plan-free.
-            Err(Error::Unsupported { .. }) => None,
-            // Every other failure is *could not ask*, which is never *absent*.
-            Err(e) => return Err(e),
-        };
-        match planned {
-            Some(Plan::Unchanged) => return Ok(Outcome::Unchanged),
-            Some(Plan::Refused { reason }) => return Ok(Outcome::Refused { reason }),
-            Some(Plan::Insert) | None => {}
-        }
-        match self.put_attestation(attestation).await {
-            Ok(_) => {
-                // §6.1: a structural-composer replay is a silent `Ok` with NO
-                // row written. Ask the store what it actually did, so
-                // `Inserted` keeps meaning inserted. Skipped on the plan-free
-                // fallback (this directory cannot be asked).
-                if dedup_possible
-                    && planned.is_some()
-                    && self.get_attestation(&attestation_id).await?.is_none()
-                {
-                    return Ok(Outcome::Deduplicated);
-                }
-                Ok(Outcome::Inserted)
-            }
-            Err(e) if e.is_duplicate_key() => Ok(Outcome::Refused {
-                reason: AttestationRefusalReason::StoreConflict,
-            }),
-            Err(e) => Err(e),
-        }
+        attestation_apply::apply_planned(
+            self,
+            attestation,
+            replication::admission::WriteOrigin::Wire,
+        )
+        .await
     }
 
     /// v4.4.0 (CIRISPersist#171, CEG §10.1.3) — **upsert** a local-tier
@@ -2657,6 +3119,17 @@ pub trait FederationDirectory: Send + Sync {
     /// `list_stranded_federation_attestations` (#530): those rows are not
     /// stranded, they are the CC 5.2 shape — this page is what
     /// `Engine::promote_consented_backlog` widens when a grant covers them.
+    ///
+    /// v50.0.0 — **stranded rows only — a row naming a cohort target is
+    /// placed, never a candidate (CIRISPersist#919).** A row whose signed
+    /// envelope names a target
+    /// ([`admission::envelope_names_cohort_target`]: any populated
+    /// [`admission::COHORT_TARGET_ENVELOPE_FIELDS`] member, or a blob
+    /// pointer's non-empty owner slot — how a self file row names its room)
+    /// had its audience chosen by its emitter; a covering grant does not
+    /// re-place it. Every
+    /// backend applies the exclusion INSIDE the page (before `LIMIT`), so the
+    /// keyset walk is unchanged.
     async fn list_widening_candidates(
         &self,
         after_attestation_id: Option<&str>,
@@ -3875,9 +4348,53 @@ pub trait FederationDirectory: Send + Sync {
     /// content normally.
     async fn put_community(&self, community: SignedCommunity) -> Result<(), Error>;
 
+    /// v50.0.0 (CIRISPersist#925/#931, review) — the REPLICATED community
+    /// entry, distinct from the local [`Self::put_community`] door. A record
+    /// received from a peer: an identical re-put is `Unchanged`; a legacy
+    /// non-conformant `infrastructure` record is admitted as DATA (the fold's
+    /// gates apply — a `node`-bearing founder's seat does not vote); an
+    /// occupied id with a supersede proof routes through the amendment checks.
+    /// The local door runs the full CC 3.2 infrastructure gate whoever signed;
+    /// this one does not. Every outcome is typed `Ok` except a hard error.
+    /// Default: [`Error::Unsupported`]; the backends and the capsule override.
+    async fn apply_replicated_community(
+        &self,
+        community: types::SignedCommunity,
+    ) -> Result<ReplicatedCommunityOutcome, Error> {
+        let _ = community;
+        Err(Error::Unsupported {
+            method: "apply_replicated_community",
+        })
+    }
+
     /// v4.0 — fetch a single community by `community_key_id`. Returns
     /// `None` if absent. Structural mirror of [`Self::lookup_family`].
     async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error>;
+
+    /// v50.0.0 (CIRISPersist#926 re-check, MEDIUM-C) — this directory's
+    /// cache of trust-root standings
+    /// ([`canonical_community::stored_standing`]), keyed on a digest of every
+    /// input the verdict reads. `None` (no caching) by default; each real
+    /// backend holds its own — never one shared across directories.
+    fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
+        None
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — one community's SIGNED row as this node
+    /// stores it (authority signature, co-signatures, supersede proof), by
+    /// point read. `None` when absent or stored unsigned. The trust-root reads
+    /// ([`canonical_community`]) re-derive the accord quorum from it. Default
+    /// `Unsupported`; every real backend overrides (a caller falls back to the
+    /// signed since-plane).
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<SignedCommunity>, Error> {
+        let _ = community_key_id;
+        Err(Error::Unsupported {
+            method: "lookup_signed_community",
+        })
+    }
 
     /// v4.0 — list every community that `member_identity_key_id`
     /// belongs to. Structural mirror of
@@ -5589,6 +6106,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Community,
             new,
             authorization,
+            false,
         )
         .await
     }
@@ -5610,6 +6128,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Affiliations,
             new,
             authorization,
+            false,
         )
         .await
     }
@@ -5744,6 +6263,9 @@ pub trait FederationDirectory: Send + Sync {
                     .map(|m| consensus::Seat {
                         key_id: m.key_id,
                         role: m.role,
+                        // A family has no `cohort_subkind`; the #925 filter
+                        // never reads this.
+                        node_bearing: false,
                     })
                     .collect();
                 (f.consensus_protocol, None, None, roster)
@@ -5758,11 +6280,17 @@ pub trait FederationDirectory: Send + Sync {
                     .and_then(|b| b.get("cohort_subkind"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
+                // v50.0.0 (CIRISPersist#925) — the `node`-bearing seats,
+                // resolved here from the roster reads, never inside the
+                // evaluator.
+                let nodes = Box::pin(community_node_bearing_seats(self, &c)).await?;
                 let roster = self
                     .active_community_members(group_key_id)
                     .await?
                     .into_iter()
                     .map(|m| consensus::Seat {
+                        // A quorum-gated supersede happens now.
+                        node_bearing: nodes.at(&m.key_id, chrono::Utc::now()),
                         key_id: m.key_id,
                         role: m.role,
                     })
@@ -6016,6 +6544,10 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Family => Role::Founder,
             _ => Role::Member,
         };
+        // v50.0.0 (CIRISPersist#926) — for a trust-root community the caller
+        // then binds the envelope to the ONE version it authorizes
+        // ([`canonical_community::bind_next_version`]: every recorded role, the
+        // next content hash, the link's instant) before the founders sign.
         Ok(ciris_verify_core::accord_genesis::build_membership_change(
             &prior_envelope,
             new_member_key_ids,
@@ -6111,13 +6643,23 @@ pub trait FederationDirectory: Send + Sync {
             &new.community.consensus_protocol,
             &change_envelope,
         )?;
-        self.verify_membership_quorum(
-            cohort::Cohort::Community,
-            &new.community.community_key_id,
-            &change_envelope,
-            &signatures,
-        )
-        .await?;
+        // v50.0.0 (CIRISPersist#926) — for a trust root whose chain holds, the
+        // quorum IS the founders' link (`prepare_trust_root_supersede`, below,
+        // before any write): the one predicate the replicated door runs. The
+        // folded roster would re-apply a resignation the record has since
+        // cleared by re-seating the key, so the two doors would disagree.
+        let founders_link_is_the_quorum =
+            canonical_community::founders_link_is_the_quorum(self, &new.community.community_key_id)
+                .await?;
+        if !founders_link_is_the_quorum {
+            self.verify_membership_quorum(
+                cohort::Cohort::Community,
+                &new.community.community_key_id,
+                &change_envelope,
+                &signatures,
+            )
+            .await?;
+        }
         let authorization = serde_json::json!({
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
@@ -6137,6 +6679,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Community,
             new,
             Some(authorization),
+            founders_link_is_the_quorum,
         )
         .await
     }
@@ -6189,6 +6732,7 @@ pub trait FederationDirectory: Send + Sync {
             cohort::Cohort::Affiliations,
             new,
             Some(authorization),
+            false,
         )
         .await
     }
@@ -8489,6 +9033,39 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the re-wrap of a
+    /// member's community DEK epochs to a new device was refused. Nothing is
+    /// granted. Authority is the member's owner-binding over the device, never
+    /// roster governance. Stable `kind()` token `federation_device_rekey_refused`.
+    ///
+    /// `rule` is one of [`DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN`] (RETRYABLE: the
+    /// host has not told the backend its key), [`DEVICE_REKEY_RULE_UNBOUND`] (RETRYABLE: the
+    /// owner-binding may not have replicated yet),
+    /// [`DEVICE_REKEY_RULE_OWNER_MISMATCH`],
+    /// [`DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER`],
+    /// [`DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE`] (RETRYABLE: the occurrence may
+    /// not have replicated yet),
+    /// [`DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE`] or
+    /// [`DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS`] (substantive until the
+    /// device registers keys). The rule rides the message across the FFI as
+    /// `"<kind>: <rule>"`.
+    #[error(
+        "re-wrap of {member_key_id:?}'s epochs in {community_key_id:?} to device \
+         {occurrence_key_id:?} refused ({rule}): a new device receives what its member holds \
+         only when the member's owner-binding names it, the member is active, and it has \
+         content-KEM keys (CIRISPersist#916)"
+    )]
+    DeviceRekeyRefused {
+        /// The room whose epochs would be re-wrapped.
+        community_key_id: String,
+        /// The member whose grants the device would receive.
+        member_key_id: String,
+        /// The new device's occurrence key.
+        occurrence_key_id: String,
+        /// Which clause refused; one of the rule tokens above.
+        rule: &'static str,
+    },
+
     /// v49.0.0 (CIRISPersist#912, FSD `ROOM_ROSTER_AUTHORITY.md` §11) — a
     /// membership LISTING (CC 2 `listed`) whose signature verified but which
     /// the listing door refuses. Nothing is stored. Stable `kind()` token
@@ -9134,13 +9711,19 @@ pub enum Error {
     #[error(
         "withdraws by issuer {issuer:?} against target attestation \
          {target_attestation_id:?} is not admitted: the issuer satisfies none of the \
-         four §3.2.3 admission rules (producer / subject / delegated-proxy authority)"
+         four §3.2.3 admission rules (producer / subject / delegated-proxy authority); \
+         beyond_delegation_depth_cap={beyond_delegation_depth_cap}"
     )]
     WithdrawsNotAdmitted {
         /// The `attesting_key_id` of the refused `withdraws`.
         issuer: String,
         /// The `attestation_id` of the target `T` being withdrawn.
         target_attestation_id: String,
+        /// v50.0.0 (CIRISPersist#928, CC 4.1.1) — a `consent_revocation`
+        /// chain continued past the default depth cap (5): the proxy authority
+        /// may exist but is too deep to confer (self_verify only). `false`
+        /// when no chain reached the cap — nothing is there.
+        beyond_delegation_depth_cap: bool,
     },
 
     /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10 / §11.11 /
@@ -9600,6 +10183,61 @@ pub enum Error {
         member_role: &'static str,
     },
 
+    /// v50.0.0 (CIRISPersist#925/#927, CC 3.2 / CC 3.4.2) — an
+    /// `infrastructure` community record (or its supersede, or a widening
+    /// that promotes a founder) is non-conformant:
+    /// `hard_case:community_consensus_protocol_violation`. `rule` is
+    /// [`admission::INFRA_RULE_NODE_BEARING_FOUNDER`] (a `node`-bearing key
+    /// listed as founder — infrastructure does not vote) or
+    /// [`admission::INFRA_RULE_PROTOCOL_NOT_QUORUM`] (the protocol is not
+    /// `quorum:M/N`). Nothing is stored. Stable `kind()` token
+    /// `federation_community_consensus_protocol_violation`.
+    #[error(
+        "hard_case:community_consensus_protocol_violation:{community_key_id} ({rule}): {detail}"
+    )]
+    CommunityConsensusProtocolViolation {
+        /// The community whose record is non-conformant.
+        community_key_id: String,
+        /// Which CC 3.2 conformance rule refused.
+        rule: &'static str,
+        /// A human-readable account.
+        detail: String,
+    },
+
+    /// v50.0.0 (CIRISPersist#925 ask 5, CC 3.4.7.3 Clause A) — a key record
+    /// whose `identity_type` set contains `node` together with `agent` or
+    /// `user` was refused at the key-record door: a key is substrate or actor,
+    /// never both. Nothing is stored. Existing fused keys are not repaired by
+    /// this (Clause B still gates them wherever they appear). Stable `kind()`
+    /// token `federation_node_identity_not_exclusive`.
+    #[error(
+        "key {key_id:?} identity_type {identity_type:?} fuses node with an actor role \
+         (CC 3.4.7.3 Clause A: node is exclusive of agent and user)"
+    )]
+    NodeIdentityNotExclusive {
+        /// The refused record's `key_id`.
+        key_id: String,
+        /// The refused `identity_type` set as submitted.
+        identity_type: String,
+    },
+
+    /// v50.0.0 (CIRISPersist#925 review H3) — a rewrite of a stored key record
+    /// would add or remove `node` from its `identity_type`. `node` is fixed at
+    /// mint; the key re-mints. Nothing is stored. Stable `kind()` token
+    /// `federation_node_identity_immutable`.
+    #[error(
+        "key {key_id:?}: a rewrite may not move `node` in or out of identity_type \
+         (stored {stored:?}, offered {offered:?}); node is fixed at mint"
+    )]
+    NodeIdentityImmutable {
+        /// The refused record's `key_id`.
+        key_id: String,
+        /// The stored `identity_type`.
+        stored: String,
+        /// The offered `identity_type`.
+        offered: String,
+    },
+
     /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a `delegates_to`
     /// whose TARGET (`attested_key_id`) resolves to a `user`-role identity was
     /// REFUSED by the CC 3.2 user-target steward-binding gate. "Stewarding a
@@ -9945,6 +10583,7 @@ impl Error {
                 "federation_location_authority_unauthorized"
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
             Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
@@ -10013,6 +10652,11 @@ impl Error {
             Error::AccordEvidenceUnverified { .. } => "accord_evidence_unverified",
             Error::AccordEvidenceCarrierMalformed { .. } => "accord_evidence_carrier_malformed",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
+            Error::CommunityConsensusProtocolViolation { .. } => {
+                "federation_community_consensus_protocol_violation"
+            }
+            Error::NodeIdentityNotExclusive { .. } => "federation_node_identity_not_exclusive",
+            Error::NodeIdentityImmutable { .. } => "federation_node_identity_immutable",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
             }

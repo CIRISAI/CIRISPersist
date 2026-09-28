@@ -3277,6 +3277,26 @@ pub struct SignedCommunity {
     /// [`SignedFamily::supersede_proof`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersede_proof: Option<GroupSupersedeProof>,
+    /// v50.0.0 (CIRISPersist#926) — further hybrid scrubs over the SAME
+    /// [`Community::signing_envelope`] the authority signed, the same shape
+    /// the roster rows carry ([`RosterCosignature`]). A trust-root-grade
+    /// `infrastructure` community (`ciris-canonical`) is admitted only when
+    /// the authority plus these co-signers reach the accord family's quorum
+    /// ([`crate::federation::canonical_community`]). Persisted beside the
+    /// authority signature (V158) and served with it, so a peer re-derives
+    /// the quorum. Omitted on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
+    /// v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — the row's CHAIN: every
+    /// prior signed version of a trust-root community, oldest first, from its
+    /// accord-born version up to (not including) this one — each carrying its
+    /// own co-signatures and founders' `supersede_proof`, and an empty
+    /// `lineage` of its own. A node holding nothing (or an older version)
+    /// walks it: the birth's accord quorum, then each proof against the version
+    /// it names. Not part of [`Community::signing_envelope`]; persisted (V158)
+    /// and served beside the row. Empty for every other community.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lineage: Vec<SignedCommunity>,
 }
 
 // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-secrecy

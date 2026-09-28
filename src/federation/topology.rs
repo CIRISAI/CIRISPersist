@@ -390,16 +390,59 @@ pub struct DelegationGraph {
     pub max_depth: usize,
     /// Edges discovered in the walk.
     pub edges: Vec<DelegationEdge>,
+    /// v50.0.0 (CIRISPersist#928, CC 4.1.1) — did the chain continue past
+    /// [`Self::max_depth`]? Distinguishes "too deep" from "nothing there":
+    /// edges beyond the cap exist and carry no transitive trust.
+    /// `#[serde(default)]` so a pre-v50 payload reads as `WithinCap`.
+    #[serde(default)]
+    pub depth_outcome: DelegationDepthOutcome,
+}
+
+/// v50.0.0 (CIRISPersist#928, CC 4.1.1) — how a depth-capped delegation walk
+/// ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationDepthOutcome {
+    /// The walk reached every recipient its chains lead to within the cap.
+    #[default]
+    WithinCap,
+    /// A chain continues past the effective cap. CC 4.1.1: a chain longer
+    /// than the cap is treated as `attestation:self_verify` only — no
+    /// transitive trust — until a caller explicitly opts into a deeper walk.
+    BeyondCapSelfVerify,
 }
 
 /// Maximum `max_depth` value [`build_delegation_graph`] honors. Above
 /// this the caller's `max_depth` is clamped — protects against UI
 /// hot-path runaway BFS on a pathologically deep delegation graph.
+///
+/// v50.0.0 (CIRISPersist#928, CC 4.1.1) — a CEILING, not a default: the
+/// ceiling bounds the walk, it does not raise [`DEFAULT_DELEGATION_DEPTH`].
 pub const MAX_DELEGATION_DEPTH: usize = 16;
+
+/// v50.0.0 (CIRISPersist#928, CC 4.1.1) — the depth a delegation walk runs at
+/// when its caller names none: "Consumer policy MUST cap traversal depth at 5
+/// hops by default (configurable)". A deeper walk, up to
+/// [`MAX_DELEGATION_DEPTH`], is an explicit caller opt-in.
+pub const DEFAULT_DELEGATION_DEPTH: usize = 5;
+
+/// v50.0.0 (CIRISPersist#928) — the depth a walk actually runs at: the CC
+/// 4.1.1 default when the caller names none, the caller's choice clamped at
+/// the ceiling when it does.
+#[must_use]
+pub fn effective_delegation_depth(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_DELEGATION_DEPTH)
+        .min(MAX_DELEGATION_DEPTH)
+}
 
 /// BFS [`crate::federation::types::attestation_type::DELEGATES_TO`]
 /// out-edges from `from_key`. Cycle-safe (visited set on the granter
-/// side) and depth-bounded (capped at [`MAX_DELEGATION_DEPTH`]).
+/// side) and depth-bounded: `max_depth = None` walks
+/// [`DEFAULT_DELEGATION_DEPTH`] hops (CC 4.1.1); `Some(n)` is the caller's
+/// explicit opt-in, clamped at [`MAX_DELEGATION_DEPTH`]. A chain that
+/// continues past the effective cap is reported as
+/// [`DelegationDepthOutcome::BeyondCapSelfVerify`], never as an empty walk.
 ///
 /// # Algorithm
 ///
@@ -417,12 +460,20 @@ pub const MAX_DELEGATION_DEPTH: usize = 16;
 pub async fn build_delegation_graph(
     directory: &dyn FederationDirectory,
     from_key: &str,
-    max_depth: usize,
+    max_depth: Option<usize>,
 ) -> Result<DelegationGraph, Error> {
     if from_key.is_empty() {
         return Err(Error::InvalidArgument("from_key must be non-empty".into()));
     }
-    let effective_depth = max_depth.min(MAX_DELEGATION_DEPTH);
+    let effective_depth = effective_delegation_depth(max_depth);
+    let mut depth_outcome = DelegationDepthOutcome::WithinCap;
+    // PR #921 review (Codex F4) — a ZERO cap (an explicit `Some(0)`, which the
+    // capsule op passes through) puts the ROOT at the cap: the walk below
+    // follows nothing, so the root's own onward delegation is the chain past
+    // the cap. Same probe as a recipient at the cap.
+    if effective_depth == 0 && delegates_onward(directory, from_key).await? {
+        depth_outcome = DelegationDepthOutcome::BeyondCapSelfVerify;
+    }
 
     let mut edges: Vec<DelegationEdge> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -471,6 +522,14 @@ pub async fn build_delegation_graph(
             if !visited.contains(&r.attested_key_id) && depth + 1 < effective_depth {
                 visited.insert(r.attested_key_id.clone());
                 queue.push_back((r.attested_key_id, depth + 1));
+            } else if depth_outcome == DelegationDepthOutcome::WithinCap
+                && depth + 1 == effective_depth
+                && !visited.contains(&r.attested_key_id)
+                && delegates_onward(directory, &r.attested_key_id).await?
+            {
+                // A recipient AT the cap that delegates onward: the chain is
+                // longer than this walk may follow (CC 4.1.1 self_verify).
+                depth_outcome = DelegationDepthOutcome::BeyondCapSelfVerify;
             }
         }
     }
@@ -481,7 +540,19 @@ pub async fn build_delegation_graph(
         root_key: from_key.to_owned(),
         max_depth: effective_depth,
         edges,
+        depth_outcome,
     })
+}
+
+/// The cap probe (CC 4.1.1 `self_verify`): does `key`, standing AT the walk's
+/// depth cap, emit a `delegates_to` the walk may not follow? One read. Used
+/// for a recipient at the cap and, under a zero cap, for the root itself.
+async fn delegates_onward(directory: &dyn FederationDirectory, key: &str) -> Result<bool, Error> {
+    Ok(directory
+        .list_attestations_by(key)
+        .await?
+        .iter()
+        .any(|n| n.attestation_type == attestation_type::DELEGATES_TO))
 }
 
 // ─── 2b. Outbound delegate standing ───────────────────────────────

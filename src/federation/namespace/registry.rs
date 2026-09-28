@@ -34,7 +34,7 @@ use super::{Authority, AuthorityClass, ReservedRule};
 use std::sync::OnceLock;
 
 /// The vendored copy of the Constitution manifest, compiled in.
-const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
+pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
@@ -42,10 +42,31 @@ pub const VENDORED_CC_VERSION: &str = "1.0-rc5";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "87aede5012064288fd5ce8770d3e77a8c5131cd61d27799c4c06558507b9a9f5";
+    "4f675532029663469f9c67694fb68d5d13742deb701d8337f1929ae8f6b7a907";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 116;
+pub const VENDORED_N_FAMILIES: usize = 148;
+
+/// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
+/// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
+/// the two hashes), so a wording edit elsewhere in CC Part 3 does not move it
+/// while `source_sha256` does. This is the pin CC asks every consumer to carry;
+/// [`tests::vendored_registry_sha256_pins_the_cc_file`] recomputes it over the
+/// vendored bytes the way `tools/build_cc_namespace.py` does.
+///
+/// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
+/// (CC 1.0-rc5 as RELEASED from `main` — the `v1.0-rc5` tag's commit),
+/// together with
+/// `namespace_match_vectors.json` from the same commit. JSON carries no
+/// comments, so this doc is the vendored files' header.
+pub const VENDORED_REGISTRY_SHA256: &str =
+    "07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb";
+
+/// The CIRISConstitution commit both vendored manifests were copied from:
+/// `c60d0a6` "Cut CC 1.0-rc5, released as guidance (#125)" on `main`, which
+/// the `v1.0-rc5` tag names. (The slice first vendored PR #113's unmerged
+/// head `4b624513`; the released manifests replaced it byte-for-byte.)
+pub const VENDORED_CC_COMMIT: &str = "c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -97,10 +118,15 @@ pub struct NamespaceEntry {
     /// `"provenance:build_manifest:{target}"`, `"accord:*"`,
     /// `"audit_chain:hash_continuity"`).
     pub prefix: String,
-    /// The literal prefix a concrete `dimension` is matched against — `prefix`
-    /// truncated at its first `{` parameter or `*` wildcard (e.g.
-    /// `"provenance:build_manifest:"`, `"accord:"`). Longest match wins in
-    /// [`authority_for`].
+    /// The family's literal stem — `prefix` truncated at its first `{`
+    /// parameter or `*` wildcard (e.g. `"provenance:build_manifest:"`,
+    /// `"accord:"`).
+    ///
+    /// v50.0.0 (CIRISPersist#924): DATA only. It no longer decides which
+    /// family a dimension resolves to — [`lookup`] asks the one matcher
+    /// ([`match_family`](super::matcher::match_family)) — and survives because
+    /// the entries are still ordered by it and the co-scrub classifier reads
+    /// it.
     pub match_prefix: String,
     /// The owning component slug (CC 3.1.N heading), e.g. `"persist"`,
     /// `"attestation"`, `"registry"`.
@@ -145,10 +171,6 @@ struct RawMeta {
     cc_version: String,
     source_sha256: String,
     n_families: usize,
-    /// v42.0.0 (CC 3.1.7 R3) — the case policy, carried as DATA so the gates
-    /// key on the manifest rather than on a convention nobody wrote down.
-    #[serde(default)]
-    case_rule: Option<RawCaseRule>,
     /// **The `_meta` key the R2 Private Use ask asked for, and the rc3
     /// re-vendor delivered.** `x_private:` on this cut.
     ///
@@ -174,12 +196,6 @@ struct RawMeta {
     /// parse.
     #[serde(default)]
     private_use_prefix: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct RawCaseRule {
-    vocab_pattern: String,
-    refusal_token: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -319,9 +335,9 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
             }
         })
         .collect();
-    // Longest match_prefix first so `authority_for`'s first hit is the most
-    // specific (e.g. `provenance:build_manifest:` beats a hypothetical
-    // `provenance:` before it).
+    // Longest match_prefix first — a stable, documented order for consumers
+    // that enumerate the registry (resolution is the matcher's, not this
+    // order's, since v50.0.0).
     entries.sort_by(|a, b| {
         b.match_prefix
             .len()
@@ -360,32 +376,22 @@ pub fn vendored_private_use_prefix() -> Option<&'static str> {
     .as_deref()
 }
 
-/// The [`NamespaceEntry`] whose `match_prefix` is the **longest prefix** of
-/// `dimension`, or `None` if `dimension` is outside the CC namespace. The
-/// registry is pre-sorted longest-first, so this returns the most specific
-/// match.
-pub fn lookup(dimension: &str) -> Option<&'static NamespaceEntry> {
-    registry()
-        .iter()
-        .find(|e| dimension.starts_with(&e.match_prefix))
-}
-
-/// v42.0.0 (CC 3.1.7 R3) — the `_meta.case_rule.vocab_pattern` a `vocab`
-/// segment must match, and the refusal token CC names for a violation.
+/// The [`NamespaceEntry`] `dimension` resolves to under the ONE matcher
+/// ([`match_family`](super::matcher::match_family), CC 3.1.7 R3), or `None`
+/// when no row claims it (open vocabulary, or a leaf under a reserved stem no
+/// row names).
 ///
-/// Read from the manifest rather than transcribed: a pattern hand-copied here
-/// is a claim about CC prose that nothing can contradict.
-#[must_use]
-pub fn case_rule() -> Option<(&'static str, &'static str)> {
-    static RULE: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
-    RULE.get_or_init(|| {
-        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).ok()?;
-        raw.meta
-            .case_rule
-            .map(|c| (c.vocab_pattern, c.refusal_token))
-    })
-    .as_ref()
-    .map(|(a, b)| (a.as_str(), b.as_str()))
+/// v50.0.0 (CIRISPersist#924) — used to be the longest LITERAL prefix
+/// (`match_prefix`), which let `session:a:b:c:v1` resolve to `session:{kind}`
+/// at the wrong arity and `accord:invoke:anything` resolve to `accord:*` as if
+/// it were a leaf CC names. The family is returned even when the dimension is
+/// REFUSED (a missing version, a closed-vocabulary value, an unlisted closed
+/// leaf): the family the refusal was judged against is still the authority a
+/// classifier must report — dropping a reservation because the row was also
+/// malformed would be a fail-open.
+pub fn lookup(dimension: &str) -> Option<&'static NamespaceEntry> {
+    let family = super::matcher::match_family(dimension).family?;
+    registry().iter().find(|e| e.prefix == family)
 }
 
 /// **`authority_for(dimension)`** — the emit authority the `dimension`'s
@@ -398,12 +404,29 @@ pub fn case_rule() -> Option<(&'static str, &'static str)> {
 /// [`AccordCoScrub`](AuthorityClass::AccordCoScrub) — identical to a canonical
 /// record, closing the chicken/egg.
 pub fn authority_for(dimension: &str) -> Authority {
-    lookup(dimension)
-        .map(|e| e.authority.clone())
-        .unwrap_or(Authority {
-            class: AuthorityClass::ProducerSteward,
-            reserved: None,
-        })
+    if let Some(e) = lookup(dimension) {
+        return e.authority.clone();
+    }
+    // v50.0.0 (CIRISPersist#924) — a dimension under a stem CC 3.4 reserves
+    // as a whole that no row claims (`capacity_assurance:reversible_imagined:
+    // financial:v1`): the old longest-literal-prefix lookup attributed it to
+    // the stem's row and so carried the reservation; the one matcher claims no
+    // row for it, and reporting it OPEN would drop the reservation. The stem's
+    // own `_meta.case_rule.reserved_stems` rule answers instead.
+    if let Some((rule, cc_ref)) = super::matcher::reserved_stem_rule(dimension) {
+        let reserved = ReservedRule {
+            rule: rule.to_owned(),
+            cc_ref: cc_ref.to_owned(),
+        };
+        return Authority {
+            class: class_for(dimension, Some(rule)),
+            reserved: Some(reserved),
+        };
+    }
+    Authority {
+        class: AuthorityClass::ProducerSteward,
+        reserved: None,
+    }
 }
 
 // ── (CIRISPersist#590, CC 3.1.7 R2) — family-STEM registration ──
@@ -441,15 +464,30 @@ pub fn registered_family_stems() -> &'static [&'static str] {
     })
 }
 
-/// **CC 3.1.7 R2 registration predicate** — does `dimension` sit on a family the
-/// vendored manifest registers? Consumes the MANIFEST, never a section-walk
-/// heuristic (R2's normative enforcement surface: "a walker that reads only
-/// `### 3.1.N` refuses traffic this Part reserves").
+/// **CC 3.1.7 R2 registration predicate** — does `dimension` resolve to a
+/// family row? Answered by the ONE matcher
+/// ([`match_family`](super::matcher::match_family)): a row claims it, and the
+/// claim is not an unlisted leaf under a closed reserved family
+/// (`namespace_family_unregistered`).
 ///
-/// Stem-granular by [`family_stem`]. `""` is not a family and answers `false`.
+/// v50.0.0 (CIRISPersist#924) — this used to be stem-granular (the first `:`),
+/// so `accord:invoke:anything:v1` read as registered because SOME `accord:`
+/// row existed, while CC closes `accord:*` to its six named leaves. A dimension
+/// that is well-registered but otherwise malformed (missing version, a closed
+/// vocabulary value) still answers `true` here — registration is R2's
+/// question; the grammar's other refusals are the case and version gates'.
+/// Asking about a STEM (`"regime:"`) is [`is_stem_registered`].
 #[must_use]
 pub fn is_family_registered(dimension: &str) -> bool {
-    let stem = family_stem(dimension);
+    let m = super::matcher::match_family(dimension);
+    m.family.is_some() && m.refusal != Some(super::matcher::Refusal::FamilyUnregistered)
+}
+
+/// Does ANY vendored row sit on `stem` (`"regime:"`, or a bare `"scores"`)? A
+/// set-membership question over the manifest's rows, not a dimension match —
+/// the R2(a) build gates ask it of the stems persist governs.
+#[must_use]
+pub fn is_stem_registered(stem: &str) -> bool {
     !stem.is_empty() && registered_family_stems().binary_search(&stem).is_ok()
 }
 
@@ -474,9 +512,15 @@ pub fn is_family_registered(dimension: &str) -> bool {
 /// could see the other.
 pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "accord:*",
+    "accord:human_dignity",
+    "accord:invoke:constitutional:{halt_id}",
+    "accord:invoke:drill:{drill_id}",
+    "accord:invoke:notify:{notify_id}",
+    "accord:lifecycle",
+    "accord:lifecycle:active",
     "activity_tier:{period}",
     "age_assurance:{level}:{band}:{version}",
-    "age_self_declared:{band}:{version}",
+    "age_self_declared:band:{band}:{version}",
     "agent_files:{kind}:{platform_or_target}",
     "approach:{goal_id}",
     "attestation:agent_integrity",
@@ -484,10 +528,12 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "attestation:license_validity",
     "attestation:registry_consensus",
     "attestation:self_verify",
+    "audio:*",
     "audit_chain:hash_continuity",
     "autonomy:{aspect}",
     "benchmark:he300:{category}:{version}",
     "beneficence:{aspect}",
+    "blog:*",
     "bond_posted:{currency}",
     "build:registered:{target}",
     "capacity:composite",
@@ -496,8 +542,11 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "capacity:integrity",
     "capacity:resilience",
     "capacity:sustained_coherence",
+    "capacity_assurance:reversible_excluded:{domain}:{version}",
+    "capacity_assurance:reversible_pending:{domain}:{version}",
     "capacity_assurance:{level}:{domain}:{band}:{version}",
     "cert_validity:{authority}",
+    "chat:*",
     "coherence_standing:{cohort}",
     "commitment_fulfillment:{prior_contribution_id}",
     "config:{scope}",
@@ -505,6 +554,16 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "conscience:entropy",
     "conscience:epistemic_humility",
     "conscience:optimization_veto",
+    "consent:decay:{stage}",
+    "consent:community_trust",
+    "consent:deletion_complete",
+    "consent:deletion_sla:{days}",
+    "consent:partnership_accept",
+    "consent:partnership_grant",
+    "consent:replication:{version}",
+    "consent:scope:{kind}",
+    "consent:state:{stance}",
+    "consent:stream:{kind}",
     "consent:{kind}",
     "content_class:{class}",
     "content_rating:{scheme}:{rating}",
@@ -526,16 +585,23 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "dma:idma:*",
     "dma:pdma:*",
     "duty:{kind}",
+    "encyclopedia:*",
+    "event:attendance",
+    "event:lifecycle:{state}",
+    "event:rsvp_count",
     "expertise:{domain}:{language}",
     "federation_directory:replication_lag",
     "fidelity:explainability_sla:{tier}",
     "fidelity:{aspect}",
+    "film:*",
     "goal:{scale}",
     "hard_case:{kind}",
     "hardware_custody:{platform}",
     "health:liveness:{version}",
     "holds_bytes:sha256:{prefix}",
+    "identity:canonical_binding:{canonical_hash}",
     "identity_continuity:relational_anchor",
+    "image:*",
     "integrity:{aspect}",
     "judge_model:verdict:{model_id}",
     "justice:{aspect}",
@@ -545,10 +611,12 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "manifold_conformity:{cohort}",
     "mesh_config:{key}",
     "method:{approach_id}:{substrate_rung}",
+    "model_3d:*",
     "moderation:{allegation_type}",
     "moderation_track_record:{community_key_id}",
     "multilateral_participation:{forum}:{kind}",
     "need:{domain}:{kind}",
+    "news:*",
     "non_maleficence:{aspect}",
     "objection:{state}",
     "ownership:{relation}:{target_kind}:{version}",
@@ -576,6 +644,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "slashing:{outcome}",
     "system:*",
     "testimonial_witness:{kind}",
+    "topical_relation:{kind}",
     "trace:{form}:{version}",
     "trace_summary:{kind}",
     "transparency_log:consistency",
@@ -584,6 +653,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "transport:{kind}",
     "trust:{job}:{version}",
     "truth_grounding:{subject}",
+    "video:*",
     "vote:{contribution_id}",
     "wa_adjudication:{state}",
     "watchlist:{id}",
@@ -592,13 +662,19 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,
-/// intentionally absent from this one. Empty as of the rc3 vendor: no CC family
-/// has ever been retired, and every disappearance so far has been a generator
-/// accident.
+/// intentionally absent from this one. The first real retirement landed with
+/// the v50.0.0 (rc5 @ 4b624513) vendor; every earlier disappearance was a
+/// generator accident.
 ///
 /// The escape hatch for [`VENDORED_FAMILY_PREFIXES`]: moving a line here is how
 /// a reviewer says "this removal is intended", in a diff someone must read.
-pub const RETIRED_FAMILIES: &[&str] = &[];
+pub const RETIRED_FAMILIES: &[&str] = &[
+    // CIRISConstitution#113 review (rc5 @ 4b624513): the two-segment arity no
+    // producer emitted, re-registered at the wire's arity as
+    // `age_self_declared:band:{band}:{version}` (CC 3.1.2). CC's own
+    // generator lists it in its `RETIRED_FAMILIES`.
+    "age_self_declared:{band}:{version}",
+];
 
 #[cfg(test)]
 mod tests {
@@ -655,6 +731,130 @@ mod tests {
             raw.families.len(),
             VENDORED_N_FAMILIES,
             "families[] length != _meta.n_families"
+        );
+        // CIRISConstitution#116 — the released rc5 declares full-match
+        // semantics for every segment pattern; `matcher::compile` implements it.
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        assert!(
+            root["_meta"]["case_rule"]["match_semantics"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("full-match")),
+            "_meta.case_rule.match_semantics is missing or no longer full-match"
+        );
+    }
+
+    /// Python's `json.dumps(v, sort_keys=True, separators=(",", ":"))` with its
+    /// default `ensure_ascii=True` — the preimage `tools/build_cc_namespace.py`
+    /// hashes for `_meta.registry_sha256`. The manifest carries no floats (a
+    /// float's repr is the one place the two serializers would disagree), and
+    /// this refuses one rather than guessing.
+    fn python_canonical_json(v: &serde_json::Value, out: &mut String) {
+        use serde_json::Value as V;
+        fn string(s: &str, out: &mut String) {
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{08}' => out.push_str("\\b"),
+                    '\u{0c}' => out.push_str("\\f"),
+                    c if (c as u32) < 0x20 || (c as u32) > 0x7e && (c as u32) != 0x7f => {
+                        let mut buf = [0u16; 2];
+                        for unit in c.encode_utf16(&mut buf) {
+                            out.push_str(&format!("\\u{unit:04x}"));
+                        }
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        match v {
+            V::Null => out.push_str("null"),
+            V::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            V::Number(n) => {
+                let t = n.to_string();
+                assert!(
+                    !t.contains(['.', 'e', 'E']),
+                    "a float in the manifest: {t} — Python's repr and serde's may differ"
+                );
+                out.push_str(&t);
+            }
+            V::String(s) => string(s, out),
+            V::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    python_canonical_json(x, out);
+                }
+                out.push(']');
+            }
+            V::Object(o) => {
+                let mut keys: Vec<&String> = o.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (i, k) in keys.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    string(k, out);
+                    out.push(':');
+                    python_canonical_json(&o[k.as_str()], out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the grammar pin.
+    ///
+    /// Recomputes `_meta.registry_sha256` over the VENDORED bytes exactly as
+    /// `tools/build_cc_namespace.py` does (`sha256(json.dumps({"_meta": meta
+    /// minus source_sha256/registry_sha256, "families": families},
+    /// sort_keys=True, separators=(",",":")))`) and requires it to equal both
+    /// the file's own claim and [`VENDORED_REGISTRY_SHA256`]. A hand edit to
+    /// the vendored grammar — or a re-vendor that moved the bytes without the
+    /// pin — fails here, while a CC wording edit (which moves only
+    /// `source_sha256`) does not.
+    #[test]
+    fn vendored_registry_sha256_pins_the_cc_file() {
+        use sha2::{Digest, Sha256};
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let meta = root["_meta"].as_object().expect("_meta object");
+        let claimed = meta["registry_sha256"]
+            .as_str()
+            .expect("rc5 carries _meta.registry_sha256");
+        let mut grammar_meta = meta.clone();
+        grammar_meta.remove("source_sha256");
+        grammar_meta.remove("registry_sha256");
+        let grammar = serde_json::json!({
+            "_meta": serde_json::Value::Object(grammar_meta),
+            "families": root["families"].clone(),
+        });
+        let mut preimage = String::new();
+        python_canonical_json(&grammar, &mut preimage);
+        let recomputed = hex::encode(Sha256::digest(preimage.as_bytes()));
+        assert_eq!(
+            recomputed, claimed,
+            "the vendored grammar does not hash to its own _meta.registry_sha256 — the file \
+             was edited after CC generated it"
+        );
+        assert_eq!(
+            claimed, VENDORED_REGISTRY_SHA256,
+            "re-vendored without moving VENDORED_REGISTRY_SHA256 (the bytes and the pin move \
+             together)"
+        );
+        // The vectors file is generated from the same grammar and says so.
+        let vectors: serde_json::Value = serde_json::from_str(super::super::matcher::VECTORS_JSON)
+            .expect("vendored vectors parse");
+        assert_eq!(
+            vectors["_meta"]["registry_sha256"],
+            VENDORED_REGISTRY_SHA256
         );
     }
 
@@ -809,24 +1009,41 @@ mod tests {
 
     /// R2's registration predicate over the real manifest — including the three
     /// families persist itself minted, which is the whole reason #590 exists.
+    ///
+    /// v50.0.0 (CIRISPersist#924): answered by the one matcher, so it is no
+    /// longer first-colon-stem granular. A leaf CC does not name under the
+    /// CLOSED `accord:*`, or an unclaimed leaf under a stem CC 3.4 reserves as
+    /// a whole, is NOT registered (CC 3.1.7 R2(b)/R3) — the two lines that
+    /// used to assert the opposite now sit in the negative list.
     #[test]
     fn is_family_registered_answers_from_the_manifest() {
         for dim in [
             "objection:raised:v1",
             "quarantine:withheld:v1",
             "wa_adjudication:petition:v1",
-            "accord:invoke:halt",
+            "accord:lifecycle:v1",
+            "accord:invoke:notify:n42:v1",
             "capacity:core_identity:v1",
             // open vocabulary WITHIN a registered family stays registered —
-            // this is the traffic R2 explicitly preserves.
+            // this is the traffic R2 explicitly preserves (and a missing
+            // version is the T3 gate's refusal, not R2's).
             "credits:rust:en:someone",
-            "detection:emergent_pattern:novel_signal:v1",
+            "credits:rust:en:someone:v1",
         ] {
             assert!(is_family_registered(dim), "{dim} must be registered");
         }
-        for dim in ["totally:made:up:v1", "", "scores"] {
+        for dim in [
+            "totally:made:up:v1",
+            "",
+            "scores",
+            "accord:invoke:halt",
+            "detection:emergent_pattern:novel_signal:v1",
+        ] {
             assert!(!is_family_registered(dim), "{dim} must NOT be registered");
         }
+        assert!(is_stem_registered("objection:"));
+        assert!(!is_stem_registered("scores:"));
+        assert!(!is_stem_registered(""));
     }
 
     /// **The redundancy `RawFamily` bets on.** Its comment says the manifest's
@@ -1003,6 +1220,55 @@ mod tests {
         assert!(e.match_prefix.starts_with("provenance:build_manifest"));
     }
 
+    /// v50.0.0 (CIRISPersist#924) — `lookup` resolves through the ONE
+    /// matcher, and the cases where the old longest-literal-prefix lookup
+    /// answered differently are pinned (mutation M7 of the #924 round
+    /// survived without this): two families sharing a literal stem
+    /// (`credits:`, `provenance:build_manifest:`) used to resolve to whichever
+    /// sorted first; a dimension off every row's arity used to inherit the
+    /// stem's row; an unclaimed leaf under a reserved stem keeps its
+    /// reservation through `authority_for`'s stem fallback.
+    #[test]
+    fn lookup_resolves_through_the_one_matcher_924() {
+        let prefix = |d: &str| lookup(d).map(|e| e.prefix.as_str());
+        assert_eq!(
+            prefix("credits:rust:en:substrate_building:v1"),
+            Some("credits:{domain}:{language}:substrate_building"),
+            "the most literal family wins, not the alphabetically first"
+        );
+        assert_eq!(
+            prefix("credits:rust:en:alice:v1"),
+            Some("credits:{domain}:{language}:{subject}")
+        );
+        assert_eq!(
+            prefix("provenance:build_manifest:agent-3.2.1:locale:en-US:v1"),
+            Some("provenance:build_manifest:{target}:locale:{lang_code}")
+        );
+        assert_eq!(
+            prefix("session:a:b:c:v1"),
+            None,
+            "off every row's arity is open vocabulary, not session:{{kind}}"
+        );
+        // An unclaimed leaf under a reserved stem: no row, so the stem's own
+        // rule answers and the reservation is not dropped.
+        let dim = "capacity_assurance:reversible_imagined:financial:v1";
+        assert_eq!(prefix(dim), None, "no row claims an unminted leaf");
+        let a = authority_for(dim);
+        assert!(
+            a.reserved.is_some_and(|r| r.cc_ref == "CC 3.4.12"),
+            "the reserved stem's own rule answers, so the reservation is not dropped"
+        );
+        // The released rc5 registers the CC 3.4.12 companions: the row answers.
+        let companion = "capacity_assurance:reversible_excluded:financial:v1";
+        assert_eq!(
+            prefix(companion),
+            Some("capacity_assurance:reversible_excluded:{domain}:{version}")
+        );
+        assert!(authority_for(companion)
+            .reserved
+            .is_some_and(|r| r.cc_ref == "CC 3.4.12"));
+    }
+
     #[test]
     fn unknown_dimension_defaults_to_producer_no_reserved() {
         let a = authority_for("totally:made:up:dimension");
@@ -1040,11 +1306,23 @@ mod tests {
             "segments",
         ];
         // Columns read OUTSIDE the shared type, each naming its reader.
-        const READ_ELSEWHERE: &[(&str, &str)] = &[(
-            "polarity",
-            "scores_read_audit.rs#vendored_family_polarities (local parse, documented \
-             at that site) + the #724 cross-manifest agreement gate",
-        )];
+        const READ_ELSEWHERE: &[(&str, &str)] = &[
+            (
+                "polarity",
+                "scores_read_audit.rs#vendored_family_polarities (local parse, documented \
+                 at that site) + the #724 cross-manifest agreement gate",
+            ),
+            // v50.0.0 (CIRISPersist#924, CC 3.1.7 R2(b)/R3) — a reserved
+            // wildcard family's published leaves and whether they are closed.
+            (
+                "leaves",
+                "namespace/matcher.rs#parse_rules -> Fam::leaves (match_family)",
+            ),
+            (
+                "leaves_closed",
+                "namespace/matcher.rs#parse_rules -> Fam::leaves_closed (match_family)",
+            ),
+        ];
         // Columns deliberately inert, each naming WHY — the subtractive
         // manifest: a rationale under 40 chars is a shrug, not a reason.
         const DELIBERATELY_UNREAD: &[(&str, &str)] = &[(
@@ -1093,5 +1371,285 @@ mod tests {
             .filter(|c| !carried.contains(**c))
             .collect();
         assert!(stale.is_empty(), "stale column pin(s): {stale:?}");
+
+        // v50.0.0 (CIRISPersist#924, CIRISConstitution#112 ask 2) — the same
+        // accounting over `_meta`, `_meta.case_rule`, its `version_segment`,
+        // and the per-segment keys. rc5 moved the GRAMMAR into these; an
+        // unread key there is a rule the substrate silently ignores.
+        let meta = &manifest["_meta"];
+        let cr = &meta["case_rule"];
+        account(
+            "_meta",
+            meta,
+            &[
+                (
+                    "cc_version",
+                    "RawMeta::cc_version (VENDORED_CC_VERSION drift gate)",
+                ),
+                (
+                    "source_sha256",
+                    "RawMeta::source_sha256 (VENDORED_SOURCE_SHA256)",
+                ),
+                (
+                    "n_families",
+                    "RawMeta::n_families (the #590 self-consistency gate)",
+                ),
+                (
+                    "private_use_prefix",
+                    "RawMeta::private_use_prefix + matcher::parse_rules",
+                ),
+                (
+                    "case_rule",
+                    "matcher::parse_rules (the grammar) — accounted key by key below",
+                ),
+                (
+                    "registry_sha256",
+                    "tests::vendored_registry_sha256_pins_the_cc_file (VENDORED_REGISTRY_SHA256)",
+                ),
+            ],
+            &[
+                (
+                    "generator",
+                    "provenance of the CC build tool; the bytes it produced are pinned by \
+                     registry_sha256, so naming the tool adds nothing enforceable",
+                ),
+                (
+                    "source",
+                    "the CC source path the rows were generated from; the source bytes are \
+                     pinned by source_sha256 and the grammar by registry_sha256",
+                ),
+                (
+                    "n_components",
+                    "a count of owning_component slugs — a CC-side summary with no rule \
+                     attached; persist keys nothing on component counts",
+                ),
+                (
+                    "n_components_normative",
+                    "the normative subset of n_components — a CC-side summary persist does not \
+                     key on; normativity of a FAMILY rides its rows, not this count",
+                ),
+                (
+                    "per_component",
+                    "per-component family counts — CC's own bookkeeping; the family set itself \
+                     is pinned row by row in VENDORED_FAMILY_PREFIXES",
+                ),
+                (
+                    "components_outside_normative",
+                    "which owning components are non-normative (cirisbench) — informational; \
+                     no admission rule reads a component's normativity",
+                ),
+            ],
+        );
+        account(
+            "_meta.case_rule",
+            cr,
+            &[
+                ("vocab_pattern", "matcher::parse_rules -> Rules::vocab"),
+                (
+                    "refusal_tokens",
+                    "matcher::parse_rules -> Rules::tokens (Refusal::as_str)",
+                ),
+                (
+                    "reserved_stems",
+                    "matcher::parse_rules -> reserved_stems / reserved_stem_rules",
+                ),
+                (
+                    "version_segment",
+                    "matcher::parse_rules -> version / exempt / version_required",
+                ),
+                (
+                    "external_standards",
+                    "matcher::parse_rules -> Rules::external",
+                ),
+                (
+                    "literal_pattern",
+                    "tests::every_literal_segment_matches_the_literal_pattern (a CC build gate, \
+                     re-checked here; literals themselves compare by byte equality)",
+                ),
+                (
+                    "refusal_token",
+                    "tests::the_singular_refusal_token_is_the_case_malformed_token (the pre-rc5 \
+                     key, pinned equal to refusal_tokens.case_malformed)",
+                ),
+                (
+                    "wildcard_rule",
+                    "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements",
+                ),
+                (
+                    "match_semantics",
+                    "matcher::compile (every pattern wrapped `^(?:p)$`) + \
+                     matcher::tests::the_manifest_declares_full_match_semantics",
+                ),
+            ],
+            &[
+                (
+                    "cc_ref",
+                    "the CC clause citation for the rule block (CC 3.1.7 R3) — a citation, not \
+                     a rule; the FSD and evidence rows cite it",
+                ),
+                (
+                    "classes",
+                    "prose glosses of the six segment classes; the classes themselves are read \
+                     per segment from families[].segments[].class",
+                ),
+                (
+                    "compare",
+                    "prose (\"byte-exact; consumers MUST NOT case-fold\") — the matcher's \
+                     byte-exact compare IS this rule, replayed by the 962 vectors",
+                ),
+                (
+                    "placeholder_classes",
+                    "the generator's INPUT table; its output is copied onto every segment's \
+                     class, which is what the matcher reads — reading both would be two \
+                     spellings of one fact",
+                ),
+                (
+                    "policy",
+                    "a one-line prose summary of the case policy; every clause of it is a key \
+                     the matcher reads",
+                ),
+            ],
+        );
+        account(
+            "_meta.case_rule.version_segment",
+            &cr["version_segment"],
+            &[
+                (
+                    "pattern",
+                    "matcher::parse_rules -> Rules::version (is_version_segment)",
+                ),
+                (
+                    "exempt",
+                    "matcher::parse_rules -> Rules::exempt (is_version_exempt)",
+                ),
+                (
+                    "required",
+                    "matcher::parse_rules -> Rules::version_required",
+                ),
+                (
+                    "position",
+                    "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements pins \
+                     it `trailing` (matcher::trailing_version)",
+                ),
+            ],
+            &[(
+                "note",
+                "the prose statement of the rule the other four keys carry as data",
+            )],
+        );
+        let mut seg_keys = serde_json::Map::new();
+        for fam in manifest["families"].as_array().unwrap() {
+            for seg in fam["segments"].as_array().unwrap() {
+                for (k, v) in seg.as_object().unwrap() {
+                    seg_keys.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        account(
+            "families[].segments[]",
+            &serde_json::Value::Object(seg_keys),
+            &[
+                ("segment", "RawSegment::segment + matcher::parse_rules"),
+                ("class", "RawSegment::class + matcher::parse_rules"),
+                ("pattern", "matcher::parse_rules -> Seg::pattern"),
+                (
+                    "values",
+                    "matcher::parse_rules -> Seg::values (closed enumerations)",
+                ),
+                ("open", "matcher::parse_rules -> Seg::open"),
+                ("multi", "matcher::parse_rules -> Seg::multi"),
+                (
+                    "variadic",
+                    "tests::the_wildcard_rule_is_the_variadic_one_the_matcher_implements (every \
+                     wildcard segment carries variadic: true)",
+                ),
+            ],
+            &[(
+                "standard",
+                "the NAME of the outside standard an external segment follows (ISO 4217) — \
+                 prose; the enforceable part is its pattern, which the matcher reads",
+            )],
+        );
+
+        fn account(
+            what: &str,
+            obj: &serde_json::Value,
+            read: &[(&str, &str)],
+            inert: &[(&str, &str)],
+        ) {
+            for (_, why) in inert {
+                assert!(
+                    why.len() > 40,
+                    "a rationale under 40 chars is a shrug: {why:?}"
+                );
+            }
+            let carried: std::collections::BTreeSet<&str> = obj
+                .as_object()
+                .unwrap_or_else(|| panic!("{what} is not an object"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let accounted: std::collections::BTreeSet<&str> =
+                read.iter().chain(inert).map(|(k, _)| *k).collect();
+            let unaccounted: Vec<&&str> = carried.difference(&accounted).collect();
+            assert!(
+                unaccounted.is_empty(),
+                "{what} carries key(s) nothing reads and nobody has declared inert: \
+                 {unaccounted:?} (#724 / #924)"
+            );
+            let stale: Vec<&&str> = accounted.difference(&carried).collect();
+            assert!(stale.is_empty(), "{what}: stale key pin(s) {stale:?}");
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#924) — CC build-gates every literal stem against
+    /// `_meta.case_rule.literal_pattern`; persist re-checks it on the vendored
+    /// bytes, because the matcher compares literals by equality and would
+    /// silently carry a miscased stem.
+    #[test]
+    fn every_literal_segment_matches_the_literal_pattern() {
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let pat = regex::Regex::new(
+            root["_meta"]["case_rule"]["literal_pattern"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        for e in entries() {
+            for (seg, class) in &e.segments {
+                if *class == SegmentClass::Literal {
+                    assert!(pat.is_match(seg), "{}: literal {seg:?}", e.prefix);
+                }
+            }
+        }
+    }
+
+    /// The pre-rc5 singular `refusal_token` must still name the case token.
+    #[test]
+    fn the_singular_refusal_token_is_the_case_malformed_token() {
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let cr = &root["_meta"]["case_rule"];
+        assert_eq!(cr["refusal_token"], cr["refusal_tokens"]["case_malformed"]);
+    }
+
+    /// The matcher implements a VARIADIC trailing `*` and a TRAILING version
+    /// segment; the manifest says so in data, and this pins the two together.
+    #[test]
+    fn the_wildcard_rule_is_the_variadic_one_the_matcher_implements() {
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let cr = &root["_meta"]["case_rule"];
+        assert_eq!(cr["wildcard_rule"]["match"], "one_or_more_segments");
+        assert_eq!(cr["version_segment"]["position"], "trailing");
+        let mut wildcards = 0;
+        for fam in root["families"].as_array().unwrap() {
+            for seg in fam["segments"].as_array().unwrap() {
+                if seg["class"] == "wildcard" {
+                    wildcards += 1;
+                    assert_eq!(seg["variadic"], true, "{}", fam["prefix"]);
+                    assert_eq!(seg["segment"], "*");
+                }
+            }
+        }
+        assert!(wildcards >= 10, "vacuous: {wildcards}");
     }
 }

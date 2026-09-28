@@ -435,6 +435,18 @@ pub const POLARITY_RANGES: &[(&str, DeclaredRange)] = &[
             lo_open: false,
         },
     ),
+    // SINGLE POLARITY, single point — the rc5 (CIRISPersist#924) accord
+    // leaves (`accord:invoke:{constitutional,notify,drill}:*`,
+    // `accord:lifecycle`, `accord:lifecycle:active`): an invocation is
+    // asserted, never scored down.
+    (
+        "+1.0 only",
+        DeclaredRange {
+            lo: 1.0,
+            hi: 1.0,
+            lo_open: false,
+        },
+    ),
     // SINGLE POLARITY, two points; the interval between them is a sound
     // widening of the two-point set.
     (
@@ -516,7 +528,7 @@ pub const POLARITY_RANGES: &[(&str, DeclaredRange)] = &[
 /// EXACTLY is the only value that unpins it: a 200k-sample sweep drawing
 /// confidences from `uniform(0, 1)` returns `{Refuted}` alone in every cell,
 /// because the escape depends on hitting a single point of a continuum. So the
-/// honest reading of the census is that these three families are pinned under
+/// honest reading of the census is that the three negative-range families are pinned under
 /// the boolean fold outright and pinned under the signed fold for every corpus
 /// an operator will actually see — and the exemption that keeps them formally
 /// unpinned is a zero-confidence row, which is to say a row asserting nothing.
@@ -526,7 +538,22 @@ pub const POLARITY_RANGES: &[(&str, DeclaredRange)] = &[
 /// (refuse `confidence <= 0` at admission) would move these families to pinned
 /// under both folds, and that test is what makes the consequence visible at the
 /// moment someone writes the check rather than afterwards.
+///
+/// # v50.0.0 (CIRISPersist#924) — the five rc5 accord leaves join, on the
+/// POSITIVE side
+///
+/// The rc5 re-vendor brought `accord:*`'s six named leaves in as rows, five of
+/// them declared `+1.0 only` (the three invocations, `accord:lifecycle`,
+/// `accord:lifecycle:active`). A single-point positive range pins `Supported`
+/// under the boolean fold exactly as the negative ranges above pin `Refuted`:
+/// an accord invocation is asserted, never scored, so the band is the
+/// dimension. Recorded here as the census says to, not argued away.
 pub const PINNING_FAMILIES: &[&str] = &[
+    "accord:invoke:constitutional:{halt_id}",
+    "accord:invoke:drill:{drill_id}",
+    "accord:invoke:notify:{notify_id}",
+    "accord:lifecycle",
+    "accord:lifecycle:active",
     "prohibited:{category}",
     "revocation:{entity_type}:{reason}",
     "rollback_detected:{revision_field}",
@@ -824,12 +851,12 @@ mod tests {
         // that choice is now a checked fact instead of an accident:
         ("capacity_assurance:", "signed", "enumerated"),
         ("config:", "signed", "boolean-via-score"),
-        // Same per-leaf intent, two spellings:
-        (
-            "consent:",
-            "per-leaf (CC 3.3.1)",
-            "per-leaf (enumerated | signed | positive-only)",
-        ),
+        // (`consent:` — "per-leaf (CC 3.3.1)" vs the walk's "per-leaf
+        // (enumerated | signed | positive-only)" — left this gate at the v50.0.0
+        // rc5 re-vendor (CIRISPersist#924): the registry now carries eight
+        // `consent:*` rows with their own polarities, so the stem is no longer
+        // single-valued on the registry side and falls outside the
+        // single-value comparison, as a per-leaf family should.)
         // The walk marked these n/a before the rc3 registry landed real
         // labels — the CEG-0.3 vintage showing through:
         ("ownership:", "boolean-via-score", "n/a"),
@@ -1670,7 +1697,7 @@ mod tests {
         );
         // The literal is not empty, so the census is a finding and not a
         // formality — and it is not everything, so it discriminates.
-        assert_eq!(PINNING_FAMILIES.len(), 3);
+        assert_eq!(PINNING_FAMILIES.len(), 8);
     }
 
     /// **CC 3.4.5's acceptance criterion, stated as it was written**: feasible
@@ -1710,11 +1737,14 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 109 of the registry's 116
-    /// families; withholding it pins 3. (107 of 114 before the v42.0.0 rc3 →
-    /// rc5 re-vendor; both new families — `duty:` and `session:` — are signed,
-    /// so both land in the retained set and the contrast is unchanged in
-    /// shape.) That two-number contrast is the whole
+    /// Retaining the contradiction count pins 136 of the registry's 148
+    /// families; withholding it pins 8. (107 of 114 before the v42.0.0 rc3 →
+    /// rc5 re-vendor; 109 of 116 / 3 until the v50.0.0 rc5 @ 4b624513
+    /// re-vendor, whose 29 net new families added 25 to the retained side and
+    /// the five `+1.0 only` accord leaves to the withheld side; 134 of 145 / 8
+    /// until the released rc5 @ c60d0a6, whose two `signed` capacity companions
+    /// joined the retained side while `consent:community_trust`, `positive-only`
+    /// like its sibling consent leaves, pins on neither.) That two-number contrast is the whole
     /// argument for what the reserved token's retained set must be, and a
     /// paragraph asserting it would rot — so it is measured.
     #[test]
@@ -1723,11 +1753,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (109, 3),
+            (136, 8),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 116);
+        assert_eq!(vendored_family_polarities().len(), 148);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

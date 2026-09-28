@@ -30,14 +30,115 @@ use super::cohort::Cohort;
 use super::types::{GroupSupersedeProof, SignedCommunity, SignedFamily};
 use super::{Error, FederationDirectory};
 
+/// v50.0.0 (CIRISPersist#925/#931, review) — which door a community record
+/// entered through. The door, never the signer, decides whether the CC 3.2
+/// infrastructure conformance gate runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityDoor {
+    /// `put_community`: a record authored or submitted on this node. The full
+    /// gate runs, whoever signed.
+    Local,
+    /// `apply_replicated_community`: a record received from a peer. A legacy
+    /// non-conformant record is admitted as data; the fold's gates apply.
+    ReplicatedApply,
+}
+
+/// v50.0.0 (CIRISPersist#931) — the typed outcome of
+/// [`FederationDirectory::apply_replicated_community`]. The refusals are
+/// typed, so a replication cursor records them and advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedCommunityOutcome {
+    /// No record under this id; stored.
+    Inserted,
+    /// The identical record was already held.
+    Unchanged,
+    /// A differing record under an occupied id carried a supersede proof this
+    /// node's own state authorizes; applied as a supersede.
+    Superseded,
+    /// Not admitted; nothing changed.
+    Refused {
+        /// Why.
+        reason: ReplicatedCommunityRefusal,
+    },
+}
+
+/// v50.0.0 (CIRISPersist#931) — why a replicated community record was refused.
+/// Closed, snake_case, APPEND-ONLY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedCommunityRefusal {
+    /// A differing record under an occupied id with no proof, or a proof over
+    /// a prior version this node does not hold ([`Error::Conflict`]).
+    ConflictingRecord,
+    /// v50.0.0 (final check) — the record would supersede a CONFORMANT
+    /// stored infrastructure record with a non-conformant one (a weakening
+    /// supersede, CC 3.2).
+    DegradesConformance,
+}
+
+/// v50.0.0 (PR #921 review, Codex F3) — what a community write DID, as the
+/// write itself saw it: under the serialization the write uses (memory's
+/// state lock, sqlite's one writer connection, the postgres statement's own
+/// row count, a supersede's prior-hash check under its lock). The typed
+/// outcome of [`FederationDirectory::apply_replicated_community`] is a
+/// function of this and nothing read before it: a pre-read raced a concurrent
+/// apply of the same record, and the door's idempotent no-op still reported
+/// `Inserted` / `Superseded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommunityWrite {
+    /// The row was stored where none was.
+    Inserted,
+    /// The identical row was already held; nothing was written.
+    Unchanged,
+    /// The held row was replaced by the offered version.
+    Superseded,
+}
+
+/// v50.0.0 (#931; PR #921 review F3) — the store step's result as a typed
+/// outcome: the write's own report, a [`Error::Conflict`] is a typed refusal,
+/// a conformance violation is `degrades_conformance`; every other error
+/// propagates.
+pub(crate) fn replicated_community_outcome(
+    stored: Result<CommunityWrite, Error>,
+) -> Result<ReplicatedCommunityOutcome, Error> {
+    match stored {
+        Ok(CommunityWrite::Inserted) => Ok(ReplicatedCommunityOutcome::Inserted),
+        Ok(CommunityWrite::Unchanged) => Ok(ReplicatedCommunityOutcome::Unchanged),
+        Ok(CommunityWrite::Superseded) => Ok(ReplicatedCommunityOutcome::Superseded),
+        Err(Error::Conflict(_)) => Ok(ReplicatedCommunityOutcome::Refused {
+            reason: ReplicatedCommunityRefusal::ConflictingRecord,
+        }),
+        Err(Error::CommunityConsensusProtocolViolation { .. }) => {
+            Ok(ReplicatedCommunityOutcome::Refused {
+                reason: ReplicatedCommunityRefusal::DegradesConformance,
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// v38.2.0 (#758) / PR #921 review F3 — the insert arm's own verdict when its
+/// insert found the id occupied (read inside the write): the identical row is
+/// `Unchanged`; a differing one is the #758 [`Error::Conflict`].
+pub(crate) fn community_insert_lost_to(
+    stored_hash: &str,
+    offered_hash: &str,
+    community_key_id: &str,
+) -> Result<CommunityWrite, Error> {
+    super::community_reput_verdict(stored_hash, offered_hash, community_key_id)
+        .map(|()| CommunityWrite::Unchanged)
+}
+
 /// What the replicated door does after the occupied-id decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OccupiedRoute {
     /// No row under this id — the caller inserts.
     Insert,
-    /// Settled here: an identical re-put (no-op) or an amendment applied as a
-    /// supersede. The caller writes nothing more.
-    Settled,
+    /// Settled here: an identical re-put (`Unchanged`, a no-op) or an
+    /// amendment applied as a supersede (`Superseded`). The caller writes
+    /// nothing more.
+    Settled(CommunityWrite),
 }
 
 /// The shape both group kinds share for the decision.
@@ -87,7 +188,7 @@ where
         entrenched: stored.consensus_protocol_entrenched,
     };
     if !admit_amendment(dir, &offer, &stored).await? {
-        return Ok(OccupiedRoute::Settled);
+        return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
     super::check_consensus_protocol_form(&f.consensus_protocol)?;
     super::admission::validate_family_members(dir, f).await?;
@@ -95,7 +196,7 @@ where
         .map_err(|e| Error::Backend(format!("family amendment snapshot serialize: {e}")))?;
     dir.supersede_group_row(Cohort::Family, snapshot, Some(authorization(&offer)))
         .await?;
-    Ok(OccupiedRoute::Settled)
+    Ok(OccupiedRoute::Settled(CommunityWrite::Superseded))
 }
 
 /// v49.0.0 (#910.5) — the occupied-id decision for a replicated
@@ -112,11 +213,27 @@ where
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
         return Ok(OccupiedRoute::Insert);
     };
+    // v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — a trust-root row is
+    // applied by its CHAIN, not by the one-hop proof below: version by version
+    // from the one this node holds (or, over a squat that never passed the
+    // door, from the accord birth). The door already judged the whole chain.
+    let offered_hash = super::types::compute_persist_row_hash(c)?;
+    if super::canonical_community::is_trust_root_grade(c)
+        || super::canonical_community::is_trust_root_grade(&stored)
+    {
+        let applied =
+            super::canonical_community::apply_trust_root_chain_counted(dir, community).await;
+        return match lost_race(dir, &c.community_key_id, &offered_hash, applied).await? {
+            None => Ok(OccupiedRoute::Insert),
+            Some(0) => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
+            Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
+        };
+    }
     let offer = Offer {
         cohort: Cohort::Community,
         kind: "community",
         group_key_id: &c.community_key_id,
-        offered_hash: super::types::compute_persist_row_hash(c)?,
+        offered_hash: offered_hash.clone(),
         member_key_ids: c.members.iter().map(|m| m.key_id.as_str()).collect(),
         consensus_protocol: &c.consensus_protocol,
         entrenched: None,
@@ -127,13 +244,46 @@ where
         entrenched: false,
     };
     if !admit_amendment(dir, &offer, &stored).await? {
-        return Ok(OccupiedRoute::Settled);
+        return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
     let snapshot = serde_json::to_value(community)
         .map_err(|e| Error::Backend(format!("community amendment snapshot serialize: {e}")))?;
-    dir.supersede_group_row(Cohort::Community, snapshot, Some(authorization(&offer)))
-        .await?;
-    Ok(OccupiedRoute::Settled)
+    let written = dir
+        .supersede_group_row(Cohort::Community, snapshot, Some(authorization(&offer)))
+        .await
+        .map(|_| Some(1));
+    Ok(
+        match lost_race(dir, &c.community_key_id, &offered_hash, written).await? {
+            Some(0) => OccupiedRoute::Settled(CommunityWrite::Unchanged),
+            _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
+        },
+    )
+}
+
+/// PR #921 review (Codex F3) — a supersede that lost its race. The
+/// supersede checks the prior version its proof names UNDER the backend's
+/// write serialization; a concurrent apply of the same record that got there
+/// first makes that check fail stale ([`Error::Conflict`]). If the row now
+/// held IS the offered version, this write changed nothing and the record is
+/// held: `Some(0)` (`Unchanged`), not a refusal. Any other result passes
+/// through: `Ok(n)` is what the write did (`None`: nothing stored, insert),
+/// and a Conflict over a row that differs from the offer stays a Conflict.
+async fn lost_race<F>(
+    dir: &F,
+    community_key_id: &str,
+    offered_hash: &str,
+    written: Result<Option<usize>, Error>,
+) -> Result<Option<usize>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match written {
+        Err(Error::Conflict(m)) => match dir.lookup_community(community_key_id).await? {
+            Some(held) if held.persist_row_hash == offered_hash => Ok(Some(0)),
+            _ => Err(Error::Conflict(m)),
+        },
+        other => other,
+    }
 }
 
 /// `Ok(false)` — identical content, nothing to do. `Ok(true)` — an amendment
@@ -294,18 +444,35 @@ where
 
 /// The community / affiliations twin of [`supersede_family_signed`]; `cohort`
 /// picks the history discriminator (CC 4.4.3.2.8 / #308 — both share the
-/// `federation_communities` row).
+/// `federation_communities` row). `generic_quorum_skipped` is true when the
+/// caller skipped the folded-roster quorum because a trust root's chain held
+/// (the founders' link stands in for it); if the chain no longer holds here,
+/// the supersede is refused, never written unquorate.
 pub(crate) async fn supersede_community_signed<F>(
     dir: &F,
     cohort: Cohort,
     new: SignedCommunity,
     authorization: Option<serde_json::Value>,
+    generic_quorum_skipped: bool,
 ) -> Result<u32, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
     super::verify_community_admission(dir, &new).await?;
+    // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — the supersede is gated as the
+    // record it replaces was: an infrastructure record stays quorum:M/N with
+    // no node-bearing founder.
+    super::admission::check_infrastructure_community_conformance(
+        dir.as_dyn_directory(),
+        &new.community,
+    )
+    .await?;
+    // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified
+    // founders' link of the held version, and is stored carrying its chain.
+    let new =
+        super::canonical_community::prepare_trust_root_supersede(dir, new, generic_quorum_skipped)
+            .await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",

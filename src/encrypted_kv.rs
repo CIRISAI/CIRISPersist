@@ -70,15 +70,24 @@
 //! tag → [`KVError::WrongPassphrase`]. The store **refuses to operate**
 //! rather than silently starting with a bad key.
 //!
-//! # Hardware-key custodian boundary
+//! # Where the key comes from — two openers
 //!
-//! persist takes the **passphrase** in (`&[u8]`). The hardware-key
-//! custodian — TPM / Secure Enclave keychain / DPAPI / libsecret that
-//! *releases* the passphrase at boot — is the **caller/operator's**
-//! responsibility, out of scope for this surface (FSD §7.8: the
-//! phone-class degraded posture is passphrase-only; hardware sealing of
-//! the passphrase is a higher tier the operator opts into). Derived keys
-//! and the passphrase copy are zeroized on drop where practical.
+//! - **`Engine::open_mls_state(path)`** (v50.0.0, CIRISPersist#920) — the
+//!   durable MLS-state store. persist supplies the key: HKDF(root,
+//!   [`MLS_STATE_CONTEXT`]) through CIRISVerify's `derive_symmetric_key`,
+//!   where the root is what the persisted content-master row resolves to on
+//!   this host — the hardware-sealed seed (TPM / Keystore / Secure Enclave)
+//!   or the persisted software content master — and the custody class is
+//!   returned by name ([`MlsStateCustody`]). The host passes a path and
+//!   nothing else. (v49's `XChaChaKvStore::open_mls_state` is removed.)
+//! - **[`XChaChaKvStore::open`] / [`open_in_memory`](XChaChaKvStore::open_in_memory)**
+//!   — a caller-supplied passphrase (`&[u8]`). Whoever releases that
+//!   passphrase (an operator-held secret, FSD §7.8's phone-class tier) is
+//!   the caller's responsibility. A public id (a room id) is not a
+//!   passphrase.
+//!
+//! Derived keys and the passphrase copy are zeroized on drop where
+//! practical.
 
 use std::future::Future;
 use std::path::Path;
@@ -89,13 +98,103 @@ use rusqlite::{Connection, OptionalExtension};
 use zeroize::{Zeroize, Zeroizing};
 
 /// v49.0.0 (CIRISPersist#911) — HKDF `context` under which the durable MLS
-/// state store's key derives from persist's ONE hardware-sealed seed,
-/// beside `secrets-store-master-v1` and
+/// state store's key derives from the content master's root, beside
+/// `secrets-store-master-v1` and
 /// [`crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT`]
-/// ([`XChaChaKvStore::open_mls_state`]). **Stable wire constant** —
-/// changing it derives a different key, and every store opened under the
-/// old one then refuses with [`KVError::WrongPassphrase`].
+/// (`Engine::open_mls_state`). v50.0.0 (#920): the root is whatever the
+/// persisted `federation_content_master` row resolves to on this host — the
+/// hardware-sealed seed or the software content master. **Stable wire
+/// constant** — changing it derives a different key, and every store opened
+/// under the old one then refuses with [`KVError::WrongPassphrase`].
 pub const MLS_STATE_CONTEXT: &str = "mls-state-at-rest-v1";
+
+/// v50.0.0 (CIRISPersist#920) — which root keys a durable MLS-state store,
+/// never a preference: a software store is a class, not a failure
+/// (CC 4.2.2.1), and it is reported by name so a host logs it. It is the
+/// persisted content-master row's `key_kind` — except under the v49
+/// compatibility arm, where a software row's store proves (by opening) to be
+/// keyed from the hardware seed and is reported `Hardware` with a
+/// `legacy-v49-hardware-keyed-under-software-row` descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlsStateCustodyKind {
+    /// Derived from the hardware-sealed seed (TPM / Keystore / Secure
+    /// Enclave) — the row says `key_kind='hardware'`.
+    Hardware,
+    /// Derived from the persisted software content master — the row says
+    /// `key_kind='software'`. Honest about being software
+    /// (`BLOB_ENCRYPTION_AT_REST.md` §4.3).
+    Software,
+}
+
+impl MlsStateCustodyKind {
+    /// `"hardware"` | `"software"` — the row's own vocabulary.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MlsStateCustodyKind::Hardware => "hardware",
+            MlsStateCustodyKind::Software => "software",
+        }
+    }
+}
+
+/// v50.0.0 (CIRISPersist#920) — the custody a durable MLS-state store was
+/// opened under, returned beside the store by `Engine::open_mls_state`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsStateCustody {
+    /// Hardware or software, from the persisted content-master row.
+    pub kind: MlsStateCustodyKind,
+    /// Provenance: the root, the HKDF context, and the row's own
+    /// descriptor. Carries no key material.
+    pub descriptor: String,
+}
+
+/// Key id under which the software content master is presented to
+/// CIRISVerify's `derive_symmetric_key` (see [`SoftwareRootAsSeed`]).
+const SOFTWARE_ROOT_KEY_ID: &str = "federation-content-master-software";
+
+/// v50.0.0 (#920 re-check) — why the hardware root produced no key, TYPED so
+/// the opener never reads a message to decide. Under a hardware row both
+/// are §11.7 ([`KVError::HardwareCustodyUnavailable`]). Under the v49
+/// compatibility arm they part: with no hardware backing v49's opener
+/// refused, so no v49-keyed store can exist and a refused store is simply
+/// wrong-keyed ([`KVError::WrongPassphrase`]); with backing present but the
+/// seed unusable the reason is kept.
+#[derive(Debug)]
+pub(crate) enum HardwareRootError {
+    /// This host's secure storage is not hardware-backed. Constructed only
+    /// by the `secrets` derivation; a build without it answers `Unreachable`.
+    #[cfg_attr(not(feature = "secrets"), allow(dead_code))]
+    NotHardwareBacked(String),
+    /// Hardware backing is (or may be) present; the seed cannot be used.
+    Unreachable(String),
+}
+
+impl std::fmt::Display for HardwareRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HardwareRootError::NotHardwareBacked(m) => {
+                write!(f, "no hardware-backed secure storage on this host: {m}")
+            }
+            HardwareRootError::Unreachable(m) => {
+                write!(f, "the hardware-sealed seed cannot be used: {m}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "secrets")]
+impl From<crate::secrets::hardware::HardwareDeriveError> for HardwareRootError {
+    fn from(e: crate::secrets::hardware::HardwareDeriveError) -> Self {
+        use crate::secrets::hardware::HardwareDeriveError as E;
+        match e {
+            E::NotHardwareBacked(m) => HardwareRootError::NotHardwareBacked(m),
+            E::Unreachable(m) | E::Crypto(m) => HardwareRootError::Unreachable(m),
+        }
+    }
+}
+
+/// What the hardware derivation hook returns: the key and its descriptor.
+pub(crate) type HardwareRootResult = Result<(Zeroizing<Vec<u8>>, String), HardwareRootError>;
 
 /// XChaCha20-Poly1305 key length (bytes).
 const KEY_LEN: usize = 32;
@@ -158,16 +257,25 @@ pub enum KVError {
     /// Caller passed an invalid argument (empty namespace, reserved
     /// namespace, etc.).
     InvalidArgument(String),
-    /// v49.0.0 (CIRISPersist#911) — [`XChaChaKvStore::open_mls_state`]
-    /// found no hardware-sealed seed to root the store in: no TPM /
-    /// Keystore / Secure Enclave, a build without the `secrets` feature,
-    /// `CIRIS_DATA_DIR` unset, or (for a store already in use) a seed that
-    /// has gone missing. **This is the degraded posture, named.** The store
-    /// is not opened; nothing falls back to a derived or public passphrase.
-    /// The host chooses what it does instead — keep MLS state in memory
-    /// (today's behaviour: a restart loses group state), or open with
-    /// [`XChaChaKvStore::open`] and a passphrase the OPERATOR supplies
-    /// (FSD §7.8's phone-class tier). A room id is not a passphrase.
+    /// v49.0.0 (CIRISPersist#911); narrowed in v50.0.0 (#920) —
+    /// **`BLOB_ENCRYPTION_AT_REST.md` §11.7**, in two shapes. (1) The
+    /// persisted content-master row says `key_kind='hardware'` and the
+    /// hardware-sealed seed it was derived from cannot be reached on this
+    /// host (the keyring directory is gone, `CIRIS_DATA_DIR` is unset, the
+    /// TPM is absent, or the build lacks `secrets`). The store is not
+    /// opened and nothing is written; no seed is minted, because a new seed
+    /// would be a different root and the content corpus sealed under the
+    /// old one would become unreadable. A host WITHOUT hardware is not this
+    /// case: its row says software and the store opens under
+    /// [`MlsStateCustodyKind::Software`]. (2) The v49 compatibility arm: the
+    /// row says software, the store is in use and refuses the software-root
+    /// key, and the one other key it may hold — v49's, from the hardware seed
+    /// — cannot be used although hardware-backed storage is present; the
+    /// message carries that reason. With NO hardware backing v49 could never
+    /// have keyed the store, so that case is [`KVError::WrongPassphrase`], as
+    /// is a store both keys were tried against. The split is typed
+    /// (`HardwareRootError`), never read from a message. A room id is not a
+    /// passphrase.
     HardwareCustodyUnavailable(String),
 }
 
@@ -184,8 +292,9 @@ impl std::fmt::Display for KVError {
             KVError::InvalidArgument(m) => write!(f, "encrypted-kv: invalid argument: {m}"),
             KVError::HardwareCustodyUnavailable(m) => write!(
                 f,
-                "encrypted-kv: no hardware-sealed seed to root the store in — not opened \
-                 (degraded posture; the host decides): {m}"
+                "encrypted-kv: the hardware-sealed seed this store is keyed from is \
+                 unreachable — not opened, nothing minted \
+                 (BLOB_ENCRYPTION_AT_REST.md §11.7): {m}"
             ),
         }
     }
@@ -362,31 +471,144 @@ impl XChaChaKvStore {
         Self::from_connection(conn, passphrase)
     }
 
-    /// v49.0.0 (CIRISPersist#911) — **open the durable MLS-state store at
-    /// `path`, keyed from persist's hardware-sealed seed.** The host passes
-    /// a path and nothing else: the key is HKDF-derived (by CIRISVerify)
-    /// from the same seed as the secrets master and the content-at-rest
-    /// master, under [`MLS_STATE_CONTEXT`], so every host gets the same key
-    /// custody and there is still one root to seal.
+    /// v50.0.0 (CIRISPersist#920) — **open the durable MLS-state store at
+    /// `path` under the root the persisted content-master row names.** The
+    /// public door is `Engine::open_mls_state(path)`, which loads (or, on a
+    /// host that has sealed nothing yet, initialises) the
+    /// `federation_content_master` row and hands its fields here; this
+    /// module takes no backend import.
     ///
-    /// Only the FIRST open of a store that holds nothing may seal a seed.
-    /// Reopening a store already in use re-derives and never mints
-    /// (`BLOB_ENCRYPTION_AT_REST.md` §11.7): a lost keyring with the TPM
-    /// still present would otherwise yield a different key and the state
-    /// would be unreadable while new writes went on.
+    /// **Clean break:** v49's bare `XChaChaKvStore::open_mls_state(path)` is
+    /// REMOVED. It asked the hardware seed only, so on every software host
+    /// (CI, dev, a server without a TPM) it could only refuse.
     ///
-    /// No hardware seed ⇒ [`KVError::HardwareCustodyUnavailable`], the
-    /// named degraded posture. **Synchronous / blocking** (TPM +
-    /// filesystem I/O) — call from `spawn_blocking`.
-    pub fn open_mls_state(path: impl AsRef<Path>) -> Result<Self, KVError> {
-        let conn = Connection::open(path).map_err(|e| KVError::Backend(e.to_string()))?;
-        Self::open_rooted(conn, hardware_mls_state_key)
+    /// The key is HKDF(root, [`MLS_STATE_CONTEXT`]) through CIRISVerify's
+    /// `derive_symmetric_key` in both arms — the same function, salt and
+    /// `info`; only the root differs:
+    ///
+    /// - `key_kind = "hardware"` → the hardware-sealed seed, via
+    ///   `hardware(create_seed_if_absent = false)`. The row exists, so a seed
+    ///   was sealed when it was written; an absent seed is §11.7's lost
+    ///   keyring and is refused ([`KVError::HardwareCustodyUnavailable`]),
+    ///   never re-minted — not even on the first open of an empty store,
+    ///   since a new seed would also move the content master.
+    /// - `key_kind = "software"` → the persisted software content master
+    ///   (`master_key_b64`), presented to verify as the seed.
+    ///
+    /// **The row wins** (§10.2): a store created on a software host keeps
+    /// opening as software after a TPM appears.
+    ///
+    /// **v49 compatibility arm** (review of #920, finding 1). v49's opener
+    /// keyed every store from the hardware seed regardless of the row, and
+    /// CIRISEdge v32.1.0 shipped on it, so a TPM host with a `software` row
+    /// can hold a store keyed HKDF(hardware seed, [`MLS_STATE_CONTEXT`]).
+    /// Under a software row, and ONLY when the store is already in use and
+    /// its verifier refuses the software-derived key, the opener asks
+    /// `hardware(false)` (never mint) and tries the v49 key. On success the
+    /// custody is reported as [`MlsStateCustodyKind::Hardware`] — the store
+    /// IS hardware-keyed — with a `legacy-v49-hardware-keyed-under-software-row`
+    /// descriptor. Nothing is re-keyed. The software key is always tried
+    /// first, so this is a fallback, never a preference. Hardware-backed
+    /// storage present but the v49 seed unusable →
+    /// [`KVError::HardwareCustodyUnavailable`] carrying that reason; no
+    /// hardware backing at all (v49 refused there, so no v49 store exists) or
+    /// both keys tried → [`KVError::WrongPassphrase`].
+    ///
+    /// **Synchronous / blocking** (TPM + filesystem I/O) — call from
+    /// `spawn_blocking`.
+    pub(crate) fn open_mls_state_from_row(
+        path: impl AsRef<Path>,
+        key_kind: &str,
+        master_key_b64: Option<&str>,
+        row_descriptor: &str,
+        hardware: impl FnOnce(bool) -> HardwareRootResult,
+    ) -> Result<(Self, MlsStateCustody), KVError> {
+        let path = path.as_ref();
+        let connect = || Connection::open(path).map_err(|e| KVError::Backend(e.to_string()));
+        // Every arm resolves its root BEFORE touching the file, so a refusal
+        // leaves nothing behind.
+        match key_kind {
+            "hardware" => {
+                let (key, seed_descriptor) = hardware(false).map_err(|e| {
+                    KVError::HardwareCustodyUnavailable(format!(
+                        "the content master row says hardware; {e}; none is minted in its \
+                         place (context={MLS_STATE_CONTEXT})"
+                    ))
+                })?;
+                let store = Self::open_rooted(connect()?, move |_first_open| Ok(key))?;
+                Ok((
+                    store,
+                    MlsStateCustody {
+                        kind: MlsStateCustodyKind::Hardware,
+                        descriptor: format!(
+                            "hardware root ({seed_descriptor}); content master row: {row_descriptor}"
+                        ),
+                    },
+                ))
+            }
+            "software" => {
+                let key = software_mls_state_key(master_key_b64)?;
+                match Self::open_rooted(connect()?, move |_first_open| Ok(key)) {
+                    Ok(store) => Ok((
+                        store,
+                        MlsStateCustody {
+                            kind: MlsStateCustodyKind::Software,
+                            descriptor: format!(
+                                "software root: the persisted software content master, \
+                                 HKDF context={MLS_STATE_CONTEXT}; content master row: \
+                                 {row_descriptor}"
+                            ),
+                        },
+                    )),
+                    // The verifier refused: a store in use under another key.
+                    // The one other key it may legitimately hold is v49's.
+                    // Its seed unreachable keeps the reason (§11.7 wording);
+                    // `WrongPassphrase` means BOTH keys were tried.
+                    Err(KVError::WrongPassphrase) => {
+                        let (legacy, seed_descriptor) = match hardware(false) {
+                            Ok(v) => v,
+                            // No hardware backing: v49 refused here, so no
+                            // v49-keyed store can exist — it is wrong-keyed.
+                            Err(HardwareRootError::NotHardwareBacked(_)) => {
+                                return Err(KVError::WrongPassphrase)
+                            }
+                            Err(HardwareRootError::Unreachable(reason)) => {
+                                return Err(KVError::HardwareCustodyUnavailable(format!(
+                                    "the store refuses the software-root key, and the only other \
+                                     key it may hold (v49's, from the hardware-sealed seed) is \
+                                     unreachable: {reason}"
+                                )))
+                            }
+                        };
+                        let store = Self::open_rooted(connect()?, move |_first_open| Ok(legacy))?;
+                        Ok((
+                            store,
+                            MlsStateCustody {
+                                kind: MlsStateCustodyKind::Hardware,
+                                descriptor: format!(
+                                    "legacy-v49-hardware-keyed-under-software-row: hardware root \
+                                     ({seed_descriptor}), not re-keyed; content master row: \
+                                     {row_descriptor}"
+                                ),
+                            },
+                        ))
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            other => Err(KVError::InvalidArgument(format!(
+                "content master row has unknown key_kind {other:?}"
+            ))),
+        }
     }
 
-    /// The seed policy of [`open_mls_state`](Self::open_mls_state) over a
-    /// supplied derivation, so it is testable without a TPM (every CI
-    /// runner): `derive(create_seed_if_absent)` is asked to create only
-    /// when the store holds no verifier row yet.
+    /// The store half of the MLS-state opener over a supplied derivation,
+    /// so it is testable without a TPM (every CI runner):
+    /// `derive(first_open)` is told whether the store holds no verifier row
+    /// yet. (v49 let the first open seal a seed; since v50 the seed belongs
+    /// to the content master's row, and
+    /// [`open_mls_state_from_row`](Self::open_mls_state_from_row) never
+    /// grants that.)
     fn open_rooted(
         conn: Connection,
         derive: impl FnOnce(bool) -> Result<Zeroizing<Vec<u8>>, KVError>,
@@ -722,20 +944,104 @@ impl EncryptedKVStore for XChaChaKvStore {
     }
 }
 
-/// The production derivation behind [`XChaChaKvStore::open_mls_state`].
-fn hardware_mls_state_key(create_seed_if_absent: bool) -> Result<Zeroizing<Vec<u8>>, KVError> {
+/// The production hardware derivation behind `Engine::open_mls_state`: the
+/// hardware-sealed seed under [`MLS_STATE_CONTEXT`], with its descriptor.
+pub(crate) fn hardware_mls_state_key(create_seed_if_absent: bool) -> HardwareRootResult {
     #[cfg(feature = "secrets")]
     {
         crate::secrets::hardware::derive_hardware_mls_state_key(create_seed_if_absent)
-            .map(|(key, _descriptor)| Zeroizing::new(key))
-            .map_err(|e| KVError::HardwareCustodyUnavailable(e.to_string()))
+            .map(|(key, descriptor)| (Zeroizing::new(key), descriptor))
+            .map_err(HardwareRootError::from)
     }
     #[cfg(not(feature = "secrets"))]
     {
+        // Unreachable, not NotHardwareBacked: this BUILD cannot reach a seed
+        // a `secrets` build on the same host may have sealed.
         let _ = create_seed_if_absent;
-        Err(KVError::HardwareCustodyUnavailable(
+        Err(HardwareRootError::Unreachable(
             "built without the `secrets` feature — no hardware-sealed seed is reachable".into(),
         ))
+    }
+}
+
+/// v50.0.0 (#920) — the software arm: HKDF(software content master,
+/// [`MLS_STATE_CONTEXT`]), through the SAME CIRISVerify
+/// `derive_symmetric_key` the hardware arm uses (HKDF-SHA-256, verify's
+/// fixed salt, `info` = the context). Verify's KDF reads its input keying
+/// material from a `SecureBlobStorage`, so the persisted master is presented
+/// to it through [`SoftwareRootAsSeed`], an in-process, read-only, one-entry
+/// storage that says it is NOT hardware-backed. Persist implements no KDF of
+/// its own (MISSION §1.4), and the two arms differ in the root alone.
+fn software_mls_state_key(master_key_b64: Option<&str>) -> Result<Zeroizing<Vec<u8>>, KVError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    let b64 = master_key_b64.ok_or_else(|| {
+        KVError::InvalidArgument("content master row says software but carries no key bytes".into())
+    })?;
+    let raw = Zeroizing::new(
+        B64.decode(b64)
+            .map_err(|e| KVError::InvalidArgument(format!("content-master b64: {e}")))?,
+    );
+    if raw.len() != KEY_LEN {
+        return Err(KVError::InvalidArgument(format!(
+            "content master is {} bytes, expected {KEY_LEN}",
+            raw.len()
+        )));
+    }
+    let key = Zeroizing::new(
+        ciris_verify_core::derive_symmetric_key(
+            &SoftwareRootAsSeed(raw),
+            SOFTWARE_ROOT_KEY_ID,
+            MLS_STATE_CONTEXT,
+        )
+        .map_err(|e| KVError::Crypto(format!("verify derive_symmetric_key failed: {e}")))?,
+    );
+    if key.len() != KEY_LEN {
+        return Err(KVError::Crypto(format!(
+            "verify derived a {}-byte key; expected {KEY_LEN}",
+            key.len()
+        )));
+    }
+    Ok(key)
+}
+
+/// The persisted software content master, presented to CIRISVerify's
+/// `derive_symmetric_key` as the seed under [`SOFTWARE_ROOT_KEY_ID`].
+/// Read-only and in-process; reports `is_hardware_backed() == false`,
+/// because it is not.
+struct SoftwareRootAsSeed(Zeroizing<Vec<u8>>);
+
+impl ciris_keyring::SecureBlobStorage for SoftwareRootAsSeed {
+    fn store(&self, key_id: &str, _data: &[u8]) -> Result<(), ciris_keyring::KeyringError> {
+        Err(ciris_keyring::KeyringError::StorageFailed {
+            reason: format!("read-only software root: refusing to store {key_id:?}"),
+        })
+    }
+    fn load(&self, key_id: &str) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+        if key_id == SOFTWARE_ROOT_KEY_ID {
+            Ok(self.0.to_vec())
+        } else {
+            Err(ciris_keyring::KeyringError::KeyNotFound {
+                alias: key_id.to_owned(),
+            })
+        }
+    }
+    fn exists(&self, key_id: &str) -> bool {
+        key_id == SOFTWARE_ROOT_KEY_ID
+    }
+    fn delete(&self, key_id: &str) -> Result<(), ciris_keyring::KeyringError> {
+        Err(ciris_keyring::KeyringError::StorageFailed {
+            reason: format!("read-only software root: refusing to delete {key_id:?}"),
+        })
+    }
+    fn list_keys(&self) -> Result<Vec<String>, ciris_keyring::KeyringError> {
+        Ok(vec![SOFTWARE_ROOT_KEY_ID.to_owned()])
+    }
+    fn is_hardware_backed(&self) -> bool {
+        false
+    }
+    fn diagnostics(&self) -> String {
+        "persisted software content master (in-process, read-only)".into()
     }
 }
 
@@ -1003,9 +1309,10 @@ mod tests {
         assert!(matches!(err, KVError::WrongPassphrase), "got {err}");
     }
 
-    /// I184 — no hardware seed is the NAMED degraded posture: the store is
-    /// not opened and nothing is written. The public-id passphrase every
-    /// host used (`open_in_memory(room_id)`) is not a fallback.
+    /// I184 — a derivation that refuses (since v50: the §11.7 case, a
+    /// hardware row whose seed is unreachable) opens nothing and writes
+    /// nothing. The public-id passphrase every host used
+    /// (`open_in_memory(room_id)`) is not a fallback.
     #[test]
     fn i184_no_hardware_seed_is_named_and_opens_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1019,7 +1326,7 @@ mod tests {
             matches!(err, KVError::HardwareCustodyUnavailable(_)),
             "got {err}"
         );
-        assert!(err.to_string().contains("degraded posture"));
+        assert!(err.to_string().contains("§11.7"));
         let conn = Connection::open(&path).unwrap();
         let tables: i64 = conn
             .query_row(
@@ -1031,16 +1338,530 @@ mod tests {
         assert_eq!(tables, 0, "a refused open must leave nothing behind");
     }
 
-    /// I184 — the production opener on a build or host without hardware
-    /// custody answers by name, never by opening under something else. (On
-    /// a host that HAS a TPM and a data dir it opens; both outcomes are
-    /// named, and no third one exists.)
-    #[test]
-    fn i184_the_production_opener_answers_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        match XChaChaKvStore::open_mls_state(dir.path().join("mls.db")) {
-            Ok(_) | Err(KVError::HardwareCustodyUnavailable(_)) => {}
-            Err(other) => panic!("the opener answered outside its vocabulary: {other}"),
+    // ── v50.0.0 (CIRISPersist#920) — I187: the MLS-state root follows the
+    // content master's persisted row. The hardware arm is driven over
+    // `secrets::hardware`'s storage double through `derive_with_storage`, as
+    // v49's seed-policy tests are; the Engine door is witnessed in
+    // `federation::mls_state_root_invariants`.
+
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    const SOFTWARE_MASTER: [u8; 32] = [0x5a; 32];
+    const SOFTWARE_ROW: &str = "software content-at-rest master (no TPM)";
+    const HARDWARE_ROW: &str = "hardware-blob-storage seed=… context=content-at-rest-master-v1";
+
+    /// HKDF(`root`, `context`) through CIRISVerify's `derive_symmetric_key`,
+    /// over a one-seed storage of the test's own (independent of the
+    /// opener's adapter).
+    fn verify_hkdf(root: &[u8; 32], context: &str) -> Vec<u8> {
+        struct OneSeed(Vec<u8>);
+        impl ciris_keyring::SecureBlobStorage for OneSeed {
+            fn store(&self, _: &str, _: &[u8]) -> Result<(), ciris_keyring::KeyringError> {
+                unreachable!()
+            }
+            fn load(&self, _: &str) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
+                Ok(self.0.clone())
+            }
+            fn exists(&self, _: &str) -> bool {
+                true
+            }
+            fn delete(&self, _: &str) -> Result<(), ciris_keyring::KeyringError> {
+                unreachable!()
+            }
+            fn list_keys(&self) -> Result<Vec<String>, ciris_keyring::KeyringError> {
+                Ok(vec!["seed".into()])
+            }
+            fn is_hardware_backed(&self) -> bool {
+                false
+            }
+            fn diagnostics(&self) -> String {
+                "test one-seed".into()
+            }
         }
+        ciris_verify_core::derive_symmetric_key(&OneSeed(root.to_vec()), "seed", context).unwrap()
+    }
+
+    fn no_hardware_consulted(_: bool) -> HardwareRootResult {
+        panic!("the hardware root must not be consulted under a software row (the row wins)")
+    }
+
+    fn open_software(path: &Path) -> Result<(XChaChaKvStore, MlsStateCustody), KVError> {
+        XChaChaKvStore::open_mls_state_from_row(
+            path,
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            no_hardware_consulted,
+        )
+    }
+
+    fn has_kv_table(path: &Path) -> bool {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'encrypted_kv'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// I187(a) — a software row opens the store, reports `Software` by
+    /// name, and the state survives a reopen.
+    #[tokio::test]
+    async fn i187_a_software_row_opens_reports_software_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let (s, custody) = open_software(&path).expect("a software host opens its store");
+        assert_eq!(custody.kind, MlsStateCustodyKind::Software);
+        assert_eq!(custody.kind.as_str(), "software");
+        assert!(
+            custody.descriptor.contains("software")
+                && custody.descriptor.contains(MLS_STATE_CONTEXT),
+            "the descriptor must name the class and the context, got: {}",
+            custody.descriptor
+        );
+        assert!(
+            !custody.descriptor.contains(&B64.encode(SOFTWARE_MASTER)),
+            "the descriptor must carry no key material"
+        );
+        s.put("mls", b"group", b"epoch-state").await.unwrap();
+        drop(s);
+        let (s, custody) = open_software(&path).expect("reopen");
+        assert_eq!(custody.kind, MlsStateCustodyKind::Software);
+        assert_eq!(
+            s.get("mls", b"group").await.unwrap().as_deref(),
+            Some(&b"epoch-state"[..]),
+            "the state survives the restart"
+        );
+    }
+
+    /// I187(b) — domain separation by context: the store's key is
+    /// HKDF(master, MLS_STATE_CONTEXT), which is neither the content master
+    /// itself nor HKDF(master, CONTENT_MASTER_CONTEXT). Measured through the
+    /// store's own verifier: only the MLS-context key opens it.
+    #[test]
+    fn i187_b_the_mls_key_is_domain_separated_from_the_content_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        drop(open_software(&path).unwrap());
+        let content = verify_hkdf(
+            &SOFTWARE_MASTER,
+            crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT,
+        );
+        for (what, key) in [
+            ("the content master itself", SOFTWARE_MASTER.to_vec()),
+            ("HKDF(master, CONTENT_MASTER_CONTEXT)", content),
+        ] {
+            let err = XChaChaKvStore::open(&path, &key)
+                .err()
+                .unwrap_or_else(|| panic!("the store opened under {what}: no domain separation"));
+            assert!(matches!(err, KVError::WrongPassphrase), "{what}: got {err}");
+        }
+        XChaChaKvStore::open(&path, &verify_hkdf(&SOFTWARE_MASTER, MLS_STATE_CONTEXT))
+            .expect("the key is HKDF(master, MLS_STATE_CONTEXT) through verify's KDF");
+    }
+
+    /// I187(c) — a hardware row whose seed is unreachable refuses
+    /// `HardwareCustodyUnavailable`, writes nothing, and never asks to mint.
+    #[test]
+    fn i187_c_a_hardware_row_with_no_reachable_seed_refuses_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let asked = std::cell::Cell::new(None);
+        let err =
+            XChaChaKvStore::open_mls_state_from_row(&path, "hardware", None, HARDWARE_ROW, |c| {
+                asked.set(Some(c));
+                Err(HardwareRootError::NotHardwareBacked(
+                    "no TPM on this host".into(),
+                ))
+            })
+            .err()
+            .expect("a hardware row with no seed must not open");
+        assert!(
+            matches!(err, KVError::HardwareCustodyUnavailable(_)),
+            "got {err}"
+        );
+        assert_eq!(
+            asked.get(),
+            Some(false),
+            "under a hardware row the opener never asks to mint"
+        );
+        assert!(
+            !has_kv_table(&path),
+            "a refused open must leave nothing behind"
+        );
+    }
+
+    /// I187(c) over the storage double — the TPM is present but the seed is
+    /// gone (a lost keyring, §11.7). Even on the FIRST open of an empty
+    /// store nothing is minted: a new seed would move the content master too.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn i187_c_a_present_tpm_with_an_absent_seed_never_mints() {
+        use crate::secrets::hardware::test_doubles::FakeHardwareStorage;
+        use ciris_keyring::SecureBlobStorage as _;
+        let storage = FakeHardwareStorage::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let err =
+            XChaChaKvStore::open_mls_state_from_row(&path, "hardware", None, HARDWARE_ROW, |c| {
+                crate::secrets::hardware::derive_with_storage_typed(&storage, MLS_STATE_CONTEXT, c)
+                    .map(|(k, d)| (Zeroizing::new(k), d))
+                    .map_err(HardwareRootError::from)
+            })
+            .err()
+            .expect("an absent seed under a hardware row must refuse");
+        assert!(
+            matches!(err, KVError::HardwareCustodyUnavailable(_)),
+            "got {err}"
+        );
+        assert!(
+            storage.list_keys().unwrap().is_empty(),
+            "refusing must not have minted a seed"
+        );
+        assert!(
+            !has_kv_table(&path),
+            "a refused open must leave nothing behind"
+        );
+    }
+
+    /// I187(d) — the hardware branch over the storage double: the row says
+    /// hardware, the seed was sealed when the row was written, the store
+    /// opens as `Hardware`, and neither the open nor the reopen mints.
+    #[cfg(feature = "secrets")]
+    #[tokio::test]
+    async fn i187_d_the_hardware_branch_reports_hardware_and_reopen_never_mints() {
+        use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+        use ciris_keyring::SecureBlobStorage as _;
+        let storage = FakeHardwareStorage::empty();
+        // The content master's row init sealed the seed (create=true).
+        derive_with_storage(
+            &storage,
+            crate::federation::at_rest_cascade::CONTENT_MASTER_CONTEXT,
+            true,
+        )
+        .unwrap();
+        let sealed = storage.list_keys().unwrap();
+        let seed = storage.load(&sealed[0]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let open = || {
+            let asked = std::cell::Cell::new(None);
+            let r = XChaChaKvStore::open_mls_state_from_row(
+                &path,
+                "hardware",
+                None,
+                HARDWARE_ROW,
+                |c| {
+                    asked.set(Some(c));
+                    crate::secrets::hardware::derive_with_storage_typed(
+                        &storage,
+                        MLS_STATE_CONTEXT,
+                        c,
+                    )
+                    .map(|(k, d)| (Zeroizing::new(k), d))
+                    .map_err(HardwareRootError::from)
+                },
+            );
+            assert_eq!(
+                asked.get(),
+                Some(false),
+                "a hardware row never asks to mint"
+            );
+            r
+        };
+        let (s, custody) = open().expect("hardware row + present seed opens");
+        assert_eq!(custody.kind, MlsStateCustodyKind::Hardware);
+        assert_eq!(custody.kind.as_str(), "hardware");
+        assert!(
+            custody.descriptor.contains("hardware")
+                && custody.descriptor.contains(MLS_STATE_CONTEXT),
+            "got: {}",
+            custody.descriptor
+        );
+        s.put("mls", b"group", b"epoch-state").await.unwrap();
+        drop(s);
+        let (s, custody) = open().expect("reopen");
+        assert_eq!(custody.kind, MlsStateCustodyKind::Hardware);
+        assert_eq!(
+            s.get("mls", b"group").await.unwrap().as_deref(),
+            Some(&b"epoch-state"[..])
+        );
+        assert_eq!(storage.list_keys().unwrap(), sealed, "no second seed");
+        assert_eq!(
+            storage.load(&sealed[0]).unwrap(),
+            seed,
+            "the seed never re-minted"
+        );
+    }
+
+    /// I187(e) — the row wins (§10.2): a store created under a software row
+    /// still opens as `Software` once a hardware seed is available, because
+    /// the row still says software. The hardware root is never consulted.
+    #[cfg(feature = "secrets")]
+    #[tokio::test]
+    async fn i187_e_the_row_wins_a_software_store_ignores_new_hardware() {
+        use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let (s, _) = open_software(&path).unwrap();
+        s.put("mls", b"group", b"epoch-state").await.unwrap();
+        drop(s);
+
+        // A TPM appears, with a sealed seed.
+        let storage = FakeHardwareStorage::empty();
+        derive_with_storage(&storage, MLS_STATE_CONTEXT, true).unwrap();
+        let consulted = std::cell::Cell::new(false);
+        let (s, custody) = XChaChaKvStore::open_mls_state_from_row(
+            &path,
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            |c| {
+                consulted.set(true);
+                crate::secrets::hardware::derive_with_storage_typed(&storage, MLS_STATE_CONTEXT, c)
+                    .map(|(k, d)| (Zeroizing::new(k), d))
+                    .map_err(HardwareRootError::from)
+            },
+        )
+        .expect("the software-created store keeps opening");
+        assert!(
+            !consulted.get(),
+            "the hardware root was consulted under a software row"
+        );
+        assert_eq!(custody.kind, MlsStateCustodyKind::Software);
+        assert_eq!(
+            s.get("mls", b"group").await.unwrap().as_deref(),
+            Some(&b"epoch-state"[..])
+        );
+    }
+
+    /// I187 — a malformed row is a refusal, never a fallback.
+    #[test]
+    fn i187_a_malformed_row_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, (kind, b64)) in [
+            ("software", None),
+            ("software", Some("!!!not b64!!!".to_owned())),
+            ("software", Some(B64.encode([1u8; 16]))),
+            ("nonsense", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.path().join(format!("{i}.db"));
+            let r = XChaChaKvStore::open_mls_state_from_row(
+                &path,
+                kind,
+                b64.as_deref(),
+                SOFTWARE_ROW,
+                no_hardware_consulted,
+            );
+            assert!(r.is_err(), "{kind}/{b64:?} opened");
+            assert!(!has_kv_table(&path), "{kind}/{b64:?} left a table behind");
+        }
+    }
+
+    /// The hardware derivation over the storage double, as production wires
+    /// `derive_hardware_mls_state_key`, recording the create flag it was asked.
+    #[cfg(feature = "secrets")]
+    fn over_double<'a>(
+        storage: &'a crate::secrets::hardware::test_doubles::FakeHardwareStorage,
+        asked: &'a std::cell::Cell<Option<bool>>,
+    ) -> impl FnOnce(bool) -> HardwareRootResult + 'a {
+        move |c| {
+            asked.set(Some(c));
+            crate::secrets::hardware::derive_with_storage_typed(storage, MLS_STATE_CONTEXT, c)
+                .map(|(k, d)| (Zeroizing::new(k), d))
+                .map_err(HardwareRootError::from)
+        }
+    }
+
+    /// I187(f) — the v49 compatibility arm (#920 review, finding 1): a store
+    /// v49 keyed from the hardware seed on a host whose row says SOFTWARE
+    /// (CIRISEdge v32.1.0 on a TPM host) still opens. It reports `Hardware`
+    /// — the store IS hardware-keyed — with the legacy descriptor, is not
+    /// re-keyed, and nothing is minted.
+    #[cfg(feature = "secrets")]
+    #[tokio::test]
+    async fn i187_f_a_v49_store_under_a_software_row_opens_as_legacy_hardware() {
+        use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+        use std::sync::atomic::Ordering;
+        let storage = FakeHardwareStorage::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        // The v49 way: `open_rooted` over the hardware seed, first open seals.
+        let s = XChaChaKvStore::open_rooted(Connection::open(&path).unwrap(), |c| {
+            derive_with_storage(&storage, MLS_STATE_CONTEXT, c)
+                .map(|(k, _)| Zeroizing::new(k))
+                .map_err(|e| KVError::HardwareCustodyUnavailable(e.to_string()))
+        })
+        .unwrap();
+        s.put("mls", b"group", b"v49-state").await.unwrap();
+        drop(s);
+        let seals = storage.stores.load(Ordering::SeqCst);
+
+        let asked = std::cell::Cell::new(None);
+        let (s, custody) = XChaChaKvStore::open_mls_state_from_row(
+            &path,
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            over_double(&storage, &asked),
+        )
+        .expect("a v49 hardware-keyed store under a software row must still open");
+        assert_eq!(custody.kind, MlsStateCustodyKind::Hardware);
+        assert!(
+            custody
+                .descriptor
+                .contains("legacy-v49-hardware-keyed-under-software-row"),
+            "got: {}",
+            custody.descriptor
+        );
+        assert_eq!(
+            asked.get(),
+            Some(false),
+            "the compat arm never asks to mint"
+        );
+        assert_eq!(
+            s.get("mls", b"group").await.unwrap().as_deref(),
+            Some(&b"v49-state"[..])
+        );
+        assert_eq!(
+            storage.stores.load(Ordering::SeqCst),
+            seals,
+            "nothing minted"
+        );
+        drop(s);
+        // Not re-keyed: the v49 key still opens it.
+        let (legacy, _) = derive_with_storage(&storage, MLS_STATE_CONTEXT, false).unwrap();
+        XChaChaKvStore::open(&path, &legacy).expect("the store was not re-keyed");
+    }
+
+    /// I187(f) — the compat arm is a fallback, not a preference: a FRESH
+    /// store under a software row with hardware available is `Software`,
+    /// and the hardware root is not consulted.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn i187_f_a_fresh_store_under_a_software_row_stays_software() {
+        use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+        let storage = FakeHardwareStorage::empty();
+        derive_with_storage(&storage, MLS_STATE_CONTEXT, true).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let asked = std::cell::Cell::new(None);
+        let (_s, custody) = XChaChaKvStore::open_mls_state_from_row(
+            dir.path().join("mls.db"),
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            over_double(&storage, &asked),
+        )
+        .unwrap();
+        assert_eq!(custody.kind, MlsStateCustodyKind::Software);
+        assert_eq!(
+            asked.get(),
+            None,
+            "the hardware root was consulted for a fresh store"
+        );
+    }
+
+    /// I187(f) — the compat arm never mints: a v49 store whose seed is gone
+    /// (TPM present, keyring lost) under a software row is `WrongPassphrase`,
+    /// and no seed is sealed in the attempt.
+    #[cfg(feature = "secrets")]
+    #[tokio::test]
+    async fn i187_f_the_compat_arm_never_mints() {
+        use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        let lost = FakeHardwareStorage::empty();
+        let (k, _) = derive_with_storage(&lost, MLS_STATE_CONTEXT, true).unwrap();
+        drop(XChaChaKvStore::open(&path, &k).unwrap());
+
+        let present_tpm_no_seed = FakeHardwareStorage::empty();
+        let asked = std::cell::Cell::new(None);
+        let err = XChaChaKvStore::open_mls_state_from_row(
+            &path,
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            over_double(&present_tpm_no_seed, &asked),
+        )
+        .err()
+        .expect("neither key opens this store");
+        // The v49 seed is unreachable: the reason is kept, not flattened to
+        // WrongPassphrase (#920 re-check).
+        match &err {
+            KVError::HardwareCustodyUnavailable(m) => assert!(
+                m.contains("only other key") && m.contains("ABSENT"),
+                "the refusal must say which key and why, got: {m}"
+            ),
+            other => panic!("expected HardwareCustodyUnavailable with the reason, got {other}"),
+        }
+        assert_eq!(asked.get(), Some(false));
+        assert_eq!(
+            present_tpm_no_seed.stores.load(Ordering::SeqCst),
+            0,
+            "the compat arm minted a seed"
+        );
+    }
+
+    /// I187(f) — `WrongPassphrase` from the compat arm means BOTH keys were
+    /// tried: a store keyed by neither the software root nor v49's hardware
+    /// key, with the seed present, is refused as a wrong key.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn i187_f_both_keys_tried_is_wrong_passphrase() {
+        use crate::secrets::hardware::{derive_with_storage, test_doubles::FakeHardwareStorage};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        drop(XChaChaKvStore::open(&path, &[9u8; 32]).unwrap());
+        let storage = FakeHardwareStorage::empty();
+        derive_with_storage(&storage, MLS_STATE_CONTEXT, true).unwrap();
+        let asked = std::cell::Cell::new(None);
+        let err = XChaChaKvStore::open_mls_state_from_row(
+            &path,
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            over_double(&storage, &asked),
+        )
+        .err()
+        .expect("neither key opens this store");
+        assert_eq!(asked.get(), Some(false), "the v49 key was tried");
+        assert!(matches!(err, KVError::WrongPassphrase), "got {err}");
+    }
+
+    /// I187(f) twin — with NO hardware backing, v49's opener refused, so no
+    /// v49-keyed store can exist: a store that refuses the software key is
+    /// wrong-keyed (`WrongPassphrase`), never a §11.7 custody refusal. The
+    /// split is typed (`HardwareRootError`), not read from a message.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn i187_f_no_hardware_backing_is_wrong_passphrase_not_custody() {
+        use crate::secrets::hardware::test_doubles::FakeHardwareStorage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.db");
+        drop(XChaChaKvStore::open(&path, &[9u8; 32]).unwrap());
+        let software_host = FakeHardwareStorage::not_hardware_backed();
+        let asked = std::cell::Cell::new(None);
+        let err = XChaChaKvStore::open_mls_state_from_row(
+            &path,
+            "software",
+            Some(&B64.encode(SOFTWARE_MASTER)),
+            SOFTWARE_ROW,
+            over_double(&software_host, &asked),
+        )
+        .err()
+        .expect("a wrong-keyed store must not open");
+        assert_eq!(
+            asked.get(),
+            Some(false),
+            "the compat arm asked, never to mint"
+        );
+        assert!(matches!(err, KVError::WrongPassphrase), "got {err}");
     }
 }

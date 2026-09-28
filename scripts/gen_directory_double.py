@@ -74,6 +74,19 @@ DELEGATED_DEFAULTS = (
     "community_roster_signers",
     # v49.0.0 (#910) — the family twin, same shape and same reason.
     "family_roster_signers",
+    # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
+    # receive doors' re-wrap); through the double it must reach the override.
+    "rewrap_own_epochs_for_device",
+    # v50.0.0 (#926) — defaulted `Unsupported`, overridden by every backend;
+    # the trust-root reads re-derive the accord quorum from it.
+    "lookup_signed_community",
+    # v50.0.0 (PR #921 review, F1) — defaulted `None`, overridden by every
+    # backend. A SYNC accessor (emitted by name in `render`): the double hands
+    # out the INNER backend's cache, so a verdict read through the double is
+    # cached where the backend caches it, while every input the cache key
+    # reads still goes through this double's fault table. Without it a fault
+    # injected here could never meet a cached verdict.
+    "trust_root_standing_cache",
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -355,6 +368,11 @@ def render(methods) -> str:
             # folds reached through it.
             A("    fn as_dyn_directory(&self) -> &dyn FederationDirectory {")
             A("        self")
+            A("    }")
+            continue
+        if name == "trust_root_standing_cache":
+            A(f"    fn {name}(&self) -> {ret} {{")
+            A(f"        self.inner.{name}()")
             A("    }")
             continue
         A(f"    async fn {name}({arglist}) -> {ret} {{")

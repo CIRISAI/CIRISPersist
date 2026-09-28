@@ -117,6 +117,40 @@ pub enum ContentMasterSource {
     },
 }
 
+/// v50.0.0 (CIRISPersist#920) — the persisted `federation_content_master`
+/// row, verbatim: the authority on WHICH root this node uses (§10.2 — the
+/// row wins). Returned by
+/// [`BlobStorage::load_or_init_content_master_row`](crate::federation::BlobStorage::load_or_init_content_master_row)
+/// so a consumer that needs the root's KIND (the MLS-state opener) reads
+/// the same row the blob doors resolve, instead of re-deciding it.
+#[derive(Clone)]
+pub struct ContentMasterRow {
+    /// `"hardware"` | `"software"` (the V070 CHECK).
+    pub key_kind: String,
+    /// The 32-byte software master, base64 — present iff `key_kind='software'`.
+    /// `Zeroizing` (v50, #920 review): scrubbed on drop, as is every copy
+    /// persist makes of it. The driver's own row buffers and CIRISVerify's
+    /// internal `seed` / `derived` copies inside `derive_symmetric_key` are
+    /// outside persist's reach (filed upstream with CIRISVerify).
+    pub master_key_b64: Option<zeroize::Zeroizing<String>>,
+    /// Provenance string.
+    pub descriptor: String,
+}
+
+impl std::fmt::Debug for ContentMasterRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the software master.
+        f.debug_struct("ContentMasterRow")
+            .field("key_kind", &self.key_kind)
+            .field(
+                "master_key_b64",
+                &self.master_key_b64.as_ref().map(|_| "<redacted>"),
+            )
+            .field("descriptor", &self.descriptor)
+            .finish()
+    }
+}
+
 /// v43.0.0 (§10.2) — **resolve the content-at-rest master key.**
 ///
 /// This is the function `at_rest_cascade`'s module header has always
@@ -155,18 +189,22 @@ pub fn content_master_key(create_seed_if_absent: bool) -> ContentMasterSource {
             // `derive_hardware_master_for_context` already asserts the length,
             // but this is the boundary where a wrong length would become a
             // silent truncation, so it is re-checked rather than assumed.
-            Ok((master, descriptor)) => match <[u8; 32]>::try_from(master.as_slice()) {
-                Ok(key) => ContentMasterSource::Hardware {
-                    key: zeroize::Zeroizing::new(key),
-                    descriptor,
-                },
-                Err(_) => ContentMasterSource::SoftwareFallback {
-                    reason: format!(
-                        "verify derived a {}-byte content master, expected 32",
-                        master.len()
-                    ),
-                },
-            },
+            Ok((master, descriptor)) => {
+                // Scrubbed on drop (v50, #920 review).
+                let master = zeroize::Zeroizing::new(master);
+                match <[u8; 32]>::try_from(master.as_slice()) {
+                    Ok(key) => ContentMasterSource::Hardware {
+                        key: zeroize::Zeroizing::new(key),
+                        descriptor,
+                    },
+                    Err(_) => ContentMasterSource::SoftwareFallback {
+                        reason: format!(
+                            "verify derived a {}-byte content master, expected 32",
+                            master.len()
+                        ),
+                    },
+                }
+            }
             Err(e) => ContentMasterSource::SoftwareFallback {
                 reason: format!("hardware content master unavailable: {e}"),
             },
@@ -271,9 +309,12 @@ pub fn resolve_persisted_content_master(
     use base64::Engine as _;
     match (key_kind, master_key_b64) {
         ("software", Some(b64)) => {
-            let raw = B64
-                .decode(b64)
-                .map_err(|e| AtRestError::Crypto(format!("content-master b64: {e}")))?;
+            // Scrubbed on drop (v50, #920 review); the returned array is the
+            // caller's copy, as the `[u8; 32]` signature has always made it.
+            let raw = zeroize::Zeroizing::new(
+                B64.decode(b64)
+                    .map_err(|e| AtRestError::Crypto(format!("content-master b64: {e}")))?,
+            );
             <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
                 AtRestError::Crypto(format!(
                     "content master is {} bytes, expected 32",
@@ -1795,6 +1836,592 @@ pub mod orchestrate {
             .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
         Ok(new_epoch)
     }
+
+    /// Why a device re-wrap could not give the device an epoch the member
+    /// holds a grant on (CC 5.1 P4 `ContentMiss`, fail-honest). Each reason
+    /// asks something different of the host.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EpochMissReason {
+        /// This node minted the epoch and has since destroyed its key
+        /// material (the state row stands, the wrap is NULL): the content is
+        /// gone by policy and no one can recover the DEK.
+        Destroyed,
+        /// This node's own key minted the epoch and its self-retention row is
+        /// gone without a destroy — local loss. Escalate: nothing on the mesh
+        /// can re-wrap it (a backend that does not know its own key cannot
+        /// tell its epochs from a peer's, and reports this, not the benign
+        /// reason).
+        LostLocally,
+        /// Another node minted the epoch; this node knows it only through the
+        /// member's wrap. Expected: the MINTER re-wraps it to the device when
+        /// the device's owner-binding reaches it
+        /// ([`rewrap_own_epochs_to_member_devices`]), and its signed
+        /// `KeyGrant` set is what carries the wrap (§11).
+        MintedElsewhere,
+    }
+
+    impl EpochMissReason {
+        /// Stable token for logs and the FFI summary.
+        #[must_use]
+        pub fn as_str(self) -> &'static str {
+            match self {
+                EpochMissReason::Destroyed => "destroyed",
+                EpochMissReason::LostLocally => "lost_locally",
+                EpochMissReason::MintedElsewhere => "minted_elsewhere",
+            }
+        }
+    }
+
+    /// One `(community, minter, epoch)` the member holds and the device
+    /// could not be given, with the reason.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct EpochMiss {
+        /// The epoch's minter (#848).
+        pub minter_key_id: String,
+        /// The minter's epoch.
+        pub epoch: u64,
+        /// Why no wrap was written.
+        pub reason: EpochMissReason,
+    }
+
+    /// Outcome of a [`rekey_community_member_device_add`] re-wrap — the
+    /// [`RekeyResult`] shape on the epoch axis.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct DeviceRekeyResult {
+        /// Distinct `(minter, epoch)` pairs the member held a grant on.
+        pub epochs_scanned: usize,
+        /// `(minter, epoch)` pairs of THIS node's own epochs (minter == this
+        /// node's key) on which this call wrote the device's grant (the insert
+        /// took), in walk order. Each is an epoch-axis `KeyGrant` set the
+        /// caller emits — or leaves dirty for the pending-set loop to emit —
+        /// else the device's remote node never receives the key.
+        pub granted: Vec<(String, u64)>,
+        /// `(minter, epoch)` pairs this call wrote the device's grant on
+        /// LOCALLY under a minter that is not this node's key (a former node
+        /// key, a pre-#876 row): readable here, never emitted, because a set
+        /// is signed by its minter and this node cannot sign as that one.
+        pub local_only: Vec<(String, u64)>,
+        /// `(minter, epoch)` pairs the device already held a grant on — a
+        /// re-run, or a concurrent call whose insert landed first.
+        pub already_held: Vec<(String, u64)>,
+        /// Epochs the member holds whose DEK this node cannot recover —
+        /// REPORTED, never skipped in silence.
+        pub content_miss: Vec<EpochMiss>,
+    }
+
+    // Test-only count of v2 wraps `rewrap_held_epochs` computed on this
+    // thread — a re-run over already-held epochs must compute none (the
+    // pre-check is what keeps a boot sweep from re-encapsulating every held
+    // epoch to every device).
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static REWRAPS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the member's
+    /// clean holders**: the keys whose grants are what `member_key_id` holds.
+    /// A caller excludes the device it is adding.
+    ///
+    /// Candidates: the member key, every occurrence the member has ever
+    /// spoken through (a lost device's grants are still what the member
+    /// held), and every node the member owns. A candidate is DROPPED when
+    /// any other party has ever held it — someone else ever issued an
+    /// owner-binding over it (live, lapsed or withdrawn: a live foreign or
+    /// ambiguous owner is a special case), or it has an identity row under
+    /// someone else (#851: one key can be bound under several identities).
+    /// Such a key's grants may belong to the other party's span — an epoch
+    /// minted while the member was absent from the room — and the member
+    /// never held those.
+    ///
+    /// Fail-closed by construction rather than by instant: the only instants
+    /// that could bound a key's "span" are `asserted_at`s the binding's
+    /// signer chose (and a login anchor is re-asserted at every login), so a
+    /// span cut on them would either be forgeable backwards or drop the
+    /// member's real history. A shared or transferred device therefore
+    /// contributes nothing; the member's other devices still do.
+    pub(crate) async fn member_holders<B>(
+        backend: &B,
+        member_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error>
+    where
+        B: FederationDirectory + Sync,
+    {
+        use crate::federation::admission::{is_owner_binding_envelope, nodes_owned_by};
+        use crate::federation::types::attestation_type;
+        let mut candidates: std::collections::BTreeSet<String> = backend
+            .list_identity_occurrences_for(member_key_id)
+            .await?
+            .into_iter()
+            .map(|o| o.occurrence_key_id)
+            .collect();
+        candidates.extend(nodes_owned_by(backend, member_key_id).await?);
+        candidates.remove(member_key_id);
+
+        let mut out = vec![member_key_id.to_owned()];
+        for h in candidates {
+            // Ever bound by anyone else — live, lapsed or withdrawn, which also
+            // covers a live foreign owner and an ambiguous one.
+            if backend.list_attestations_for(&h).await?.iter().any(|a| {
+                a.attestation_type == attestation_type::DELEGATES_TO
+                    && is_owner_binding_envelope(&a.attestation_envelope)
+                    && a.attesting_key_id != member_key_id
+            }) {
+                continue;
+            }
+            if backend
+                .list_identity_occurrences_by_occurrence_key(&h)
+                .await?
+                .iter()
+                .any(|o| o.identity_key_id != member_key_id && o.identity_key_id != h)
+            {
+                continue;
+            }
+            out.push(h);
+        }
+        Ok(out)
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **is `device`
+    /// one of `member_key_id`'s devices?** The seal fan-out's own definition
+    /// — an ACTIVE identity occurrence of the member — with the owner-binding
+    /// as the authority on it: `owner_of(device) == member`. A node the
+    /// member owns but does not speak through (infrastructure the member
+    /// operates for others) is not a device of theirs and receives none of
+    /// their history.
+    async fn is_member_device<B>(
+        backend: &B,
+        member_key_id: &str,
+        device: &str,
+    ) -> Result<bool, crate::federation::Error>
+    where
+        B: FederationDirectory + Sync,
+    {
+        if !backend
+            .list_identity_occurrences_active(member_key_id)
+            .await?
+            .iter()
+            .any(|o| o.occurrence_key_id == device)
+        {
+            return Ok(false);
+        }
+        match crate::federation::admission::owner_of(backend, device).await {
+            Ok(owner) => Ok(owner.as_deref() == Some(member_key_id)),
+            Err(crate::federation::Error::AmbiguousNodeOwner { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// v50.0.0 (CIRISPersist#916) — the re-wrap itself, shared by the host's
+    /// door and the minter-side sweep. Authority is the CALLER's: both check
+    /// the owner-binding and the roster before calling. Re-wraps every epoch
+    /// the member's `holders` ([`member_holders`], computed once per member
+    /// by the caller) hold a grant on — only `me`'s when `only_mine` (the
+    /// sweep re-wraps its own epochs and no one else's) — to `device`'s
+    /// `keys`, from persist's own self-retention row. `me` is this node's
+    /// key, named by the caller: it decides `granted` vs `local_only` and
+    /// `minted_elsewhere` vs `lost_locally`, so it is never guessed here.
+    async fn rewrap_held_epochs<B>(
+        backend: &B,
+        community_key_id: &str,
+        holders: &[String],
+        device: &str,
+        keys: &EncryptionPubkeys,
+        me: &str,
+        only_mine: bool,
+    ) -> Result<DeviceRekeyResult, crate::federation::Error>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::Error;
+        let blob = |e: BlobError| Error::Backend(format!("device re-wrap (#916): {e}"));
+        let holders: Vec<String> = holders.iter().filter(|h| *h != device).cloned().collect();
+        let held: Vec<(String, u64)> = backend
+            .community_dek_member_grant_epochs(community_key_id, &holders)
+            .await
+            .map_err(blob)?
+            .into_iter()
+            .filter(|(m, _)| !only_mine || m == me)
+            .collect();
+
+        let mut result = DeviceRekeyResult {
+            epochs_scanned: held.len(),
+            ..DeviceRekeyResult::default()
+        };
+        if held.is_empty() {
+            return Ok(result);
+        }
+        let content_master = backend.load_or_init_content_master().await.map_err(blob)?;
+        for (minter, epoch) in held {
+            if backend
+                .community_dek_has_member_grant(community_key_id, &minter, epoch, device)
+                .await
+                .map_err(blob)?
+            {
+                result.already_held.push((minter, epoch));
+                continue;
+            }
+            let Some(wrapped) = backend
+                .community_dek_get_self_retention(community_key_id, &minter, epoch)
+                .await
+                .map_err(blob)?
+            else {
+                // A destroyed epoch of OUR OWN keeps its state row with NULL
+                // material (V139); a peer's epoch has no row here at all, and
+                // neither has one of ours whose row was lost.
+                let reason = if backend
+                    .community_dek_key_state(community_key_id, &minter, epoch)
+                    .await
+                    .map_err(blob)?
+                    .is_some()
+                {
+                    EpochMissReason::Destroyed
+                } else if minter != me {
+                    EpochMissReason::MintedElsewhere
+                } else {
+                    EpochMissReason::LostLocally
+                };
+                result.content_miss.push(EpochMiss {
+                    minter_key_id: minter,
+                    epoch,
+                    reason,
+                });
+                continue;
+            };
+            let dek = unwrap_dek_for_persist(&content_master, &wrapped)
+                .map_err(|e| blob(map_at_rest_err(e)))?;
+            #[cfg(test)]
+            REWRAPS_COMPUTED.with(|c| c.set(c.get() + 1));
+            let wrap = wrap_dek_v2(&keys.x25519_base64, &keys.ml_kem_768_base64, &dek)
+                .map_err(|e| blob(map_at_rest_err(e)))?;
+            // The insert decides, not the pre-check: a concurrent call that
+            // wrote first makes this one `already_held`, honestly.
+            if !backend
+                .community_dek_put_member_grant(
+                    community_key_id,
+                    &minter,
+                    epoch,
+                    device,
+                    WRAP_ALGORITHM_V2,
+                    &wrap,
+                )
+                .await
+                .map_err(blob)?
+            {
+                result.already_held.push((minter, epoch));
+            } else if minter == me {
+                result.granted.push((minter, epoch));
+            } else {
+                result.local_only.push((minter, epoch));
+            }
+        }
+        Ok(result)
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
+    /// new device receives exactly what the member holds.** The community
+    /// twin of [`rekey_self_occurrence_add`], run by the host on its own
+    /// node: re-wrap every retained `(community, minter, epoch)` DEK on which
+    /// the member's [`member_holders`] hold a grant to
+    /// `new_occurrence_key_id`'s content-KEM `encryption_pubkeys`. An epoch
+    /// another node minted is reported `MintedElsewhere`; that node re-wraps
+    /// it itself when the device's owner-binding reaches it
+    /// ([`rewrap_own_epochs_to_member_devices`]).
+    ///
+    /// **No epoch bump**: the member set did not change, so no forward-secrecy
+    /// event occurred. **Idempotent**: a grant the device already holds is
+    /// skipped (pre-checked, and the put is `ON CONFLICT DO NOTHING` and
+    /// reports whether it inserted). The DEK is recovered from persist's own
+    /// self-retention row, as `ensure_epoch_dek` does, never from a plaintext
+    /// side channel; an epoch with none here is reported in
+    /// [`DeviceRekeyResult::content_miss`].
+    ///
+    /// A member removed and later re-added holds what their devices held
+    /// before the removal (CC 4.4.3.4.5 Option A: removed members retain
+    /// extant grants) and nothing minted in the absence — the holder set
+    /// excludes every key another party has held.
+    ///
+    /// **The owner-binding is the authority, never the roster** (the member's
+    /// standing does not change); `authority_key_id` names who the host says
+    /// is acting and must be that owner. Refused as
+    /// [`Error::DeviceRekeyRefused`](crate::federation::Error::DeviceRekeyRefused)
+    /// by rule, before anything is written:
+    /// 0. the backend must know this node's key (`node_key_id()`) — else
+    ///    `device_rekey_node_key_unknown`: it decides what is this node's own;
+    /// 1. `owner_of(new_occurrence_key_id)` must be `member_key_id` — an
+    ///    unbound device is `device_rekey_unbound` (retryable: the binding may
+    ///    not have replicated yet), one bound to another person
+    ///    `device_rekey_owner_mismatch` (an ambiguous owner propagates
+    ///    `AmbiguousNodeOwner`, fail-closed);
+    /// 2. `authority_key_id` must be that owner — `device_rekey_authority_not_owner`;
+    /// 3. the device must be an ACTIVE identity occurrence of the member (the
+    ///    seal fan-out's definition of a member's device) —
+    ///    `device_rekey_not_an_occurrence` (retryable: the occurrence may not
+    ///    have replicated yet);
+    /// 4. the member must be on the room's authorized roster at `as_of`
+    ///    (`authorized_community_roster_at`) — `device_rekey_member_not_active`;
+    /// 5. the device must resolve valid `encryption_pubkeys` — else
+    ///    `device_rekey_no_encryption_pubkeys`, recorded as
+    ///    `hard_case:recipient_excluded`, and never a plaintext fallback.
+    pub async fn rekey_community_member_device_add<B>(
+        backend: &B,
+        community_key_id: &str,
+        member_key_id: &str,
+        new_occurrence_key_id: &str,
+        authority_key_id: &str,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<DeviceRekeyResult, crate::federation::Error>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::{hard_case, Error};
+        let refuse = |rule: &'static str| Error::DeviceRekeyRefused {
+            community_key_id: community_key_id.to_owned(),
+            member_key_id: member_key_id.to_owned(),
+            occurrence_key_id: new_occurrence_key_id.to_owned(),
+            rule,
+        };
+
+        // 0 — who THIS node is decides which epochs are its own (`granted`,
+        // emitted) and which a peer's; a backend nobody told cannot answer,
+        // and a guess would misreport both. Refused, before anything else.
+        let Some(me) = backend.node_key_id() else {
+            return Err(refuse(
+                crate::federation::DEVICE_REKEY_RULE_NODE_KEY_UNKNOWN,
+            ));
+        };
+
+        // 1 + 2 — the member's owner-binding over THIS machine.
+        match crate::federation::admission::owner_of(backend, new_occurrence_key_id).await? {
+            None => return Err(refuse(crate::federation::DEVICE_REKEY_RULE_UNBOUND)),
+            Some(owner) if owner != member_key_id => {
+                return Err(refuse(crate::federation::DEVICE_REKEY_RULE_OWNER_MISMATCH))
+            }
+            Some(_) => {}
+        }
+        if authority_key_id != member_key_id {
+            return Err(refuse(
+                crate::federation::DEVICE_REKEY_RULE_AUTHORITY_NOT_OWNER,
+            ));
+        }
+        // 3 — a device the member speaks through, not infrastructure they own.
+        if !is_member_device(backend, member_key_id, new_occurrence_key_id).await? {
+            return Err(refuse(
+                crate::federation::DEVICE_REKEY_RULE_NOT_AN_OCCURRENCE,
+            ));
+        }
+
+        // 4 — the member is ACTIVE by the one fold, at the call's instant.
+        let community = backend
+            .lookup_community(community_key_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "rekey_community_member_device_add names unknown community_key_id \
+                     {community_key_id:?}"
+                ))
+            })?;
+        if !crate::federation::authorized_community_roster_at(backend, &community, as_of)
+            .await?
+            .iter()
+            .any(|m| m.key_id == member_key_id)
+        {
+            return Err(refuse(
+                crate::federation::DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE,
+            ));
+        }
+
+        // 5 — the device's content-KEM keys, revocation- and validity-aware.
+        let keys = backend
+            .resolve_encryption_keys(new_occurrence_key_id)
+            .await?;
+        let Some(keys) = usable_keys(&keys).cloned() else {
+            backend
+                .record_hard_case(hard_case::HardCaseEvent {
+                    event_id: hard_case::recipient_excluded_event_id(
+                        crate::federation::types::cohort_scope::COMMUNITY,
+                        new_occurrence_key_id,
+                        as_of,
+                    ),
+                    kind: hard_case::kind::RECIPIENT_EXCLUDED.to_string(),
+                    target_key_id: Some(community_key_id.to_owned()),
+                    subject_key_id: Some(new_occurrence_key_id.to_owned()),
+                    detail: serde_json::json!({
+                        "cohort_scope": crate::federation::types::cohort_scope::COMMUNITY,
+                        "member_key_id": member_key_id,
+                        "reason": "no_valid_encryption_pubkeys",
+                    }),
+                    emitted_at: as_of,
+                })
+                .await?;
+            return Err(refuse(
+                crate::federation::DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS,
+            ));
+        };
+
+        let holders = member_holders(backend, member_key_id).await?;
+        rewrap_held_epochs(
+            backend,
+            community_key_id,
+            &holders,
+            new_occurrence_key_id,
+            &keys,
+            &me,
+            false,
+        )
+        .await
+    }
+
+    /// What a minter-side sweep re-wrapped: every `(community, epoch)` of
+    /// the minter's own that gained a device's grant (each is a `KeyGrant`
+    /// set the caller emits; the grant also leaves the epoch dirty in the
+    /// V146 ledger, so the pending-set loop emits it if the caller does not),
+    /// and the member devices it could not wrap to for want of content-KEM
+    /// keys (the next sweep retries).
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct MinterRewrapReport {
+        /// `(community_key_id, epoch)` of `minter_key_id`'s that changed.
+        pub changed: Vec<(String, u64)>,
+        /// `(community_key_id, device)` pairs skipped: no usable keys yet.
+        pub keyless: Vec<(String, String)>,
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the minter
+    /// side: a node re-wraps its OWN epochs to a member's new device.** Only
+    /// an epoch's minter can sign the `KeyGrant` set that carries a wrap
+    /// (`admit_replicated_key_grant`: signer == minter), so the host's door
+    /// on the member's node cannot reach epochs other nodes minted. Every
+    /// minter runs this from the receive doors (an owner-binding admitted by
+    /// `apply_replicated_attestation` / `put_attestation_synced`, a signed
+    /// occurrence admitted by `put_identity_occurrence` — see
+    /// [`FederationDirectory::rewrap_own_epochs_for_device`](crate::federation::FederationDirectory::rewrap_own_epochs_for_device))
+    /// and in its pending-`KeyGrant` sweep (boot and on demand).
+    ///
+    /// For every community `minter_key_id` has minted in on this node, for
+    /// every member ACTIVE on the authorized roster at `as_of`, for every
+    /// device of the member — an active identity occurrence the member's
+    /// live owner-binding names (`is_member_device`) — that resolves usable
+    /// keys: [`rewrap_held_epochs`] restricted to this minter's epochs.
+    /// [`member_holders`] is computed once per member. Idempotent; the cost
+    /// of a full sweep is communities × members × devices point reads, and a
+    /// wrap is computed only for an epoch a device does not yet hold.
+    /// `only = Some((member, device))` narrows the walk to one device (a
+    /// receive-door trigger); `None` is the full sweep.
+    pub async fn rewrap_own_epochs_to_member_devices<B>(
+        backend: &B,
+        minter_key_id: &str,
+        only: Option<(&str, &str)>,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<MinterRewrapReport, crate::federation::Error>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::Error;
+        let blob = |e: BlobError| Error::Backend(format!("minter re-wrap (#916): {e}"));
+        let mut report = MinterRewrapReport::default();
+        let mut holders_of: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut devices_of: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        // The narrow walk (a receive-door trigger, which also fires on every
+        // idempotent re-delivery) settles the cheap questions first: is this a
+        // device of the member at all, and in which rooms does the member hold
+        // an epoch of this minter's — so only those rooms fold a roster (#916
+        // review).
+        if let Some((m, d)) = only {
+            if !is_member_device(backend, m, d).await? {
+                return Ok(report);
+            }
+            holders_of.insert(m.to_owned(), member_holders(backend, m).await?);
+        }
+        for community_key_id in backend.community_dek_communities().await.map_err(blob)? {
+            if backend
+                .community_dek_epochs(&community_key_id, minter_key_id)
+                .await
+                .map_err(blob)?
+                .is_empty()
+            {
+                continue;
+            }
+            if let Some((m, _)) = only {
+                if !backend
+                    .community_dek_member_grant_epochs(&community_key_id, &holders_of[m])
+                    .await
+                    .map_err(blob)?
+                    .iter()
+                    .any(|(minter, _)| minter == minter_key_id)
+                {
+                    continue;
+                }
+            }
+            let Some(community) = backend.lookup_community(&community_key_id).await? else {
+                continue;
+            };
+            let roster =
+                crate::federation::authorized_community_roster_at(backend, &community, as_of)
+                    .await?;
+            for member in roster.iter().map(|m| m.key_id.as_str()) {
+                if only.is_some_and(|(m, _)| m != member) {
+                    continue;
+                }
+                if !devices_of.contains_key(member) {
+                    let candidates: Vec<String> = match only {
+                        Some((_, d)) => vec![d.to_owned()],
+                        None => backend
+                            .list_identity_occurrences_active(member)
+                            .await?
+                            .into_iter()
+                            .map(|o| o.occurrence_key_id)
+                            .collect(),
+                    };
+                    let mut devices = Vec::new();
+                    for d in candidates {
+                        if is_member_device(backend, member, &d).await? {
+                            devices.push(d);
+                        }
+                    }
+                    devices_of.insert(member.to_owned(), devices);
+                }
+                let devices = devices_of[member].clone();
+                if devices.is_empty() {
+                    continue;
+                }
+                if !holders_of.contains_key(member) {
+                    holders_of.insert(member.to_owned(), member_holders(backend, member).await?);
+                }
+                let holders = &holders_of[member];
+                for device in devices {
+                    let keys = backend.resolve_encryption_keys(&device).await?;
+                    let Some(keys) = usable_keys(&keys).cloned() else {
+                        report
+                            .keyless
+                            .push((community_key_id.clone(), device.clone()));
+                        continue;
+                    };
+                    let r = rewrap_held_epochs(
+                        backend,
+                        &community_key_id,
+                        holders,
+                        &device,
+                        &keys,
+                        minter_key_id,
+                        true,
+                    )
+                    .await?;
+                    for (_, epoch) in r.granted {
+                        if !report
+                            .changed
+                            .iter()
+                            .any(|(c, e)| *c == community_key_id && *e == epoch)
+                        {
+                            report.changed.push((community_key_id.clone(), epoch));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// #833 (§11.5, I31) — **the refusal for a sha with no row**, shared by
     /// every read door (whole-blob, range, and a DAG's covering chunk —
     /// ultrareview of v44 found the range door saying "never ours" where the

@@ -2298,6 +2298,20 @@ impl PyEngine {
             let key: Option<String> = py
                 .detach(|| runtime.block_on(crate::signing::federation_key_id_of(&*signer_for_key)))
                 .ok();
+            // v50.0.0 (CIRISPersist#916 review, N1) — tell the backend who
+            // this node is, exactly as the `Engine` constructors do
+            // (`set_backend_node_key_id`): the receive doors' re-wrap, the
+            // device door and every "do I trust this" gate ask the backend's
+            // `node_key_id()`, and a wheel host that never set it answered
+            // them as nobody.
+            if let Some(k) = key.as_deref() {
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => pg.set_node_key_id(k),
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => sq.set_node_key_id(k),
+                }
+            }
             match &backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -2335,6 +2349,30 @@ impl PyEngine {
                     let me = crate::signing::federation_key_id_of(&*signer)
                         .await
                         .map_err(|e| crate::federation::Error::Backend(format!("node key: {e}")))?;
+                    // v50.0.0 (CIRISPersist#916) — first re-wrap this node's
+                    // own epochs to every member device whose binding or keys
+                    // arrived since the last pass; the grants dirty their
+                    // epochs and the loop below emits them. Logged, not fatal.
+                    let now = chrono::Utc::now();
+                    let rewrapped = match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                pg.as_ref(), &me, None, now,
+                            )
+                            .await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                sq.as_ref(), &me, None, now,
+                            )
+                            .await
+                        }
+                    };
+                    if let Err(e) = rewrapped {
+                        tracing::warn!(error = %e, "member-device re-wrap sweep failed at init (#916)");
+                    }
                     let mut emitted = 0usize;
                     match &backend {
                         #[cfg(feature = "postgres")]
@@ -5445,6 +5483,15 @@ impl PyEngine {
             // v47.0.0 (CIRISPersist#797) — waiting on a roster, not skipped.
             dict.set_item("awaiting_roster", report.awaiting_roster)?;
             dict.set_item("skipped", report.skipped)?;
+            // v50.0.0 (CIRISPersist#924) — grant-covered rows the grammar refuses.
+            dict.set_item(
+                "skipped_unmatched_dimension",
+                report.skipped_unmatched_dimension,
+            )?;
+            dict.set_item(
+                "unmatched_dimension_examples",
+                report.unmatched_dimension_examples.clone(),
+            )?;
             Ok(dict)
         })
     }
@@ -6598,6 +6645,36 @@ impl PyEngine {
             }
             py.detach(|| {
                 let me = runtime.block_on(self.local_derived_key_id_async())?;
+                // v50.0.0 (CIRISPersist#916) — the member-device re-wrap walk
+                // first (logged, not fatal); its grants dirty their epochs.
+                let now = chrono::Utc::now();
+                let rewrapped = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        let me = me.clone();
+                        runtime.block_on(async move {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                backend.as_ref(), &me, None, now,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        let me = me.clone();
+                        runtime.block_on(async move {
+                            crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
+                                backend.as_ref(), &me, None, now,
+                            )
+                            .await
+                        })
+                    }
+                };
+                if let Err(e) = rewrapped {
+                    tracing::warn!(error = %e, "member-device re-wrap sweep failed (#916)");
+                }
                 let axes = match &self.backend {
                     #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
@@ -11467,6 +11544,24 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
             let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
                 extract_authority_fields(&value);
+            // v50.0.0 (CIRISPersist#926) — the co-signatures a trust-root row
+            // carries (a JSON list of `{authority_key_id,
+            // scrub_signature_classical, scrub_signature_pqc}` over the same
+            // signing envelope). Absent = none; malformed is refused, never
+            // read as none.
+            let cosignatures: Vec<crate::federation::RosterCosignature> =
+                match value.get("cosignatures") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                        PyValueError::new_err(format!("community cosignatures decode: {e}"))
+                    })?,
+                };
+            if authority_key_id.is_empty() && !cosignatures.is_empty() {
+                return Err(PyValueError::new_err(
+                    "community cosignatures need the authority signature they sit beside \
+                     (authority_key_id is empty)",
+                ));
+            }
             // v21.0.0 (#502 E4 followup) — self-sign when the caller supplies
             // no authority signature: this is the NODE creating a community it
             // is the authority for (a local wheel API, not a wire path), so the
@@ -11502,12 +11597,62 @@ impl PyEngine {
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
                                 supersede_proof: None,
+                                cosignatures,
+                                lineage: Vec::new(),
                             })
                             .await
                             .map_err(federation_err_to_py)
                     }
                 })
             })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#925/#931) — the REPLICATED community entry:
+    /// admit a `SignedCommunity` received from a peer (the shape the signed
+    /// since-read serves). Distinct from [`Self::put_community_json`], the
+    /// LOCAL door, which runs the full CC 3.2 infrastructure gate whoever
+    /// signed: here a legacy infrastructure record is admitted as data and
+    /// the fold's gates apply. Returns the typed outcome as JSON —
+    /// `"inserted"`, `"unchanged"`, `"superseded"`, or
+    /// `{"refused":{"reason":"conflicting_record"}}`.
+    fn apply_replicated_community_json(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community: crate::federation::SignedCommunity = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("signed community decode: {e}")))?;
+            let backend = self.backend.clone();
+            let outcome = py.detach(move || match &backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    let b = b.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::apply_replicated_community(
+                            &*b, community,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    let b = b.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::apply_replicated_community(
+                            &*b, community,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_string(&outcome)
+                .map_err(|e| PyRuntimeError::new_err(format!("outcome encode: {e}")))
         })
     }
 
@@ -11970,6 +12115,150 @@ impl PyEngine {
                         .map_err(|e| PyValueError::new_err(format!("community serialize: {e}")))
                 })
                 .transpose()
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — CC 4.4.3.2.4 `resolve_community`: the
+    /// folded founders (eligible only) and members of `community_key_id`, its
+    /// subkind, protocol and entrenchment, as JSON `ResolvedCommunity`; `None`
+    /// when no row is stored or a trust-root id holds a row that is not rooted.
+    /// Wraps [`crate::federation::canonical_community::resolve_community`].
+    fn resolve_community_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            py.detach(move || {
+                let out = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::resolve_community(
+                                &*backend,
+                                &community_key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::resolve_community(
+                                &*backend,
+                                &community_key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                out.map(|r| {
+                    serde_json::to_string(&r).map_err(|e| {
+                        PyValueError::new_err(format!("resolved community serialize: {e}"))
+                    })
+                })
+                .transpose()
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (`GET
+    /// /v1/trust-root/bundle`): the compiled-in GenesisBundle with this node's
+    /// rooted `ciris-canonical` row beside it, as JSON
+    /// `TrustRootBundleResponse`. Wraps
+    /// [`crate::federation::canonical_community::trust_root_bundle_response`].
+    fn trust_root_bundle_response_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+
+            py.detach(move || {
+                let out = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::trust_root_bundle_response(
+                                &*backend,
+                                crate::federation::genesis::canonical_genesis_bundle(),
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::trust_root_bundle_response(
+                                &*backend,
+                                crate::federation::genesis::canonical_genesis_bundle(),
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&out).map_err(|e| {
+                    PyValueError::new_err(format!("trust-root response serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin
+    /// `ciris-canonical` from ONE `TrustRootBundleResponse` JSON (the bundle's
+    /// quorum verified against this node's own roster, the key records and the
+    /// community admitted through the ordinary doors). Returns JSON
+    /// `PinnedTrust`. Wraps
+    /// [`crate::federation::canonical_community::pin_trust_from_bundle_response`].
+    fn pin_trust_from_bundle_response_json(
+        &self,
+        py: Python<'_>,
+        response_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let response: crate::federation::canonical_community::TrustRootBundleResponse =
+                serde_json::from_str(response_json).map_err(|e| {
+                    PyValueError::new_err(format!("trust-root response decode: {e}"))
+                })?;
+            py.detach(move || {
+                let out = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::pin_trust_from_bundle_response(
+                                &*backend, &response,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::pin_trust_from_bundle_response(
+                                &*backend, &response,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&out)
+                    .map_err(|e| PyValueError::new_err(format!("pinned trust serialize: {e}")))
             })
         })
     }
@@ -23189,16 +23478,20 @@ impl PyEngine {
     /// [`crate::federation::DelegationGraph`] with one
     /// [`crate::federation::DelegationEdge`] per `delegates_to:*`
     /// row reachable within `max_depth` (clamped to
-    /// [`crate::federation::MAX_DELEGATION_DEPTH`]).
+    /// [`crate::federation::MAX_DELEGATION_DEPTH`]). v50.0.0
+    /// (CIRISPersist#928, CC 4.1.1): `max_depth=None` walks the default 5
+    /// hops; a chain past the cap is reported in `depth_outcome` as
+    /// `beyond_cap_self_verify`.
     ///
     /// `withdraws` / `recants` rows are surfaced as a per-edge
     /// [`crate::federation::WithdrawalEntry`] annotation, not
     /// filtered out — UI policy decides whether to render the edge.
+    #[pyo3(signature = (from_key, max_depth=None))]
     fn delegates_to_graph(
         &self,
         py: Python<'_>,
         from_key: &str,
-        max_depth: usize,
+        max_depth: Option<usize>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -23740,6 +24033,8 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
+                lineage: Vec::new(),
             }),
             _ => None,
         };
@@ -24035,6 +24330,8 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
+                lineage: Vec::new(),
             }),
             _ => None,
         };
@@ -24308,6 +24605,104 @@ impl PyEngine {
                     "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
                 }))
                 .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **a member's
+    /// new device receives exactly what the member holds**: every retained
+    /// community DEK epoch `member_key_id` holds a grant on in
+    /// `community_key_id` is re-wrapped to `new_occurrence_key_id`, with no
+    /// epoch bump, and the epoch-axis `key_grant` sets this node minted are
+    /// emitted. `authority_key_id` must be the member's owner-binding over the
+    /// device and the member must be active in the room; a refusal raises
+    /// `ValueError` whose message starts `federation_device_rekey_refused`.
+    /// JSON `{epochs_scanned, granted: [[minter, epoch]], local_only:
+    /// [[minter, epoch]], already_held: [[minter, epoch]], content_miss:
+    /// [{minter_key_id, epoch, reason}]}` — `granted` is this node's own
+    /// epochs (their sets are emitted), `local_only` a grant written under a
+    /// minter that is not this node's key (never emitted), and an epoch this
+    /// node cannot recover is reported, never dropped.
+    fn rekey_community_member_device_add_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        member_key_id: &str,
+        new_occurrence_key_id: &str,
+        authority_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let (comm, member, occ, authority) = (
+                community_key_id.to_owned(),
+                member_key_id.to_owned(),
+                new_occurrence_key_id.to_owned(),
+                authority_key_id.to_owned(),
+            );
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(
+                        engine.rekey_community_member_device_add(&comm, &member, &occ, &authority),
+                    )
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({
+                    "epochs_scanned": r.epochs_scanned,
+                    "granted": r.granted,
+                    "local_only": r.local_only,
+                    "already_held": r.already_held,
+                    "content_miss": r.content_miss.iter().map(|m| serde_json::json!({
+                        "minter_key_id": m.minter_key_id,
+                        "epoch": m.epoch,
+                        "reason": m.reason.as_str(),
+                    })).collect::<Vec<_>>(),
+                }))
+                .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
+            })
+        })
+    }
+
+    /// v50.0.0 (CIRISPersist#916, `FSD/SECOND_DEVICE.md` §3) — **the minter
+    /// side of the second device, on demand**: re-wrap every retained epoch
+    /// THIS node minted to each device of an active member that does not hold
+    /// it yet (a device = an active identity occurrence the member's live
+    /// owner-binding names), and emit each changed epoch's `KeyGrant` set.
+    /// `member_key_id` + `device_key_id` narrow the walk to one device; both
+    /// `None` sweeps every room. The receive doors and `emit_pending_key_grants`
+    /// run the same walk themselves. JSON `{changed: [[community, epoch]],
+    /// keyless: [[community, device]]}`.
+    #[pyo3(signature = (member_key_id = None, device_key_id = None))]
+    fn rewrap_own_epochs_to_member_devices_json(
+        &self,
+        py: Python<'_>,
+        member_key_id: Option<&str>,
+        device_key_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let only =
+                match (member_key_id, device_key_id) {
+                    (Some(m), Some(d)) => Some((m.to_owned(), d.to_owned())),
+                    (None, None) => None,
+                    _ => return Err(PyValueError::new_err(
+                        "rewrap_own_epochs_to_member_devices_json: pass both member_key_id and \
+                         device_key_id, or neither",
+                    )),
+                };
+            let engine = self.hold_engine_view();
+            py.detach(move || {
+                let r = self
+                    .runtime
+                    .block_on(engine.rewrap_own_epochs_to_member_devices(
+                        only.as_ref().map(|(m, d)| (m.as_str(), d.as_str())),
+                    ))
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&serde_json::json!({
+                    "changed": r.changed,
+                    "keyless": r.keyless,
+                }))
+                .map_err(|e| PyRuntimeError::new_err(format!("rewrap encode: {e}")))
             })
         })
     }
@@ -24654,7 +25049,10 @@ impl PyEngine {
     /// snake_case verdict token instead of a bool so a Python consumer
     /// can route a distinct audit entry per refusal reason. Tokens:
     /// `"reachable"`, `"retracted_at_root"`, `"missing_scope"`,
-    /// `"signer_unreached"`, `"substrate_unavailable"`, `"no_trust_roots"`.
+    /// `"signer_unreached"`, `"substrate_unavailable"`, `"no_trust_roots"`,
+    /// and (v50.0.0, CIRISPersist#928) `"beyond_depth_cap"` — a scope-bearing
+    /// chain continues past `max_depth`: too deep to confer (CC 4.1.1
+    /// self_verify), distinct from `"signer_unreached"`.
     fn reachable_under_scope_with_reasons(
         &self,
         py: Python<'_>,
@@ -24712,6 +25110,8 @@ impl PyEngine {
                     "substrate_unavailable"
                 }
                 crate::federation::ReachabilityVerdict::NoTrustRoots => "no_trust_roots",
+                // v50.0.0 (CIRISPersist#928, CC 4.1.1) — too deep, not absent.
+                crate::federation::ReachabilityVerdict::BeyondDepthCap => "beyond_depth_cap",
             };
             Ok(token.to_owned())
         })
@@ -32605,6 +33005,13 @@ fn write_scope_refused_message(kind: &str, reason: &crate::scope::ScopeRefusalRe
     format!("{kind}: {}", reason.kind())
 }
 
+/// v50.0.0 (#916 review) — a refusal whose `rule` token decides what the
+/// caller does next (retry, or not) carries it across the FFI:
+/// `"<kind>: <rule>"`, the [`write_scope_refused_message`] shape.
+fn rule_refusal_message(kind: &str, rule: &str) -> String {
+    format!("{kind}: {rule}")
+}
+
 fn rate_limited_message(
     kind: &str,
     reason: crate::federation::PeerQuotaRefusal,
@@ -32834,11 +33241,25 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // authorization failure; ValueError (4xx). Location is self-knowledge:
         // a third party has no source for where a subject is. The `rule` field
         // separates the RETRYABLE out-of-order case (the `delegates_to` has not
-        // replicated yet) from a substantive verdict, but only `kind()` crosses
-        // the FFI — so a caller that must distinguish them reads the message.
-        crate::federation::Error::LocationAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
-        // v49.0.0 (#908) — the same standing-not-signature refusal as #734.
-        crate::federation::Error::RosterAuthorityUnauthorized { .. } => PyValueError::new_err(kind),
+        // replicated yet) from a substantive verdict. v50.0.0 (#916 review):
+        // until this cut only `kind()` crossed the FFI, so the message a caller
+        // was told to read carried no rule; it now reads `"<kind>: <rule>"`
+        // (the `rate_limited_message` shape) — `except ValueError` and a
+        // `startswith(kind)` check are unchanged, an equality match breaks.
+        crate::federation::Error::LocationAuthorityUnauthorized { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
+        // v49.0.0 (#908) — the same standing-not-signature refusal as #734;
+        // `roster_authority_not_established` is the retryable rule.
+        crate::federation::Error::RosterAuthorityUnauthorized { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
+        // v50.0.0 (#916) — a device re-wrap refused on the owner-binding, the
+        // roster or the device's keys: the same caller-side refusal, the same
+        // type; `device_rekey_unbound` is the retryable rule.
+        crate::federation::Error::DeviceRekeyRefused { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
         // v49.0.0 (#912) — a listing its door refuses (not the member's own,
         // or not `public`): the same caller-side refusal, the same type.
         crate::federation::Error::MembershipListingRefused { .. } => PyValueError::new_err(kind),
@@ -32916,6 +33337,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // failure (non-infra membership is an authority act that must root
         // in an owner); ValueError (4xx).
         crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
+        // v50.0.0 (CIRISPersist#925/#927) — a non-conformant infrastructure
+        // record and a fused node key are the submitter's to re-mint: 4xx.
+        crate::federation::Error::CommunityConsensusProtocolViolation { .. }
+        | crate::federation::Error::NodeIdentityNotExclusive { .. }
+        | crate::federation::Error::NodeIdentityImmutable { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused
         // user-target steward-binding (target is a self-sovereign adult / its
         // age is unverified / the granter is not a proven adult user) is a
@@ -34869,6 +35295,37 @@ mod tests {
 
     /// v47.0.0 (CIRISPersist#797) — the AV-45 reason reaches the host, and
     /// the retryable one is distinguishable from the terminal ones.
+    #[test]
+    fn rule_refusals_carry_the_rule_across_the_ffi_916() {
+        let e = crate::federation::Error::DeviceRekeyRefused {
+            community_key_id: "c".into(),
+            member_key_id: "m".into(),
+            occurrence_key_id: "d".into(),
+            rule: crate::federation::DEVICE_REKEY_RULE_UNBOUND,
+        };
+        assert_eq!(
+            rule_refusal_message(e.kind(), crate::federation::DEVICE_REKEY_RULE_UNBOUND),
+            "federation_device_rekey_refused: device_rekey_unbound"
+        );
+        pyo3::Python::initialize();
+        for (e, want) in [
+            (e, "federation_device_rekey_refused: device_rekey_unbound"),
+            (
+                crate::federation::Error::RosterAuthorityUnauthorized {
+                    group_key_id: "g".into(),
+                    offered_authority_key_id: "a".into(),
+                    rule: crate::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED,
+                },
+                "federation_roster_authority_unauthorized: roster_authority_not_established",
+            ),
+        ] {
+            let py_err = federation_err_to_py(e);
+            pyo3::Python::attach(|py| {
+                assert_eq!(py_err.value(py).to_string(), want);
+            });
+        }
+    }
+
     #[test]
     fn write_scope_refused_message_carries_the_reason_797() {
         use crate::scope::ScopeRefusalReason as R;

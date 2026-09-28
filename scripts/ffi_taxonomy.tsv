@@ -161,6 +161,7 @@ Engine	aggregate_scoring_factors_stream	axiotic
 Engine	aggregate_scrub_stats	axiotic	
 Engine	apply_replicated_accord_evidence	deontic
 Engine	apply_replicated_attestation	deontic
+Engine	apply_replicated_community_json	deontic
 Engine	apply_replicated_key_grant	deontic
 Engine	apply_replicated_key_record	deontic
 Engine	attach_attestation_pqc_signature	ontological
@@ -429,6 +430,8 @@ Engine	send_set_for_json	empirical
 Engine	minter_of_blob_json	empirical	
 Engine	rekey_self_occurrence_add_json	deontic	
 Engine	rekey_family_member_add_json	deontic	
+Engine	rekey_community_member_device_add_json	deontic	
+Engine	rewrap_own_epochs_to_member_devices_json	deontic	
 Engine	list_identity_occurrences_for_json	ontological	
 Engine	list_live_occurrences	ontological	
 Engine	list_llm_calls	empirical	
@@ -728,3 +731,11 @@ ScoringFactorStream	__next__	structural
 ScoringFactorStream	summary	epistemic	
 Engine	consent_peers_by_principals	deontic	
 Engine	resolve_scoped_consent_by_principals	deontic	
+# v50.0.0 (CIRISPersist#926) — `resolve_community_json` and
+# `pin_trust_from_bundle_response_json` are DEONTIC: a wrong entry names the
+# founders a consumer trusts (or admits a row its accord did not found), which
+# is a security finding. `trust_root_bundle_response_json` is EMPIRICAL: it
+# serves this node's stored state, re-derivable by re-reading it.
+Engine	resolve_community_json	deontic	
+Engine	trust_root_bundle_response_json	empirical	
+Engine	pin_trust_from_bundle_response_json	deontic	

@@ -5,7 +5,8 @@
 #
 #   scripts/release_ship.sh <pr> <version> <expected-head-7> <subject> <body-file>
 #
-# 1. refuses a dirty tree or a PR head that moved from <expected-head-7>;
+# 1. refuses a dirty tree, a PR head that moved from <expected-head-7>, or a
+#    PR head whose CI run is not completed/success (#756);
 # 2. merges the PR (--merge) with <subject>/<body-file>;
 # 3. waits for main CI on the merge sha — UNLESS the merge commit's TREE is
 #    byte-identical to the PR head's tree (no intervening main commit), in
@@ -22,11 +23,15 @@ cd "$(git rev-parse --show-toplevel)"
 [ -z "$(git status --porcelain)" ] || { echo "DIRTY TREE"; exit 2; }
 head=$(gh pr view "$pr" --json headRefOid --jq .headRefOid); [ "${head:0:7}" = "$want" ] || { echo "HEAD MOVED: $head"; exit 3; }
 head_tree=$(git rev-parse "${head}^{tree}" 2>/dev/null || { git fetch -q origin "$head" && git rev-parse "${head}^{tree}"; })
+# The PR run must be GREEN before the merge (#756): the main-CI wait below
+# is skipped when the trees match, and that skip leans on this run.
+prst=$(gh run list --commit "$head" --workflow ci.yml --event pull_request --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"' 2>/dev/null || echo none)
+[ "$prst" = "completed/success" ] || { echo "PR CI on $head NOT GREEN ($prst) — refusing to merge (#756)"; exit 3; }
 gh pr merge "$pr" --merge --subject "$subject" --body-file "$bodyf" || exit 4
 git fetch -q origin main; merge_sha=$(git rev-parse origin/main); echo "merged: $merge_sha"
 merge_tree=$(git rev-parse "${merge_sha}^{tree}")
 if [ "$merge_tree" = "$head_tree" ]; then
-  echo "merge tree == PR head tree ($merge_tree): the PR run certified these bytes — main-CI wait skipped (#881)"
+  echo "merge tree == PR head tree ($merge_tree): the PR run ($prst) certified these bytes — main-CI wait skipped (#881)"
 else
   echo "merge tree $merge_tree != PR head tree $head_tree — waiting for main CI on the merge"
   st=none
@@ -60,7 +65,10 @@ for i in $(seq 1 30); do gh release view "v$ver" >/dev/null 2>&1 && break; sleep
 gh release view "v$ver" >/dev/null 2>&1 || { echo "release v$ver never appeared"; exit 13; }
 gh release view "v$ver" --json assets --jq '[.assets[].name] | join(", ")'
 gh release edit "v$ver" --notes-file "$tmp/tagbody.md" >/dev/null || { echo "release edit failed"; exit 14; }
-body_bytes=$(gh release view "v$ver" --json body --jq '.body | length')
+# BYTES, not characters: jq's `length` counts code points, and v49.0.0's
+# section (85 more bytes than characters — em dashes, arrows) failed this
+# check with a body byte-identical to the tag.
+body_bytes=$(gh release view "v$ver" --json body --jq '.body' | wc -c)
 echo "release body bytes=$body_bytes (tag body $in_bytes)"
 [ "$body_bytes" -ge $(( in_bytes - 64 )) ] || { echo "release body too short — not the CHANGELOG section"; exit 15; }
 echo "=== RELEASE_SHIP_DONE v$ver at $merge_sha ==="

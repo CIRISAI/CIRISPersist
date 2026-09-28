@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "49.0.0"
+version = "50.0.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -117,7 +117,7 @@ test-panic = []
 #               deployments at full_traces level.
 # - scrub-ort:  ORT INT8 backend for NER. Faster inference; same NER
 #               coverage as Candle.
-classify       = ["dep:regex"]
+classify       = []
 scrub          = ["classify"]
 extract        = ["scrub"]
 
@@ -704,7 +704,12 @@ pyo3 = { version = "0.29", features = ["abi3-py310"], optional = true }
 # `number_prefix` + `paste` unmaintained-track advisories are
 # ignored in deny.toml per α4. Pinned versions match CIRISLens
 # cirislens-core (source-of-truth for the lifted scrub/NER code).
-regex                = { version = "1.10", optional = true }
+# v50.0.0 (CIRISPersist#924) — no longer optional: the CC 3.1.7 R3 dimension
+# grammar is manifest DATA carried as regular expressions
+# (`_meta.case_rule.*_pattern`, `segments[].pattern`), and the one matcher
+# compiles them. `regex` was already in every build through `jsonschema`, so
+# this adds no crate to any feature set.
+regex                = "1.10"
 # v0.6.0-α4 — ML loader / inference deps. `anyhow` + `log` are used
 # only inside the NER backends (CIRISLensCore convention) so they're
 # gated behind `scrub-ner` too.

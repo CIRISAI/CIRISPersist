@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 103 delegations, generated. Every one: fault first, then delegate.
+// 106 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -912,6 +912,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.lookup_public_key(key_id).await
     }
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<SignedCommunity>, Error> {
+        if let Some(e) = self.faulted("lookup_signed_community") {
+            return Err(e);
+        }
+        self.inner.lookup_signed_community(community_key_id).await
+    }
     async fn lookup_signed_record_by_content_hash(
         &self,
         kind: &str,
@@ -1095,6 +1104,12 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.revocations_for(revoked_key_id).await
     }
+    async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
+        if let Some(e) = self.faulted("rewrap_own_epochs_for_device") {
+            return Err(e);
+        }
+        self.inner.rewrap_own_epochs_for_device(owner, device).await
+    }
     async fn set_active_halt(
         &self,
         family_key_id: &str,
@@ -1138,5 +1153,8 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .supersede_group_row(cohort, new_snapshot, authorization)
             .await
+    }
+    fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
+        self.inner.trust_root_standing_cache()
     }
 }
