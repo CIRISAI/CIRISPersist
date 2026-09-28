@@ -2851,6 +2851,39 @@ pub(crate) mod bodies {
         assert_eq!(cache.computations(), computed, "nothing computed");
     }
 
+    /// (f1), third phase — `Unsupported` is a structural answer (the
+    /// directory cannot be asked), keyed as its own marker; a FAILED read is
+    /// not that answer either. A squat refused by shape is judged `NotRooted`
+    /// before any family fold, so a directory that cannot answer the family's
+    /// widenings still caches it; the same read FAILING must return the
+    /// error, never that cached verdict.
+    pub(crate) async fn f1_c_a_failed_read_is_not_unsupported(
+        inner: std::sync::Arc<dyn FederationDirectory>,
+    ) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        const READ: &str = "list_family_membership_widenings_for";
+        let cache = inner.trust_root_standing_cache().expect("a standing cache");
+        let now = chrono::Utc::now();
+        let cannot = FaultInjectingDirectory::new(inner.clone()).unsupported(READ);
+        assert!(
+            matches!(
+                cc::stored_standing_at(&cannot, CANON, now).await.unwrap(),
+                cc::StoredStanding::NotRooted { .. }
+            ),
+            "the squat is refused by shape"
+        );
+        let computed = cache.computations();
+        assert!(computed >= 1, "the verdict was cached");
+        let failing = FaultInjectingDirectory::new(inner.clone()).erroring(READ);
+        match cc::stored_standing_at(&failing, CANON, now).await {
+            Err(Error::Backend(m)) => assert!(m.contains(READ), "{m}"),
+            other => {
+                panic!("a failed read is not `Unsupported`: expected the error, got {other:?}")
+            }
+        }
+        assert_eq!(cache.computations(), computed, "nothing computed");
+    }
+
     /// (m) — MEDIUM-C: a second read with every input unchanged verifies no
     /// signature (the directory's standing cache serves it); a holder
     /// revocation in the accord family is a changed input, recomputes, and
@@ -3682,6 +3715,44 @@ mod run {
             std::sync::Arc::new(d),
         )
         .await;
+    }
+
+    /// (f1), third phase, on every backend: a planted non-conformant squat.
+    #[tokio::test]
+    async fn i190_f1_c_memory() {
+        let d = crate::store::memory::MemoryBackend::new();
+        let squat = super::bodies::j_squat(&d).await;
+        d.plant_community_below_the_door(squat);
+        super::bodies::f1_c_a_failed_read_is_not_unsupported(std::sync::Arc::new(d)).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i190_f1_c_sqlite() {
+        use crate::store::Backend as _;
+        let d = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        let squat = super::bodies::j_squat(&d).await;
+        plant_sqlite(&d, squat).await;
+        super::bodies::f1_c_a_failed_read_is_not_unsupported(std::sync::Arc::new(d)).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i190_f1_c_postgres() {
+        use crate::store::Backend as _;
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let d = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        d.run_migrations().await.unwrap();
+        let squat = super::bodies::j_squat(&d).await;
+        plant_postgres(&d, squat).await;
+        super::bodies::f1_c_a_failed_read_is_not_unsupported(std::sync::Arc::new(d)).await;
     }
 
     #[tokio::test]
