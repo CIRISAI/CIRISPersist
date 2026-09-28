@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790411149101,
+  "lastUpdate": 1790624078868,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -98759,6 +98759,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 178,
             "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ebc51de59c75742d847b7c909e56d5597fc18e23",
+          "message": "v50.0.0: the second device and the CC rc5 adopts — sweep never widens a placed row, device re-wrap, MLS root follows the content master, typed sync-door outcome; the dimension grammar as manifest data (released rc5), infrastructure does not vote, the ciris-canonical trust root, quorum:M/N, 5-hop delegation, strict put_community, the rc5 evidence rows, the pre-flight and ship gates\n\nv50.0.0 (MAJOR): the second device, and the CC rc5 adopts. The consent sweep never widens a placed row — a metadata leak of every self file (#919); a member's new device receives what the member holds, re-wrapped by each minter from every receive door (#916); the durable MLS-state store's key follows the content master's root, with a software fallback honest about being software (#920); the attributed sync door returns the typed pre-write outcome, across the capsule too (#917). Pulled in by the operator against CIRISConstitution 1.0-rc5: the dimension grammar is manifest data — 145 families, one matcher (#924); infrastructure does not vote, Clause A at mint (#925); the `ciris-canonical` trust root born as a post-genesis Contribution (#926); the infrastructure protocol `quorum:M/N` (#927); the 5-hop delegation default, recorded per row (#928); `put_community` strict by default with `apply_replicated_community` as the replication door (#931); the rc5 evidence rows (#935); the trust-root pre-flight gates the bundle quorum (#809); the ship script refuses to tag on a non-green PR run (#756). Each slice was built by one agent in its own worktree and independently reviewed against `FSD/SECOND_DEVICE.md` before merge.\n\nCloses #919, #916, #920, #917, #924, #925, #926, #927, #928, #931, #809, #756, #935.\n\n\n**MAJOR.** CIRISServer's second-device flow was blocked three ways in persist, and CIRISEdge's attributed sync door booked a duplicate as a refusal. Each interpretation below was checked against CC RC5, the FSDs and shipped code before building, and each turned out to be already decided there (FSD `SECOND_DEVICE.md` §0). Every slice was built by one agent and reviewed by another against the FSD before merge; most reviews changed the slice materially.\n\n### Fixed — the consent sweep never widens a placed row (CIRISPersist#919; FSD §1)\n\n**A privacy leak.** The #530 consent sweep widened every `federation`-tier `self`/`family` row with no widening yet to the audience of a covering consent grant, and the widening carried no room. Every row a device placed in its owner's self room — the MLS handshake (KeyPackage, Welcome, Commit) and **every self file row, filename and pointer included** — was republished federation-wide within seconds of the write, and the second device could neither join nor list (CIRISServer measured 26/26 file rows). Now a row whose signed envelope names a cohort target is **placed** and is never a widening candidate: a top-level alias (`community_id` / `community_key_id` / `cohort_key_id` / `family_key_id`) **or a blob pointer's owner slot** (`content.community_key_id`) — the only place Edge's self file rows name their room. One predicate (`admission::envelope_names_cohort_target`, with `blob_pointer::names_pointer_owner`) on all three backends; sqlite and postgres apply it inside the candidate query before `LIMIT`, and the sweep's own widening step refuses a placed row on both of its passes. A self row naming NO target (a stranded trace, the #530 case) is still repaired. `Engine::widen_audience` stays the one deliberate host path (the member choosing to publish wider). I186, built on Edge v32.1.0's real self-file row shape with the second device's read modelled on Edge's `files::in_room` and `chat::rows_in_room`; it failed before the fix. 15 mutants, 15 killed.\n\n- **Residual, stated:** persist has no \"placed by `share`\" marker, so a self row naming its room in neither place would still be a candidate; no current Edge writer produces one. Self file rows authored under an Edge OLDER than #646 carry an empty pointer owner slot and remain candidates: a node with that history that grants `file:` consent would widen its own old self files. A device still on persist < v50 keeps widening its own rows, and v50 nodes ingest those widenings. Rows already widened are not repaired (none found on the canonical).\n- **Cost:** the candidate read scans the self/family corpus (placed rows stay in it); a generated placement column is the follow-up if mobile sqlite shows it.\n\n### Changed — the durable MLS-state store's key follows the content master's root (CIRISPersist#920; FSD §2)\n\nv49's `open_mls_state` refused on every host without a TPM / Keystore / Secure Enclave — every CI runner and dev box — although persist's own rule (`BLOB_ENCRYPTION_AT_REST.md` §4.3/§10.2) had already locked the posture: hardware-rooted, *with a software fallback honest about being software*. Now **`Engine::open_mls_state(path) -> (XChaChaKvStore, MlsStateCustody)`** derives the MLS-state key, under `MLS_STATE_CONTEXT`, from whatever root the persisted content master resolves to on this host — the hardware-sealed seed (`key_kind='hardware'`) or the persisted software content master (`key_kind='software'`) — through CIRISVerify's `derive_symmetric_key` in both arms, and returns the custody kind (`Hardware` / `Software`) with a descriptor that holds no key material. The persisted row wins: a store created on a software host keeps opening after hardware appears. No seed file is ever minted for this path. **`XChaChaKvStore::open_mls_state(path)` (v49) is REMOVED** (clean break). `KVError::HardwareCustodyUnavailable` now means exactly: the row says hardware and the seed is unreachable (§11.7), or — in the compat arm — a v49 store's hardware key is unreachable.\n\n- **v49 compatibility:** Edge v32.1.0 calls the v49 opener, so a v49 store (keyed from the hardware seed regardless of the row) can exist on a TPM host whose row says `software`. Under a software row the software key is tried first; only when the store refuses it and hardware-backed storage is present is v49's key tried, never minting; on success the custody reported is `Hardware` with descriptor `legacy-v49-hardware-keyed-under-software-row`. On a host with no hardware storage a v49 store cannot exist, so a refusing store is `WrongPassphrase` (a typed distinction, never a message match).\n- **Seed policy:** under a hardware row the opener never mints; the only moment the MLS/content path seals a seed is the content-master row's own initialisation. An in-process lock serializes seed minting (two first-writers — the first blob write and the first MLS open — could each mint). The sqlite row init runs through `sqlite_conn_model::dispatch_blocking` (a bare `spawn_blocking` panics when a statically linked consumer polls outside a tokio runtime; witnessed with no runtime on the thread).\n- **API:** `BlobStorage` gains a **required** method `load_or_init_content_master_row` (implemented on sqlite and postgres; breaks out-of-tree implementors — MAJOR). `ContentMasterRow.master_key_b64` and every persist-side copy of the master are `Zeroizing` (verify's own copies: CIRISVerify#295).\n- I187 (software row, hardware row, §11.7 refusal writes nothing, the row wins, domain separation, the compat arm both ways, the seed race). 12 mutants, 12 killed over three rounds.\n- Note for hosts with `CIRIS_DATA_DIR` unset: a wrong-keyed software store reports `HardwareCustodyUnavailable` there (the v49 key cannot be ruled out), not `WrongPassphrase`.\n\n### Added — a member's new device receives what the member holds (CIRISPersist#916; FSD §3)\n\nMessages and files written before a person's second device joined did not open on it: community DEKs were wrapped to the member's devices as they were at seal time, and nothing re-wrapped retained epochs to a device added later (the self and family paths had this; rooms did not). Now:\n- **The host's door:** `Engine::rekey_community_member_device_add(community, member, new_occurrence, authority)` (and the orchestrator `at_rest_cascade::orchestrate::rekey_community_member_device_add`) re-wraps every retained `(community, epoch)` DEK this node minted that the member already holds a grant on, to the new occurrence's content-KEM keys, idempotently, with **no epoch bump** (the member set did not change), and emits the epoch `KeyGrant` sets signed by this node as minter (#876). Result: `DeviceRekeyResult { epochs_scanned, granted, already_held, local_only, content_miss: [EpochMiss { minter, epoch, reason: Destroyed | LostLocally | MintedElsewhere }] }`. Python: `rekey_community_member_device_add_json`.\n- **The minter side, on every receive door hosts use:** when an owner-binding for an ACTIVE member's device is admitted — through `apply_replicated_attestation`, `put_attestation_synced` (both now one body, `apply_planned`, on a store-confirmed insert), the signed `put_identity_occurrence`, or the boot / on-demand `emit_pending_key_grants` sweep — each minter node re-wraps its own retained epochs to that device and the dirty-emit loop every host already runs sends the sets. Through the capsule the far side runs the typed door, so Edge's production path reaches it. Python: `rewrap_own_epochs_to_member_devices_json`.\n- **Authority is the member's owner-binding, never roster governance** (the member's standing does not change): the device must be an ACTIVE identity occurrence of the member whose live owner is the member (the same set a seal fans out to — a node someone operates for others receives nothing), the member must be active by the authorized fold at the call's instant, and the occurrence must have valid encryption keys. Refusals are one typed error, `Error::DeviceRekeyRefused { community_key_id, member_key_id, occurrence_key_id, rule }` (kind `federation_device_rekey_refused`; Python `ValueError` with message `\"<kind>: <rule>\"`), rules `device_rekey_unbound` (**retryable** — the binding has not replicated yet), `device_rekey_owner_mismatch`, `device_rekey_authority_not_owner`, `device_rekey_member_not_active`, `device_rekey_not_an_occurrence` (retryable), `device_rekey_no_encryption_pubkeys` (also records a `recipient_excluded` hard-case event), `device_rekey_node_key_unknown` (retryable). **PyEngine init now sets the backend's node key from its signer** as the Rust constructors do — a wheel host without it would have had silent no-op hooks and wrong results.\n- **What the member holds:** grants on every device the member has had, plus the member key; **any key another party has ever held contributes nothing** (a shared or transferred device is excluded), so a re-added member's device receives the epochs the member's devices already held before the removal (CC 4.4.3.4.5 Option A) and never an epoch from the absence. An epoch the node no longer retains is reported, never silently skipped (`ContentMiss` shape, CC 5.1 P4); an epoch held under a former node key is `local_only` (granted here, never emitted).\n- **Python messages** for `RosterAuthorityUnauthorized` and `LocationAuthorityUnauthorized` now also carry the rule (`\"<kind>: <rule>\"`); the #734 \"reads the message\" comment was false until now.\n- New floor read `BlobStorage::community_dek_member_grant_epochs`; `community_dek_put_member_grant` reports whether it inserted (a concurrent second call is reported honestly). **sqlite and postgres only** (the memory backend has no community DEK plane). No kind added, no hash moved. I188 (single-node arms a–j incl. absence-span and non-occurrence devices; two-node arms T0–T3, S, D delivering through the real doors and signed reads). 25 mutants, 25 killed over three rounds.\n\n### Changed — the attributed sync door has the typed pre-write outcome (CIRISPersist#917; FSD §4)\n\n`put_attestation_synced(record, peer)` now runs the same `plan_replicated_attestation_apply` body as `apply_replicated_attestation` (`attestation_apply::apply_planned`) and returns **`ReplicatedAttestationOutcome`** (`Inserted` / `Unchanged` / `Deduplicated` / `Refused { reason }`), keeping the `peer` argument and the `shares_cohort_with(peer)` metering. A same-signed-assertion, different-decoration re-delivery is `Refused { already_present_identical }` (which Edge already books as a duplicate), a different signed row under the same id is `Refused { conflicting_attestation }`, a byte-identical row is `Unchanged`; both doors yield the same variant for the same bytes. **The old `Ok(AttestationOutcome::AlreadyHeld)` / `Err(Conflict)` shape is REMOVED** (clean break; `put_attestation` keeps `AttestationOutcome`).\n- **Capsule:** the typed outcome crosses the boundary through two APPENDED ops (`ApplyReplicatedAttestation`, `ApplyReplicatedAttestationSynced`) and one appended result variant; the far side runs the typed door (so #916's hook fires there too). The old `PutAttestationSynced` op keeps its pre-v50 contract. Both capsule wire digests re-pinned (growth); the ABI moves to 6 for #928, below.\n- **Hardening found in review:** a lost race (`AlreadyHeld` from the store after a plan that saw no row) is `Unchanged`, not `Inserted`; a replay of a held id runs `check_envelope_size_admission` before the plan canonicalizes (a fresh row keeps meter-then-gate); the `already_present_identical` arm recomputes the content hash from the incoming envelope, so a forged row wearing a stored row's hash is `conflicting_attestation`, not a quiet duplicate. Settled rows (`Unchanged` / `Refused`) charge no peer budget, as the unattributed door always did.\n- I189 (a–i on memory, sqlite, postgres, plus the same sequence through an `OpsDirectory`). Edge's `bridge.rs` match on the old shape fails to compile on re-pin (intended: route through `attestation_outcome_to_apply`).\n\n### Changed — CC rc5 adopts pulled into v50 (CIRISPersist#925, #927, #928, #931; FSD §8; #924, #926 below)\n\nEach was checked against CIRISConstitution 1.0-rc5 as PR #113 @ 4b624513 before building — the released text (c60d0a6, tag `v1.0-rc5`) differs from it only in the namespace manifests, which #924 re-vendored; independent review found the defects the mutation tables could not, and the fixes are the rules below.\n\n**#925 — infrastructure does not vote (CC 3.2 rc5).** A `node`-bearing key — its own `identity_type` contains `node`, or it is an occurrence of a `node` identity **that the occurrence itself agreed to** (a row signed by the occurrence key; never an identity-signed unilateral claim, the #873 shape) — cannot be a founder of a `cohort_subkind: infrastructure` community and holds no founder power there: it is refused as founder on `put_community`, the supersede door and the widening door (the revocation door cannot seat a founder); the fold drops its seat (`consensus::Seat::node_bearing`), it roots no `moderate` chain, does not count for the last-founder rule, and is no reverse-quorum duty holder. **The fold and the widening door judge it at each change's instant** from the signed `asserted_at`/revocation instants (v49's non-retroactivity; never a node-local admission time); the record and supersede doors judge it now. **Clause A (CC 3.4.7.3):** a `{node,user}` / `{node,agent}` key cannot be minted locally (`put_public_key`, `add_peer_record`, genesis seeding, rebind) and **no rewrite door moves `node` in or out** (`adopt_scrub_upgrade`, `supersede_canonical_record`, `adopt_genesis_reanchor` — `Error::NodeIdentityImmutable`; the reanchor door's check is unwitnessed, no certify lane reaches it); a fused key minted on a v49 peer is still ADMITTED by the replicated door as gated data (Clause B), with typed `KeyRefusalReason::{NodeIdentityFused, NodeIdentityChanged}` on the upgrade/supersede arms. Refusals: `Error::CommunityConsensusProtocolViolation { community_key_id, rule, detail }` (kind `federation_community_consensus_protocol_violation`), `Error::NodeIdentityNotExclusive`, `Error::NodeIdentityImmutable` — Python `ValueError`.\n\n**#927 — the infrastructure protocol (CC 3.2 rc5).** An infrastructure record offered at the local door (`put_community`) or a supersede door must declare `quorum:M/N` with `1 ≤ M ≤ N`, `M ≥ 2` whenever `N ≥ 2` (`quorum:1/1` is the single-founder case), **N equal to its founder count**, and at least one founder; `founder_only`, bare `majority`, `unanimous`, `weighted:`, `custom:` and `reverse_quorum:` are refused. A conformant room's founder count is fixed by its record: a widening or revocation that would move it is refused on both roster doors, **except a founder leaving on their own signature** (v49's consent floor) — N is the founder count as admitted, and a self-leave may leave M unreachable, freezing the room until its conferring authority re-founds it (`ciris-canonical`: an accord re-birth); the last founder still cannot leave. `ConferralPlane::FamilyQuorum` is documented as the ceremony plane in family form (CC 3.2 T2); no rename.\n\n**#931 (pulled in) — `put_community` is STRICT by default; replication has its own door.** Telling \"authored here\" by signer would have switched these gates off on every real host (an infrastructure record is normally signed by its human founder). Now `put_community` (trait, all backends, pyo3, Engine) judges every new or changed infrastructure record whoever signed it, and an identical re-put settles; **`apply_replicated_community(record) -> ReplicatedCommunityOutcome { Inserted | Unchanged | Superseded | Refused { conflicting_record | degrades_conformance } }`** is the replication entry (a legacy non-conformant record is admitted as data with the fold's gates applying; an occupied id goes through the #910 amendment checks; **a conformant room never degrades** — a supersede whose stored prior conforms and whose offered version does not is refused even under a founders' proof). Capsule op `ApplyReplicatedCommunity` + result appended; pyo3 `apply_replicated_community_json`. **Edge's replication bridge moves its community apply to it**; `put_family` is unchanged.\n\n**#928 — 5-hop delegation default (CC 4.1.1).** `DEFAULT_DELEGATION_DEPTH = 5` for the general walk (`build_delegation_graph(dir, from, max_depth: Option<usize>)`), the withdraws gate and the moderation walk; 16 stays the ceiling by explicit opt-in (`check_withdraws_admission_at`, `set_withdraws_delegation_depth`). A chain past the effective cap is REPORTED, never an empty walk: `DelegationGraph::depth_outcome`, `ReachabilityVerdict::BeyondDepthCap` (pyo3 `beyond_depth_cap`), `WithdrawsNotAdmitted.beyond_delegation_depth_cap`. **Nothing is retroactive:** V157 `federation_withdraws_admission_depths` records each withdraws row's admitting depth (written in the row's transaction on both dialects, repaired on an identical re-put; pre-V157 rows read as 16; the local-tier doors record it too), and the bytes-plane fold re-derives at the ROW's depth through the new pub **`check_withdraws_admission_as_admitted(dir, row)`** — the write-form `check_withdraws_admission` must not be used to re-judge stored rows (CIRISServer#690, CIRISEdge#703). The capsule forwards `withdraws_admission_depth` (appended op). **Mixed fleet:** a v49 node admits a 6–16-hop withdraws that a v50 node refuses at admission; the bytes it withdraws stay live on the v50 node until the fleet upgrades.\n\n**Breaking (this group):** `DIRECTORY_ABI_VERSION` 6; `RosterRules::of_community(c, &NodeBearingSeats)`, `community_roster_events(dir, c, &seats)`, `Seat` gains `node_bearing` (pub fields); `build_delegation_graph(.., Option<usize>)`; new arms/fields on pub types — `ReachabilityVerdict::BeyondDepthCap`, `KeyRefusalReason::{NodeIdentityFused, NodeIdentityChanged}`, `WithdrawsNotAdmitted.beyond_delegation_depth_cap`, `DelegationGraph.depth_outcome`; behaviour — `put_community` is strict whoever signs (a replication bridge must move to `apply_replicated_community`), a fused `{node,user}`/`{node,agent}` key is refused at `put_public_key`/`add_peer_record` (`NodeIdentityNotExclusive`) and rewrites that move `node` are refused; the withdraws gate walks 5 (a withdraws resting on a 6–16-hop proxy chain is refused at admission unless opted in). New pub: `check_infrastructure_record_admission(dir, community)`, `check_withdraws_admission_as_admitted(dir, row)`. I-witnesses in `rc5_adopts_invariants.rs` and `reverse_quorum::test_support`; 31 + 20 + 11 mutants killed in the last three of five rounds (§8.6–§8.11; P3 needed a witness first). Follow-ups filed: #930 (per-assertion occurrence history — the plane keeps the latest assertion, so history is final over the assertions kept — and the backdated-revocation clamp), #932 (#873's resolver has the same unilateral-claim shape), #933 (postgres projections after the commit).\n\n### Changed — the dimension grammar is manifest data (CIRISPersist#924; CC rc5 / CIRISConstitution#112; FSD §10)\n\n**A wire break on the domain-label version.** Persist re-vendors the rc5 registry of record — **148 families** (116 before) at CIRISConstitution c60d0a6 — the released 1.0-rc5, tag `v1.0-rc5` — `_meta.registry_sha256 = 07e0c725…60b7fb` (the grammar hash: `_meta` minus its two hash fields plus `families`, CC's own recipe, recomputed by a test) pinned as `VENDORED_REGISTRY_SHA256` — byte-for-byte, with the grammar carried as data (`_meta.case_rule.version_segment`, `segments[].values`/`open`/`pattern`/`multi`, `leaves`/`leaves_closed`, `reserved_stems`, `external_standards`, `variadic`, `refusal_tokens`, `wildcard_rule`), and replaces its four disagreeing matchers with **one**, `namespace::matcher::match_family(dimension) -> FamilyMatch { family, binds, refusal }`, ported from CC's reference `tools/cc_namespace_match.py` and replayed against all **962 published vectors** two ways (CC's contract, and the reference's exact answer, the family compared exactly). CC's reference matcher itself moved between the pre-release and the release, and every change is ported: full-match patterns (`compile` anchors `^(?:p)$`), closed stems fence unmatched descendants, a closed vocab-ended parent admits only its leaves, `v1beta` in last place is malformed, open vocabulary owes its version tail (a duplicated tail or a lone `v1` refused), a case-mutated fenced stem is malformed, a refused hit is re-attributed to the clean row it mutates, a `multi` value gets no version-shape test. `prefix_match_score` is deleted; `registry::lookup`, `is_family_registered` and `consent_grammar::covers` call the matcher (`is_stem_registered` answers the stem-only question). **One version parser** reads `version_segment` from the manifest (the two coded carve-outs — the five attestation-ladder families and `identity:canonical_binding:{canonical_hash}` — are now its `exempt` list). Closed leaves refuse `namespace_family_unregistered`; closed enumerations refuse `namespace_vocab_value_unregistered`; the R3 case gate also checks variadic tails; `hardware_custody:{platform}` is the closed vocabulary of the 13 `HardwareType` tokens (`as_platform()`, unlisted class ⇒ multiplier 0.0); the accord fixture is the lowercase leaf `accord:invoke:constitutional:{halt_id}`; **minors (CC 5.4.6 / #111):** an owner-purpose `delegates_to` at `cohort_scope: federation` whose granter's age band is `minor` is refused — including a **widening** of a self-scope binding (`widen_audience` is exactly CC's \"re-signing at that audience\"), `ScopeRefusalReason::MinorOwnerBindingAtFederation`.\n\n- **What v50 now refuses that v49 admitted (name them before you re-pin):** `hardware_custody:{android|ios_secure_enclave|tpm}` as CIRISVerify 17.1.0 emits them (no version tail; `android`/`tpm` outside the vocabulary — CIRISVerify#296 asks for `hardware_custody:android_keystore:v1` etc.; do not store those entries on persist 50 until it ships); `detection:emergent_pattern:novel_signal:v1` (an unclaimed leaf under the reserved `detection:` stem) and `accord:invoke:halt` (an unnamed leaf under the closed `accord:*`); the old canonical-binding spelling `identity:canonical_binding:canonical:sha256:<hex>` (now `{canonical_hash}`, one 64-hex segment; a stored old-shape row parses to nothing and loses withdraws authority — fail-closed; no emitter found outside persist tests); the capacity companions now need the version tail (`capacity_assurance:reversible_excluded:{domain}:v1`), on the rows CC registered at the release (CIRISConstitution#117 — the pre-release carve-out is deleted); `capacity_assurance:{level}` and `{band}` are closed, so `…:reversible_excluded:a:b:v1` no longer reads as a level; an unlisted `consent:{kind}` (`consent:made_up:v1` — `consent:` is closed to its ten leaves; `consent:community_trust:v1`, CIRISAgent's live grant, still admits on its own row); an unversioned or mis-versioned open-vocabulary dimension (`x:leaf`, `x:leaf:V1`, `x:leaf:v1beta`, `x:leaf:v1:v2`); a non-canonical BCP 47 locale (`en-us`, extlang forms) — while `x-…` private-use and the five grandfathered tags are newly ADMITTED; an unversioned registered dimension (`capacity:composite` fails T3); a version-shaped segment that is not last; a lowercase `{currency}` (`usd`); the retired `age_self_declared:{band}:v1` spelling (now `age_self_declared:band:{band}:v1`); the uppercase `accord:invoke:CONSTITUTIONAL:…`; unclaimed leaves under `capacity:`, `age_assurance:`, `capacity_assurance:`, `transparency_log:cosigned:` and `age_self_declared:`.\n- **Stored rows only ever narrow:** a pre-v50 row on an old shape is covered by no grant, so the sweep counts it (`ConsentSweepReport.skipped_unmatched_dimension` + examples, on the pyo3 dict) and never promotes or widens it; `family_for_dimension` / `authority_for` narrow, never widen.\n- **Rust API (clean breaks):** `registry::case_rule` removed (the manifest's `version_segment` replaces it); `is_family_registered` is match-based; `consent_grammar::covers` refuses a malformed dimension; `ScopeRefusalReason::MinorOwnerBindingAtFederation` is a new arm; `prefix_match_score` deleted.\n- **Unchanged:** `VENDORED_MANIFEST_VERSION` (0.3.0 — it versions the supersets walk, which did not move), `TRANSFORM_ALGEBRA_HASH`, `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `ENVELOPE_VOCABULARY_SHA256`, both capsule digests (#924 adds no op); the ledger gate's integer-version rule (`v1.2` was already refused in v49). `VENDORED_CC_VERSION` (1.0-rc5). Family diff v49 → released: `scripts/manifest_diff.py` (33 added, 1 renamed, 27 changed; pre-release → release: +3 families, 4 changed, `_meta.case_rule.match_semantics` added). `regex` is a direct dependency. 32 mutants killed (20 on the pre-release build, 12 on the released re-vendor — one, Python's trailing-newline tolerance, caught only by a reference-edge witness the 962 vectors would have missed). Follow-up: #929 (a receiving peer lacking the self-scope prior checks a widening's body only).\n\n### Added — the `ciris-canonical` trust root, born as a post-genesis Contribution (CIRISPersist#926; CC 3.2 / 4.4 / 5.3.4 rc5; FSD §9)\n\nGenesis carried no `ciris-canonical` community row, so the anchor CC 4.4 tells a consumer to pin (`pinned_trust = {community_key_id: ciris-canonical, family: humanity-accord}`) resolved to nothing. **Ruled (operator, (b)):** the row is born as a post-genesis `community` Contribution and served beside the bundle; the GenesisBundle is untouched. Persist's half, after five review rounds:\n- **Birth and amendment.** The accord holders' 2-of-3 co-scrub over the row is its BIRTH and confers each founder (ceremony plane); after birth the row is amended by the **founders' quorum** (`quorum:2/3` over the founders, entrenched) through the record — each founders' change envelope binds the next version's full content hash, every recorded role and a signed `amended_at`, so **one proof admits exactly one body**; the grade, `admission_quorum_basis`, `cohort_subkind` and the entrenched protocol never change, and since #927's N equals the founder count, a founder change is a SWAP. **A row's standing is its verifiable chain:** `SignedCommunity.lineage` carries the accord-born version and every amendment (outside `signing_envelope()`, V158), so any node — fresh, or holding an older version — walks it from the birth; a held version must be contained in an offered chain (forks are first-seen-wins; only founder equivocation can fork).\n- **One predicate on both doors.** `put_community` and #931's `apply_replicated_community` run the same trust-root check (`check_trust_root_at_door`: the reserved id, the lineage caps, the chain walk). On the replicated entry a typed refusal is `Refused { degrades_conformance }` (rc5's mapping) and a short quorum propagates; another id's legacy `infrastructure_constraint` row that does not verify is kept as data there (NotRooted, never a root). Refusals are #925's typed `CommunityConsensusProtocolViolation`, with new rules `trust_root_chain`, `trust_root_lineage_cap`, `founder_seat_on_plane`, `resignation_backdated`.\n- **Founder seats move only through the record.** The roster planes admit and remove MEMBERS only; any founder seat change there is refused whoever signs, except a founder's own signed revocation, which is admitted as a resignation (for a trust root, rc5's founder-count check steps aside so this is the one gate). A founder's OWN signed revocation is a **resignation** (v49's consent floor): it stops them counting from its instant, **and a later version may record them, but they count as nothing until the record re-seats them; the row is Stalled meanwhile** — until the others amend the seat out or re-seat them; consent over availability, one founder can stall the root; the last founder cannot resign on the plane. **One counting rule for links and the head:** a founder counts on a version's link iff they are a founder of the prior version with no resignation in (`seated_since`, `amended_at`], `seated_since` being the instant of the version that (re-)seated them; a node walking from a version it holds reads `seated_since` from the chain it holds, and finds that version by its position and founders' proof in the offered chain, never by content alone (a re-seat back to the birth roster repeats the birth's content). This replaces round 7's carry-forward refusal, which could split the default root permanently between a node that admitted a resignation and one whose newer head it predated; under the rule both converge on the next amendment. **A resignation must be dated strictly after the head's instant** (at or before it is refused, `resignation_backdated`); residual: a node holding an older head can admit a resignation dated between its head and a link it has not seen; if that link needed the founder's signature the founder signed it and chose the divergence, and if not, that node reads Stalled until the next amendment. A re-seat through the record clears older resignations; every resignation is kept (and keys the standing cache), so a second one after a re-seat counts. A local supersede that skipped the folded quorum because the chain held is refused if the chain stopped holding before the write. Every founder on every version must be human, accord-conferred and non-node-bearing at the version's instant (#925, `is_node_bearing_key_at`).\n- **`StoredStanding::{Rooted, Stalled, NotRooted}`**, re-derived on read (`stored_standing_at(now)`: nothing under the verdict reads the wall clock). It is cached per directory, keyed on every input the verdict reads as stored, and each entry is served only until `valid_until`, the earliest time-dependent boundary after the instant it was judged at (a future-dated resignation, occurrence binding or holder revocation, a link's future-skew bound). A withdrawal's proposal landing is a changed input. A row is Rooted iff conformant, its chain verifies from an accord birth, and every RECORDED founder counts. **Stalled** (a recorded founder withdrawn or resigned): not served, resolved or trusted, but amendable from — and **an accord re-birth (a later birth reaching the accord quorum) replaces a Stalled row; never a Rooted one.** One holder revocation un-roots the mesh's default root on every node until the accord re-signs (CC T4, loud by design). A pre-v50 squat at the reserved id reads NotRooted, is served as `community: null` with a named reason, and is replaced by the birth chain (any accord birth replaces a NotRooted row); the reserved id is refused on both doors from any direction. A fork's losing side holds a Rooted version; it stalls only if the accord withdraws the equivocating founders, and a node that met the fork before the withdrawal evidence reads it NotRooted once the evidence lands, so the legitimate chain replaces it.\n- **Withdrawal instants are node-independent:** a steward withdrawal counts from the signed `window_until` of the accord proposal it re-tallied (a missing proposal dates it MIN, fail-secure: the links that key signed stop verifying and the row reads NotRooted); the bundle response carries the steward withdrawals and co-signer key records of every chain-named key, admitted on the pin through the ordinary doors, so a retired founder quorum cannot fork a fresh consumer. Founder key records are never deleted. There is no steward supersede door: a rotation is a plain accord withdraw of the old key plus a conferral of the new one, and it stalls the root until the founders swap the seat. The response's evidence is gathered by point reads per withdrawal, never an accord-history scan.\n- **Surfaces.** `GET /v1/trust-root/bundle` (`/v1/steward-key` alias; `server` feature) serves the bundle with the signed row, its lineage, the member/co-signer key records and withdrawal evidence; `pin_trust_from_bundle_response` verifies the bundle quorum against the consumer's own roster before admitting anything; `resolve_community` (the record's founders, answered only while Rooted); a trust-root-grade community is a valid `trust:accepts:v1` subject and `trust_root_valid` resolves it through its accord family (**`RootKind::Community`, a new serde variant**). Lineage capped at 1024 versions / 32 MiB; compaction is a re-birth. pyo3: `put_community_json(cosignatures)`, `resolve_community_json`, `trust_root_bundle_response_json`, `pin_trust_from_bundle_response_json`. **#809:** the CI pre-flight (`scripts/preflight_trust_root.py`) now GATES the bundle quorum (counts authorizations; does not verify signatures — stated). **Breaking:** `SignedCommunity` gains pub `cosignatures` and `lineage`; `FederationDirectory` gains `lookup_signed_community` (defaulted) and `trust_root_standing_cache` (defaulted). `verify_founders_link` takes the chain up to its prior and an explicit `now`; `verify_chain` and `check_founder(s)_eligible` take `now`. I190 (94 witnesses on memory, sqlite, postgres; the two-node, both-doors and fresh-consumer arms); eleven mutation rounds; round 6 ran 63 mutants (60 killed, 3 equivalent), round 9 ran 13 (12 killed; one of two defence-in-depth layers is equivalent alone) round 10 ran 3 (the first- and last-occurrence content matches both killed) and round 11 killed the one that stores an offered prefix, whose unverified signature bytes would un-root the replica on its next read (FSD §9).\n- **Not in v50:** the real row and the `registry-steward-*` key records (a holder signing session outside persist — a production node resolves `ciris-canonical` to nothing until then; only the fixture resolves); an operator-founded infrastructure root under its own family (any `infrastructure_constraint` row needs the HUMANITY_ACCORD quorum today); the read-time infrastructure carve-outs still key on the `substrate_persist` community key (stricter side); freshness against a rolled-back valid prefix is CC's rule to write.\n\n### Release gating (CIRISPersist#756)\n`scripts/release_ship.sh` now refuses to merge unless the PR head's CI run is `completed/success`. The main-CI wait is skipped when the merge tree equals the PR head tree (#881), and that skip leaned on a PR run nothing checked; every tag now rests on a green run (the PR run or main CI), then tag CI. (#809's pre-flight gate is under #926 above.)\n\n### Fixed in review (PR #921)\nCodex reviewed the release tree at 6a81b01b; each finding has a witness on memory, sqlite and postgres that was RED there, and a killed mutant (FSD §8.12, §9.1).\n- **F1 — a failed read is never a cache hit (#926).** The trust-root standing cache keyed a FAILED read of the accord family's record or roster plane exactly as a genuinely empty plane, so a cached Rooted verdict could be served while the revocation state could not be read. Every read in the key now propagates its failure (nothing is looked up or cached); `Unsupported` keys as its own marker. I190 f1_a/f1_b/f1_c; mutants M1a–M1e killed.\n- **F2 — a transient read failure never degrades a conformant room (#925/#927/#931).** The replicated door's degrade check took ANY error from re-judging the stored infrastructure row as \"legacy, non-conformant\" and admitted the offered row. Only the typed `CommunityConsensusProtocolViolation` is legacy now; any other error propagates. No other gate in the #925/#927/#931 set swallows a directory read. rc5 f2_a (the gate) and f2_b (the door, a one-shot failure); M2 killed.\n- **F3 — `apply_replicated_community`'s outcome is what the write did (#931).** The outcome came from a read taken before the write, so an apply that lost a race to a concurrent apply of the same record reported `Inserted` / `Superseded` for an idempotent no-op. The write now reports what it did under its own serialization, and the pre-read is gone. A supersede that loses its race while the offered version ends up held is `Unchanged`, not a refusal. rc5 f3_a (a rival at the door, before the insert, before the supersede's re-check) and f3_b (two joined applies: one change, one `Unchanged`); M3a–M3c killed.\n- **F4 — a zero depth cap reports what it cut (#928).** `build_delegation_graph(.., Some(0))` reported `WithinCap` for a root WITH delegations. Under a zero cap the root now gets the cap probe: `BeyondCapSelfVerify`. The scoped walk did the same, so the withdraws gate at depth 0 now says `beyond_delegation_depth_cap: true`, and `reachable_under_scope_with_reasons(.., 0)` is `BeyondDepthCap` for an issuer that delegates the scope (it was always `SignerUnreached`). 0 is still accepted; the capsule op passes it through. rc5 f4_a and the capsule op; M4a–M4c killed, M4d equivalent by trace.\n\n### Pins moved\n- **Migrations:** V157 `federation_withdraws_admission_depths` (#928), V158 `federation_communities.cosignatures` + `lineage` (#926); both dialects, bytes pinned in `evidence/migration_checksums.tsv`.\n- **`DIRECTORY_ABI_VERSION` 5 → 6** (#928: `ReachabilityVerdict::BeyondDepthCap` is a new variant returned by an EXISTING op's result, which persist's capsule policy treats as a payload-shape change, not growth). Both capsule wire digests moved for the appended ops and results of #917, #925/#931 and #928 (`ApplyReplicatedAttestation`, `ApplyReplicatedAttestationSynced`, `ApplyReplicatedCommunity`, `WithdrawsAdmissionDepth`) — final values at the tag: op `be22e2dc22c75b7c88cc236bfb5ea2c6613c8d3933b4efc554f9980b350731aa`, result `dccdb0994c22284eea288d333bb0160eaed3ed4dd1f0d19039368046bcf0d930`. `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH` and `ENVELOPE_VOCABULARY_SHA256` are unchanged (no kind, no vocabulary change). `VENDORED_REGISTRY_SHA256` and `VENDORED_CC_COMMIT` are new, `VENDORED_SOURCE_SHA256` and `VENDORED_N_FAMILIES` (116 → 145) move (#924); `VENDORED_MANIFEST_VERSION` and `TRANSFORM_ALGEBRA_HASH` do not.\n- `BlobStorage` gains required `load_or_init_content_master_row` (#920) and `community_dek_member_grant_epochs` (#916); `FederationDirectory` gains defaulted `rewrap_own_epochs_for_device` (#916).\n\n### Witnesses\nI186 (#919), I187 (#920), I188 (#916), I189 (#917), the rc5 witnesses in `rc5_adopts_invariants.rs` (#925/#927/#928/#931), the 962-vector replay and the grammar witnesses (#924), I190 (#926). **Mutation: 15 + 12 + 25 + 12 (second device, §7) + 31 + 20 + 11 (rc5, §8) + 32 (#924, §10) + 141 mutant runs over eleven rounds (#926, §9 — every prior family re-run after each fix; 137 killed, 4 equivalent by trace: the absolute M, the node-bearing link seat, the rc5 founder-count gate behind the trust-root guard, the door-walk behind the apply route) + 13 (the PR #921 review fixes, §8.12/§9.1; 12 killed, 1 equivalent — the root-epoch filter no zero-depth lens reaches), all others killed**, over thirty rounds across ten slices and one review round. Each slice was built by one agent in its own worktree and independently reviewed against the FSD by a read-only reviewer before merge; most reviews found a defect the mutation table could not (a witness on a row shape the adopter never emits; a hook reachable from no host door; a typed outcome lost across the capsule; a by-signer gate that was off on every real host; a retroactive withdraws depth; a backdatable resignation).\n\n### Adopter notes\n- **Edge (v33.0.0):** re-pin persist 50 (no verify move; v17.1.0 stays). `put_attestation_synced` returns `ReplicatedAttestationOutcome` — route through your `attestation_outcome_to_apply`. `XChaChaKvStore::open_mls_state(path)` → `Engine::open_mls_state(path) -> (store, MlsStateCustody)`; surface the custody kind; `HardwareCustodyUnavailable` is now only §11.7 / the compat arm. **`DIRECTORY_ABI_VERSION` 6**, both capsule digests moved. On a device claim, the minter-side re-wrap fires from the receive doors; the host's door is for the claiming node. **rc5:** the replicated community apply moves from `put_community` to `apply_replicated_community` (#931); read-time re-judging of stored withdraws goes through `check_withdraws_admission_as_admitted` (#928 — CIRISEdge#703), and `ReachabilityVerdict::BeyondDepthCap` is a new arm (CIRISEdge#701); `SignedCommunity` gains pub `cosignatures` and `lineage`, `RootKind::Community` is a new serde variant (#926); `RosterRules::of_community` / `community_roster_events` take the node-bearing seat set (#925). **#924 refuses what v49 admitted:** CIRISVerify 17.1.0's `hardware_custody:{android|ios_secure_enclave|tpm}` entries (CIRISVerify#296 — do not store them on persist 50 until it ships), the reserved-stem and closed-leaf refusals named above, the old canonical-binding spelling.\n- **Server (0.5.218):** #919 unblocks the self-files ladder; hold nothing else. The second device opens history once its owner-binding replicates (retry `device_rekey_unbound`). The Python refusal message now carries the rule after the kind. **rc5:** `drive.rs`'s read-time withdraws re-judgement must use `check_withdraws_admission_as_admitted` (CIRISServer#690); `put_community_json` takes `cosignatures`; new `resolve_community_json`, `trust_root_bundle_response_json`, `pin_trust_from_bundle_response_json`, `apply_replicated_community_json`; `scripts/preflight_trust_root.py` now gates the bundle quorum in pre-flight (#809). A production node resolves `ciris-canonical` to nothing until the accord holders sign the real row (a session outside persist) — do not gate a flow on it before then. `ConsentSweepReport.skipped_unmatched_dimension` names stored rows the rc5 grammar no longer matches (they narrow; they are never widened).\n\n\n## Gates\n- `scripts/certify.sh full` (LANES=2) on a6bb89bf: EVERY CI LEG GREEN BY EXIT CODE — 34 green, 0 red (`target/certify-logs`).\n- Full lanes (unfiltered) on a6bb89bf: sqlite (`pyo3,sqlite`) 3624/3624; postgres (`postgres,sqlite`, live database) 3554/3554; union lib (`postgres,pyo3,server --lib`) 2583 passed, 0 failed, 1 ignored.\n- Gate chain on a6bb89bf: fmt, the five no-backend axes ± postgres, the server-only axis under `-D warnings`, directory double, pyi surface, clippy (lib / all-targets / all-features), doc-version refs, feature matrix, the six feature TEST lanes (cirisnode 3009, cirisaudit 2952, secrets 2934, encrypted-kv+secrets 2964, cirisgraph 2905, telemetry 2930) and the sqlite suite 2879 — all green.\n- Mutation: 15 + 12 + 25 + 12 (second device) + 31 + 20 + 11 (rc5) + 32 (#924, incl. the released re-vendor) + 141 runs over eleven rounds (#926; 137 killed, 4 equivalent by trace) + 13 (the PR #921 review fixes; 12 killed, 1 equivalent) — every other mutant killed; ten slices, each with an independent read-only review re-checked after its fix rounds.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+          "timestamp": "2026-09-28T13:52:10-05:00",
+          "tree_id": "fb4da2526ebc3df8e3d4fbae303e3be461077398",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/ebc51de59c75742d847b7c909e56d5597fc18e23"
+        },
+        "date": 1790624075032,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 42481241,
+            "range": "± 423299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 1007311,
+            "range": "± 9550",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 10796,
+            "range": "± 264",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 17016,
+            "range": "± 211",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 28488,
+            "range": "± 341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 80734,
+            "range": "± 478",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 27,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 159,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 430,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 503,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1856,
+            "range": "± 31",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 82,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 261,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1178,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 48777,
+            "range": "± 12852",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 106579,
+            "range": "± 21789",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 293332,
+            "range": "± 60688",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 12155,
+            "range": "± 1329",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 13600,
+            "range": "± 769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 18776,
+            "range": "± 990",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 29387,
+            "range": "± 1502",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 8706554,
+            "range": "± 40881",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 14448795,
+            "range": "± 220121",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 1139560,
+            "range": "± 41922",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 2758438,
+            "range": "± 77176",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 134982270,
+            "range": "± 1804177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 4168997,
+            "range": "± 348124",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 21054894,
+            "range": "± 548177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 334712713,
+            "range": "± 2145439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 10652225,
+            "range": "± 630702",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 55525339,
+            "range": "± 1057908",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 6613,
+            "range": "± 145",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 184813,
+            "range": "± 3970",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 220207,
+            "range": "± 5233",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 14491,
+            "range": "± 336",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 242206,
+            "range": "± 9147",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 337683,
+            "range": "± 4596",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 49585,
+            "range": "± 437",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 319940,
+            "range": "± 3578",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 798007,
+            "range": "± 10462",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 70741,
+            "range": "± 1250",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 293048,
+            "range": "± 1153",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1637146,
+            "range": "± 8226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 1925331,
+            "range": "± 9290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 52,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 520705,
+            "range": "± 29590",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 469569,
+            "range": "± 37555",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 18661,
+            "range": "± 282",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 123669,
+            "range": "± 874",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 1125317,
+            "range": "± 17942",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 654,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 87,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 207,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 107,
+            "range": "± 2",
             "unit": "ns/iter"
           },
           {
