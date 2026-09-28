@@ -3055,6 +3055,15 @@ class Engine:
     def lookup_community_json(self, community_key_id: str) -> str | None:
         """(derived) empirical — #249 Cut A — fetch a single community by community_key_id. Returns JSON Community object or None (null). Structural mirror of [Self::lookup_family_..."""
 
+    def resolve_community_json(self, community_key_id: str) -> str | None:
+        """(derived) deontic — v50.0.0 (CIRISPersist#926) — CC 4.4.3.2.4 resolve_community: the folded founders (eligible only) and members, subkind, protocol and entrenchment; None when absent or a trust-root id holds a row that is not rooted."""
+
+    def trust_root_bundle_response_json(self) -> str:
+        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body: the compiled-in GenesisBundle with this node's rooted ciris-canonical row beside it (TrustRootBundleResponse JSON)."""
+
+    def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
+        """(derived) deontic — v50.0.0 (CIRISPersist#926) — pin ciris-canonical from ONE TrustRootBundleResponse: bundle quorum verified against this node's roster, records and row admitted through the ordinary doors. Returns PinnedTrust JSON."""
+
     def lookup_family_json(self, family_key_id: str) -> str | None:
         """(derived) empirical — v3.12.0 — fetch a single family by family_key_id. Returns JSON Family object or None (null)."""
 

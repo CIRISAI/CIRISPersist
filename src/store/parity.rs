@@ -213,6 +213,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (#931) — Plumbing: reads what is held under the offered id to
     // name the typed outcome; it refuses nothing about the caller's input.
     ("replicated_community_prior", Class::Plumbing),
+    // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
+    // row (the reserved `ciris-canonical` id, or one declaring
+    // `infrastructure_constraint`) whose shape, founders or chain fails — the
+    // one predicate on the local and the replicated community door.
+    ("check_trust_root_at_door", Class::Gate),
     ("check_consensus_protocol_form", Class::Gate),
     ("check_content_hash_hex", Class::Gate),
     ("check_delegated_duty_scores_admission", Class::Gate),

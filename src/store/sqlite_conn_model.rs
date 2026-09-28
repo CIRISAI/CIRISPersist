@@ -494,6 +494,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_public_key", ConnClass::Read),
     ("lookup_role_withdrawal", ConnClass::Read),
     ("lookup_shared_instance_lease", ConnClass::Read),
+    ("lookup_signed_community", ConnClass::Read),
     ("lookup_signed_record_by_content_hash", ConnClass::Read),
     ("lookup_trust", ConnClass::Read),
     ("mark_ack_received", ConnClass::Write),

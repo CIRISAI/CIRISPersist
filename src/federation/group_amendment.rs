@@ -209,6 +209,21 @@ where
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
         return Ok(OccupiedRoute::Insert);
     };
+    // v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — a trust-root row is
+    // applied by its CHAIN, not by the one-hop proof below: version by version
+    // from the one this node holds (or, over a squat that never passed the
+    // door, from the accord birth). The door already judged the whole chain.
+    if super::canonical_community::is_trust_root_grade(c)
+        || super::canonical_community::is_trust_root_grade(&stored)
+    {
+        return Ok(
+            if super::canonical_community::apply_trust_root_chain(dir, community).await? {
+                OccupiedRoute::Settled
+            } else {
+                OccupiedRoute::Insert
+            },
+        );
+    }
     let offer = Offer {
         cohort: Cohort::Community,
         kind: "community",
@@ -391,12 +406,16 @@ where
 
 /// The community / affiliations twin of [`supersede_family_signed`]; `cohort`
 /// picks the history discriminator (CC 4.4.3.2.8 / #308 — both share the
-/// `federation_communities` row).
+/// `federation_communities` row). `generic_quorum_skipped` is true when the
+/// caller skipped the folded-roster quorum because a trust root's chain held
+/// (the founders' link stands in for it); if the chain no longer holds here,
+/// the supersede is refused, never written unquorate.
 pub(crate) async fn supersede_community_signed<F>(
     dir: &F,
     cohort: Cohort,
     new: SignedCommunity,
     authorization: Option<serde_json::Value>,
+    generic_quorum_skipped: bool,
 ) -> Result<u32, Error>
 where
     F: FederationDirectory + ?Sized,
@@ -411,6 +430,11 @@ where
         &new.community,
     )
     .await?;
+    // v50.0.0 (CIRISPersist#926) — a trust-root row amends only as a verified
+    // founders' link of the held version, and is stored carrying its chain.
+    let new =
+        super::canonical_community::prepare_trust_root_supersede(dir, new, generic_quorum_skipped)
+            .await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",

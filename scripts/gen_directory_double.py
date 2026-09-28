@@ -77,6 +77,9 @@ DELEGATED_DEFAULTS = (
     # v50.0.0 (#916) — defaulted no-op, overridden by sqlite/postgres (the
     # receive doors' re-wrap); through the double it must reach the override.
     "rewrap_own_epochs_for_device",
+    # v50.0.0 (#926) — defaulted `Unsupported`, overridden by every backend;
+    # the trust-root reads re-derive the accord quorum from it.
+    "lookup_signed_community",
 )
 
 ROOT = Path(__file__).resolve().parent.parent

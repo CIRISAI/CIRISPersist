@@ -1268,3 +1268,83 @@ def test_would_hold_adopt_and_hold_breadth_846() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_ciris_canonical_trust_root_surface_926() -> None:
+    """v50.0.0 (CIRISPersist#926) — the trust-root surface is host-reachable.
+
+    A fresh engine (genesis seeded, no community row yet) resolves
+    ``ciris-canonical`` to nothing, serves the compiled-in bundle with
+    ``community: null``, and a consumer pin from that one response is refused
+    (nothing beside the bundle) rather than pinning a name that resolves to
+    nothing. A ``cosignatures`` list on ``put_community_json`` is decoded, and
+    a malformed one is refused, never read as "none".
+    """
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        assert eng.resolve_community_json("ciris-canonical") is None
+        resp = json.loads(eng.trust_root_bundle_response_json())
+        assert resp["charter_root_key_id"] == "humanity-accord"
+        assert resp["community"] is None
+        assert isinstance(resp["bundle"]["authorizations"], list)
+        with pytest.raises(ValueError, match="federation_invalid_argument"):
+            eng.pin_trust_from_bundle_response_json(json.dumps(resp))
+        now = "2026-06-25T00:00:00.000Z"
+        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+        base = {
+            "community_key_id": kid,
+            "community_name": "T",
+            "members": [{"key_id": kid, "joined_at": now, "role": "founder"}],
+            "founded_at": now,
+            "consensus_protocol": "majority",
+            "policy_blob": None,
+            "persist_row_hash": "",
+            "authority_key_id": kid,
+            "scrub_signature_classical": "AAAA",
+        }
+        with pytest.raises(ValueError, match="cosignatures decode"):
+            eng.put_community_json(json.dumps({**base, "cosignatures": "not-a-list"}))
+        # A well-formed list is decoded and reaches the door, which verifies it
+        # (here the authority signature itself is bogus, so the door refuses).
+        with pytest.raises(Exception):
+            eng.put_community_json(
+                json.dumps(
+                    {
+                        **base,
+                        "cosignatures": [
+                            {"authority_key_id": kid, "scrub_signature_classical": "AAAA"}
+                        ],
+                    }
+                )
+            )
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

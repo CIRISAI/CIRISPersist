@@ -9379,9 +9379,26 @@ where
         Err(Error::Unsupported { .. }) => {}
         Err(e) => return Err(e),
     }
+    // v50.0.0 (CIRISPersist#926) — CC 4.4's default pin names a COMMUNITY
+    // (`pinned_trust.community_key_id: ciris-canonical`), and its un-trust
+    // lever is the consumer's own `trust:accepts:v1` row to it (CC 3.2 T3). A
+    // trust-root-grade community is keyless like a family, and one is stored
+    // only through the accord-quorum door, so it is a subject this node knows.
+    // Any other community stays unnamed here: a room is not a root.
+    match directory.lookup_community(attested_key_id).await {
+        Ok(Some(c))
+            if super::canonical_community::is_trust_root_grade(&c)
+                && super::canonical_community::is_rooted(directory, attested_key_id).await? =>
+        {
+            return Ok(())
+        }
+        Ok(_) | Err(Error::Unsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
     Err(Error::InvalidArgument(format!(
         "attested_key_id {attested_key_id} resolves as neither a registered \
-         federation_keys row nor a constitutional family known to this node"
+         federation_keys row, a constitutional family, nor a trust-root community \
+         known to this node"
     )))
 }
 
@@ -11290,6 +11307,26 @@ pub async fn has_root_delegated_role(
     )
 }
 
+/// v50.0.0 (CIRISPersist#926) — the CONFERRAL half of
+/// [`has_accord_conferred_role_over_roster`] for `row` as given: it claims
+/// `role` and its scrub set still reaches the accord family's m-of-n. No
+/// withdrawal fold — the trust-root chain judges a withdrawal against the
+/// instant of the act it is counting, so it asks the two questions apart.
+pub(crate) async fn record_is_accord_conferred<F>(
+    directory: &F,
+    row: &super::KeyRecord,
+    role: &str,
+    roster_key_ids: &[String],
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    Ok(row.claims_role(role)
+        && verify_accord_family_coscrub(directory, row, roster_key_ids)
+            .await
+            .is_ok())
+}
+
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
 /// their own signable holders).
 // v30.3.0 (CIRISPersist#611) — `?Sized`-generic for the same reason
@@ -12129,6 +12166,23 @@ pub const INFRA_RULE_FOUNDER_NOT_CONFERRED: &str = "founder_not_conferred";
 /// v50.0.0 (merge prep for #926) — rule: a supersede changes the record's
 /// trust-root grade (subkind, basis or entrenchment).
 pub const INFRA_RULE_GRADE_CHANGED: &str = "grade_changed";
+/// v50.0.0 (CIRISPersist#926) — rule: a trust-root chain does not verify —
+/// it does not start at an accord birth, a link's proof does not name the
+/// version it follows or does not bind the version (roles, content hash,
+/// instant), its authority is not a counted founder, or the offered chain does
+/// not extend the version this node holds.
+pub const TRUST_ROOT_RULE_CHAIN: &str = "trust_root_chain";
+/// v50.0.0 (CIRISPersist#926) — rule: a trust-root chain is over its length cap.
+pub const TRUST_ROOT_RULE_LINEAGE_CAP: &str = "trust_root_lineage_cap";
+/// v50.0.0 (CIRISPersist#926, HIGH-3 ruling) — rule: a roster-plane row would
+/// move a founder seat of a trust-root community (seat, re-role, revoke other
+/// than the founder's own resignation). Founder seats move only through the
+/// record.
+pub const TRUST_ROOT_RULE_FOUNDER_SEAT_ON_PLANE: &str = "founder_seat_on_plane";
+/// v50.0.0 (CIRISPersist#926, review MEDIUM-R) — rule: a founder's resignation
+/// is not dated strictly after the stored head's instant (it would un-count a
+/// link the founder co-signed).
+pub const TRUST_ROOT_RULE_RESIGNATION_BACKDATED: &str = "resignation_backdated";
 
 /// v50.0.0 (CIRISPersist#927, review M1) — THE `infrastructure` quorum parser:
 /// `quorum:M/N` with `1 ≤ M ≤ N`, `N ≥ 1`, and `M ≥ 2` whenever `N ≥ 2` (CC
@@ -12256,6 +12310,14 @@ pub async fn check_infrastructure_founder_count_unchanged(
     if !is_infrastructure_labeled(community)
         || infrastructure_quorum(&community.consensus_protocol).is_none()
     {
+        return Ok(());
+    }
+    // v50.0.0 (CIRISPersist#926, merge) — ONE predicate for a trust-root row:
+    // its founder seats move only through the record, and a founder's own
+    // leave is a RESIGNATION, both decided by
+    // `canonical_community::check_trust_root_roster_change` (run by
+    // `check_community_roster_authority` on both roster doors). No second gate.
+    if super::canonical_community::is_trust_root_grade(community) {
         return Ok(());
     }
     // v49's consent floor (ruled 2026-09-27): a founder removing THEMSELVES
@@ -12416,6 +12478,15 @@ pub async fn check_community_membership_steward_binding(
     // infra community whose key is NOT substrate_persist falls through to
     // the strict steward-binding path below (SecReview F2, fail-secure).
     if is_authorized_infrastructure_community(directory, community).await? {
+        return Ok(());
+    }
+    // v50.0.0 (CIRISPersist#926, review HIGH-2) — a trust-root community the
+    // accord's quorum founded is an authorized infrastructure community too:
+    // a serve node joins it through the roster plane without a steward. Judged
+    // from the STORED row (rooted), never the probe's label.
+    if super::canonical_community::is_trust_root_grade(community)
+        && super::canonical_community::is_rooted(directory, &community.community_key_id).await?
+    {
         return Ok(());
     }
     for member in &community.members {

@@ -1737,9 +1737,11 @@ mod tests {
         // regression is catastrophic; an exact count makes registry growth a
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
+        // One number, stated once: the message reads it, so it cannot go stale.
+        const EXPECTED: usize = 97;
         assert_eq!(
-            checked, 91,
-            "checked {checked} version-pinned persist src/ rows, expected 91. \
+            checked, EXPECTED,
+            "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \
              If you ADDED evidence rows, update this number in the same commit. \
              If you did not, a parse change just silently emptied this test."
         );

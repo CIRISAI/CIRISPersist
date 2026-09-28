@@ -72,6 +72,8 @@ pub struct MemoryBackend {
     /// simply never ran here, on any write path, since v3.4.0. Same
     /// recurrence class as #541.
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
+    /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
+    trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
     /// v2.5.0 (CIRISPersist#102 Ask 4) — per-axis envelope-schema resolver.
     /// The default is [`crate::federation::NoOpSchemaResolver`], which makes
     /// the `put_attestation` validation hook a no-op (existing callers don't
@@ -435,6 +437,13 @@ struct State {
     /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the community twin of
     /// `federation_family_supersede_proofs`, keyed by `community_key_id`.
     federation_community_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
+    /// v50.0.0 (CIRISPersist#926, V158 mirror) — a community's co-signatures
+    /// over its signing envelope, keyed by `community_key_id`. Absent = none.
+    federation_community_cosignatures:
+        HashMap<String, Vec<crate::federation::types::RosterCosignature>>,
+    /// v50.0.0 (CIRISPersist#926, V158 mirror) — a trust-root community's
+    /// prior signed versions (its chain), keyed by `community_key_id`.
+    federation_community_lineages: HashMap<String, Vec<crate::federation::SignedCommunity>>,
     /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
     /// mirror, keyed like `federation_family_membership_revocations`.
     federation_family_membership_revocation_authority_sigs:
@@ -959,6 +968,8 @@ impl Default for MemoryBackend {
                 federation_community_authority_sigs: HashMap::new(),
                 federation_family_supersede_proofs: HashMap::new(),
                 federation_community_supersede_proofs: HashMap::new(),
+                federation_community_cosignatures: HashMap::new(),
+                federation_community_lineages: HashMap::new(),
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
                 federation_family_membership_widening_authority_sigs: HashMap::new(),
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
@@ -980,6 +991,7 @@ impl Default for MemoryBackend {
                 crate::federation::topology::DEFAULT_DELEGATION_DEPTH,
             ),
             admission_gate: std::sync::RwLock::new(None),
+            trust_root_standing_cache: Default::default(),
             schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::NoOpSchemaResolver,
             )),
@@ -1237,6 +1249,39 @@ impl MemoryBackend {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// v50.0.0 (CIRISPersist#926, test only) — store a signed community row
+    /// BELOW every admission gate: the memory twin of a raw `INSERT`, for the
+    /// witness that a pre-v50 row the trust-root door never judged is not
+    /// honoured. Never reachable outside `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn plant_community_below_the_door(
+        &self,
+        signed: crate::federation::SignedCommunity,
+    ) {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let mut row = signed.community;
+        row.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&row).expect("row hash");
+        let id = row.community_key_id.clone();
+        if let Some(p) = signed.supersede_proof {
+            state
+                .federation_community_supersede_proofs
+                .insert(id.clone(), p);
+        }
+        state.federation_community_authority_sigs.insert(
+            id.clone(),
+            (
+                signed.authority_key_id,
+                signed.scrub_signature_classical,
+                signed.scrub_signature_pqc,
+            ),
+        );
+        let admitted_at =
+            next_plane_position(&state, PLANE_COMMUNITY, community_rows(&state).into_iter());
+        state.federation_communities.insert(id.clone(), row);
+        stamp_plane_position(&mut state, PLANE_COMMUNITY, id, admitted_at);
     }
 
     /// v22.0.0 (CIRISPersist#543) — genesis-trusted seed of the
@@ -5952,6 +5997,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         supersede_proof,
+                        cosignatures,
+                        lineage,
                     } = serde_json::from_value(new_snapshot).map_err(|e| {
                         Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
                     })?;
@@ -6015,6 +6062,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         None => {
                             state.federation_community_supersede_proofs.remove(&key);
                         }
+                    }
+                    // v50.0.0 (#926) — the co-signatures travel with the
+                    // authority signature they sit beside.
+                    if cosignatures.is_empty() {
+                        state.federation_community_cosignatures.remove(&key);
+                    } else {
+                        state
+                            .federation_community_cosignatures
+                            .insert(key.clone(), cosignatures);
+                    }
+                    if lineage.is_empty() {
+                        state.federation_community_lineages.remove(&key);
+                    } else {
+                        state
+                            .federation_community_lineages
+                            .insert(key.clone(), lineage);
                     }
                     // v36.0.0 (#668/#707-class) — see the family arm.
                     let rows = community_rows(&state);
@@ -6145,6 +6208,50 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .put_community_at_door(community, crate::federation::CommunityDoor::ReplicatedApply)
             .await;
         crate::federation::group_amendment::replicated_community_outcome(prior, stored)
+    }
+
+    fn trust_root_standing_cache(
+        &self,
+    ) -> Option<&crate::federation::canonical_community::StandingCache> {
+        Some(&self.trust_root_standing_cache)
+    }
+
+    async fn lookup_signed_community(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Option<crate::federation::SignedCommunity>, crate::federation::Error> {
+        // v50.0.0 (CIRISPersist#926) — the point twin of the signed since-read.
+        let state = self.state.lock().expect("memory backend lock");
+        let Some(c) = state.federation_communities.get(community_key_id) else {
+            return Ok(None);
+        };
+        let Some((authority_key_id, scrub_signature_classical, scrub_signature_pqc)) = state
+            .federation_community_authority_sigs
+            .get(community_key_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(crate::federation::SignedCommunity {
+            community: c.clone(),
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            supersede_proof: state
+                .federation_community_supersede_proofs
+                .get(community_key_id)
+                .cloned(),
+            cosignatures: state
+                .federation_community_cosignatures
+                .get(community_key_id)
+                .cloned()
+                .unwrap_or_default(),
+            lineage: state
+                .federation_community_lineages
+                .get(community_key_id)
+                .cloned()
+                .unwrap_or_default(),
+        }))
     }
 
     async fn lookup_community(
@@ -8301,6 +8408,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             .federation_community_supersede_proofs
                             .get(&c.community_key_id)
                             .cloned(),
+                        cosignatures: state
+                            .federation_community_cosignatures
+                            .get(&c.community_key_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        lineage: state
+                            .federation_community_lineages
+                            .get(&c.community_key_id)
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                 })
             })
@@ -11202,6 +11319,18 @@ impl MemoryBackend {
         // other admission step (mirrors put_family). Hybrid-Strict vs the
         // authority's registered pubkeys.
         crate::federation::verify_community_admission(self, &community).await?;
+        // v50.0.0 (CIRISPersist#926) — the trust-root door, ONE predicate on
+        // both doors: the reserved `ciris-canonical` id and any
+        // `infrastructure_constraint` row are admitted only as a chain from an
+        // accord birth (caps, shape, founders, links). The replicated door may
+        // keep another id's non-conformant record as data (it reads NotRooted);
+        // the reserved id never. `true` = an authorized infrastructure room.
+        let trust_root = crate::federation::canonical_community::check_trust_root_at_door(
+            self,
+            &community,
+            door == crate::federation::CommunityDoor::ReplicatedApply,
+        )
+        .await?;
         let row = community.community;
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
@@ -11233,8 +11362,10 @@ impl MemoryBackend {
             crate::federation::admission::check_replicated_supersede_does_not_degrade(self, &row)
                 .await?;
         }
-        crate::federation::admission::check_community_membership_steward_binding(self, &row)
-            .await?;
+        if !trust_root {
+            crate::federation::admission::check_community_membership_steward_binding(self, &row)
+                .await?;
+        }
         // v49.0.0 (CIRISPersist#910.5) — an occupied id: an identical re-put
         // is a no-op, a proof-carrying amendment this node's own state
         // authorizes is applied as a supersede, anything else is refused (the
@@ -11246,6 +11377,8 @@ impl MemoryBackend {
             scrub_signature_classical: community.scrub_signature_classical,
             scrub_signature_pqc: community.scrub_signature_pqc,
             supersede_proof: community.supersede_proof,
+            cosignatures: community.cosignatures,
+            lineage: community.lineage,
         };
         if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
             == crate::federation::group_amendment::OccupiedRoute::Settled
@@ -11296,6 +11429,17 @@ impl MemoryBackend {
                 state
                     .federation_community_supersede_proofs
                     .insert(row.community_key_id.clone(), p);
+            }
+            // v50.0.0 (#926) — persisted beside the authority signature.
+            if !community.cosignatures.is_empty() {
+                state
+                    .federation_community_cosignatures
+                    .insert(row.community_key_id.clone(), community.cosignatures);
+            }
+            if !community.lineage.is_empty() {
+                state
+                    .federation_community_lineages
+                    .insert(row.community_key_id.clone(), community.lineage);
             }
             // v36.0.0 (#668) — serve position (V130 mirror).
             let admitted_at =
