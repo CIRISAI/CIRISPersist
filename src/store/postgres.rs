@@ -8485,15 +8485,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cosign: &crate::federation::lineage_witness::LineageHeadCosign,
     ) -> Result<bool, crate::federation::Error> {
         // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
-        let parse = |s: &str, what: &str| {
+        let parse_rfc3339_instant = |s: &str, what: &str| {
             chrono::DateTime::parse_from_rfc3339(s)
                 .map(|t| t.with_timezone(&chrono::Utc))
                 .map_err(|e| {
                     crate::federation::Error::InvalidArgument(format!("{what}: not RFC 3339: {e}"))
                 })
         };
-        let head_at = parse(&cosign.head_asserted_at, "head_asserted_at")?;
-        let signed_at = parse(&cosign.signed_at, "signed_at")?;
+        let head_at = parse_rfc3339_instant(&cosign.head_asserted_at, "head_asserted_at")?;
+        let signed_at = parse_rfc3339_instant(&cosign.signed_at, "signed_at")?;
+        let admitted_at = chrono::Utc::now();
         let client = self
             .get_client()
             .await
@@ -8502,8 +8503,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.federation_lineage_head_cosigns \
                  (lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
-                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc, \
+                  admitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
                 &[
                     &cosign.lineage_key_id,
                     &cosign.head_digest_sha256_hex,
@@ -8513,6 +8515,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &signed_at,
                     &cosign.signature_classical,
                     &cosign.signature_pqc,
+                    &admitted_at,
                 ],
             )
             .await

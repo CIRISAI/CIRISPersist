@@ -495,6 +495,9 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("lookup_role_withdrawal", ConnClass::Read),
     ("lookup_shared_instance_lease", ConnClass::Read),
     ("lookup_signed_community", ConnClass::Read),
+    // v51.0.0 (CIRISPersist#938) — the witness plane (V159).
+    ("list_lineage_head_cosigns_for", ConnClass::Read),
+    ("store_lineage_head_cosign", ConnClass::Write),
     ("lookup_signed_record_by_content_hash", ConnClass::Read),
     ("lookup_trust", ConnClass::Read),
     ("mark_ack_received", ConnClass::Write),

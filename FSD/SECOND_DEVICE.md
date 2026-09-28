@@ -1566,4 +1566,4 @@ The ruling that registers Edge's `capacity:relay_delivery` (CC 3.1.4 edge-owned,
 
 | # | Mutant | Verdict | Killed by |
 |---|---|---|---|
-| P1 | delegation_purpose unprotected | KILLED |  |
+| P1 | delegation_purpose unprotected (the protected list shortened to 7, entry removed) | KILLED (rc=100) | engine::tests::a_widening_never_strips_the_delegation_purpose_marker |

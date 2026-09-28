@@ -214,6 +214,14 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // witness arms inside a backend door (`store::test_hooks`); never armed
     // outside a test, and it judges nothing about the caller's input.
     ("fail_if_armed", Class::Plumbing),
+    // v51.0.0 (CIRISPersist#937) — Gate: refuses a `trust:accepts:v1` edge whose
+    // presented lineage head is absent, stale or unwitnessed under an armed
+    // charter (`trust_root_head_stale`).
+    ("check_attach_freshness", Class::Gate),
+    // v51.0.0 (#938) — Plumbing: the postgres cosign store re-parses the two
+    // RFC 3339 instants the DOOR already validated (`Malformed`) into
+    // TIMESTAMPTZ; it fails only on the substrate's own terms.
+    ("parse_rfc3339_instant", Class::Plumbing),
     // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` rival write a
     // witness arms at a fixed point of a community write
     // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
