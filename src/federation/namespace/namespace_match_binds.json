@@ -1,9 +1,9 @@
 {
  "_meta": {
-  "cc_commit": "c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f",
+  "cc_commit": "651140a2a553e2276bf5d80c77a32feaa9968f75",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
-  "vectors_sha256": "63dd444d530290160489ed4fd5c1f117f29b4b10b0456c2ddef11f67525ee291"
+  "vectors_sha256": "e5260d2b351aa171e92ea559edad381f5208b1a713ef38091c99cd5f5f391a6c"
  },
  "binds": [
   {
@@ -1176,6 +1176,44 @@
    "binds": {},
    "dimension": "capacity:integrity",
    "family": "capacity:integrity",
+   "refusal": "missing_version_segment"
+  },
+  {
+   "binds": {
+    "version": "v1"
+   },
+   "dimension": "capacity:relay_delivery:v1",
+   "family": "capacity:relay_delivery",
+   "refusal": null
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:relay_delivery:V1",
+   "family": "capacity:relay_delivery",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:relay_delivery:v1:v2",
+   "family": "capacity:relay_delivery",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:relay_delivery:v1beta",
+   "family": "capacity:relay_delivery",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "Capacity:relay_delivery:v1",
+   "family": "capacity:relay_delivery",
+   "refusal": "namespace_dimension_case_malformed"
+  },
+  {
+   "binds": {},
+   "dimension": "capacity:relay_delivery",
+   "family": "capacity:relay_delivery",
    "refusal": "missing_version_segment"
   },
   {

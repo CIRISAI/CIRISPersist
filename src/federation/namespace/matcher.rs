@@ -986,8 +986,8 @@ mod tests {
         let vs = vectors();
         assert_eq!(
             vs.len(),
-            962,
-            "the released rc5 vectors file (c60d0a6) carries 962 vectors"
+            968,
+            "the rc6 vectors file at 651140a (CIRISConstitution#129, capacity:relay_delivery) carries 968 vectors"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();

@@ -53,12 +53,28 @@ git tag -a "v$ver" "$merge_sha" --cleanup=verbatim -F "$tmp/tagbody.md" || exit 
 in_bytes=$(wc -c < "$tmp/tagbody.md"); out_bytes=$(git tag -l --format='%(contents)' "v$ver" | wc -c)
 echo "tag body bytes in=$in_bytes stored=$out_bytes headings=$(git tag -l --format='%(contents)' "v$ver" | grep -c '^#')"
 [ "$out_bytes" -ge "$in_bytes" ] || { echo "tag body LOST bytes"; exit 9; }
+# v51.0.0 (v50 lesson): the CI workflow's concurrency group is keyed on the SHA (#397). When the tag is
+# pushed while main's push run for the SAME sha is queued or running, the dedup CANCELS THE TAG RUN — the
+# only run that publishes the release. So: wait for main's run on the merge sha to complete before pushing
+# the tag, and if the tag run is still cancelled, re-run it rather than refuse.
+for i in $(seq 1 150); do
+  mst=$(gh run list --branch main --commit "$merge_sha" --workflow ci.yml --event push --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"' 2>/dev/null || echo none)
+  case "$mst" in completed/*|none) break;; esac; echo "main push run on $merge_sha: $mst — waiting before the tag push"; sleep 60
+done
 git push origin "v$ver" || exit 10; echo "tagged v$ver at $merge_sha"
 sleep 90
 st=none
 for i in $(seq 1 120); do
   st=$(gh run list --event push --branch "v$ver" --json status,conclusion,workflowName --jq '[.[] | select(.workflowName=="CI")] | .[0] | "\(.status)/\(.conclusion)"' 2>/dev/null || echo none)
-  echo "tag CI: $st"; case "$st" in completed/success) break;; completed/*) echo "TAG CI NOT GREEN: $st"; exit 11;; esac; sleep 60
+  echo "tag CI: $st"
+  case "$st" in
+    completed/success) break;;
+    completed/cancelled)
+      rid=$(gh run list --event push --branch "v$ver" --json databaseId,workflowName --jq '[.[] | select(.workflowName=="CI")] | .[0].databaseId' 2>/dev/null)
+      [ -n "$rid" ] && { echo "tag run $rid cancelled by the same-SHA dedup — re-running"; gh run rerun "$rid" >/dev/null 2>&1; sleep 90; continue; }
+      echo "TAG CI NOT GREEN: $st"; exit 11;;
+    completed/*) echo "TAG CI NOT GREEN: $st"; exit 11;;
+  esac; sleep 60
 done
 [ "$st" = "completed/success" ] || { echo "tag CI timeout"; exit 12; }
 for i in $(seq 1 30); do gh release view "v$ver" >/dev/null 2>&1 && break; sleep 10; done

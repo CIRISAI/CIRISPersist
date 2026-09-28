@@ -1983,5 +1983,22 @@ mod tests {
         assert!(match_family("accord:invoke:CONSTITUTIONAL:halt-001:v1")
             .refusal
             .is_some());
+        // v51.0.0 (CIRISConstitution#129 @ 651140a, CIRISEdge#706/#702) — Edge's
+        // relay-delivery score is an edge-owned reserved row under `capacity:`.
+        let m = match_family("capacity:relay_delivery:v1");
+        assert_eq!(m.family, Some("capacity:relay_delivery"), "{m:?}");
+        assert!(m.refusal.is_none(), "{:?}", m.refusal);
+        assert!(
+            match_family("capacity:relay_delivery:V1").refusal.is_some(),
+            "case"
+        );
+        assert!(
+            match_family("capacity:relay_delivery").refusal.is_some(),
+            "missing version"
+        );
+        assert!(
+            match_family("capacity:made_up:v1").refusal.is_some(),
+            "an unregistered capacity leaf"
+        );
     }
 }
