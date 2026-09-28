@@ -924,6 +924,7 @@ Plus the server route test on both paths.
 - Round 5, recovery and resignation (b97978ce): `pyo3,sqlite` 3464/3464; `postgres,sqlite` under `pg_test_db.sh` 3394/3394; `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2468 passed, 0 failed; `-D warnings` `--no-run` with `server` and with `test-anchor,sqlite` both exit 0. The Python wheel was not rebuilt: no pyo3 signature changed; the response gained an additive field.
 - Round 6, the rebase and the fold (991f8857 on `v50-926`; the commit after it changes only this FSD): `cargo nextest run -j 3 --features pyo3,sqlite --no-fail-fast` in two partitions, 1774 + 1767 = 3541/3541; `scripts/pg_test_db.sh -- cargo nextest run -j 3 --features postgres,sqlite --no-fail-fast` in two partitions, 1739 + 1732 = 3471/3471 (233 s and 286 s: a database was present); `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2520 passed, 0 failed, 1 ignored; `RUSTFLAGS="-D warnings" cargo check --features server` exit 0; `python3 scripts/pyi_surface.py check` exit 0; `python3 scripts/gen_directory_double.py --check` current (105 delegations). The Python wheel was not rebuilt: no pyo3 signature changed in the fold.
 - Round 7, R2 and the TOCTOU (a5912f40; the commit after it changes only this FSD): `pyo3,sqlite` in two partitions, 1777 + 1770 = 3547/3547; `postgres,sqlite` under `pg_test_db.sh` in two partitions, 1742 + 1735 = 3477/3477 (238 s and 243 s: a database was present); `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2524 passed, 0 failed, 1 ignored.
+- Round 8, the strict floor and the cache key (e873a01c; the commit after it changes only this FSD): `pyo3,sqlite` in two partitions, 1778 + 1772 = 3550/3550; `postgres,sqlite` under `pg_test_db.sh` in two partitions, 1743 + 1737 = 3480/3480 (243 s and 241 s: a database was present); `cargo test -q --features postgres,pyo3,server --lib` under `pg_test_db.sh` 2526 passed, 0 failed, 1 ignored.
 
 **Mutation table, round 1 (#926).** The round ran on 34fe6df5, with M12 re-run on dc2fa151.
 - **Lane:** `test(i190) | test(canonical) | test(genesis) | test(bundle) | test(trust_root) | test(conferral)`, `--features sqlite,postgres`, under `scripts/pg_test_db.sh`.
@@ -1208,4 +1209,13 @@ Plus the server route test on both paths.
 
 - **B2's meaning changed.** Before R2 it was the only thing a lapse turned on, and its floor was what made the lapse possible. After R2 no admitted version carries a founder past their resignation, so B2 now guards only the re-seat. A re-seated founder's older resignation must not un-count a later link they co-sign. (o) is the arm that measures that.
 - **Superseded by round 8:** this round's "not witnessed" note on keeping every resignation. (o‴) now witnesses it, and building (o‴) found that the standing cache key omitted the resignations.
+
+**Mutation round 8 (re-check B, and every resignation).** The round ran on e873a01c, on the same lane as round 6 (359 tests; the full lanes above are its baseline). Each mutant was reverted before the next; there were no OOM kills, and every run had a database. All 4 were killed.
+
+| # | Mutant | Failed | Killed by (I190 arm) |
+|---|---|---|---|
+| E1 | B: the plane floor at equality (`<=` reverted to `<`) | 3 | (o′) equality arm |
+| B1 | MEDIUM-R (a): the plane's past floor dropped (re-anchored on `<=`) | 3 | (o′) |
+| E2 | only the earliest resignation kept | 3 | (o‴) |
+| E3 | the standing cache key omits the resignations | 3 | (o‴) |
 
