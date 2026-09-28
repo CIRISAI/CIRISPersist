@@ -1646,19 +1646,16 @@ where
     let mut memo = Memo::at(now);
     let standing = stored_standing_at(directory, &community.community_key_id, now).await?;
     if let Some(held) = standing.held() {
-        let held_hash = row_hash(&held.community)?;
-        if row_hash(community)? == held_hash {
-            return Ok(true);
-        }
-        match extends_at(&chain, &held_hash)? {
-            Some(pos) => {
+        match extends(held, &chain)? {
+            Extends::Same => return Ok(true),
+            Extends::From(pos) => {
                 let (walk, at) = walk_from_held(held, &chain, pos);
                 verify_links_from(directory, &walk, at, &mut memo).await?;
             }
-            None if is_rebirth_over_stalled(&standing, &chain) => {
+            Extends::No if is_rebirth_over_stalled(&standing, &chain) => {
                 verify_chain_memo(directory, &chain, &mut memo).await?
             }
-            None => return Err(does_not_extend(&community.community_key_id)),
+            Extends::No => return Err(does_not_extend(&community.community_key_id)),
         }
     } else {
         verify_chain_memo(directory, &chain, &mut memo).await?;
@@ -1720,13 +1717,60 @@ where
     }
 }
 
-fn extends_at(chain: &[SignedCommunity], held_hash: &str) -> Result<Option<usize>, Error> {
-    for (i, v) in chain.iter().enumerate() {
-        if row_hash(&v.community)? == held_hash {
-            return Ok(Some(i));
+/// How an offered chain relates to the version this node holds.
+enum Extends {
+    /// Nothing new: the offered chain IS the held chain, or its head has the
+    /// held content (#758's no-op; a stale or equivocating copy of the held
+    /// content never replaces it).
+    Same,
+    /// The offered chain extends the held version, which sits at this index.
+    From(usize),
+    /// Neither.
+    No,
+}
+
+/// One version of a chain, as a node-independent identity: its content hash,
+/// its authority and its founders' proof (`None` for a birth). The same
+/// content reached by two different links (a re-seat back to an earlier
+/// roster, or equivocation) is two different versions.
+fn same_version(a: &SignedCommunity, b: &SignedCommunity) -> Result<bool, Error> {
+    Ok(row_hash(&a.community)? == row_hash(&b.community)?
+        && a.authority_key_id == b.authority_key_id
+        && serde_json::to_value(&a.supersede_proof).ok()
+            == serde_json::to_value(&b.supersede_proof).ok())
+}
+
+/// Does `chain` extend `held` (#926 round 10)? The held version is located by
+/// POSITION, not by content: its index is `held.lineage.len()`, and the
+/// offered chain up to and including that index must be the held chain,
+/// version for version (`same_version`). Content alone repeats: a re-seat
+/// back to the birth roster reproduces the birth's content, so a
+/// first-occurrence match replayed old links after the held head, and a
+/// last-occurrence match skipped the links that re-seated a founder.
+fn extends(held: &SignedCommunity, chain: &[SignedCommunity]) -> Result<Extends, Error> {
+    let held_chain = chain_of(held);
+    let at = held_chain.len() - 1;
+    let mut prefix_matches = chain.len() > at;
+    if prefix_matches {
+        for (h, o) in held_chain.iter().zip(chain) {
+            if !same_version(h, o)? {
+                prefix_matches = false;
+                break;
+            }
         }
     }
-    Ok(None)
+    if prefix_matches {
+        return Ok(if chain.len() - 1 == at {
+            Extends::Same
+        } else {
+            Extends::From(at)
+        });
+    }
+    let offered_head = chain.last().map(|v| row_hash(&v.community)).transpose()?;
+    if offered_head.as_deref() == Some(row_hash(&held.community)?.as_str()) {
+        return Ok(Extends::Same);
+    }
+    Ok(Extends::No)
 }
 
 fn does_not_extend(id: &str) -> Error {
@@ -1771,22 +1815,20 @@ where
         (StoredStanding::Absent, _) => return Ok(false),
         (_, Some(held)) => {
             let held_hash = row_hash(&held.community)?;
-            if row_hash(&offered.community)? == held_hash {
-                return Ok(true);
-            }
-            match extends_at(&chain, &held_hash)? {
-                Some(pos) => {
+            match extends(held, &chain)? {
+                Extends::Same => return Ok(true),
+                Extends::From(pos) => {
                     // Walk, and store, from the chain this node holds.
                     let (walk, at) = walk_from_held(held, &chain, pos);
                     verify_links_from(directory, &walk, at, &mut memo).await?;
                     chain = walk;
                     (at + 1, None)
                 }
-                None if is_rebirth_over_stalled(&standing, &chain) => {
+                Extends::No if is_rebirth_over_stalled(&standing, &chain) => {
                     verify_chain_memo(directory, &chain, &mut memo).await?;
                     (0, Some(("accord_rebirth_replaces_stalled", held_hash)))
                 }
-                None => return Err(does_not_extend(id)),
+                Extends::No => return Err(does_not_extend(id)),
             }
         }
         (_, None) => {

@@ -1765,16 +1765,15 @@ pub(crate) mod bodies {
         offered
     }
 
-    /// (y) — round 9: a node walking from a version it HOLDS reads each
-    /// founder's `seated_since` from the chain it holds, never from the
-    /// offered lineage before that version. `a` holds v1 → v3 (v3 still
-    /// records F2, who resigned after v1: Stalled). The founders also signed
-    /// another path to the SAME content: v1 → v2b (F2 out) → v3′ (F2 back,
-    /// content equal to v3), which would date F2's seat after the
-    /// resignation. v4, signed by F2 and F0 over that path, is refused: on
-    /// the chain `a` holds, F2 has been seated since the birth and counts as
-    /// nothing. The same v4 signed by F0 and F1 is admitted and stored on the
-    /// chain `a` holds.
+    /// (y) — rounds 9 and 10: an offered lineage cannot re-date a founder's
+    /// seat. `a` holds v1 → v3 (v3 still records F2, who resigned after v1:
+    /// Stalled). The founders also signed another path to the SAME content:
+    /// v1 → v2b (F2 out) → v3′ (F2 back, content equal to v3), which would
+    /// date F2's seat after the resignation. A v4 over that path does not
+    /// extend the version `a` holds (the held version is matched by position
+    /// and proof, not by content), whoever signs it. Over the chain `a` holds,
+    /// v4 by F2 and F0 falls short (F2 has been seated since the birth), and
+    /// v4 by F0 and F1 is admitted and stored on that chain.
     pub async fn y_an_offered_prefix_cannot_reseat(d: &dyn FederationDirectory) {
         let holders = stand_up(d).await;
         put_conferred(d, &holders, "ys-steward", "user,steward").await;
@@ -1832,10 +1831,26 @@ pub(crate) mod bodies {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let v4_body = with_member(v3_body, "ys2-serve-node", "member");
         let forged_prefix = vec![v1.clone(), v2b.clone(), v3b.clone()];
+        for signers in [[FOUNDERS[2], FOUNDERS[0]], [FOUNDERS[0], FOUNDERS[1]]] {
+            let over_forged = link_by_hand(
+                d,
+                &v3b,
+                forged_prefix.clone(),
+                v4_body.clone(),
+                &signers,
+                FOUNDERS[0],
+            )
+            .await;
+            let e = d
+                .put_community(over_forged)
+                .await
+                .expect_err("another path to the held content does not extend the held version");
+            assert_violation(&e, "does not extend");
+        }
         let by_f2 = link_by_hand(
             d,
-            &v3b,
-            forged_prefix.clone(),
+            &held,
+            cc::chain_of(&held),
             v4_body.clone(),
             &[FOUNDERS[2], FOUNDERS[0]],
             FOUNDERS[0],
@@ -1844,15 +1859,15 @@ pub(crate) mod bodies {
         let e = d
             .put_community(by_f2)
             .await
-            .expect_err("the offered prefix cannot move F2's seat past the resignation");
+            .expect_err("on the held chain F2 has been seated since the birth");
         assert!(
             matches!(e, Error::RosterAuthorityUnauthorized { .. }),
             "{e:?}"
         );
         let by_others = link_by_hand(
             d,
-            &v3b,
-            forged_prefix,
+            &held,
+            cc::chain_of(&held),
             v4_body,
             &[FOUNDERS[0], FOUNDERS[1]],
             FOUNDERS[0],
@@ -1877,6 +1892,115 @@ pub(crate) mod bodies {
                 .collect::<Vec<_>>(),
             "v4 is stored on the chain this node holds"
         );
+    }
+
+    /// (z) — round 10: a re-seat back to the birth roster REPEATS content, so
+    /// the held version is matched by its position and proof, never by
+    /// content. On `b`: F2 resigns after the birth X; v2 retires F2 (Y); v3
+    /// re-seats F2, content X again; v4 is signed by F2 and F0 (F2 counts:
+    /// re-seated after the resignation). Every node holds F2's resignation.
+    /// Arm 1: replica `c` receives v2, then v3 (the LAST occurrence of X),
+    /// then v4, and MUST admit it (a first-occurrence match replayed v2 and v3
+    /// after v3). Arm 2: `a` holds the birth (the FIRST occurrence of X), is
+    /// never shown v2 or v3, and MUST admit v4 by walking every link (a
+    /// last-occurrence match skipped the re-seat and read F2 as seated since
+    /// the birth). All three end Rooted on v4.
+    pub async fn z_repeated_content_is_matched_by_position(
+        b: &dyn FederationDirectory,
+        a: &dyn FederationDirectory,
+        c: &dyn FederationDirectory,
+    ) {
+        for d in [b, a, c] {
+            let holders = stand_up(d).await;
+            put_conferred(d, &holders, "zs-steward", "user,steward").await;
+            ts::register_hybrid_key_as(d, "zs-serve-node", "zs-serve-node", identity_type::NODE)
+                .await;
+            d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+                .await
+                .unwrap();
+        }
+        let birth_hash = cc::lookup_signed_community(b, CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .community
+            .persist_row_hash;
+        let t_r = chrono::Utc::now();
+        for d in [b, a, c] {
+            d.put_community_membership_revocation(founder_revocation_at(
+                &[FOUNDERS[2]],
+                FOUNDERS[2],
+                t_r,
+            ))
+            .await
+            .expect("F2 resigns after the birth, on every node");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            b,
+            swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "zs-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("b: v2 retires F2");
+        let v2 = cc::lookup_signed_community(b, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        c.put_community(v2).await.expect("c: v2");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(b, canonical_row(&FOUNDERS), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("b: v3 re-seats F2");
+        let v3 = cc::lookup_signed_community(b, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v3.community.persist_row_hash, birth_hash,
+            "the re-seat reproduces the birth's content"
+        );
+        c.put_community(v3).await.expect("c: v3");
+        assert_eq!(
+            cc::lookup_signed_community(c, CANON)
+                .await
+                .unwrap()
+                .unwrap()
+                .lineage
+                .len(),
+            2,
+            "c holds the re-seated head, the last occurrence of the birth's content"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            b,
+            with_member(canonical_row(&FOUNDERS), "zs-serve-node", "member"),
+            &[FOUNDERS[2], FOUNDERS[0]],
+        )
+        .await
+        .expect("b: v4 by F2 and F0, F2 re-seated after the resignation");
+        let v4 = cc::lookup_signed_community(b, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        c.put_community(v4.clone())
+            .await
+            .expect("arm 1: a replica holding the re-seated head admits the next link");
+        a.put_community(v4.clone())
+            .await
+            .expect("arm 2: a node holding the first occurrence walks every link");
+        for d in [b, a, c] {
+            match cc::stored_standing(d, CANON).await.unwrap() {
+                cc::StoredStanding::Rooted(held) => {
+                    assert_eq!(
+                        held.community.persist_row_hash,
+                        v4.community.persist_row_hash
+                    );
+                    assert_eq!(held.lineage.len(), 3, "the whole chain is stored");
+                }
+                other => panic!("every node converges Rooted on v4: {other:?}"),
+            }
+        }
     }
 
     /// Review TOCTOU: `supersede_community_with_quorum` skips the generic
@@ -3076,6 +3200,19 @@ mod run {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::y_an_offered_prefix_cannot_reseat(
                         &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i190_z() {
+                    let (Some(b), Some(a), Some(c)) = ($fresh.await, $fresh.await, $fresh.await)
+                    else {
+                        return;
+                    };
+                    super::super::bodies::z_repeated_content_is_matched_by_position(
+                        &b as &dyn FederationDirectory,
+                        &a as &dyn FederationDirectory,
+                        &c as &dyn FederationDirectory,
                     )
                     .await
                 }
