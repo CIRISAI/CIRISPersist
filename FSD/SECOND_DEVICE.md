@@ -694,6 +694,46 @@ Lane: round 4's, plus `test(withdraws_depth) | test(withdraws_admission_depth_op
 
 The id-collision repair path for a `withdraws` is reachable only when the structural-composer dedup does not match first. For an identical re-put, the dedup always matches first, so a mutant of that second repair would be equivalent. It is kept as a belt, and not claimed as witnessed.
 
+### 8.12 PR review (Codex) fixes — F2, F3, F4
+
+Codex reviewed PR #921 at 6a81b01b. F1 is recorded in §9. Every witness below was RED on 6a81b01b before its fix, on memory, sqlite and postgres.
+
+**F2 (P1) — a transient read failure is never "legacy".** The replicated door's `check_replicated_supersede_does_not_degrade` re-judges the STORED infrastructure row to decide whether it is legacy. It took ANY error from that re-judgement as "already non-conformant" and let the offered row through, so a failed node-bearing or roster read let a degrading supersede of a conformant room in. Now only the typed `CommunityConsensusProtocolViolation` is legacy; the conformance check returns it for each of its rules (no founder, protocol not `quorum:M/N`, `N` not the founder count, a node-bearing founder). Any other error propagates. An audit of the #925/#927/#931 gates (`check_infrastructure_*`, the `is_node_bearing_key_at` callers, `community_node_bearing_seats`, `node_bearing_of`, `occurrence_agreed_to`, the three backends' door call sites) found no other swallowed directory read.
+
+- (f2_a, the gate) Through the fault double with the occurrence read failing, the gate returns the read error, never the legacy pass. A room non-conformant by its protocol is decided before any read and stays legacy.
+- (f2_b, the door) The occurrence read fails ONCE, inside the door, and succeeds after. A persistent fault cannot witness this, because the later quorum fold rereads the same plane and fails too. `apply_replicated_community` returns the error, not `Superseded`, and the stored row is unchanged. Offered again, it is refused `degrades_conformance`.
+
+**F3 (P2) — the outcome is what the write did.** `apply_replicated_community` read the id, then wrote; a concurrent apply of the same record between the two made the write an idempotent no-op while the outcome still said `Inserted` or `Superseded`. The pre-read (`replicated_community_prior`) is gone. `put_community_at_door` returns `CommunityWrite` (`Inserted` / `Unchanged` / `Superseded`), decided under the write's own serialization:
+
+- memory: the state lock around the insert;
+- sqlite: `INSERT OR IGNORE` and the re-read in one writer closure;
+- postgres: the `INSERT … ON CONFLICT DO NOTHING` row count;
+- a supersede: its prior-hash check under the backend's lock.
+
+A supersede that loses its race fails that check stale; if the row now held IS the offered version, the outcome is `Unchanged`, and a Conflict over any other row stays a refusal. The trust-root route reports versions written (`apply_trust_root_chain_counted`).
+
+- (f3_a) A test hook inside each backend (`store::test_hooks`, `cfg(test)`) applies a rival copy of the same record at a named point: the door's first line, after the route said "insert", and at a community supersede's first line. Each time, the outcome is `Unchanged`.
+- (f3_b) Two applies of one record, joined: `{Inserted, Unchanged}`, then `{Superseded, Unchanged}`. The join interleaves on sqlite and postgres, and was RED there on 6a81b01b. Memory futures never yield, so on memory it passes on either code, and f3_a pins the interleaving everywhere.
+
+One residual: a trust-root chain whose apply writes some versions and then loses its race on a later one reports `Unchanged` when the offered version ends up held, not `Superseded`.
+
+**F4 (P2) — a zero cap reports what it cut.** `build_delegation_graph(.., Some(0))` skipped the root before looking at its edges, so a root WITH delegations reported `WithinCap`. The cap probe (§8.3) is extracted (`delegates_onward`) and, under a zero cap, asked of the root: a root that delegates is `BeyondCapSelfVerify` with no edges. The scoped walk had the same early return, so the withdraws gate at depth 0 now refuses with `beyond_delegation_depth_cap: true`. `set_withdraws_delegation_depth(0)` reaches it. `reachable_under_scope_with_reasons` at 0 is now `BeyondDepthCap` when the issuer delegates the scope onward, and `SignerUnreached` when it does not. 0 is not rejected; the capsule op passes it through.
+
+- (f4_a) Graph, moderation classifier and withdraws gate at depth 0, with and without a delegating root. The capsule op `BuildDelegationGraph { max_depth: 0 }` is witnessed on memory.
+
+**Mutation table.** Lane and discipline as in §9.1. The baseline was 368/368 at f4443a0b. The final tree's lane has 374 tests, all passing in M4d's run.
+
+| # | Mutant | Failed | Killed by |
+|---|---|---|---|
+| M2 | `.is_err()` restored (any error from the stored re-judgement is legacy) | 6 | f2_a ×3, f2_b ×3 |
+| M3a | the outcome derived from a pre-read again (all three backends) | 5 | f3_a ×3; f3_b sqlite, postgres |
+| M3b | a lost supersede race refused as a Conflict | 5 | f3_a ×3 (BeforeSupersede); f3_b sqlite, postgres |
+| M3c | the insert arm's lost race reported `Inserted` | 4 | f3_a ×3 (BeforeInsert); f3_b sqlite. Survived before the inner rival points existed. |
+| M4a | the graph's root probe dropped | 4 | f4_a ×3; the capsule op |
+| M4b | the scoped walk's root probe dropped | 3 | f4_a ×3 |
+| M4c | the classifier at 0 always `SignerUnreached` | 3 | f4_a ×3 |
+| M4d | the root-epoch filter in the zero-cap probe dropped | 0 | equivalent by trace: the only lens with a root epoch is built at `MAX_MODERATION_DELEGATION_DEPTH` (5), never 0; kept for a future caller |
+
 ## 9. #926 — the ciris-canonical community row (ruling b)
 
 **The ruling (operator, 2026-09-27): (b).** The `ciris-canonical` community row is a post-genesis `community` Contribution. It is signed 2-of-3 by the accord holders, admitted under the accord's quorum, and served beside the bundle on the CC 5.3.4 route. The pinned GenesisBundle is untouched: its bytes, `authorization_digest` and `verify_bundle_quorum` do not change, and `verify_bundle_quorum` stays the only root authority. The community row adds a roster, not a second root.
@@ -1304,6 +1344,28 @@ Plus the server route test on both paths.
 | H1b, sub-arm (b) alone | the same, with (z′)'s first sub-arm skipped (a test edit, to measure the second on its own) | 3 | (z′) sub-arm (b): "v2's authority signature: the row stays Rooted on its next re-judgement" |
 
 - Round 11 changed no code. The full lanes run on the merged release SHA. This round ran only the I190 and mutation lane (380/380 on memory, sqlite and postgres).
+### 9.1 PR review (Codex) fix — F1: a failed read is never a cache hit
+
+**Finding (P1).** `standing_cache_key` read the accord family's record and roster plane with `.ok().flatten()` and `unwrap_or_default()`. A backend failure on any of those four reads keyed exactly as a genuinely empty plane does. A Rooted verdict cached over an empty plane was then served while the revocation state could not be read, and the verdict path's own error propagation never ran.
+
+**Fix.** Every read in the key builder propagates its failure: no key, no lookup, nothing cached, and the caller gets the error. `Unsupported` is a structural answer (the directory cannot be asked), so it keys as its own marker, never equal to any answer. `family_roster_signers` is asked only when the family read returned a family, since it names an unknown family `InvalidArgument`. The remaining `unwrap_or_default` calls in the function are serialization, and its remaining `Unsupported` mappings mirror what the verdict path itself does for the same read.
+
+**Witnesses (I190 f1, every backend).** The fault double now hands out the inner backend's standing cache (generator `DELEGATED_DEFAULTS`), so a verdict read through the double meets the cache while every key input still goes through the double's fault table.
+
+- (f1_a) The canonical row is Rooted over an empty family plane and cached; a clean double hits the cache. With each of the four family reads failing, the read returns the error, and nothing is computed or served.
+- (f1_b) With no accord family stored, the planted row reads NotRooted and is cached. With `lookup_family` failing, the read returns the error, not the cached NotRooted.
+- (f1_c) A shape-refused squat is judged NotRooted before any family fold, so it is cached while the widenings read answers `Unsupported`. With the same read failing, the read returns the error, not that cached verdict.
+
+**Mutants.** Lane: the brief's (`i190 | canonical | rc5 | infrastructure | replicated_community | delegation | topology | depth`) under `scripts/pg_test_db.sh`, every run with a database, none OOM-killed, each reverted with `git checkout --`.
+
+| # | Mutant | Failed | Killed by |
+|---|---|---|---|
+| M1a | the widenings read swallowed (`unwrap_or_default`) | 3 | (f1_a) ×3 |
+| M1b | the revocations read swallowed | 3 | (f1_a) ×3 |
+| M1c | the family read swallowed (`.ok().flatten()`, the line as shipped at 6a81b01b) | 3 | (f1_b) ×3. Survived (f1_a) alone: with the family present, the failed read keys differently and the verdict's own read errors. |
+| M1d | the roster-signers read swallowed | 3 | (f1_a) ×3: the seeded family's genuine signers answer equals the empty default |
+| M1e | every error keyed as the `Unsupported` marker | 3 | (f1_c) ×3. Survived (f1_a) and (f1_b): the marker misses an answered key. |
+
 ## 10. #924 — the dimension grammar is manifest data (CC 1.0-rc5, released at c60d0a6)
 
 **Why in this cut.** CIRISConstitution#112 (operator decision 2026-09-26) makes parsing and casing one rule across CC and every consumer, carried as data in the registry, and rides the wire break on the domain-label version. Persist ran four dimension matchers that disagreed with CC and with each other; v50.0.0 is the MAJOR that can absorb it.
