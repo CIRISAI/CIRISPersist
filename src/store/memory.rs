@@ -5743,7 +5743,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
         #[cfg(test)]
         self.test_hooks
-            .check("list_identity_occurrences_by_occurrence_key")?;
+            .fail_if_armed("list_identity_occurrences_by_occurrence_key")?;
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state
             .federation_identity_occurrences
@@ -5788,8 +5788,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // is a no-op, a proof-carrying amendment this node's own state
         // authorizes is applied as a supersede, anything else is refused.
         // (Memory used to OVERWRITE here — `put_family_local` is a map insert.)
-        if crate::federation::group_amendment::route_occupied_family(self, &family).await?
-            == crate::federation::group_amendment::OccupiedRoute::Settled
+        if let crate::federation::group_amendment::OccupiedRoute::Settled(_) =
+            crate::federation::group_amendment::route_occupied_family(self, &family).await?
         {
             return Ok(());
         }
@@ -6221,13 +6221,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<crate::federation::ReplicatedCommunityOutcome, crate::federation::Error> {
-        let prior =
-            crate::federation::group_amendment::replicated_community_prior(self, &community)
-                .await?;
+        // PR #921 review (Codex F3) — the outcome is what the write did, as
+        // the write saw it; no read taken before it.
         let stored = self
             .put_community_at_door(community, crate::federation::CommunityDoor::ReplicatedApply)
             .await;
-        crate::federation::group_amendment::replicated_community_outcome(prior, stored)
+        crate::federation::group_amendment::replicated_community_outcome(stored)
     }
 
     fn trust_root_standing_cache(
@@ -11334,7 +11333,7 @@ impl MemoryBackend {
         &self,
         community: crate::federation::SignedCommunity,
         door: crate::federation::CommunityDoor,
-    ) -> Result<(), crate::federation::Error> {
+    ) -> Result<crate::federation::group_amendment::CommunityWrite, crate::federation::Error> {
         // Test-only (PR #921 review, F3): a rival write that won the race
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
@@ -11413,10 +11412,10 @@ impl MemoryBackend {
             cosignatures: community.cosignatures,
             lineage: community.lineage,
         };
-        if crate::federation::group_amendment::route_occupied_community(self, &offered).await?
-            == crate::federation::group_amendment::OccupiedRoute::Settled
+        if let crate::federation::group_amendment::OccupiedRoute::Settled(written) =
+            crate::federation::group_amendment::route_occupied_community(self, &offered).await?
         {
-            return Ok(());
+            return Ok(written);
         }
         let community = offered;
         let mut row = community.community;
@@ -11437,7 +11436,9 @@ impl MemoryBackend {
                 let offered = row.persist_row_hash.clone();
                 let id = row.community_key_id.clone();
                 drop(state);
-                return crate::federation::community_reput_verdict(&stored, &offered, &id);
+                return crate::federation::group_amendment::community_insert_lost_to(
+                    &stored, &offered, &id,
+                );
             }
             // v21.1.0 (CIRISPersist#507b) — computed before the moves below
             // consume `row.clone()` / `community.*`.
@@ -11486,7 +11487,7 @@ impl MemoryBackend {
         };
         self.index_stored_record("Community", &wire_index_key)
             .await?;
-        Ok(())
+        Ok(crate::federation::group_amendment::CommunityWrite::Inserted)
     }
 }
 

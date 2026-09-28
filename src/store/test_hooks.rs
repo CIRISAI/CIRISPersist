@@ -36,7 +36,10 @@ impl TestHooks {
     }
 
     /// Called by the backend at the top of `method`: `Err` while armed.
-    pub(crate) fn check(&self, method: &'static str) -> Result<(), crate::federation::Error> {
+    pub(crate) fn fail_if_armed(
+        &self,
+        method: &'static str,
+    ) -> Result<(), crate::federation::Error> {
         let mut fail = self.fail.lock().expect("test hooks");
         match fail.get_mut(method) {
             Some(n) if *n > 0 => {

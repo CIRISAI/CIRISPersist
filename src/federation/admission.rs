@@ -6958,6 +6958,26 @@ async fn scoped_delegation_reach(
     .await
 }
 
+/// The scoped walk's cap probe (CIRISPersist#928; PR #921 review F4): does
+/// `key`, standing AT the depth cap, emit a `delegates_to` carrying
+/// `scope_token` that `lens` admits — a chain longer than the walk may follow?
+/// `is_root`: `key` is the walk's issuer (a zero cap), so its edges also pass
+/// the lens's root-epoch filter, as its first hops always do.
+async fn scoped_delegates_onward(
+    directory: &dyn super::FederationDirectory,
+    key: &str,
+    scope_token: &str,
+    lens: &DelegationWalkLens<'_>,
+    is_root: bool,
+) -> Result<bool, Error> {
+    Ok(directory.list_attestations_by(key).await?.iter().any(|n| {
+        n.attestation_type == attestation_type::DELEGATES_TO
+            && lens.admits_edge(n)
+            && (!is_root || lens.admits_root_edge(n))
+            && delegation_scope_grants(&n.attestation_envelope, scope_token)
+    }))
+}
+
 /// v49.0.0 (#908) — a half-open `[start, end)` span during which a key held
 /// authority in a group (`end: None` = still holds it).
 pub(crate) type AuthorityInterval = (
@@ -7068,6 +7088,13 @@ async fn scoped_delegation_reach_at(
     let mut out = ScopedReach::default();
     let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
     if effective_depth == 0 {
+        // PR #921 review (Codex F4) — a zero cap puts the ROOT at the cap: the
+        // walk follows nothing, and an issuer that delegates the scope onward
+        // (a first-hop edge this lens admits) is a chain past the cap — "too
+        // deep", never "nothing there". The same probe as a recipient at the
+        // cap, plus the root's epoch filter its own first hops always carry.
+        out.beyond_cap =
+            scoped_delegates_onward(directory, issuer, scope_token, &lens, true).await?;
         return Ok(out);
     }
     // Per-node walk state. `parent_scope` is the scope-set of the edge that
@@ -7230,15 +7257,8 @@ async fn scoped_delegation_reach_at(
             if !out.beyond_cap
                 && node.depth + 1 == effective_depth
                 && !visited.contains(&r.attested_key_id)
-                && directory
-                    .list_attestations_by(&r.attested_key_id)
+                && scoped_delegates_onward(directory, &r.attested_key_id, scope_token, &lens, false)
                     .await?
-                    .iter()
-                    .any(|n| {
-                        n.attestation_type == attestation_type::DELEGATES_TO
-                            && lens.admits_edge(n)
-                            && delegation_scope_grants(&n.attestation_envelope, scope_token)
-                    })
             {
                 // v50.0.0 (CIRISPersist#928) — a recipient AT the cap that
                 // delegates the scope onward: the chain is longer than this
@@ -7538,15 +7558,31 @@ pub async fn reachable_under_scope_with_reasons(
     scope: &str,
     max_depth: usize,
 ) -> Result<ReachabilityVerdict, Error> {
-    // A zero effective depth is `SignerUnreached`, NOT `NoTrustRoots` — the
-    // walk never got far enough to learn whether the issuer emitted anything.
-    // Kept explicit here because the shared walk cannot distinguish the two
-    // from its (all-false) zero-depth result.
-    if max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH) == 0 {
-        return Ok(ReachabilityVerdict::SignerUnreached);
-    }
     let targets: std::collections::HashSet<String> =
         std::iter::once(target_key_id.to_owned()).collect();
+    // A zero effective depth never classifies as `NoTrustRoots` — the walk
+    // does not enumerate the issuer's edges. PR #921 review (Codex F4): it
+    // does probe them, as the cap probe does, so an issuer that delegates the
+    // scope onward is `BeyondDepthCap` ("too deep", self_verify only), and
+    // one that does not is `SignerUnreached`.
+    if max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH) == 0 {
+        return Ok(
+            match scoped_delegation_reach(
+                directory,
+                issuer_key_id,
+                &targets,
+                scope,
+                0,
+                DelegationWalkPolicy::MODERATION_DUTY,
+            )
+            .await
+            {
+                Ok(reach) if reach.beyond_cap => ReachabilityVerdict::BeyondDepthCap,
+                Ok(_) => ReachabilityVerdict::SignerUnreached,
+                Err(_) => ReachabilityVerdict::SubstrateUnavailable,
+            },
+        );
+    }
     // (CIRISPersist#593) The SAME body the `bool` walk runs — which is what
     // makes the byte-identical claim above structural rather than aspirational.
     // A substrate read failure is the one contract difference: the predicate
@@ -12366,6 +12402,14 @@ pub async fn check_infrastructure_community_conformance(
 /// weakening supersede is rejected (CC 3.2), whatever proof it carries. A
 /// legacy room — nothing stored, or the stored version already
 /// non-conformant — still syncs as data.
+///
+/// PR #921 review (Codex, F2): "already non-conformant" is ONE answer, the
+/// typed [`Error::CommunityConsensusProtocolViolation`] the conformance check
+/// returns for each of its rules (no founder, protocol not `quorum:M/N`, `N`
+/// not the founder count, a node-bearing founder). Any other error is the
+/// check failing to ASK — a node-bearing or roster read that failed — and it
+/// propagates: a transient read failure is never "legacy", so it can never
+/// let a degrading supersede of a conformant room through.
 pub async fn check_replicated_supersede_does_not_degrade(
     directory: &dyn super::FederationDirectory,
     offered: &super::Community,
@@ -12378,13 +12422,14 @@ pub async fn check_replicated_supersede_does_not_degrade(
     };
     if stored.persist_row_hash == super::types::compute_persist_row_hash(offered)?
         || !is_infrastructure_labeled(&stored)
-        || check_infrastructure_community_conformance(directory, &stored)
-            .await
-            .is_err()
     {
         return Ok(());
     }
-    check_infrastructure_community_conformance(directory, offered).await
+    match check_infrastructure_community_conformance(directory, &stored).await {
+        Ok(()) => check_infrastructure_community_conformance(directory, offered).await,
+        Err(Error::CommunityConsensusProtocolViolation { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// v50.0.0 (CIRISPersist#925/#927, review M6 + final check) — the LOCAL

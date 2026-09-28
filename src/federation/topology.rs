@@ -467,6 +467,13 @@ pub async fn build_delegation_graph(
     }
     let effective_depth = effective_delegation_depth(max_depth);
     let mut depth_outcome = DelegationDepthOutcome::WithinCap;
+    // PR #921 review (Codex F4) — a ZERO cap (an explicit `Some(0)`, which the
+    // capsule op passes through) puts the ROOT at the cap: the walk below
+    // follows nothing, so the root's own onward delegation is the chain past
+    // the cap. Same probe as a recipient at the cap.
+    if effective_depth == 0 && delegates_onward(directory, from_key).await? {
+        depth_outcome = DelegationDepthOutcome::BeyondCapSelfVerify;
+    }
 
     let mut edges: Vec<DelegationEdge> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -518,11 +525,7 @@ pub async fn build_delegation_graph(
             } else if depth_outcome == DelegationDepthOutcome::WithinCap
                 && depth + 1 == effective_depth
                 && !visited.contains(&r.attested_key_id)
-                && directory
-                    .list_attestations_by(&r.attested_key_id)
-                    .await?
-                    .iter()
-                    .any(|n| n.attestation_type == attestation_type::DELEGATES_TO)
+                && delegates_onward(directory, &r.attested_key_id).await?
             {
                 // A recipient AT the cap that delegates onward: the chain is
                 // longer than this walk may follow (CC 4.1.1 self_verify).
@@ -539,6 +542,17 @@ pub async fn build_delegation_graph(
         edges,
         depth_outcome,
     })
+}
+
+/// The cap probe (CC 4.1.1 `self_verify`): does `key`, standing AT the walk's
+/// depth cap, emit a `delegates_to` the walk may not follow? One read. Used
+/// for a recipient at the cap and, under a zero cap, for the root itself.
+async fn delegates_onward(directory: &dyn FederationDirectory, key: &str) -> Result<bool, Error> {
+    Ok(directory
+        .list_attestations_by(key)
+        .await?
+        .iter()
+        .any(|n| n.attestation_type == attestation_type::DELEGATES_TO))
 }
 
 // ─── 2b. Outbound delegate standing ───────────────────────────────

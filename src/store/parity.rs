@@ -210,9 +210,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v50.0.0 (review, CIRISPersist#931) — Delegates: `put_community` and
     // `apply_replicated_community` are the two doors of this one store step.
     ("put_community_at_door", Class::Delegates),
-    // v50.0.0 (#931) — Plumbing: reads what is held under the offered id to
-    // name the typed outcome; it refuses nothing about the caller's input.
-    ("replicated_community_prior", Class::Plumbing),
+    // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` one-shot fault a
+    // witness arms inside a backend door (`store::test_hooks`); never armed
+    // outside a test, and it judges nothing about the caller's input.
+    ("fail_if_armed", Class::Plumbing),
     // v50.0.0 (CIRISPersist#926) — Gate: refuses a trust-root-grade community
     // row (the reserved `ciris-canonical` id, or one declaring
     // `infrastructure_constraint`) whose shape, founders or chain fails — the

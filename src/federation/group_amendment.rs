@@ -77,44 +77,35 @@ pub enum ReplicatedCommunityRefusal {
     DegradesConformance,
 }
 
-/// What this node held under a replicated record's id before the apply.
+/// v50.0.0 (PR #921 review, Codex F3) — what a community write DID, as the
+/// write itself saw it: under the serialization the write uses (memory's
+/// state lock, sqlite's one writer connection, the postgres statement's own
+/// row count, a supersede's prior-hash check under its lock). The typed
+/// outcome of [`FederationDirectory::apply_replicated_community`] is a
+/// function of this and nothing read before it: a pre-read raced a concurrent
+/// apply of the same record, and the door's idempotent no-op still reported
+/// `Inserted` / `Superseded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReplicatedCommunityPrior {
-    Absent,
-    Identical,
-    Differing,
+pub(crate) enum CommunityWrite {
+    /// The row was stored where none was.
+    Inserted,
+    /// The identical row was already held; nothing was written.
+    Unchanged,
+    /// The held row was replaced by the offered version.
+    Superseded,
 }
 
-/// v50.0.0 (#931) — read [`ReplicatedCommunityPrior`] before the store step.
-pub(crate) async fn replicated_community_prior<F>(
-    dir: &F,
-    community: &SignedCommunity,
-) -> Result<ReplicatedCommunityPrior, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let c = &community.community;
-    Ok(match dir.lookup_community(&c.community_key_id).await? {
-        None => ReplicatedCommunityPrior::Absent,
-        Some(stored) if stored.persist_row_hash == super::types::compute_persist_row_hash(c)? => {
-            ReplicatedCommunityPrior::Identical
-        }
-        Some(_) => ReplicatedCommunityPrior::Differing,
-    })
-}
-
-/// v50.0.0 (#931) — the store step's result as a typed outcome: a
-/// [`Error::Conflict`] is a typed refusal; every other error propagates.
+/// v50.0.0 (#931; PR #921 review F3) — the store step's result as a typed
+/// outcome: the write's own report, a [`Error::Conflict`] is a typed refusal,
+/// a conformance violation is `degrades_conformance`; every other error
+/// propagates.
 pub(crate) fn replicated_community_outcome(
-    prior: ReplicatedCommunityPrior,
-    stored: Result<(), Error>,
+    stored: Result<CommunityWrite, Error>,
 ) -> Result<ReplicatedCommunityOutcome, Error> {
     match stored {
-        Ok(()) => Ok(match prior {
-            ReplicatedCommunityPrior::Absent => ReplicatedCommunityOutcome::Inserted,
-            ReplicatedCommunityPrior::Identical => ReplicatedCommunityOutcome::Unchanged,
-            ReplicatedCommunityPrior::Differing => ReplicatedCommunityOutcome::Superseded,
-        }),
+        Ok(CommunityWrite::Inserted) => Ok(ReplicatedCommunityOutcome::Inserted),
+        Ok(CommunityWrite::Unchanged) => Ok(ReplicatedCommunityOutcome::Unchanged),
+        Ok(CommunityWrite::Superseded) => Ok(ReplicatedCommunityOutcome::Superseded),
         Err(Error::Conflict(_)) => Ok(ReplicatedCommunityOutcome::Refused {
             reason: ReplicatedCommunityRefusal::ConflictingRecord,
         }),
@@ -127,14 +118,27 @@ pub(crate) fn replicated_community_outcome(
     }
 }
 
+/// v38.2.0 (#758) / PR #921 review F3 — the insert arm's own verdict when its
+/// insert found the id occupied (read inside the write): the identical row is
+/// `Unchanged`; a differing one is the #758 [`Error::Conflict`].
+pub(crate) fn community_insert_lost_to(
+    stored_hash: &str,
+    offered_hash: &str,
+    community_key_id: &str,
+) -> Result<CommunityWrite, Error> {
+    super::community_reput_verdict(stored_hash, offered_hash, community_key_id)
+        .map(|()| CommunityWrite::Unchanged)
+}
+
 /// What the replicated door does after the occupied-id decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OccupiedRoute {
     /// No row under this id — the caller inserts.
     Insert,
-    /// Settled here: an identical re-put (no-op) or an amendment applied as a
-    /// supersede. The caller writes nothing more.
-    Settled,
+    /// Settled here: an identical re-put (`Unchanged`, a no-op) or an
+    /// amendment applied as a supersede (`Superseded`). The caller writes
+    /// nothing more.
+    Settled(CommunityWrite),
 }
 
 /// The shape both group kinds share for the decision.
@@ -184,7 +188,7 @@ where
         entrenched: stored.consensus_protocol_entrenched,
     };
     if !admit_amendment(dir, &offer, &stored).await? {
-        return Ok(OccupiedRoute::Settled);
+        return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
     super::check_consensus_protocol_form(&f.consensus_protocol)?;
     super::admission::validate_family_members(dir, f).await?;
@@ -192,7 +196,7 @@ where
         .map_err(|e| Error::Backend(format!("family amendment snapshot serialize: {e}")))?;
     dir.supersede_group_row(Cohort::Family, snapshot, Some(authorization(&offer)))
         .await?;
-    Ok(OccupiedRoute::Settled)
+    Ok(OccupiedRoute::Settled(CommunityWrite::Superseded))
 }
 
 /// v49.0.0 (#910.5) — the occupied-id decision for a replicated
@@ -213,22 +217,23 @@ where
     // applied by its CHAIN, not by the one-hop proof below: version by version
     // from the one this node holds (or, over a squat that never passed the
     // door, from the accord birth). The door already judged the whole chain.
+    let offered_hash = super::types::compute_persist_row_hash(c)?;
     if super::canonical_community::is_trust_root_grade(c)
         || super::canonical_community::is_trust_root_grade(&stored)
     {
-        return Ok(
-            if super::canonical_community::apply_trust_root_chain(dir, community).await? {
-                OccupiedRoute::Settled
-            } else {
-                OccupiedRoute::Insert
-            },
-        );
+        let applied =
+            super::canonical_community::apply_trust_root_chain_counted(dir, community).await;
+        return match lost_race(dir, &c.community_key_id, &offered_hash, applied).await? {
+            None => Ok(OccupiedRoute::Insert),
+            Some(0) => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
+            Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
+        };
     }
     let offer = Offer {
         cohort: Cohort::Community,
         kind: "community",
         group_key_id: &c.community_key_id,
-        offered_hash: super::types::compute_persist_row_hash(c)?,
+        offered_hash: offered_hash.clone(),
         member_key_ids: c.members.iter().map(|m| m.key_id.as_str()).collect(),
         consensus_protocol: &c.consensus_protocol,
         entrenched: None,
@@ -239,13 +244,46 @@ where
         entrenched: false,
     };
     if !admit_amendment(dir, &offer, &stored).await? {
-        return Ok(OccupiedRoute::Settled);
+        return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
     }
     let snapshot = serde_json::to_value(community)
         .map_err(|e| Error::Backend(format!("community amendment snapshot serialize: {e}")))?;
-    dir.supersede_group_row(Cohort::Community, snapshot, Some(authorization(&offer)))
-        .await?;
-    Ok(OccupiedRoute::Settled)
+    let written = dir
+        .supersede_group_row(Cohort::Community, snapshot, Some(authorization(&offer)))
+        .await
+        .map(|_| Some(1));
+    Ok(
+        match lost_race(dir, &c.community_key_id, &offered_hash, written).await? {
+            Some(0) => OccupiedRoute::Settled(CommunityWrite::Unchanged),
+            _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
+        },
+    )
+}
+
+/// PR #921 review (Codex F3) — a supersede that lost its race. The
+/// supersede checks the prior version its proof names UNDER the backend's
+/// write serialization; a concurrent apply of the same record that got there
+/// first makes that check fail stale ([`Error::Conflict`]). If the row now
+/// held IS the offered version, this write changed nothing and the record is
+/// held: `Some(0)` (`Unchanged`), not a refusal. Any other result passes
+/// through: `Ok(n)` is what the write did (`None`: nothing stored, insert),
+/// and a Conflict over a row that differs from the offer stays a Conflict.
+async fn lost_race<F>(
+    dir: &F,
+    community_key_id: &str,
+    offered_hash: &str,
+    written: Result<Option<usize>, Error>,
+) -> Result<Option<usize>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match written {
+        Err(Error::Conflict(m)) => match dir.lookup_community(community_key_id).await? {
+            Some(held) if held.persist_row_hash == offered_hash => Ok(Some(0)),
+            _ => Err(Error::Conflict(m)),
+        },
+        other => other,
+    }
 }
 
 /// `Ok(false)` — identical content, nothing to do. `Ok(true)` — an amendment

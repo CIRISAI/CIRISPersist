@@ -1259,23 +1259,34 @@ where
     };
     feed("row", &serde_json::to_value(signed).unwrap_or_default());
     let family_id = accord_family_key_id();
-    let family = directory.lookup_family(family_id).await.ok().flatten();
+    // PR #921 review (Codex, F1) — every read here PROPAGATES its failure. A
+    // key built over a failed read keyed exactly like a genuinely empty
+    // plane, so a Rooted verdict cached over an empty plane was served while
+    // the revocation state could not be read. No key → no lookup → the error
+    // reaches the caller and nothing is cached. `Unsupported` (the directory
+    // cannot answer, a structural fact) keys as its own marker, never equal to
+    // any answer.
+    let family = directory.lookup_family(family_id).await?;
     feed("family", &serde_json::to_value(&family).unwrap_or_default());
     // The family's roster plane AS STORED (every widening and revocation, and
     // their signers), not the roster folded at the clock: the fold's answer
     // at the verdict's instant is bounded by `valid_until` instead.
-    let widenings = directory
-        .list_family_membership_widenings_for(family_id)
-        .await
-        .unwrap_or_default();
-    let revocations = directory
-        .list_family_membership_revocations_for(family_id)
-        .await
-        .unwrap_or_default();
-    let signers = directory
-        .family_roster_signers(family_id)
-        .await
-        .unwrap_or_default();
+    let widenings = answered(
+        directory
+            .list_family_membership_widenings_for(family_id)
+            .await,
+    )?;
+    let revocations = answered(
+        directory
+            .list_family_membership_revocations_for(family_id)
+            .await,
+    )?;
+    // `family_roster_signers` names an unknown family `InvalidArgument`; with
+    // no family read above there is nothing to ask it.
+    let signers = match &family {
+        Some(_) => answered(directory.family_roster_signers(family_id).await)?,
+        None => None,
+    };
     feed(
         "family_plane",
         &serde_json::json!({
@@ -1291,7 +1302,7 @@ where
     if let Some(f) = &family {
         keys.extend(f.members.iter().map(|m| m.key_id.clone()));
     }
-    keys.extend(widenings.iter().map(|w| w.member().key_id));
+    keys.extend(widenings.iter().flatten().map(|w| w.member().key_id));
     for v in chain_of(signed) {
         keys.extend(v.community.members.iter().map(|m| m.key_id.clone()));
         keys.insert(v.authority_key_id.clone());
@@ -1361,6 +1372,18 @@ where
     resignations.sort();
     feed("resignations", &serde_json::json!(resignations));
     Ok(hex::encode(h.finalize()))
+}
+
+/// A cache-key read's answer: `Some` for a real answer, `None` when the
+/// directory cannot answer (`Unsupported`, keyed as `null` — never equal to an
+/// answer, the empty plane included). Every other error propagates: a failed
+/// read is not an answer (PR #921 review, F1).
+fn answered<T>(read: Result<T, Error>) -> Result<Option<T>, Error> {
+    match read {
+        Ok(v) => Ok(Some(v)),
+        Err(Error::Unsupported { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// [`stored_standing_at`] at the wall clock: the one clock read, taken by the
@@ -1806,17 +1829,34 @@ pub async fn apply_trust_root_chain<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    Ok(apply_trust_root_chain_counted(directory, offered)
+        .await?
+        .is_some())
+}
+
+/// [`apply_trust_root_chain`] reporting what it WROTE (PR #921 review, F3):
+/// `None` — nothing stored, the caller inserts; `Some(0)` — the chain this
+/// node holds is the offered one, nothing written; `Some(n)` — `n` versions
+/// written. The replicated door's typed outcome is derived from this, not
+/// from a read taken before the write.
+pub(crate) async fn apply_trust_root_chain_counted<F>(
+    directory: &F,
+    offered: &SignedCommunity,
+) -> Result<Option<usize>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let mut chain = chain_of(offered);
     let id = offered.community.community_key_id.as_str();
     let now = chrono::Utc::now();
     let mut memo = Memo::at(now);
     let standing = stored_standing_at(directory, id, now).await?;
     let (start, replaces) = match (&standing, standing.held()) {
-        (StoredStanding::Absent, _) => return Ok(false),
+        (StoredStanding::Absent, _) => return Ok(None),
         (_, Some(held)) => {
             let held_hash = row_hash(&held.community)?;
             match extends(held, &chain)? {
-                Extends::Same => return Ok(true),
+                Extends::Same => return Ok(Some(0)),
                 Extends::From(pos) => {
                     // Walk, and store, from the chain this node holds.
                     let (walk, at) = walk_from_held(held, &chain, pos);
@@ -1841,6 +1881,7 @@ where
             (0, Some(("accord_birth_replaces_unrooted", stored)))
         }
     };
+    let mut written = 0;
     for i in start..chain.len() {
         let mut version = chain[i].clone();
         version.lineage = chain[..i].to_vec();
@@ -1861,8 +1902,9 @@ where
                 Some(authorization),
             )
             .await?;
+        written += 1;
     }
-    Ok(true)
+    Ok(Some(written))
 }
 
 /// Whether the local quorum-gated supersede of `community_key_id` is judged by
