@@ -1214,6 +1214,11 @@ impl StoredStanding {
 pub struct StandingCache {
     entries: std::sync::Mutex<std::collections::HashMap<String, CachedStanding>>,
     computations: std::sync::atomic::AtomicU64,
+    /// v51.0.0 (CIRISPersist#939) — the last verdict this directory OBSERVED
+    /// per community, keyed by id (not by input key), so a Rooted ↔ Stalled
+    /// transition is declared once even though the transition changes the
+    /// cache key. A report of the transition, never an input to a verdict.
+    last: std::sync::Mutex<std::collections::HashMap<String, StoredStanding>>,
 }
 
 /// One cached verdict and the span of instants it holds for.
@@ -1458,15 +1463,13 @@ where
             }
         }
     }
-    let previous = match (cache, key.as_ref()) {
-        (Some(c), Some(k)) => c
-            .entries
+    let previous = cache.and_then(|c| {
+        c.last
             .lock()
             .expect("standing cache")
-            .get(k)
-            .map(|h| h.standing.clone()),
-        _ => None,
-    };
+            .get(community_key_id)
+            .cloned()
+    });
     let (standing, valid_until) = compute_standing(directory, signed, now).await?;
     // v51.0.0 (CIRISPersist#939, CC 3.2 T7) — stalled is DECLARED at the
     // transition: Rooted → Stalled emits `community_liveness_stalled`, the
@@ -1474,6 +1477,12 @@ where
     // hard case is a report of the transition, never an input.
     if let Some(prev) = previous {
         emit_liveness_transition(directory, community_key_id, &prev, &standing, now).await?;
+    }
+    if let Some(c) = cache {
+        c.last
+            .lock()
+            .expect("standing cache")
+            .insert(community_key_id.to_owned(), standing.clone());
     }
     if let (Some(c), Some(k)) = (cache, key) {
         c.computations
@@ -1664,15 +1673,24 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::envelope::paths;
-    let rows = directory.list_attestations_by(root_key_id).await?;
-    let charter = rows.iter().find(|a| {
+    // The charter names the root as its ATTESTED key (a key root charters
+    // itself; the accord's holders charter their family). A community root
+    // has no signing key: its charter is its conferring family's — for a
+    // trust-root-grade community, the accord family's.
+    let mut rows = directory.list_attestations_for(root_key_id).await?;
+    let is_charter = |a: &super::Attestation| {
         a.attestation_type == super::types::attestation_type::DELEGATES_TO
-            && a.attested_key_id == root_key_id
             && super::trust_root::job_dimension_admits(
                 &a.attestation_envelope,
                 super::trust_root::TRUST_CHARTER_DIMENSION,
             )
-    });
+    };
+    if !rows.iter().any(is_charter) && root_key_id != accord_family_key_id() {
+        rows = directory
+            .list_attestations_for(accord_family_key_id())
+            .await?;
+    }
+    let charter = rows.iter().find(|a| is_charter(a));
     Ok(charter.map(|a| {
         let e = &a.attestation_envelope;
         CharterMembers {
@@ -1906,13 +1924,24 @@ where
     let charter = charter_members_for(directory, root)
         .await?
         .unwrap_or_default();
-    let Some(presented) = envelope
+    let presented = envelope
         .get(paths::ATTACHED_HEAD_DIGEST)
-        .and_then(|v| v.as_str())
-    else {
+        .and_then(|v| v.as_str());
+    // The gate is ARMED by the charter: a charter that declares no
+    // `attach_window_secs` is a pre-rc6 charter, and an edge that names no head
+    // under it is the pre-rc6 shape (admitted, stated — CHANGELOG 51.0.0). Once
+    // the conferring roster re-scrubs its charter with a window (the shipped
+    // default for ciris-canonical / humanity-accord is 7 days), every attach
+    // needs the witnessed head; an edge that names a head is judged under any
+    // charter (the T5 anchor).
+    let Some(presented) = presented else {
+        if charter.attach_window_secs.is_none() {
+            return Ok(());
+        }
         return refuse(format!(
-            "the acceptance edge names no lineage head (`{}`): attaching requires the witnessed \
-             head inside the root's attach window, or an anchored head (T5)",
+            "the root's charter declares an attach window of {}s: attaching requires the \
+             witnessed lineage head (`{}`) inside it — never attach on a stale or absent one",
+            charter.attach_window_secs.unwrap_or_default(),
             paths::ATTACHED_HEAD_DIGEST
         ));
     };
@@ -2113,10 +2142,15 @@ where
     }
     check_lineage_caps(signed)?;
     check_trust_root_shape(community)?;
+    let chain = chain_of(signed);
+    // v51.0.0 (CIRISPersist#939, CC 3.2 T7) — the liveness margin at FOUNDING
+    // is a property of the BIRTH version (the protocol is entrenched, N is the
+    // founder count): judged on chain[0], so an amendment that tries to move
+    // the protocol is still refused as the entrenchment violation it is.
+    check_founding_margin(&chain[0].community)?;
     // The door's one clock read; everything below judges at it.
     let now = chrono::Utc::now();
     check_founders_eligible(directory, community, now).await?;
-    let chain = chain_of(signed);
     let mut memo = Memo::at(now);
     let standing = stored_standing_at(directory, &community.community_key_id, now).await?;
     if let Some(held) = standing.held() {
@@ -2135,6 +2169,30 @@ where
         verify_chain_memo(directory, &chain, &mut memo).await?;
     }
     Ok(true)
+}
+
+/// v51.0.0 (CIRISPersist#939, CC 3.2 T7 rc6) — a trust-root-grade row is live
+/// only at M + 1 active founders; founded at N ≤ M it is stalled from birth
+/// (every remaining founder a veto). `liveness_margin_at_founding`.
+fn check_founding_margin(birth: &Community) -> Result<(), Error> {
+    let Some((m, _n)) = super::admission::infrastructure_quorum(&birth.consensus_protocol) else {
+        return Ok(()); // the protocol gate names this refusal
+    };
+    let founders_n = founders(birth).len();
+    if founders_n < m as usize + 1 {
+        return Err(violation(
+            &birth.community_key_id,
+            super::admission::INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING,
+            format!(
+                "consensus_protocol {:?} over {founders_n} founder(s): a trust-root-grade community \
+                 is live only at M + 1 = {} active founders (CC 3.2 T7 rc6, CIRISPersist#939); \
+                 founded at N ≤ M it is stalled from birth",
+                birth.consensus_protocol,
+                m + 1
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The recovery ruling (#926 re-check): an accord RE-BIRTH replaces a

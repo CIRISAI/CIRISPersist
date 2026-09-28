@@ -178,3 +178,10 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 4.4.3.8	CLM-trust-root	CIRISPersist	src/federation/trust_root.rs#resolve_transit_eligibility	ciris-persist@51.0.0
 4.5.5	CLM-scope-attenuation	CIRISPersist	src/federation/admission.rs#scope_covers	ciris-persist@51.0.0
 4.5.5	CLM-scope-attenuation	CIRISPersist	src/federation/admission.rs#delegation_scope_grants	ciris-persist@51.0.0
+3.2	CLM-attach-freshness	CIRISPersist	src/federation/canonical_community.rs#check_attach_freshness	ciris-persist@51.0.0
+3.2	CLM-attach-freshness	CIRISPersist	src/federation/envelope.rs#ATTACH_WINDOW_SECS	ciris-persist@51.0.0
+3.2	CLM-witnessed-lineage	CIRISPersist	src/federation/lineage_witness.rs#admit_lineage_head_cosign	ciris-persist@51.0.0
+3.2	CLM-witnessed-lineage	CIRISPersist	src/federation/lineage_witness.rs#witnessed	ciris-persist@51.0.0
+3.2	CLM-witnessed-lineage	CIRISPersist	src/federation/canonical_community.rs#witnessed_head	ciris-persist@51.0.0
+3.2	CLM-liveness-margin	CIRISPersist	src/federation/admission.rs#INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING	ciris-persist@51.0.0
+3.2	CLM-liveness-margin	CIRISPersist	src/federation/canonical_community.rs#emit_liveness_transition	ciris-persist@51.0.0

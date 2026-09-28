@@ -71,7 +71,7 @@ Identical re-put → `Unchanged`. No cosign is ever deleted (evidence).
 `check_attach_freshness(dir, delegates_to(node → root) carrying trust:accepts:v1, presented_head, now)` runs inside the existing `trust:accepts:v1` admission (the `delegates_to` door), BEFORE the edge is stored:
 - the caller presents the head it attaches under (`presented_head`: the head record + its cosigns; through the capsule op and pyo3 as the bundle response's `lineage_head` object, CIRISServer#693 §3);
 - refuse `trust_root_head_stale` when `now − head_asserted_at > attach_window_secs` (measured against the SIGNER-stamped instant under the CC 2.6.7 skew rule — never the consumer's clock alone), or when the head is not witnessed (fewer than `witness_quorum` valid cosigns from independent witnesses after §2.1's admission);
-- a root whose charter declares no window: refuse unless the edge names the head by digest (T5 out-of-band anchor: `anchored_head_digest` on the edge);
+- **the gate is ARMED by the charter**: a charter that declares no `attach_window_secs` is a pre-rc6 charter, and an edge naming no head under it is the pre-rc6 shape — admitted, stated (the mixed-fleet allowance: every consumer edge in the field today names no head). Once the conferring roster re-scrubs its charter with a window (the shipped default for `ciris-canonical` / `humanity-accord` is 7 days), every attach needs the witnessed head. An edge that names a head (`attached_head_digest`) is judged under any charter — that is the T5 out-of-band anchor;
 - **nothing on the attached side changes**: `trust_root_valid` MUST NOT read the window, the cadence or drill staleness (I-witness: an attached node whose head goes stale stays `Rooted`).
 `freshness.rs` stays a monotonic lower bound.
 
@@ -106,11 +106,14 @@ After a restore, a founder node re-syncs its head from the witness plane before 
 
 At the transition Live→Stalled the substrate emits `hard_case:community_liveness_stalled:{community_key_id}`; at Stalled→Live `…_restored:{community_key_id}`; every fold reproduces the verdict from rows alone (the hard case is a report of the transition, never an input). Emitted from the read that observes the transition (idempotent per (community, transition instant)) and from the roster/record doors that cause it.
 
-## 4. Surfaces
+## 4. Surfaces (as built)
 
-- Trait/Engine: `put_lineage_head_cosign`, `list_lineage_head_cosigns(lineage, head_digest)`, `lineage_head(lineage) -> LineageHead { head_digest, asserted_at, cosigns, witnessed, silent_since }`; `resolve_community` gains `live`, `witnessed`, `witness_silent_since`; `trust_root_bundle_response` gains `lineage_head` (outside `bundle`, unsigned convenience, for CIRISServer#693 §3) and `pin_trust_from_bundle_response` verifies it (record quorum, each cosign against the consumer's OWN witness directory, descent from genesis, the window) before attaching.
-- pyo3: `put_lineage_head_cosign_json`, `lineage_head_json`, the three new fields on the resolve dict; refusal types as their neighbours.
-- Capsule: `PutLineageHeadCosign`, `LineageHead` ops + results APPENDED (growth; digests re-pinned).
+- Trait: `put_lineage_head_cosign(cosign) -> LineageCosignOutcome` — a defaulted method whose body IS the door (`lineage_witness::admit_lineage_head_cosign` at the door's one clock read), so the capsule proxies it and no backend overrides it; `store_lineage_head_cosign` / `list_lineage_head_cosigns_for` — defaulted `Unsupported`, overridden by memory / sqlite / postgres (V159).
+- Engine: `put_lineage_head_cosign`, `lineage_head(id) -> Option<WitnessedHead { judged, unwitnessed_tail, equivocation, latest_cosign_at }>`; `resolve_community` gains `live`, `witnessed`, `unwitnessed_tail`, `equivocation`, `witness_silent_since` (the served row of a trust root is its WITNESSED head, which may be an ancestor of the stored row).
+- pyo3: `put_lineage_head_cosign_json`, `lineage_head_json`; the resolve dict carries the five fields.
+- Capsule: `PutLineageHeadCosign` op + `LineageCosignOutcome` result APPENDED (growth; digests re-pinned; ABI 6).
+- Standing: `StoredStanding` is unchanged in shape; `Rooted` boxes the JUDGED (witnessed) head; the liveness margin is `resolve_community.live`; the transition hard cases are emitted from `stored_standing_at` against the last verdict the cache OBSERVED per community (keyed by id).
+- Charter members: typed `EnvelopeCore` fields (`attach_window_secs`, `witness_cadence_secs`, `witness_quorum`) + `attached_head_digest` on the edge — `ENVELOPE_VOCABULARY_SHA256` re-pinned; `canonical_community::charter_members_for(root)` reads them from the charter row this node holds for the root, falling back to the accord family's charter for a community root.
 - Migration V159 (both dialects). Evidence rows at CC 3.2: `CLM-attach-freshness`, `CLM-witnessed-lineage`, `CLM-liveness-margin`.
 
 ## 5. Invariants (I191–I196; memory, sqlite, postgres unless stated)

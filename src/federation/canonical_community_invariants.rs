@@ -42,7 +42,7 @@ pub(crate) mod bodies {
     pub(crate) const FOUNDERS: [&str; 3] = ["us-steward", "eu-steward", "ap-steward"];
     pub(crate) const SERVE_NODE: &str = "cc1-serve-node";
 
-    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+    pub(crate) fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().expect("rfc3339")
     }
 
@@ -628,7 +628,7 @@ pub(crate) mod bodies {
         .await
     }
 
-    fn with_member(mut row: Community, key_id: &str, role: &str) -> Community {
+    pub(crate) fn with_member(mut row: Community, key_id: &str, role: &str) -> Community {
         row.members.push(CommunityMember {
             key_id: key_id.to_owned(),
             joined_at: at("2026-09-21T00:00:00Z"),
@@ -638,7 +638,7 @@ pub(crate) mod bodies {
     }
 
     /// `row` with `from` replaced by `to` (same role, same instant).
-    fn swapped(mut row: Community, from: &str, to: &str) -> Community {
+    pub(crate) fn swapped(mut row: Community, from: &str, to: &str) -> Community {
         for m in &mut row.members {
             if m.key_id == from {
                 m.key_id = to.to_owned();
@@ -651,7 +651,7 @@ pub(crate) mod bodies {
     /// for the REPLICATED door: the bound envelope, then `edit`, signed by
     /// `signers`; the version signed by `authority` and carrying the held
     /// row's chain.
-    async fn hand_proof(
+    pub(crate) async fn hand_proof(
         d: &dyn FederationDirectory,
         next: Community,
         signers: &[&str],
@@ -1033,7 +1033,7 @@ pub(crate) mod bodies {
         w
     }
 
-    fn founder_revocation(
+    pub(crate) fn founder_revocation(
         signers: &[&str],
         founder: &str,
     ) -> crate::federation::SignedCommunityMembershipRevocation {
@@ -1041,7 +1041,7 @@ pub(crate) mod bodies {
     }
 
     /// [`founder_revocation`] dated `t` (removed and effective).
-    fn founder_revocation_at(
+    pub(crate) fn founder_revocation_at(
         signers: &[&str],
         founder: &str,
         t: chrono::DateTime<chrono::Utc>,

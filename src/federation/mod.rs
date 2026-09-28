@@ -134,6 +134,9 @@ pub mod moderation_walk_asof_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
+/// v51.0.0 — the rc6 trust-root security set (I191–I196).
+#[cfg(test)]
+pub(crate) mod rc6_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.

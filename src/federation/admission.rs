@@ -12249,24 +12249,6 @@ pub fn check_infrastructure_consensus_protocol(community: &super::Community) -> 
             .filter(|m| m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
             .count();
         if n as usize == founders {
-            // v51.0.0 (CIRISPersist#939, CC 3.2 T7) — the liveness margin at
-            // founding: a TRUST-ROOT-GRADE row needs N ≥ M + 1, or one exit
-            // makes every remaining founder a veto (stalled from birth).
-            // Ordinary infrastructure rooms keep #927's M ≥ 2 rule only.
-            if super::canonical_community::is_trust_root_grade(community)
-                && founders < _m as usize + 1
-            {
-                return Err(Error::CommunityConsensusProtocolViolation {
-                    community_key_id: community.community_key_id.clone(),
-                    rule: INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING,
-                    detail: format!(
-                        "consensus_protocol {p:?} over {founders} founder(s): a trust-root-grade \
-                         community is live only at M + 1 = {} active founders (CC 3.2 T7 rc6, \
-                         CIRISPersist#939); founded at N ≤ M it is stalled from birth",
-                        _m + 1
-                    ),
-                });
-            }
             return Ok(());
         }
         return Err(Error::CommunityConsensusProtocolViolation {
