@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 105 delegations, generated. Every one: fault first, then delegate.
+// 106 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -1153,5 +1153,8 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .supersede_group_row(cohort, new_snapshot, authorization)
             .await
+    }
+    fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
+        self.inner.trust_root_standing_cache()
     }
 }

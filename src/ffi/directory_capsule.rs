@@ -5726,6 +5726,67 @@ mod tests {
         unsafe { (directory.vtable.drop)(directory.data) };
     }
 
+    /// PR #921 review (Codex, F4) — `max_depth: 0` through the op: a root
+    /// that delegates is past a zero cap (`BeyondCapSelfVerify`, no edges); a
+    /// root that delegates nothing is `WithinCap`. The op passes 0 through
+    /// (the cap is the caller's explicit choice); it is not rejected.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn build_delegation_graph_op_reports_a_zero_cap() {
+        use crate::federation::admission::steward_liveness_test_support::{register, signed_row};
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::{attestation_type, identity_type as it};
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+        rt.block_on(async {
+            register(dir.as_ref(), "zc-root", &[it::USER]).await;
+            register(dir.as_ref(), "zc-next", &[it::PRIMITIVE]).await;
+            register(dir.as_ref(), "zc-lone", &[it::USER]).await;
+            let mut row = signed_row(
+                "zc-root",
+                "zc-next",
+                attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "scope": ["infra:serve"],
+                    "sub_delegation": true
+                }),
+            );
+            ts::reseal(&mut row);
+            dir.put_attestation(crate::federation::SignedAttestation { attestation: row })
+                .await
+                .expect("edge");
+        });
+        for (root, want) in [
+            (
+                "zc-root",
+                crate::federation::DelegationDepthOutcome::BeyondCapSelfVerify,
+            ),
+            (
+                "zc-lone",
+                crate::federation::DelegationDepthOutcome::WithinCap,
+            ),
+        ] {
+            match run_op(
+                &rt,
+                &directory,
+                &DirectoryOp::BuildDelegationGraph {
+                    from_key: root.into(),
+                    max_depth: 0,
+                },
+            ) {
+                DirectoryOpResult::DelegationGraph(g) => {
+                    assert_eq!(g.max_depth, 0, "{root}");
+                    assert!(g.edges.is_empty(), "{root}: a zero cap follows nothing");
+                    assert_eq!(g.depth_outcome, want, "{root}");
+                }
+                other => panic!("{root}: expected DelegationGraph, got {other:?}"),
+            }
+        }
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
     #[test]
     fn backend_error_flattens_to_err_variant() {
         // MemoryBackend has no `lookup_shared_instance_lease` impl (the

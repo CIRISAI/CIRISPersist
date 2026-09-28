@@ -1764,6 +1764,331 @@ pub mod bodies {
             ReachabilityVerdict::SignerUnreached
         );
     }
+
+    // ─── PR #921 review (Codex) — F2, F3, F4 ────────────────────────────
+
+    /// A replicated supersede of `room` to `(protocol, members)`, carrying a
+    /// valid proof both founders signed over the change. Built BEFORE any
+    /// fault is armed: the envelope build reads the roster planes too.
+    async fn founders_supersede_offer(
+        d: &dyn FederationDirectory,
+        room: &str,
+        protocol: &str,
+        members: Vec<CommunityMember>,
+        founders: [&str; 2],
+    ) -> crate::federation::SignedCommunity {
+        let prior = d.lookup_community(room).await.unwrap().expect("stored");
+        let keys: Vec<String> = members.iter().map(|m| m.key_id.clone()).collect();
+        let change = d
+            .build_membership_change_envelope(
+                crate::federation::cohort::Cohort::Community,
+                room,
+                &keys,
+                false,
+                Some(protocol),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("build change: {e}"));
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
+        let mut signed = ts::sign_community(founders[0], infra_room(room, protocol, members));
+        signed.supersede_proof = Some(crate::federation::types::GroupSupersedeProof {
+            prior_persist_row_hash: prior.persist_row_hash,
+            change_envelope: change,
+            quorum_signatures: founders
+                .iter()
+                .map(|f| ts::threshold_sign(f, &bytes))
+                .collect(),
+        });
+        signed
+    }
+
+    /// A conformant `quorum:2/2` infrastructure room of two human founders,
+    /// stored through the local door. Returns `(room, h1, h2)`.
+    async fn conformant_room(d: &dyn FederationDirectory, tag: &str) -> (String, String, String) {
+        let [h1, h2] = ["h1", "h2"].map(|k| format!("{k}-{tag}"));
+        ts::register_hybrid_key_as(d, &h1, &h1, it::USER).await;
+        ts::register_hybrid_key_as(d, &h2, &h2, it::USER).await;
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
+        d.put_community(ts::sign_community(
+            &h1,
+            infra_room(
+                &room,
+                "quorum:2/2",
+                vec![seat(&h1, "founder"), seat(&h2, "founder")],
+            ),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: conformant room: {e}"));
+        (room, h1, h2)
+    }
+
+    /// **PR #921 review (Codex, F2) — the gate.** The stored row's
+    /// conformance is re-judged to decide "legacy or not"; a read that FAILS
+    /// inside that judgement is not the row being non-conformant. Through the
+    /// fault double (the gate composes through the directory it is handed):
+    /// with the node-bearing read failing, the gate returns the read error,
+    /// never `Ok` (the legacy pass). A room that is non-conformant by its
+    /// PROTOCOL is decided before any read, so it stays legacy with the read
+    /// failing.
+    pub async fn f2_a_failed_read_is_not_legacy_at_the_gate(
+        inner: std::sync::Arc<dyn FederationDirectory>,
+        tag: &str,
+    ) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        const READ: &str = "list_identity_occurrences_by_occurrence_key";
+        let d = inner.as_ref();
+        let (room, h1, h2) = conformant_room(d, tag).await;
+        let founders = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
+        let offered = infra_room(&room, "founder_only", founders());
+        let clean = FaultInjectingDirectory::new(inner.clone());
+        let e = admission::check_replicated_supersede_does_not_degrade(&clean, &offered)
+            .await
+            .expect_err("a conformant stored room refuses a degrading offer");
+        assert_eq!(violation_rule(&e), INFRA_RULE_PROTOCOL_NOT_QUORUM, "{tag}");
+        let failing = FaultInjectingDirectory::new(inner.clone()).erroring(READ);
+        match admission::check_replicated_supersede_does_not_degrade(&failing, &offered).await {
+            Err(Error::Backend(m)) => assert!(m.contains(READ), "{tag}: {m}"),
+            other => panic!(
+                "{tag}: a failed read of the stored row's founders is not legacy \
+                 non-conformance — the gate must propagate it, got {other:?}"
+            ),
+        }
+        let legacy = format!("legacy-{tag}");
+        plant_legacy(
+            d,
+            ts::sign_community(&h1, infra_room(&legacy, "majority", founders())),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: legacy room: {e}"));
+        admission::check_replicated_supersede_does_not_degrade(
+            &failing,
+            &infra_room(&legacy, "founder_only", founders()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("{tag}: a room non-conformant by its protocol is legacy, read or no read: {e}")
+        });
+    }
+
+    /// **PR #921 review (Codex, F2) — the door.** The same, end to end, with
+    /// a TRANSIENT failure: the node-bearing read fails once (inside the
+    /// replicated door's re-judgement of the stored row) and succeeds after.
+    /// `apply_replicated_community` must return the error — not `Superseded`
+    /// — and the stored row is unchanged. Offered again with every read
+    /// succeeding, it is refused `degrades_conformance`.
+    pub async fn f2_b_a_transient_failure_never_degrades_at_the_door(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        fail_next_occurrence_read: &(dyn Fn(u32) + Sync),
+    ) {
+        use crate::federation::{ReplicatedCommunityOutcome as Out, ReplicatedCommunityRefusal};
+        let (room, h1, h2) = conformant_room(d, tag).await;
+        let founders = vec![seat(&h1, "founder"), seat(&h2, "founder")];
+        let offer = founders_supersede_offer(d, &room, "founder_only", founders, [&h1, &h2]).await;
+        fail_next_occurrence_read(1);
+        let got = d.apply_replicated_community(offer.clone()).await;
+        assert!(
+            matches!(&got, Err(Error::Backend(m)) if m.contains("injected transient")),
+            "{tag}: a transient read failure is an error, never a degrading supersede: {got:?}"
+        );
+        assert_eq!(
+            d.lookup_community(&room)
+                .await
+                .unwrap()
+                .unwrap()
+                .consensus_protocol,
+            "quorum:2/2",
+            "{tag}: the stored row is unchanged"
+        );
+        fail_next_occurrence_read(0);
+        assert_eq!(
+            d.apply_replicated_community(offer).await.unwrap(),
+            Out::Refused {
+                reason: ReplicatedCommunityRefusal::DegradesConformance
+            },
+            "{tag}: with the read answering, the offer is judged"
+        );
+    }
+
+    /// **PR #921 review (Codex, F3) — the outcome is what the WRITE did.** A
+    /// rival apply of the same record lands after anything the caller read
+    /// and before this write (the backend's test hook). The write then
+    /// changes nothing, so the outcome is `Unchanged`: an insert that lost
+    /// the race is not `Inserted`, a supersede that lost it is not
+    /// `Superseded`.
+    pub async fn f3_a_the_outcome_is_what_the_write_did(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        arm_rival: &(dyn Fn(crate::federation::SignedCommunity) + Sync),
+    ) {
+        use crate::federation::ReplicatedCommunityOutcome as Out;
+        let [h1, h2] = ["h1", "h2"].map(|k| format!("{k}-{tag}"));
+        ts::register_hybrid_key_as(d, &h1, &h1, it::USER).await;
+        ts::register_hybrid_key_as(d, &h2, &h2, it::USER).await;
+        let founders = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
+        let room = format!("race-{tag}");
+        let v1 = ts::sign_community(&h1, infra_room(&room, "majority", founders()));
+        arm_rival(v1.clone());
+        assert_eq!(
+            d.apply_replicated_community(v1.clone()).await.unwrap(),
+            Out::Unchanged,
+            "{tag}: the rival inserted it first; this write inserted nothing"
+        );
+        assert_eq!(
+            d.apply_replicated_community(v1).await.unwrap(),
+            Out::Unchanged
+        );
+        let v2 = founders_supersede_offer(d, &room, "founder_only", founders(), [&h1, &h2]).await;
+        arm_rival(v2.clone());
+        assert_eq!(
+            d.apply_replicated_community(v2.clone()).await.unwrap(),
+            Out::Unchanged,
+            "{tag}: the rival superseded first; this write superseded nothing"
+        );
+        assert_eq!(
+            d.lookup_community(&room)
+                .await
+                .unwrap()
+                .unwrap()
+                .consensus_protocol,
+            "founder_only"
+        );
+        // Without a rival, each outcome is still reported.
+        let room2 = format!("solo-{tag}");
+        let w1 = ts::sign_community(&h1, infra_room(&room2, "majority", founders()));
+        assert_eq!(
+            d.apply_replicated_community(w1).await.unwrap(),
+            Out::Inserted
+        );
+        let w2 = founders_supersede_offer(d, &room2, "founder_only", founders(), [&h1, &h2]).await;
+        assert_eq!(
+            d.apply_replicated_community(w2).await.unwrap(),
+            Out::Superseded
+        );
+    }
+
+    /// **PR #921 review (Codex, F3) — two applies of one record, joined.**
+    /// Exactly one reports the change; the other reports `Unchanged` — never
+    /// two `Inserted`, never two `Superseded`. (On the memory backend the
+    /// join does not interleave; `f3_a` pins the interleaving everywhere.)
+    pub async fn f3_b_concurrent_applies_report_one_change(d: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::ReplicatedCommunityOutcome as Out;
+        let [h1, h2] = ["h1", "h2"].map(|k| format!("{k}-{tag}"));
+        ts::register_hybrid_key_as(d, &h1, &h1, it::USER).await;
+        ts::register_hybrid_key_as(d, &h2, &h2, it::USER).await;
+        let founders = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
+        let room = format!("join-{tag}");
+        let v1 = ts::sign_community(&h1, infra_room(&room, "majority", founders()));
+        let (a, b) = tokio::join!(
+            d.apply_replicated_community(v1.clone()),
+            d.apply_replicated_community(v1)
+        );
+        let mut got = vec![a.unwrap(), b.unwrap()];
+        got.sort_by_key(|o| format!("{o:?}"));
+        assert_eq!(got, vec![Out::Inserted, Out::Unchanged], "{tag}: insert");
+        let v2 = founders_supersede_offer(d, &room, "founder_only", founders(), [&h1, &h2]).await;
+        let (a, b) = tokio::join!(
+            d.apply_replicated_community(v2.clone()),
+            d.apply_replicated_community(v2)
+        );
+        let mut got = vec![a.unwrap(), b.unwrap()];
+        got.sort_by_key(|o| format!("{o:?}"));
+        assert_eq!(
+            got,
+            vec![Out::Superseded, Out::Unchanged],
+            "{tag}: supersede"
+        );
+    }
+
+    /// **PR #921 review (Codex, F4) — a zero cap reports what it cut.** With
+    /// `max_depth = 0` (accepted: the capsule op passes it through) the walk
+    /// follows nothing, and a root WITH a delegation is past the cap
+    /// (`BeyondCapSelfVerify`), not complete; a root without one is
+    /// `WithinCap`. The scoped walks: the moderation classifier says
+    /// `BeyondDepthCap`, and the withdraws gate's refusal carries
+    /// `beyond_delegation_depth_cap: true`.
+    pub async fn f4_a_zero_depth_reports_the_cut(d: &dyn FederationDirectory, tag: &str) {
+        let keys = chain(d, &format!("z1-{tag}"), 1, "infra:serve").await;
+        let g = crate::federation::build_delegation_graph(d, &keys[0], Some(0))
+            .await
+            .unwrap();
+        assert_eq!(g.max_depth, 0);
+        assert!(g.edges.is_empty(), "{tag}: a zero cap follows nothing");
+        assert_eq!(
+            g.depth_outcome,
+            DelegationDepthOutcome::BeyondCapSelfVerify,
+            "{tag}: the root delegates — the chain is past a zero cap"
+        );
+        let lone = format!("lone-{tag}");
+        register(d, &lone, &[it::USER]).await;
+        let g = crate::federation::build_delegation_graph(d, &lone, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(g.depth_outcome, DelegationDepthOutcome::WithinCap, "{tag}");
+        // The moderation classifier.
+        let m = chain(d, &format!("zm-{tag}"), 1, DELEGATION_SCOPE_MODERATE).await;
+        assert_eq!(
+            admission::reachable_under_scope_with_reasons(
+                d,
+                &m[0],
+                &m[1],
+                DELEGATION_SCOPE_MODERATE,
+                0
+            )
+            .await
+            .unwrap(),
+            ReachabilityVerdict::BeyondDepthCap,
+            "{tag}: moderation at a zero cap"
+        );
+        assert_eq!(
+            admission::reachable_under_scope_with_reasons(
+                d,
+                &lone,
+                &m[1],
+                DELEGATION_SCOPE_MODERATE,
+                0
+            )
+            .await
+            .unwrap(),
+            ReachabilityVerdict::SignerUnreached,
+            "{tag}: a root that delegates nothing"
+        );
+        // The withdraws gate's proxy walk.
+        let w = chain(
+            d,
+            &format!("zw-{tag}"),
+            1,
+            DELEGATION_SCOPE_CONSENT_REVOCATION,
+        )
+        .await;
+        let producer = format!("producer-{tag}");
+        register(d, &producer, &[it::PRIMITIVE]).await;
+        let mut target = signed_row(
+            &producer,
+            &w[1],
+            attestation_type::SCORES,
+            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
+        );
+        target.subject_key_ids = vec![w[1].clone()];
+        match admission::resolve_withdraws_admission_rule_at(d, &w[0], &target, 0).await {
+            Err(Error::WithdrawsNotAdmitted {
+                beyond_delegation_depth_cap,
+                ..
+            }) => assert!(
+                beyond_delegation_depth_cap,
+                "{tag}: the refusal says the chain is past a zero cap"
+            ),
+            other => panic!("{tag}: a 1-hop proxy chain at depth 0: {other:?}"),
+        }
+        assert_eq!(
+            admission::resolve_withdraws_admission_rule_at(d, &w[0], &target, 1)
+                .await
+                .unwrap(),
+            3,
+            "{tag}: at depth 1 the proxy reaches"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1802,6 +2127,44 @@ mod runners {
                 case!(replicated_supersede_never_degrades_a_conformant_room);
                 case!(local_withdraws_records_its_depth);
                 case!(clause_a_replicated_insert_admits_a_fused_key);
+                // PR #921 review (Codex).
+                case!(f3_b_concurrent_applies_report_one_change);
+                case!(f4_a_zero_depth_reports_the_cut);
+                #[tokio::test]
+                async fn f2_a_failed_read_is_not_legacy_at_the_gate() {
+                    let Some(d) = $fresh.await else { return };
+                    let inner: std::sync::Arc<dyn FederationDirectory> = std::sync::Arc::new(d);
+                    super::super::bodies::f2_a_failed_read_is_not_legacy_at_the_gate(
+                        inner,
+                        &format!("f2a-{}", suffix()),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn f2_b_a_transient_failure_never_degrades_at_the_door() {
+                    let Some(d) = $fresh.await else { return };
+                    let arm = |n: u32| {
+                        d.test_hooks()
+                            .fail_next("list_identity_occurrences_by_occurrence_key", n)
+                    };
+                    super::super::bodies::f2_b_a_transient_failure_never_degrades_at_the_door(
+                        &d as &dyn FederationDirectory,
+                        &format!("f2b-{}", suffix()),
+                        &arm,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn f3_a_the_outcome_is_what_the_write_did() {
+                    let Some(d) = $fresh.await else { return };
+                    let arm = |rival| d.test_hooks().arm_rival_community_write(rival);
+                    super::super::bodies::f3_a_the_outcome_is_what_the_write_did(
+                        &d as &dyn FederationDirectory,
+                        &format!("f3a-{}", suffix()),
+                        &arm,
+                    )
+                    .await
+                }
             }
         };
     }

@@ -74,6 +74,9 @@ pub struct MemoryBackend {
     admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
     /// v50.0.0 (CIRISPersist#926) — this directory's trust-root standing cache.
     trust_root_standing_cache: crate::federation::canonical_community::StandingCache,
+    /// v50.0.0 (PR #921 review) — test-only hooks inside this backend's doors.
+    #[cfg(test)]
+    test_hooks: crate::store::test_hooks::TestHooks,
     /// v2.5.0 (CIRISPersist#102 Ask 4) — per-axis envelope-schema resolver.
     /// The default is [`crate::federation::NoOpSchemaResolver`], which makes
     /// the `put_attestation` validation hook a no-op (existing callers don't
@@ -992,6 +995,8 @@ impl Default for MemoryBackend {
             ),
             admission_gate: std::sync::RwLock::new(None),
             trust_root_standing_cache: Default::default(),
+            #[cfg(test)]
+            test_hooks: Default::default(),
             schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
                 crate::federation::NoOpSchemaResolver,
             )),
@@ -1004,6 +1009,13 @@ impl Default for MemoryBackend {
 }
 
 impl MemoryBackend {
+    /// v50.0.0 (PR #921 review) — the test-only hook table (see
+    /// [`crate::store::test_hooks`]).
+    #[cfg(test)]
+    pub(crate) fn test_hooks(&self) -> &crate::store::test_hooks::TestHooks {
+        &self.test_hooks
+    }
+
     /// v44.7.0 (CIRISPersist#864) — the trait default is first-seen-wins with
     /// no plan (it cannot run one over an unsized `Self`). This backend runs
     /// the ONE key plan first, exactly as the sqlite/postgres applies do, and
@@ -5729,6 +5741,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::IdentityOccurrence>, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks
+            .check("list_identity_occurrences_by_occurrence_key")?;
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state
             .federation_identity_occurrences
@@ -11320,6 +11335,19 @@ impl MemoryBackend {
         community: crate::federation::SignedCommunity,
         door: crate::federation::CommunityDoor,
     ) -> Result<(), crate::federation::Error> {
+        // Test-only (PR #921 review, F3): a rival write that won the race
+        // lands here, after any read the caller made and before this write's
+        // own gates and reads.
+        #[cfg(test)]
+        if let Some(rival) = self.test_hooks.take_rival_community_write() {
+            Box::pin(
+                self.put_community_at_door(
+                    rival,
+                    crate::federation::CommunityDoor::ReplicatedApply,
+                ),
+            )
+            .await?;
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step (mirrors put_family). Hybrid-Strict vs the
         // authority's registered pubkeys.

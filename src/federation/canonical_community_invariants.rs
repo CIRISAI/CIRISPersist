@@ -2728,6 +2728,80 @@ pub(crate) mod bodies {
             .contains(&"f2r-steward".to_owned()));
     }
 
+    /// (f1) — PR #921 review (Codex, F1): **a failed read is never a cache
+    /// hit.** The standing cache is keyed on every input the verdict reads,
+    /// the accord family's roster plane among them. A read of that plane that
+    /// FAILS must not key like a plane that is genuinely empty: a Rooted
+    /// verdict cached over an empty plane would then be served while the
+    /// revocation state cannot be read. Through the fault double (which hands
+    /// out the backend's own cache): the verdict is cached, a clean double
+    /// hits it, and with each family-plane read failing the read returns the
+    /// error — nothing computed, nothing served from the cache.
+    pub async fn f1_a_failed_family_read_is_never_a_cache_hit(
+        inner: std::sync::Arc<dyn FederationDirectory>,
+    ) {
+        use crate::federation::directory_double::FaultInjectingDirectory;
+        let d = inner.as_ref();
+        stand_up(d).await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        let fam = cc::accord_family_key_id();
+        assert!(
+            d.list_family_membership_widenings_for(fam)
+                .await
+                .unwrap()
+                .is_empty()
+                && d.list_family_membership_revocations_for(fam)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+            "the accord family's roster plane is genuinely empty"
+        );
+        let cache = d
+            .trust_root_standing_cache()
+            .expect("every real backend holds a standing cache");
+        let now = chrono::Utc::now();
+        assert!(matches!(
+            cc::stored_standing_at(d, CANON, now).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        let computed = cache.computations();
+        let clean = FaultInjectingDirectory::new(inner.clone());
+        assert!(
+            matches!(
+                cc::stored_standing_at(&clean, CANON, now).await.unwrap(),
+                cc::StoredStanding::Rooted(_)
+            ),
+            "the clean double reads the same verdict"
+        );
+        assert_eq!(
+            cache.computations(),
+            computed,
+            "the double reaches the backend's cache: a hit, so a fault below meets a cached verdict"
+        );
+        for method in [
+            "lookup_family",
+            "list_family_membership_widenings_for",
+            "list_family_membership_revocations_for",
+            "family_roster_signers",
+        ] {
+            let failing = FaultInjectingDirectory::new(inner.clone()).erroring(method);
+            match cc::stored_standing_at(&failing, CANON, now).await {
+                Err(Error::Backend(m)) => assert!(m.contains(method), "{method}: {m}"),
+                other => panic!(
+                    "{method}: a failed family-plane read is an error, never the cached \
+                     verdict: {other:?}"
+                ),
+            }
+            assert_eq!(
+                cache.computations(),
+                computed,
+                "{method}: nothing computed, nothing cached"
+            );
+        }
+    }
+
     /// (m) — MEDIUM-C: a second read with every input unchanged verifies no
     /// signature (the directory's standing cache serves it); a holder
     /// revocation in the accord family is a changed input, recomputes, and
@@ -3185,6 +3259,12 @@ mod run {
                         &f as &dyn FederationDirectory,
                     )
                     .await
+                }
+                #[tokio::test]
+                async fn i190_f1_a_failed_family_read_is_never_a_cache_hit() {
+                    let Some(d) = $fresh.await else { return };
+                    let inner: std::sync::Arc<dyn FederationDirectory> = std::sync::Arc::new(d);
+                    super::super::bodies::f1_a_failed_family_read_is_never_a_cache_hit(inner).await
                 }
                 #[tokio::test]
                 async fn i190_m() {
