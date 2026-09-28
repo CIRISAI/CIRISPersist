@@ -6373,6 +6373,7 @@ impl Engine {
     /// typed refusals of the door come back as `Refused { reason }`; a cosign
     /// for a head this node does not hold is stored as evidence
     /// (`HeldForUnknownHead`). Nothing is ever deleted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_lineage_head_cosign(
         &self,
         cosign: crate::federation::lineage_witness::LineageHeadCosign,
@@ -6396,6 +6397,7 @@ impl Engine {
     /// trust-root lineage: the judged (witnessed) index, the unwitnessed tail,
     /// any equivocation, the latest cosign instant. `None` when no signed row
     /// is held.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn lineage_head(
         &self,
         community_key_id: &str,
