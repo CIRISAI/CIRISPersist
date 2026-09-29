@@ -90,10 +90,12 @@ mod postgres {
     }
 
     /// I125b (PR #943 review) — a DIFFERENT row under an occupied id is
-    /// refused, and its projections are not committed: the subject it named is
-    /// never indexed to the stored row.
+    /// refused, and its projections are not committed: a consent grant's
+    /// peer (the `consent_peer_set` projection, which gates replication)
+    /// never enters the peer set from a row that was not stored.
     #[tokio::test]
     async fn i125b_a_refused_duplicate_projects_nothing_on_postgres() {
+        use crate::federation::consent_peer_set::test_support::grant;
         let Some(dsn) = crate::test_pg::empty_dsn() else {
             return;
         };
@@ -103,50 +105,32 @@ mod postgres {
         b.run_migrations().await.unwrap();
         let d: &dyn FederationDirectory = &b;
         let s = suffix();
-        let granter = format!("g943-{s}");
-        let (first, second) = (format!("r943a-{s}"), format!("r943b-{s}"));
-        register(d, &granter, &[it::USER]).await;
-        register(d, &first, &[it::PRIMITIVE]).await;
-        register(d, &second, &[it::PRIMITIVE]).await;
+        let node = format!("n943-{s}");
+        let (first, second) = (format!("p943a-{s}"), format!("p943b-{s}"));
+        ts::register_hybrid_key(d, &node).await;
         let id = uuid::Uuid::new_v4().to_string();
-        let mk = |to: &str| {
-            let mut r = signed_row(
-                &granter,
-                to,
-                attestation_type::DELEGATES_TO,
-                serde_json::json!({ "id": id, "scope": ["infra:serve"] }),
-            );
-            r.attestation_id = id.clone();
-            // the subject projection indexes `subject_key_ids`
-            r.subject_key_ids = vec![to.to_owned()];
-            ts::reseal(&mut r);
-            r
-        };
-        let stored = mk(&first);
         assert_eq!(
             d.put_attestation(SignedAttestation {
-                attestation: stored.clone(),
+                attestation: grant(&id, &node, &first),
             })
             .await
             .unwrap(),
             AttestationOutcome::Inserted
         );
-        let other = mk(&second);
-        assert_ne!(other.attested_key_id, stored.attested_key_id);
         let got = d
-            .put_attestation(SignedAttestation { attestation: other })
+            .put_attestation(SignedAttestation {
+                attestation: grant(&id, &node, &second),
+            })
             .await;
         assert!(
             !matches!(got, Ok(AttestationOutcome::Inserted)),
             "a different row under an occupied id is not stored: {got:?}"
         );
-        let for_second = d.list_attestations_for(&second).await.unwrap();
-        assert!(
-            !for_second.iter().any(|a| a.attestation_id == id),
-            "the refused row's subject projection was not committed: {for_second:?}"
+        assert_eq!(
+            d.list_consent_peers(&node).await.unwrap(),
+            vec![first],
+            "the refused row's peer never entered the replication peer set"
         );
-        let for_first = d.list_attestations_for(&first).await.unwrap();
-        assert!(for_first.iter().any(|a| a.attestation_id == id));
     }
 }
 
