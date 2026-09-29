@@ -303,5 +303,5 @@ sqlite	157	withdraws_admission_depth	12156340618215052621
 postgres	157	withdraws_admission_depth	12463337010685569261
 sqlite	158	community_cosignatures	213348730017454975
 postgres	158	community_cosignatures	10172012065790018845
-sqlite	159	lineage_head_cosigns	14198395716823344201
-postgres	159	lineage_head_cosigns	13253275158281215435
+sqlite	159	lineage_head_cosigns	1773651349682845568
+postgres	159	lineage_head_cosigns	8951756672550208017

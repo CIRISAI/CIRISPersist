@@ -81,6 +81,10 @@ pub enum LineageCosignRefusal {
     WitnessNotRegistered,
     /// The witness's `identity_type` does not contain `witness`.
     WitnessNotWitnessType,
+    /// The witness key was not valid at `signed_at`: before its `valid_from`,
+    /// at or after its `valid_until`, or revoked effective at or before it
+    /// (PR #943 review — a retired or compromised key confers nothing).
+    WitnessNotValidAt,
     /// The witness is a founder of the lineage (the independence rule).
     WitnessIsFounder,
     /// Hybrid verification over the envelope failed.
@@ -102,6 +106,7 @@ impl LineageCosignRefusal {
         match self {
             Self::WitnessNotRegistered => "witness_not_registered",
             Self::WitnessNotWitnessType => "witness_not_witness_type",
+            Self::WitnessNotValidAt => "witness_not_valid_at",
             Self::WitnessIsFounder => "witness_is_founder",
             Self::SignatureInvalid => "signature_invalid",
             Self::HeadInstantMismatch => "head_instant_mismatch",
@@ -143,7 +148,6 @@ pub async fn admit_lineage_head_cosign<F>(
 where
     F: crate::federation::FederationDirectory + ?Sized,
 {
-    use crate::federation::types::identity_type;
     let refused = |reason: LineageCosignRefusal| Ok(LineageCosignOutcome::Refused { reason });
     // 0. shape
     let hex64 = |s: &str| {
@@ -167,15 +171,20 @@ where
     else {
         return refused(LineageCosignRefusal::Malformed);
     };
-    // 1–2. the witness: registered, identity_type ⊇ {witness}
-    let Some(record) = directory.lookup_public_key(&cosign.witness_key_id).await? else {
-        return refused(LineageCosignRefusal::WitnessNotRegistered);
+    // 1–2. the witness: registered, identity_type ⊇ {witness}, and a key that
+    //      was VALID at the instant it signed (lifetime + revocations).
+    let principal = match witness_standing_at(directory, &cosign.witness_key_id, signed_at).await? {
+        WitnessStanding::NotRegistered => {
+            return refused(LineageCosignRefusal::WitnessNotRegistered)
+        }
+        WitnessStanding::NotWitness => return refused(LineageCosignRefusal::WitnessNotWitnessType),
+        WitnessStanding::NotValidAt => return refused(LineageCosignRefusal::WitnessNotValidAt),
+        WitnessStanding::Counts { principal } => principal,
     };
-    if !identity_type::set_contains(&record.identity_type, identity_type::WITNESS) {
-        return refused(LineageCosignRefusal::WitnessNotWitnessType);
-    }
-    // 3. independence: not a founder of the lineage (at the head, or on any
-    //    version of the chain this node holds) — a family's members likewise.
+    // 3. independence: the witness's PERSON is not a founder of the lineage (on
+    //    any version of the chain this node holds) — a family's members
+    //    likewise. Judged at the principal, so a founder's second,
+    //    witness-typed key does not launder the founder into a witness.
     let held = directory
         .lookup_signed_community(&cosign.lineage_key_id)
         .await?;
@@ -196,7 +205,10 @@ where
     if let Some(f) = &family {
         founders.extend(f.members.iter().map(|m| m.key_id.clone()));
     }
-    if founders.iter().any(|f| f == &cosign.witness_key_id) {
+    let founder_principals = principals_of(directory, &founders).await?;
+    if founder_principals.contains(&principal)
+        || founders.iter().any(|f| f == &cosign.witness_key_id)
+    {
         return refused(LineageCosignRefusal::WitnessIsFounder);
     }
     // 4. the signature, hybrid-Strict over the domain-labelled envelope
@@ -272,23 +284,179 @@ where
     })
 }
 
-/// `witnessed(head)` — at least `quorum` admitted cosigns for `head_digest`
-/// from DISTINCT witnesses, none of which is in `founders` (FSD §3.2). Pure.
-pub fn witnessed(
+/// The witness's standing at an instant (PR #943 review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitnessStanding {
+    /// No key record here.
+    NotRegistered,
+    /// A key whose `identity_type` does not contain `witness`.
+    NotWitness,
+    /// Outside its lifetime, or revoked effective at or before the instant.
+    NotValidAt,
+    /// Counts, as this person (the principal persist's fold resolves the key to).
+    Counts {
+        /// The witness's person.
+        principal: String,
+    },
+}
+
+/// A witness key's standing at `at`: registered, `identity_type ⊇ {witness}`,
+/// `valid_from <= at < valid_until`, no admitted revocation effective at or
+/// before `at`; and the PERSON it resolves to (occurrence axis, then
+/// owner-binding axis — [`crate::federation::admission::admission_identity_for_writer`]).
+/// An ambiguous owner resolves to the key itself.
+pub async fn witness_standing_at<F>(
+    directory: &F,
+    witness_key_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<WitnessStanding, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    use crate::federation::types::identity_type;
+    let Some(record) = directory.lookup_public_key(witness_key_id).await? else {
+        return Ok(WitnessStanding::NotRegistered);
+    };
+    if !identity_type::set_contains(&record.identity_type, identity_type::WITNESS) {
+        return Ok(WitnessStanding::NotWitness);
+    }
+    if record.valid_from > at || record.valid_until.is_some_and(|u| u <= at) {
+        return Ok(WitnessStanding::NotValidAt);
+    }
+    if directory
+        .revocations_for(witness_key_id)
+        .await?
+        .iter()
+        .any(|r| r.effective_at <= at)
+    {
+        return Ok(WitnessStanding::NotValidAt);
+    }
+    let principal =
+        crate::federation::admission::admission_identity_for_writer(directory, witness_key_id)
+            .await
+            .unwrap_or_else(|_| witness_key_id.to_owned());
+    Ok(WitnessStanding::Counts { principal })
+}
+
+/// Every key's person (see [`witness_standing_at`]); a key whose fold errors is
+/// its own person.
+pub async fn principals_of<F>(
+    directory: &F,
+    keys: &[String],
+) -> Result<std::collections::BTreeSet<String>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let mut out = std::collections::BTreeSet::new();
+    for k in keys {
+        out.insert(
+            crate::federation::admission::admission_identity_for_writer(directory, k)
+                .await
+                .unwrap_or_else(|_| k.clone()),
+        );
+    }
+    Ok(out)
+}
+
+/// A stored cosign that COUNTS: its witness key was valid at its `signed_at`,
+/// and — when this node holds the version it names — its `head_asserted_at` is
+/// that version's instant and its `prior`, when held, is an ancestor. A cosign
+/// stored for a head this node did not yet hold is re-checked here when the
+/// head arrives (PR #943 review: deferred rows pass the skipped checks before
+/// they count).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveCosign {
+    /// The head it names.
+    pub head_digest: String,
+    /// The prior it names.
+    pub prior: Option<String>,
+    /// The witness's person.
+    pub principal: String,
+    /// The witness key.
+    pub witness_key_id: String,
+    /// The witness's instant.
+    pub signed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Filter `cosigns` to the ones that count, against the versions this node
+/// holds (`known`: digest and signer-stamped instant, oldest first).
+pub async fn effective_cosigns<F>(
+    directory: &F,
     cosigns: &[LineageHeadCosign],
+    known: &[(String, chrono::DateTime<chrono::Utc>)],
+) -> Result<Vec<EffectiveCosign>, crate::federation::Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    let parse = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let mut out = Vec::new();
+    for c in cosigns {
+        let (Some(signed_at), Some(head_at)) = (parse(&c.signed_at), parse(&c.head_asserted_at))
+        else {
+            continue;
+        };
+        let WitnessStanding::Counts { principal } =
+            witness_standing_at(directory, &c.witness_key_id, signed_at).await?
+        else {
+            continue;
+        };
+        if let Some(pos) = known
+            .iter()
+            .position(|(d, _)| d == &c.head_digest_sha256_hex)
+        {
+            if known[pos].1 != head_at {
+                continue;
+            }
+            if let Some(p) = &c.prior_head_digest_sha256_hex {
+                if let Some(pp) = known.iter().position(|(d, _)| d == p) {
+                    if pp >= pos {
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(EffectiveCosign {
+            head_digest: c.head_digest_sha256_hex.clone(),
+            prior: c.prior_head_digest_sha256_hex.clone(),
+            principal,
+            witness_key_id: c.witness_key_id.clone(),
+            signed_at,
+        });
+    }
+    Ok(out)
+}
+
+/// `witnessed(head)` — at least `quorum` effective cosigns for `head_digest`
+/// from DISTINCT PERSONS, none of whom is a founder's person (FSD §3.2; PR
+/// #943 review: one identity's several keys count once). Pure.
+pub fn witnessed(
+    effective: &[EffectiveCosign],
     head_digest: &str,
-    founders: &[String],
+    founder_principals: &std::collections::BTreeSet<String>,
     quorum: u32,
 ) -> bool {
-    let mut distinct: Vec<&str> = cosigns
+    witnesses_of(effective, head_digest, founder_principals).len() as u32 >= quorum.max(1)
+}
+
+/// The distinct non-founder persons whose effective cosigns name `head_digest`.
+pub fn witnesses_of(
+    effective: &[EffectiveCosign],
+    head_digest: &str,
+    founder_principals: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let mut w: Vec<String> = effective
         .iter()
-        .filter(|c| c.head_digest_sha256_hex == head_digest)
-        .filter(|c| !founders.iter().any(|f| f == &c.witness_key_id))
-        .map(|c| c.witness_key_id.as_str())
+        .filter(|c| c.head_digest == head_digest)
+        .filter(|c| !founder_principals.contains(&c.principal))
+        .map(|c| c.principal.clone())
         .collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-    distinct.len() as u32 >= quorum.max(1)
+    w.sort();
+    w.dedup();
+    w
 }
 
 #[cfg(test)]
@@ -321,23 +489,37 @@ mod tests {
         assert_eq!(c.signing_envelope()["prior_head_digest_sha256_hex"], "bb");
     }
 
-    /// Witnessed counts DISTINCT non-founder witnesses against the quorum.
+    fn eff(head: &str, principal: &str) -> EffectiveCosign {
+        EffectiveCosign {
+            head_digest: head.into(),
+            prior: None,
+            principal: principal.into(),
+            witness_key_id: format!("{principal}-key"),
+            signed_at: "2026-09-28T00:00:01Z".parse().unwrap(),
+        }
+    }
+
+    /// Witnessed counts DISTINCT non-founder PERSONS against the quorum: one
+    /// person's two keys count once; a founder's person never counts.
     #[test]
-    fn witnessed_counts_distinct_independent_witnesses() {
-        let founders = vec!["f1".to_string(), "f2".to_string()];
+    fn witnessed_counts_distinct_independent_persons() {
+        let founders: std::collections::BTreeSet<String> =
+            ["f1".to_string(), "f2".to_string()].into();
+        let mut two_keys_one_person = eff("h", "w1");
+        two_keys_one_person.witness_key_id = "w1-second-key".into();
         let cs = vec![
-            cosign("h", "w1"),
-            cosign("h", "w1"),
-            cosign("h", "f1"),
-            cosign("g", "w2"),
+            eff("h", "w1"),
+            two_keys_one_person,
+            eff("h", "f1"),
+            eff("g", "w2"),
         ];
         assert!(witnessed(&cs, "h", &founders, 1));
         assert!(
             !witnessed(&cs, "h", &founders, 2),
-            "one distinct independent witness"
+            "one person with two keys is one witness"
         );
         assert!(witnessed(&cs, "g", &founders, 1), "w2 witnesses g");
-        let only_founder = vec![cosign("h", "f1"), cosign("h", "f2")];
+        let only_founder = vec![eff("h", "f1"), eff("h", "f2")];
         assert!(
             !witnessed(&only_founder, "h", &founders, 1),
             "a lineage witnessed solely by its founders is unwitnessed"

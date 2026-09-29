@@ -7899,11 +7899,23 @@ async fn issuer_owned_the_producer_when(
         Err(e) => return Err(e),
     }
     let bindings = directory.list_attestations_for(node).await?;
+    // PR #943 review (A→B→A) — a binding the issuer held once, withdrawn when
+    // the node moved to another owner, must not lift a row produced under that
+    // other owner after the issuer re-binds. Only a binding that is STILL LIVE
+    // (the same admitted-`withdraws` fold `owner_of` reads) and that was live
+    // at the row's instant (asserted at or before it, not expired by it)
+    // proves the issuer owned the node when the row was produced. A re-issued
+    // binding (withdraw + re-bind with no gap) fails closed here: the older
+    // edge is withdrawn and the newer one post-dates the row — the issuer's
+    // other rules still run.
+    let withdrawn = retracted_edge_ids(&bindings);
     Ok(bindings.iter().any(|b| {
         b.attesting_key_id == issuer
             && b.attestation_type == super::types::attestation_type::DELEGATES_TO
             && is_owner_binding_envelope(&b.attestation_envelope)
+            && !withdrawn.contains(b.attestation_id.as_str())
             && b.asserted_at <= target.asserted_at
+            && b.expires_at.is_none_or(|exp| exp > target.asserted_at)
     }))
 }
 
@@ -12229,6 +12241,9 @@ pub const INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING: &str = "liveness_margin_at_fou
 /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — the witness plane knows a head
 /// this node does not hold: fetch before extending (restore discipline).
 pub const TRUST_ROOT_RULE_BEHIND_WITNESS: &str = "lineage_head_behind_witness";
+/// v51.0.0 (CIRISPersist#939, CC 3.2 T7) — a stalled trust root is valid but
+/// non-admitting: a member widening waits for the margin to be restored.
+pub const TRUST_ROOT_RULE_STALLED_NON_ADMITTING: &str = "liveness_stalled_non_admitting";
 /// v50.0.0 (merge prep for #926) — rule: a supersede changes the record's
 /// trust-root grade (subkind, basis or entrenchment).
 pub const INFRA_RULE_GRADE_CHANGED: &str = "grade_changed";

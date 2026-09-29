@@ -20,7 +20,9 @@
 -- signer-stamped `head_asserted_at`, the prior head this witness last cosigned
 -- (absent on its first), and the hybrid signatures. `admitted_at` is node-local
 -- and is read by no verdict. Nothing here is ever deleted: a cosign that names
--- a competing head is the equivocation evidence.
+-- a competing head is the equivocation evidence. signed_at is part of the key:
+-- a witness RENEWS its cosign of an unchanged head at the charter's cadence, and
+-- each renewal is a row (the latest one is what `witness_silent_since` reads).
 CREATE TABLE IF NOT EXISTS federation_lineage_head_cosigns (
     lineage_key_id                TEXT NOT NULL,
     head_digest_sha256_hex        TEXT NOT NULL,
@@ -31,7 +33,7 @@ CREATE TABLE IF NOT EXISTS federation_lineage_head_cosigns (
     signature_classical           TEXT NOT NULL,
     signature_pqc                 TEXT,
     admitted_at                   TEXT NOT NULL,
-    PRIMARY KEY (lineage_key_id, head_digest_sha256_hex, witness_key_id)
+    PRIMARY KEY (lineage_key_id, head_digest_sha256_hex, witness_key_id, signed_at)
 );
 CREATE INDEX IF NOT EXISTS idx_lineage_head_cosigns_lineage
     ON federation_lineage_head_cosigns (lineage_key_id, signed_at);

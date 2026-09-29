@@ -6302,36 +6302,42 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("withdraws admission depth: {e}"))
             })?;
         }
-        // v51.0.0 (CIRISPersist#933) — the three projections run INSIDE the
-        // transaction, before the commit: a failed projection rolls the row
-        // back, never leaves a committed row unprojected.
-        // v17.4.0 (V106) — maintain the subject projection (federation tier).
-        pg_project_attestation_subjects(
-            &*tx,
-            &row,
-            &row.attestation_id,
-            crate::federation::types::attestation_tier::FEDERATION,
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
-        })?;
-        // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
-        // projection (grant upsert / withdraws-revocation fold). v51.0.0
-        // (CIRISPersist#933): INSIDE the row's transaction — it ran after the
-        // commit as an autocommit statement, so a failed projection left a
-        // committed `withdraws` whose revocation was never folded, and a retry
-        // dedups to `AlreadyHeld` without re-projecting (fail-open on "cease
-        // replicating on revoke"). sqlite always ran it inside.
-        #[cfg(test)]
-        self.test_hooks()
-            .fail_if_armed("pg_project_consent_peer_set")?;
-        pg_project_consent_peer_set(&*tx, &row).await.map_err(|e| {
-            crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
-        })?;
-        // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
-        // `blob_renditions` projection on the same client.
-        pg_project_rendition_row(&*tx, &row).await?;
+        // PR #943 review (Codex): project ONLY a row this statement stored.
+        // An occupied id (`ON CONFLICT DO NOTHING`, 0 rows) stored nothing, so
+        // its incoming (possibly different, about-to-be-refused) body must not
+        // reach the projections — the re-read below decides that case.
+        if inserted_rows > 0 {
+            // v51.0.0 (CIRISPersist#933) — the three projections run INSIDE the
+            // transaction, before the commit: a failed projection rolls the row
+            // back, never leaves a committed row unprojected.
+            // v17.4.0 (V106) — maintain the subject projection (federation tier).
+            pg_project_attestation_subjects(
+                &*tx,
+                &row,
+                &row.attestation_id,
+                crate::federation::types::attestation_tier::FEDERATION,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
+            })?;
+            // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+            // projection (grant upsert / withdraws-revocation fold). v51.0.0
+            // (CIRISPersist#933): INSIDE the row's transaction — it ran after the
+            // commit as an autocommit statement, so a failed projection left a
+            // committed `withdraws` whose revocation was never folded, and a retry
+            // dedups to `AlreadyHeld` without re-projecting (fail-open on "cease
+            // replicating on revoke"). sqlite always ran it inside.
+            #[cfg(test)]
+            self.test_hooks()
+                .fail_if_armed("pg_project_consent_peer_set")?;
+            pg_project_consent_peer_set(&*tx, &row).await.map_err(|e| {
+                crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
+            })?;
+            // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+            // `blob_renditions` projection on the same client.
+            pg_project_rendition_row(&*tx, &row).await?;
+        }
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attestation commit: {e}")))?;
@@ -8485,15 +8491,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         cosign: &crate::federation::lineage_witness::LineageHeadCosign,
     ) -> Result<bool, crate::federation::Error> {
         // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
-        let parse_rfc3339_instant = |s: &str, what: &str| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|t| t.with_timezone(&chrono::Utc))
-                .map_err(|e| {
-                    crate::federation::Error::InvalidArgument(format!("{what}: not RFC 3339: {e}"))
-                })
-        };
-        let head_at = parse_rfc3339_instant(&cosign.head_asserted_at, "head_asserted_at")?;
-        let signed_at = parse_rfc3339_instant(&cosign.signed_at, "signed_at")?;
         let admitted_at = chrono::Utc::now();
         let client = self
             .get_client()
@@ -8510,9 +8507,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &cosign.lineage_key_id,
                     &cosign.head_digest_sha256_hex,
                     &cosign.witness_key_id,
-                    &head_at,
+                    &cosign.head_asserted_at,
                     &cosign.prior_head_digest_sha256_hex,
-                    &signed_at,
+                    &cosign.signed_at,
                     &cosign.signature_classical,
                     &cosign.signature_pqc,
                     &admitted_at,
@@ -8553,17 +8550,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     lineage_key_id: r.try_get("lineage_key_id").map_err(col)?,
                     head_digest_sha256_hex: r.try_get("head_digest_sha256_hex").map_err(col)?,
                     witness_key_id: r.try_get("witness_key_id").map_err(col)?,
-                    head_asserted_at: r
-                        .try_get::<_, chrono::DateTime<chrono::Utc>>("head_asserted_at")
-                        .map_err(col)?
-                        .to_rfc3339(),
+                    head_asserted_at: r.try_get("head_asserted_at").map_err(col)?,
                     prior_head_digest_sha256_hex: r
                         .try_get("prior_head_digest_sha256_hex")
                         .map_err(col)?,
-                    signed_at: r
-                        .try_get::<_, chrono::DateTime<chrono::Utc>>("signed_at")
-                        .map_err(col)?
-                        .to_rfc3339(),
+                    signed_at: r.try_get("signed_at").map_err(col)?,
                     signature_classical: r.try_get("signature_classical").map_err(col)?,
                     signature_pqc: r.try_get("signature_pqc").map_err(col)?,
                 })

@@ -1021,7 +1021,7 @@ pub(crate) mod bodies {
         }
     }
 
-    fn widening_by(
+    pub(crate) fn widening_by(
         signers: &[&str],
         member: &str,
         role: Option<&str>,

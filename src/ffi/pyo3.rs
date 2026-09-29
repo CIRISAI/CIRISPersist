@@ -11704,9 +11704,10 @@ impl PyEngine {
         })
     }
 
-    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held
-    /// trust-root lineage as JSON (`judged`, `unwitnessed_tail`,
-    /// `equivocation`, `latest_cosign_at`), or `null` when no signed row is held.
+    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this
+    /// node holds a lineage for (a trust-root community or a conferring
+    /// family) as JSON (`witnessed_head`, `quorum`, `community` detail,
+    /// `latest_cosign_at`), or `null` when no lineage is held.
     fn lineage_head_json(&self, py: Python<'_>, community_key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -11720,22 +11721,18 @@ impl PyEngine {
                     BackendDispatch::Postgres(b) => {
                         let b = b.clone();
                         runtime.block_on(async move {
-                            crate::federation::canonical_community::lineage_witness_view(
-                                &*b, &id, now,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
+                            crate::federation::canonical_community::root_witness_view(&*b, &id, now)
+                                .await
+                                .map_err(federation_err_to_py)
                         })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(b) => {
                         let b = b.clone();
                         runtime.block_on(async move {
-                            crate::federation::canonical_community::lineage_witness_view(
-                                &*b, &id, now,
-                            )
-                            .await
-                            .map_err(federation_err_to_py)
+                            crate::federation::canonical_community::root_witness_view(&*b, &id, now)
+                                .await
+                                .map_err(federation_err_to_py)
                         })
                     }
                 }

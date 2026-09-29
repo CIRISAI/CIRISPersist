@@ -125,7 +125,7 @@ pub struct MemoryBackend {
 struct State {
     /// v51.0.0 (#938) — the witness plane, keyed (lineage, head, witness).
     lineage_head_cosigns: std::collections::BTreeMap<
-        (String, String, String),
+        (String, String, String, String),
         crate::federation::lineage_witness::LineageHeadCosign,
     >,
     /// Inserted `trace_events` rows, keyed by dedup tuple
@@ -6302,6 +6302,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             cosign.lineage_key_id.clone(),
             cosign.head_digest_sha256_hex.clone(),
             cosign.witness_key_id.clone(),
+            cosign.signed_at.clone(),
         );
         if state.lineage_head_cosigns.contains_key(&key) {
             return Ok(false);

@@ -6393,29 +6393,29 @@ impl Engine {
         }
     }
 
-    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held
-    /// trust-root lineage: the judged (witnessed) index, the unwitnessed tail,
-    /// any equivocation, the latest cosign instant. `None` when no signed row
-    /// is held.
+    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a ROOT this
+    /// node holds a lineage for — a trust-root community (its chain) or a
+    /// conferring family (its record): the witnessed head, the charter's
+    /// quorum, the community fold's detail (judged index, unwitnessed tail,
+    /// equivocation) and the latest counting cosign. `None` when no lineage is
+    /// held.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn lineage_head(
         &self,
-        community_key_id: &str,
+        root_key_id: &str,
     ) -> Result<
-        Option<crate::federation::canonical_community::WitnessedHead>,
+        Option<crate::federation::canonical_community::RootWitnessView>,
         crate::federation::Error,
     > {
-        use crate::federation::canonical_community::lineage_witness_view;
+        use crate::federation::canonical_community::root_witness_view;
         let now = chrono::Utc::now();
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                lineage_witness_view(arc.as_ref(), community_key_id, now).await
+                root_witness_view(arc.as_ref(), root_key_id, now).await
             }
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => {
-                lineage_witness_view(arc.as_ref(), community_key_id, now).await
-            }
+            BackendDispatch::Sqlite(arc) => root_witness_view(arc.as_ref(), root_key_id, now).await,
         }
     }
 

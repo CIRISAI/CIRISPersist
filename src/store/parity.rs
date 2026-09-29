@@ -218,10 +218,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // presented lineage head is absent, stale or unwitnessed under an armed
     // charter (`trust_root_head_stale`).
     ("check_attach_freshness", Class::Gate),
-    // v51.0.0 (#938) — Plumbing: the postgres cosign store re-parses the two
-    // RFC 3339 instants the DOOR already validated (`Malformed`) into
-    // TIMESTAMPTZ; it fails only on the substrate's own terms.
-    ("parse_rfc3339_instant", Class::Plumbing),
     // v50.0.0 (PR #921 review) — Plumbing: the `cfg(test)` rival write a
     // witness arms at a fixed point of a community write
     // (`store::test_hooks::RivalPoint`); never armed outside a test, so it
