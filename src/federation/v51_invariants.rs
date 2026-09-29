@@ -254,7 +254,9 @@ mod descriptor {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod owner_withdraw {
     use crate::federation::admission::resolve_withdraws_admission_rule;
-    use crate::federation::admission::steward_liveness_test_support::{register, signed_row};
+    use crate::federation::admission::steward_liveness_test_support::{
+        register, signed_row, withdraws_of,
+    };
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, identity_type as it, SignedAttestation};
     use crate::federation::{Error, FederationDirectory};
@@ -324,6 +326,56 @@ pub(crate) mod owner_withdraw {
                 .await
                 .unwrap(),
             1
+        );
+        // PR #943 review — A→B→A: the node moves to another owner, produces a
+        // row, and moves back. The first owner's old binding (withdrawn at the
+        // hand-off) predates the row but proves nothing about who owned the
+        // node when it was produced — refused. The owner at that instant is
+        // admitted while they own it.
+        let other = format!("ow-other-{s}");
+        register(d, &other, &[it::USER]).await;
+        let put = |a: crate::federation::Attestation| async move {
+            d.put_attestation(SignedAttestation { attestation: a })
+                .await
+                .expect("stored")
+        };
+        put(withdraws_of(&owner, &node, &format!("ob-{s}"))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        put(ts::owner_binding_attestation(
+            &format!("ob2-{s}"),
+            &other,
+            &node,
+        ))
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let under_other = signed_row(
+            &node,
+            &subject,
+            attestation_type::SCORES,
+            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
+        );
+        assert_eq!(
+            resolve_withdraws_admission_rule(d, &other, &under_other)
+                .await
+                .unwrap(),
+            1,
+            "the owner at the row's instant withdraws it"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        put(withdraws_of(&other, &node, &format!("ob2-{s}"))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        put(ts::owner_binding_attestation(
+            &format!("ob3-{s}"),
+            &owner,
+            &node,
+        ))
+        .await;
+        assert!(
+            matches!(
+                resolve_withdraws_admission_rule(d, &owner, &under_other).await,
+                Err(Error::WithdrawsNotAdmitted { .. })
+            ),
+            "A→B→A: the returning owner did not own the node when B's row was produced"
         );
     }
 

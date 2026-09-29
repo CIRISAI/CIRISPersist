@@ -2662,24 +2662,40 @@ where
         Err(Error::Unsupported { .. }) => return Ok(()),
         Err(e) => return Err(e),
     };
-    let chain = chain_of(held);
+    // PR #943 review (I193b) — two chains: `held` is the judged (witnessed)
+    // prefix the next amendment follows; the node may also STORE an
+    // unwitnessed tail beyond it. A cosign shows the node is behind when it
+    // names a head the node does not STORE whose prior is a stored version at
+    // or after the judged one — never for cosigns on the node's own tail.
+    let judged_len = chain_of(held).len();
+    let stored = lookup_signed_community(directory, id).await?;
+    let chain = chain_of(stored.as_ref().unwrap_or(held));
     let digests: Vec<String> = chain
         .iter()
         .map(|v| row_hash(&v.community))
         .collect::<Result<_, _>>()?;
+    let anchors = &digests[judged_len.saturating_sub(1).min(digests.len())..];
     let head_digest = digests.last().cloned().unwrap_or_default();
     if let Some(c) = cosigns.iter().find(|c| {
         !digests.contains(&c.head_digest_sha256_hex)
-            && c.prior_head_digest_sha256_hex.as_deref() == Some(head_digest.as_str())
+            && c.prior_head_digest_sha256_hex
+                .as_deref()
+                .is_some_and(|p| anchors.iter().any(|a| a == p))
     }) {
         return Err(violation(
             id,
             super::admission::TRUST_ROOT_RULE_BEHIND_WITNESS,
             format!(
-                "the witness plane holds a cosign by {} for head {} whose prior is this node's \
-                 head {}: this node is behind the witnessed lineage (a restore or a lag) — \
-                 fetch the witnessed head before extending (CC 3.2 T6 rc6, restore discipline)",
-                c.witness_key_id, c.head_digest_sha256_hex, head_digest
+                "the witness plane holds a cosign by {} for head {} whose prior {} is a \
+                 version this node holds (its head is {}): this node is behind the witnessed \
+                 lineage (a restore or a lag) — fetch the witnessed head before extending \
+                 (CC 3.2 T6 rc6, restore discipline)",
+                c.witness_key_id,
+                c.head_digest_sha256_hex,
+                c.prior_head_digest_sha256_hex
+                    .as_deref()
+                    .unwrap_or_default(),
+                head_digest
             ),
         ));
     }

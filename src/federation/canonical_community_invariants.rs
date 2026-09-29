@@ -1082,7 +1082,15 @@ pub(crate) mod bodies {
             }
             other => panic!("a withdrawn founder stalls the row: {other:?}"),
         }
-        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+        // v51.0.0 (CC 3.2 T7, PR #943 review): stalled is valid but
+        // non-admitting — still served, not live.
+        assert!(
+            !cc::resolve_community(d, CANON)
+                .await
+                .unwrap()
+                .expect("a stalled root is still served")
+                .live
+        );
         let retired = swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "kr-steward");
         founders_supersede(d, retired, &[FOUNDERS[0], FOUNDERS[1]])
             .await
@@ -1362,7 +1370,15 @@ pub(crate) mod bodies {
             }
             other => panic!("a version recording a resigned founder is Stalled: {other:?}"),
         }
-        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+        // v51.0.0 (CC 3.2 T7, PR #943 review): stalled is valid but
+        // non-admitting — still served, not live.
+        assert!(
+            !cc::resolve_community(d, CANON)
+                .await
+                .unwrap()
+                .expect("a stalled root is still served")
+                .live
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         // The lapse: v6's instant is after F2's resignation, but F2 was seated
         // at the birth, so the resignation still un-counts F2 on v6 → v7.
@@ -1458,7 +1474,15 @@ pub(crate) mod bodies {
             }
             other => panic!("the second resignation stalls the row: {other:?}"),
         }
-        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+        // v51.0.0 (CC 3.2 T7, PR #943 review): stalled is valid but
+        // non-admitting — still served, not live.
+        assert!(
+            !cc::resolve_community(d, CANON)
+                .await
+                .unwrap()
+                .expect("a stalled root is still served")
+                .live
+        );
     }
 
     /// F2 resigns, the others retire F2 and re-seat F2 through the record:
@@ -2153,7 +2177,15 @@ pub(crate) mod bodies {
             }
             other => panic!("a founder turned node-bearing stalls the row: {other:?}"),
         }
-        assert!(cc::resolve_community(d, CANON).await.unwrap().is_none());
+        // v51.0.0 (CC 3.2 T7, PR #943 review): stalled is valid but
+        // non-admitting — still served, not live.
+        assert!(
+            !cc::resolve_community(d, CANON)
+                .await
+                .unwrap()
+                .expect("a stalled root is still served")
+                .live
+        );
         let mut rebirth = canonical_row(&[FOUNDERS[0], FOUNDERS[1], "oc-steward"]);
         rebirth.founded_at = at("2026-09-25T00:00:00Z");
         let e = d
