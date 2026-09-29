@@ -21,6 +21,18 @@ Since edge v33 every self file whose sealed size crosses 1 MiB is a sealed DAG. 
 
 **I144** (two nodes, sqlite and postgres): A seals a three-chunk `self` stream; B, the owner's other device, receives the content sets, adopts the manifest as received and — pinned — reads the manifest JSON as the file; a stranger cannot open the chunk list; B opens it; promotion is refused naming `seq 0` while no chunk is held and `seq 1` after one; B adopts every chunk at the manifest's `(stream_id, seq)`, promotes, and reads the file whole and across a chunk boundary by range; a second promotion is `promoted: false`; the stranger still reads nothing. **I145**: `put_blob_chunks_signing` stores a plaintext DAG that reads whole and lists this node as a holder; the plaintext DAG is refused by the sealed opener.
 
+### Mutation round (on the committed tree; lane = I144 + I145 on sqlite and postgres)
+| # | Mutant | Verdict |
+|---|---|---|
+| D1 | the opener skips the tier authorization | EQUIVALENT by layering: the DEK recovery behind it refuses the same viewer (`read_for_viewer_sealed` needs the viewer's grant; the community path its epoch grant), so a stranger is `NotGranted` either way — the tier check stays as the read's first gate, as in `read_any_range_for_viewer` |
+| D2 | a missing chunk falls back to the first held row | KILLED by I144 on both backends, after the witness was sharpened: a missing chunk is named as missing, never as a mismatch of the held one |
+| D3 | the chunk sha is not checked against the manifest | KILLED by I144 (s2: the wrong chunk at the right position) |
+| D4 | sqlite: the floor does not flip the row | KILLED by I144 (the read after promotion) |
+| D5 | postgres: the floor does not flip the row | KILLED by I144 |
+| D6 | the orchestration's idempotency return dropped | EQUIVALENT by layering: the floor answers `Ok(false)` for a `chunk_dag` row itself |
+| D7 | `put_blob_chunks_signing` does not announce | KILLED by I145 on both backends |
+| D8 | sqlite: the floor's chunk-count check dropped | EQUIVALENT by layering: the orchestration requires every named chunk before it reaches the floor; the count is the floor's own defence, stated |
+
 ## [51.2.0] - UNRELEASED
 
 **PATCH — four backlog defects, no wire, hash or migration change.** Built directly, each witnessed RED-first on memory, sqlite and postgres, mutated on a committed tree.
