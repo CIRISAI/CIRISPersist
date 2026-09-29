@@ -1284,19 +1284,48 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
+        grant_deks_to_cohort(
+            backend,
+            &[(*at_rest_sha256, *dek)],
+            cohort_scope,
+            owner_or_family_key_id,
+        )
+        .await
+        .map(|(report, _)| report)
+    }
+
+    /// v51.0.0 (#923 amendment 2, D9) — wrap SEVERAL blobs' DEKs to ONE
+    /// recipient set, resolved once: the objects of one self/family stream
+    /// (its chunks and its manifest) share one access set by construction,
+    /// even when the occurrence set moved while the stream was written.
+    /// Grants already present are kept (the store is `ON CONFLICT DO
+    /// NOTHING`; a grant is never narrowed here). Returns the report and the
+    /// blobs on which a NEW recipient grant was written (each a content-axis
+    /// key-grant set the caller emits, #848 §14 / #850).
+    pub(crate) async fn grant_deks_to_cohort<B>(
+        backend: &B,
+        items: &[([u8; 32], [u8; DEK_LEN])],
+        cohort_scope: &str,
+        owner_or_family_key_id: &str,
+    ) -> Result<(GrantReport, Vec<[u8; 32]>), BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
         // persist self-retention: wrap the DEK under the content master so
         // the read door can recover it in the default tier.
         let content_master = backend.load_or_init_content_master().await?;
-        let self_wrap = wrap_dek_for_persist(&content_master, dek).map_err(map_at_rest_err)?;
-        backend
-            .put_at_rest_grant(
-                at_rest_sha256,
-                PERSIST_SELF_RECIPIENT,
-                WRAP_ALGORITHM_CONTENT_MASTER,
-                &self_wrap,
-                cohort_scope,
-            )
-            .await?;
+        for (sha, dek) in items {
+            let self_wrap = wrap_dek_for_persist(&content_master, dek).map_err(map_at_rest_err)?;
+            backend
+                .put_at_rest_grant(
+                    sha,
+                    PERSIST_SELF_RECIPIENT,
+                    WRAP_ALGORITHM_CONTENT_MASTER,
+                    &self_wrap,
+                    cohort_scope,
+                )
+                .await?;
+        }
 
         // Recipient cascade — wrap the DEK to each active recipient whose
         // occurrence carries valid encryption_pubkeys; fail-secure exclude
@@ -1306,14 +1335,25 @@ pub mod orchestrate {
         let recipients = resolve_recipients(backend, cohort_scope, owner_or_family_key_id).await?;
         let (targets, report) = partition_roster(recipients);
         let v2_algo = WRAP_ALGORITHM_V2;
-        for (occ_key_id, k) in targets {
-            let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, dek)
-                .map_err(map_at_rest_err)?;
-            backend
-                .put_at_rest_grant(at_rest_sha256, &occ_key_id, v2_algo, &wrapped, cohort_scope)
-                .await?;
+        let mut changed: Vec<[u8; 32]> = Vec::new();
+        for (sha, dek) in items {
+            let mut wrote = false;
+            for (occ_key_id, k) in &targets {
+                if items.len() > 1 && backend.get_at_rest_grant(sha, occ_key_id).await?.is_some() {
+                    continue;
+                }
+                let wrapped = wrap_dek_v2(&k.x25519_base64, &k.ml_kem_768_base64, dek)
+                    .map_err(map_at_rest_err)?;
+                backend
+                    .put_at_rest_grant(sha, occ_key_id, v2_algo, &wrapped, cohort_scope)
+                    .await?;
+                wrote = true;
+            }
+            if wrote {
+                changed.push(*sha);
+            }
         }
-        Ok(report)
+        Ok((report, changed))
     }
 
     /// One newcomer's wrap target for the [`rekey_for_newcomers`] walk:
@@ -2569,11 +2609,22 @@ pub mod orchestrate {
     /// authorization as the bytes read; a descriptor sealed for another blob
     /// (or the blob's own ciphertext) fails the AAD after authorization as a
     /// crypto-class error, never `NotGranted` (the viewer WAS authorized).
+    ///
+    /// `caller_aad` (#923 amendment 1, CIRISEdge#699 / #710 D8) — the
+    /// associated data of the ROW that references the blob, exactly as
+    /// [`read_any_for_viewer`] takes it. Before the descriptor opens, the
+    /// blob itself is authenticated under it (the first covering chunk, or
+    /// the whole envelope; the plaintext is discarded), so a pointer
+    /// TRANSPLANTED onto another row releases no name or format even though
+    /// the descriptor's own AAD stays the address digest (#114). A blob sealed
+    /// under a row's data refuses a missing or different `caller_aad`, AFTER
+    /// authorization, as the bytes read does.
     pub async fn open_descriptor_for_blob<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
         sealed: &[u8],
+        caller_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -2586,6 +2637,25 @@ pub mod orchestrate {
             )));
         }
         let dek = descriptor_dek_for_viewer(backend, at_rest_sha256, viewer_key_id).await?;
+        // #923 amendment 1 — the ROW's binding first: the bytes must open
+        // under the caller's associated data before their description does.
+        match crate::federation::chunk_dag_cascade::orchestrate::read_any_range_for_viewer(
+            backend,
+            at_rest_sha256,
+            viewer_key_id,
+            0,
+            0,
+            caller_aad,
+        )
+        .await
+        {
+            Ok(_) => {}
+            // an empty blob has no byte 0: authenticate the whole (empty) body
+            Err(BlobError::RangeNotSatisfiable { .. }) => {
+                read_any_for_viewer(backend, at_rest_sha256, viewer_key_id, caller_aad).await?;
+            }
+            Err(e) => return Err(e),
+        }
         let envelope = AtRestEnvelope::from_bytes(sealed).map_err(|e| {
             BlobError::InvalidArgument(format!("sealed descriptor is not an at-rest envelope: {e}"))
         })?;

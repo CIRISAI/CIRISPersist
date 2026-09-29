@@ -6461,11 +6461,17 @@ impl Engine {
     /// ciphertext presented as one, fails AFTER authorization as a crypto-class
     /// error, never `NotGranted`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// `caller_aad` (#923 amendment 1) — the associated data of the ROW that
+    /// references the blob, as [`read_blob_as`](Self::read_blob_as) takes it:
+    /// the blob is authenticated under it before the descriptor opens, so a
+    /// pointer transplanted onto another row reveals nothing.
     pub async fn open_descriptor_for_blob(
         &self,
         at_rest_sha256: &[u8; 32],
         viewer_key_id: &str,
         sealed: &[u8],
+        caller_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, crate::federation::BlobError> {
         self.ensure_minter_sentinels_resolved().await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
@@ -6474,11 +6480,25 @@ impl Engine {
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
-                open_descriptor_for_blob(arc.as_ref(), at_rest_sha256, viewer_key_id, sealed).await
+                open_descriptor_for_blob(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    sealed,
+                    caller_aad,
+                )
+                .await
             }
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => {
-                open_descriptor_for_blob(arc.as_ref(), at_rest_sha256, viewer_key_id, sealed).await
+                open_descriptor_for_blob(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    sealed,
+                    caller_aad,
+                )
+                .await
             }
         }
     }
@@ -6694,6 +6714,10 @@ impl Engine {
         }?;
         // #848 (§14) — the key follows the manifest.
         if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
+        }
+        // #923 amendment 2 (D9) — and the chunks the seal widened to it.
+        for axis in &r.chunk_key_grant_emissions {
             self.emit_key_grant(axis).await?;
         }
         Ok(r)

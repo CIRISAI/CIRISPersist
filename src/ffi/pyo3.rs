@@ -14279,13 +14279,18 @@ impl PyEngine {
     /// `viewer_key_id`: `sealed_b64` (the struct member) → the base64 plaintext.
     /// Same authorization as `read_blob_as`; a descriptor sealed for another
     /// blob fails after authorization as a backend/crypto error, never
-    /// `blob_not_granted`.
+    /// `blob_not_granted`. `caller_aad_b64` (#923 amendment 1): base64 of the
+    /// REFERENCING ROW's associated data, as `read_blob_as` takes it — the
+    /// blob is authenticated under it first, so a pointer transplanted onto
+    /// another row reveals no name or format.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, sealed_b64, caller_aad_b64=None))]
     fn open_descriptor_for_blob(
         &self,
         py: Python<'_>,
         at_rest_sha256_hex: &str,
         viewer_key_id: &str,
         sealed_b64: &str,
+        caller_aad_b64: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -14297,6 +14302,7 @@ impl PyEngine {
             let sealed = B64
                 .decode(sealed_b64)
                 .map_err(|e| PyValueError::new_err(format!("sealed_b64: {e}")))?;
+            let aad = decode_aad_b64(caller_aad_b64)?;
             py.detach(move || {
                 use crate::federation::at_rest_cascade::orchestrate::open_descriptor_for_blob;
                 let bytes = match &self.backend {
@@ -14304,14 +14310,28 @@ impl PyEngine {
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            open_descriptor_for_blob(backend.as_ref(), &sha, &viewer, &sealed).await
+                            open_descriptor_for_blob(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                &sealed,
+                                aad.as_deref(),
+                            )
+                            .await
                         })
                     }
                     #[cfg(feature = "sqlite")]
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            open_descriptor_for_blob(backend.as_ref(), &sha, &viewer, &sealed).await
+                            open_descriptor_for_blob(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                &sealed,
+                                aad.as_deref(),
+                            )
+                            .await
                         })
                     }
                 }

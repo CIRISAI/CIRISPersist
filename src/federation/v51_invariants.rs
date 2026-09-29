@@ -88,6 +88,64 @@ mod postgres {
         );
         assert!(d.get_attestation(&id).await.unwrap().is_some());
     }
+
+    /// I125b (PR #943 review) — a DIFFERENT row under an occupied id is
+    /// refused, and its projections are not committed: the subject it named is
+    /// never indexed to the stored row.
+    #[tokio::test]
+    async fn i125b_a_refused_duplicate_projects_nothing_on_postgres() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            return;
+        };
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let d: &dyn FederationDirectory = &b;
+        let s = suffix();
+        let granter = format!("g943-{s}");
+        let (first, second) = (format!("r943a-{s}"), format!("r943b-{s}"));
+        register(d, &granter, &[it::USER]).await;
+        register(d, &first, &[it::PRIMITIVE]).await;
+        register(d, &second, &[it::PRIMITIVE]).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mk = |to: &str| {
+            let mut r = signed_row(
+                &granter,
+                to,
+                attestation_type::DELEGATES_TO,
+                serde_json::json!({ "id": id, "scope": ["infra:serve"] }),
+            );
+            r.attestation_id = id.clone();
+            ts::reseal(&mut r);
+            r
+        };
+        let stored = mk(&first);
+        assert_eq!(
+            d.put_attestation(SignedAttestation {
+                attestation: stored.clone(),
+            })
+            .await
+            .unwrap(),
+            AttestationOutcome::Inserted
+        );
+        let other = mk(&second);
+        assert_ne!(other.attested_key_id, stored.attested_key_id);
+        let got = d
+            .put_attestation(SignedAttestation { attestation: other })
+            .await;
+        assert!(
+            !matches!(got, Ok(AttestationOutcome::Inserted)),
+            "a different row under an occupied id is not stored: {got:?}"
+        );
+        let for_second = d.list_attestations_for(&second).await.unwrap();
+        assert!(
+            !for_second.iter().any(|a| a.attestation_id == id),
+            "the refused row's subject projection was not committed: {for_second:?}"
+        );
+        let for_first = d.list_attestations_for(&first).await.unwrap();
+        assert!(for_first.iter().any(|a| a.attestation_id == id));
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -125,7 +183,7 @@ mod descriptor {
             .await
             .expect("the sealer of the bytes seals the descriptor");
         assert_eq!(
-            e.open_descriptor_for_blob(&sha, &l.node_a, &sealed)
+            e.open_descriptor_for_blob(&sha, &l.node_a, &sealed, None)
                 .await
                 .unwrap(),
             plaintext,
@@ -141,17 +199,53 @@ mod descriptor {
         }
         // a member's node (bob's, granted A's epoch on A — I188's precondition) opens it too
         assert_eq!(
-            e.open_descriptor_for_blob(&sha, &l.node_b, &sealed)
+            e.open_descriptor_for_blob(&sha, &l.node_b, &sealed, None)
                 .await
                 .unwrap(),
             plaintext,
             "a member who may open the bytes may open the descriptor"
         );
+        // #923 amendment 1 (CIRISEdge#710 D8) — a blob sealed under its ROW's
+        // associated data: the descriptor opens only under that row's data; a
+        // pointer transplanted onto another row (or presented with none)
+        // reveals nothing, refused AFTER authorization
+        let row1: &[u8] = b"row-1|author|2026-09-28T00:00:00Z|media";
+        let bound = e
+            .put_blob_scoped(
+                COMMUNITY,
+                Some(&l.comm),
+                b"row-bound bytes",
+                None,
+                Some(row1),
+            )
+            .await
+            .expect("a row-bound community blob");
+        let sealed_bound = e
+            .seal_descriptor_for_blob(&bound.at_rest_sha256, &l.node_a, plaintext)
+            .await
+            .unwrap();
+        assert_eq!(
+            e.open_descriptor_for_blob(&bound.at_rest_sha256, &l.node_a, &sealed_bound, Some(row1))
+                .await
+                .unwrap(),
+            plaintext,
+            "the referencing row opens its descriptor"
+        );
+        for other in [Some(&b"row-2|author|2026-09-28T00:00:01Z|media"[..]), None] {
+            let t = e
+                .open_descriptor_for_blob(&bound.at_rest_sha256, &l.node_a, &sealed_bound, other)
+                .await;
+            assert!(
+                !matches!(t, Ok(_) | Err(BlobError::NotGranted { .. })),
+                "a transplanted pointer ({other:?}) must reveal nothing: {t:?}"
+            );
+        }
         // a stranger is NotGranted on both doors and learns nothing
         let stranger = format!("em-stranger-{run}");
         assert!(
             matches!(
-                e.open_descriptor_for_blob(&sha, &stranger, &sealed).await,
+                e.open_descriptor_for_blob(&sha, &stranger, &sealed, None)
+                    .await,
                 Err(BlobError::NotGranted { .. })
             ),
             "a stranger cannot open the descriptor"
@@ -179,7 +273,7 @@ mod descriptor {
         );
         assert!(
             matches!(
-                e.open_descriptor_for_blob(&p.at_rest_sha256, &l.node_a, &sealed)
+                e.open_descriptor_for_blob(&p.at_rest_sha256, &l.node_a, &sealed, None)
                     .await,
                 Err(BlobError::InvalidArgument(_))
             ),
@@ -192,7 +286,7 @@ mod descriptor {
             .await
             .unwrap();
         let cross = e
-            .open_descriptor_for_blob(&r2.at_rest_sha256, &l.node_a, &sealed)
+            .open_descriptor_for_blob(&r2.at_rest_sha256, &l.node_a, &sealed, None)
             .await;
         assert!(
             !matches!(cross, Ok(_) | Err(BlobError::NotGranted { .. })),
@@ -202,7 +296,9 @@ mod descriptor {
         let Some(BlobBody::Inline(body)) = l.ba.get_blob(&sha).await.unwrap() else {
             panic!("inline body")
         };
-        let as_descriptor = e.open_descriptor_for_blob(&sha, &l.node_a, &body).await;
+        let as_descriptor = e
+            .open_descriptor_for_blob(&sha, &l.node_a, &body, None)
+            .await;
         assert!(
             !matches!(as_descriptor, Ok(_) | Err(BlobError::NotGranted { .. })),
             "the bytes' ciphertext is not a descriptor: {as_descriptor:?}"

@@ -153,6 +153,38 @@ pub(crate) mod bodies {
             .latest_cosign_at
             .unwrap();
         assert!(after > before, "the renewal advances latest_cosign_at");
+        // PR #943 review — the stored cosign is the SIGNED one, byte for byte
+        // (postgres kept the instants as TEXT: a TIMESTAMPTZ round trip
+        // truncates nanoseconds and re-renders the offset, and the signature
+        // over the listed row would no longer verify)
+        let listed = d.list_lineage_head_cosigns_for(CANON).await.unwrap();
+        assert!(listed.contains(&good), "listed as signed: {listed:?}");
+        // PR #943 review — a FAMILY lineage has a witness view too
+        let family = cc::accord_family_key_id();
+        let fam = d.lookup_family(family).await.unwrap().expect("seeded");
+        assert_eq!(
+            d.put_lineage_head_cosign(cosign_for(
+                family,
+                &fam.persist_row_hash,
+                fam.founded_at,
+                "w1",
+                None,
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap(),
+            Out::Inserted
+        );
+        let fv = cc::root_witness_view(d, family, chrono::Utc::now())
+            .await
+            .unwrap()
+            .expect("a family root has a witness view");
+        assert!(fv.community.is_none());
+        assert_eq!(
+            fv.witnessed_head.map(|(h, _)| h),
+            Some(fam.persist_row_hash.clone()),
+            "the family's head is witnessed"
+        );
         let refused = |o: Out, r: R| assert_eq!(o, Out::Refused { reason: r });
         // PR #943 review — a witness key not valid at the cosign's instant
         // (w2 registered NOW; the cosign is dated a day after the birth)
@@ -476,6 +508,18 @@ pub(crate) mod bodies {
             cc::StoredStanding::Rooted(_)
         ));
         let _ = edge;
+        // PR #943 review — an unrepresentable window (> i64::MAX seconds) is
+        // no bound, never a negative one that makes a fresh head stale
+        charter_the_accord_with(
+            d,
+            serde_json::json!({ "attach_window_secs": u64::MAX, "witness_quorum": 1 }),
+        )
+        .await;
+        let huge = "i194-huge";
+        ts::register_hybrid_key_as(d, huge, huge, identity_type::USER).await;
+        accept_edge(d, huge, Some(&head))
+            .await
+            .expect("a window beyond an instant's range never makes a head stale");
         // PR #943 review — the attach anchor is the WITNESSED head, not the
         // stored one: after an unwitnessed amendment the birth (witnessed)
         // attaches and the held-but-unwitnessed v2 does not.
