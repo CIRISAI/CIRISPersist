@@ -23,8 +23,11 @@ v48.0.0 (#860) put the "already on the plane" test in FRONT of the fold's short-
 ### Fixed — the scores-read log witness captures through a process-wide hub (CIRISPersist#940)
 `scores_read_log_parity_memory` installed its capture subscriber as the test thread's default and once captured `[]` under a full parallel `cargo test` — an event the door provably emits, unseen, with the same code green alone and on re-run. The capture is now a hub installed once as the process's global subscriber (nothing else in the crate sets one; a second attempt panics rather than capturing nothing); each witness tags its reads with a fresh id and reads back only its own entries, so the capture no longer depends on which thread a read logs from and concurrent witnesses cannot see each other. No `#[ignore]`, no retry. The exact interaction between a scoped dispatcher and the callsite interest cache under load was not pinned down; the hub removes the dependence rather than the symptom. No other `*_log_parity_*` test shares the old shape.
 
-### Fixed — the test harness
-`test_pg::empty_dsn` (shipped in v51.0.0) is unchanged; the CHANGELOG dates for 51.0.0 and 51.1.0 now read 2026-09-29.
+### Mutation round (on the committed tree; lane = I128 + I164 + rc5 + scores_read_audit on memory, sqlite, postgres)
+Seven mutants, seven killed: the admitted-rule clause dropped at each of the five Live filters (memory `list_scores`; sqlite and postgres `list_scores` and `list_attestations`) — each killed by I128 on that backend; the #936 short-circuit moved back behind the put door — killed by I164's unsigned retry on every backend; the #932 consent test dropped — killed by the rc5 H1 witness on every backend.
+
+### Housekeeping
+The CHANGELOG dates for 51.0.0 and 51.1.0 now read 2026-09-29.
 
 ## [51.1.0] - 2026-09-29
 
