@@ -368,8 +368,12 @@ pub(crate) mod bodies {
                     .promote_adopted_manifest_to_dag(&manifest, &b.key, None)
                     .await
                     .expect_err("two chunks missing");
+                // Named as MISSING, not as a mismatch of the chunk that IS held
+                // (mutant D2: a lookup that fell back to the first held row
+                // reported seq 1 "held as … manifest names …").
                 assert!(
-                    matches!(&e, BlobError::InvalidArgument(m) if m.contains("seq 1")),
+                    matches!(&e, BlobError::InvalidArgument(m)
+                        if m.contains("seq 1") && m.contains("not held") && !m.contains("held as")),
                     "{e:?}"
                 );
             }
