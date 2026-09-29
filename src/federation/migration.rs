@@ -283,13 +283,16 @@ pub fn fold_retractions_from(
             continue;
         };
         // A composer that targets a row from a DIFFERENT attester is a
-        // cross-attester chain; the read plane's Live filter requires
-        // same-attester, and so does this. A target absent from the corpus is
-        // ignored — there is nothing here to retract.
+        // cross-attester chain: it retracts only when the write door ADMITTED
+        // it (a `withdraws` carrying its admission rule — a subject's, an
+        // owner's, a delegate's). That is the rule the read plane's Live
+        // filter applies (v51.2.0, CIRISPersist#945), and this fold mirrors
+        // it. A target absent from the corpus is ignored — there is nothing
+        // here to retract.
         let Some(target_author) = authors.get(target) else {
             continue;
         };
-        if *target_author != winner.attesting_key_id {
+        if *target_author != winner.attesting_key_id && winner.withdraws_admission_rule.is_none() {
             continue;
         }
         retracted.insert(target.to_owned(), winner.attestation_id.clone());
@@ -1814,10 +1817,19 @@ mod tests {
         assert!(fold.is_retracted("t1"));
         assert_eq!(fold.retracted_by("t1"), Some("w1"));
 
-        // A DIFFERENT attester's composer does not — CEG §6.1 rule 4, and the
-        // same rule every backend's `LifecycleView::Live` filter applies.
-        let fold = fold_retractions(&[target, theirs]);
+        // A DIFFERENT attester's UNADMITTED composer does not — CEG §6.1 rule
+        // 4, and the same rule every backend's `LifecycleView::Live` filter
+        // applies …
+        let fold = fold_retractions(&[target.clone(), theirs.clone()]);
         assert!(!fold.is_retracted("t1"));
+        // … but one the write door admitted (v51.2.0, #945: a subject's
+        // rule-2 revocation, an owner's rule 1) retracts, as the Live filter
+        // now hides it.
+        let mut admitted = theirs;
+        admitted.withdraws_admission_rule = Some(2);
+        let fold = fold_retractions(&[target, admitted]);
+        assert!(fold.is_retracted("t1"));
+        assert_eq!(fold.retracted_by("t1"), Some("w2"));
     }
 
     #[test]
