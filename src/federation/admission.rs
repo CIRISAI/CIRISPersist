@@ -7883,8 +7883,8 @@ pub async fn resolve_withdraws_admission_rule_at(
 }
 
 /// v51.0.0 (CIRISPersist#941) — `issuer` is the single live owner of the node
-/// that attested `target` NOW, and held an owner-binding over that node that
-/// was asserted at or before `target`. See rule 1's principal lift in
+/// that attested `target` NOW, held an owner-binding over that node IN FORCE at
+/// `target`'s instant, and no other granter did (PR #943 review, A→B→A). See rule 1's principal lift in
 /// [`resolve_withdraws_admission_rule_at`]. An ambiguous owner is not a
 /// principal (`owner_of` errors → no lift, the other rules still run).
 async fn issuer_owned_the_producer_when(
@@ -7898,25 +7898,58 @@ async fn issuer_owned_the_producer_when(
         Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(false),
         Err(e) => return Err(e),
     }
-    let bindings = directory.list_attestations_for(node).await?;
-    // PR #943 review (A→B→A) — a binding the issuer held once, withdrawn when
-    // the node moved to another owner, must not lift a row produced under that
-    // other owner after the issuer re-binds. Only a binding that is STILL LIVE
-    // (the same admitted-`withdraws` fold `owner_of` reads) and that was live
-    // at the row's instant (asserted at or before it, not expired by it)
-    // proves the issuer owned the node when the row was produced. A re-issued
-    // binding (withdraw + re-bind with no gap) fails closed here: the older
-    // edge is withdrawn and the newer one post-dates the row — the issuer's
-    // other rules still run.
-    let withdrawn = retracted_edge_ids(&bindings);
-    Ok(bindings.iter().any(|b| {
-        b.attesting_key_id == issuer
-            && b.attestation_type == super::types::attestation_type::DELEGATES_TO
+    let rows = directory.list_attestations_for(node).await?;
+    // PR #943 review (A→B→A) — "the issuer owned the node when `target` was
+    // produced", asked of the whole ownership record, not of one binding's
+    // signer-chosen instant. A binding is IN FORCE at `t` from its
+    // `asserted_at` until the earlier of its `expires_at` and the first
+    // admitted `withdraws` that ends it (one naming it, or its granter's bare
+    // retraction against the node). The issuer must hold a binding in force at
+    // `target.asserted_at`, and NO OTHER granter may: a returning owner that
+    // backdates a fresh binding into another owner's era overlaps that
+    // owner's binding and is refused. Only the other owner can shorten its own
+    // era, by signing the withdrawal that ends it.
+    let t = target.asserted_at;
+    let ended_at = |b: &super::Attestation| -> Option<chrono::DateTime<chrono::Utc>> {
+        let withdrawn = rows
+            .iter()
+            .filter(|w| w.attestation_type == super::types::attestation_type::WITHDRAWS)
+            .filter(|w| {
+                match w
+                    .attestation_envelope
+                    .get("references_attestation_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(r) => r == b.attestation_id,
+                    // the granter's bare edge retraction against the node
+                    None => w.attesting_key_id == b.attesting_key_id,
+                }
+            })
+            .map(|w| w.asserted_at)
+            .min();
+        match (b.expires_at, withdrawn) {
+            (Some(e), Some(w)) => Some(e.min(w)),
+            (e, w) => e.or(w),
+        }
+    };
+    let in_force_at_t =
+        |b: &super::Attestation| b.asserted_at <= t && ended_at(b).is_none_or(|e| e > t);
+    let owner_bindings = rows.iter().filter(|b| {
+        b.attestation_type == super::types::attestation_type::DELEGATES_TO
             && is_owner_binding_envelope(&b.attestation_envelope)
-            && !withdrawn.contains(b.attestation_id.as_str())
-            && b.asserted_at <= target.asserted_at
-            && b.expires_at.is_none_or(|exp| exp > target.asserted_at)
-    }))
+    });
+    let mut issuer_in_force = false;
+    for b in owner_bindings {
+        if !in_force_at_t(b) {
+            continue;
+        }
+        if b.attesting_key_id == issuer {
+            issuer_in_force = true;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(issuer_in_force)
 }
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point

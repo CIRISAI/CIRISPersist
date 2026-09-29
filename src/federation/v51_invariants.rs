@@ -253,10 +253,10 @@ mod descriptor {
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod owner_withdraw {
-    use crate::federation::admission::resolve_withdraws_admission_rule;
     use crate::federation::admission::steward_liveness_test_support::{
         register, signed_row, withdraws_of,
     };
+    use crate::federation::admission::{owner_of, resolve_withdraws_admission_rule};
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{attestation_type, identity_type as it, SignedAttestation};
     use crate::federation::{Error, FederationDirectory};
@@ -327,29 +327,43 @@ pub(crate) mod owner_withdraw {
                 .unwrap(),
             1
         );
-        // PR #943 review — A→B→A: the node moves to another owner, produces a
-        // row, and moves back. The first owner's old binding (withdrawn at the
-        // hand-off) predates the row but proves nothing about who owned the
-        // node when it was produced — refused. The owner at that instant is
-        // admitted while they own it.
+        // PR #943 review — A→B→A. The first owner's binding LAPSES (its
+        // expiry), the node is bound to another owner and produces a row, that
+        // owner withdraws, and the first owner binds the node again. The old
+        // binding predates the row but was not in force when it was produced —
+        // refused. (A withdrawal by the granter itself retires every later edge
+        // from it too, so A→B→A through a self-withdrawal cannot return to A;
+        // the reachable paths are a lapse and a CC 4.3 reclaim.)
+        let node2 = format!("ow-node2-{s}");
         let other = format!("ow-other-{s}");
+        register(d, &node2, &[it::NODE]).await;
         register(d, &other, &[it::USER]).await;
         let put = |a: crate::federation::Attestation| async move {
             d.put_attestation(SignedAttestation { attestation: a })
                 .await
                 .expect("stored")
         };
-        put(withdraws_of(&owner, &node, &format!("ob-{s}"))).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let mut lapsing = ts::owner_binding_attestation(&format!("ob1-{s}"), &owner, &node2);
+        lapsing.expires_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(300));
+        ts::reseal(&mut lapsing);
+        put(lapsing).await;
+        assert_eq!(owner_of(d, &node2).await.unwrap(), Some(owner.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            owner_of(d, &node2).await.unwrap(),
+            None,
+            "precondition: the first binding lapsed"
+        );
         put(ts::owner_binding_attestation(
             &format!("ob2-{s}"),
             &other,
-            &node,
+            &node2,
         ))
         .await;
+        assert_eq!(owner_of(d, &node2).await.unwrap(), Some(other.clone()));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let under_other = signed_row(
-            &node,
+            &node2,
             &subject,
             attestation_type::SCORES,
             serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
@@ -362,14 +376,19 @@ pub(crate) mod owner_withdraw {
             "the owner at the row's instant withdraws it"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        put(withdraws_of(&other, &node, &format!("ob2-{s}"))).await;
+        put(withdraws_of(&other, &node2, &format!("ob2-{s}"))).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         put(ts::owner_binding_attestation(
             &format!("ob3-{s}"),
             &owner,
-            &node,
+            &node2,
         ))
         .await;
+        assert_eq!(
+            owner_of(d, &node2).await.unwrap(),
+            Some(owner.clone()),
+            "precondition: the first owner owns the node again, alone"
+        );
         assert!(
             matches!(
                 resolve_withdraws_admission_rule(d, &owner, &under_other).await,
@@ -377,6 +396,44 @@ pub(crate) mod owner_withdraw {
             ),
             "A→B→A: the returning owner did not own the node when B's row was produced"
         );
+        // the hand-off: C owns node3 and withdraws its binding; A binds node3
+        // and the node produces a row. C's era ended (its withdrawal) before
+        // the row, so A — the only owner in force then — retracts it.
+        let node3 = format!("ow-node3-{s}");
+        let prior = format!("ow-prior-{s}");
+        register(d, &node3, &[it::NODE]).await;
+        register(d, &prior, &[it::USER]).await;
+        put(ts::owner_binding_attestation(
+            &format!("obc-{s}"),
+            &prior,
+            &node3,
+        ))
+        .await;
+        put(withdraws_of(&prior, &node3, &format!("obc-{s}"))).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        put(ts::owner_binding_attestation(
+            &format!("oba-{s}"),
+            &owner,
+            &node3,
+        ))
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let under_a = signed_row(
+            &node3,
+            &subject,
+            attestation_type::SCORES,
+            serde_json::json!({ "id": uuid::Uuid::new_v4().to_string(), "dimension": "x:y" }),
+        );
+        assert_eq!(
+            resolve_withdraws_admission_rule(d, &owner, &under_a)
+                .await
+                .unwrap(),
+            1,
+            "a hand-off: the previous owner's era ended before the row"
+        );
+        // the fixture stamps every owner binding 2026-05-01 — i.e. A's ob3 is
+        // already BACKDATED into B's era; the refusal above is the backdating
+        // witness too (B's binding was in force at the row's instant)
     }
 
     macro_rules! runners {
