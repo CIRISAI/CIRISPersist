@@ -555,3 +555,125 @@ pub(crate) mod owner_withdraw {
         Some(b)
     });
 }
+
+/// **I127 (CIRISPersist#942)** — the custody view, on sqlite and postgres over
+/// the two-node community ladder (#876's fixture): a community blob lists the
+/// members of its sealing epoch and counts this node's copy; a self blob lists
+/// the owner's grant recipients and says its copies elsewhere are NOT
+/// observable (never "1 copy"); a commons blob lists no access and is
+/// observable; a stranger is `NotGranted` and learns nothing.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod custody {
+    use crate::federation::epoch_minter_invariants::bodies::{ladder, Pick};
+    use crate::federation::types::cohort_scope::{COMMUNITY, FEDERATION, SELF};
+    use crate::federation::{BlobError, BlobStorage, FederationDirectory};
+
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    }
+
+    pub(crate) async fn i127_the_custody_view<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>)
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let e = &l.engine_a;
+        // community
+        let c = e
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"room bytes", None, None)
+            .await
+            .unwrap();
+        let v = e.blob_custody(&c.at_rest_sha256, &l.node_a).await.unwrap();
+        assert_eq!(v.tier, "community_dek");
+        assert!(
+            v.held_here && v.copies_observable && v.copies_known >= 1,
+            "{v:?}"
+        );
+        let devices: Vec<&String> = v.access.iter().flat_map(|a| &a.devices).collect();
+        assert!(
+            devices.contains(&&l.node_a) && devices.contains(&&l.node_b),
+            "both members' devices: {v:?}"
+        );
+        assert!(v.access.iter().all(|a| a.via == "community_epoch_grant"));
+        // self
+        let s = e
+            .put_blob_scoped(SELF, Some(&l.alice), b"my bytes", None, None)
+            .await
+            .unwrap();
+        let v = e.blob_custody(&s.at_rest_sha256, &l.node_a).await.unwrap();
+        assert_eq!(v.tier, "invisible_encrypted");
+        assert!(v.held_here);
+        assert!(
+            !v.copies_observable,
+            "self/family copies are never countable today: {v:?}"
+        );
+        assert!(
+            v.why
+                .as_deref()
+                .is_some_and(|w| w.contains("never announced")),
+            "{v:?}"
+        );
+        assert!(
+            v.access
+                .iter()
+                .flat_map(|a| &a.devices)
+                .all(|d| d != crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT),
+            "persist's self-retention row never appears as a device"
+        );
+        assert!(
+            !v.access.is_empty(),
+            "the owner's device holds a key: {v:?}"
+        );
+        // commons
+        let p = e
+            .put_blob_scoped(FEDERATION, None, b"public bytes", None, None)
+            .await
+            .unwrap();
+        let v = e.blob_custody(&p.at_rest_sha256, &l.node_a).await.unwrap();
+        assert_eq!(v.tier, "plaintext");
+        assert!(v.access.is_empty() && v.copies_observable, "{v:?}");
+        // a stranger learns nothing
+        let stranger = format!("cu-stranger-{run}");
+        assert!(
+            matches!(
+                e.blob_custody(&c.at_rest_sha256, &stranger).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "a stranger is refused the community blob's custody view"
+        );
+        assert!(
+            matches!(
+                e.blob_custody(&s.at_rest_sha256, &stranger).await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "and the self blob's"
+        );
+    }
+
+    macro_rules! runners {
+        ($modname:ident, $dsns:expr, $pick:expr) => {
+            mod $modname {
+                use super::*;
+                #[tokio::test]
+                async fn i127() {
+                    let Some((a, b)) = $dsns else { return };
+                    i127_the_custody_view(&a, &b, &suffix(), $pick).await
+                }
+            }
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    runners!(
+        sqlite,
+        Some(("sqlite::memory:".to_owned(), "sqlite::memory:".to_owned())),
+        (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+            as Pick<crate::store::sqlite::SqliteBackend>
+    );
+    #[cfg(feature = "postgres")]
+    runners!(
+        postgres,
+        (|| Some((crate::test_pg::empty_dsn()?, crate::test_pg::empty_dsn()?)))(),
+        (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+            as Pick<crate::store::postgres::PostgresBackend>
+    );
+}

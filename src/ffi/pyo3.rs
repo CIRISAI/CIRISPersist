@@ -14228,6 +14228,48 @@ impl PyEngine {
         })
     }
 
+    /// v51.1.0 (CIRISPersist#942) — **the custody view** of one blob as JSON:
+    /// `{sha256_hex, tier, cohort_scope, size_bytes, held_here, access:
+    /// [{person_key_id, devices, via}], announced_holders: [{node_key_id,
+    /// size_bytes}], copies_known, copies_observable, why?}`. Authorized like
+    /// `read_blob_as` (`blob_not_granted` for a stranger). For self/family,
+    /// `copies_observable` is false: never render it as "1 copy".
+    fn blob_custody_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::blob_custody::blob_custody;
+                let view = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            blob_custody(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            blob_custody(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                serde_json::to_string(&view)
+                    .map_err(|e| PyRuntimeError::new_err(format!("custody encode: {e}")))
+            })
+        })
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — **seal a descriptor
     /// under an existing blob's DEK** as `key_id`: `plaintext_b64` (the JCS
     /// `{name, format, codec?}`, ≤ the descriptor cap) → the base64 at-rest
