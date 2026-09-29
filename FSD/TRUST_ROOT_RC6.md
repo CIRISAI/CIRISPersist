@@ -162,3 +162,30 @@ Domain label dropped (STH cosign accepted as lineage cosign); founder-witness ad
 | L1 | founding floor at N >= M | KILLED | memory::i195b, postgres::i195b, sqlite::i195b |
 
 Every mutant reverted with `git checkout --` before the next; a `signal: 9` lane is re-run alone (none occurred). Rows marked NOT-APPLIED had a stale pattern and were re-run after the fix (their later row stands).
+
+### 6.2 Review round (PR #943 — the 16 Codex findings, Edge's #923 amendments)
+
+Lane: rc6 + v51 + I190 + lineage_witness + I34b, on memory, sqlite and postgres. Each mutant was applied to a committed tree and reverted before the next.
+
+| # | Mutant | Verdict | Killed by |
+|---|---|---|---|
+| R1 | witness key validity window unchecked | KILLED | I191 (all backends) |
+| R2 | deferred cosign instant not re-checked | KILLED | I197 |
+| R3 | fork walk stops at the immediate prior | KILLED | I193b |
+| R4 | quorum counts keys, not persons | KILLED | I198, `witnessed_counts_distinct_independent_persons` |
+| R5 | witnessed mode engages below the quorum | KILLED | I192b, I198 |
+| R6 | a withdrawn owner binding proves ownership | SUPERSEDED | The guard was replaced by the in-force rule (R6b, R11, R12). A granter's own withdrawal retires every later edge from it, so that path cannot return to A. |
+| R6b | another owner in force at the row's instant ignored | KILLED | I126 A→B→A |
+| R7 | a stalled root is invalid | KILLED | I195 |
+| R8 | a stalled root admits members | KILLED | I195 |
+| R9 | the charter quorum is not in the standing cache key | KILLED | I192b |
+| R10 | restore discipline reads the judged prefix | KILLED | I192b |
+| R11 | a lapsed binding stays in force | KILLED | I126 |
+| R12 | a withdrawal never ends a binding | KILLED | I126 hand-off |
+| R13 | postgres projects a refused duplicate | KILLED | I125b (replication peer set) |
+| R14 | the descriptor opener ignores the row's `caller_aad` | KILLED | I122 transplant (sqlite, postgres) |
+| R15 | D9: the seal does not widen the chunks | KILLED | I34b (sqlite, postgres) |
+| R16 | the window cast wraps | EQUIVALENT | An envelope carries no integer above 2^53 (JCS numbers are doubles), so the cast never wraps. |
+| R16b | the window addition is unchecked | KILLED | I194 (2^53 − 1 s window) |
+
+Two first-draft witnesses were measuring a neighbouring fact, and both were rebuilt before their mutant was killed. I125b read the attested column, which the projections never write; it now reads the replication peer set. I194 used a `u64::MAX` window, which canonicalization turns into a float; it now uses 2^53 − 1. A third lane stall came from the harness (`empty_dsn` never reaped) and was fixed there.
