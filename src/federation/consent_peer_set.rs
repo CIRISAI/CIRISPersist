@@ -79,7 +79,7 @@ pub(crate) mod test_support {
     use crate::federation::types::{attestation_tier, attestation_type};
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
-    fn grant(id: &str, node: &str, peer: &str) -> Attestation {
+    pub(crate) fn grant(id: &str, node: &str, peer: &str) -> Attestation {
         // v21.3.0 (CIRISPersist#510 P1) — a `consent:replication:v1` row
         // now admits through the closed-grammar gate (`put_attestation`),
         // so this E7/#509 projection fixture needs a minimally-valid

@@ -2395,7 +2395,7 @@ pub mod test_support {
     /// (not just MemoryBackend). The graph-shaped counterpart to
     /// [`signed_canonical_record`] (which builds a `KeyRecord`); the trust-root
     /// legs are `delegates_to` / `scores` rows, not key records.
-    fn signed_trust_attestation(
+    pub(crate) fn signed_trust_attestation(
         id: &str,
         attester: &str,
         attested: &str,

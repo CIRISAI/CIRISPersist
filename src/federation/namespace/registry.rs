@@ -38,14 +38,14 @@ pub(super) const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc5";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc6";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "4f675532029663469f9c67694fb68d5d13742deb701d8337f1929ae8f6b7a907";
+    "fbb6c32e0ff0a4ef3aa0956c65882e9d0a50123827f9e1eee2c15858f84bd4de";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 148;
+pub const VENDORED_N_FAMILIES: usize = 149;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -60,13 +60,13 @@ pub const VENDORED_N_FAMILIES: usize = 148;
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb";
+    "c22dc0874b4c5ade08d8a691effdee36464eeaa76e3c57de28bdd0d0b2328d3e";
 
 /// The CIRISConstitution commit both vendored manifests were copied from:
 /// `c60d0a6` "Cut CC 1.0-rc5, released as guidance (#125)" on `main`, which
 /// the `v1.0-rc5` tag names. (The slice first vendored PR #113's unmerged
 /// head `4b624513`; the released manifests replaced it byte-for-byte.)
-pub const VENDORED_CC_COMMIT: &str = "c60d0a6a0dfd3a0f2f2c3970b4148bf5b8777b3f";
+pub const VENDORED_CC_COMMIT: &str = "651140a2a553e2276bf5d80c77a32feaa9968f75";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -540,6 +540,7 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "capacity:core_identity",
     "capacity:incompleteness_awareness",
     "capacity:integrity",
+    "capacity:relay_delivery",
     "capacity:resilience",
     "capacity:sustained_coherence",
     "capacity_assurance:reversible_excluded:{domain}:{version}",
@@ -832,6 +833,10 @@ mod tests {
         let mut grammar_meta = meta.clone();
         grammar_meta.remove("source_sha256");
         grammar_meta.remove("registry_sha256");
+        // v51.0.0 — CC's recipe at 651140a (`tools/build_cc_namespace.py`,
+        // rc6) also excludes `cc_version`: a version bump is not a grammar
+        // change. The recipe moves with the bytes it hashes.
+        grammar_meta.remove("cc_version");
         let grammar = serde_json::json!({
             "_meta": serde_json::Value::Object(grammar_meta),
             "families": root["families"].clone(),
@@ -1495,7 +1500,7 @@ mod tests {
                 (
                     "compare",
                     "prose (\"byte-exact; consumers MUST NOT case-fold\") — the matcher's \
-                     byte-exact compare IS this rule, replayed by the 962 vectors",
+                     byte-exact compare IS this rule, replayed by the 968 vectors",
                 ),
                 (
                     "placeholder_classes",

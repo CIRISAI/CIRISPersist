@@ -217,7 +217,7 @@ const TRUST_JOB_DIMENSIONS: &[&str] = &[
 ///   than pick a winner.
 /// - carries no job label → yes; direction inference stands, which is what
 ///   keeps this additive for every row written before v23.0.0.
-fn job_dimension_admits(envelope: &serde_json::Value, expected: &str) -> bool {
+pub(crate) fn job_dimension_admits(envelope: &serde_json::Value, expected: &str) -> bool {
     match super::admission::envelope_dimension(envelope) {
         Some(d) if TRUST_JOB_DIMENSIONS.contains(&d) => d == expected,
         _ => true,

@@ -6367,6 +6367,142 @@ impl Engine {
         }
     }
 
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6; `TRUST_ROOT_RC6.md` §2.1) —
+    /// **the lineage-head cosign door**: admit one witness's cosignature over a
+    /// conferring lineage's head (`ciris.lineage_head_cosign.v1`). The eight
+    /// typed refusals of the door come back as `Refused { reason }`; a cosign
+    /// for a head this node does not hold is stored as evidence
+    /// (`HeldForUnknownHead`). Nothing is ever deleted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_lineage_head_cosign(
+        &self,
+        cosign: crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<crate::federation::lineage_witness::LineageCosignOutcome, crate::federation::Error>
+    {
+        use crate::federation::lineage_witness::admit_lineage_head_cosign;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                admit_lineage_head_cosign(arc.as_ref(), &cosign, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                admit_lineage_head_cosign(arc.as_ref(), &cosign, now).await
+            }
+        }
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a ROOT this
+    /// node holds a lineage for — a trust-root community (its chain) or a
+    /// conferring family (its record): the witnessed head, the charter's
+    /// quorum, the community fold's detail (judged index, unwitnessed tail,
+    /// equivocation) and the latest counting cosign. `None` when no lineage is
+    /// held.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn lineage_head(
+        &self,
+        root_key_id: &str,
+    ) -> Result<
+        Option<crate::federation::canonical_community::RootWitnessView>,
+        crate::federation::Error,
+    > {
+        use crate::federation::canonical_community::root_witness_view;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                root_witness_view(arc.as_ref(), root_key_id, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => root_witness_view(arc.as_ref(), root_key_id, now).await,
+        }
+    }
+
+    /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114; `MEDIA_SOURCE.md`
+    /// §9.3) — **seal a small descriptor under an existing blob's DEK.** The
+    /// caller is authorized exactly as [`read_blob_as`](Self::read_blob_as)
+    /// authorizes a viewer (the row's recorded tier, then the withdrawn
+    /// check); the DEK is the BLOB's, recovered by the tier's own resolver
+    /// (no edge-derived key, no seed); the associated data is the
+    /// persist-framed address digest (`ciris.sealed_descriptor.v1 ‖ sha256`),
+    /// so a descriptor lifted onto another blob does not open. Returns the raw
+    /// at-rest envelope bytes the producer base64s into
+    /// `media.sealed_descriptor`. A plaintext row is `InvalidArgument`
+    /// (nothing to seal under); a stranger is `NotGranted`; a plaintext over
+    /// the descriptor cap is `InvalidArgument`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn seal_descriptor_for_blob(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        key_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::at_rest_cascade::orchestrate::seal_descriptor_for_blob;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                seal_descriptor_for_blob(arc.as_ref(), at_rest_sha256, key_id, plaintext).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                seal_descriptor_for_blob(arc.as_ref(), at_rest_sha256, key_id, plaintext).await
+            }
+        }
+    }
+
+    /// v51.0.0 (CIRISPersist#923) — the reverse of
+    /// [`seal_descriptor_for_blob`](Self::seal_descriptor_for_blob): open a
+    /// `sealed_descriptor` as `viewer_key_id`, under the same authorization as
+    /// the bytes read. A descriptor sealed for another blob, or the blob's own
+    /// ciphertext presented as one, fails AFTER authorization as a crypto-class
+    /// error, never `NotGranted`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    ///
+    /// `caller_aad` (#923 amendment 1) — the associated data of the ROW that
+    /// references the blob, as [`read_blob_as`](Self::read_blob_as) takes it:
+    /// the blob is authenticated under it before the descriptor opens, so a
+    /// pointer transplanted onto another row reveals nothing.
+    pub async fn open_descriptor_for_blob(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        sealed: &[u8],
+        caller_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, crate::federation::BlobError> {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::at_rest_cascade::orchestrate::open_descriptor_for_blob;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                open_descriptor_for_blob(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    sealed,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                open_descriptor_for_blob(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    sealed,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
     /// #832 (`BLOB_ENCRYPTION_AT_REST.md` §12.4) — **the decrypting range
     /// read**: plaintext bytes `[range_start, range_end_inclusive]` of any
     /// blob, as `viewer_key_id`. Authorizes by the row's tier before any
@@ -6578,6 +6714,10 @@ impl Engine {
         }?;
         // #848 (§14) — the key follows the manifest.
         if let Some(axis) = &r.key_grant_emission {
+            self.emit_key_grant(axis).await?;
+        }
+        // #923 amendment 2 (D9) — and the chunks the seal widened to it.
+        for axis in &r.chunk_key_grant_emissions {
             self.emit_key_grant(axis).await?;
         }
         Ok(r)
@@ -14988,6 +15128,54 @@ mod tests {
         crate::federation::verify_row_hybrid_signature(&*sq, &after)
             .await
             .expect("W6/W9: the actor's signature AND the node's co-scrub verify at ingest");
+    }
+
+    /// v51.0.0 (CIRISPersist#929, CC 5.4.6) — a widening never strips the
+    /// CC 2.4.1.2 purpose marker: `delegation_purpose` is a protected member,
+    /// so a strip naming it is `WideningMalformed` before anything is signed,
+    /// and the prior is untouched. A receiving peer that lacks the self-scope
+    /// prior reads exactly this marker to run the minors gate on a widening.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_widening_never_strips_the_delegation_purpose_marker() {
+        use crate::federation::FederationDirectory;
+        let (engine, sq, node) = engine_with_registered_node("node-929").await;
+        let id = sq
+            .attestation_upsert_local(local_scores_input(&node))
+            .await
+            .unwrap();
+        let local = sq.get_attestation(&id).await.unwrap().expect("row");
+        engine
+            .enter_mesh(
+                &id,
+                &producer_ci(&local, crate::federation::Audience::SelfOnly),
+                None,
+            )
+            .await
+            .unwrap();
+        let prior = sq.get_attestation(&id).await.unwrap().expect("row");
+        let err = engine
+            .widen_audience(
+                &id,
+                &producer_ci(&prior, crate::federation::Audience::Species),
+                None,
+                &["delegation_purpose".to_string()],
+            )
+            .await
+            .expect_err("stripping the purpose marker is refused");
+        assert!(
+            matches!(err, crate::federation::Error::WideningMalformed { .. }),
+            "{err}"
+        );
+        assert!(
+            crate::federation::crossing::WIDENING_PROTECTED_MEMBERS.contains(&"delegation_purpose"),
+            "the marker is on the protected list"
+        );
+        let after = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            after.persist_row_hash, prior.persist_row_hash,
+            "the prior is untouched"
+        );
     }
 
     /// W7/W8 at the engine: a widening is a NEW `supersedes` row; the prior is

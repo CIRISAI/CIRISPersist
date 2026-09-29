@@ -11656,6 +11656,92 @@ impl PyEngine {
         })
     }
 
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — **the lineage-head cosign
+    /// door**: `payload_json` is a `ciris.lineage_head_cosign.v1` object
+    /// (`lineage_key_id`, `head_digest_sha256_hex`, `head_asserted_at`,
+    /// `prior_head_digest_sha256_hex?`, `signed_at`, `witness_key_id`,
+    /// `signature_classical`, `signature_pqc`). Returns the typed outcome as
+    /// JSON: `{"outcome": "inserted" | "unchanged" | "held_for_unknown_head" |
+    /// "refused", "reason"?: <rule>}`. Nothing is ever deleted.
+    fn put_lineage_head_cosign_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let cosign: crate::federation::lineage_witness::LineageHeadCosign =
+                serde_json::from_str(payload_json).map_err(|e| {
+                    PyValueError::new_err(format!("lineage head cosign decode: {e}"))
+                })?;
+            let backend = self.backend.clone();
+            let outcome = py.detach(move || {
+                let now = chrono::Utc::now();
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::lineage_witness::admit_lineage_head_cosign(
+                                &*b, &cosign, now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::lineage_witness::admit_lineage_head_cosign(
+                                &*b, &cosign, now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })
+                    }
+                }
+            })?;
+            serde_json::to_string(&outcome)
+                .map_err(|e| PyRuntimeError::new_err(format!("outcome encode: {e}")))
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this
+    /// node holds a lineage for (a trust-root community or a conferring
+    /// family) as JSON (`witnessed_head`, `quorum`, `community` detail,
+    /// `latest_cosign_at`), or `null` when no lineage is held.
+    fn lineage_head_json(&self, py: Python<'_>, community_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let id = community_key_id.to_owned();
+            let backend = self.backend.clone();
+            let view = py.detach(move || {
+                let now = chrono::Utc::now();
+                match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::root_witness_view(&*b, &id, now)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => {
+                        let b = b.clone();
+                        runtime.block_on(async move {
+                            crate::federation::canonical_community::root_witness_view(&*b, &id, now)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })
+                    }
+                }
+            })?;
+            serde_json::to_string(&view)
+                .map_err(|e| PyRuntimeError::new_err(format!("view encode: {e}")))
+        })
+    }
+
     // ── #302 (FSD-004) accord live-quorum write-through (CIRISServer#122) ──
     //
     // CIRISServer's Phase-3 runtime writes the verify-core wire objects +
@@ -14133,6 +14219,119 @@ impl PyEngine {
                         runtime.block_on(async move {
                             read_any_for_viewer(backend.as_ref(), &sha, &viewer, aad.as_deref())
                                 .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — **seal a descriptor
+    /// under an existing blob's DEK** as `key_id`: `plaintext_b64` (the JCS
+    /// `{name, format, codec?}`, ≤ the descriptor cap) → the base64 at-rest
+    /// envelope for `media.sealed_descriptor`. Authorized like `read_blob_as`
+    /// (`blob_not_granted` for a stranger); a plaintext row raises
+    /// `ValueError` (nothing to seal under).
+    fn seal_descriptor_for_blob(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        key_id: &str,
+        plaintext_b64: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let key = key_id.to_owned();
+            let plaintext = B64
+                .decode(plaintext_b64)
+                .map_err(|e| PyValueError::new_err(format!("plaintext_b64: {e}")))?;
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::seal_descriptor_for_blob;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            seal_descriptor_for_blob(backend.as_ref(), &sha, &key, &plaintext).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            seal_descriptor_for_blob(backend.as_ref(), &sha, &key, &plaintext).await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                Ok(B64.encode(bytes))
+            })
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#923) — **open a `sealed_descriptor`** as
+    /// `viewer_key_id`: `sealed_b64` (the struct member) → the base64 plaintext.
+    /// Same authorization as `read_blob_as`; a descriptor sealed for another
+    /// blob fails after authorization as a backend/crypto error, never
+    /// `blob_not_granted`. `caller_aad_b64` (#923 amendment 1): base64 of the
+    /// REFERENCING ROW's associated data, as `read_blob_as` takes it — the
+    /// blob is authenticated under it first, so a pointer transplanted onto
+    /// another row reveals no name or format.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, sealed_b64, caller_aad_b64=None))]
+    fn open_descriptor_for_blob(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        sealed_b64: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let sealed = B64
+                .decode(sealed_b64)
+                .map_err(|e| PyValueError::new_err(format!("sealed_b64: {e}")))?;
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            py.detach(move || {
+                use crate::federation::at_rest_cascade::orchestrate::open_descriptor_for_blob;
+                let bytes = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            open_descriptor_for_blob(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                &sealed,
+                                aad.as_deref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            open_descriptor_for_blob(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                &sealed,
+                                aad.as_deref(),
+                            )
+                            .await
                         })
                     }
                 }
@@ -33389,6 +33588,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::TraceDimensionInvalid { .. } => PyValueError::new_err(kind),
         // v19.0.0 — caller-fixable: add the pre-rotation commitment / fix binding.
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
+        crate::federation::Error::TrustRootHeadStale { .. } => PyValueError::new_err(kind),
         // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
         crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
         // v31.0.0 (CIRISPersist#648) — NOT caller-fixable by fixing the

@@ -118,6 +118,11 @@ pub struct SealStreamScopedResult {
     /// #848 (§14) — the `KeyGrant` set the door emits after this seal, if
     /// the fan-out changed (see `PutBlobScopedResult::key_grant_emission`).
     pub key_grant_emission: Option<crate::federation::key_grant::KeyGrantAxis>,
+    /// v51.0.0 (#923 amendment 2, D9) — the chunk rows the seal granted to
+    /// the stream's one access set that lacked it (a self/family stream
+    /// written across an occurrence change). Each is a content-axis key-grant
+    /// set the caller emits, as it emits [`Self::key_grant_emission`].
+    pub chunk_key_grant_emissions: Vec<crate::federation::key_grant::KeyGrantAxis>,
 }
 
 impl SealStreamScopedResult {
@@ -135,10 +140,11 @@ impl SealStreamScopedResult {
 pub mod orchestrate {
     use super::*;
     use crate::federation::at_rest_cascade::orchestrate::{
-        authorize_viewer_by_tier, grant_dek_to_cohort, read_for_viewer_sealed,
+        authorize_viewer_by_tier, grant_dek_to_cohort, grant_deks_to_cohort, read_for_viewer_sealed,
     };
     use crate::federation::at_rest_cascade::{
-        fresh_dek, resolve_write_tier, seal, sealed_plaintext_len, AtRestEnvelope, AtRestError,
+        fresh_dek, resolve_write_tier, seal, sealed_plaintext_len, unwrap_dek_for_persist,
+        AtRestEnvelope, AtRestError, PERSIST_SELF_RECIPIENT,
     };
     use crate::federation::blobs::{
         BlobHead, ChunkManifest, ChunkRef, EpochBinding, ManifestRowSpec, StreamChunkRef,
@@ -470,6 +476,7 @@ pub mod orchestrate {
                     excluded: Vec::new(),
                     roster: RosterPartition::default(),
                     key_grant_emission: None,
+                    chunk_key_grant_emissions: Vec::new(),
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -497,7 +504,36 @@ pub mod orchestrate {
                         None,
                     )
                     .await?;
-                let report = grant_dek_to_cohort(backend, &sha, cohort_scope, owner, &dek).await?;
+                // #923 amendment 2 (D9) — ONE access set per stream: the
+                // manifest and every chunk are wrapped to the recipient set
+                // resolved ONCE, here. A chunk written before an occurrence
+                // joined gains it; the name (sealed under the manifest's DEK)
+                // and the bytes are one fact. Each chunk DEK is recovered
+                // through persist's self-retention, as the rekey walk does.
+                let content_master = backend.load_or_init_content_master().await?;
+                let mut items: Vec<([u8; 32], [u8; 32])> = vec![(sha, dek)];
+                for c in &listing.chunks {
+                    let self_grant = backend
+                        .get_at_rest_grant(&c.chunk_sha, PERSIST_SELF_RECIPIENT)
+                        .await?
+                        .ok_or_else(|| {
+                            BlobError::Backend(format!(
+                                "seal_stream_scoped: chunk {} of stream {stream_id} has no \
+                                 persist self-retention row (corrupt cascade state)",
+                                c.seq
+                            ))
+                        })?;
+                    let chunk_dek = unwrap_dek_for_persist(&content_master, &self_grant.1)
+                        .map_err(map_at_rest_err)?;
+                    items.push((c.chunk_sha, chunk_dek));
+                }
+                let (report, changed) =
+                    grant_deks_to_cohort(backend, &items, cohort_scope, owner).await?;
+                let axis = |s: &[u8; 32]| crate::federation::key_grant::KeyGrantAxis::Content {
+                    at_rest_sha256: hex::encode(s),
+                    cohort_scope: cohort_scope.to_owned(),
+                    owner_key_id: owner.to_owned(),
+                };
                 Ok(SealStreamScopedResult {
                     manifest_sha256: sha,
                     tier,
@@ -509,11 +545,12 @@ pub mod orchestrate {
                     roster: report.roster,
                     // #848 (§14, content axis) — the sealed manifest has its
                     // own per-write DEK and grants; a new set every time.
-                    key_grant_emission: Some(crate::federation::key_grant::KeyGrantAxis::Content {
-                        at_rest_sha256: hex::encode(sha),
-                        cohort_scope: cohort_scope.to_owned(),
-                        owner_key_id: owner.to_owned(),
-                    }),
+                    key_grant_emission: Some(axis(&sha)),
+                    chunk_key_grant_emissions: changed
+                        .iter()
+                        .filter(|s| **s != sha)
+                        .map(axis)
+                        .collect(),
                 })
             }
             CryptoTier::CommunityDek => {
@@ -586,6 +623,7 @@ pub mod orchestrate {
                                         epoch: dek_epoch,
                                     }
                                 }),
+                                chunk_key_grant_emissions: Vec::new(),
                             });
                         }
                         Err(BlobError::EpochNotCurrent { .. }) => {
@@ -1902,10 +1940,13 @@ pub mod invariants {
             );
         }
 
-        // A second occurrence of the owner that arrived AFTER the chunk was
-        // written and BEFORE the seal: granted on the manifest, on no chunk
-        // row. The reader checks the CHUNK ROW's grant (I38 for self): it is
-        // refused until `rekey_for_newcomers` walks the chunk rows too.
+        // v51.0.0 (#923 amendment 2, D9) — a second occurrence of the owner
+        // that arrived AFTER the chunk was written and BEFORE the seal: the
+        // seal wraps the manifest and EVERY chunk to one recipient set, so it
+        // reads the whole stream (one access set per stream; the descriptor
+        // under the manifest's DEK and the bytes are one fact). The reader
+        // still checks the CHUNK ROW's grant (I38 for self): a viewer granted
+        // on the manifest alone is refused.
         {
             let stream2 = format!("{tag}-stream2-{run}");
             let seg = segment(13, 700);
@@ -1937,15 +1978,38 @@ pub mod invariants {
                     .get_at_rest_grant(&c.chunk_sha256, &later_occ)
                     .await
                     .unwrap()
-                    .is_none(),
-                "{tag} I34b: precondition — and NOT on the chunk row"
+                    .is_some(),
+                "{tag} D9: the seal widened the chunk row to the stream's access set"
             );
+            assert_eq!(
+                sealed2.chunk_key_grant_emissions.len(),
+                1,
+                "{tag} D9: the widened chunk's key-grant set is emitted"
+            );
+            assert_eq!(
+                read_any_for_viewer(backend, &sealed2.manifest_sha256, &later_occ, None)
+                    .await
+                    .unwrap(),
+                seg,
+                "{tag} D9: the occurrence that joined mid-write reads the whole stream"
+            );
+            // I38 still holds: a grant on the manifest alone opens no chunk
+            let ghost = format!("{tag}-owner-ghost-occ-{run}");
+            let (algo, wrapped) = backend
+                .get_at_rest_grant(&sealed2.manifest_sha256, &later_occ)
+                .await
+                .unwrap()
+                .unwrap();
+            backend
+                .put_at_rest_grant(&sealed2.manifest_sha256, &ghost, &algo, &wrapped, SELF)
+                .await
+                .unwrap();
             assert!(
                 matches!(
                     read_any_range_for_viewer(
                         backend,
                         &sealed2.manifest_sha256,
-                        &later_occ,
+                        &ghost,
                         0,
                         9,
                         None

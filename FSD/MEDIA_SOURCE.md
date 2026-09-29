@@ -217,3 +217,141 @@ rendition).
   every reader).
 - Changing `list_holders`'s signature.
 - `settlement:*`, hop/TTL (#672), the community principal (#860) — next.
+
+## 9. `sealed_descriptor` — the description inside the seal (v51.0.0; CIRISPersist#922 / #923; CIRISConstitution#114)
+
+**Ruling (CIRISConstitution#114, 2026-09-27).** In CC 3.3.13's encrypted
+two-hash case, `name`, `format` (and `codec`) live INSIDE the seal; `size`,
+the address digest, the room target, `content_digest` and `placeholder` stay
+in clear. "May read the name" and "may open the bytes" are one fact: the
+descriptor is sealed under the SAME DEK the bytes were sealed under (the
+pointer's tier / community / epoch), never an edge-derived key.
+
+### 9.1 The struct change
+
+```
+media := {
+  … (§3 unchanged) …
+  format              string  REQUIRED iff sealed_descriptor is ABSENT
+  codec               string  as §3, iff format is present in clear
+  name                string  optional; FORBIDDEN beside sealed_descriptor
+  sealed_descriptor   string  optional; standard base64 of an AtRestEnvelope
+                              (magic ‖ nonce ‖ ciphertext‖tag) over the JCS bytes of
+                              {name, format, codec?}, AES-256-GCM under the blob's DEK,
+                              AAD = the persist-framed address digest (§9.3)
+}
+```
+
+Exactly one description: a struct carries `format` (+ `codec`) in clear XOR
+`sealed_descriptor`. `KNOWN_MEMBERS` gains `sealed_descriptor` (15). The
+member joins `paths::MEDIA`'s object, not the envelope vocabulary: no
+vocabulary path moves (`ENVELOPE_VOCABULARY_SHA256` unchanged — the
+vocabulary lists the `media` member, not its keys; asserted by the existing
+hash pin).
+
+### 9.2 The gate (`check_media_source`, all seven doors)
+
+Four shapes, one parser, refusals by member name (`Error::MediaSourceInvalid
+{ member, reason }`, kind unchanged):
+1. clear `format` (+`codec`), no seal — admitted as today;
+2. `sealed_descriptor` present, `format`/`codec`/`name` ABSENT in clear —
+   admitted iff the seal decodes (base64) to an at-rest envelope of at least
+   `magic + nonce + tag` bytes; persist NEVER opens it (no DEK on the row
+   plane) and never sniffs (CC 5.3.2.6 runs where bytes decrypt);
+3. neither — refused, member `format` (today's token, unchanged);
+4. both a seal and clear `format` or `codec` — refused, member
+   `sealed_descriptor`, reason `one description: format/codec in clear beside
+   a seal`; `name` in clear beside a seal — refused, member `name`, reason
+   `the name lives inside the seal` (CC 3.3.13 two-hash case).
+`size`, `digest`, the room target, `content_digest`, `placeholder` are
+required/checked BEFORE any hashing exactly as before (CC 5.3.2.5 / AV-88).
+`MediaSource.format` becomes `Option<String>` (Rust clean break); the blob
+write doors store `media_type` only when it is in clear (a sealed row's
+`media_type` is NULL — a reader learns it after the DEK opens; I119's
+"validated format" clause reads "when present in clear").
+
+### 9.3 The doors (#923) — `Engine::seal_descriptor_for_blob` / `open_descriptor_for_blob`
+
+Edge never holds a DEK. Two Engine doors seal/open small caller bytes under
+an EXISTING blob's DEK:
+
+```
+seal_descriptor_for_blob(at_rest_sha256, key_id, plaintext_jcs) -> Result<Vec<u8>, BlobError>
+open_descriptor_for_blob(at_rest_sha256, viewer_key_id, sealed)   -> Result<Vec<u8>, BlobError>
+```
+- The row says what the blob is (its recorded tier, §11.1); the caller is
+  authorized exactly as `read_blob_as` authorizes a viewer
+  (`authorize_viewer_by_tier`, then `refuse_if_withdrawn`): a stranger is
+  `NotGranted` and learns nothing; a withdrawn blob refuses; a PLAINTEXT
+  row is `InvalidArgument` (nothing to seal under — the description of a
+  plaintext blob is in clear by construction).
+- The DEK is the blob's, recovered by the tier's own resolver
+  (`recover_blob_dek_for_viewer` for the invisible tier;
+  `community_dek_has_member_grant` + `recover_epoch_dek_for_viewer` for a
+  community row) — one resolver per tier, shared with the bytes read, so
+  "may open the descriptor" ⇔ "may open the bytes" by construction.
+- AAD = `b"ciris.sealed_descriptor.v1" ‖ at_rest_sha256` (persist-framed,
+  domain-separated from the bytes' own AAD, so a descriptor lifted onto
+  another blob, or the blob's ciphertext presented as a descriptor, does not
+  open). The seal is `seal_aad`; the open is `open_aad`; the envelope is the
+  on-disk `AtRestEnvelope` byte layout, returned raw (the producer base64s it
+  into the struct).
+- Plaintext cap: a descriptor over 4 KiB is refused at the seal door
+  (`InvalidArgument`) — it is `{name, format, codec?}`, not a payload.
+- pyo3: `seal_descriptor_for_blob(sha256_hex, key_id, plaintext: bytes) -> bytes`,
+  `open_descriptor_for_blob(sha256_hex, viewer_key_id, sealed: bytes) -> bytes`;
+  refusals keep `read_blob_as`'s Python types.
+
+### 9.4 Invariants
+
+- **I121** — the four shapes of §9.2 on memory, sqlite, postgres at the
+  ingest door and the local door: (1) admitted; (2) admitted, stored
+  `media_type` NULL; (3) refused `format`; (4) refused `sealed_descriptor`
+  (both) and `name` (name beside seal); a seal that is not base64, or decodes
+  short of the envelope header, is refused by member `sealed_descriptor`.
+  `ENVELOPE_VOCABULARY_SHA256` is unchanged (the pin test stays green
+  without a re-pin).
+- **I122** — the doors: a member of the room seals `{name, format}` for a
+  community-sealed blob and opens it back; a non-member is `NotGranted` on
+  both doors and learns nothing; the invisible tier likewise for its owner
+  vs a stranger; a plaintext row is `InvalidArgument` on both; a withdrawn
+  blob refuses the open; the descriptor sealed for blob A does not open
+  against blob B (AAD); the blob's own ciphertext presented as a descriptor
+  does not open (domain separation); a 4 KiB + 1 plaintext is refused at the
+  seal.
+- **I123** — end to end through the real doors (two nodes): the producer
+  seals the descriptor, writes the row with `sealed_descriptor`, the row
+  replicates, the second node's member opens the descriptor and reads
+  `format`; the same node's non-member sees the row (size, digest, room) and
+  cannot open the descriptor.
+- **I124** — from disk: the gate call is unchanged at all seven doors; every
+  blob write door's `media_type` store reads the clear `format` only.
+
+### 9.5 Mixed fleet and adopters
+
+A v50 reader ADMITS a `file:v1` row whose `content` pointer carries
+`sealed_descriptor` (no `media` member — the gate never sees it) and
+REFUSES a `media` struct with no clear `format`; a v51 reader admits both
+shapes. Producers must not emit the sealed `media` struct until every
+reader runs v51 (CIRISEdge#698 sequences after this cut; CIRISNodeCore's
+MEDIA_SHARING schema and CIRISServer's FileRef read after the DEK opens
+take the same vectors).
+
+### 9.6 Not in this cut
+
+- **#784 (moderation / de-admission / revocation addressed by key
+  fingerprint).** Deferred, stated: it is a wire-vocabulary change on three
+  planes (`revoked_key_id` and the moderation subject fields would carry a
+  second identifier form) and a CC §4.5.1 Standards Action, not a persist
+  ruling; bundling it here would hold the cut Edge is waiting on. It is
+  filed for the cut after v51 with the CC ask.
+- The disclosure store (#914): its own FSD.
+
+### 9.7 Mutation round (v51.0.0)
+
+| # | Mutant | Verdict | Killed by |
+|---|---|---|---|
+| S1 | one-description rule dropped | KILLED | media_source::tests::a_sealed_descriptor_is_one_description_and_never_opened |
+| S2 | descriptor AAD dropped at the seal | KILLED | v51_invariants::descriptor::postgres::i122, v51_invariants::descriptor::sqlite::i122 |
+
+S3 (a plaintext row sealable) is not a clean single-site mutant: the plaintext arm is one `match` arm whose only alternative is the refusal I122 asserts on both doors.

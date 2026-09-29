@@ -216,6 +216,20 @@ pub mod paths {
     /// accord X — and where, if BOTH signals are present and DISAGREE, the row
     /// is refused rather than one signal silently preferred.
     pub const ACCORD_ROOT: &str = "accord_root";
+    /// v51.0.0 (CIRISPersist#937, CC 3.2 T4a rc6) — a charter member: how old
+    /// (seconds) a WITNESSED lineage head may be for a consumer to ATTACH the
+    /// root. Attached is never gated by it (T4).
+    pub const ATTACH_WINDOW_SECS: &str = "attach_window_secs";
+    /// v51.0.0 (CIRISPersist#938, T6) — a charter member: the re-commit cadence
+    /// (seconds) of the lineage's witness cosigns; older = silent (a liveness
+    /// signal, never a validity leg).
+    pub const WITNESS_CADENCE_SECS: &str = "witness_cadence_secs";
+    /// v51.0.0 (CIRISPersist#938) — a charter member: how many independent
+    /// witnesses make a head "witnessed" (default 1).
+    pub const WITNESS_QUORUM: &str = "witness_quorum";
+    /// v51.0.0 (CIRISPersist#937) — on a `trust:accepts:v1` acceptance edge:
+    /// the lineage head (its `persist_row_hash`) the consumer attaches under.
+    pub const ATTACHED_HEAD_DIGEST: &str = "attached_head_digest";
 }
 
 /// v31.0.0 (CIRISPersist#643) — the member names INSIDE [`paths::ROW`]. One
@@ -490,6 +504,18 @@ pub struct EnvelopeCore {
     /// no key ⇒ identical JCS bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accord_root: Option<String>,
+    /// [`paths::ATTACH_WINDOW_SECS`] — v51.0.0 (#937).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_window_secs: Option<u64>,
+    /// [`paths::WITNESS_CADENCE_SECS`] — v51.0.0 (#938).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_cadence_secs: Option<u64>,
+    /// [`paths::WITNESS_QUORUM`] — v51.0.0 (#938).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_quorum: Option<u32>,
+    /// [`paths::ATTACHED_HEAD_DIGEST`] — v51.0.0 (#937).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_head_digest: Option<String>,
     /// Every dimension-specific key, untyped and preserved. Covered by
     /// the envelope vocabulary hash, not by the compiler.
     #[serde(flatten)]
@@ -922,6 +948,10 @@ fn fully_populated_core() -> EnvelopeCore {
             weight: serde_json::Number::from_f64(1.0),
         }),
         accord_root: Some("humanity-accord".into()),
+        attach_window_secs: Some(604_800),
+        witness_cadence_secs: Some(86_400),
+        witness_quorum: Some(1),
+        attached_head_digest: Some("cd".repeat(32)),
         // Deliberately EMPTY: `extra` is the open half, and the typed
         // key set is exactly what this value serializes to only while
         // nothing untyped rides along.
@@ -958,6 +988,10 @@ mod tests {
             (paths::WIDENED_AT, true),
             (paths::ROW, true),
             (paths::ACCORD_ROOT, true),
+            (paths::ATTACH_WINDOW_SECS, true),
+            (paths::WITNESS_CADENCE_SECS, true),
+            (paths::WITNESS_QUORUM, true),
+            (paths::ATTACHED_HEAD_DIGEST, true),
         ] {
             assert_eq!(
                 v.get(path).is_some(),
@@ -1149,6 +1183,16 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             // name no accord, and every relaying node will refuse to carry
             // them once enforcement is on.
             paths::ACCORD_ROOT,
+            // v51.0.0 (CIRISPersist#937/#938, CC 3.2 T4a/T6 rc6) — RE-PINNED:
+            // the charter's attach window, witness cadence and witness quorum
+            // are scrub-signed charter members (changing one is a re-scrub, not
+            // a config edit), and the acceptance edge names the head it attaches
+            // under. All four DECIDE whether a consumer attaches, so they are
+            // vocabulary both sides agree on.
+            paths::ATTACH_WINDOW_SECS,
+            paths::WITNESS_CADENCE_SECS,
+            paths::WITNESS_QUORUM,
+            paths::ATTACHED_HEAD_DIGEST,
         ],
         // v31.0.0 (CIRISPersist#643) — the CLOSED member set of `row`. Served
         // alongside the universal paths so a consumer can validate the mirror
@@ -1251,8 +1295,13 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// DEK epochs already decide what a joiner can read — `from_join` is what
 /// persist enforces today). It joins in the cut that gives it a door, with its
 /// own re-pin.
+/// v51.0.0 (CIRISPersist#937/#938, CC 3.2 T4a/T6 rc6) — RE-PINNED. The
+/// charter's `attach_window_secs`, `witness_cadence_secs` and `witness_quorum`
+/// and the acceptance edge's `attached_head_digest` joined `universal_paths`:
+/// they decide whether a consumer ATTACHES a root. Previous pin:
+/// `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a`.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a";
+    "c9558c98bf871e97c2e73c428894e2dc642fcffec4de92da06ab5a9fa69ddca2";
 
 #[cfg(test)]
 mod vocab_tests {

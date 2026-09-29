@@ -106,6 +106,11 @@ pub fn empty_dsn() -> Option<String> {
     let (host_part, base_db) = split(&base)?;
     let name = unique_name();
     let admin = format!("{host_part}/{base_db}");
+    // v51.0.0 — reap here too, as `provision` does. Every targeted lane whose
+    // witnesses all use `empty_dsn` (rc6, v51, I190) never reached
+    // `provision`, so nothing reaped: 540 per-test databases filled the 8 GB
+    // test tmpfs mid-mutation-round and every later lane failed to CREATE.
+    reap_dead(&admin);
     ensure_cluster_global_role(&admin);
     let sql = format!("CREATE DATABASE \"{name}\"");
     match run_sql(&admin, &sql) {

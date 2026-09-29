@@ -7749,6 +7749,22 @@ pub async fn resolve_withdraws_admission_rule_at(
     if issuer == target.attesting_key_id {
         return Ok(1);
     }
+    // Rule 1, lifted to the producer's PRINCIPAL — v51.0.0 (CIRISPersist#941,
+    // CIRISEdge#675/#708; CC 3.4.7.3: a node acts for its single responsible
+    // owner, [`admission_identity_for_writer`]'s owner-binding axis). The live
+    // owner of the NODE that attested `T` may withdraw `T`: a file written on
+    // the owner's laptop before Edge authored files as the person is still the
+    // person's to retract from their phone. Recorded as rule 1 (the producer's
+    // own retraction, not a subject consent event — the consent folds read
+    // 2..=4). Guards, so a node's CURRENT owner cannot reach into another
+    // owner's era: the issuer is the node's single live owner NOW
+    // ([`owner_of`], fail-closed on ambiguity), AND an owner-binding the issuer
+    // signed for that node was asserted at or before `T` — the issuer owned the
+    // node when `T` was produced (a later buyer of a used node retracts
+    // nothing from the seller's time).
+    if issuer_owned_the_producer_when(directory, issuer, target).await? {
+        return Ok(1);
+    }
 
     // v21.11.0 (CIRISPersist#528), RATIFIED at **CC 2.4.1.1** as the
     // anti-Goodhart retraction dual — for the scored families whose
@@ -7864,6 +7880,76 @@ pub async fn resolve_withdraws_admission_rule_at(
         target_attestation_id: target.attestation_id.clone(),
         beyond_delegation_depth_cap: beyond_cap,
     })
+}
+
+/// v51.0.0 (CIRISPersist#941) — `issuer` is the single live owner of the node
+/// that attested `target` NOW, held an owner-binding over that node IN FORCE at
+/// `target`'s instant, and no other granter did (PR #943 review, A→B→A). See rule 1's principal lift in
+/// [`resolve_withdraws_admission_rule_at`]. An ambiguous owner is not a
+/// principal (`owner_of` errors → no lift, the other rules still run).
+async fn issuer_owned_the_producer_when(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    target: &super::Attestation,
+) -> Result<bool, Error> {
+    let node = target.attesting_key_id.as_str();
+    match owner_of(directory, node).await {
+        Ok(Some(owner)) if owner == issuer => {}
+        Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let rows = directory.list_attestations_for(node).await?;
+    // PR #943 review (A→B→A) — "the issuer owned the node when `target` was
+    // produced", asked of the whole ownership record, not of one binding's
+    // signer-chosen instant. A binding is IN FORCE at `t` from its
+    // `asserted_at` until the earlier of its `expires_at` and the first
+    // admitted `withdraws` that ends it (one naming it, or its granter's bare
+    // retraction against the node). The issuer must hold a binding in force at
+    // `target.asserted_at`, and NO OTHER granter may: a returning owner that
+    // backdates a fresh binding into another owner's era overlaps that
+    // owner's binding and is refused. Only the other owner can shorten its own
+    // era, by signing the withdrawal that ends it.
+    let t = target.asserted_at;
+    let ended_at = |b: &super::Attestation| -> Option<chrono::DateTime<chrono::Utc>> {
+        let withdrawn = rows
+            .iter()
+            .filter(|w| w.attestation_type == super::types::attestation_type::WITHDRAWS)
+            .filter(|w| {
+                match w
+                    .attestation_envelope
+                    .get("references_attestation_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(r) => r == b.attestation_id,
+                    // the granter's bare edge retraction against the node
+                    None => w.attesting_key_id == b.attesting_key_id,
+                }
+            })
+            .map(|w| w.asserted_at)
+            .min();
+        match (b.expires_at, withdrawn) {
+            (Some(e), Some(w)) => Some(e.min(w)),
+            (e, w) => e.or(w),
+        }
+    };
+    let in_force_at_t =
+        |b: &super::Attestation| b.asserted_at <= t && ended_at(b).is_none_or(|e| e > t);
+    let owner_bindings = rows.iter().filter(|b| {
+        b.attestation_type == super::types::attestation_type::DELEGATES_TO
+            && is_owner_binding_envelope(&b.attestation_envelope)
+    });
+    let mut issuer_in_force = false;
+    for b in owner_bindings {
+        if !in_force_at_t(b) {
+            continue;
+        }
+        if b.attesting_key_id == issuer {
+            issuer_in_force = true;
+        } else {
+            return Ok(false);
+        }
+    }
+    Ok(issuer_in_force)
 }
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
@@ -12181,6 +12267,16 @@ pub const INFRA_RULE_NOT_ENTRENCHED: &str = "protocol_not_entrenched";
 /// v50.0.0 (merge prep for #926) — rule: a founder was not conferred on the
 /// ceremony plane (CC 3.2 T2).
 pub const INFRA_RULE_FOUNDER_NOT_CONFERRED: &str = "founder_not_conferred";
+/// v51.0.0 (CIRISPersist#939, CC 3.2 T7 rc6) — a trust-root-grade `infrastructure`
+/// row founded at N ≤ M active founders: every remaining founder is a veto from
+/// birth. N ≥ M + 1 is the conformance floor.
+pub const INFRA_RULE_LIVENESS_MARGIN_AT_FOUNDING: &str = "liveness_margin_at_founding";
+/// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — the witness plane knows a head
+/// this node does not hold: fetch before extending (restore discipline).
+pub const TRUST_ROOT_RULE_BEHIND_WITNESS: &str = "lineage_head_behind_witness";
+/// v51.0.0 (CIRISPersist#939, CC 3.2 T7) — a stalled trust root is valid but
+/// non-admitting: a member widening waits for the margin to be restored.
+pub const TRUST_ROOT_RULE_STALLED_NON_ADMITTING: &str = "liveness_stalled_non_admitting";
 /// v50.0.0 (merge prep for #926) — rule: a supersede changes the record's
 /// trust-root grade (subkind, basis or entrenchment).
 pub const INFRA_RULE_GRADE_CHANGED: &str = "grade_changed";

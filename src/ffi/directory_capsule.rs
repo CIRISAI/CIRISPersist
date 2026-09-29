@@ -1053,6 +1053,14 @@ pub enum DirectoryOp {
         /// The signed community row received from a peer.
         community: SignedCommunity,
     },
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) —
+    /// [`FederationDirectory::put_lineage_head_cosign`], the witness plane's
+    /// door: a replication bridge forwards a `ciris.lineage_head_cosign.v1`
+    /// object. Result rides `LineageCosignOutcome`. APPEND-ONLY (Growth).
+    PutLineageHeadCosign {
+        /// The cosign received from a peer or a witness.
+        cosign: crate::federation::lineage_witness::LineageHeadCosign,
+    },
     /// v50.0.0 (CIRISPersist#928, final check) —
     /// [`FederationDirectory::withdraws_admission_depth`]: the depth a stored
     /// `withdraws` was admitted under, so a capsule consumer re-deriving it at
@@ -1313,6 +1321,9 @@ pub enum DirectoryOpResult {
     /// nothing was recorded (a pre-V157 row reads as the 16-hop walk).
     /// APPEND-ONLY (Growth).
     WithdrawsAdmissionDepth(Option<u32>),
+    /// v51.0.0 (CIRISPersist#938) — `PutLineageHeadCosign`'s typed outcome.
+    /// APPEND-ONLY (Growth).
+    LineageCosignOutcome(crate::federation::lineage_witness::LineageCosignOutcome),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -2042,6 +2053,12 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::PutLineageHeadCosign { cosign } => {
+            match dir.put_lineage_head_cosign(cosign).await {
+                Ok(o) => DirectoryOpResult::LineageCosignOutcome(o),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::WithdrawsAdmissionDepth { attestation_id } => {
             match dir.withdraws_admission_depth(&attestation_id).await {
                 Ok(d) => DirectoryOpResult::WithdrawsAdmissionDepth(
@@ -2686,6 +2703,23 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::ReplicatedCommunityOutcome(o) => Ok(o),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — the lineage-head cosign door, proxied.
+    async fn put_lineage_head_cosign(
+        &self,
+        cosign: crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<crate::federation::lineage_witness::LineageCosignOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::PutLineageHeadCosign { cosign })
+            .await?
+        {
+            DirectoryOpResult::LineageCosignOutcome(o) => Ok(o),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -5034,7 +5068,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "be22e2dc22c75b7c88cc236bfb5ea2c6613c8d3933b4efc554f9980b350731aa",
+            "9050c899ce3233018639118740a87793f393015db3dcdbeb2e56628962bcd034",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \
@@ -5078,7 +5112,7 @@ mod tests {
     fn directory_op_result_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOpResult"),
-            "dccdb0994c22284eea288d333bb0160eaed3ed4dd1f0d19039368046bcf0d930",
+            "bf09a0103ca37a06866e6f8160dd01df41c8e10caded5660e3c2fa352b4e9262",
             "DirectoryOpResult's wire shape changed — same fork as the op gate: \
              growth re-pins, a break re-pins AND bumps DIRECTORY_ABI_VERSION."
         );

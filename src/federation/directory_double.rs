@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 106 delegations, generated. Every one: fault first, then delegate.
+// 108 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -630,6 +630,17 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner
             .list_known_wire_hashes_since(kind, after_content_hash, limit)
+            .await
+    }
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<lineage_witness::LineageHeadCosign>, Error> {
+        if let Some(e) = self.faulted("list_lineage_head_cosigns_for") {
+            return Err(e);
+        }
+        self.inner
+            .list_lineage_head_cosigns_for(lineage_key_id)
             .await
     }
     async fn list_location_proofs_for(
@@ -1131,6 +1142,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.set_consent_role(key_id, consent_role).await
+    }
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, Error> {
+        if let Some(e) = self.faulted("store_lineage_head_cosign") {
+            return Err(e);
+        }
+        self.inner.store_lineage_head_cosign(cosign).await
     }
     async fn store_rebound_key_record(
         &self,

@@ -67,6 +67,8 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+/// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
+pub mod lineage_witness;
 // CIRISPersist#857 (`FSD/CONSENT_BY_HUMANS.md`) — consent is by humans: the
 // principal walk in the consent doors, one combine rule.
 pub mod consent_by_humans;
@@ -132,6 +134,9 @@ pub mod moderation_walk_asof_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
+/// v51.0.0 — the rc6 trust-root security set (I191–I196).
+#[cfg(test)]
+pub(crate) mod rc6_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
@@ -148,6 +153,9 @@ pub mod sweep_placement_invariants;
 /// v47.3.0 (CIRISPersist#901) — I154–I158: a root is as attested as its holders.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod trust_root_hardware_invariants;
+/// v51.0.0 — the backend-door invariants of the v51 cut (I125 …).
+#[cfg(test)]
+pub(crate) mod v51_invariants;
 // v49.0.0 (CIRISPersist#915) — I185, Android generation custody.
 #[cfg(test)]
 mod android_custody_invariants;
@@ -4393,6 +4401,48 @@ pub trait FederationDirectory: Send + Sync {
         let _ = community_key_id;
         Err(Error::Unsupported {
             method: "lookup_signed_community",
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6) — store one admitted lineage-head
+    /// cosign (the witness plane, V159). The DOOR — every refusal of FSD
+    /// `TRUST_ROOT_RC6.md` §2.1 — is [`lineage_witness::admit_lineage_head_cosign`];
+    /// this is the raw store it ends in. Returns `true` when inserted, `false`
+    /// when the identical row was already held. Default `Unsupported`; every
+    /// real backend overrides.
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, Error> {
+        let _ = cosign;
+        Err(Error::Unsupported {
+            method: "store_lineage_head_cosign",
+        })
+    }
+
+    /// v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — **the lineage-head cosign
+    /// door**: [`lineage_witness::admit_lineage_head_cosign`] over this
+    /// directory at the door's one clock read. A trait method so the capsule
+    /// proxies it (a replication bridge forwards cosigns) and every backend
+    /// runs the same door; the default body IS the door — no backend
+    /// overrides it.
+    async fn put_lineage_head_cosign(
+        &self,
+        cosign: lineage_witness::LineageHeadCosign,
+    ) -> Result<lineage_witness::LineageCosignOutcome, Error> {
+        lineage_witness::admit_lineage_head_cosign(self, &cosign, chrono::Utc::now()).await
+    }
+
+    /// v51.0.0 (CIRISPersist#938) — every cosign held for `lineage_key_id`,
+    /// ordered by `signed_at` then witness. Read by the witnessed-head fold and
+    /// the bundle response. Default `Unsupported`; every real backend overrides.
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<lineage_witness::LineageHeadCosign>, Error> {
+        let _ = lineage_key_id;
+        Err(Error::Unsupported {
+            method: "list_lineage_head_cosigns_for",
         })
     }
 
@@ -8758,6 +8808,17 @@ pub enum Error {
         detail: String,
     },
 
+    /// v51.0.0 (CIRISPersist#937, CC 3.2 T4a rc6) — an acceptance edge
+    /// (`trust:accepts:v1`) presented a lineage head that is stale (older than
+    /// the root's charter `attach_window_secs`) or unwitnessed, or presented
+    /// none: ATTACHING is gated on freshness; attached never is.
+    #[error("trust root head stale: attaching {root_key_id} refused — {detail}")]
+    TrustRootHeadStale {
+        /// The root being attached.
+        root_key_id: String,
+        /// The rule that refused, in words.
+        detail: String,
+    },
     /// v19.0.0 (CIRISPersist#488, CRITICAL — the KERI lesson) — a root
     /// charter (`delegates_to(root → root, infra:*)`) failed the recovery
     /// admission gate: missing/malformed pre-rotation commitment, or a
@@ -10571,6 +10632,7 @@ impl Error {
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
+            Error::TrustRootHeadStale { .. } => "trust_root_head_stale",
             Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
             Error::NoConstitutionalRootYet { .. } => "federation_no_constitutional_root_yet",
             Error::ConstitutionalFamilyReserved { .. } => {

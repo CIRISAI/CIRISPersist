@@ -6059,6 +6059,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &row.attestation_envelope,
         )
         .await?;
+        // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
+        // witnessed lineage head inside the root's attach window.
+        crate::federation::canonical_community::check_attach_freshness(
+            self,
+            &row.attestation_type,
+            &row.attested_key_id,
+            &row.attestation_envelope,
+            chrono::Utc::now(),
+        )
+        .await?;
         // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
         // must be signed by that family's QUORUM. Sits beside the key-charter
         // gate above and refuses the same class of row for the same reason: a
@@ -6292,6 +6302,42 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("withdraws admission depth: {e}"))
             })?;
         }
+        // PR #943 review (Codex): project ONLY a row this statement stored.
+        // An occupied id (`ON CONFLICT DO NOTHING`, 0 rows) stored nothing, so
+        // its incoming (possibly different, about-to-be-refused) body must not
+        // reach the projections — the re-read below decides that case.
+        if inserted_rows > 0 {
+            // v51.0.0 (CIRISPersist#933) — the three projections run INSIDE the
+            // transaction, before the commit: a failed projection rolls the row
+            // back, never leaves a committed row unprojected.
+            // v17.4.0 (V106) — maintain the subject projection (federation tier).
+            pg_project_attestation_subjects(
+                &*tx,
+                &row,
+                &row.attestation_id,
+                crate::federation::types::attestation_tier::FEDERATION,
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
+            })?;
+            // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+            // projection (grant upsert / withdraws-revocation fold). v51.0.0
+            // (CIRISPersist#933): INSIDE the row's transaction — it ran after the
+            // commit as an autocommit statement, so a failed projection left a
+            // committed `withdraws` whose revocation was never folded, and a retry
+            // dedups to `AlreadyHeld` without re-projecting (fail-open on "cease
+            // replicating on revoke"). sqlite always ran it inside.
+            #[cfg(test)]
+            self.test_hooks()
+                .fail_if_armed("pg_project_consent_peer_set")?;
+            pg_project_consent_peer_set(&*tx, &row).await.map_err(|e| {
+                crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
+            })?;
+            // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
+            // `blob_renditions` projection on the same client.
+            pg_project_rendition_row(&*tx, &row).await?;
+        }
         tx.commit()
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("attestation commit: {e}")))?;
@@ -6358,28 +6404,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.attestation_id,
                 )])
             });
-        // v17.4.0 (V106) — maintain the subject projection (federation tier).
-        pg_project_attestation_subjects(
-            &**client,
-            &row,
-            &row.attestation_id,
-            crate::federation::types::attestation_tier::FEDERATION,
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
-        })?;
-        // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
-        // projection (grant upsert / withdraws-revocation fold), same
-        // client/transaction as the insert above.
-        pg_project_consent_peer_set(&**client, &row)
-            .await
-            .map_err(|e| {
-                crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
-            })?;
-        // v45.0.0 (CIRISPersist#871, FSD §5) — maintain the V149
-        // `blob_renditions` projection on the same client.
-        pg_project_rendition_row(&**client, &row).await?;
         drop(client);
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`
@@ -8460,6 +8484,82 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
     ) -> Option<&crate::federation::canonical_community::StandingCache> {
         Some(&self.trust_root_standing_cache)
+    }
+
+    async fn store_lineage_head_cosign(
+        &self,
+        cosign: &crate::federation::lineage_witness::LineageHeadCosign,
+    ) -> Result<bool, crate::federation::Error> {
+        // v51.0.0 (#938) — V159; insert-or-hold, never delete (evidence).
+        let admitted_at = chrono::Utc::now();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.federation_lineage_head_cosigns \
+                 (lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
+                  prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc, \
+                  admitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
+                &[
+                    &cosign.lineage_key_id,
+                    &cosign.head_digest_sha256_hex,
+                    &cosign.witness_key_id,
+                    &cosign.head_asserted_at,
+                    &cosign.prior_head_digest_sha256_hex,
+                    &cosign.signed_at,
+                    &cosign.signature_classical,
+                    &cosign.signature_pqc,
+                    &admitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("store lineage head cosign: {e}"))
+            })?;
+        Ok(n == 1)
+    }
+
+    async fn list_lineage_head_cosigns_for(
+        &self,
+        lineage_key_id: &str,
+    ) -> Result<Vec<crate::federation::lineage_witness::LineageHeadCosign>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT lineage_key_id, head_digest_sha256_hex, witness_key_id, head_asserted_at, \
+                        prior_head_digest_sha256_hex, signed_at, signature_classical, signature_pqc \
+                 FROM cirislens.federation_lineage_head_cosigns WHERE lineage_key_id = $1 \
+                 ORDER BY signed_at ASC, witness_key_id ASC",
+                &[&lineage_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list lineage head cosigns: {e}"))
+            })?;
+        let col = |e: tokio_postgres::Error| crate::federation::Error::Backend(e.to_string());
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::federation::lineage_witness::LineageHeadCosign {
+                    lineage_key_id: r.try_get("lineage_key_id").map_err(col)?,
+                    head_digest_sha256_hex: r.try_get("head_digest_sha256_hex").map_err(col)?,
+                    witness_key_id: r.try_get("witness_key_id").map_err(col)?,
+                    head_asserted_at: r.try_get("head_asserted_at").map_err(col)?,
+                    prior_head_digest_sha256_hex: r
+                        .try_get("prior_head_digest_sha256_hex")
+                        .map_err(col)?,
+                    signed_at: r.try_get("signed_at").map_err(col)?,
+                    signature_classical: r.try_get("signature_classical").map_err(col)?,
+                    signature_pqc: r.try_get("signature_pqc").map_err(col)?,
+                })
+            })
+            .collect()
     }
 
     async fn lookup_signed_community(
@@ -20419,6 +20519,19 @@ impl PostgresBackend {
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
             &envelope_value,
+        )
+        .await?;
+        // v51.0.0 (CIRISPersist#937, CC 3.2 T4a) — attaching is gated on a
+        // witnessed lineage head inside the root's attach window.
+        crate::federation::canonical_community::check_attach_freshness(
+            self,
+            &input.attestation_type,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+            &envelope_value,
+            chrono::Utc::now(),
         )
         .await?;
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
