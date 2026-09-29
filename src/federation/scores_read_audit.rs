@@ -988,16 +988,47 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// Run `f` with the capture subscriber installed on THIS thread and return
-    /// the scores-plane events it emitted, with the non-deterministic `at`
+    /// **The process-wide capture hub (CIRISPersist#940).** The first cut
+    /// installed the capture subscriber as THIS THREAD's default and ran the
+    /// doors on a current-thread runtime inside that scope. Under a full
+    /// parallel `cargo test` the memory witness once captured `[]` — an event
+    /// the door provably emits, unseen — and a parity witness that can report
+    /// nothing under load is a check that fails toward noise. The hub is
+    /// installed ONCE as the process's global default (nothing else in this
+    /// crate sets one; a second attempt panics rather than capturing nothing),
+    /// so the scores-plane events of every thread land here whatever thread a
+    /// read runs on. Each witness tags its reads with a fresh id and reads
+    /// back only the events carrying that tag, so concurrent witnesses never
+    /// see each other's entries.
+    fn hub() -> Arc<Mutex<Vec<Captured>>> {
+        static HUB: std::sync::OnceLock<Arc<Mutex<Vec<Captured>>>> = std::sync::OnceLock::new();
+        Arc::clone(HUB.get_or_init(|| {
+            let events: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
+            tracing::subscriber::set_global_default(CaptureSubscriber {
+                events: Arc::clone(&events),
+            })
+            .expect("the scores-plane capture hub must be this process's one global subscriber");
+            events
+        }))
+    }
+
+    /// A fresh tag for one witness's reads.
+    fn fresh_tag() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    }
+
+    /// Run `f`, then return the scores-plane events emitted since that carry
+    /// `tag` in some field, in emission order, with the non-deterministic `at`
     /// field lifted out (returned separately so it can still be checked).
-    fn capture<F: FnOnce()>(f: F) -> (Vec<Captured>, Vec<String>) {
-        let events: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
-        let sub = CaptureSubscriber {
-            events: Arc::clone(&events),
-        };
-        tracing::subscriber::with_default(sub, f);
-        let raw = events.lock().expect("capture lock").clone();
+    fn capture<F: FnOnce()>(tag: &str, f: F) -> (Vec<Captured>, Vec<String>) {
+        let h = hub();
+        let start = h.lock().expect("capture lock").len();
+        f();
+        let raw: Vec<Captured> = h.lock().expect("capture lock")[start..]
+            .iter()
+            .filter(|e| e.values().any(|v| v.contains(tag)))
+            .cloned()
+            .collect();
         let mut stamps = Vec::new();
         let stripped = raw
             .into_iter()
@@ -1009,11 +1040,9 @@ mod tests {
         (stripped, stamps)
     }
 
-    /// A current-thread runtime, built INSIDE the capture closure so every
-    /// `.await` in the exercised door runs on the thread holding the
-    /// subscriber's thread-local dispatcher. The three doors are careful to
-    /// emit before any `spawn_blocking` (sqlite) or pool checkout (postgres)
-    /// precisely because the log is the first statement.
+    /// A current-thread runtime for the exercised door. (With the hub as the
+    /// global default the capture no longer depends on which thread a read
+    /// logs from; a current-thread runtime is simply the cheapest.)
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1029,10 +1058,11 @@ mod tests {
     /// The `list_scores` probe filter. Deliberately exercises BOTH subject
     /// axes, BOTH dimension axes, duplicate ids across the singular and set
     /// forms, and an unsorted prefix list — so the canonical rendering is
-    /// actually under test rather than incidentally correct.
-    fn probe_filter() -> AttestationFilter {
+    /// actually under test rather than incidentally correct. `tag` names
+    /// the subject, which is how the hub tells this witness's reads apart.
+    fn probe_filter(tag: &str) -> AttestationFilter {
         AttestationFilter {
-            subject_key_id: Some("subject_key_552".to_owned()),
+            subject_key_id: Some(format!("subject_{tag}")),
             attested_key_id: Some("alpha_key".to_owned()),
             attested_key_ids: vec![
                 "zeta_key".to_owned(),
@@ -1046,40 +1076,51 @@ mod tests {
         }
     }
 
+    /// The tagged `resolve_scores` probe: a bare filter but for the subject.
+    fn resolve_probe_filter(tag: &str) -> AttestationFilter {
+        AttestationFilter {
+            subject_key_id: Some(format!("subject_{tag}")),
+            ..AttestationFilter::default()
+        }
+    }
+
     /// HAND-WRITTEN. Never derived from `ScoresReadLogRecord`.
-    fn expected_list_event() -> Captured {
+    fn expected_list_event(tag: &str) -> Captured {
         [
-            ("message", "scores-plane read"),
-            ("site", "list_scores"),
-            ("caller_key_id", "caller_key_552"),
+            ("message", "scores-plane read".to_owned()),
+            ("site", "list_scores".to_owned()),
+            ("caller_key_id", format!("caller_{tag}")),
             (
                 "subject_filter",
-                "subject=subject_key_552;attested=alpha_key,zeta_key",
+                format!("subject=subject_{tag};attested=alpha_key,zeta_key"),
             ),
             (
                 "dimension_filter",
-                "exact=capacity:composite:v1;prefixes=capacity:,trust:",
+                "exact=capacity:composite:v1;prefixes=capacity:,trust:".to_owned(),
             ),
-            ("confidence_floor_supplied", "true"),
+            ("confidence_floor_supplied", "true".to_owned()),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(k, v)| (k.to_owned(), v))
         .collect()
     }
 
     /// HAND-WRITTEN. The `None`-caller (unauthenticated) `resolve_scores`
-    /// entry, over a bare filter.
-    fn expected_resolve_unauthenticated_event() -> Captured {
+    /// entry, over the tagged bare filter.
+    fn expected_resolve_unauthenticated_event(tag: &str) -> Captured {
         [
-            ("message", "scores-plane read"),
-            ("site", "resolve_scores"),
-            ("caller_key_id", "unauthenticated"),
-            ("subject_filter", "subject=-;attested=-"),
-            ("dimension_filter", "exact=-;prefixes=-"),
-            ("confidence_floor_supplied", "false"),
+            ("message", "scores-plane read".to_owned()),
+            ("site", "resolve_scores".to_owned()),
+            ("caller_key_id", "unauthenticated".to_owned()),
+            (
+                "subject_filter",
+                format!("subject=subject_{tag};attested=-"),
+            ),
+            ("dimension_filter", "exact=-;prefixes=-".to_owned()),
+            ("confidence_floor_supplied", "false".to_owned()),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(k, v)| (k.to_owned(), v))
         .collect()
     }
 
@@ -1087,14 +1128,14 @@ mod tests {
     /// purpose: what the read RETURNS is another surface's contract, and the
     /// log must be emitted whether the read succeeds, finds nothing, or is
     /// refused.
-    async fn exercise(dir: &dyn FederationDirectory) {
+    async fn exercise(dir: &dyn FederationDirectory, tag: &str) {
         let _ = dir
-            .list_scores("caller_key_552", probe_filter(), None, 10)
+            .list_scores(&format!("caller_{tag}"), probe_filter(tag), None, 10)
             .await;
         let _ = dir
             .resolve_scores(
                 "",
-                AttestationFilter::default(),
+                resolve_probe_filter(tag),
                 "cc-4.4.2-signed-mean".to_owned(),
                 false,
             )
@@ -1103,26 +1144,26 @@ mod tests {
 
     /// The per-backend assertion: two entries, in door order, byte-equal to
     /// the literals — and both timestamps parse as RFC-3339.
-    fn assert_backend_entries(tag: &str, events: &[Captured], stamps: &[String]) {
+    fn assert_backend_entries(backend: &str, tag: &str, events: &[Captured], stamps: &[String]) {
         assert_eq!(
             events.len(),
             2,
-            "({tag}) the scores plane must emit exactly one log entry per read \
+            "({backend}) the scores plane must emit exactly one log entry per read \
              at each of its two doors; got {events:#?}"
         );
         assert_eq!(
             events[0],
-            expected_list_event(),
-            "({tag}) list_scores entry"
+            expected_list_event(tag),
+            "({backend}) list_scores entry"
         );
         assert_eq!(
             events[1],
-            expected_resolve_unauthenticated_event(),
-            "({tag}) resolve_scores entry"
+            expected_resolve_unauthenticated_event(tag),
+            "({backend}) resolve_scores entry"
         );
         for s in stamps {
             chrono::DateTime::parse_from_rfc3339(s)
-                .unwrap_or_else(|e| panic!("({tag}) log timestamp {s:?} is not RFC-3339: {e}"));
+                .unwrap_or_else(|e| panic!("({backend}) log timestamp {s:?} is not RFC-3339: {e}"));
         }
     }
 
@@ -1130,27 +1171,29 @@ mod tests {
 
     #[test]
     fn scores_read_log_parity_memory() {
-        let (events, stamps) = capture(|| {
+        let tag = fresh_tag();
+        let (events, stamps) = capture(&tag, || {
             let dir = crate::store::MemoryBackend::new();
-            block_on(exercise(&dir));
+            block_on(exercise(&dir, &tag));
         });
-        assert_backend_entries("mem", &events, &stamps);
+        assert_backend_entries("mem", &tag, &events, &stamps);
     }
 
     #[cfg(feature = "sqlite")]
     #[test]
     fn scores_read_log_parity_sqlite() {
-        let (events, stamps) = capture(|| {
+        let tag = fresh_tag();
+        let (events, stamps) = capture(&tag, || {
             block_on(async {
                 use crate::store::Backend as _;
                 let dir = crate::store::SqliteBackend::open_in_memory()
                     .await
                     .expect("open sqlite");
                 dir.run_migrations().await.expect("migrations");
-                exercise(&dir).await;
+                exercise(&dir, &tag).await;
             });
         });
-        assert_backend_entries("sq", &events, &stamps);
+        assert_backend_entries("sq", &tag, &events, &stamps);
     }
 
     #[cfg(feature = "postgres")]
@@ -1163,17 +1206,18 @@ mod tests {
             eprintln!("scores_read_log_parity_postgres skipped: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        let (events, stamps) = capture(|| {
+        let tag = fresh_tag();
+        let (events, stamps) = capture(&tag, || {
             block_on(async {
                 use crate::store::Backend as _;
                 let dir = crate::store::PostgresBackend::connect(&dsn)
                     .await
                     .expect("connect postgres");
                 dir.run_migrations().await.expect("migrations");
-                exercise(&dir).await;
+                exercise(&dir, &tag).await;
             });
         });
-        assert_backend_entries("pg", &events, &stamps);
+        assert_backend_entries("pg", &tag, &events, &stamps);
     }
 
     /// **The differential itself**, in one process: the same two reads against
@@ -1186,20 +1230,22 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[test]
     fn scores_read_log_is_identical_across_backends() {
-        let (mem, _) = capture(|| {
+        let tag = fresh_tag();
+        let (mem, _) = capture(&tag, || {
             let dir = crate::store::MemoryBackend::new();
-            block_on(exercise(&dir));
+            block_on(exercise(&dir, &tag));
         });
-        let (sq, _) = capture(|| {
+        let (sq, _) = capture(&tag, || {
             block_on(async {
                 use crate::store::Backend as _;
                 let dir = crate::store::SqliteBackend::open_in_memory()
                     .await
                     .expect("open sqlite");
                 dir.run_migrations().await.expect("migrations");
-                exercise(&dir).await;
+                exercise(&dir, &tag).await;
             });
         });
+        assert_eq!(mem.len(), 2, "memory logged both reads: {mem:#?}");
         assert_eq!(
             mem, sq,
             "memory and sqlite disagree about what a scores-plane read logs"
@@ -1216,19 +1262,20 @@ mod tests {
     /// A read nobody can attribute is exactly the read an audit exists to find.
     #[test]
     fn the_none_caller_path_is_logged_as_unauthenticated() {
-        let (events, _) = capture(|| {
+        let tag = fresh_tag();
+        let (events, _) = capture(&tag, || {
             let dir = crate::store::MemoryBackend::new();
             block_on(async {
                 // The FFI wrapper's `caller_occurrence_key_id: Option<String>`
                 // reaches the door as `unwrap_or_default()` — the empty string.
                 let _ = dir
-                    .list_scores("", AttestationFilter::default(), None, 10)
+                    .list_scores("", resolve_probe_filter(&tag), None, 10)
                     .await;
                 // Whitespace is the same absence wearing a disguise.
                 let _ = dir
                     .resolve_scores(
                         "   ",
-                        AttestationFilter::default(),
+                        resolve_probe_filter(&tag),
                         "cc-4.4.2-signed-mean".to_owned(),
                         false,
                     )
@@ -1251,19 +1298,20 @@ mod tests {
     /// and never "the capture silently failed".
     #[test]
     fn the_witness_observes_the_tracing_emit_itself() {
-        let (events, stamps) = capture(|| {
+        let tag = fresh_tag();
+        let (events, stamps) = capture(&tag, || {
             log_scores_read(
                 ScoresReadSite::ListScores,
-                "caller_key_552",
-                &probe_filter(),
+                &format!("caller_{tag}"),
+                &probe_filter(&tag),
             );
         });
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0], expected_list_event());
+        assert_eq!(events[0], expected_list_event(&tag));
         assert_eq!(stamps.len(), 1);
         // And it does NOT capture the rest of persist's logging.
-        let (other, _) = capture(|| {
-            tracing::info!(target: "some_other_plane", "not the scores plane");
+        let (other, _) = capture(&tag, || {
+            tracing::info!(target: "some_other_plane", tag = %tag, "not the scores plane");
         });
         assert!(
             other.is_empty(),
@@ -1275,19 +1323,19 @@ mod tests {
 
     #[test]
     fn the_canonical_renderings_are_order_and_duplicate_stable() {
-        let a = ScoresReadLogRecord::render_subject_filter(&probe_filter());
+        let a = ScoresReadLogRecord::render_subject_filter(&probe_filter("key_552"));
         let reordered = AttestationFilter {
             attested_key_ids: vec![
                 "alpha_key".to_owned(),
                 "zeta_key".to_owned(),
                 "alpha_key".to_owned(),
             ],
-            ..probe_filter()
+            ..probe_filter("key_552")
         };
         assert_eq!(a, ScoresReadLogRecord::render_subject_filter(&reordered));
         assert_eq!(a, "subject=subject_key_552;attested=alpha_key,zeta_key");
 
-        let d = ScoresReadLogRecord::render_dimension_filter(&probe_filter());
+        let d = ScoresReadLogRecord::render_dimension_filter(&probe_filter("key_552"));
         assert_eq!(d, "exact=capacity:composite:v1;prefixes=capacity:,trust:");
         assert_eq!(
             ScoresReadLogRecord::render_dimension_filter(&AttestationFilter::default()),

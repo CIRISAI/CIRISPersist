@@ -204,11 +204,54 @@ pub mod bodies {
         ts::register_hybrid_key_as(d, &newcomer, &newcomer, it::USER).await;
         identity_claims(d, &attacker, &human).await;
         assert!(
-            d.active_identities_for_occurrence(&human)
+            d.list_identity_occurrences_by_occurrence_key(&human)
+                .await
+                .unwrap()
+                .iter()
+                .any(|io| io.identity_key_id == attacker),
+            "{tag}: precondition — the claim is stored on the plane"
+        );
+        // v51.2.0 (CIRISPersist#932) — stored, but it resolves NOTHING: the
+        // attacker is not the human's principal (H1 applied to the resolver).
+        assert!(
+            !d.active_identities_for_occurrence(&human)
                 .await
                 .unwrap()
                 .contains(&attacker),
-            "{tag}: precondition — the claim is in the active fold"
+            "{tag}: #932 — a unilateral signed claim is not a principal"
+        );
+        // Controls: the occurrence's OWN agreement resolves, and a
+        // trusted-local anchor (this node's `self_at_login`, no signature)
+        // resolves — the two shapes production writes.
+        let agreed = format!("agreed-device-{tag}");
+        ts::register_hybrid_key_as(d, &agreed, &agreed, it::USER).await;
+        identity_claims(d, &human, &agreed).await;
+        assert!(
+            !d.active_identities_for_occurrence(&agreed)
+                .await
+                .unwrap()
+                .contains(&human),
+            "{tag}: #932 — the identity's claim alone does not resolve the device"
+        );
+        occurrence_agrees(d, &human, &agreed).await;
+        assert_eq!(
+            d.active_identities_for_occurrence(&agreed).await.unwrap(),
+            vec![human.clone()],
+            "{tag}: #932 — the occurrence's agreement resolves it"
+        );
+        let anchor = format!("local-device-{tag}");
+        ts::register_hybrid_key_as(d, &anchor, &anchor, it::USER).await;
+        d.put_identity_occurrence_local(
+            ts::signed_content_only_occurrence(&human, &human, &anchor, ago(1))
+                .await
+                .identity_occurrence,
+        )
+        .await
+        .expect("a trusted-local anchor is stored");
+        assert_eq!(
+            d.active_identities_for_occurrence(&anchor).await.unwrap(),
+            vec![human.clone()],
+            "{tag}: #932 — a trusted-local anchor resolves"
         );
         assert!(
             !crate::federation::is_node_bearing_key(d, &human)

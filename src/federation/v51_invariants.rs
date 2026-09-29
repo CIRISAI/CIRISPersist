@@ -7,6 +7,8 @@
 //!   another blob (or the blob's own ciphertext) fails after authorization, the
 //!   plaintext cap holds. On sqlite and postgres over the two-node community
 //!   ladder (#876's fixture).
+//! - **I128 (CIRISPersist#945)** — the Live listing honours every admitted
+//!   retraction (an owner's, a subject's), on every backend.
 //! - **I126 (CIRISPersist#941)** — the live owner of a NODE may withdraw a
 //!   row that node attested (rule 1 lifted to the producer's principal, CC
 //!   3.4.7.3) — but only a row produced while the issuer already owned the
@@ -330,6 +332,235 @@ mod descriptor {
         (|| Some((crate::test_pg::empty_dsn()?, crate::test_pg::empty_dsn()?)))(),
         (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
             as Pick<crate::store::postgres::PostgresBackend>
+    );
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod live_fold {
+    //! **I128 (CIRISPersist#945)** — the Live listing honours EVERY admitted
+    //! retraction, not only the author's own. v51.0.0's #941 admitted a node
+    //! owner's `withdraws` over a node-authored row (stamped
+    //! `withdraws_admission_rule = 1`), and the consolidated fold
+    //! (`precedence::retired_ids`) retired it — but the five scores-plane Live
+    //! filters (sqlite ×2, postgres ×2, memory) hid a row only when the
+    //! retracting row's attester was the target's attester, so an admitted
+    //! owner's (or subject's, or delegate's) withdrawal was stored as withdrawn
+    //! and still listed as Live. Edge's `lifecycle_of` mirrored it
+    //! (CIRISEdge#712).
+    use crate::federation::admission::steward_liveness_test_support::{register, withdraws_of};
+    use crate::federation::consent_peer_set::test_support::grant;
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{identity_type as it, SignedAttestation};
+    use crate::federation::{AttestationOutcome, Error, FederationDirectory};
+    use crate::read::{AttestationFilter, LifecycleView};
+
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    }
+
+    async fn listed(
+        d: &dyn FederationDirectory,
+        node: &str,
+        lifecycle: LifecycleView,
+    ) -> Vec<String> {
+        d.list_scores(
+            "",
+            AttestationFilter {
+                attesting_key_id: Some(node.to_owned()),
+                lifecycle,
+                ..AttestationFilter::default()
+            },
+            None,
+            100,
+        )
+        .await
+        .expect("list_scores")
+        .items
+        .into_iter()
+        .map(|a| a.attestation_id)
+        .collect()
+    }
+
+    /// Returns `(node, a, b)` so a backend's runner can also read the second
+    /// Live filter (`ReadEngine::list_attestations`, sqlite and postgres).
+    pub(crate) async fn i128_the_live_listing_honours_every_admitted_retraction(
+        d: &dyn FederationDirectory,
+    ) -> (String, String, String) {
+        let s = suffix();
+        let (owner, node, peer, stranger) = (
+            format!("lf-owner-{s}"),
+            format!("lf-node-{s}"),
+            format!("lf-peer-{s}"),
+            format!("lf-stranger-{s}"),
+        );
+        register(d, &owner, &[it::USER]).await;
+        register(d, &node, &[it::NODE]).await;
+        register(d, &peer, &[it::USER]).await;
+        register(d, &stranger, &[it::USER]).await;
+        let put = |a: crate::federation::Attestation| async move {
+            d.put_attestation(SignedAttestation { attestation: a })
+                .await
+        };
+        put(ts::owner_binding_attestation(
+            &format!("lf-ob-{s}"),
+            &owner,
+            &node,
+        ))
+        .await
+        .expect("the owner binds the node");
+        // two node-authored rows naming the peer as subject
+        let (a, b) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        for id in [&a, &b] {
+            assert_eq!(
+                put(grant(id, &node, &peer)).await.expect("stored"),
+                AttestationOutcome::Inserted
+            );
+        }
+        let live = listed(d, &node, LifecycleView::Live).await;
+        assert!(
+            live.contains(&a) && live.contains(&b),
+            "precondition: {live:?}"
+        );
+        // control: a stranger's withdrawal is refused at the door
+        assert!(
+            matches!(
+                put(withdraws_of(&stranger, &node, &a)).await,
+                Err(Error::WithdrawsNotAdmitted { .. })
+            ),
+            "a stranger's withdrawal is refused"
+        );
+        // the node's OWNER withdraws A (#941, rule 1 lifted to the principal)
+        let wa = withdraws_of(&owner, &node, &a);
+        let wa_id = wa.attestation_id.clone();
+        put(wa).await.expect("the owner's withdrawal is admitted");
+        assert_eq!(
+            d.get_attestation(&wa_id)
+                .await
+                .unwrap()
+                .expect("stored")
+                .withdraws_admission_rule,
+            Some(1),
+            "the door recorded the admitting rule"
+        );
+        // the SUBJECT withdraws B (rule 2)
+        let wb = withdraws_of(&peer, &node, &b);
+        let wb_id = wb.attestation_id.clone();
+        put(wb).await.expect("the subject's revocation is admitted");
+        assert_eq!(
+            d.get_attestation(&wb_id)
+                .await
+                .unwrap()
+                .expect("stored")
+                .withdraws_admission_rule,
+            Some(2)
+        );
+        let live = listed(d, &node, LifecycleView::Live).await;
+        assert!(
+            !live.contains(&a) && !live.contains(&b),
+            "I128: an admitted non-author retraction hides the row: {live:?}"
+        );
+        let withdrawn = listed(d, &node, LifecycleView::IncludeWithdrawn).await;
+        assert!(
+            withdrawn.contains(&a) && withdrawn.contains(&b),
+            "IncludeWithdrawn still shows them: {withdrawn:?}"
+        );
+        assert!(
+            d.list_consent_peers(&node).await.unwrap().is_empty(),
+            "the consolidated fold agrees (the replication peer set is empty)"
+        );
+        (node, a, b)
+    }
+
+    /// The second Live filter: `ReadEngine::list_attestations` (the generic
+    /// listing behind `Engine::list_attestations`), on the backends that
+    /// implement it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i128_on_list_attestations<B>(b: &B, node: &str, a: &str, bb: &str)
+    where
+        B: crate::read::ReadEngine + Sync,
+    {
+        let ids = |lifecycle: LifecycleView| async move {
+            b.list_attestations(
+                AttestationFilter {
+                    attesting_key_id: Some(node.to_owned()),
+                    lifecycle,
+                    ..AttestationFilter::default()
+                },
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .expect("list_attestations")
+            .items
+            .into_iter()
+            .map(|x| x.attestation_id)
+            .collect::<Vec<_>>()
+        };
+        let live = ids(LifecycleView::Live).await;
+        assert!(
+            !live.contains(&a.to_owned()) && !live.contains(&bb.to_owned()),
+            "I128 (list_attestations): admitted non-author retractions hide: {live:?}"
+        );
+        let withdrawn = ids(LifecycleView::IncludeWithdrawn).await;
+        assert!(
+            withdrawn.contains(&a.to_owned()) && withdrawn.contains(&bb.to_owned()),
+            "{withdrawn:?}"
+        );
+    }
+
+    macro_rules! runners {
+        ($modname:ident, $fresh:expr, $read_engine:expr) => {
+            mod $modname {
+                #[tokio::test]
+                async fn i128() {
+                    let Some(d) = $fresh.await else { return };
+                    let (node, a, b) =
+                        super::i128_the_live_listing_honours_every_admitted_retraction(
+                            &d as &dyn crate::federation::FederationDirectory,
+                        )
+                        .await;
+                    if $read_engine {
+                        super::i128_on_list_attestations(&d, &node, &a, &b).await;
+                    }
+                }
+            }
+        };
+    }
+    runners!(
+        memory,
+        async { Some(crate::store::memory::MemoryBackend::new()) },
+        false
+    );
+    #[cfg(feature = "sqlite")]
+    runners!(
+        sqlite,
+        async {
+            use crate::store::Backend as _;
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            Some(b)
+        },
+        true
+    );
+    #[cfg(feature = "postgres")]
+    runners!(
+        postgres,
+        async {
+            use crate::store::Backend as _;
+            let dsn = crate::test_pg::empty_dsn()?;
+            let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            Some(b)
+        },
+        true
     );
 }
 

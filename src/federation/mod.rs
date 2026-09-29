@@ -5403,6 +5403,20 @@ pub trait FederationDirectory: Send + Sync {
     /// first. Default impl over
     /// [`Self::list_identity_occurrences_by_occurrence_key`]; backends need
     /// not override.
+    ///
+    /// v51.2.0 (CIRISPersist#932; the #925 H1 rule applied here) — **a binding
+    /// counts only with the occurrence's consent or this node's own trust.** A
+    /// peer-replicated SIGNED row whose signer is the identity alone is a
+    /// unilateral claim: any registered key N could sign `{identity: N,
+    /// occurrence: H}` and become H's principal on every node — H's on-behalf
+    /// writes would then act as N, and N would be party to H's rooms. Such a
+    /// row is stored (the occurrence gate admits the identity's signature) but
+    /// resolves nothing. A binding resolves when:
+    /// - it is TRUSTED-LOCAL (no signature columns: `self_at_login`, the HTTP
+    ///   self-bind — produced by this node for its own user, never reachable
+    ///   from the replication apply), or
+    /// - a stored signed row for the pair was signed by the OCCURRENCE
+    ///   ([`occurrence_agreed_to`]).
     async fn active_identities_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -5417,6 +5431,20 @@ pub trait FederationDirectory: Send + Sync {
                 continue;
             }
             if principals.iter().any(|(id, _)| *id == io.identity_key_id) {
+                continue;
+            }
+            // #932 — consent or local trust, never the identity's word alone.
+            let signed_for_pair: Vec<SignedIdentityOccurrence> = self
+                .list_signed_identity_occurrences_for(&io.identity_key_id)
+                .await?
+                .into_iter()
+                .filter(|s| s.identity_occurrence.occurrence_key_id == occurrence_key_id)
+                .collect();
+            let trusted_local = signed_for_pair.is_empty();
+            let agreed = signed_for_pair
+                .iter()
+                .any(|s| s.attesting_key_id == occurrence_key_id);
+            if !(trusted_local || agreed) {
                 continue;
             }
             let active = self
@@ -5574,10 +5602,20 @@ pub trait FederationDirectory: Send + Sync {
         let widenings = self
             .list_community_membership_widenings_for(community_key_id)
             .await?;
+        // v51.2.0 (CIRISPersist#936) — an IDENTICAL widening already on the
+        // plane IS the idempotent no-op: the member is active at that instant
+        // by construction, so answer `false` without a row and without
+        // verifying the caller's spec (v48 routed the exact retry through the
+        // put door, which refused an unsigned retry `tier_unverified` while a
+        // retry at a later instant passed authority-free — inverted from the
+        // pre-v48 contract CIRISConformance pins).
         let already = widenings.iter().any(|w| {
             w.member_key_id == widening.member_key_id && w.effective_at == widening.effective_at
         });
-        if !already {
+        if already {
+            return Ok(false);
+        }
+        {
             // Already active at that instant: the row would not move the fold.
             let record = self
                 .lookup_community(community_key_id)
@@ -5607,7 +5645,7 @@ pub trait FederationDirectory: Send + Sync {
             cosignatures: spec.cosignatures.clone(),
         })
         .await?;
-        Ok(!already)
+        Ok(true)
     }
 
     // ── #249 Cut G1 ── the uniform rostered-group surface ──────────────

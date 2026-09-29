@@ -7,12 +7,31 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [51.1.0] - UNRELEASED
+## [51.2.0] - UNRELEASED
+
+**PATCH — four backlog defects, no wire, hash or migration change.** Built directly, each witnessed RED-first on memory, sqlite and postgres, mutated on a committed tree.
+
+### Fixed — the Live listing honours every admitted retraction (CIRISPersist#945; found by CIRISEdge PR #711, mirrored as CIRISEdge#712)
+v51.0.0's #941 admitted a node owner's `withdraws` over a node-authored row and stamped `withdraws_admission_rule = 1`; the consolidated retraction fold (`precedence::retired_ids`) retired the row — but the five scores-plane Live filters (`list_scores` and `list_attestations`, sqlite and postgres; memory's `list_scores`) hid a row only when the retracting row's attester was the target's own, so an admitted owner's withdrawal was stored as withdrawn and still listed as Live. The same held for a subject's consent revocation (rule 2) and a delegate's (rules 3/4): every non-author retraction the write door admits was invisible to the listing. Each filter now also hides a row whose `withdraws` carries a recorded admission rule — the write door's verdict, which the listing had ignored. `supersedes` stays same-author (only the author renames, as Edge found). This narrows #720 (the listing is still a precedence-free decider) without closing it. **I128** on every backend: two node-authored rows; the owner withdraws one (rule 1) and the subject the other (rule 2); a stranger's withdrawal is refused at the door; Live lists neither, `IncludeWithdrawn` lists both; the replication peer set agrees.
+
+### Fixed — the exact roster re-add is the idempotent no-op whatever the spec (CIRISPersist#936; CIRISConformance `test_263`)
+v48.0.0 (#860) put the "already on the plane" test in FRONT of the fold's short-circuit as a reason to skip it, so a byte-identical `add_community_member` retry went to the put door and an unsigned retry was refused `tier_unverified`, while a retry at a later instant passed authority-free — inverted from the pre-v48 contract. An identical widening on the plane means the member is active at that instant by construction: the door now answers `false` there, writes no row and verifies no spec; the fold and the put run only for a new widening. I164 gains the unsigned exact retry.
+
+### Fixed — the principal resolver needs the occurrence's consent or this node's own trust (CIRISPersist#932; the #925 H1 rule)
+`active_identities_for_occurrence` (the write-side principal lift and the hold-side audience) resolved any active binding, including a peer-replicated signed row whose signer was the identity alone: any registered key N could sign `{identity: N, occurrence: H}` and become H's principal on every node. A binding now resolves only when it is TRUSTED-LOCAL (no signature columns — `self_at_login`, the HTTP self-bind, never reachable from the replication apply) or when a stored signed row for the pair was signed by the OCCURRENCE (`occurrence_agreed_to`). Server writes login anchors trusted-local, so nothing in the field changes hands. The rc5 H1 witness now asserts the attacker is stored and resolves nothing, with both production shapes as controls.
+
+### Fixed — the scores-read log witness captures through a process-wide hub (CIRISPersist#940)
+`scores_read_log_parity_memory` installed its capture subscriber as the test thread's default and once captured `[]` under a full parallel `cargo test` — an event the door provably emits, unseen, with the same code green alone and on re-run. The capture is now a hub installed once as the process's global subscriber (nothing else in the crate sets one; a second attempt panics rather than capturing nothing); each witness tags its reads with a fresh id and reads back only its own entries, so the capture no longer depends on which thread a read logs from and concurrent witnesses cannot see each other. No `#[ignore]`, no retry. The exact interaction between a scoped dispatcher and the callsite interest cache under load was not pinned down; the hub removes the dependence rather than the symptom. No other `*_log_parity_*` test shares the old shape.
+
+### Fixed — the test harness
+`test_pg::empty_dsn` (shipped in v51.0.0) is unchanged; the CHANGELOG dates for 51.0.0 and 51.1.0 now read 2026-09-29.
+
+## [51.1.0] - 2026-09-29
 
 ### Added — the custody view: who can open a file, and how many copies are known (CIRISPersist#942)
 **Recovery for family content** (operator, 2026-09-28 — "is this the only copy of the baby photos?"). `Engine::blob_custody(at_rest_sha256, viewer_key_id) -> BlobCustody` and pyo3 **`blob_custody_json(sha256_hex, viewer_key_id)`**: `{sha256_hex, tier, cohort_scope, size_bytes, held_here, access: [{person_key_id, devices, via}], announced_holders: [{node_key_id, size_bytes}], copies_known, copies_observable, why?}`. Authorized exactly as `read_blob_as` (the row's recorded tier; a stranger is `NotGranted` and learns nothing, not even the access list). **Access is exact**: `self`/`family` — the at-rest grant recipients (persist's self-retention row excluded); `community` — the member grants on the epoch the blob was sealed under; each device resolved to its person by persist's own principal fold (occurrence axis, then owner-binding axis), grouped. **Copies**: exact for community and the commons (this node + announced holders); for `self`/`family` they are **not countable by design** — those bytes are never announced (CC 5.2 structural invisibility; I52) — so the view says `copies_observable: false` with the reason, never a false "1 copy". Within-cohort custody acknowledgements that make family copies countable are the v52 follow-on, on a CC ruling (CIRISConstitution#130). Encryption is unchanged: a `family` blob stays sealed (CC 4.4.3.2.1; I25). Additive: no wire, hash or migration change. I127 on sqlite and postgres (a community blob lists both members' devices and counts this node's copy; a self blob lists the owner's devices and reports copies not observable; a commons blob lists no access; a stranger is refused on both). Mutants: the authorization dropped, family copies claimed observable, community access emptied — killed; the self-retention filter dropped — equivalent (`list_at_rest_grants` already excludes that row; the filter is belt-and-braces, stated).
 
-## [51.0.0] - UNRELEASED
+## [51.0.0] - 2026-09-29
 
 **MAJOR — the release adopters take ("no one adopts 50"): the rc6 security set, the sealed descriptor, the released-registry row for Edge, CIRISVerify 18.** Built directly on v50.0.0; every slice witnessed RED first on memory, sqlite and postgres, mutation-tested on a committed tree, and reviewed against its FSD before merge.
 
