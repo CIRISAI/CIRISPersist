@@ -810,6 +810,33 @@ pub(crate) mod bodies {
         assert_eq!(v.unwitnessed_tail, 1);
         let r = cc::resolve_community(d, CANON).await.unwrap().unwrap();
         assert_eq!(r.founders, FOUNDERS.to_vec(), "served at the birth");
+        // a below-quorum cosign on this node's OWN stored tail: the node is not
+        // behind the witness plane (the restore discipline reads the stored
+        // chain); an amendment on the unwitnessed tail is refused because it
+        // does not follow the witnessed head — named as that, not as a lag
+        let v2_digest = d
+            .lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        assert_ne!(v2_digest, birth_digest);
+        d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", Some(&birth_digest)).await)
+            .await
+            .unwrap();
+        put_conferred(d, &holders, "q2-steward-b", "user,steward").await;
+        let e = founders_supersede(
+            d,
+            swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "q2-steward-b"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect_err("an unwitnessed tail is not extended");
+        assert!(
+            !e.to_string()
+                .contains(crate::federation::admission::TRUST_ROOT_RULE_BEHIND_WITNESS),
+            "a cosign on the node's own tail is not a lag: {e:?}"
+        );
         // the charter raises the quorum to 3: no version reaches it, so the
         // lineage is judged as before rc6 again — the CACHED standing must not
         // survive a charter change (the charter members are in its key)
