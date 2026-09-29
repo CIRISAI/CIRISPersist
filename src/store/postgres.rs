@@ -12937,7 +12937,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // v20.0.0 (#495 C2) — path from the ONE constant (see sqlite twin).
             where_parts.push(format!(
                 "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
-                   WHERE c.attesting_key_id = fa.attesting_key_id \
+                   WHERE (c.attesting_key_id = fa.attesting_key_id \
+                          OR c.withdraws_admission_rule IS NOT NULL) \
                      AND c.attestation_type IN ({}) \
                      AND c.attestation_envelope::jsonb->>'{}' = fa.attestation_id::text)",
                 ph.join(","),
@@ -24178,7 +24179,8 @@ impl crate::read::ReadEngine for PostgresBackend {
                 }
                 where_parts.push(format!(
                     "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
-                       WHERE c.attesting_key_id = federation_attestations.attesting_key_id \
+                       WHERE (c.attesting_key_id = federation_attestations.attesting_key_id \
+                              OR c.withdraws_admission_rule IS NOT NULL) \
                          AND c.attestation_type IN ({}) \
                          AND c.attestation_envelope::jsonb->>'{}' = \
                              federation_attestations.attestation_id::text)",

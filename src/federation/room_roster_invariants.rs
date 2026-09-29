@@ -320,6 +320,27 @@ pub mod bodies {
                 .unwrap(),
             "{tag} I164: the byte-identical row is a no-op"
         );
+        // v51.2.0 (CIRISPersist#936) — the exact retry is the no-op WHATEVER
+        // the spec: an identical widening on the plane means the member is
+        // active at that instant by construction, so no authority is asked
+        // for. v48 routed the byte-identical retry through the put door
+        // (an unsigned retry was refused `tier_unverified`) while a retry at
+        // a later instant passed authority-free — inverted from the pre-v48
+        // contract CIRISConformance pins (`test_263`).
+        let empty = crate::federation::cohort::AdmitSpec {
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            cosignatures: Vec::new(),
+        };
+        assert!(
+            !a.add_community_member(&room, member.clone(), &empty)
+                .await
+                .unwrap_or_else(|e| panic!(
+                    "{tag} #936: an unsigned exact retry must be the idempotent no-op, got {e}"
+                )),
+            "{tag} #936: the unsigned exact retry is a no-op"
+        );
         // The pre-v48 idempotency holds on the plane: a re-add of an ACTIVE
         // member with a fresh `joined_at` is a no-op that writes no row (the
         // fold is identical with or without it) — pg's Cut B graph DX test

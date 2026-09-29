@@ -4178,11 +4178,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 if hide.is_empty() {
                     return true;
                 }
-                // Exclude rows retracted by a still-hiding composer from the
-                // same attester.
+                // Exclude rows retracted by a still-hiding composer: the
+                // target's own author's, or one the write door admitted under
+                // a resolved rule (v51.2.0, #945 — a node owner's, a subject's
+                // or a delegate's withdrawal hides too; the consolidated fold
+                // `precedence::retired_ids` already held so).
                 !all.iter().any(|c| {
                     hide.contains(&c.attestation_type.as_str())
-                        && c.attesting_key_id == r.attesting_key_id
+                        && (c.attesting_key_id == r.attesting_key_id
+                            || c.withdraws_admission_rule.is_some())
                         && crate::federation::precedence::references_attestation_id_from_envelope(
                             &c.attestation_envelope,
                         ) == Some(r.attestation_id.as_str())

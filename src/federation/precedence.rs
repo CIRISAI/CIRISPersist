@@ -555,25 +555,42 @@ pub(crate) mod test_support {
              the refusal above meaningful"
         );
 
-        // ── what the subject's revocation does NOT do, recorded because it
-        //    surprised this test into being right. The §6.1 lifecycle fold is
-        //    PER ATTESTER (rule 4: cross-attester composers are independent
-        //    chains), so `S`'s admitted revocation does not hide the
-        //    producer's row from the producer's own chain — it is an admitted,
-        //    stored consent act that the consumer composes. That is a
-        //    composition-policy fact about `subject_key_ids` authority; it is
-        //    NOT the pointer conferring anything, which is the whole point.
+        // ── what the subject's revocation DOES (v51.2.0, CIRISPersist#945).
+        //    Before #945 this block pinned the opposite — "S's admitted
+        //    revocation does not hide the producer's row from the producer's
+        //    own chain" — because the five scores-plane Live filters hid a row
+        //    only under its own author's retraction, and the test recorded what
+        //    it found. That was the listing disagreeing with the write door and
+        //    with the consolidated fold (`retired_ids`, #686), which both
+        //    honour the rule-2 admission. The listing now reads the door's
+        //    verdict: an admitted retraction hides, whoever signed it. R still
+        //    never appears in a subject-keyed read — that is the pointer point,
+        //    unchanged.
         if let Some(ids) = subject_visible_ids(dir, &subject).await {
             assert!(
-                ids.contains(&p_id),
-                "P must still be visible on the producer's chain: a cross-attester revocation is \
-                 admitted (rule 2, above) and composed by the consumer, not folded into the \
-                 producer's own lifecycle (CEG §6.1 rule 4): {ids:?}"
+                !ids.contains(&p_id),
+                "the subject's admitted rule-2 revocation must hide P from the Live view \
+                 (#945: every admitted retraction hides, not only the author's): {ids:?}"
             );
             assert!(
                 !ids.contains(&r_id),
                 "R must never appear in a subject-keyed read for {subject} — not before the \
                  withdraws, and not after: {ids:?}"
+            );
+        }
+        if let Some(ids) = visible_ids(
+            dir,
+            crate::read::AttestationFilter {
+                subject_key_id: Some(subject.clone()),
+                lifecycle: crate::read::LifecycleView::IncludeWithdrawn,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            assert!(
+                ids.contains(&p_id),
+                "P is withdrawn, not gone: IncludeWithdrawn still lists it: {ids:?}"
             );
         }
     }

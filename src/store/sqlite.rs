@@ -11744,9 +11744,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // ONE envelope-path constant (bound to EnvelopeCore's serde
             // name by witness); a key rename can no longer silently leave
             // a withdrawn attestation active.
+            // v51.2.0 (#945) — the retracting row is the target's own author's, OR the write door admitted it under a resolved rule (#945: a node owner's, a subject's, a delegate's withdrawal — every admitted retraction hides, as the consolidated fold already holds).
             parts.push(format!(
                 "NOT EXISTS (SELECT 1 FROM federation_attestations c \
-                   WHERE c.attesting_key_id = fa.attesting_key_id \
+                   WHERE (c.attesting_key_id = fa.attesting_key_id \
+                          OR c.withdraws_admission_rule IS NOT NULL) \
                      AND c.attestation_type IN ({}) \
                      AND json_extract(c.attestation_envelope, '$.{}') = fa.attestation_id)",
                 ph.join(","),
@@ -23368,7 +23370,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                 }
                 parts.push(format!(
                     "NOT EXISTS (SELECT 1 FROM federation_attestations c \
-                       WHERE c.attesting_key_id = federation_attestations.attesting_key_id \
+                       WHERE (c.attesting_key_id = federation_attestations.attesting_key_id \
+                              OR c.withdraws_admission_rule IS NOT NULL) \
                          AND c.attestation_type IN ({}) \
                          AND json_extract(c.attestation_envelope, '$.{}') = \
                              federation_attestations.attestation_id)",
