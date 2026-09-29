@@ -780,6 +780,238 @@ pub mod orchestrate {
         })
     }
 
+    // ── the sealed-DAG adopt (v51.3.0, CIRISPersist#947) ─────────────────
+
+    /// One chunk of an opened sealed manifest, as the puller needs it: the
+    /// CIPHERTEXT address to fetch by, the plaintext size, the position to
+    /// adopt it at.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct SealedManifestChunk {
+        /// The chunk's content address (over its CIPHERTEXT): fetch by this.
+        pub sha256_hex: String,
+        /// The chunk's PLAINTEXT size — `plaintext_size` at the adopt.
+        pub size: u32,
+        /// The chunk's position in the stream — adopt it at `(stream_id, seq)`.
+        pub seq: u64,
+    }
+
+    /// `Engine::open_sealed_manifest_as` — a sealed DAG's manifest, opened for
+    /// an authorized viewer: the chunk list to fetch and adopt, the stream to
+    /// adopt it under, and the three bounds the puller checks BEFORE it
+    /// fetches (per-chunk inline cap, whole-read cap, chunk-count cap).
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct SealedManifestView {
+        /// The manifest's address (the DAG's address).
+        pub sha256_hex: String,
+        /// `inline` for a manifest adopted and not yet promoted; `chunk_dag`
+        /// once promoted, or at the origin.
+        pub storage_kind: String,
+        /// The row's recorded crypto tier (`invisible_encrypted` / `community_dek`).
+        pub tier: String,
+        /// The stream the chunks belong to — the `stream_id` to adopt them under.
+        pub stream_id: String,
+        /// The file's plaintext size (the sum of the chunks' sizes).
+        pub total_size: u64,
+        /// The chunks, in stream order.
+        pub chunks: Vec<SealedManifestChunk>,
+        /// This node's inline cap: a chunk envelope above it is refused at the adopt.
+        pub inline_bytes_cap: u64,
+        /// The whole-read cap: a file above it is read by range only.
+        pub whole_read_cap_bytes: u64,
+        /// The chunk-count cap.
+        pub max_chunks: u64,
+    }
+
+    /// `Engine::promote_adopted_manifest_to_dag`'s answer.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct DagPromotion {
+        /// The manifest's address (the DAG's address).
+        pub sha256_hex: String,
+        /// `false` when the row was already a `chunk_dag` (idempotent).
+        pub promoted: bool,
+        /// The chunks the manifest names, all held.
+        pub chunk_count: u64,
+        /// The file's plaintext size.
+        pub total_size: u64,
+    }
+
+    /// The manifest of a SEALED DAG this node holds, opened for `viewer`:
+    /// authorized by the row's tier exactly as `read_any_for_viewer`
+    /// (a stranger is `NotGranted` and learns nothing; a withdrawn blob
+    /// refuses), then the inline envelope opened under `caller_aad` and
+    /// parsed as a v2 manifest at the row's tier. A plaintext row, a sealed
+    /// whole blob, or a v1 manifest is `InvalidArgument` (named).
+    async fn opened_sealed_manifest<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<(BlobHead, ChunkManifest), BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let Some(head) = backend.blob_head(sha256).await? else {
+            return Err(
+                crate::federation::at_rest_cascade::orchestrate::refuse_missing_row(
+                    backend,
+                    sha256,
+                    viewer_key_id,
+                )
+                .await?,
+            );
+        };
+        let tier = head.crypto_tier;
+        if tier == CryptoTier::Plaintext {
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {} is recorded at the plaintext tier: a plaintext DAG's manifest is in \
+                 clear (get_blob) and is stored through put_blob_chunks; only a SEALED \
+                 manifest is opened here",
+                hex::encode(sha256)
+            )));
+        }
+        authorize_viewer_by_tier(backend, sha256, tier, viewer_key_id).await?;
+        crate::federation::at_rest_cascade::refuse_if_withdrawn(backend, sha256).await?;
+        if head.storage_kind != "inline" && head.storage_kind != "chunk_dag" {
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {} is a {:?} row, not a held envelope",
+                hex::encode(sha256),
+                head.storage_kind
+            )));
+        }
+        let jcs =
+            read_sealed_inline_authorized(backend, sha256, tier, viewer_key_id, caller_aad).await?;
+        let m = ChunkManifest::from_manifest_bytes(&jcs).map_err(|e| {
+            BlobError::InvalidArgument(format!(
+                "blob {} opened, but its plaintext is not a chunk manifest ({e}): a sealed whole \
+                 blob is read with read_blob_as, not promoted",
+                hex::encode(sha256)
+            ))
+        })?;
+        if m.v != CHUNK_MANIFEST_VERSION_SEALED
+            || m.chunk_tier != Some(tier)
+            || m.stream_id.is_none()
+        {
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {} is not a v{CHUNK_MANIFEST_VERSION_SEALED} sealed manifest at tier {tier:?} \
+                 (v = {}, chunk_tier = {:?}, stream_id = {:?})",
+                hex::encode(sha256),
+                m.v,
+                m.chunk_tier,
+                m.stream_id
+            )));
+        }
+        Ok((head, m))
+    }
+
+    /// `Engine::open_sealed_manifest_as` (#947 ask 2) — see
+    /// [`SealedManifestView`]. Nothing is written.
+    pub async fn open_sealed_manifest_for_viewer<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<SealedManifestView, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let (head, m) = opened_sealed_manifest(backend, sha256, viewer_key_id, caller_aad).await?;
+        Ok(SealedManifestView {
+            sha256_hex: hex::encode(sha256),
+            storage_kind: head.storage_kind.clone(),
+            tier: head.crypto_tier.as_str().to_owned(),
+            stream_id: m.stream_id.clone().unwrap_or_default(),
+            total_size: m.total_size,
+            chunks: m
+                .chunks
+                .iter()
+                .map(|c| SealedManifestChunk {
+                    sha256_hex: hex::encode(c.sha),
+                    size: c.size,
+                    seq: c.seq.unwrap_or_default(),
+                })
+                .collect(),
+            inline_bytes_cap: backend.inline_bytes_cap() as u64,
+            whole_read_cap_bytes: DAG_WHOLE_READ_CAP_BYTES,
+            max_chunks: crate::federation::blobs::MAX_CHUNKS_PER_EPOCH,
+        })
+    }
+
+    /// `Engine::promote_adopted_manifest_to_dag` (#947 ask 1) — **the adopt
+    /// door's DAG half.** Opens the held manifest as `viewer_key_id` (the
+    /// same authorization as the bytes read), requires every chunk it names
+    /// to be held under the manifest's `stream_id` at its `seq` with the
+    /// named sha, plaintext size and tier — the checks `prepare_chunk_rows`
+    /// makes for a plaintext DAG, made here against the adopted chunk ROWS —
+    /// and then flips the row through the storage floor. A missing chunk
+    /// names its `(seq, sha)`; nothing is written until every chunk is held.
+    /// Idempotent: a row already promoted (or sealed here) answers
+    /// `promoted: false`.
+    pub async fn promote_adopted_manifest_to_dag<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<DagPromotion, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let (head, m) = opened_sealed_manifest(backend, sha256, viewer_key_id, caller_aad).await?;
+        let stream_id = m.stream_id.clone().unwrap_or_default();
+        let chunk_count = m.chunks.len() as u64;
+        let done = |promoted: bool| DagPromotion {
+            sha256_hex: hex::encode(sha256),
+            promoted,
+            chunk_count,
+            total_size: m.total_size,
+        };
+        if head.storage_kind == "chunk_dag" {
+            return Ok(done(false));
+        }
+        let listing = backend.stream_chunks(&stream_id).await?;
+        for (i, c) in m.chunks.iter().enumerate() {
+            let Some(seq) = c.seq else {
+                return Err(BlobError::InvalidArgument(format!(
+                    "manifest chunk [{i}] of {} carries no seq: not a positioned sealed manifest",
+                    hex::encode(sha256)
+                )));
+            };
+            let Some(row) = listing.chunks.iter().find(|r| r.seq == seq) else {
+                return Err(BlobError::InvalidArgument(format!(
+                    "chunk seq {seq} ({}) of stream {stream_id} is not held: fetch it by that sha \
+                     and adopt it at (stream_id, seq) with plaintext_size {} before promoting \
+                     (adopt_sealed_chunk)",
+                    hex::encode(c.sha),
+                    c.size
+                )));
+            };
+            if row.chunk_sha != c.sha {
+                return Err(BlobError::InvalidArgument(format!(
+                    "chunk seq {seq} of stream {stream_id} is held as {} but the manifest names {}",
+                    hex::encode(row.chunk_sha),
+                    hex::encode(c.sha)
+                )));
+            }
+            if row.plaintext_size != u64::from(c.size) {
+                return Err(BlobError::InvalidArgument(format!(
+                    "chunk seq {seq} of stream {stream_id} was adopted with plaintext_size {} but \
+                     the manifest says {}",
+                    row.plaintext_size, c.size
+                )));
+            }
+            if row.crypto_tier != head.crypto_tier {
+                return Err(BlobError::InvalidArgument(format!(
+                    "chunk seq {seq} of stream {stream_id} is recorded at tier {:?} but the \
+                     manifest is at {:?}",
+                    row.crypto_tier, head.crypto_tier
+                )));
+            }
+        }
+        let promoted = backend
+            .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
+            .await?;
+        Ok(done(promoted))
+    }
+
     // ── the reads ────────────────────────────────────────────────────────
 
     /// §12.4 — **the decrypting range read**, the door beside

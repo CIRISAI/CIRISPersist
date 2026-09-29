@@ -914,6 +914,18 @@ class Engine:
         Read-only -- it releases, evicts and mutates nothing.
         """
 
+    def open_descriptor_for_blob(self, at_rest_sha256_hex: str, viewer_key_id: str, sealed_b64: str, caller_aad_b64: str | None = None) -> str:
+        """(derived) deontic — v51.0.0 (CIRISPersist#923) — open a sealed_descriptor as viewer_key_id: sealed_b64 (the struct member) → the base64 plaintext. Same authorization a..."""
+
+    def open_sealed_manifest_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+        """(derived) deontic — v51.3.0 (CIRISPersist#947) — the chunk list of a sealed DAG this node holds, opened as viewer_key_id under the same authorization as read_blob_as (..."""
+
+    def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
+        """(derived) deontic — v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin ciris-canonical from ONE TrustRootBundleResponse JSON (the bundle's quorum ve..."""
+
+    def promote_adopted_manifest_to_dag_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+        """(derived) deontic — v51.3.0 (CIRISPersist#947) — finish a sealed DAG adopt. adopt_sealed_blob_json stores a received sealed manifest as an inline envelope; until this..."""
+
     def publish_self_occurrence(self, identity_key_id: str, device_class: str, valid_until_iso: str | None = None) -> str:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
@@ -969,6 +981,9 @@ class Engine:
 
     def put_blob_chunk_scoped(self, cohort_scope: str, stream_id: str, seq: int, plaintext_b64: str, epoch: int, community_key_id: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (§12.3) — append one plaintext segment to a live stream at cohort_scope, sealed where the tier requires it. The chunk twin of put_blob_scoped:..."""
+
+    def put_blob_chunks_signing_json(self, payload_json: str) -> str:
+        """(derived) deontic — v51.3.0 (CIRISPersist#947 ask 3) — store a plaintext chunk DAG and announce its manifest (holds_bytes, this node's claim), so a pulled commons DAG..."""
 
     def put_blob_encrypted_community(self, community_key_id: str, plaintext_b64: str, media_type: str | None = None) -> str:
         """(derived) deontic — v43.0.0 (FSD/BLOB_ENCRYPTION_AT_REST.md §10.1) — store a blob encrypted under a community's current-epoch DEK."""
@@ -1030,6 +1045,9 @@ class Engine:
     def put_identity_occurrence_json(self, payload_json: str) -> None:
         """(derived) deontic — v3.12.0 (CIRISPersist#153 Ask 1, CEG 0.7 §5.6.8.8) — admit an identity_occurrence binding (this occurrence_key_id IS also identity_key_id)."""
 
+    def put_lineage_head_cosign_json(self, payload_json: str) -> str:
+        """(derived) deontic — v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6) — the lineage-head cosign door: payload_json is a ciris.lineage_head_cosign.v1 object (lineage_key_id, he..."""
+
     def put_org_membership(self, signed_json: str) -> None:
         """(derived) deontic — Federation directory: admit an org_membership envelope (role- gated; CEG 1.0-RC2 §5.6.8.13). Same arg shape as [put_organization](Self::put_organiz..."""
 
@@ -1074,21 +1092,6 @@ class Engine:
 
     def read_blob_range_as(self, at_rest_sha256_hex: str, viewer_key_id: str, start: int, end_inclusive: int, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (BLOB_ENCRYPTION_AT_REST.md §12.4) — the decrypting range read. Plaintext bytes [start, end_inclusive] of any blob as viewer_key_id, base64-en..."""
-
-    def blob_custody_json(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
-        """(derived) epistemic — v51.1.0 (CIRISPersist#942) — the custody view of one blob as JSON: tier, cohort_scope, size_bytes, held_here, access (persons and their devices holding a key; via at_rest_grant | community_epoch_grant), announced_holders (community/commons), copies_known, copies_observable, why. Authorized like read_blob_as (blob_not_granted for a stranger). For self/family, copies_observable is false — copies on other devices are unknowable by design until within-cohort custody acknowledgements land (CIRISConstitution#130); never render that as \"1 copy\"."""
-
-    def put_lineage_head_cosign_json(self, payload_json: str) -> str:
-        """(derived) deontic — v51.0.0 (CIRISPersist#938, CC 3.2 T6 rc6; TRUST_ROOT_RC6.md §2.1) — the lineage-head cosign door: payload_json is a ciris.lineage_head_cosign.v1 object (lineage_key_id, head_digest_sha256_hex, head_asserted_at, prior_head_digest_sha256_hex?, signed_at, witness_key_id, signature_classical, signature_pqc). Returns the typed outcome as JSON ({"outcome": "inserted" | "unchanged" | "held_for_unknown_head" | "refused", "reason"?: witness_not_registered | witness_not_witness_type | witness_is_founder | signature_invalid | head_instant_mismatch | prior_not_ancestor | skew | malformed}). A witness that is a founder of the lineage is refused (independence); nothing is ever deleted (a competing head's cosign is the equivocation evidence)."""
-
-    def lineage_head_json(self, community_key_id: str) -> str:
-        """(derived) epistemic — v51.0.0 (CIRISPersist#938) — the witness plane\'s view of a root this node holds a lineage for (a trust-root community or a conferring family such as humanity-accord) as JSON: witnessed_head ([digest, asserted_at] or null), quorum, community (judged index, unwitnessed_tail, equivocation — null for a family) and latest_cosign_at; null when no lineage is held."""
-
-    def seal_descriptor_for_blob(self, at_rest_sha256_hex: str, key_id: str, plaintext_b64: str) -> str:
-        """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114; MEDIA_SOURCE.md §9.3) — seal a descriptor ({name, format, codec?} as JCS, base64 in, ≤ the descriptor cap) under an EXISTING blob's DEK as key_id: authorized like read_blob_as (blob_not_granted for a non-member), the DEK is the blob's (no edge-derived key), AAD = ciris.sealed_descriptor.v1 ‖ sha256. A plaintext-tier row raises ValueError (nothing to seal under). Returns the base64 at-rest envelope for media.sealed_descriptor."""
-
-    def open_descriptor_for_blob(self, at_rest_sha256_hex: str, viewer_key_id: str, sealed_b64: str, caller_aad_b64: str | None = None) -> str:
-        """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114; MEDIA_SOURCE.md §9.3) — open a media.sealed_descriptor as viewer_key_id under the BLOB's DEK: the same authorization as read_blob_as (blob_not_granted for a stranger; a withdrawn blob refuses); AAD = ciris.sealed_descriptor.v1 ‖ sha256, so a descriptor sealed for another blob (or the blob's own ciphertext) fails AFTER authorization as a backend/crypto error, never blob_not_granted. caller_aad_b64 (#923 amendment 1): the referencing ROW's associated data, as read_blob_as takes it; the blob is authenticated under it first, so a pointer transplanted onto another row reveals nothing. Returns the base64 plaintext ({name, format, codec?} as JCS)."""
 
     def read_stream_chunk_as(self, stream_id: str, seq: int, viewer_key_id: str, aad_b64: str | None = None) -> str:
         """(derived) deontic — #838 (§12.10) — read one chunk of a stream by POSITION as viewer_key_id, base64-encoded. The DVR / catch-up read: the row at (stream_id, seq) autho..."""
@@ -1167,6 +1170,9 @@ class Engine:
 
     def remove_peer_record(self, key_id: str, hard: bool, reason: str, acting_under_delegation_id: str | None = None) -> None:
         """(derived) deontic — Federation directory: remove a peer record. hard=false soft-marks removed_at; hard=true cascades through the FK to delete the federation_keys row (..."""
+
+    def resolve_community_json(self, community_key_id: str) -> str | None:
+        """(derived) deontic — v50.0.0 (CIRISPersist#926) — CC 4.4.3.2.4 resolve_community: the folded founders (eligible only) and members of community_key_id, its subkind, prot..."""
 
     def resolve_key_statement_standing_json(self, key_id: str, statement_at: str | None = None, now: str | None = None) -> str:
         """CIRISServer#356 — **do this key's past statements still stand?**
@@ -1355,6 +1361,9 @@ class Engine:
 
     def rewrap_own_epochs_to_member_devices_json(self, member_key_id: str | None = None, device_key_id: str | None = None) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#916, FSD/SECOND_DEVICE.md §3) — the minter side of the second device, on demand: re-wrap every retained epoch THIS node minte..."""
+
+    def seal_descriptor_for_blob(self, at_rest_sha256_hex: str, key_id: str, plaintext_b64: str) -> str:
+        """(derived) deontic — v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — seal a descriptor under an existing blob's DEK as key_id: plaintext_b64 (the JCS {name, format,..."""
 
     def seal_stream_scoped(self, cohort_scope: str, stream_id: str, community_key_id: str | None = None, media_type: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) deontic — #832 (§12.3) — seal a live stream into a chunk_dag at cohort_scope. Refuses unless every chunk ROW is at the DAG's tier (I32); builds the manifest..."""
@@ -2161,6 +2170,9 @@ class Engine:
     def age_band_json(self, key_id: str) -> str:
         """(derived) epistemic — v11.5.0 (CIRISPersist#306, CC 3.3.12 / CC 1.15.6) — the I1 age band of key_id, resolved from its incoming age attestations (witness age_assurance:..."""
 
+    def blob_custody_json(self, at_rest_sha256_hex: str, viewer_key_id: str) -> str:
+        """(derived) epistemic — v51.1.0 (CIRISPersist#942) — the custody view of one blob as JSON: {sha256_hex, tier, cohort_scope, size_bytes, held_here, access: [{person_key_id,..."""
+
     def cache_budget_bytes(self) -> int:
         """(derived) epistemic — v6.8.0 (CIRISPersist#148) — the operator-set (or mode-default) storage budget in bytes. u64::MAX ⇒ unbounded (Server mode)."""
 
@@ -2184,6 +2196,9 @@ class Engine:
 
     def get_repository_statistics(self, filter_json: str, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) epistemic — Corpus-shape rollup for a window — distinct trace counts by task_class, QA language / question_num, agent name / version, primary model, deployment..."""
+
+    def lineage_head_json(self, community_key_id: str) -> str:
+        """(derived) epistemic — v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this node holds a lineage for (a trust-root community or a conferring family) as JS..."""
 
     def list_signed_accord_quorum_evidence_since(self, since_rfc3339: str | None, since_id: str | None, limit: int) -> str:
         """(derived) epistemic — v31.1.0 (CIRISPersist#662) — bulk-list the signed accord EVIDENCE bundles (proposal + its hybrid-signed participations) since a cursor, as a JSON a..."""
@@ -3070,15 +3085,6 @@ class Engine:
     def lookup_community_json(self, community_key_id: str) -> str | None:
         """(derived) empirical — #249 Cut A — fetch a single community by community_key_id. Returns JSON Community object or None (null). Structural mirror of [Self::lookup_family_..."""
 
-    def resolve_community_json(self, community_key_id: str) -> str | None:
-        """(derived) deontic — v50.0.0 (CIRISPersist#926) — CC 4.4.3.2.4 resolve_community: the folded founders (eligible only) and members, subkind, protocol and entrenchment; None when absent or a trust-root id holds a row that is not rooted."""
-
-    def trust_root_bundle_response_json(self) -> str:
-        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body: the compiled-in GenesisBundle with this node's rooted ciris-canonical row beside it (TrustRootBundleResponse JSON)."""
-
-    def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
-        """(derived) deontic — v50.0.0 (CIRISPersist#926) — pin ciris-canonical from ONE TrustRootBundleResponse: bundle quorum verified against this node's roster, records and row admitted through the ordinary doors. Returns PinnedTrust JSON."""
-
     def lookup_family_json(self, family_key_id: str) -> str | None:
         """(derived) empirical — v3.12.0 — fetch a single family by family_key_id. Returns JSON Family object or None (null)."""
 
@@ -3433,6 +3439,9 @@ class Engine:
         (default 5). ``agent_occurrence_id`` default is
         ``"__shared__"`` (cross-occurrence work items).
         """
+
+    def trust_root_bundle_response_json(self) -> str:
+        """(derived) empirical — v50.0.0 (CIRISPersist#926) — the CC 5.3.4 body (GET /v1/trust-root/bundle): the compiled-in GenesisBundle with this node's rooted ciris-canonical r..."""
 
     def tsdb_count_edges_by_relationship_in_window(
         self,

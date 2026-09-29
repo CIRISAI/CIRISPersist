@@ -147,6 +147,8 @@ pub mod room_roster_invariants;
 /// v47.0.0 (CIRISPersist#897, #796, #797) — one scope, one question, every
 /// gate: I145 / I147 (`FSD/SCOPE_CLASSIFIER.md` §5).
 pub mod scope_classifier_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.

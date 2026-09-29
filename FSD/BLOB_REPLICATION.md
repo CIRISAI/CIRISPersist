@@ -284,6 +284,17 @@ under current pressure — the same "one predicate, asked twice" shape Edge#601
 asks for on its side. The adopt doors call the same function; there are not two
 copies (I46).
 
+### 6.5 The sealed DAG adopt (v51.3.0, CIRISPersist#947)
+
+§6.1 stores a received envelope as an inline row and never opens it (I45). A sealed chunk-DAG's manifest is such an envelope, so a second device that adopted it held a row `read_blob_as` served as the manifest JSON, and no door turned it into a DAG. Two doors close that, both a VIEWER's (authorized exactly as the bytes read), neither on the adopt path:
+
+- `Engine::open_sealed_manifest_as(sha, viewer, caller_aad)` — the opened manifest's chunk list (`sha`, plaintext `size`, `seq`), its `stream_id`, `total_size`, the row's `storage_kind`, and the three bounds (`inline_bytes_cap`, `whole_read_cap_bytes`, `max_chunks`). A plaintext row, a sealed whole blob or a v1 manifest is refused by name.
+- `Engine::promote_adopted_manifest_to_dag(sha, viewer, caller_aad)` — opens the manifest, requires every chunk it names to be held at `(stream_id, seq)` with the named sha, size and tier (against the adopted chunk ROWS, the checks `prepare_chunk_rows` makes for a plaintext DAG), then the storage floor `promote_adopted_manifest_to_dag` flips the row to `chunk_dag` and stamps the stream sealed in one transaction — `seal_stream_with_scope`'s shape. `size_bytes` stays the envelope's length, as at the origin. Idempotent.
+
+The pull: adopt the manifest (§6.1) → open the chunk list → fetch each chunk by sha and adopt it (§6.2) at the manifest's position with its plaintext size → promote → read. A commons (plaintext) DAG is stored and announced in one call, `Engine::put_blob_chunks_signing(manifest, chunks, author)`, so the puller is a holder by name.
+
+Witnesses: I144 (two nodes) and I145, `federation::sealed_dag_adopt_invariants`.
+
 ### 6.4 What does not change
 
 `put_blob_scoped` keeps its contract (local author, current epoch, I17). `put_blob`

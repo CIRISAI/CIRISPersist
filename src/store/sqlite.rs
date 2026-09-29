@@ -16301,6 +16301,91 @@ impl crate::federation::BlobStorage for SqliteBackend {
         row.map(sqlite_stream_chunk_ref).transpose()
     }
 
+    async fn promote_adopted_manifest_to_dag(
+        &self,
+        sha256: &[u8; 32],
+        stream_id: &str,
+        expected_chunk_count: u64,
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let expected = i64::try_from(expected_chunk_count).unwrap_or(i64::MAX);
+        let sha_vec = sha256.to_vec();
+        let sha_hex = hex::encode(sha256);
+        let stream = stream_id.to_owned();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        enum Promote {
+            Done,
+            Already,
+            NoRow,
+            NotInline(String),
+            Plaintext,
+            StreamCount(i64),
+        }
+        let outcome = self
+            .write(move |conn| -> Result<Promote, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let row: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT storage_kind, crypto_tier FROM federation_blobs WHERE sha256 = ?1",
+                        rusqlite::params![sha_vec],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((kind, tier)) = row else {
+                    return Ok(Promote::NoRow);
+                };
+                if kind == "chunk_dag" {
+                    return Ok(Promote::Already);
+                }
+                if kind != "inline" {
+                    return Ok(Promote::NotInline(kind));
+                }
+                if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+                    return Ok(Promote::Plaintext);
+                }
+                // §12.3 carried across nodes: the manifest names N chunks; the
+                // adopted stream must hold exactly N before the row becomes a DAG.
+                let count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM federation_stream_chunks WHERE stream_id = ?1",
+                    rusqlite::params![stream],
+                    |r| r.get(0),
+                )?;
+                if count != expected {
+                    return Ok(Promote::StreamCount(count));
+                }
+                tx.execute(
+                    "UPDATE federation_blobs SET storage_kind = 'chunk_dag' WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec],
+                )?;
+                tx.execute(
+                    "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
+                    rusqlite::params![stream, now_iso],
+                )?;
+                tx.commit()?;
+                Ok(Promote::Done)
+            })
+            .await
+            .map_err(|e| BlobError::Backend(format!("promote_adopted_manifest_to_dag tx: {e}")))?;
+        match outcome {
+            Promote::Done => Ok(true),
+            Promote::Already => Ok(false),
+            Promote::NoRow => Err(BlobError::NotHeld {
+                sha256_hex: sha_hex,
+            }),
+            Promote::NotInline(kind) => Err(BlobError::InvalidArgument(format!(
+                "blob {sha_hex} is a {kind:?} row: only an adopted inline envelope is promoted"
+            ))),
+            Promote::Plaintext => Err(BlobError::InvalidArgument(format!(
+                "blob {sha_hex} is recorded at the plaintext tier: a plaintext DAG is stored \
+                 through put_blob_chunks, never promoted"
+            ))),
+            Promote::StreamCount(count) => Err(BlobError::InvalidArgument(format!(
+                "blob {sha_hex}: stream {stream_id} holds {count} chunk row(s) but the manifest \
+                 names {expected_chunk_count}; adopt every chunk at (stream_id, seq) first"
+            ))),
+        }
+    }
+
     async fn adopt_sealed_blob_at(
         &self,
         envelope_bytes: Vec<u8>,
