@@ -508,11 +508,13 @@ pub(crate) mod bodies {
             cc::StoredStanding::Rooted(_)
         ));
         let _ = edge;
-        // PR #943 review — an unrepresentable window (> i64::MAX seconds) is
-        // no bound, never a negative one that makes a fresh head stale
+        // PR #943 review — a window beyond an instant's range is no bound,
+        // never an overflow. The largest window an envelope can carry exactly
+        // is 2^53 − 1 s (JCS numbers are IEEE doubles; a larger one never
+        // reaches the arithmetic): ~285 million years, past chrono's range.
         charter_the_accord_with(
             d,
-            serde_json::json!({ "attach_window_secs": u64::MAX, "witness_quorum": 1 }),
+            serde_json::json!({ "attach_window_secs": 9_007_199_254_740_991_u64, "witness_quorum": 1 }),
         )
         .await;
         let huge = "i194-huge";

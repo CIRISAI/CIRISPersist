@@ -117,6 +117,8 @@ mod postgres {
                 serde_json::json!({ "id": id, "scope": ["infra:serve"] }),
             );
             r.attestation_id = id.clone();
+            // the subject projection indexes `subject_key_ids`
+            r.subject_key_ids = vec![to.to_owned()];
             ts::reseal(&mut r);
             r
         };
