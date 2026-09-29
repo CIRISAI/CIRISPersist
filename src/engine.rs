@@ -6419,6 +6419,32 @@ impl Engine {
         }
     }
 
+    /// v51.1.0 (CIRISPersist#942) — **the custody view** of one blob for
+    /// `viewer_key_id`: tier, scope, size, whether this node holds the bytes,
+    /// who can open it (grant recipients resolved to persons), announced
+    /// holders, and `copies_known` / `copies_observable` — false for
+    /// `self`/`family`, whose copies elsewhere are unknowable by design until
+    /// within-cohort custody acknowledgements land. Authorized like
+    /// [`read_blob_as`](Self::read_blob_as): a stranger is `NotGranted`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn blob_custody(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+    ) -> Result<crate::federation::blob_custody::BlobCustody, crate::federation::BlobError> {
+        use crate::federation::blob_custody::blob_custody;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                blob_custody(arc.as_ref(), at_rest_sha256, viewer_key_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                blob_custody(arc.as_ref(), at_rest_sha256, viewer_key_id).await
+            }
+        }
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114; `MEDIA_SOURCE.md`
     /// §9.3) — **seal a small descriptor under an existing blob's DEK.** The
     /// caller is authorized exactly as [`read_blob_as`](Self::read_blob_as)

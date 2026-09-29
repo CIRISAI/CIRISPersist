@@ -62,6 +62,8 @@ pub mod consensus;
 // CIRISPersist#832 (BLOB_ENCRYPTION_AT_REST.md §12) — chunked
 // content under the envelope: the per-chunk seal, the sealed manifest, the
 // decrypting range read and the live-stream chunk listing.
+/// v51.1.0 (CIRISPersist#942) — the custody view (who can open a blob; known copies).
+pub mod blob_custody;
 pub mod chunk_dag_cascade;
 pub mod community_dek;
 pub mod consent;
