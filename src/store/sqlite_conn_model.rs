@@ -537,6 +537,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_blob_chunk_floor", ConnClass::Write),
     ("repair_minter_sentinel", ConnClass::Write),
     ("seal_stream_with_scope", ConnClass::Write),
+    // v51.3.0 (#947) — the sealed-DAG promotion: one write transaction.
+    ("promote_adopted_manifest_to_dag", ConnClass::Write),
     ("blob_head", ConnClass::Read),
     ("stream_chunks", ConnClass::Read),
     ("stream_chunk_at", ConnClass::Read),
