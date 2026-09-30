@@ -143,6 +143,7 @@ pub(crate) mod bodies {
                 founded_at: now,
                 consensus_protocol: "founder_only".to_owned(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
