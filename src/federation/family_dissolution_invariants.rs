@@ -10,8 +10,8 @@
 //!   each refused, and the family stays live.
 //! - **I282** — after dissolution every write naming the family is refused
 //!   `federation_group_dissolved` (a further amendment on A and on B's apply,
-//!   a membership revocation); the identical dissolved record re-offered is
-//!   the idempotent no-op.
+//!   a membership revocation, a row placed at it); the identical dissolved
+//!   record re-offered is the idempotent no-op.
 //! - **I283** — a self-leave: carol's amendment removing only herself,
 //!   signed by carol alone, is admitted on A and applied on B.
 //! - **I284** — the self-leave arm admits nothing else: removing someone
@@ -290,8 +290,18 @@ pub mod bodies {
         let all: Vec<&String> = w.keys.iter().collect();
         // B applies the dissolution, then is offered a later amendment that
         // every member signed.
+        // Before: a member may place a row at the family.
+        a.check_write_cohort_scope_for(alice, "i282", "family", Some(&w.id))
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I282: a member places a row at a live family: {e}"));
         let dissolved = dissolve_on_a(a, &w, tag).await;
         b.put_family(dissolved.clone()).await.unwrap();
+        // After: no row is placed at it, whoever writes it — by name.
+        let e = a
+            .check_write_cohort_scope_for(alice, "i282", "family", Some(&w.id))
+            .await
+            .expect_err("no row is placed at a dissolved family");
+        assert!(is_dissolved_refusal(&e), "{tag} I282: {e:?}");
         // The identical dissolved record again: the idempotent no-op.
         b.put_family(dissolved)
             .await
