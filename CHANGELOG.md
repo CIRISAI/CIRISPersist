@@ -103,6 +103,8 @@ Witnesses I210–I219 (memory, sqlite, postgres): read arm both twins; reply arm
 
 Mutation round (sqlite + memory lane of I210–I219): **17 / 17 killed** — growth gate skipped; reply conflict ignored; acceptance or growth after expiry admitted; withdrawn proposal live; role / hash not compared; reply signer not the invitee (**survived first**: AV-84 refused it later under another name and I211 accepted either — I211 now requires the named refusal); founding signers unchecked; family co-signatures unverified; supersede may add; subject-apply arm reverting to AV-45; `founder_only` proposer unchecked, community and family (the family arm **survived first**: no witness had one — I212 now does); read arm admitting any subject; TTL unbounded; retryable misclassified.
 
+**#955 follow-up (found by CIRISEdge#754 at prestage):** an invitee who only ever DECLINED was reported at the growth gate as `membership_acceptance_unresolved`, which is retryable. The gate ranked declines only among acceptances, and I213 had pinned that answer as expected. A decline now decides, as terminal `membership_declined`, whenever the member holds no acceptance for the group. With an acceptance on record, the accepted proposal's own verdict stands: I213's second invitee accepted an invitation that has since expired and gets `membership_proposal_expired`, not declined. RED first on memory and sqlite. Mutants: removing the decline rule (I213) and dropping the no-acceptance guard (I213's second invitee) are both killed. Postgres 30/30.
+
 ### #954 — a file above the flat manifest's ceiling; the abandoned stream
 
 **The ceiling (MAJOR: a new manifest version on the wire).**
