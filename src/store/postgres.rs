@@ -27324,6 +27324,7 @@ pub(crate) mod postgres_serial_scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use chrono::TimeZone;
 
     fn pg_dsn() -> Option<String> {
@@ -34465,6 +34466,10 @@ mod tests {
             .await
             .unwrap();
 
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            &backend,
+        )
+        .await;
         let community = |key: &str, members: Vec<&str>, policy: Option<serde_json::Value>| {
             crate::federation::tier_ingest::test_support::sign_community(
                 key,
@@ -34813,7 +34818,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, &coop, carol_row, &admit)
+            .add_member_consented(Cohort::Affiliations, &coop, carol_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added);
@@ -35100,7 +35105,7 @@ mod tests {
         let admit =
             crate::federation::cohort::test_support::admit_family(&alice, &fam_before, &bob_row);
         assert!(backend
-            .add_family_member(&fam, bob_row, &admit)
+            .add_family_member_consented(&fam, bob_row, &admit)
             .await
             .expect("signed roster grow"));
 
@@ -35144,7 +35149,7 @@ mod tests {
 
         // Idempotent re-add: no-op, no duplicate roster entry.
         assert!(!backend
-            .add_family_member(
+            .add_family_member_consented(
                 &fam,
                 crate::federation::FamilyMember {
                     key_id: bob.clone(),
@@ -38686,6 +38691,10 @@ mod tests {
                 .unwrap();
         }
 
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            &backend,
+        )
+        .await;
         // Build a community keyed by a fresh run-scoped id with `members`
         // + optional cohort_subkind.
         let put_comm = |cid: &str, members: Vec<&str>, subkind: Option<&str>| {
@@ -47620,7 +47629,7 @@ mod tests {
             )
             .await;
         assert!(backend
-            .add_community_member(&comm, member(&u2, None), &admit_u2)
+            .add_community_member_consented(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
         assert_eq!(
@@ -47630,7 +47639,7 @@ mod tests {
         // idempotent re-add (the stale spec is reused deliberately — the no-op
         // returns before the gate; nothing is written, so nothing to authorize).
         assert!(!backend
-            .add_community_member(&comm, member(&u2, None), &admit_u2)
+            .add_community_member_consented(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
         // v48.0.0 (#860): the RECORD never grows — u2 rides the widening

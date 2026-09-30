@@ -480,6 +480,17 @@ pub(crate) mod bodies {
         )
         .await
         .expect("I212: a role change needs no acceptance");
+        // under founder_only only a founder invites: K (a plain member) cannot
+        let e = put(
+            d,
+            &proposal(&k, COMMUNITY, &cid, &j, None, now, Some(Duration::days(7))),
+        )
+        .await
+        .expect_err("I212: a non-founder's proposal under founder_only");
+        assert!(
+            matches!(e, Error::InvalidArgument(ref m) if m.contains("founder_only")),
+            "I212: {e:?}"
+        );
         // the family plane, the same rule
         found_family(d, &fid, "founder_only", &[&founder], &[])
             .await
@@ -734,6 +745,35 @@ pub(crate) mod bodies {
             .await
             .expect_err("I216: an unsigned founding family member");
         assert_eq!(rule_of(&e), RULE_FOUNDING_MEMBER_UNSIGNED, "I216: {e}");
+        // a forged co-signature is refused, never counted as consent
+        {
+            let f = Family {
+                family_key_id: f2.clone(),
+                family_name: "forged".into(),
+                members: [&founder, &cofounder]
+                    .iter()
+                    .map(|k| FamilyMember {
+                        key_id: (*k).clone(),
+                        joined_at: ms(Utc::now()),
+                        role: Some("founder".into()),
+                    })
+                    .collect(),
+                founded_at: ms(Utc::now()),
+                consensus_protocol: "majority".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            };
+            let mut signed = ts::sign_family(&founder, f);
+            signed.cosignatures[0].scrub_signature_classical =
+                signed.scrub_signature_classical.clone();
+            d.put_family(signed)
+                .await
+                .expect_err("I216: a forged founding co-signature");
+            assert!(
+                d.lookup_family(&f2).await.unwrap().is_none(),
+                "I216: nothing stored"
+            );
+        }
         found_family(d, &f2, "majority", &[&founder, &cofounder], &[])
             .await
             .expect("I216: a co-signed family founding");
