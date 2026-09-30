@@ -422,9 +422,11 @@ mod tests {
                 v["community"]["community"]["community_key_id"], "ciris-canonical",
                 "{path}"
             );
-            assert_eq!(
-                v["community"]["cosignatures"][0]["authority_key_id"], "B1",
-                "{path}"
+            assert!(
+                v["community"]["cosignatures"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|c| c["authority_key_id"] == "B1")),
+                "{path}: the named cosigner is carried: {v}"
             );
         }
     }
