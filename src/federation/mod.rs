@@ -128,6 +128,11 @@ pub(crate) mod community_trust_consent_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+/// v52.0.0 (CIRISPersist#956) — a quorum-family's leave and dissolve replicate as amendments.
+pub mod family_dissolution;
+/// v52.0.0 (CIRISPersist#956) — I280–I285.
+#[cfg(test)]
+pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
@@ -2076,6 +2081,8 @@ where
     let Some(family) = directory.lookup_family(family_key_id).await? else {
         return Ok(());
     };
+    // v52.0.0 (CIRISPersist#956) — no roster change on a dissolved family.
+    family_dissolution::refuse_if_dissolved(&family)?;
     let events = Box::pin(family_roster_events(directory, &family)).await?;
     let record: Vec<types::CommunityMember> = family
         .members
@@ -5496,6 +5503,10 @@ pub trait FederationDirectory: Send + Sync {
                 "active_family_members names unknown family_key_id {family_key_id:?}"
             ))
         })?;
+        // v52.0.0 (CIRISPersist#956) — a dissolved family has no members.
+        if family.dissolved_at.is_some() {
+            return Ok(Vec::new());
+        }
         authorized_family_roster_at(self, &family, chrono::Utc::now()).await
     }
 
@@ -6325,6 +6336,16 @@ pub trait FederationDirectory: Send + Sync {
         // handed in here was verified by no one, so it is not stored (a peer
         // would refuse it anyway; this node must not serve it as its own).
         new.supersede_proof = None;
+        // v52.0.0 (CIRISPersist#956) — a dissolution enters only through
+        // `supersede_family_with_quorum`. This door's `authorization` is the
+        // caller's own JSON, verified by no one, so it cannot stand in.
+        if new.family.dissolved_at.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "family {}: a dissolution is only a quorum-verified amendment \
+                 (supersede_family_with_quorum; CIRISPersist#956)",
+                new.family.family_key_id
+            )));
+        }
         group_amendment::supersede_family_signed(self, new, authorization).await
     }
 
@@ -6838,13 +6859,30 @@ pub trait FederationDirectory: Send + Sync {
             new.family.consensus_protocol_entrenched,
             &change_envelope,
         )?;
-        self.verify_membership_quorum(
-            cohort::Cohort::Family,
-            &new.family.family_key_id,
-            &change_envelope,
-            &signatures,
-        )
-        .await?;
+        // v52.0.0 (CIRISPersist#956) — a dissolved family admits no change; a
+        // dissolution changes nothing but `dissolved_at`, and is the one the
+        // quorum signed; a self-leave is admitted on the leaver's signature.
+        family_dissolution::refuse_if_dissolved(&prior)?;
+        family_dissolution::check_dissolve_is_terminal_only(&prior, &new.family)?;
+        family_dissolution::check_dissolution_matches_envelope(&new.family, &change_envelope)?;
+        if let Some(leaver) = family_dissolution::self_leave_member(&prior, &new.family) {
+            family_dissolution::verify_self_leave_signature(
+                self,
+                &prior,
+                &change_envelope,
+                &signatures,
+                leaver,
+            )
+            .await?;
+        } else {
+            self.verify_membership_quorum(
+                cohort::Cohort::Family,
+                &new.family.family_key_id,
+                &change_envelope,
+                &signatures,
+            )
+            .await?;
+        }
         let authorization = serde_json::json!({
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
@@ -7076,7 +7114,15 @@ pub trait FederationDirectory: Send + Sync {
             let mut community_key_ids: Vec<String> = Vec::new();
             if let Some(target) = claimed_target_id {
                 let held = match plane {
-                    TargetPlane::Family => self.lookup_family(target).await?.is_some(),
+                    TargetPlane::Family => match self.lookup_family(target).await? {
+                        // v52.0.0 (CIRISPersist#956) — no row is placed at a
+                        // dissolved family, whoever writes it.
+                        Some(f) => {
+                            family_dissolution::refuse_if_dissolved(&f)?;
+                            true
+                        }
+                        None => false,
+                    },
                     TargetPlane::Room => self.lookup_community(target).await?.is_some(),
                 };
                 if !held {
@@ -9299,6 +9345,22 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v52.0.0 (CIRISPersist#956) — a write naming a family that a
+    /// quorum-verified terminal amendment dissolved. Terminal: the group has
+    /// no members, no roster change, supersede or row placed at it is ever
+    /// admitted again, on the local door or on replication apply. Stable
+    /// `kind()` token `federation_group_dissolved`.
+    #[error(
+        "family {group_key_id:?} was dissolved at {dissolved_at} (CIRISPersist#956): a \
+         dissolved group admits no further change and no row placed at it"
+    )]
+    GroupDissolved {
+        /// The dissolved family.
+        group_key_id: String,
+        /// The instant its quorum signed the dissolution.
+        dissolved_at: chrono::DateTime<chrono::Utc>,
+    },
+
     /// v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — a roster change or
     /// membership reply refused because the member's own signed consent is
     /// missing or does not hold: no acceptance of a live proposal
@@ -10876,6 +10938,7 @@ impl Error {
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
             Error::MembershipAcceptanceRefused { .. } => "federation_membership_acceptance_refused",
+            Error::GroupDissolved { .. } => "federation_group_dissolved",
             Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
             Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {

@@ -87,6 +87,7 @@ pub mod bodies {
                 founded_at: at("2026-01-01T00:00:00Z"),
                 consensus_protocol: protocol.to_owned(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         )

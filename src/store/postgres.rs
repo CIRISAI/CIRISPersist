@@ -8284,8 +8284,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "INSERT INTO cirislens.federation_families (\
                     family_key_id, family_name, members, founded_at, \
                     consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    admitted_at, dissolved_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &row.family_key_id,
                     &row.family_name,
@@ -8295,6 +8295,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.consensus_protocol_entrenched,
                     &row.persist_row_hash,
                     &admitted_at,
+                    &row.dissolved_at,
                 ],
             )
             .await
@@ -8378,7 +8379,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let prior = tx
                     .query_opt(
                         "SELECT version, family_key_id, family_name, members, founded_at, \
-                                consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                                consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                          FROM cirislens.federation_families WHERE family_key_id = $1 \
                          FOR UPDATE",
                         &[&new_fam.family_key_id],
@@ -8435,7 +8436,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
                         scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13, cosignatures = $14 \
+                        supersede_proof = $13, cosignatures = $14, dissolved_at = $15 \
                      WHERE family_key_id = $1",
                     &[
                         &new_fam.family_key_id,
@@ -8456,6 +8457,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &admitted_at,
                         &proof_value,
                         &cosignatures_value,
+                        &new_fam.dissolved_at,
                     ],
                 )
                 .await
@@ -8647,7 +8649,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             client
                 .query_opt(
                     "SELECT version, family_key_id, family_name, members, founded_at, \
-                            consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                      FROM cirislens.federation_families WHERE family_key_id = $1",
                     &[&group_key_id],
                 )
@@ -8706,7 +8708,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                  FROM cirislens.federation_families WHERE family_key_id = $1",
                 &[&family_key_id],
             )
@@ -8731,7 +8733,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                  FROM cirislens.federation_families \
                  WHERE members @> $1 \
                     OR family_key_id IN ( \
@@ -22138,6 +22140,7 @@ fn pg_row_to_family(
         consensus_protocol: row.safe_get_with("consensus_protocol", mk_err)?,
         consensus_protocol_entrenched: row
             .safe_get_with("consensus_protocol_entrenched", mk_err)?,
+        dissolved_at: row.safe_get_with("dissolved_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -34683,6 +34686,7 @@ mod tests {
                     founded_at: now,
                     consensus_protocol: "unanimous".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             )
@@ -35458,6 +35462,7 @@ mod tests {
                     founded_at: now,
                     consensus_protocol: "unanimous".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -40233,6 +40238,7 @@ mod tests {
                     founded_at: chrono::Utc::now(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -48604,6 +48610,7 @@ mod tests {
             founded_at: now,
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let signed =
@@ -48884,6 +48891,7 @@ mod tests {
                 consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
                     .to_owned(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             })
             .await
@@ -49631,6 +49639,7 @@ mod tests {
             founded_at: now,
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let signed = crate::federation::tier_ingest::test_support::sign_family(&auth, family_row);

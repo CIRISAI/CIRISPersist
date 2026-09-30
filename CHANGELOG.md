@@ -39,6 +39,44 @@ Nine mutants, nine killed: the lease's day bound dropped and a backwards lease a
 ### Changed — evidence (CIRISPersist#946)
 `evidence/cc_impl.tsv` gains the four rows the register owed: `CLM-sealed-descriptor` (3.3.13 → `media_source.rs#check_sealed_descriptor_shape`, evidence only — #922 shipped it), `CLM-session-claim` (3.1.3.1 → `check_session_lease_bound` and `session_claim.rs#resolve_claim`), `CLM-duty` (3.1.1 → `admission.rs#check_duty_admission`; the family's own gate, #814 part 1 — the 4.5.5 row named the delegated-duty path, which is a different claim), `CLM-consent-community-trust` (3.3.1 → the gate and the fold).
 
+### #956 — a quorum family's leave and dissolve replicate as amendments (CIRISServer#700)
+A family record rewrite has reached a peer only as a quorum-proved amendment since v49. Two acts had no shape there. A dissolution (an empty roster) was refused as `group has no members`, and a self-leave had no arm that admitted it on the leaver's signature alone. So only the revocation rows travelled, and a peer's copy of the record kept the leaver and kept a dissolved group live.
+
+- **Dissolve.** `Family.dissolved_at` (V166, both dialects) is set only by a **quorum-verified TERMINAL amendment** through `supersede_family_with_quorum`, local or applied. The amendment changes nothing but `dissolved_at`; the name, founding instant, protocol, entrenchment and every seat stay byte-identical. It is bound to the `dissolved_at` the quorum signed inside the change envelope (the JCS signing bytes cover it), and it is judged as an `Add`, the strict direction.
+- **Where a dissolution is refused.** The plain `supersede_family` door (its `authorization` is the caller's own JSON), a founding record, a record whose instant the quorum did not sign, and a dissolution that also renames.
+- **After dissolution.** The family has **no active members**, and every write naming it is refused **`federation_group_dissolved`** (`Error::GroupDissolved`, Python `ValueError`, terminal). That covers a further amendment on the local door or on apply, a roster widening or revocation, a row placed at the family, and a membership proposal or reply. The identical dissolved record re-offered stays the idempotent no-op.
+- **Self-leave.** An amendment whose ONLY change removes one member from the held record is admitted on **that member's signature** over the change envelope, with no quorum. Every other seat must be identical and in order, and nothing else may change; the envelope must name the held roster as `supersedes.prior_member_key_ids` and may not dissolve. It applies on `supersede_family_with_quorum` and on replication apply. Removing someone else, leaving while renaming or re-roling a seat, and a leave the leaver did not sign all fall to the quorum.
+- **Wire.** A live family's record never carries `dissolved_at`, so every record written before v52.0.0 keeps its bytes, signature and `persist_row_hash`.
+- **Not built.** The community twin. A room's membership rides the widening planes, and its record carries trust-root and infrastructure-conformance rules that a dissolve marker would have to answer to; #956 names families.
+- **Server:** dissolve = `supersede_family_with_quorum(record with dissolved_at = t, envelope from build_membership_change_envelope(..same members..) plus "dissolved_at": t.to_rfc3339(), M-of-N signatures)`. Leave = the same door with the record minus the leaver and the envelope signed by the leaver alone.
+
+**Witnesses** (memory, sqlite, postgres; two directories, B learning every record from A's signed since-read):
+- **I280:** a quorum dissolution replicates.
+- **I281:** only a quorum terminal amendment dissolves.
+- **I282:** a dissolved family admits nothing (amendment on A and on B's apply, revocation, placed row); the identical re-offer is a no-op.
+- **I283:** a self-leave needs only the leaver.
+- **I284:** the leave arm admits only a leave.
+- **I285:** a live record carries no `dissolved_at`.
+
+**Mutation round** (committed tree, lane = I280–I284 + I178 on memory and sqlite; M14 on postgres): 14/14 killed.
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M1 | `active_family_members` ignores the dissolution | I280 |
+| M2 | the roster-authority gate admits on a dissolved family | I282 |
+| M3 | the replicated apply drops the dissolved refusal | I282 |
+| M4 | `refuse_if_dissolved` is a no-op | I282 |
+| M5 | a dissolution need not be terminal-only | I281 |
+| M6 | `dissolved_at` need not match the envelope | I281 |
+| M7 | the plain door dissolves | I281 |
+| M8 | a leave may re-role other seats | I284 |
+| M9 | the leaver's signature is not verified | I284 |
+| M10 | a leave may rename | I284 |
+| M11 | a founding record may be dissolved | I281 |
+| M12 | the write-scope gate ignores the dissolution | I282 |
+| M13 | the sqlite decoder drops `dissolved_at` | I280, I282 |
+| M14 | the postgres decoder drops `dissolved_at` | I280, I282 (postgres) |
+
 ### #955 — nobody joins a family or community without their own signed acceptance (CIRISConstitution#133)
 
 **Wire / behaviour break.** Every roster GROWTH (a key not active before the growth's instant) on the widening planes — local door and replicated apply, every backend, every `consensus_protocol` including `founder_only` — now needs the member's live acceptance of a live proposal. Three `scores` claim families, no new EnvelopeKind: `membership:proposal:v1` (inviter → invitee in `subject_key_ids`, `expires_at` required, ≤ 30 days), `membership:acceptance:v1` / `membership:decline:v1` (signed by the invitee or a key acting for them; binds the proposal id, content hash and role). The group's quorum stays on the growth record: under a quorum protocol an accepted member is "accepted, awaiting the group". Expiry is judged on the two signed instants (acceptance and growth) against the proposal's `expires_at`, never a receiver's clock; a proposer's `withdraws` expires a proposal; a decline is final.

@@ -1211,6 +1211,7 @@ pub mod two_node {
                         consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
                             .to_owned(),
                         consensus_protocol_entrenched: false,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 ))

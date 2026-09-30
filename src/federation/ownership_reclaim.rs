@@ -1597,6 +1597,7 @@ pub(crate) mod test_support {
             founded_at: now,
             consensus_protocol: "majority".to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         })
         .await
@@ -1846,6 +1847,7 @@ pub(crate) mod test_support {
             founded_at: now,
             consensus_protocol: "majority".to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         })
         .await

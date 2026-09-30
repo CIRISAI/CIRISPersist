@@ -809,6 +809,7 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
             founded_at: ts,
             consensus_protocol: "founder_only".to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         },
         authority_key_id: rogue.clone(),

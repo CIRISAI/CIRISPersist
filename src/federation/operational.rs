@@ -3611,6 +3611,7 @@ pub mod test_support {
             founded_at,
             consensus_protocol: consensus_protocol.to_owned(),
             consensus_protocol_entrenched: true,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         directory.put_family_local(family).await

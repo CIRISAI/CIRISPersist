@@ -542,6 +542,7 @@ mod run {
                 consensus_protocol: crate::federation::types::consensus_protocol::UNANIMOUS
                     .to_owned(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))

@@ -3124,6 +3124,15 @@ pub struct Family {
     /// instance.
     #[serde(default)]
     pub consensus_protocol_entrenched: bool,
+    /// v52.0.0 (CIRISPersist#956) — set iff a quorum-verified TERMINAL
+    /// amendment dissolved the family; the instant is the one the quorum
+    /// signed (the change envelope's `dissolved_at`). A dissolved family is
+    /// not live: it has no active members, and every write naming it is
+    /// refused [`Error::GroupDissolved`](super::Error::GroupDissolved).
+    /// Absent (never serialized) on a live family, so every record written
+    /// before v52.0.0 keeps its bytes, signature and `persist_row_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dissolved_at: Option<DateTime<Utc>>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
@@ -5255,6 +5264,7 @@ mod persist_row_hash_v1_pin_tests {
             consensus_protocol_entrenched: false,
             // Deliberately non-empty: the projection must DROP it, so a rule
             // that started hashing it would change the answer.
+            dissolved_at: None,
             persist_row_hash: "ff".repeat(32),
         };
         let got = compute_persist_row_hash(&fam).expect("hash");
@@ -5459,6 +5469,7 @@ mod signing_preimage_pin_tests {
             founded_at: t("2026-01-01T00:00:00Z"),
             consensus_protocol: "quorum:2/3".to_owned(),
             consensus_protocol_entrenched: true,
+            dissolved_at: None,
             persist_row_hash: "aa".repeat(32),
         }
     }
@@ -5586,6 +5597,7 @@ mod signing_preimage_pin_tests {
             founded_at: t("2026-01-01T00:00:00Z"),
             consensus_protocol: "quorum:2/3".to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: "aa".repeat(32),
         }
     }

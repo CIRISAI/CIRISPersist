@@ -19975,6 +19975,7 @@ mod tests {
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -22818,6 +22819,7 @@ mod tests {
                 founded_at: now,
                 consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -24684,6 +24686,7 @@ mod tests {
             founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         // Honest: signed by the authority it claims to be — admits.
@@ -24826,6 +24829,7 @@ mod tests {
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -25127,6 +25131,7 @@ mod tests {
             founded_at: "2026-07-01T00:00:00Z".parse().unwrap(),
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let signed =
