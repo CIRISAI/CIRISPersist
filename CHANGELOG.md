@@ -228,6 +228,28 @@ MEASURED (this machine, sqlite, file-backed, one lane; wall-clock at 256 KiB chu
 | M13 | the signing form hard-wired to the V1 rule | I292, `for_signing_matches_the_produce_gate_byte_for_byte` |
 | M14 | postgres cap off by one | I287 (pg) |
 
+### #672 — a re-offer of a held record settles before verification (CIRISPersist#672)
+Transitive propagation had no bound on re-injection: a peer re-offering rows this node already held paid the full apply every time, and on the attestation plane each re-offer was charged to the sender's per-peer write quota before the duplicate was noticed. **`replication_policy::settle_if_held(dir, kind, record)`** now runs first in every replicated door on memory, sqlite and postgres (17 kinds). It serializes the arriving record exactly as the wire index hashes it and settles, with no state change, only when the index entry resolves to a held row whose bytes are identical. In `put_attestation` it runs after the pure envelope gates and before the per-peer quota. Misses, purged, evicted or erased rows (the lookup reloads the row) and differing bodies under a held id all take the full apply unchanged. `AccordQuorumEvidence` and `KeyGrant` are exempt, with written reasons (`SETTLE_EXEMPT`). Each settle counts on `already_held_count(kind)` and emits `persist_replication_already_held_total{kind}`. **Behaviour change:** on planes whose doors refused an identical resubmission (anti-rollback, PK conflict), a byte-identical re-offer of a held row is now idempotent success, the #771 doctrine. No wire, hash, preimage or migration change. Persist builds no hop counter; closing the relay half waits on Edge confirming that no path pushes bodies the receiver did not request (`FSD/HELD_RECORD_SETTLE.md`).
+
+Witnesses (memory, sqlite, postgres):
+- **I230:** every seeded kind (Key, Attestation, Revocation, LocationProof, Family, Community), re-offered as served, answers held and counts.
+- **I231:** a differing body is refused on its merits; a purged row whose index entry survives is admitted again.
+- **I233:** a three-node cycle returns held.
+- **I234:** 1 000 held re-offers exceed the 600-per-window quota, and all settle.
+- **I235** (from disk): every replicated door in every backend settles first, under its own kind, or is exempt with a reason.
+
+Mutation round (lane = `held_settle_invariants` on memory + sqlite; the postgres mutants on the postgres leg): 10 killed, 1 equivalent.
+- Killed:
+  - M1: the settle never settles (the pre-fix behaviour; I230, I233 and I234 red on memory and sqlite);
+  - M3: the counter is not incremented;
+  - M4 and M10: the attestation settle is removed on sqlite and postgres (I234: the quota drains);
+  - M5′, M8′, M9′: one door's settle short-circuited off (sqlite Family, memory Revocation, postgres Community);
+  - M6: a door settles under the wrong kind;
+  - M7: a settling kind is also listed as exempt;
+  - M11: the settle is placed after verification.
+- Equivalent, M2: dropping the byte compare. The lookup already requires the reloaded row's sha256 to equal the arriving bytes' hash, so the compare is defense in depth.
+- First-round note: the M5 and M9 mutants of the first round appended `&& false` after the call. That still evaluated and counted the settle, so they did not remove it. They were rerun as a leading `false &&`, which short-circuits the call.
+
 ## [51.3.0] - UNRELEASED
 
 **MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.
