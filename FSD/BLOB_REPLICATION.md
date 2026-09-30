@@ -295,6 +295,47 @@ The pull: adopt the manifest (§6.1) → open the chunk list → fetch each chun
 
 Witnesses: I144 (two nodes) and I145, `federation::sealed_dag_adopt_invariants`.
 
+### 6.6 A file above the flat manifest's ceiling, and the abandoned stream (v52.0.0, CIRISPersist#954)
+
+**The ceiling.** A sealed chunk-DAG's manifest is one inline row, and the inline cap (1 MiB) bounded it at ~10 400 entries, so one file topped out near 2.5 GiB. The per-epoch chunk cap (2²⁴) was unreachable. When a sealed manifest's envelope would exceed the node's inline cap, `seal_stream_scoped` now writes a **v3 root** over **children**:
+- Each child is an ordinary v2 manifest over a contiguous run of chunks, partitioned greedily in order so that each child's envelope fits the cap.
+- Each child is sealed under `manifest_child_aad(caller_aad, stream_id, index)`: its own domain (`ciris-persist:manifest-child:v1`) and its index. A child therefore opens only at its own index of its own stream, never as a chunk.
+- The children are stored in the root's transaction as inline rows at the DAG's tier and cohort. At a community they are bound to the same epoch. `federation_manifest_children` (V160) relates them to the root.
+- They join the stream's one access set (D9).
+
+A manifest that fits stays v2, byte for byte, at the same address. The depth is fixed at 2, and a child that is itself v3 is refused. A plaintext (v1) DAG is not partitioned: the storage layer parses its manifest, and above the cap the floor still refuses it by name (`InlineSizeExceeded`).
+
+Root wire (JCS): `{"children":[{"chunk_count","first_seq","last_seq","sha","size"},…],"chunk_tier","stream_id","total_size","v":3}`. The parser refuses by name:
+- an empty root;
+- an empty or reversed run;
+- runs that do not strictly increase;
+- a size sum that is not the total.
+
+`check_child` refuses an opened child whose stream, tier, count, run or total differs from its entry. The flat parser refuses a v3 root by name.
+
+**The doors (viewer's, authorized as `read_blob_as`).**
+- `open_sealed_manifest_as` answers `version: 3` with `children` and an EMPTY `chunks`. v2 is unchanged, apart from the added `version: 2` and an empty `children`.
+- `open_sealed_manifest_page_as(sha, child_index, viewer, aad)` lists one child's chunks. A child not held is `NotHeld` naming the child.
+- `adopt_sealed_manifest_child(root, index, envelope, provenance)` is §6.1 for a child, plus the relation. It never opens the child (I45), and the root must be held first.
+- `promote_adopted_manifest_to_dag` requires every child to be held and recorded (named if not) before it checks any chunk.
+- The whole and range reads choose the covering children by prefix sum, open only those, and read within them.
+- `delete_blob` on a root takes its children, found by the relation and never by opening the root.
+- The stream STH is unchanged: its leaves are the chunk rows, not the manifest.
+
+The v3 pull: adopt the root → open it → adopt each child → open each page → adopt each chunk at `(stream_id, seq)` → promote → read.
+
+**The abandoned stream.** A streaming publish refused midway left chunk rows, index rows and a stream that could never be sealed. `Engine::abandon_stream(stream_id)` (pyo3 `abandon_stream_json`) is for the stream's owner only (this Engine's derived key), and only before a seal (`stream_sealed`):
+- It stamps `federation_streams.abandoned_at` (V160). The id is never reused, and the chunk floor and the seal refuse it as `stream_abandoned`.
+- It drops the stream's index rows.
+- It evicts its sealed chunk rows together with their grants and bindings.
+- A plaintext chunk's bytes stay, because they are content-addressed and may be shared.
+
+It is idempotent: a second call answers `already`.
+
+**What it does not do, and why.** The design withdrew every content key-grant set emitted for an evicted chunk, so the owner's other devices would retire the grants. The withdraws gate refuses a `withdraws` naming a `key_grant` row, and it is right to: CC 3 says a shared key cannot be retroactively un-shared. So abandon is a LOCAL cleanup. On a device that received a chunk's set but never its bytes, the set stays an inert pending row, and nothing opens with it. A device that received both keeps a chunk of a stream that will never be sealed, until its own eviction reaches it. A cross-node "this stream was abandoned" signal would be a new claim; it needs CC text first and is not built here (I208 reserved).
+
+Witnesses: I202–I207 and I209, `federation::nested_manifest_invariants`.
+
 ### 6.4 What does not change
 
 `put_blob_scoped` keeps its contract (local author, current epoch, I17). `put_blob`

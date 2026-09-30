@@ -39,6 +39,65 @@ Nine mutants, nine killed: the lease's day bound dropped and a backwards lease a
 ### Changed — evidence (CIRISPersist#946)
 `evidence/cc_impl.tsv` gains the four rows the register owed: `CLM-sealed-descriptor` (3.3.13 → `media_source.rs#check_sealed_descriptor_shape`, evidence only — #922 shipped it), `CLM-session-claim` (3.1.3.1 → `check_session_lease_bound` and `session_claim.rs#resolve_claim`), `CLM-duty` (3.1.1 → `admission.rs#check_duty_admission`; the family's own gate, #814 part 1 — the 4.5.5 row named the delegated-duty path, which is a different claim), `CLM-consent-community-trust` (3.3.1 → the gate and the fold).
 
+### #954 — a file above the flat manifest's ceiling; the abandoned stream
+
+**The ceiling (MAJOR: a new manifest version on the wire).**
+- **What changed:** a sealed manifest whose envelope would exceed the inline cap is now written as a v3 root over v2 children. Before, one file topped out near 2.5 GiB; the 2²⁴-chunk epoch cap was unreachable.
+  - Each child is sealed under `manifest_child_aad` (its own domain, its index), stored in the root's transaction, bound to the root's epoch at a community, and granted in the stream's one access set.
+  - Children are related to the root in `federation_manifest_children` (V160).
+  - A manifest that fits is byte-identical v2.
+- **Doors:**
+  - `open_sealed_manifest_as` gains `version` and `children`. A v3 view's `chunks` is empty, and Edge must walk the pages.
+  - `open_sealed_manifest_page_as` / pyo3 `open_sealed_manifest_page_json`.
+  - `adopt_sealed_manifest_child` / `adopt_sealed_manifest_child_json`.
+  - `promote_adopted_manifest_to_dag` requires every child held first.
+  - The whole and range reads walk the children.
+  - `delete_blob` takes a root's children.
+- **Wire:** a pre-v52 peer refuses a v3 root by name. That affects only files above the old ceiling, which could not exist before.
+- **Plaintext:** DAGs are not partitioned. Above the cap the floor still refuses them `InlineSizeExceeded`, and Edge's commons files keep the old ceiling.
+
+**The abandoned stream.**
+- `Engine::abandon_stream` / `abandon_stream_json` is for the owner only and only before a seal.
+  - It tombstones the stream: `federation_streams.abandoned_at` (V160). Append and seal then refuse `stream_abandoned`.
+  - It drops the index rows and evicts the sealed chunk rows. A plaintext chunk's bytes stay.
+  - It is idempotent.
+- **Not built:** withdrawing the emitted content key-grant sets. The existing withdraws gate refuses a `withdraws` naming a `key_grant` row (CC 3: a shared key cannot be retroactively un-shared). A set whose bytes never arrive stays an inert pending row on the other device. A cross-node abandon signal needs CC text first (I208 reserved).
+
+**Gates:** the parity and conn-model reds that #953 had left on the v52 branch were fixed here:
+- `list_stored_delivery_receipts_for`, `inline_blob_of_stream_id` and `refuse_reserved_stream_id` were unclassified in CALL_CLASSES;
+- the conn-model row for `list_delivery_receipts_for` had gone stale.
+
+I67 allows `abandon_stream_floor`'s grant deletes (each rides its own blob row's eviction).
+
+**Witnesses** (sqlite and postgres; `federation::nested_manifest_invariants`):
+- I202 v3 seal, whole read, three ranges, v2 below the cap, root eviction takes the children.
+- I203 a manifest that fits stays flat; the root JCS is pinned.
+- I204 two-node v3 pull: the child before its root is refused, a missing child is named, pages, chunks, promote, read.
+- I205 the child AAD is its position; its bytes are pinned.
+- I206 the parser and `check_child` refusals, and range selection.
+- I207 abandon.
+- I209 a community stream's abandon.
+
+**Mutation round** (on the committed tree 6f36fddc; lane = `nested_manifest_invariants` on sqlite, plus two postgres floor mutants on their pg runners). Fifteen mutants, fifteen killed. M1 (v3 switched off) is the pre-#954 seal: I202 and I204 fail with the manifest refused `InlineSizeExceeded`, which is the RED the witnesses were written against.
+
+| mutant | verdict | killed by |
+|---|---|---|
+| M1 v3 switch off (the pre-fix seal) | KILLED | i202 i203_a_manifest_that_fits_stays_flat i204 |
+| M2 partition overflows the cap | KILLED | i202 i203_a_manifest_that_fits_stays_flat i204 |
+| M3 child AAD under the chunk domain | KILLED | i205_a_child_opens_only_at_its_own_position |
+| M4 child sealed at index 0 | KILLED | i202 i204 |
+| M5 child continuity unchecked | KILLED | i206_the_nested_parser_refuses |
+| M6 child size sum unchecked | KILLED | i206_the_nested_parser_refuses |
+| M7 promote skips the child-held check | KILLED | i204 |
+| M8 range child selection off by one | KILLED | i202 i206_the_nested_parser_refuses |
+| M9 abandon owner unchecked (sqlite) | KILLED | i207 |
+| M10 abandon of a sealed stream admitted (sqlite) | KILLED | i207 |
+| M11 chunk floor ignores the tombstone (sqlite) | KILLED | i207 |
+| M12 abandon evicts plaintext bytes too (sqlite) | KILLED | i207 |
+| M13 root eviction leaves its children (sqlite) | KILLED | i202 |
+| M14 abandon owner unchecked (postgres) | KILLED | i207 (postgres) |
+| M15 root eviction leaves its children (postgres) | KILLED | i202 (postgres) |
+
 ## [51.3.0] - UNRELEASED
 
 **MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.
