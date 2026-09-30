@@ -20,6 +20,7 @@ pub(crate) mod bodies {
     use crate::federation::at_rest_cascade::{unwrap_dek_v2_json, DEK_LEN};
     use crate::federation::community_dek::orchestrate::{ensure_epoch_dek, set_key_state};
     use crate::federation::identity_aggregate::{mint_content_kem_keypair, ContentKemPrivate};
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type::{NODE, USER};
     use crate::federation::types::{
@@ -674,7 +675,7 @@ pub(crate) mod bodies {
             },
         );
         ts::cosign_community_membership_widening(&mut w, &carol);
-        b.put_community_membership_widening(w)
+        b.put_community_membership_widening_consented(w)
             .await
             .unwrap_or_else(|e| panic!("(i) bob re-added: {e}"));
 

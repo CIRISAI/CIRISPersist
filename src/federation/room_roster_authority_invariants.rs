@@ -12,6 +12,7 @@
 #[cfg(test)]
 pub mod bodies {
     use crate::federation::cohort::Cohort;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         consensus_protocol, identity_type, Community, CommunityMember,
@@ -125,7 +126,7 @@ pub mod bodies {
         for c in &signers[1..] {
             ts::cosign_community_membership_widening(&mut s, c);
         }
-        d.put_community_membership_widening(s).await
+        d.put_community_membership_widening_consented(s).await
     }
 
     /// A revocation signed by `signers[0]` and co-signed by the rest.
@@ -146,8 +147,10 @@ pub mod bodies {
         signer: &str,
         w: CommunityMembershipWidening,
     ) -> Result<(), Error> {
-        d.put_community_membership_widening(ts::sign_community_membership_widening(signer, w))
-            .await
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
+            signer, w,
+        ))
+        .await
     }
 
     async fn revoke(
@@ -455,7 +458,7 @@ pub mod bodies {
             widening(&room, &dan, at("2026-03-02T00:00:00Z"), None),
         );
         ts::cosign_community_membership_widening(&mut wid, alice);
-        a.put_community_membership_widening(wid.clone())
+        a.put_community_membership_widening_consented(wid.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag} I172: A admits the widening first: {e}"));
         a.put_community_membership_revocation(rev.clone())
@@ -463,7 +466,7 @@ pub mod bodies {
             .unwrap();
         b.put_community_membership_revocation(rev).await.unwrap();
         let e = b
-            .put_community_membership_widening(wid)
+            .put_community_membership_widening_consented(wid)
             .await
             .expect_err("B refuses: bob was out at t2");
         assert_eq!(
@@ -671,7 +674,7 @@ pub mod bodies {
             ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
         wrong_env.cosignatures = foreign.cosignatures.clone();
         let e = d
-            .put_community_membership_widening(wrong_env)
+            .put_community_membership_widening_consented(wrong_env)
             .await
             .expect_err("I176: a co-signature over another envelope");
         assert_eq!(
@@ -685,7 +688,7 @@ pub mod bodies {
         ts::cosign_community_membership_widening(&mut dup, &bob);
         ts::cosign_community_membership_widening(&mut dup, &bob);
         let e = d
-            .put_community_membership_widening(dup)
+            .put_community_membership_widening_consented(dup)
             .await
             .expect_err("I176: a duplicate co-signer");
         assert_invalid(&e, "duplicate co-signer", "widening duplicate");
@@ -694,7 +697,7 @@ pub mod bodies {
             ts::sign_community_membership_widening(&alice, widening(&room, &dave, t1, None));
         ts::cosign_community_membership_widening(&mut selfco, &alice);
         let e = d
-            .put_community_membership_widening(selfco)
+            .put_community_membership_widening_consented(selfco)
             .await
             .expect_err("I176: the primary as its own co-signer");
         assert_invalid(&e, "is the primary signer", "widening self co-sign");
@@ -707,11 +710,11 @@ pub mod bodies {
         let mut good =
             ts::sign_community_membership_widening(&alice, widening(&room, &carol, t1, None));
         ts::cosign_community_membership_widening(&mut good, &bob);
-        d.put_community_membership_widening(good.clone())
+        d.put_community_membership_widening_consented(good.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag} I176: a co-signed widening: {e}"));
         // #861 — the byte-identical re-put is a no-op, not a refusal.
-        d.put_community_membership_widening(good.clone())
+        d.put_community_membership_widening_consented(good.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag} I176: an identical re-put: {e}"));
         let served: Vec<_> = d

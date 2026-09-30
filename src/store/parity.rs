@@ -300,9 +300,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // the pure `check_promotion_cohort_standing` survives only as the
     // string-compare delegate inside `cohort_standing_core`'s callers.
     ("check_cohort_standing_resolved", Class::Gate),
-    // Refuses a split-brain row whose cohort-target aliases disagree; a
-    // refusal, so it contributes to the compared sequence.
-    ("envelope_cohort_target", Class::Gate),
+    // v52.0.0 (CIRISPersist#955) — Gate: AV-45 (the writer is a member of the
+    // cohort it names, the split-brain target refusal) plus the two
+    // membership arms; it replaced the direct `check_write_cohort_scope_for`
+    // and `envelope_cohort_target` calls at every put door.
+    ("check_attestation_write_scope", Class::Gate),
     // Targeted cohorts REQUIRE federation tier (every other tier is
     // signature-exempt; a membership claim needs the verified signature) —
     // PR #761 strengthened the v38.2.0 never-local form, which an unknown
@@ -341,7 +343,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_user_target_steward_binding_admission", Class::Gate),
     ("check_withdraws_admission", Class::Gate),
     ("check_write", Class::Gate),
-    ("check_write_cohort_scope_for", Class::Gate),
     ("cloned", Class::Plumbing),
     ("commit", Class::Plumbing),
     ("compute_persist_row_hash", Class::Plumbing),

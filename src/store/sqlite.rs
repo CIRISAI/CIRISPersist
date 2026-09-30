@@ -4857,17 +4857,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // membership). Runs AFTER the closed-set value validation in tier
         // 1 and BEFORE persist_row_hash + INSERT: a refused row leaves no
         // trace (verify-then-gate-then-persist, MISSION §1.6).
-        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+        // v52.0.0 (CIRISPersist#955) — AV-45 plus the two membership arms (a
+        // proposal reaching its invitee, a reply at a group its signer is not in).
+        crate::federation::membership_acceptance::check_attestation_write_scope(
             self,
-            &row.attesting_key_id,
+            &row,
             "put_attestation",
-            &row.cohort_scope,
-            // v38.2.0 (#757) — the target the producer SIGNED into the
-            // envelope. Was hardcoded `None`, which made AV-45 refuse every
-            // family/community placement and left an owner-signed community
-            // row inexpressible (promotion, the only other door, re-seals
-            // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -7014,8 +7009,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             scrub_signature_classical,
             scrub_signature_pqc,
             supersede_proof,
+            cosignatures,
         } = family;
         let supersede_proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+        // v52.0.0 (#955, V162) — the founding members' consent travels with the
+        // authority signature it sits beside.
+        let cosignatures_json = serde_json::to_string(&cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
@@ -7038,7 +7038,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             conn.execute(
                 "UPDATE federation_families \
                     SET authority_key_id = ?2, scrub_signature_classical = ?3, \
-                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6 \
+                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6, \
+                        cosignatures = ?7 \
                   WHERE family_key_id = ?1",
                 rusqlite::params![
                     family_key_id_for_db,
@@ -7049,6 +7050,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     // v49.0.0 (#910.5) — a first copy of an amended version
                     // keeps its proof, so the next peer can apply it.
                     supersede_proof_json,
+                    cosignatures_json,
                 ],
             )?;
             Ok(())
@@ -7178,10 +7180,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_classical,
                     scrub_signature_pqc,
                     supersede_proof,
+                    cosignatures,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                let cosignatures_json = serde_json::to_string(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
                 let stale = stale.clone();
                 new_fam.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_fam)?;
@@ -7249,7 +7254,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
                             scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13 \
+                            supersede_proof = ?13, cosignatures = ?14 \
                          WHERE family_key_id = ?1",
                         rusqlite::params![
                             new_fam.family_key_id,
@@ -7269,6 +7274,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             scrub_signature_pqc,
                             admitted_at.to_rfc3339(),
                             proof_json,
+                            cosignatures_json,
                         ],
                     )?;
                     tx.commit()?;
@@ -21702,6 +21708,8 @@ fn sqlite_row_to_signed_family(
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
     let supersede_proof = sqlite_supersede_proof(row)?;
+    // v52.0.0 (#955, V162) — the founding co-signatures, same codec.
+    let cosignatures = sqlite_roster_cosignatures(row)?;
     let family = sqlite_row_to_family(row)?;
     Ok(crate::federation::SignedFamily {
         family,
@@ -21709,6 +21717,7 @@ fn sqlite_row_to_signed_family(
         scrub_signature_classical,
         scrub_signature_pqc,
         supersede_proof,
+        cosignatures,
     })
 }
 
@@ -27583,6 +27592,7 @@ mod accord_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
     use chrono::{TimeZone, Utc};
 
@@ -33202,6 +33212,10 @@ mod tests {
                 .unwrap();
             member_idents.push(*ident);
         }
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            &backend,
+        )
+        .await;
         backend
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
@@ -34432,7 +34446,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, "comm", carol_row, &admit)
+            .add_member_consented(Cohort::Affiliations, "comm", carol_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added);
@@ -35803,7 +35817,7 @@ mod tests {
             cosignatures: Vec::new(),
         };
         let err = backend
-            .add_family_member("fam", bob_row.clone(), &unsigned)
+            .add_family_member_consented("fam", bob_row.clone(), &unsigned)
             .await
             .expect_err("an unsigned family roster grow must be refused");
         assert!(
@@ -35822,7 +35836,7 @@ mod tests {
             },
         );
         backend
-            .add_family_member("fam", bob_row.clone(), &wrong)
+            .add_family_member_consented("fam", bob_row.clone(), &wrong)
             .await
             .expect_err("a signature over a different widening must not admit this one");
         assert_eq!(
@@ -35840,7 +35854,7 @@ mod tests {
         let admit =
             crate::federation::cohort::test_support::admit_family("alice", &fam_before, &bob_row);
         assert!(backend
-            .add_family_member("fam", bob_row, &admit)
+            .add_family_member_consented("fam", bob_row, &admit)
             .await
             .expect("signed roster grow"));
 
@@ -35897,7 +35911,7 @@ mod tests {
         // Idempotent admission: re-adding bob is a no-op, no duplicate row.
         assert!(
             !backend
-                .add_family_member(
+                .add_family_member_consented(
                     "fam",
                     crate::federation::types::FamilyMember {
                         key_id: "bob".into(),
@@ -46292,6 +46306,10 @@ mod tests {
             .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            backend,
+        )
+        .await;
         let policy = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
@@ -51494,7 +51512,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         )
         .await;
         assert!(backend
-            .add_community_member("addc-comm", cm("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", cm("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -51513,7 +51531,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         // Idempotent re-add (stale spec reused deliberately: the no-op returns
         // before the gate — nothing is written, so nothing to authorize).
         assert!(!backend
-            .add_community_member("addc-comm", cm("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", cm("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -51528,7 +51546,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         );
         // Unknown community.
         assert!(backend
-            .add_community_member("no-such", cm("addc-0"), &admit)
+            .add_community_member_consented("no-such", cm("addc-0"), &admit)
             .await
             .is_err());
     }
@@ -52548,17 +52566,22 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             persist_row_hash: String::new(),
         };
 
-        // v1: one member, admitted through the signed door.
+        // v1: two members (each co-signs the founding record — v52.0.0, #955
+        // Q1), admitted through the signed door.
         origin
-            .put_family(ts::sign_family(authority, mk(vec![m1], "founder_only")))
+            .put_family(ts::sign_family(authority, mk(vec![m1, m2], "founder_only")))
             .await
             .expect("651: the signed put admits");
 
         // SUPERSEDE to a DIFFERENT roster and a DIFFERENT protocol — both
-        // inside the signing preimage, so both are re-signed.
-        let v2 = ts::sign_family(authority, mk(vec![m1, m2], "unanimous"));
+        // inside the signing preimage, so both are re-signed. A contraction:
+        // a supersede never adds (#955 Q2).
+        let v2 = ts::sign_family(authority, mk(vec![m1], "unanimous"));
         let version = origin
-            .supersede_family(v2, Some(serde_json::json!({"membership_change": "add m2"})))
+            .supersede_family(
+                v2,
+                Some(serde_json::json!({"membership_change": "remove m2"})),
+            )
             .await
             .expect("651: the signed supersede admits");
         assert_eq!(version, 2, "supersede bumps the version");
@@ -52574,7 +52597,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             .family;
         assert_eq!(
             served.family.members.len(),
-            2,
+            1,
             "651: the served record must be the POST-supersede roster"
         );
         assert_eq!(

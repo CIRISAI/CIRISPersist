@@ -35,6 +35,7 @@ pub mod bodies {
     use crate::federation::admission::{
         moderation_reach_of, moderation_reach_of_at, DELEGATION_SCOPE_MODERATE, MEMBER_ROLE_FOUNDER,
     };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support::{
         moderate_delegation_attestation, reseal, sign_community,
     };
@@ -339,10 +340,10 @@ pub mod bodies {
         .await;
         let t0 = e.asserted_at;
         tick().await;
-        dir.put_community_membership_widening(widen(&hank, Utc::now()))
+        dir.put_community_membership_widening_consented(widen(&hank, Utc::now()))
             .await
             .unwrap_or_else(|err| panic!("[{tag}] I175: mo widens hank while appointed: {err}"));
-        dir.put_community_membership_widening(widen(&jay, t0 - Duration::seconds(5)))
+        dir.put_community_membership_widening_consented(widen(&jay, t0 - Duration::seconds(5)))
             .await
             .expect_err("a widening dated before the appointment has no moderator standing");
         tick().await;
@@ -353,7 +354,7 @@ pub mod bodies {
         )
         .await;
         tick().await;
-        dir.put_community_membership_widening(widen(&ivy, Utc::now()))
+        dir.put_community_membership_widening_consented(widen(&ivy, Utc::now()))
             .await
             .expect_err("after the withdrawal mo has no standing");
         let roster: Vec<String> = dir
@@ -458,7 +459,7 @@ pub mod bodies {
         .await
         .unwrap_or_else(|e| panic!("[{tag}] alice leaves (bob remains a founder): {e}"));
         tick().await;
-        dir.put_community_membership_widening(widen(&mo, &hank, None))
+        dir.put_community_membership_widening_consented(widen(&mo, &hank, None))
             .await
             .unwrap_or_else(|e| {
                 panic!("[{tag}] I175b: alice left, mo's appointment stands — mo widens hank: {e}")
@@ -471,11 +472,15 @@ pub mod bodies {
         )
         .await;
         tick().await;
-        dir.put_community_membership_widening(widen(&bob, &carol, Some(MEMBER_ROLE_FOUNDER)))
-            .await
-            .unwrap_or_else(|e| panic!("[{tag}] bob makes carol a founder: {e}"));
+        dir.put_community_membership_widening_consented(widen(
+            &bob,
+            &carol,
+            Some(MEMBER_ROLE_FOUNDER),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] bob makes carol a founder: {e}"));
         tick().await;
-        dir.put_community_membership_widening(widen(&mo2, &ivy, None))
+        dir.put_community_membership_widening_consented(widen(&mo2, &ivy, None))
             .await
             .expect_err(
                 "an appointment issued while carol had no authority never conferred the duty",

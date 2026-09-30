@@ -815,6 +815,7 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
         scrub_signature_classical: "AA==".to_owned(),
         scrub_signature_pqc: None,
         supersede_proof: None,
+        cosignatures: Vec::new(),
     };
     let err = dir
         .put_family(squat)

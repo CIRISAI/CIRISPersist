@@ -30,6 +30,7 @@ pub(crate) mod bodies {
     use crate::federation::genesis::bundle::{
         authorization_digest, GenesisAuthorization, GenesisBundle,
     };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         identity_type, Community, CommunityMember, KeyRecord, RosterCosignature, SignedCommunity,
@@ -145,6 +146,10 @@ pub(crate) mod bodies {
     /// Sign `row` by `signers[0]` and co-sign by the rest.
     pub(crate) fn signed(row: Community, signers: &[&str]) -> SignedCommunity {
         let mut s = ts::sign_community(signers[0], row);
+        // v52.0.0 (#955, Q1) — the listed founders consent by co-signing (the
+        // fixture signer adds them); the named signers are added once each.
+        s.cosignatures
+            .retain(|c| !signers.contains(&c.authority_key_id.as_str()));
         for c in &signers[1..] {
             let (_h, classical, pqc) = ts::sign_envelope(c, &s.community.signing_envelope());
             s.cosignatures.push(RosterCosignature {
@@ -777,7 +782,17 @@ pub(crate) mod bodies {
         ));
         // A FRESH node: nothing without the chain, nothing through a skip.
         fresh_consumer(fresh).await;
-        for k in [FOUNDERS[0], FOUNDERS[1], FOUNDERS[2], "f3-steward"] {
+        // v52.0.0 (#955, Q1) — the record's co-signers (its members consent by
+        // signing) are keys a consumer holds before it judges the record.
+        for k in [
+            FOUNDERS[0],
+            FOUNDERS[1],
+            FOUNDERS[2],
+            "f3-steward",
+            SERVE_NODE,
+            "cc2-serve-node",
+            "cc3-serve-node",
+        ] {
             let record = a.lookup_public_key(k).await.unwrap().unwrap();
             fresh
                 .put_public_key(crate::federation::types::SignedKeyRecord { record })
@@ -2554,12 +2569,17 @@ pub(crate) mod bodies {
             }
         }
         // The fork's new founder is known on the consumer too (so only the
-        // count decides).
-        let pf = a.lookup_public_key("pf-steward").await.unwrap().unwrap();
-        fresh
-            .put_public_key(crate::federation::types::SignedKeyRecord { record: pf })
-            .await
-            .unwrap();
+        // count decides), and so are the record's other co-signers (#955).
+        for k in ["pf-steward", "ck-serve-node", SERVE_NODE] {
+            if fresh.lookup_public_key(k).await.unwrap().is_some() {
+                continue;
+            }
+            let record = a.lookup_public_key(k).await.unwrap().unwrap();
+            fresh
+                .put_public_key(crate::federation::types::SignedKeyRecord { record })
+                .await
+                .unwrap();
+        }
         cc::admit_response_withdrawals(fresh, &resp)
             .await
             .expect("the withdrawal evidence re-tallies on the consumer");
@@ -2605,10 +2625,15 @@ pub(crate) mod bodies {
                 late.put_public_key(r.clone()).await.unwrap();
             }
         }
-        let pf = a.lookup_public_key("pf-steward").await.unwrap().unwrap();
-        late.put_public_key(crate::federation::types::SignedKeyRecord { record: pf })
-            .await
-            .unwrap();
+        for k in ["pf-steward", "ck-serve-node", SERVE_NODE] {
+            if late.lookup_public_key(k).await.unwrap().is_some() {
+                continue;
+            }
+            let record = a.lookup_public_key(k).await.unwrap().unwrap();
+            late.put_public_key(crate::federation::types::SignedKeyRecord { record })
+                .await
+                .unwrap();
+        }
         late.put_community(fork.clone())
             .await
             .expect("without the evidence the fork verifies");
@@ -2651,7 +2676,7 @@ pub(crate) mod bodies {
             .unwrap();
         ts::register_hybrid_key_as(d, "cc3-serve-node", "cc3-serve-node", identity_type::NODE)
             .await;
-        d.put_community_membership_widening(widening_by(
+        d.put_community_membership_widening_consented(widening_by(
             &[FOUNDERS[0], FOUNDERS[1]],
             "cc3-serve-node",
             Some("member"),
@@ -2660,7 +2685,7 @@ pub(crate) mod bodies {
         .expect("a serve node joins the trust root through the plane, no steward needed");
         put_conferred(d, &holders, "x4-steward", "user,steward").await;
         let e = d
-            .put_community_membership_widening(widening_by(
+            .put_community_membership_widening_consented(widening_by(
                 &[FOUNDERS[0], FOUNDERS[1], FOUNDERS[2]],
                 "x4-steward",
                 Some("founder"),
@@ -2669,7 +2694,7 @@ pub(crate) mod bodies {
             .expect_err("no founder is seated on the plane, even by every founder");
         assert_violation(&e, "only through the record");
         let e = d
-            .put_community_membership_widening(widening_by(
+            .put_community_membership_widening_consented(widening_by(
                 &[FOUNDERS[0], FOUNDERS[1]],
                 FOUNDERS[2],
                 Some("member"),
@@ -3053,12 +3078,16 @@ pub(crate) mod bodies {
             .expect("a founder appoints a moderator");
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         ts::register_hybrid_key_as(d, "mm-member", "mm-member", identity_type::USER).await;
-        d.put_community_membership_widening(widening_by(&["mo-moderator"], "mm-member", None))
-            .await
-            .expect("the moderator's standing seats a member");
+        d.put_community_membership_widening_consented(widening_by(
+            &["mo-moderator"],
+            "mm-member",
+            None,
+        ))
+        .await
+        .expect("the moderator's standing seats a member");
         put_conferred(d, &holders, "mf-steward", "user,steward").await;
         let e = d
-            .put_community_membership_widening(widening_by(
+            .put_community_membership_widening_consented(widening_by(
                 &["mo-moderator"],
                 "mf-steward",
                 Some("founder"),

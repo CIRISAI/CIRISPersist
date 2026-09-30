@@ -446,6 +446,10 @@ struct State {
     /// family's current version carries, keyed by `family_key_id`. Absent for
     /// a founding record or one superseded without a quorum.
     federation_family_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
+    /// v52.0.0 (CIRISPersist#955, V162 mirror) — a family's founding
+    /// co-signatures, keyed by `family_key_id`. Absent when single-signed.
+    federation_family_cosignatures:
+        HashMap<String, Vec<crate::federation::types::RosterCosignature>>,
     /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the community twin of
     /// `federation_family_supersede_proofs`, keyed by `community_key_id`.
     federation_community_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
@@ -981,6 +985,7 @@ impl Default for MemoryBackend {
                 federation_family_authority_sigs: HashMap::new(),
                 federation_community_authority_sigs: HashMap::new(),
                 federation_family_supersede_proofs: HashMap::new(),
+                federation_family_cosignatures: HashMap::new(),
                 federation_community_supersede_proofs: HashMap::new(),
                 federation_community_cosignatures: HashMap::new(),
                 federation_community_lineages: HashMap::new(),
@@ -3661,17 +3666,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // owner-signed community row inexpressible on the whole substrate).
         // Runs AFTER the closed-set value validation in tier 1 and
         // BEFORE persist (verify-then-gate-then-persist, MISSION §1.6).
-        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+        // v52.0.0 (CIRISPersist#955) — AV-45 plus the two membership arms (a
+        // proposal reaching its invitee, a reply at a group its signer is not in).
+        crate::federation::membership_acceptance::check_attestation_write_scope(
             self,
-            &row.attesting_key_id,
+            &row,
             "put_attestation",
-            &row.cohort_scope,
-            // v38.2.0 (#757) — the target the producer SIGNED into the
-            // envelope. Was hardcoded `None`, which made AV-45 refuse every
-            // family/community placement and left an owner-signed community
-            // row inexpressible (promotion, the only other door, re-seals
-            // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -5933,6 +5933,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             scrub_signature_classical,
             scrub_signature_pqc,
             supersede_proof,
+            cosignatures,
         } = family;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
@@ -5967,6 +5968,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         .remove(&family_key_id);
                 }
             }
+            // v52.0.0 (#955, V162 mirror) — the founding members' consent.
+            state
+                .federation_family_cosignatures
+                .insert(family_key_id.clone(), cosignatures);
             // v36.0.0 (#668) — attaching the authority signature is what makes
             // the row visible to the signed serve cursor; re-stamp the serve
             // position here (V130 mirror).
@@ -6073,6 +6078,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         supersede_proof,
+                        cosignatures,
                     } = serde_json::from_value(new_snapshot).map_err(|e| {
                         Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                     })?;
@@ -6139,6 +6145,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             state.federation_family_supersede_proofs.remove(&key);
                         }
                     }
+                    state
+                        .federation_family_cosignatures
+                        .insert(key.clone(), cosignatures);
                     // v36.0.0 (#668/#707-class) — a supersede rewrites the served
                     // bytes; the serve position moves with them.
                     let rows = family_rows(&state);
@@ -8558,6 +8567,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             .federation_family_supersede_proofs
                             .get(&f.family_key_id)
                             .cloned(),
+                        cosignatures: state
+                            .federation_family_cosignatures
+                            .get(&f.family_key_id)
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                 })
             })
@@ -12279,6 +12293,7 @@ mod accord_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::schema::CompleteTrace;
     use crate::schema::{ComponentType, SchemaVersion, TraceLevel};
     use crate::store::decompose::decompose;
@@ -18869,6 +18884,10 @@ mod tests {
             .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            backend,
+        )
+        .await;
         let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
@@ -19367,7 +19386,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, group, joiner_row, &admit)
+            .add_member_consented(Cohort::Affiliations, group, joiner_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added, "genuine add returns true");
@@ -20676,7 +20695,7 @@ mod tests {
         )
         .await;
         assert!(backend
-            .add_community_member("addc-comm", member("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -20697,7 +20716,7 @@ mod tests {
         // BEFORE the gate, because nothing is written and there is nothing to
         // authorize (CIRISPersist#654).
         assert!(!backend
-            .add_community_member("addc-comm", member("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -20715,7 +20734,7 @@ mod tests {
         // is no stored roster to have signed over).
         assert!(matches!(
             backend
-                .add_community_member("no-such-comm", member("addc-2"), &admit)
+                .add_community_member_consented("no-such-comm", member("addc-2"), &admit)
                 .await
                 .unwrap_err(),
             crate::federation::Error::UnstewardedCommunityMember { .. }

@@ -4750,9 +4750,17 @@ mod tests {
             ))
             .await
             .expect_err("a family with an unregistered member must be refused");
+        // v52.0.0 (#955, Q1) — a founding member consents by co-signing, so an
+        // unregistered member is refused where its co-signature cannot verify
+        // (before the registration check behind it can run); either way the
+        // refusal names the unregistered key.
         assert!(
-            format!("{err:?}").contains("not a registered"),
-            "expected member-not-registered error, got {err:?}"
+            matches!(
+                &err,
+                crate::federation::Error::FederationTierUnverified { attesting_key_id, .. }
+                    if attesting_key_id == "not-a-registered-key"
+            ) || format!("{err:?}").contains("not a registered"),
+            "expected the unregistered member refused, got {err:?}"
         );
     }
 

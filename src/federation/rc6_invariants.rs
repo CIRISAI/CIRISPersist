@@ -38,6 +38,7 @@ pub(crate) mod bodies {
     use crate::federation::lineage_witness::{
         LineageCosignOutcome as Out, LineageCosignRefusal as R, LineageHeadCosign,
     };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::identity_type;
     use crate::federation::{Error, FederationDirectory};
@@ -759,7 +760,7 @@ pub(crate) mod bodies {
             "a stalled root stays the attached consumer's community root: {v:?}"
         );
         let e = d
-            .put_community_membership_widening(widening_by(
+            .put_community_membership_widening_consented(widening_by(
                 &[FOUNDERS[0], FOUNDERS[1]],
                 "stall-node",
                 Some("member"),
@@ -795,7 +796,7 @@ pub(crate) mod bodies {
         assert_eq!(count(d, kind::COMMUNITY_LIVENESS_RESTORED).await, 1);
         assert_eq!(count(d, kind::COMMUNITY_LIVENESS_STALLED).await, 1);
         assert!(cc::resolve_community(d, CANON).await.unwrap().unwrap().live);
-        d.put_community_membership_widening(widening_by(
+        d.put_community_membership_widening_consented(widening_by(
             &[FOUNDERS[0], FOUNDERS[1]],
             "stall-node",
             Some("member"),

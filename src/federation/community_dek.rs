@@ -1601,6 +1601,7 @@ pub mod lifecycle_support {
                 role: None,
             })
             .collect();
+        ts::register_fixture_infrastructure_founder(backend).await;
         backend
             .put_community(ts::sign_community(
                 community_key_id,

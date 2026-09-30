@@ -3181,6 +3181,14 @@ pub struct SignedFamily {
     /// record that never carried one keeps its bytes and content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersede_proof: Option<GroupSupersedeProof>,
+    /// v52.0.0 (CIRISPersist#955, Q1 ruling) — further hybrid scrubs over the
+    /// SAME [`Family::signing_envelope`] the authority signed, the shape a
+    /// community row carries. A founding record admits exactly the members
+    /// who signed it (authority or co-signer): signing is their consent.
+    /// Persisted (V162) and served beside the authority signature. Omitted on
+    /// the wire when empty, so a single-signed record keeps its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
 }
 
 /// v49.0.0 (CIRISPersist#910.5, `FSD/ROOM_ROSTER_AUTHORITY.md` §10 item 5) —
