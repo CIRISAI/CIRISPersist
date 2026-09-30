@@ -218,6 +218,7 @@ pub(crate) mod bodies {
 
     /// I275 — the V161 backfill copies the current rows. `wipe` empties the
     /// history, `replay` re-runs the migration file against the live store.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub(crate) async fn i275_the_backfill_restores_the_history<W, R>(
         d: &dyn FederationDirectory,
         tag: &str,

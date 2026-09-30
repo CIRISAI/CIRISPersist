@@ -5495,6 +5495,7 @@ impl Engine {
     /// the proposal's attestation id — what the invitee's reply references.
     /// The group's quorum is NOT asked here: it signs the widening that
     /// admits the member once they accept.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn propose_membership(
         &self,
         scope: &str,
@@ -10504,6 +10505,7 @@ pub enum EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     // Gate the import to the union of its users so the no-backend
     // `--features server` build (`-D warnings`) doesn't see it as unused,
