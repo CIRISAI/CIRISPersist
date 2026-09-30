@@ -106,6 +106,21 @@ I67 allows `abandon_stream_floor`'s grant deletes (each rides its own blob row's
 
 **Witnesses:** I270 renewal, I271 re-signing, I272 before agreement, I273 revocation per assertion, I274 an older assertion arriving late, I276 the next edge, I278 trusted-local (memory, sqlite, postgres); I275 the backfill replayed (sqlite, postgres); I277 the adopter-shaped roster judgement in `rc5_adopts_invariants` (memory, sqlite, postgres); I279 the provenance token (unit + the signed route matrix leg 15 on all three backends).
 
+**Mutation round** (committed tree 5ec8927e + 2dca04e1; lane = the occurrence history witnesses + `node_bearing` + the provenance unit + the signed route matrix, sqlite+memory; M9 on postgres): **10/10 killed.**
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M0 | the fold reads the current-state row (the pre-V161 behaviour; the RED-first proof) | I270, I271, I273, I274, I275, I276, I277 |
+| M1 | sqlite signed door appends history only when the upsert applied | I274 |
+| M2 | the agreement clip dropped | I272, I278 |
+| M3 | `agreed_from` = the LATEST own signature | I270, I273, I274, I276, I277 |
+| M4 | revocation filter `>=` → `>` | I273(b) (added: survived until a revocation at an assertion's own instant was witnessed) |
+| M5 | the sqlite V161 backfill omitted | I275 |
+| M6 | an unknown provenance token reads `Rooted` | I279 (unit, matrix memory + sqlite) |
+| M7 | a trusted-local row counts as agreement | I278 |
+| M8 | memory's local door skips the history | I278 |
+| M9 | postgres's signed door writes no history row | I270–I278 on postgres, and the rc5 node-bearing runners |
+
 ## [51.3.0] - UNRELEASED
 
 **MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.
