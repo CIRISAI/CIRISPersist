@@ -24,6 +24,18 @@ A family seal's content-axis `key_grant` set named its family only as `owner_key
 
 **From #950/#946 — the receipts lane's STH producer (CIRISPersist#950, for CIRISEdge#734) and the four rows the register still owed after v51.1.0 (CIRISPersist#946).** Additive: two doors and two admission bounds; no wire, hash or migration change.
 
+### Mutation round — #953 (on the committed tree; lane = I199 + I147/I200/I201 + the key_grant unit tests, sqlite)
+Eight mutants, eight killed:
+- the family set omits `family_key_id` (I199 and the unit test);
+- the parser accepts any family target, or one on a self set (unit test);
+- the sqlite loader loses the inline fallback (I200, I201);
+- an unheld blob still becomes a leaf (I200);
+- the inline id accepts uppercase (I200);
+- the reservation is dropped, or reserves lowercase only (I200);
+- the stored listing shifts `received_at` (I201).
+
+The postgres loader and listing are exercised by I200 and I201's postgres runners. No postgres-specific mutants were run for #953.
+
 ### Added — the per-stream STH producer (CIRISPersist#950)
 No production path published a per-stream Signed Tree Head for a chunk-DAG file (every `put_stream_sth` caller was a test; `sign_stream_sth` was a test helper), so a host building CC 5.3.3.6 delivery receipts had to reimplement the canonical bytes. **`stream_sth::produce_stream_sth(local, stream_id, chunk_shas, tree_size, timestamp)`** mints the STH exactly as the anti-equivocation gate recomputes it (the RFC 6962 root over the first `tree_size` chunk shas in `seq` order, `log_id_for_stream`, `SignedTreeHead::signing_bytes`, the producer's hybrid signature under the node's LocalSigner); **`Engine::sign_stream_sth`** and pyo3 **`sign_stream_sth_json(stream_id, chunk_shas_hex, tree_size)`** mint it under the engine's announcing signer (its derived key is the producer `put_stream_sth` verifies). Nothing is stored by the producer; the host publishes with `put_stream_sth`, whose doc now states what the producer signs over and that a disagreeing root is refused by name (`InvalidArgument("put_stream_sth: root mismatch — …anti-equivocation gate")`), as is an over-claimed `tree_size`. **I147** (sqlite, postgres): the engine's STH is admitted and served back; a one-leaf prefix admits; the same shas in the wrong order are refused by name; an over-claimed `tree_size` is refused by the producer; the signature verifies against the named producer only.
 
