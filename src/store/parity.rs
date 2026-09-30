@@ -179,6 +179,16 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
     // row whose grant shape or granter is not admissible. A statement about the input.
     ("check_community_trust_grant_admission", Class::Gate),
+    // v52.0.0 (CIRISPersist#953) — Gate: refuses a chunk under a stream id
+    // shaped like a SHA-256 (reserved for an inline blob's one-leaf log). A
+    // statement about the caller's input.
+    ("refuse_reserved_stream_id", Class::Gate),
+    // v52.0.0 (#953) — Plumbing: a pure shape test that names the inline blob
+    // a stream id spells, inside the chunk-hash loader; it refuses nothing.
+    ("inline_blob_of_stream_id", Class::Plumbing),
+    // v52.0.0 (#953) — Delegates: the plain receipt listing is the stored
+    // listing with the instants dropped.
+    ("list_stored_delivery_receipts_for", Class::Delegates),
     // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose
     // segment breaks its manifest-declared case class. A statement about the
     // caller's input.

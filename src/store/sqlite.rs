@@ -865,6 +865,14 @@ impl SqliteBackend {
         self
     }
 
+    /// v52.0.0 (#954) — set the inline cap on a SHARED backend (an Engine's
+    /// `Arc`), which [`Self::with_inline_bytes_cap`] cannot reach. A test
+    /// shrinks it to exercise the nested manifest without gigabytes.
+    pub fn set_inline_bytes_cap(&self, cap: usize) {
+        self.inline_bytes_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Open (or create) a file-backed SQLite database with the default
     /// reader count ([`crate::store::sqlite_conn_model::default_reader_count`]:
     /// `available_parallelism().clamp(2, 8)`, or `CIRIS_PERSIST_SQLITE_READERS`).
@@ -16095,13 +16103,47 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let tier = floor.tier().as_str().to_owned();
         let media = media_type.map(str::to_owned);
         let bind = binding.clone();
+        for c in &spec.children {
+            if c.body.len() > cap {
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: c.body.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(&c.sha256, &c.body)?;
+        }
+        let children: Vec<(i64, Vec<u8>, Vec<u8>, i64)> = spec
+            .children
+            .iter()
+            .map(|c| {
+                (
+                    i64::try_from(c.index).unwrap_or(i64::MAX),
+                    c.sha256.to_vec(),
+                    c.body.clone(),
+                    i64::try_from(c.body.len()).unwrap_or(i64::MAX),
+                )
+            })
+            .collect();
         enum Sealed {
             Ok,
             StreamMoved(i64),
             EpochMoved,
+            Abandoned,
         }
         let outcome = self.write(move |conn| -> Result<Sealed, rusqlite::Error> {
             let tx = conn.transaction()?;
+            // #954 — an abandoned stream is never sealed.
+            let abandoned: bool = tx
+                .query_row(
+                    "SELECT abandoned_at IS NOT NULL FROM federation_streams WHERE stream_id = ?1",
+                    rusqlite::params![stream_id_owned],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if abandoned {
+                return Ok(Sealed::Abandoned);
+            }
             // §12.3 — the door listed N chunks and sealed a manifest over
             // them; if the stream has moved since, this manifest describes
             // a stream that no longer exists. Refuse, never truncate.
@@ -16162,6 +16204,35 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     return Ok(Sealed::EpochMoved);
                 }
             }
+            // #954 — a v3 root's children: inline rows at the DAG's tier and
+            // cohort, authored by the stream's owner, bound to the root's
+            // epoch at a community, and related to the root. One transaction
+            // with the root, so a root never exists without its children.
+            for (index, child_sha, body, len) in &children {
+                tx.execute(
+                    "INSERT INTO federation_blobs (\
+                        sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                        last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
+                     ) VALUES (?1, 'inline', ?2, NULL, ?3, NULL, ?4, 0, ?5, ?6, \
+                               (SELECT owner_key_id FROM federation_streams WHERE stream_id = ?7)) \
+                     ON CONFLICT (sha256) DO NOTHING",
+                    rusqlite::params![child_sha, body, len, now_iso, scope, tier, stream_id_owned],
+                )?;
+                if let Some(b) = &bind {
+                    let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                    tx.execute(
+                        "INSERT INTO federation_community_blob_epoch \
+                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT (at_rest_sha256) DO NOTHING",
+                        rusqlite::params![child_sha, b.community_key_id, b.minter_key_id, ep],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO federation_manifest_children (root_sha256, child_index, child_sha256) \
+                     VALUES (?1, ?2, ?3) ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                    rusqlite::params![sha_vec, index, child_sha],
+                )?;
+            }
             tx.execute(
                 "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
                 rusqlite::params![stream_id_owned, now_iso],
@@ -16190,6 +16261,225 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     epoch: b.epoch,
                 })
             }
+            Sealed::Abandoned => Err(crate::federation::blobs::stream_abandoned_refusal(
+                stream_id,
+            )),
+        }
+    }
+
+    async fn manifest_children(
+        &self,
+        root_sha256: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
+        let root = root_sha256.to_vec();
+        let rows: Vec<(i64, Vec<u8>)> = self
+            .read(
+                move |conn| -> Result<Vec<(i64, Vec<u8>)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT child_index, child_sha256 FROM federation_manifest_children \
+                      WHERE root_sha256 = ?1 ORDER BY child_index ASC",
+                    )?;
+                    let it =
+                        stmt.query_map(rusqlite::params![root], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("manifest_children: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(i, sha)| {
+                Ok((
+                    u64::try_from(i).map_err(|_| {
+                        crate::federation::BlobError::Backend("negative child_index".into())
+                    })?,
+                    crate::federation::stream_sth::root_hash_from_bytes(&sha)?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn record_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        index: u64,
+        child_sha256: &[u8; 32],
+    ) -> Result<(), crate::federation::BlobError> {
+        let (root, child) = (root_sha256.to_vec(), child_sha256.to_vec());
+        let idx = i64::try_from(index).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("child index exceeds i64".into())
+        })?;
+        enum Rec {
+            Ok,
+            RootMissing,
+            ChildMissing,
+            Other(Vec<u8>),
+        }
+        let out = self
+            .write(move |conn| -> Result<Rec, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                for (sha, missing) in [(&root, Rec::RootMissing), (&child, Rec::ChildMissing)] {
+                    let is_held: bool = tx.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM federation_blobs WHERE sha256 = ?1)",
+                        rusqlite::params![sha],
+                        |r| r.get(0),
+                    )?;
+                    if !is_held {
+                        return Ok(missing);
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO federation_manifest_children (root_sha256, child_index, child_sha256) \
+                     VALUES (?1, ?2, ?3) ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                    rusqlite::params![root, idx, child],
+                )?;
+                let stored: Vec<u8> = tx.query_row(
+                    "SELECT child_sha256 FROM federation_manifest_children \
+                      WHERE root_sha256 = ?1 AND child_index = ?2",
+                    rusqlite::params![root, idx],
+                    |r| r.get(0),
+                )?;
+                if stored != child {
+                    return Ok(Rec::Other(stored));
+                }
+                tx.commit()?;
+                Ok(Rec::Ok)
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("record_manifest_child: {e}"))
+            })?;
+        crate::federation::blobs::manifest_child_record_outcome(
+            root_sha256,
+            index,
+            child_sha256,
+            match out {
+                Rec::Ok => None,
+                Rec::RootMissing => Some(("root", None)),
+                Rec::ChildMissing => Some(("child", None)),
+                Rec::Other(s) => Some(("other", Some(s))),
+            },
+        )
+    }
+
+    async fn abandon_stream_floor(
+        &self,
+        stream_id: &str,
+        owner_key_id: &str,
+    ) -> Result<crate::federation::AbandonFloorReport, crate::federation::BlobError> {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let (sid, owner) = (stream_id.to_owned(), owner_key_id.to_owned());
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        enum Ab {
+            Unknown,
+            NotOwned,
+            Sealed,
+            Done(crate::federation::AbandonFloorReport),
+        }
+        let out = self
+            .write(move |conn| -> Result<Ab, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                let head: Option<(Option<String>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT owner_key_id, abandoned_at FROM federation_streams \
+                          WHERE stream_id = ?1",
+                        rusqlite::params![sid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((s_owner, abandoned)) = head else {
+                    return Ok(Ab::Unknown);
+                };
+                if s_owner.as_deref() != Some(owner.as_str()) {
+                    return Ok(Ab::NotOwned);
+                }
+                if abandoned.is_some() {
+                    return Ok(Ab::Done(crate::federation::AbandonFloorReport {
+                        already: true,
+                        ..Default::default()
+                    }));
+                }
+                let sealed: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM federation_stream_chunks \
+                                     WHERE stream_id = ?1 AND sealed_at IS NOT NULL)",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )?;
+                if sealed {
+                    return Ok(Ab::Sealed);
+                }
+                let rows: Vec<(Vec<u8>, Option<String>, Option<i64>)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT c.chunk_sha, b.crypto_tier, b.size_bytes \
+                           FROM federation_stream_chunks c \
+                           LEFT JOIN federation_blobs b ON b.sha256 = c.chunk_sha \
+                          WHERE c.stream_id = ?1 ORDER BY c.seq ASC",
+                    )?;
+                    let it = stmt.query_map(rusqlite::params![sid], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?;
+                    it.collect::<Result<_, _>>()?
+                };
+                tx.execute(
+                    "UPDATE federation_streams SET abandoned_at = ?2 WHERE stream_id = ?1",
+                    rusqlite::params![sid, now_iso],
+                )?;
+                let dropped = tx.execute(
+                    "DELETE FROM federation_stream_chunks WHERE stream_id = ?1",
+                    rusqlite::params![sid],
+                )?;
+                let mut report = crate::federation::AbandonFloorReport {
+                    already: false,
+                    chunks_dropped: dropped as u64,
+                    ..Default::default()
+                };
+                for (sha, tier, size) in rows {
+                    let tier = tier.as_deref().and_then(CryptoTier::parse_str);
+                    let Some(tier) = tier.filter(|t| *t != CryptoTier::Plaintext) else {
+                        continue;
+                    };
+                    tx.execute(
+                        "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 = ?1",
+                        rusqlite::params![sha],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
+                        rusqlite::params![sha],
+                    )?;
+                    let n = tx.execute(
+                        "DELETE FROM federation_blobs WHERE sha256 = ?1",
+                        rusqlite::params![sha],
+                    )?;
+                    if n > 0 {
+                        report.bytes_evicted += size.unwrap_or(0).max(0) as u64;
+                        let mut a = [0u8; 32];
+                        if sha.len() == 32 {
+                            a.copy_from_slice(&sha);
+                            report.evicted.push((a, tier));
+                        }
+                    }
+                }
+                tx.commit()?;
+                Ok(Ab::Done(report))
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("abandon_stream_floor: {e}"))
+            })?;
+        match out {
+            Ab::Done(r) => Ok(r),
+            Ab::Unknown => Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_unknown: no stream {stream_id} is held here"
+            ))),
+            Ab::NotOwned => Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_not_owned: stream {stream_id} belongs to another writer; only its owner \
+                 abandons it (CIRISPersist#954)"
+            ))),
+            Ab::Sealed => Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_sealed: stream {stream_id} is sealed; a sealed DAG is evicted, not \
+                 abandoned (CIRISPersist#954)"
+            ))),
         }
     }
 
@@ -18033,6 +18323,8 @@ impl SqliteBackend {
                 cohort_scope: String,
                 community_key_id: Option<String>,
             },
+            /// #954 — the stream was abandoned.
+            StreamAbandoned,
         }
         let outcome = self.write(move |conn| -> Result<Appended, rusqlite::Error> {
             let tx = conn.transaction()?;
@@ -18054,13 +18346,20 @@ impl SqliteBackend {
                     now_iso,
                 ],
             )?;
-            let (s_cohort, s_comm, s_owner): (String, Option<String>, Option<String>) = tx
-                .query_row(
-                    "SELECT cohort_scope, community_key_id, owner_key_id \
-                       FROM federation_streams WHERE stream_id = ?1",
-                    rusqlite::params![stream_id_owned],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?;
+            let (s_cohort, s_comm, s_owner, s_abandoned): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = tx.query_row(
+                "SELECT cohort_scope, community_key_id, owner_key_id, abandoned_at \
+                   FROM federation_streams WHERE stream_id = ?1",
+                rusqlite::params![stream_id_owned],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            if s_abandoned.is_some() {
+                return Ok(Appended::StreamAbandoned);
+            }
             if s_cohort != scope || s_comm != claim_tx.community_key_id {
                 return Ok(Appended::StreamElsewhere {
                     cohort_scope: s_cohort,
@@ -18237,6 +18536,9 @@ impl SqliteBackend {
                 &s_cohort,
                 s_comm.as_deref(),
             )),
+            Appended::StreamAbandoned => Err(crate::federation::blobs::stream_abandoned_refusal(
+                stream_id,
+            )),
         }
     }
 
@@ -18363,12 +18665,34 @@ impl SqliteBackend {
         // key material for nothing.
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
             let tx = conn.transaction()?;
+            // v52.0.0 (#954) — a v3 root's children die with it (found by
+            // the relation, never by opening the root), and so does the
+            // relation itself.
+            let children: Vec<Vec<u8>> = {
+                let mut stmt = tx.prepare(
+                    "SELECT child_sha256 FROM federation_manifest_children WHERE root_sha256 = ?1",
+                )?;
+                let it = stmt.query_map(rusqlite::params![sha_vec], |r| r.get(0))?;
+                it.collect::<Result<_, _>>()?
+            };
+            for sha in children.iter().chain(std::iter::once(&sha_vec)) {
+                tx.execute(
+                    "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 = ?1",
+                    rusqlite::params![sha],
+                )?;
+                tx.execute(
+                    "DELETE FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
+                    rusqlite::params![sha],
+                )?;
+            }
+            for sha in &children {
+                tx.execute(
+                    "DELETE FROM federation_blobs WHERE sha256 = ?1",
+                    rusqlite::params![sha],
+                )?;
+            }
             tx.execute(
-                "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 = ?1",
-                rusqlite::params![sha_vec],
-            )?;
-            tx.execute(
-                "DELETE FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
+                "DELETE FROM federation_manifest_children WHERE root_sha256 = ?1",
                 rusqlite::params![sha_vec],
             )?;
             let n = tx.execute(

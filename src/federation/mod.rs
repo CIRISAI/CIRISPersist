@@ -136,6 +136,10 @@ pub mod listing_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
+/// v52.0.0 (CIRISPersist#954) — the nested manifest and abandon_stream witnesses
+/// (I202–I209).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod nested_manifest_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
@@ -501,13 +505,14 @@ pub use admission::{
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
-    BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow, BlobRange, BlobStorage,
-    ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport,
-    EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestRowSpec, MemberGrant,
+    AbandonFloorReport, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow,
+    BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding,
+    EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestChildRef,
+    ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest, ParsedManifest,
     PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
     StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION,
-    CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX,
-    HOLDS_BYTES_PREFIX_HEX_LEN,
+    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
+    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;

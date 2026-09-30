@@ -389,7 +389,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("minter_of_blob", ConnClass::Read),
     ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
-    ("list_delivery_receipts_for", ConnClass::Read),
     ("list_stored_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),
     ("list_families_for_member", ConnClass::Read),
@@ -540,6 +539,11 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("seal_stream_with_scope", ConnClass::Write),
     // v51.3.0 (#947) — the sealed-DAG promotion: one write transaction.
     ("promote_adopted_manifest_to_dag", ConnClass::Write),
+    // v52.0.0 (CIRISPersist#954) — the nested manifest's relation and the
+    // abandoned stream.
+    ("manifest_children", ConnClass::Read),
+    ("record_manifest_child", ConnClass::Write),
+    ("abandon_stream_floor", ConnClass::Write),
     ("blob_head", ConnClass::Read),
     ("stream_chunks", ConnClass::Read),
     ("stream_chunk_at", ConnClass::Read),

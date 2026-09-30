@@ -14724,6 +14724,115 @@ impl PyEngine {
         })
     }
 
+    /// v52.0.0 (CIRISPersist#954) — **one page of a v3 manifest**: the chunks
+    /// child `child_index` lists, opened as `viewer_key_id` (authorized on the
+    /// root as `read_blob_as`, then on the child row). For a file above the
+    /// flat manifest's ceiling, `open_sealed_manifest_json` answers
+    /// `"version": 3` with `"children": [{"index", "sha256_hex", "first_seq",
+    /// "last_seq", "chunk_count", "size"}, …]` and an empty `"chunks"`; the
+    /// puller adopts each child with `adopt_sealed_manifest_child_json`, then
+    /// opens its page here. Returns JSON `[{"sha256_hex", "size", "seq"}, …]`.
+    /// A child not held raises `ValueError` (`blob_not_held`) naming the child.
+    #[pyo3(signature = (at_rest_sha256_hex, child_index, viewer_key_id, caller_aad_b64=None))]
+    fn open_sealed_manifest_page_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        child_index: u64,
+        viewer_key_id: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let page = runtime
+                    .block_on(async move {
+                        engine
+                            .open_sealed_manifest_page_as(
+                                &sha,
+                                child_index,
+                                &viewer,
+                                aad.as_deref(),
+                            )
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&page).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **adopt one child of a v3 manifest**
+    /// (fetched by the `sha256_hex` its root names): stored as the sealed
+    /// envelope it is, never opened, and related to the root so eviction and
+    /// promotion find it. The root must be held first. Payload JSON: the
+    /// provenance members of `adopt_sealed_blob_json` plus `"envelope_b64"`,
+    /// `"root_sha256"` (hex) and `"child_index"`. Returns JSON
+    /// `{"child_sha256": "<hex>"}`.
+    fn adopt_sealed_manifest_child_json(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptManifestChildWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_manifest_child_json decode: {e}"))
+            })?;
+            let envelope = B64.decode(&wire.envelope_b64).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "adopt_sealed_manifest_child_json envelope_b64 decode: {e}"
+                ))
+            })?;
+            let root = parse_sha256_hex(&wire.root_sha256)?;
+            let index = wire.child_index;
+            let provenance = wire
+                .provenance
+                .into_provenance("adopt_sealed_manifest_child_json")?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(async move {
+                        engine
+                            .adopt_sealed_manifest_child(&root, index, &envelope, provenance)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({ "child_sha256": hex::encode(sha) }).to_string())
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **abandon an unsealed stream this node
+    /// owns** (a streaming publish refused midway): the stream is tombstoned
+    /// (`stream_abandoned` on any later append or seal), its index rows go,
+    /// and its sealed chunk rows are evicted. Key-grant sets already emitted
+    /// stay (CC 3: a shared key is not un-shared). Only the stream's owner; a
+    /// sealed stream raises `ValueError` (`stream_sealed`). Idempotent.
+    /// Returns JSON `{"already", "chunks_dropped", "bytes_evicted"}`.
+    fn abandon_stream_json(&self, py: Python<'_>, stream_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let stream = stream_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let out = runtime
+                    .block_on(async move { engine.abandon_stream(&stream).await })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&out).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
     /// v51.3.0 (CIRISPersist#947) — **finish a sealed DAG adopt.**
     /// `adopt_sealed_blob_json` stores a received sealed manifest as an inline
     /// envelope; until this runs, `read_blob_as` on that address returns the
@@ -34218,6 +34327,18 @@ struct AdoptSealedBlobWire {
     #[serde(default)]
     aad_b64: Option<String>,
     disposition: String,
+}
+
+/// v52.0.0 (CIRISPersist#954) — the wire for `adopt_sealed_manifest_child_json`:
+/// the blob wire's provenance plus the child's root and index. No
+/// `disposition` — a child announces nothing; the root is what a holder claims.
+#[derive(serde::Deserialize)]
+struct AdoptManifestChildWire {
+    envelope_b64: String,
+    root_sha256: String,
+    child_index: u64,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
 }
 
 /// v46.4.0 (CIRISPersist#821) — the wire for `adopt_sealed_chunk_json`: the

@@ -5629,6 +5629,140 @@ impl Engine {
         }
     }
 
+    /// v52.0.0 (CIRISPersist#954, `BLOB_REPLICATION.md` §6.6) — **the chunks
+    /// child `index` of a v3 manifest lists**, opened for `viewer_key_id`
+    /// under the same authorization as [`read_blob_as`](Self::read_blob_as)
+    /// on the ROOT, then on the child row. For a file above the flat
+    /// manifest's ceiling, [`open_sealed_manifest_as`](Self::open_sealed_manifest_as)
+    /// answers `version: 3` with `children` and no `chunks`; the puller walks
+    /// the children one page at a time.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn open_sealed_manifest_page_as(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        child_index: u64,
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        Vec<crate::federation::chunk_dag_cascade::orchestrate::SealedManifestChunk>,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::open_sealed_manifest_page_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                open_sealed_manifest_page_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    child_index,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                open_sealed_manifest_page_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    child_index,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v52.0.0 (#954, `BLOB_REPLICATION.md` §6.6) — **adopt one child of a
+    /// v3 manifest**: the child's sealed envelope through
+    /// [`adopt_sealed_blob`](Self::adopt_sealed_blob) (`LocalOnly`; it is
+    /// never opened, I45), then the relation `(root, index) → child` so
+    /// eviction and promotion find it without opening the root. The root
+    /// must already be held (adopt it first). Returns the child's address.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        child_index: u64,
+        envelope: &[u8],
+        provenance: crate::federation::BlobProvenance,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        let held = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.blob_head(root_sha256).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.blob_head(root_sha256).await?,
+        };
+        if held.is_none() {
+            return Err(crate::federation::BlobError::NotHeld {
+                sha256_hex: hex::encode(root_sha256),
+            });
+        }
+        let out = self
+            .adopt_sealed_blob(
+                envelope,
+                provenance,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.record_manifest_child(root_sha256, child_index, &out.sha256)
+                    .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.record_manifest_child(root_sha256, child_index, &out.sha256)
+                    .await?
+            }
+        }
+        Ok(out.sha256)
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **abandon an unsealed stream this node
+    /// owns.** A streaming publish refused midway leaves chunk rows, index
+    /// rows and per-chunk content key-grant sets that replicate to the
+    /// owner's devices for bytes that will never be sealed. This door, for
+    /// the stream's OWNER only (this Engine's derived key) and only before a
+    /// seal: tombstones the stream (the id is never reused; the chunk door
+    /// and the seal refuse it as `stream_abandoned`), drops its index rows,
+    /// evicts its sealed chunk rows (a plaintext chunk's bytes stay: they are
+    /// content-addressed and may be shared). The content key-grant sets
+    /// already emitted for those chunks are NOT withdrawn: CC 3 says a shared
+    /// key cannot be retroactively un-shared, and the withdraws gate refuses
+    /// one naming a `key_grant` row. On a peer that never received the bytes
+    /// such a set stays an inert pending row; nothing opens with it.
+    /// Idempotent: a second call answers `already: true`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn abandon_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::federation::chunk_dag_cascade::AbandonReport, crate::federation::BlobError>
+    {
+        use crate::federation::BlobStorage;
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("abandon_stream: signer: {e}"))
+        })?;
+        let floor = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
+        };
+        Ok(crate::federation::chunk_dag_cascade::AbandonReport {
+            already: floor.already,
+            chunks_dropped: floor.chunks_dropped,
+            bytes_evicted: floor.bytes_evicted,
+        })
+    }
+
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
     /// announce it**: [`put_blob_chunks`](crate::federation::BlobStorage::put_blob_chunks)
     /// (every chunk verified against the manifest), then the manifest's

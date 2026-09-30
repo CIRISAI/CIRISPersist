@@ -2529,11 +2529,17 @@ mod tests {
                 .match_indices(&needle)
                 .map(|(i, _)| enclosing_fn(&prod, i))
                 .collect();
-            let allowed: std::collections::BTreeSet<String> =
-                ["delete_blob", "community_dek_evict_epoch_objects"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect();
+            // v52.0.0 (#954) — `abandon_stream_floor` evicts an abandoned
+            // stream's sealed chunk rows; each grant delete rides the delete
+            // of its own blob row in the same transaction (blob deletion).
+            let allowed: std::collections::BTreeSet<String> = [
+                "delete_blob",
+                "community_dek_evict_epoch_objects",
+                "abandon_stream_floor",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
             assert!(
                 fns.is_subset(&allowed),
                 "I67: {file}: at-rest grant deletes may ride only blob deletion, found in {fns:?}"
