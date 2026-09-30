@@ -563,6 +563,52 @@ mod sqlite {
         timing(8192, 256 * 1024, 256).await;
     }
 
+    /// The batch door at Edge's in-flight run of 8, same scale.
+    #[tokio::test]
+    #[ignore = "timing, run by hand"]
+    async fn timing_957_batch8_8192_chunks_of_256k() {
+        let dir = std::env::temp_dir().join(format!("b957-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = SqliteBackend::open(dir.join("t.db").to_string_lossy().to_string())
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        let (n, size, run) = (8192u64, 256 * 1024usize, 8u64);
+        let t0 = std::time::Instant::now();
+        let mut seq = 0;
+        while seq < n {
+            let items = (seq..seq + run)
+                .map(|s| {
+                    let mut p = vec![7u8; size];
+                    p[..8].copy_from_slice(&s.to_le_bytes());
+                    (s, super::bodies::sealed(&p), size as u64)
+                })
+                .collect();
+            let got = crate::federation::BlobStorage::adopt_sealed_chunks_at(
+                &b,
+                "timing-957-batch",
+                items,
+                0,
+                "self",
+                "timing-author",
+                crate::federation::StorageFloor::resolved(
+                    crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(got.iter().all(Result::is_ok));
+            seq += run;
+        }
+        let total = t0.elapsed();
+        eprintln!(
+            "MEASURED #957 batch-of-8 {n} x {size} B: total {total:?} ({:.3} ms/chunk)",
+            total.as_secs_f64() * 1000.0 / n as f64
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn timing(n: u64, size: usize, window: u64) {
         let dir = std::env::temp_dir().join(format!("b957-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
