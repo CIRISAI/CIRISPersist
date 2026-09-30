@@ -413,13 +413,9 @@ pub(crate) mod bodies {
         // a stranger replying as K (their own signature, K's name): mismatch
         let forged = reply(&stranger, &k, &p, true, Utc::now());
         let e = put(d, &forged).await.expect_err("I211: a stranger's reply");
-        assert!(
-            matches!(
-                &e,
-                Error::MembershipAcceptanceRefused { rule, .. } if *rule == RULE_ACCEPTANCE_MISMATCH
-            ) || matches!(&e, Error::CohortStandingRefused { .. }),
-            "I211: {e:?}"
-        );
+        // refused BY NAME at the reply arm (the signer does not act for the
+        // invitee), not left to a later, unrelated standing gate
+        assert_eq!(rule_of(&e), RULE_ACCEPTANCE_MISMATCH, "I211: {e:?}");
         // a stranger replying as themselves: not the invitee
         let own = reply(&stranger, &stranger, &p, true, Utc::now());
         let e = put(d, &own).await.expect_err("I211: a non-invitee's reply");
@@ -495,6 +491,39 @@ pub(crate) mod bodies {
         found_family(d, &fid, "founder_only", &[&founder], &[])
             .await
             .unwrap();
+        // only a founder invites into a founder_only family either: K is no
+        // member at all, and is refused whatever the membership gate says;
+        // a non-founder member is refused by the proposer rule
+        let pk = proposal(&k, FAMILY, &fid, &j, None, now, Some(Duration::days(7)));
+        put(d, &pk)
+            .await
+            .expect_err("I212: a non-member's family proposal");
+        let m = format!("i212-m-{s}");
+        reg(d, &[&m]).await;
+        let pm = proposal(
+            &founder,
+            FAMILY,
+            &fid,
+            &m,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(d, &pm).await.unwrap();
+        put(d, &reply(&m, &m, &pm, true, now)).await.unwrap();
+        widen_family(d, &fid, &founder, &m, None, now)
+            .await
+            .expect("I212: a member (not a founder) joins the family");
+        let e = put(
+            d,
+            &proposal(&m, FAMILY, &fid, &j, None, now, Some(Duration::days(7))),
+        )
+        .await
+        .expect_err("I212: a non-founder member's proposal under founder_only (family)");
+        assert!(
+            matches!(e, Error::InvalidArgument(ref msg) if msg.contains("founder_only")),
+            "I212: {e:?}"
+        );
         let e = widen_family(d, &fid, &founder, &j, None, now)
             .await
             .expect_err("I212: a family widening without an acceptance");
