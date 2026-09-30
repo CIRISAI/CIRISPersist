@@ -2644,7 +2644,7 @@ pub async fn check_promotion_admission(
     // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
     check_session_self_report_admission(row)?;
     // CC 3.3.1 — a `consent:community_trust` grant is the node's own and lists
-    // its owner at the grant's instant (v51.4.0, CIRISPersist#946).
+    // its owner at the grant's instant (v52.0.0, CIRISPersist#946).
     super::community_trust_consent::check_community_trust_grant_admission(directory, row).await?;
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
@@ -3305,7 +3305,7 @@ pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(
     check_session_lease_bound(dimension, &row.attestation_envelope)
 }
 
-/// v51.4.0 (CIRISPersist#946; CC 3.1.3.1, the #113/#122 review bound) — **the
+/// v52.0.0 (CIRISPersist#946; CC 3.1.3.1, the #113/#122 review bound) — **the
 /// lease is bounded, and the bound reads the claim alone.** A signature
 /// proves who supplied `claimed_at`, not that it is honest; "earliest wins"
 /// would otherwise let one occurrence hold a session indefinitely by
@@ -7957,7 +7957,7 @@ async fn issuer_owned_the_producer_when(
     Ok(in_force.len() == 1 && in_force.contains(issuer))
 }
 
-/// v51.4.0 (factored out of the #941 rule for CIRISPersist#946) — **the owner
+/// v52.0.0 (factored out of the #941 rule for CIRISPersist#946) — **the owner
 /// granters whose binding over `node` was IN FORCE at `t`.** A binding is in
 /// force from its `asserted_at` until the earlier of its `expires_at` and the
 /// first admitted `withdraws` that ends it (one naming it, or its granter's

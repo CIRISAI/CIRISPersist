@@ -5486,7 +5486,7 @@ impl Engine {
         }
     }
 
-    /// v51.4.0 (CIRISPersist#946; CC 3.3.1) — **the standing
+    /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
     /// `consent:community_trust` grant for `node`**, or `None`: the capture
     /// gate's answer, folded from the rows about the node (latest grant after
     /// the latest admitted revocation; ties on the smallest id). See
@@ -5509,7 +5509,7 @@ impl Engine {
         }
     }
 
-    /// v51.4.0 (CIRISPersist#950, for CIRISEdge#734) — **mint this node's
+    /// v52.0.0 (CIRISPersist#950, for CIRISEdge#734) — **mint this node's
     /// Signed Tree Head over a chunk-DAG file's stream**, under the engine's
     /// PQC LocalSigner (the announcing signer; its derived key is the
     /// producer `put_stream_sth` verifies against). `chunk_shas` are the

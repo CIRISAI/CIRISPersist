@@ -10731,7 +10731,7 @@ impl PyEngine {
     /// v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts
     /// for `stream_id`, ascending `(k, subscriber_key_id)`, bounded by
     /// `limit`. Returns a JSON array of serialized `DeliveryReceipt`s, each
-    /// with the `received_at` this node stored it at (v51.5.0, #953).
+    /// with the `received_at` this node stored it at (v52.0.0, #953).
     fn list_delivery_receipts_for(
         &self,
         py: Python<'_>,
@@ -14625,7 +14625,7 @@ impl PyEngine {
         })
     }
 
-    /// v51.4.0 (CIRISPersist#946; CC 3.3.1) — **the standing
+    /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
     /// `consent:community_trust` grant for `node_key_id`**, as the attestation
     /// row's JSON, or `null`: lens-core's per-seal capture gate reads this.
     /// The fold: rows about the node, the latest admitted revocation is a
@@ -14647,7 +14647,7 @@ impl PyEngine {
         })
     }
 
-    /// v51.4.0 (CIRISPersist#950) — **mint this node's Signed Tree Head over a
+    /// v52.0.0 (CIRISPersist#950) — **mint this node's Signed Tree Head over a
     /// chunk-DAG file's stream** under the engine's local signer.
     /// `chunk_shas_hex` are the stream's chunk shas in `seq` order (a
     /// one-element list for an inline file); the STH covers the first

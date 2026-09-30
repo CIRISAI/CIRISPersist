@@ -1902,7 +1902,7 @@ pub mod test_support {
             .unwrap_or_else(|e| panic!("({tag}) #814: a self-report session claim admits: {e}"));
 
         // A stranger claiming about that occurrence is REFUSED and NOT STORED.
-        // v51.4.0 (CIRISPersist#946; CC 3.1.3.1) — the lease is bounded, read
+        // v52.0.0 (CIRISPersist#946; CC 3.1.3.1) — the lease is bounded, read
         // from the claim alone: no valid_until, a lease over a day, or a
         // valid_until before claimed_at is malformed on this family.
         for (label, from, secs, needle) in [

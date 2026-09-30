@@ -3869,7 +3869,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
         crate::federation::admission::check_session_self_report_admission(&row)?;
         // CC 3.3.1 — a `consent:community_trust` grant is the node's own and
-        // lists its owner at the grant's instant (v51.4.0, CIRISPersist#946).
+        // lists its owner at the grant's instant (v52.0.0, CIRISPersist#946).
         crate::federation::community_trust_consent::check_community_trust_grant_admission(
             self, &row,
         )

@@ -1,4 +1,4 @@
-//! v51.4.0 (CIRISPersist#946; CC 3.3.1) — **I148: the capture grant is the
+//! v52.0.0 (CIRISPersist#946; CC 3.3.1) — **I148: the capture grant is the
 //! node's own, names its owner at the grant's instant, and the fold treats a
 //! revocation as a boundary.** Memory, sqlite, postgres.
 

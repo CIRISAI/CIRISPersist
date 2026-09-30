@@ -1,4 +1,4 @@
-//! v51.4.0 (CIRISPersist#946; CC 3.3.1 `consent:community_trust`, the capture
+//! v52.0.0 (CIRISPersist#946; CC 3.3.1 `consent:community_trust`, the capture
 //! gate of the three-artifact trace-sharing chain) — **a node owner's
 //! standing grant that the node's sealed reasoning traces may be captured**
 //! for the community-trust plane, and the ONE fold that decides whether it

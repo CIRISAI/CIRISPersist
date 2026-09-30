@@ -6120,7 +6120,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
         crate::federation::admission::check_session_self_report_admission(&row)?;
         // CC 3.3.1 — a `consent:community_trust` grant is the node's own and
-        // lists its owner at the grant's instant (v51.4.0, CIRISPersist#946).
+        // lists its owner at the grant's instant (v52.0.0, CIRISPersist#946).
         crate::federation::community_trust_consent::check_community_trust_grant_admission(
             self, &row,
         )
@@ -19103,7 +19103,7 @@ async fn pg_load_stream_chunk_hashes(
             &sha_vec,
         )?);
     }
-    // v51.5.0 (#953) — no stream rows, and the id names an inline blob this
+    // v52.0.0 (#953) — no stream rows, and the id names an inline blob this
     // node holds: the log is that blob's one leaf.
     if out.is_empty() {
         if let Some(sha) = crate::federation::stream_sth::inline_blob_of_stream_id(stream_id) {

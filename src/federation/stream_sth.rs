@@ -64,7 +64,7 @@ pub fn log_id_for_stream(stream_id: &str) -> String {
     format!("{STREAM_LOG_ID_PREFIX}{stream_id}")
 }
 
-/// v51.5.0 (CIRISPersist#953) — **the stream id of an inline blob's log**:
+/// v52.0.0 (CIRISPersist#953) — **the stream id of an inline blob's log**:
 /// its SHA-256 as 64 lowercase hex. An inline blob has no stream rows; its
 /// log has ONE leaf, the blob's own sha, so `produce_stream_sth(local,
 /// &inline_blob_stream_id(&sha), &[sha], 1, t)` builds the STH that
@@ -75,7 +75,7 @@ pub fn inline_blob_stream_id(sha: &[u8; 32]) -> String {
     hex::encode(sha)
 }
 
-/// v51.5.0 (#953) — the inline blob a stream id names, if it has the one
+/// v52.0.0 (#953) — the inline blob a stream id names, if it has the one
 /// spelling [`inline_blob_stream_id`] produces (64 lowercase hex).
 #[must_use]
 pub fn inline_blob_of_stream_id(stream_id: &str) -> Option<[u8; 32]> {
@@ -91,7 +91,7 @@ pub fn inline_blob_of_stream_id(stream_id: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// v51.5.0 (#953) — **a stream id shaped like a SHA-256 is reserved for the
+/// v52.0.0 (#953) — **a stream id shaped like a SHA-256 is reserved for the
 /// inline blob it names.** The chunk floor refuses to write stream rows
 /// under one (either case), so no chunked stream can take an inline blob's
 /// log name and turn its one-leaf STH into an equivocation.
@@ -182,7 +182,7 @@ fn build_store(
     Ok(store)
 }
 
-/// v51.4.0 (CIRISPersist#950, for CIRISEdge#734) — **the per-stream STH
+/// v52.0.0 (CIRISPersist#950, for CIRISEdge#734) — **the per-stream STH
 /// producer.** The one place a Signed Tree Head over a chunk-DAG file's
 /// stream is minted: the RFC 6962 root over `chunk_shas` (the stream's
 /// `chunk_sha` values in `seq` order; the first `tree_size` of them are the

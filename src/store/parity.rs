@@ -176,7 +176,7 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v42.0.0 (CIRISPersist#814 part 5) — Gate: refuses a `session:*` row whose
     // attester is not the attested occurrence (CC 3.4.3 substrate-self-report).
     ("check_session_self_report_admission", Class::Gate),
-    // v51.4.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
+    // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
     // row whose grant shape or granter is not admissible. A statement about the input.
     ("check_community_trust_grant_admission", Class::Gate),
     // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose

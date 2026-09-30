@@ -1,4 +1,4 @@
-//! v51.4.0 (CIRISPersist#950; CIRISEdge#734) — **the per-stream STH producer
+//! v52.0.0 (CIRISPersist#950; CIRISEdge#734) — **the per-stream STH producer
 //! mints exactly what the anti-equivocation gate accepts.**
 //!
 //! - **I147** (sqlite, postgres) — a two-chunk commons stream; the engine's
@@ -9,12 +9,12 @@
 //!   by the producer; the producer's key is this node's derived key.
 //!   (The one-leaf STH here is a PREFIX of a chunked stream, not an inline
 //!   file: that shape was refused until I200.)
-//! - **I200** (v51.5.0, #953) — an inline blob's one-leaf log: the STH over
+//! - **I200** (v52.0.0, #953) — an inline blob's one-leaf log: the STH over
 //!   `[sha]` at `inline_blob_stream_id(sha)` is admitted, served, and proves
 //!   its leaf; two leaves, a blob this node does not hold, and the
 //!   uppercase spelling are refused; the chunk floor refuses a stream named
 //!   like a SHA-256 in either case.
-//! - **I201** (v51.5.0, #953) — a stored receipt lists with the
+//! - **I201** (v52.0.0, #953) — a stored receipt lists with the
 //!   `received_at` this node stored it at, and the plain listing is the same
 //!   receipts.
 

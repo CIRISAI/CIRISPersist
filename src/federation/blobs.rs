@@ -1511,7 +1511,7 @@ pub trait BlobStorage: Send + Sync {
     /// Persist does NOT sign stream STHs (unlike the audit log). Witness
     /// cosignatures are stored as-provided (default empty); Cut C1b does
     /// NOT enforce a cosign quorum (best-effort tier — CEG §10.5.1).
-    /// v51.4.0 (CIRISPersist#950) — **what the producer signs, and what is
+    /// v52.0.0 (CIRISPersist#950) — **what the producer signs, and what is
     /// refused by name.** The producer signs over the stream's chunk shas in
     /// `seq` order (the RFC 6962 root of the first `tree_size` leaves, CEG
     /// §10.5.1) — mint it with
@@ -1591,7 +1591,7 @@ pub trait BlobStorage: Send + Sync {
         Output = Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, BlobError>,
     > + Send;
 
-    /// v51.5.0 (CIRISPersist#953) — the same listing, each receipt with the
+    /// v52.0.0 (CIRISPersist#953) — the same listing, each receipt with the
     /// `received_at` this node stored it at. [`Self::list_delivery_receipts_for`]
     /// is this listing with the instants dropped.
     fn list_stored_delivery_receipts_for(
