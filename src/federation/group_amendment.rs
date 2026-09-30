@@ -552,7 +552,25 @@ where
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
     super::verify_community_admission(dir, &new).await?;
-    // v52.0.0 (#955, Q2) — an amendment never adds a member.
+    // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
+    // exception is a trust-root founders' amendment (#926 HIGH-3: its founder
+    // seats move ONLY through the record): a founder it seats signed that very
+    // version, and signing the record is consent (Q1) — no proposal, so no
+    // expiry to judge.
+    let mut allowed = super::membership_acceptance::supersede_allowed_members(
+        dir,
+        cohort,
+        &new.community.community_key_id,
+    )
+    .await?;
+    if super::canonical_community::is_trust_root_grade(&new.community) {
+        for signer in std::iter::once(new.authority_key_id.as_str())
+            .chain(new.cosignatures.iter().map(|c| c.authority_key_id.as_str()))
+        {
+            allowed.insert(signer.to_owned());
+            allowed.insert(super::admission::admission_identity_for_writer(dir, signer).await?);
+        }
+    }
     super::membership_acceptance::check_supersede_adds_no_member(
         &new.community.community_key_id,
         &new.community
@@ -560,12 +578,7 @@ where
             .iter()
             .map(|m| m.key_id.as_str())
             .collect::<Vec<_>>(),
-        &super::membership_acceptance::supersede_allowed_members(
-            dir,
-            cohort,
-            &new.community.community_key_id,
-        )
-        .await?,
+        &allowed,
     )?;
     // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — the supersede is gated as the
     // record it replaces was: an infrastructure record stays quorum:M/N with

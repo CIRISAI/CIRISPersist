@@ -27310,6 +27310,7 @@ mod accord_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::schema::{LlmCallStatus, ReasoningEventType, TraceLevel};
     use chrono::{TimeZone, Utc};
 
@@ -32927,6 +32928,10 @@ mod tests {
                 .unwrap();
             member_idents.push(*ident);
         }
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            &backend,
+        )
+        .await;
         backend
             .put_community(
                 crate::federation::tier_ingest::test_support::sign_community(
@@ -34157,7 +34162,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, "comm", carol_row, &admit)
+            .add_member_consented(Cohort::Affiliations, "comm", carol_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added);
@@ -35528,7 +35533,7 @@ mod tests {
             cosignatures: Vec::new(),
         };
         let err = backend
-            .add_family_member("fam", bob_row.clone(), &unsigned)
+            .add_family_member_consented("fam", bob_row.clone(), &unsigned)
             .await
             .expect_err("an unsigned family roster grow must be refused");
         assert!(
@@ -35547,7 +35552,7 @@ mod tests {
             },
         );
         backend
-            .add_family_member("fam", bob_row.clone(), &wrong)
+            .add_family_member_consented("fam", bob_row.clone(), &wrong)
             .await
             .expect_err("a signature over a different widening must not admit this one");
         assert_eq!(
@@ -35565,7 +35570,7 @@ mod tests {
         let admit =
             crate::federation::cohort::test_support::admit_family("alice", &fam_before, &bob_row);
         assert!(backend
-            .add_family_member("fam", bob_row, &admit)
+            .add_family_member_consented("fam", bob_row, &admit)
             .await
             .expect("signed roster grow"));
 
@@ -35622,7 +35627,7 @@ mod tests {
         // Idempotent admission: re-adding bob is a no-op, no duplicate row.
         assert!(
             !backend
-                .add_family_member(
+                .add_family_member_consented(
                     "fam",
                     crate::federation::types::FamilyMember {
                         key_id: "bob".into(),
@@ -46017,6 +46022,10 @@ mod tests {
             .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            backend,
+        )
+        .await;
         let policy = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
@@ -51219,7 +51228,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         )
         .await;
         assert!(backend
-            .add_community_member("addc-comm", cm("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", cm("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -51238,7 +51247,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         // Idempotent re-add (stale spec reused deliberately: the no-op returns
         // before the gate — nothing is written, so nothing to authorize).
         assert!(!backend
-            .add_community_member("addc-comm", cm("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", cm("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -51253,7 +51262,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         );
         // Unknown community.
         assert!(backend
-            .add_community_member("no-such", cm("addc-0"), &admit)
+            .add_community_member_consented("no-such", cm("addc-0"), &admit)
             .await
             .is_err());
     }
@@ -52267,17 +52276,22 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             persist_row_hash: String::new(),
         };
 
-        // v1: one member, admitted through the signed door.
+        // v1: two members (each co-signs the founding record — v52.0.0, #955
+        // Q1), admitted through the signed door.
         origin
-            .put_family(ts::sign_family(authority, mk(vec![m1], "founder_only")))
+            .put_family(ts::sign_family(authority, mk(vec![m1, m2], "founder_only")))
             .await
             .expect("651: the signed put admits");
 
         // SUPERSEDE to a DIFFERENT roster and a DIFFERENT protocol — both
-        // inside the signing preimage, so both are re-signed.
-        let v2 = ts::sign_family(authority, mk(vec![m1, m2], "unanimous"));
+        // inside the signing preimage, so both are re-signed. A contraction:
+        // a supersede never adds (#955 Q2).
+        let v2 = ts::sign_family(authority, mk(vec![m1], "unanimous"));
         let version = origin
-            .supersede_family(v2, Some(serde_json::json!({"membership_change": "add m2"})))
+            .supersede_family(
+                v2,
+                Some(serde_json::json!({"membership_change": "remove m2"})),
+            )
             .await
             .expect("651: the signed supersede admits");
         assert_eq!(version, 2, "supersede bumps the version");
@@ -52293,7 +52307,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             .family;
         assert_eq!(
             served.family.members.len(),
-            2,
+            1,
             "651: the served record must be the POST-supersede roster"
         );
         assert_eq!(

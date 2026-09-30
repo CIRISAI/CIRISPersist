@@ -747,7 +747,16 @@ pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
 ///   [`tests::declared_exceptions_are_still_unregistered`] fails once CC
 ///   registers it, forcing removal instead of letting a stale excuse outlive
 ///   its reason. It has now done that once, for real.
-pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[];
+pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[
+    // v52.0.0 (CIRISPersist#955) — `membership:` (proposal / acceptance /
+    // decline): the operator ruled on 2026-09-30 that nobody joins a family or
+    // community without their own signed acceptance, and the rows that carry
+    // it ship ahead of the CC text. CIRISConstitution#133 registers them; the
+    // re-vendor deletes this line (the test below fails until it does). NOT a
+    // staged family: a staged family refuses at federation tier, which would
+    // stop the proposal reaching its invitee.
+    "membership:",
+];
 
 /// **Staged families** `(stem, tracking ref)` — governed NOW, registered NOT
 /// YET, and the R2(b) refusal is the staging latch (CIRISPersist#754).
@@ -1093,6 +1102,11 @@ pub fn governed_family_stems() -> Vec<String> {
                 .iter()
                 .map(|f| family_stem(f).to_owned()),
         )
+        // v52.0.0 (CIRISPersist#955) — the membership rows' own rules and the
+        // growth gate every roster door runs.
+        .chain(std::iter::once(
+            super::membership_acceptance::MEMBERSHIP_FAMILY_STEM.to_owned(),
+        ))
         .filter(|s| !s.is_empty())
         .collect();
     stems.sort();
@@ -13150,6 +13164,14 @@ pub async fn check_no_moderator_federate_apply(
 ) -> Result<(), Error> {
     // Only federation-tier rows are a federation apply step.
     if row.tier != crate::federation::types::attestation_tier::FEDERATION {
+        return Ok(());
+    }
+    // v52.0.0 (CIRISPersist#955) — a membership proposal / acceptance /
+    // decline is part of ADMISSION to the group, the same act as the roster
+    // row it precedes (which this gate never judged): it is how a founder
+    // brings in the moderator the room lacks. Refusing it would make an
+    // unmoderated room unable ever to gain one.
+    if super::membership_acceptance::membership_row(row).is_some() {
         return Ok(());
     }
     // Collect every community reference the row carries (deduplicated —

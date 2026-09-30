@@ -644,3 +644,320 @@ pub fn reply_input(proposal: &Attestation, accept: bool) -> super::types::EmitAt
     input.attested_key_id = proposal.subject_key_ids.first().cloned();
     input
 }
+
+/// v52.0.0 (CIRISPersist#955) — fixtures for a member's consent: a proposal
+/// by one of the group's active founders (else the given signer) and the
+/// member's own acceptance, both hybrid-signed with the deterministic test
+/// signers and stored through the ordinary put door. Nothing here bypasses a
+/// gate: the growth that follows is still judged by the group's standing and
+/// by [`check_growth_accepted`].
+#[cfg(any(test, feature = "test-anchor"))]
+pub mod test_support {
+    use super::{ACCEPTANCE_DIMENSION, PROPOSAL_DIMENSION};
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{attestation_type, cohort_scope};
+    use crate::federation::{Attestation, Error, FederationDirectory, SignedAttestation};
+    use chrono::{DateTime, Duration, Utc};
+
+    fn ms(t: DateTime<Utc>) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms instant")
+    }
+
+    fn target_key(scope: &str) -> &'static str {
+        if scope == cohort_scope::FAMILY {
+            "family_key_id"
+        } else {
+            "community_key_id"
+        }
+    }
+
+    fn sealed(
+        signer: &str,
+        attested: &str,
+        scope: &str,
+        envelope: serde_json::Value,
+        at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+        subjects: Vec<String>,
+    ) -> Attestation {
+        let mut r = ts::bare_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            signer,
+            attested,
+            &envelope,
+        );
+        r.attestation_type = attestation_type::SCORES.into();
+        r.weight = None;
+        r.cohort_scope = scope.into();
+        r.asserted_at = ms(at);
+        r.scrub_timestamp = ms(at);
+        r.expires_at = expires_at.map(ms);
+        r.subject_key_ids = subjects;
+        ts::seal_row_in_place(signer, &mut r);
+        r
+    }
+
+    /// A proposal by `proposer` of `member` into `group` at `at` (30 days).
+    #[must_use]
+    pub fn proposal_row(
+        proposer: &str,
+        scope: &str,
+        group: &str,
+        member: &str,
+        role: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Attestation {
+        sealed(
+            proposer,
+            proposer,
+            scope,
+            serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "dimension": PROPOSAL_DIMENSION,
+                "group_kind": scope,
+                target_key(scope): group,
+                "role": role,
+            }),
+            at,
+            Some(at + Duration::seconds(super::MEMBERSHIP_PROPOSAL_MAX_TTL_SECS)),
+            vec![member.to_owned()],
+        )
+    }
+
+    /// `member`'s acceptance of `p` at `at`, signed by `member`.
+    #[must_use]
+    pub fn acceptance_row(member: &str, p: &Attestation, at: DateTime<Utc>) -> Attestation {
+        let scope = p.cohort_scope.clone();
+        sealed(
+            member,
+            member,
+            &scope,
+            serde_json::json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "dimension": ACCEPTANCE_DIMENSION,
+                "group_kind": scope,
+                target_key(&scope): p.attestation_envelope.get(target_key(&scope)).cloned(),
+                "references_attestation_id": p.attestation_id,
+                "proposal_hash": p.original_content_hash,
+                "role": p.attestation_envelope.get("role").cloned(),
+            }),
+            at,
+            None,
+            vec![],
+        )
+    }
+
+    async fn founder_of<D: FederationDirectory + ?Sized>(
+        d: &D,
+        scope: &str,
+        group: &str,
+    ) -> Result<Option<String>, Error> {
+        let founder = Some(crate::federation::admission::MEMBER_ROLE_FOUNDER);
+        Ok(if scope == cohort_scope::FAMILY {
+            d.active_family_members(group)
+                .await?
+                .into_iter()
+                .find(|m| m.role.as_deref() == founder)
+                .map(|m| m.key_id)
+        } else {
+            d.active_community_members(group)
+                .await?
+                .into_iter()
+                .find(|m| m.role.as_deref() == founder)
+                .map(|m| m.key_id)
+        })
+    }
+
+    /// **`member` consents to join `group` at `role`**: a proposal (by an
+    /// active founder, else `fallback_proposer`) and the member's acceptance,
+    /// both at `at`, stored in `d`.
+    pub async fn consent<D: FederationDirectory + ?Sized>(
+        d: &D,
+        scope: &str,
+        group: &str,
+        fallback_proposer: &str,
+        member: &str,
+        role: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        let proposer = founder_of(d, scope, group)
+            .await?
+            .unwrap_or_else(|| fallback_proposer.to_owned());
+        let p = proposal_row(&proposer, scope, group, member, role, at);
+        d.put_attestation(SignedAttestation {
+            attestation: p.clone(),
+        })
+        .await?;
+        d.put_attestation(SignedAttestation {
+            attestation: acceptance_row(member, &p, at),
+        })
+        .await
+        .map(|_| ())
+    }
+
+    fn report(r: Result<(), Error>) {
+        if let Err(e) = r {
+            eprintln!("membership_acceptance::test_support: consent not written: {e}");
+        }
+    }
+
+    /// Put a widening AFTER the member's consent: the fixture shape of the
+    /// real flow (proposal → acceptance → widening). The consent is written
+    /// best-effort — a fixture whose widening must be refused for another
+    /// reason (an unregistered member, a signer without standing) is still
+    /// refused by the door, by that reason or by the missing acceptance.
+    #[allow(async_fn_in_trait)]
+    pub trait ConsentedWidening {
+        /// `put_community_membership_widening`, consented first.
+        async fn put_community_membership_widening_consented(
+            &self,
+            w: crate::federation::SignedCommunityMembershipWidening,
+        ) -> Result<(), Error>;
+        /// `put_family_membership_widening`, consented first.
+        async fn put_family_membership_widening_consented(
+            &self,
+            w: crate::federation::SignedFamilyMembershipWidening,
+        ) -> Result<(), Error>;
+        /// `add_community_member`, consented first.
+        async fn add_community_member_consented(
+            &self,
+            group: &str,
+            member: crate::federation::types::CommunityMember,
+            spec: &crate::federation::cohort::AdmitSpec,
+        ) -> Result<bool, Error>;
+        /// `add_family_member`, consented first.
+        async fn add_family_member_consented(
+            &self,
+            group: &str,
+            member: crate::federation::types::FamilyMember,
+            spec: &crate::federation::cohort::AdmitSpec,
+        ) -> Result<bool, Error>;
+        /// `add_member`, consented first.
+        async fn add_member_consented(
+            &self,
+            cohort: crate::federation::Cohort,
+            group: &str,
+            member: crate::federation::RosterMember,
+            spec: &crate::federation::cohort::AdmitSpec,
+        ) -> Result<bool, Error>;
+    }
+
+    impl<T: FederationDirectory + ?Sized> ConsentedWidening for T {
+        async fn put_community_membership_widening_consented(
+            &self,
+            w: crate::federation::SignedCommunityMembershipWidening,
+        ) -> Result<(), Error> {
+            report(consent_community_widening(self, &w).await);
+            self.put_community_membership_widening(w).await
+        }
+        async fn put_family_membership_widening_consented(
+            &self,
+            w: crate::federation::SignedFamilyMembershipWidening,
+        ) -> Result<(), Error> {
+            report(consent_family_widening(self, &w).await);
+            self.put_family_membership_widening(w).await
+        }
+        async fn add_community_member_consented(
+            &self,
+            group: &str,
+            member: crate::federation::types::CommunityMember,
+            spec: &crate::federation::cohort::AdmitSpec,
+        ) -> Result<bool, Error> {
+            report(
+                consent(
+                    self,
+                    cohort_scope::COMMUNITY,
+                    group,
+                    &spec.authority_key_id,
+                    &member.key_id,
+                    member.role.as_deref(),
+                    member.joined_at,
+                )
+                .await,
+            );
+            self.add_community_member(group, member, spec).await
+        }
+        async fn add_family_member_consented(
+            &self,
+            group: &str,
+            member: crate::federation::types::FamilyMember,
+            spec: &crate::federation::cohort::AdmitSpec,
+        ) -> Result<bool, Error> {
+            report(
+                consent(
+                    self,
+                    cohort_scope::FAMILY,
+                    group,
+                    &spec.authority_key_id,
+                    &member.key_id,
+                    member.role.as_deref(),
+                    member.joined_at,
+                )
+                .await,
+            );
+            self.add_family_member(group, member, spec).await
+        }
+        async fn add_member_consented(
+            &self,
+            cohort: crate::federation::Cohort,
+            group: &str,
+            member: crate::federation::RosterMember,
+            spec: &crate::federation::cohort::AdmitSpec,
+        ) -> Result<bool, Error> {
+            let scope = if cohort == crate::federation::Cohort::Family {
+                cohort_scope::FAMILY
+            } else {
+                cohort_scope::COMMUNITY
+            };
+            report(
+                consent(
+                    self,
+                    scope,
+                    group,
+                    &spec.authority_key_id,
+                    &member.key_id,
+                    member.role.as_deref(),
+                    member.joined_at,
+                )
+                .await,
+            );
+            self.add_member(cohort, group, member, spec).await
+        }
+    }
+
+    /// [`consent`] for the member a signed community widening adds.
+    pub async fn consent_community_widening<D: FederationDirectory + ?Sized>(
+        d: &D,
+        w: &crate::federation::SignedCommunityMembershipWidening,
+    ) -> Result<(), Error> {
+        let r = &w.community_membership_widening;
+        consent(
+            d,
+            cohort_scope::COMMUNITY,
+            &r.community_key_id,
+            &w.authority_key_id,
+            &r.member_key_id,
+            r.role.as_deref(),
+            r.effective_at,
+        )
+        .await
+    }
+
+    /// [`consent`] for the member a signed family widening adds.
+    pub async fn consent_family_widening<D: FederationDirectory + ?Sized>(
+        d: &D,
+        w: &crate::federation::SignedFamilyMembershipWidening,
+    ) -> Result<(), Error> {
+        let r = &w.family_membership_widening;
+        consent(
+            d,
+            cohort_scope::FAMILY,
+            &r.family_key_id,
+            &w.authority_key_id,
+            &r.member_key_id,
+            r.role.as_deref(),
+            r.effective_at,
+        )
+        .await
+    }
+}

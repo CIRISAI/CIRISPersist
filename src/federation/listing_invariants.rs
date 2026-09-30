@@ -20,6 +20,7 @@ pub mod bodies {
         LISTED_PUBLIC, LISTED_RULE_BAD_VALUE, LISTED_RULE_NOT_SELF_ASSERTED,
         LISTED_RULE_SCOPE_INVALID,
     };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::room_roster_authority_invariants::bodies::make_group;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
@@ -64,7 +65,7 @@ pub mod bodies {
         t: &str,
         role: Option<&str>,
     ) {
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             signer,
             CommunityMembershipWidening {
                 community_key_id: room.to_owned(),

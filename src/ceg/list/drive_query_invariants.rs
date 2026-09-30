@@ -27,31 +27,54 @@ pub mod bodies {
     where
         B: crate::federation::FederationDirectory + Sync,
     {
+        let signed: Vec<(&str, &str)> = members.iter().map(|m| (*m, *m)).collect();
+        seed_room_signed(b, comm, &signed).await;
+    }
+
+    /// [`seed_room`] where a member's key carries another label's pubkeys
+    /// (an aliased registration): `(member, signing_label)`. v52.0.0 (#955,
+    /// Q1) — each founding member co-signs the record with its own keys.
+    pub async fn seed_room_signed<B>(b: &B, comm: &str, members_signed: &[(&str, &str)])
+    where
+        B: crate::federation::FederationDirectory + Sync,
+    {
         use crate::federation::{Community, CommunityMember};
+        let members: Vec<&str> = members_signed.iter().map(|(m, _)| *m).collect();
         let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
         ts::register_identity_key(b, comm, crate::federation::types::identity_type::USER).await;
-        b.put_community(ts::sign_community(
-            comm,
-            Community {
-                community_key_id: comm.to_owned(),
-                community_name: "Room".into(),
-                members: members
-                    .iter()
-                    .map(|m| CommunityMember {
-                        key_id: (*m).to_owned(),
-                        joined_at: at("2026-06-01T00:00:00Z"),
-                        role: None,
-                    })
-                    .collect(),
-                founded_at: at("2026-06-01T00:00:00Z"),
-                consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
-                    .to_owned(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("I144 room {comm}: {e}"));
+        let community = Community {
+            community_key_id: comm.to_owned(),
+            community_name: "Room".into(),
+            members: members
+                .iter()
+                .map(|m| CommunityMember {
+                    key_id: (*m).to_owned(),
+                    joined_at: at("2026-06-01T00:00:00Z"),
+                    role: None,
+                })
+                .collect(),
+            founded_at: at("2026-06-01T00:00:00Z"),
+            consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.to_owned(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        let envelope = community.signing_envelope();
+        let mut signed = ts::sign_community(comm, community);
+        signed.cosignatures = members_signed
+            .iter()
+            .filter(|(m, _)| *m != comm)
+            .map(|(m, label)| {
+                let (_h, classical, pqc) = ts::sign_envelope(label, &envelope);
+                crate::federation::types::RosterCosignature {
+                    authority_key_id: (*m).to_owned(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                }
+            })
+            .collect();
+        b.put_community(signed)
+            .await
+            .unwrap_or_else(|e| panic!("I144 room {comm}: {e}"));
     }
 
     /// Seed one scoped attestation row through the local put door.

@@ -12219,6 +12219,7 @@ mod accord_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::schema::CompleteTrace;
     use crate::schema::{ComponentType, SchemaVersion, TraceLevel};
     use crate::store::decompose::decompose;
@@ -18784,6 +18785,10 @@ mod tests {
             .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            backend,
+        )
+        .await;
         let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
@@ -19282,7 +19287,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, group, joiner_row, &admit)
+            .add_member_consented(Cohort::Affiliations, group, joiner_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added, "genuine add returns true");
@@ -20591,7 +20596,7 @@ mod tests {
         )
         .await;
         assert!(backend
-            .add_community_member("addc-comm", member("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -20612,7 +20617,7 @@ mod tests {
         // BEFORE the gate, because nothing is written and there is nothing to
         // authorize (CIRISPersist#654).
         assert!(!backend
-            .add_community_member("addc-comm", member("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -20630,7 +20635,7 @@ mod tests {
         // is no stored roster to have signed over).
         assert!(matches!(
             backend
-                .add_community_member("no-such-comm", member("addc-2"), &admit)
+                .add_community_member_consented("no-such-comm", member("addc-2"), &admit)
                 .await
                 .unwrap_err(),
             crate::federation::Error::UnstewardedCommunityMember { .. }

@@ -307,3 +307,5 @@ sqlite	159	lineage_head_cosigns	1773651349682845568
 postgres	159	lineage_head_cosigns	8951756672550208017
 sqlite	160	manifest_children_and_stream_abandon	11224047662985470837
 postgres	160	manifest_children_and_stream_abandon	1121282349503895701
+sqlite	162	family_cosignatures	16404834741622517764
+postgres	162	family_cosignatures	5611462457761447786

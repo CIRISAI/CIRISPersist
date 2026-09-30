@@ -21,6 +21,7 @@ pub mod bodies {
         INFRA_RULE_NODE_BEARING_FOUNDER, INFRA_RULE_PROTOCOL_NOT_QUORUM,
         MAX_MODERATION_DELEGATION_DEPTH,
     };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         attestation_type, identity_type as it, Community, CommunityMember,
@@ -170,7 +171,7 @@ pub mod bodies {
         member: &str,
         t: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Error> {
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             signer,
             widening_at(room, member, t),
         ))
@@ -267,7 +268,7 @@ pub mod bodies {
         ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: H1 — the human is still a founder: {e}"));
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             &human,
             CommunityMembershipWidening {
                 community_key_id: room.clone(),
@@ -417,7 +418,7 @@ pub mod bodies {
             persist_row_hash: String::new(),
         };
         let err = d
-            .put_community_membership_widening(ts::sign_community_membership_widening(
+            .put_community_membership_widening_consented(ts::sign_community_membership_widening(
                 &human,
                 w("founder"),
             ))
@@ -428,7 +429,7 @@ pub mod bodies {
             INFRA_RULE_NODE_BEARING_FOUNDER,
             "{err}"
         );
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             &human,
             w("member"),
         ))
@@ -816,6 +817,10 @@ pub mod bodies {
         // so `quorum:1/1` over three founders would let one of them admit
         // alone, and `quorum:2/3` over two would demand a founder who is not
         // there.
+        // v52.0.0 (#955, Q1) — founding members co-sign, so they are keys.
+        for f in [format!("f2-{tag}"), format!("f3-{tag}")] {
+            ts::register_hybrid_key_as(d, &f, &f, it::USER).await;
+        }
         let three = vec![
             seat(&human, "founder"),
             seat(&format!("f2-{tag}"), "founder"),
@@ -1095,9 +1100,9 @@ pub mod bodies {
         let mut founder = widening_at(&room, &h4, ago(40));
         founder.role = Some("founder".into());
         let err = d
-            .put_community_membership_widening(by_two(ts::sign_community_membership_widening(
-                &h1, founder,
-            )))
+            .put_community_membership_widening_consented(by_two(
+                ts::sign_community_membership_widening(&h1, founder),
+            ))
             .await
             .expect_err("adding a founder would leave N stale");
         assert_eq!(
@@ -1105,10 +1110,9 @@ pub mod bodies {
             crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
             "{err}"
         );
-        d.put_community_membership_widening(by_two(ts::sign_community_membership_widening(
-            &h1,
-            widening_at(&room, &m, ago(30)),
-        )))
+        d.put_community_membership_widening_consented(by_two(
+            ts::sign_community_membership_widening(&h1, widening_at(&room, &m, ago(30))),
+        ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: a plain member is admitted: {e}"));
         let removal = |signer: &String, t| {

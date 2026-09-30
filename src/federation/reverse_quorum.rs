@@ -3839,6 +3839,7 @@ mod tests {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
     use crate::federation::types::{attestation_tier, attestation_type, CommunityMember};
     use crate::federation::{Community, SignedAttestation};
@@ -4336,10 +4337,10 @@ pub(crate) mod test_support {
             }
             s
         };
-        dir.put_community_membership_widening(widen(&[&bob]))
+        dir.put_community_membership_widening_consented(widen(&[&bob]))
             .await
             .expect_err("an addition is never 1-of-N");
-        dir.put_community_membership_widening(widen(&[&bob, &dave, &erin]))
+        dir.put_community_membership_widening_consented(widen(&[&bob, &dave, &erin]))
             .await
             .unwrap_or_else(|e| panic!("({suffix}) I181: three of five admit an addition: {e}"));
         assert!(active().await.contains(&frank), "({suffix}) I181");
@@ -4952,7 +4953,7 @@ pub(crate) mod test_support {
                     dir, &community, &member,
                 )
                 .await;
-            dir.add_community_member(&community, member, &spec)
+            dir.add_community_member_consented(&community, member, &spec)
                 .await
                 .expect("grow the commons");
         }

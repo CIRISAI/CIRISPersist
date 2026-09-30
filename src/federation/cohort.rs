@@ -48,6 +48,7 @@ use super::types;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod test_support {
     use super::{types, AdmitSpec};
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
 
     /// The [`AdmitSpec`] for adding `member` to `family`, hybrid-signed by
     /// `authority_key_id`'s deterministic test keypair over the family
@@ -237,7 +238,7 @@ pub mod test_support {
             role: None,
         };
         let err = directory
-            .add_family_member(&fam, member.clone(), &unsigned)
+            .add_family_member_consented(&fam, member.clone(), &unsigned)
             .await
             .expect_err("(1) an unsigned family roster grow must be refused");
         assert!(
@@ -256,7 +257,7 @@ pub mod test_support {
         )
         .await;
         directory
-            .add_family_member(&fam, member.clone(), &wrong)
+            .add_family_member_consented(&fam, member.clone(), &wrong)
             .await
             .expect_err("(2) a signature over a different widening must not admit this one");
         assert_eq!(
@@ -271,7 +272,9 @@ pub mod test_support {
         );
         let admit = admit_family_via(directory, &seated, &fam, &member).await;
         assert!(
-            directory.add_family_member(&fam, member, &admit).await?,
+            directory
+                .add_family_member_consented(&fam, member, &admit)
+                .await?,
             "({tag}) the signed grow is a genuine add"
         );
         let signed_fam = directory
@@ -326,7 +329,7 @@ pub mod test_support {
             role: None,
         };
         directory
-            .add_community_member(&comm, member.clone(), &unsigned)
+            .add_community_member_consented(&comm, member.clone(), &unsigned)
             .await
             .expect_err("(1) an unsigned community roster grow must be refused");
         let wrong = admit_community_via(
@@ -341,7 +344,7 @@ pub mod test_support {
         )
         .await;
         directory
-            .add_community_member(&comm, member.clone(), &wrong)
+            .add_community_member_consented(&comm, member.clone(), &wrong)
             .await
             .expect_err("(2) a signature over a different widening must not admit this one");
         assert_eq!(
@@ -357,7 +360,7 @@ pub mod test_support {
         let admit = admit_community_via(directory, &seated, &comm, &member).await;
         assert!(
             directory
-                .add_community_member(&comm, member, &admit)
+                .add_community_member_consented(&comm, member, &admit)
                 .await?,
             "({tag}) the signed grow is a genuine add"
         );

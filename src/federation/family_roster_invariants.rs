@@ -13,6 +13,7 @@
 #[cfg(test)]
 pub mod bodies {
     use crate::federation::cohort::Cohort;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         consensus_protocol, identity_type, Family, FamilyMember, FamilyMembershipRevocation,
@@ -125,7 +126,7 @@ pub mod bodies {
         for c in &signers[1..] {
             ts::cosign_family_membership_widening(&mut s, c);
         }
-        d.put_family_membership_widening(s).await
+        d.put_family_membership_widening_consented(s).await
     }
 
     /// A revocation signed by `signers[0]` and co-signed by the rest.
@@ -215,7 +216,7 @@ pub mod bodies {
             .unwrap()
         {
             if w.widening.family_membership_widening.family_key_id == fam {
-                b.put_family_membership_widening(w.widening)
+                b.put_family_membership_widening_consented(w.widening)
                     .await
                     .unwrap_or_else(|e| panic!("B must admit A's served widening: {e}"));
             }
@@ -276,13 +277,15 @@ pub mod bodies {
         };
         let spec = ts::family_widening_admit_spec(alice, &fam, &carol_row);
         assert!(
-            a.add_family_member(&fam, carol_row.clone(), &spec)
+            a.add_family_member_consented(&fam, carol_row.clone(), &spec)
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I177: the founder widens carol: {e}")),
             "{tag} I177: a genuine add"
         );
         assert!(
-            !a.add_family_member(&fam, carol_row, &spec).await.unwrap(),
+            !a.add_family_member_consented(&fam, carol_row, &spec)
+                .await
+                .unwrap(),
             "{tag} I177: the same row again is the idempotent no-op"
         );
         assert_eq!(
@@ -458,7 +461,7 @@ pub mod bodies {
         };
         let spec = ts::family_widening_admit_spec(&k[0], &fo, &promote);
         assert!(
-            d.add_family_member(&fo, promote.clone(), &spec)
+            d.add_family_member_consented(&fo, promote.clone(), &spec)
                 .await
                 .unwrap_or_else(|e| panic!("{tag} I179: the founder promotes bob: {e}")),
             "{tag} I179 (#910.4): a role change is a genuine change"
@@ -469,7 +472,9 @@ pub mod bodies {
         };
         let spec = ts::family_widening_admit_spec(&k[0], &fo, &again);
         assert!(
-            !d.add_family_member(&fo, again, &spec).await.unwrap(),
+            !d.add_family_member_consented(&fo, again, &spec)
+                .await
+                .unwrap(),
             "{tag} I179 (#910.4): the same role again is the no-op"
         );
         assert_eq!(
@@ -582,7 +587,7 @@ pub mod bodies {
         };
         let alone = ts::family_widening_admit_spec(&l[0], &lm, &row);
         let e = d
-            .add_family_member(&lm, row.clone(), &alone)
+            .add_family_member_consented(&lm, row.clone(), &alone)
             .await
             .expect_err("add_family_member is judged by the protocol");
         assert_eq!(
@@ -592,7 +597,10 @@ pub mod bodies {
         );
         let quorum = ts::family_widening_admit_spec_by_consensus(d, &lm, &row).await;
         assert_eq!(quorum.cosignatures.len(), 1, "{tag}: two of three sign");
-        assert!(d.add_family_member(&lm, row, &quorum).await.unwrap());
+        assert!(d
+            .add_family_member_consented(&lm, row, &quorum)
+            .await
+            .unwrap());
         assert!(active(d, &lm).await.contains(&newbie), "{tag} I179");
 
         // #910.2 — verify_membership_quorum's prior roster is the FOLD. q3 is

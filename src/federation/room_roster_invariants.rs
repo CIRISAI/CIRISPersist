@@ -13,6 +13,7 @@
 pub mod bodies {
     use crate::federation::blobs::BlobStorage;
     use crate::federation::community_dek::lifecycle_support as dek;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::operational::test_support as ops;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
@@ -306,7 +307,7 @@ pub mod bodies {
         };
         let spec = ts::widening_admit_spec(&alice, &room, &member);
         let added = a
-            .add_community_member(&room, member.clone(), &spec)
+            .add_community_member_consented(&room, member.clone(), &spec)
             .await
             .unwrap_or_else(|e| panic!("{tag} I164: widen on A: {e}"));
         assert!(added, "{tag} I164: a new row");
@@ -315,7 +316,7 @@ pub mod bodies {
             vec![alice.clone(), bob.clone(), carol.clone()]
         );
         assert!(
-            !a.add_community_member(&room, member.clone(), &spec)
+            !a.add_community_member_consented(&room, member.clone(), &spec)
                 .await
                 .unwrap(),
             "{tag} I164: the byte-identical row is a no-op"
@@ -334,7 +335,7 @@ pub mod bodies {
             cosignatures: Vec::new(),
         };
         assert!(
-            !a.add_community_member(&room, member.clone(), &empty)
+            !a.add_community_member_consented(&room, member.clone(), &empty)
                 .await
                 .unwrap_or_else(|e| panic!(
                     "{tag} #936: an unsigned exact retry must be the idempotent no-op, got {e}"
@@ -351,7 +352,7 @@ pub mod bodies {
             role: None,
         };
         assert!(
-            !a.add_community_member(
+            !a.add_community_member_consented(
                 &room,
                 later.clone(),
                 &ts::widening_admit_spec(&alice, &room, &later)
@@ -375,7 +376,7 @@ pub mod bodies {
             role: None,
         };
         assert!(
-            !a.add_community_member(
+            !a.add_community_member_consented(
                 &room,
                 bob_again.clone(),
                 &ts::widening_admit_spec(&alice, &room, &bob_again)
@@ -405,7 +406,7 @@ pub mod bodies {
             resume_id.contains(&carol),
             "{tag} I164: the resume id names the member"
         );
-        b.put_community_membership_widening(served[0].widening.clone())
+        b.put_community_membership_widening_consented(served[0].widening.clone())
             .await
             .unwrap_or_else(|e| panic!("{tag} I164: the widening applies on B: {e}"));
         assert_eq!(
@@ -444,7 +445,7 @@ pub mod bodies {
             cosignatures: Vec::new(),
         };
         let err = a
-            .add_community_member(&room, dave_member, &stale_spec)
+            .add_community_member_consented(&room, dave_member, &stale_spec)
             .await
             .expect_err("I164: a scrub over the grown record is not a scrub over the widening");
         assert!(
@@ -480,8 +481,14 @@ pub mod bodies {
             };
             for (kind, n) in events {
                 match (kind, n) {
-                    ("w", 1) => d.put_community_membership_widening(w1.clone()).await,
-                    ("w", 3) => d.put_community_membership_widening(w3.clone()).await,
+                    ("w", 1) => {
+                        d.put_community_membership_widening_consented(w1.clone())
+                            .await
+                    }
+                    ("w", 3) => {
+                        d.put_community_membership_widening_consented(w3.clone())
+                            .await
+                    }
                     ("r", 2) => d.put_community_membership_revocation(r2.clone()).await,
                     _ => d.put_community_membership_revocation(r4.clone()).await,
                 }
@@ -628,7 +635,7 @@ pub mod bodies {
             joined_at: at("2026-03-01T00:00:00Z"),
             role: Some(MEMBER_ROLE_FOUNDER.into()),
         };
-        d.add_community_member(
+        d.add_community_member_consented(
             &room,
             member.clone(),
             &ts::widening_admit_spec(&alice, &room, &member),
@@ -701,7 +708,7 @@ pub mod bodies {
         ))
         .await
         .unwrap();
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             &alice,
             widening(&room, &bob, t2),
         ))

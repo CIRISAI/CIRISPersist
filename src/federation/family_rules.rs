@@ -801,6 +801,10 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
                 // refusal (`check_licensure_delegator_is_authority`), read at
                 // the const the fold and the gate share.
                 crate::federation::licensure::LICENSURE_DIMENSION_PREFIX,
+                // v52.0.0 (CIRISPersist#955) — persist rules on `membership:`:
+                // the proposal / acceptance / decline row rules and the growth
+                // gate every roster door runs.
+                crate::federation::membership_acceptance::MEMBERSHIP_FAMILY_STEM,
             ]
             .into_iter()
             .map(str::to_owned),
