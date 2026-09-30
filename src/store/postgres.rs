@@ -311,6 +311,17 @@ impl PostgresBackend {
         community: crate::federation::SignedCommunity,
         door: crate::federation::CommunityDoor,
     ) -> Result<crate::federation::group_amendment::CommunityWrite, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Community,
+            &community,
+        )
+        .await?
+        {
+            return Ok(crate::federation::group_amendment::CommunityWrite::Unchanged);
+        }
         // Test-only (PR #921 review, F3): a rival write that won the race
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
@@ -4834,6 +4845,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Key,
+            &record,
+        )
+        .await?
+        {
+            return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
+        }
         PostgresBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -5705,6 +5727,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             crate::federation::SubjectGate::Ingest,
         )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held federation-tier row
+        // settles here: AHEAD of the per-peer quota (a duplicate did no work
+        // and must not spend the sender's budget) and of every verify. Only
+        // an index hit that resolves to a byte-identical held row settles; an
+        // oversized or otherwise inadmissible row is never held, so it misses
+        // and meets the pure gates below exactly as before.
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION
+            && crate::federation::replication_policy::settle_if_held(
+                self,
+                crate::federation::replication_policy::EnvelopeKind::Attestation,
+                &row,
+            )
+            .await?
+        {
+            return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+        }
         if !row.attesting_key_id.is_empty() {
             // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
             // quota. It LEADS the state-consulting checks because it is the
@@ -7558,6 +7596,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Revocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         let mut row = revocation.revocation;
         // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
         // envelope is stored as the JCS bytes its scrub signature and
@@ -7777,6 +7826,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrence,
+            &occurrence,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
         // producer envelope + signer authority + C4 BEFORE any write (one gate,
         // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
@@ -8177,6 +8237,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Family,
+            &family,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
@@ -9418,6 +9489,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
         // write (the revocation-plane mirror of the #418 occurrence gate).
         crate::federation::admission::verify_signed_identity_occurrence_revocation(
@@ -9570,6 +9652,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
@@ -9677,6 +9770,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step. THE worst-case E4 hole: an unverified
         // removal here rotates the community DEK epoch below — an
@@ -9910,6 +10014,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedCommunityMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipWidening,
+            &widening,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
         // door; see the sqlite twin for the legs.
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
@@ -10031,6 +10146,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipWidening,
+            &widening,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v49.0.0 (CIRISPersist#910) — the family twin of the room's widening
         // door; see the sqlite twin for the legs.
         crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
@@ -10116,6 +10242,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         listing: crate::federation::SignedCommunityMembershipListing,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipListing,
+            &listing,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
         // insert; see the sqlite twin.
         crate::federation::listing::check_community_membership_listing(self, &listing).await?;
@@ -10528,6 +10665,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::LocationProof,
+            &proof,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_location_proof_admission(self, &proof).await?;
@@ -10855,6 +11003,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: &crate::federation::SignedTransportDestination,
     ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::TransportDestination,
+            signed,
+        )
+        .await?
+        {
+            return Ok(
+                crate::federation::self_at_login::TransportDestinationApplyOutcome::Unchanged,
+            );
+        }
         use crate::federation::TransportDestinationApplyOutcome as Outcome;
         // #443 — the admission gate BEFORE any write (one gate, all backends).
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
@@ -11619,6 +11780,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedOrganization,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Organization,
+            &signed.organization,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let mut row = signed.organization;
         operational::check_skew_and_payment(
@@ -11696,6 +11868,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedOrgMembership,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::OrgMembership,
+            &signed.org_membership,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let mut row = signed.org_membership;
         operational::check_skew_and_payment(
@@ -11771,6 +11954,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedPartnerRecord,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::PartnerRecord,
+            &signed,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         operational::check_skew_and_payment(
             signed.partner_record.asserted_at,

@@ -139,6 +139,9 @@ pub mod family_roster_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
+/// v52.0.0 (CIRISPersist#672) — I230–I235: the held-record settle.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod held_settle_invariants;
 /// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
 #[cfg(test)]
 pub mod listing_invariants;

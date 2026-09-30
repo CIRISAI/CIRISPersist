@@ -183,6 +183,12 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
     // row whose grant shape or granter is not admissible. A statement about the input.
     ("check_community_trust_grant_admission", Class::Gate),
+    // v52.0.0 (CIRISPersist#672) — Plumbing: the held-record settle. Its `?`
+    // propagates only a serialization failure (the substrate's own terms); a
+    // lookup error falls through to the full apply, and a settle returns early
+    // only for a byte-identical row this node already admitted, so it refuses
+    // nothing and admits nothing new.
+    ("settle_if_held", Class::Plumbing),
     // v52.0.0 — Gate: refuses a binding_provenance token that is neither
     // `rooted` nor `advisory` (it read `Rooted` until v52: fail-open).
     ("from_token", Class::Gate),
