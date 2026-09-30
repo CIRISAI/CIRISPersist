@@ -14624,6 +14624,121 @@ impl PyEngine {
         })
     }
 
+    /// v51.3.0 (CIRISPersist#947) — **the chunk list of a sealed DAG this node
+    /// holds**, opened as `viewer_key_id` under the same authorization as
+    /// `read_blob_as` (`caller_aad_b64` as there; `blob_not_granted` for a
+    /// stranger). Returns JSON `{"sha256_hex", "storage_kind": "inline" |
+    /// "chunk_dag", "tier", "stream_id", "total_size", "chunks": [{"sha256_hex",
+    /// "size", "seq"}, …], "inline_bytes_cap", "whole_read_cap_bytes",
+    /// "max_chunks"}`. The puller fetches each chunk by `sha256_hex`, adopts
+    /// it with `adopt_sealed_chunk_json` at `(stream_id, seq)` with
+    /// `plaintext_size = size`, then calls `promote_adopted_manifest_to_dag_json`.
+    /// A plaintext row, a sealed whole blob or a v1 manifest raises
+    /// `ValueError` naming which.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, caller_aad_b64=None))]
+    fn open_sealed_manifest_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let view = runtime
+                    .block_on(async move {
+                        engine
+                            .open_sealed_manifest_as(&sha, &viewer, aad.as_deref())
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&view).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v51.3.0 (CIRISPersist#947) — **finish a sealed DAG adopt.**
+    /// `adopt_sealed_blob_json` stores a received sealed manifest as an inline
+    /// envelope; until this runs, `read_blob_as` on that address returns the
+    /// manifest JSON, not the file. Opens the manifest as `viewer_key_id`
+    /// (`caller_aad_b64` as `read_blob_as`), requires every chunk it names to
+    /// be held at `(stream_id, seq)` with the named sha, size and tier
+    /// (`ValueError` naming the first missing `(seq, sha)`), and flips the row
+    /// to a `chunk_dag`. Returns JSON `{"sha256_hex", "promoted": true|false,
+    /// "chunk_count", "total_size"}`; `promoted: false` means it already was.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, caller_aad_b64=None))]
+    fn promote_adopted_manifest_to_dag_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let out = runtime
+                    .block_on(async move {
+                        engine
+                            .promote_adopted_manifest_to_dag(&sha, &viewer, aad.as_deref())
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&out).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
+    /// announce its manifest** (`holds_bytes`, this node's claim), so a
+    /// pulled commons DAG is not a silent holder. Payload: the
+    /// `put_blob_chunks_json` payload plus `"author_key_id"` (whose content
+    /// this is). Returns JSON `{"manifest_sha256": "<hex>", "announced": true}`.
+    fn put_blob_chunks_signing_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let mut v: serde_json::Value = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("put_blob_chunks_signing_json decode: {e}"))
+            })?;
+            let author = v
+                .as_object_mut()
+                .and_then(|o| o.remove("author_key_id"))
+                .and_then(|a| a.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "put_blob_chunks_signing_json: payload needs \"author_key_id\"",
+                    )
+                })?;
+            let (manifest, chunks) = parse_put_blob_chunks_payload(&v.to_string())?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(async move {
+                        engine
+                            .put_blob_chunks_signing(manifest, chunks, &author)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(
+                    serde_json::json!({ "manifest_sha256": hex::encode(sha), "announced": true })
+                        .to_string(),
+                )
+            })
+        })
+    }
+
     /// #846 (`BLOB_REPLICATION.md` §6.3) — **the WILL decision as a door**,
     /// asked before a fetch: would this node hold content with this
     /// provenance, now? Writes nothing. Payload JSON is the provenance

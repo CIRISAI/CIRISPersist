@@ -28,7 +28,7 @@ pub(crate) mod bodies {
 
     /// Bind `occurrence` (a node key) as an active occurrence of `identity`
     /// on `d`, with `kem` as its content-KEM keys.
-    async fn bind(
+    pub(crate) async fn bind(
         d: &dyn FederationDirectory,
         identity: &str,
         occurrence: &str,

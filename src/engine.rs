@@ -5486,6 +5486,138 @@ impl Engine {
         }
     }
 
+    /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the chunk
+    /// list of a sealed DAG this node holds**, opened for `viewer_key_id`
+    /// under the same authorization as [`read_blob_as`](Self::read_blob_as)
+    /// (`caller_aad` as there). For the puller: fetch each chunk by its
+    /// `sha256_hex`, adopt it at `(stream_id, seq)` with `size` through
+    /// [`adopt_sealed_chunk`](Self::adopt_sealed_chunk), then
+    /// [`promote_adopted_manifest_to_dag`](Self::promote_adopted_manifest_to_dag).
+    /// The three caps let the puller bound the work before it fetches.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn open_sealed_manifest_as(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::SealedManifestView,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::open_sealed_manifest_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                open_sealed_manifest_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                open_sealed_manifest_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the sealed
+    /// DAG adopt's second half.** [`adopt_sealed_blob`](Self::adopt_sealed_blob)
+    /// stores a received sealed manifest as an inline envelope (it never opens
+    /// one); until this door runs, a read of that address returns the
+    /// manifest JSON, not the file. Opens the manifest as `viewer_key_id`,
+    /// requires every chunk it names to be held at `(stream_id, seq)` with
+    /// the named sha, size and tier, and flips the row to a `chunk_dag`, after
+    /// which [`read_blob_as`](Self::read_blob_as) and the range read serve the
+    /// file. Idempotent.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn promote_adopted_manifest_to_dag(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::DagPromotion,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::promote_adopted_manifest_to_dag;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                promote_adopted_manifest_to_dag(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                promote_adopted_manifest_to_dag(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
+    /// announce it**: [`put_blob_chunks`](crate::federation::BlobStorage::put_blob_chunks)
+    /// (every chunk verified against the manifest), then the manifest's
+    /// `holds_bytes` claim through [`put_blob_signing`](Self::put_blob_signing)
+    /// — the shape `seal_stream_scoped` uses for a commons stream at the
+    /// origin, so a pulled commons DAG is not a silent holder. `author_key_id`
+    /// is whose content this is (the proxy decision); the claim is this
+    /// node's. Returns the manifest's address.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_blob_chunks_signing(
+        &self,
+        manifest: crate::federation::ChunkManifest,
+        chunks: Vec<([u8; 32], crate::federation::BlobBody)>,
+        author_key_id: &str,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        use sha2::Digest as _;
+        let jcs = manifest.to_jcs_bytes();
+        let sha256: [u8; 32] = sha2::Sha256::digest(&jcs).into();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.put_blob_chunks(manifest, chunks).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.put_blob_chunks(manifest, chunks).await?,
+        }
+        // The row exists; the signing floor's insert is a no-op on conflict and
+        // the attestation is what this adds.
+        self.put_blob_signing(
+            &sha256,
+            crate::federation::BlobBody::Inline(jcs),
+            None,
+            author_key_id,
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await?;
+        Ok(sha256)
+    }
+
     /// #846 (`BLOB_REPLICATION.md` §6.2, I50) — **adopt one sealed chunk** of
     /// a stream at `(stream_id, seq)`: the same steps as
     /// [`adopt_sealed_blob`](Self::adopt_sealed_blob), then the chunk floor

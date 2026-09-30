@@ -7,6 +7,32 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [51.3.0] - UNRELEASED
+
+**MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.
+
+### Fixed — a second device reads a sealed chunk-DAG as the file, not as its manifest (CIRISPersist#947)
+Since edge v33 every self file whose sealed size crosses 1 MiB is a sealed DAG. The holder serves the manifest's address as an inline envelope, and the receiver's only door, `adopt_sealed_blob`, stores every received envelope as `storage_kind = 'inline'` (it never opens one, I45) — so on the owner's second device `read_blob_as` took the inline branch and returned the manifest JSON as the file (CIRISServer measured 518 / 610 / 9,529 bytes served for 1 MiB and 24 MiB files). Adopting every chunk beside it changed nothing: no door turned the row into a DAG, and the receive-side witness (I143) read chunks by position, never the file through its manifest.
+
+- **`Engine::open_sealed_manifest_as(sha, viewer, caller_aad)`** (pyo3 `open_sealed_manifest_json(sha_hex, viewer, caller_aad_b64=None)`; ask 2): the chunk list of a sealed DAG this node holds — `{sha, size, seq}` per chunk, `stream_id`, `total_size`, the row's current `storage_kind`, and the three bounds the puller checks before it fetches (`inline_bytes_cap`, `whole_read_cap_bytes`, `max_chunks`). Authorized exactly as `read_blob_as` (a stranger is `NotGranted` and learns nothing; a withdrawn blob refuses). A plaintext row, a sealed whole blob or a v1 manifest is `InvalidArgument`, named — which is ask 4 by another route: the envelope's header shows nothing without decrypting, so the answer comes from the opened bytes, to an authorized viewer.
+- **`Engine::promote_adopted_manifest_to_dag(sha, viewer, caller_aad)`** (pyo3 `promote_adopted_manifest_to_dag_json`; ask 1, the "adopt the manifest after its chunks" shape): opens the held manifest as the viewer, requires every chunk it names to be held under the manifest's `stream_id` at its `seq` with the named sha, plaintext size and tier (the checks `prepare_chunk_rows` makes for a plaintext DAG, made against the adopted chunk ROWS; the first missing chunk is named by `(seq, sha)` and nothing is written), then the new storage floor `promote_adopted_manifest_to_dag` (sqlite, postgres) flips the row to `chunk_dag` and stamps the stream sealed in one transaction — the shape `seal_stream_with_scope` writes at the origin. `size_bytes` stays the envelope's length, as at the origin (the plaintext total lives in the opened manifest). Idempotent: `promoted: false` when it already was. The adopt path itself still never decrypts (I45's gate is unchanged); this door is a viewer's, under the read's authorization.
+- **The pull**, as Edge will run it: `adopt_sealed_blob_json` (the manifest, as received) → `open_sealed_manifest_json` → for each chunk, fetch by `sha256_hex` and `adopt_sealed_chunk_json` at `(stream_id, seq)` with `plaintext_size = size` → `promote_adopted_manifest_to_dag_json` → `read_blob_as` / `read_blob_range_as` serve the file.
+- **`Engine::put_blob_chunks_signing(manifest, chunks, author_key_id)`** (pyo3 `put_blob_chunks_signing_json`, the `put_blob_chunks_json` payload plus `author_key_id`; ask 3): stores a plaintext DAG through `put_blob_chunks` and announces its manifest (`holds_bytes`, this node's claim) through `put_blob_signing` — the shape a commons stream is announced with at the origin — so a pulled commons DAG is not a silent holder.
+
+**I144** (two nodes, sqlite and postgres): A seals a three-chunk `self` stream; B, the owner's other device, receives the content sets, adopts the manifest as received and — pinned — reads the manifest JSON as the file; a stranger cannot open the chunk list; B opens it; promotion is refused naming `seq 0` while no chunk is held and `seq 1` after one; B adopts every chunk at the manifest's `(stream_id, seq)`, promotes, and reads the file whole and across a chunk boundary by range; a second promotion is `promoted: false`; the stranger still reads nothing. **I145**: `put_blob_chunks_signing` stores a plaintext DAG that reads whole and lists this node as a holder; the plaintext DAG is refused by the sealed opener.
+
+### Mutation round (on the committed tree; lane = I144 + I145 on sqlite and postgres)
+| # | Mutant | Verdict |
+|---|---|---|
+| D1 | the opener skips the tier authorization | EQUIVALENT by layering: the DEK recovery behind it refuses the same viewer (`read_for_viewer_sealed` needs the viewer's grant; the community path its epoch grant), so a stranger is `NotGranted` either way — the tier check stays as the read's first gate, as in `read_any_range_for_viewer` |
+| D2 | a missing chunk falls back to the first held row | KILLED by I144 on both backends, after the witness was sharpened: a missing chunk is named as missing, never as a mismatch of the held one |
+| D3 | the chunk sha is not checked against the manifest | KILLED by I144 (s2: the wrong chunk at the right position) |
+| D4 | sqlite: the floor does not flip the row | KILLED by I144 (the read after promotion) |
+| D5 | postgres: the floor does not flip the row | KILLED by I144 |
+| D6 | the orchestration's idempotency return dropped | EQUIVALENT by layering: the floor answers `Ok(false)` for a `chunk_dag` row itself |
+| D7 | `put_blob_chunks_signing` does not announce | KILLED by I145 on both backends |
+| D8 | sqlite: the floor's chunk-count check dropped | EQUIVALENT by layering: the orchestration requires every named chunk before it reaches the floor; the count is the floor's own defence, stated |
+
 ## [51.2.0] - UNRELEASED
 
 **PATCH — four backlog defects, no wire, hash or migration change.** Built directly, each witnessed RED-first on memory, sqlite and postgres, mutated on a committed tree.

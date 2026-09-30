@@ -17544,6 +17544,94 @@ impl crate::federation::BlobStorage for PostgresBackend {
         row.as_ref().map(pg_stream_chunk_ref).transpose()
     }
 
+    async fn promote_adopted_manifest_to_dag(
+        &self,
+        sha256: &[u8; 32],
+        stream_id: &str,
+        expected_chunk_count: u64,
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let expected = i64::try_from(expected_chunk_count).unwrap_or(i64::MAX);
+        let sha_vec = sha256.to_vec();
+        let sha_hex = hex::encode(sha256);
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| BlobError::Backend(format!("begin tx: {e}")))?;
+        let row = tx
+            .query_opt(
+                "SELECT storage_kind, crypto_tier FROM cirislens.federation_blobs \
+                 WHERE sha256 = $1 FOR UPDATE",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("promote_adopted_manifest_to_dag row: {e}")))?;
+        let Some(row) = row else {
+            let _ = tx.rollback().await;
+            return Err(BlobError::NotHeld {
+                sha256_hex: sha_hex,
+            });
+        };
+        let kind: String = row.safe_get_with("storage_kind", BlobError::Backend)?;
+        let tier: String = row.safe_get_with("crypto_tier", BlobError::Backend)?;
+        if kind == "chunk_dag" {
+            let _ = tx.rollback().await;
+            return Ok(false);
+        }
+        if kind != "inline" {
+            let _ = tx.rollback().await;
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {sha_hex} is a {kind:?} row: only an adopted inline envelope is promoted"
+            )));
+        }
+        if tier == crate::federation::types::cohort_scope::CryptoTier::Plaintext.as_str() {
+            let _ = tx.rollback().await;
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {sha_hex} is recorded at the plaintext tier: a plaintext DAG is stored \
+                 through put_blob_chunks, never promoted"
+            )));
+        }
+        // §12.3 carried across nodes: the manifest names N chunks; the adopted
+        // stream must hold exactly N before the row becomes a DAG.
+        let count_row = tx
+            .query_one(
+                "SELECT COUNT(*) AS n FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                BlobError::Backend(format!("promote_adopted_manifest_to_dag count: {e}"))
+            })?;
+        let count: i64 = count_row.safe_get_with("n", BlobError::Backend)?;
+        if count != expected {
+            let _ = tx.rollback().await;
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {sha_hex}: stream {stream_id} holds {count} chunk row(s) but the manifest \
+                 names {expected_chunk_count}; adopt every chunk at (stream_id, seq) first"
+            )));
+        }
+        tx.execute(
+            "UPDATE cirislens.federation_blobs SET storage_kind = 'chunk_dag' WHERE sha256 = $1",
+            &[&sha_vec],
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("promote_adopted_manifest_to_dag update: {e}")))?;
+        tx.execute(
+            "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("promote_adopted_manifest_to_dag seal: {e}")))?;
+        tx.commit().await.map_err(|e| {
+            BlobError::Backend(format!("promote_adopted_manifest_to_dag commit: {e}"))
+        })?;
+        Ok(true)
+    }
+
     async fn adopt_sealed_blob_at(
         &self,
         envelope_bytes: Vec<u8>,

@@ -1196,6 +1196,27 @@ pub trait BlobStorage: Send + Sync {
         binding: Option<EpochBinding>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
+    /// v51.3.0 (CIRISPersist#947) — **promote an ADOPTED sealed manifest row
+    /// to a `chunk_dag`.** [`adopt_sealed_blob_at`](Self::adopt_sealed_blob_at)
+    /// stores every received envelope as `inline` (it never opens one, I45),
+    /// so a sealed manifest adopted on a second device read back as the
+    /// manifest JSON. This is the storage half of the fix. In ONE transaction:
+    /// refuse unless the row is held `inline` at a sealed tier and
+    /// `stream_id` has exactly `expected_chunk_count` chunk rows; then flip
+    /// `storage_kind` to `chunk_dag` and stamp the stream's chunks sealed —
+    /// the shape [`seal_stream_with_scope`](Self::seal_stream_with_scope)
+    /// writes at the origin (`size_bytes` stays the envelope's length, as
+    /// there). `Ok(false)` when the row is already a `chunk_dag` (idempotent).
+    /// The opened manifest's chunk list is checked by the orchestration
+    /// (`chunk_dag_cascade::orchestrate::promote_adopted_manifest_to_dag`),
+    /// its only caller; this floor sees no plaintext.
+    fn promote_adopted_manifest_to_dag(
+        &self,
+        sha256: &[u8; 32],
+        stream_id: &str,
+        expected_chunk_count: u64,
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
     /// #846 (§5, I49) — the row's PROVENANCE, for the proxy classification:
     /// its `author_key_id` (NULL = unknown), the cohort it was stored under,
     /// and the community its epoch binding names, or `None` if absent.
