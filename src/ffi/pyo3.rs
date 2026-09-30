@@ -14624,6 +14624,66 @@ impl PyEngine {
         })
     }
 
+    /// v51.4.0 (CIRISPersist#946; CC 3.3.1) — **the standing
+    /// `consent:community_trust` grant for `node_key_id`**, as the attestation
+    /// row's JSON, or `null`: lens-core's per-seal capture gate reads this.
+    /// The fold: rows about the node, the latest admitted revocation is a
+    /// boundary (every grant at or before it is out, whichever it named), the
+    /// latest grant after it wins, ties on the smallest id; no grant, no
+    /// consent.
+    fn community_trust_consent_json(&self, py: Python<'_>, node_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let node = node_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let row = runtime
+                    .block_on(async move { engine.community_trust_consent_for(&node).await })
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&row).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v51.4.0 (CIRISPersist#950) — **mint this node's Signed Tree Head over a
+    /// chunk-DAG file's stream** under the engine's local signer.
+    /// `chunk_shas_hex` are the stream's chunk shas in `seq` order (a
+    /// one-element list for an inline file); the STH covers the first
+    /// `tree_size` of them. Returns the serialized `SignedTreeHead`
+    /// (`{log_id, tree_size, root_hash, timestamp, signature,
+    /// witness_signatures}`) — the exact `sth_json` `put_stream_sth` takes,
+    /// with this node's derived key as the producer. Nothing is stored here.
+    /// `put_stream_sth` recomputes the root from this node's chunks and
+    /// raises `ValueError` naming a root mismatch or an over-claimed
+    /// `tree_size`.
+    fn sign_stream_sth_json(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        chunk_shas_hex: Vec<String>,
+        tree_size: u64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let mut shas: Vec<[u8; 32]> = Vec::with_capacity(chunk_shas_hex.len());
+            for h in &chunk_shas_hex {
+                shas.push(parse_sha256_hex(h)?);
+            }
+            let stream = stream_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sth = runtime
+                    .block_on(
+                        async move { engine.sign_stream_sth(&stream, &shas, tree_size).await },
+                    )
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&sth).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
     /// v51.3.0 (CIRISPersist#947) — **the chunk list of a sealed DAG this node
     /// holds**, opened as `viewer_key_id` under the same authorization as
     /// `read_blob_as` (`caller_aad_b64` as there; `blob_not_granted` for a

@@ -1738,7 +1738,7 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         // One number, stated once: the message reads it, so it cannot go stale.
-        const EXPECTED: usize = 154;
+        const EXPECTED: usize = 160;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

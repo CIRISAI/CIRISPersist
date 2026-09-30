@@ -747,3 +747,5 @@ Engine	pin_trust_from_bundle_response_json	deontic
 Engine	open_sealed_manifest_json	deontic	
 Engine	promote_adopted_manifest_to_dag_json	deontic	
 Engine	put_blob_chunks_signing_json	deontic	
+Engine	sign_stream_sth_json	deontic	
+Engine	community_trust_consent_json	deontic	

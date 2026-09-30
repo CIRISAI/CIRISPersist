@@ -118,6 +118,9 @@ pub mod blob_tombstone;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bytes_plane_tombstone_invariants;
+pub mod community_trust_consent;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod community_trust_consent_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
@@ -151,6 +154,8 @@ pub mod scope_classifier_invariants;
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
 #[cfg(test)]
 pub mod sweep_placement_invariants;

@@ -1885,17 +1885,60 @@ pub mod test_support {
         }
 
         // The occurrence speaking for ITSELF admits.
+        let lease = |r: &mut Attestation, from: chrono::DateTime<chrono::Utc>, secs: i64| {
+            r.attestation_envelope["community_id"] = serde_json::json!(format!("room-{run}"));
+            r.attestation_envelope["session_id"] = serde_json::json!("s-1");
+            r.attestation_envelope["claimed_at"] = serde_json::json!(from.to_rfc3339());
+            r.attestation_envelope["valid_until"] =
+                serde_json::json!((from + chrono::Duration::seconds(secs)).to_rfc3339());
+            ts::reseal(r);
+        };
+        let now = chrono::Utc::now();
         let mine = uuid::Uuid::new_v4().to_string();
         let mut r = scores_row(&mine, &occurrence, &occurrence, "session:claim:v1");
-        ts::reseal(&mut r);
+        lease(&mut r, now, 3_600);
         dir.put_attestation(SignedAttestation { attestation: r })
             .await
             .unwrap_or_else(|e| panic!("({tag}) #814: a self-report session claim admits: {e}"));
 
         // A stranger claiming about that occurrence is REFUSED and NOT STORED.
+        // v51.4.0 (CIRISPersist#946; CC 3.1.3.1) — the lease is bounded, read
+        // from the claim alone: no valid_until, a lease over a day, or a
+        // valid_until before claimed_at is malformed on this family.
+        for (label, from, secs, needle) in [
+            ("over a day", now, 86_401, "over the 86400s bound"),
+            ("backwards", now, -1, "precedes claimed_at"),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut r = scores_row(&id, &occurrence, &occurrence, "session:claim:v1");
+            lease(&mut r, from, secs);
+            let err = dir
+                .put_attestation(SignedAttestation { attestation: r })
+                .await
+                .expect_err(label);
+            assert!(
+                format!("{err}").contains(needle),
+                "({tag}) #946 {label}: got {err}"
+            );
+            assert!(dir.get_attestation(&id).await.expect("read").is_none());
+        }
+        {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut r = scores_row(&id, &occurrence, &occurrence, "session:claim:v1");
+            r.attestation_envelope["claimed_at"] = serde_json::json!(now.to_rfc3339());
+            ts::reseal(&mut r);
+            let err = dir
+                .put_attestation(SignedAttestation { attestation: r })
+                .await
+                .expect_err("no valid_until");
+            assert!(
+                format!("{err}").contains("`valid_until` is REQUIRED"),
+                "({tag}) #946: got {err}"
+            );
+        }
         let theirs = uuid::Uuid::new_v4().to_string();
         let mut bad = scores_row(&theirs, &stranger, &occurrence, "session:claim:v1");
-        ts::reseal(&mut bad);
+        lease(&mut bad, now, 3_600);
         let err = dir
             .put_attestation(SignedAttestation { attestation: bad })
             .await

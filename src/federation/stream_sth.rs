@@ -136,6 +136,65 @@ fn build_store(
     Ok(store)
 }
 
+/// v51.4.0 (CIRISPersist#950, for CIRISEdge#734) — **the per-stream STH
+/// producer.** The one place a Signed Tree Head over a chunk-DAG file's
+/// stream is minted: the RFC 6962 root over `chunk_shas` (the stream's
+/// `chunk_sha` values in `seq` order; the first `tree_size` of them are the
+/// leaves), the log id [`log_id_for_stream`], the signing bytes
+/// [`SignedTreeHead::signing_bytes`], and the producer's HYBRID signature
+/// under `local` — exactly what [`recompute_and_assert_root`] (the
+/// anti-equivocation gate `put_stream_sth` runs) recomputes and what
+/// `verify_stream_sth_signature` verifies against the producer's pinned
+/// keys. A host that publishes an STH through anything else reimplements
+/// these bytes; this is so it does not have to.
+///
+/// No production path publishes a stream STH on its own (`put_blob_chunks`,
+/// `put_blob_chunk_scoped` and `seal_stream_scoped` write chunks and the
+/// manifest only); the host publishes at its own "file is complete" step.
+/// A one-leaf STH over an inline file's single chunk is valid, so every file
+/// is receiptable (CC 5.3.3.6).
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] when `tree_size` is 0 or exceeds
+/// `chunk_shas.len()`; [`BlobError::Backend`] when the signer fails.
+pub async fn produce_stream_sth(
+    local: &crate::signing::LocalSigner,
+    stream_id: &str,
+    chunk_shas: &[[u8; 32]],
+    tree_size: u64,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<SignedTreeHead, BlobError> {
+    let n = usize::try_from(tree_size).map_err(|_| {
+        BlobError::InvalidArgument("produce_stream_sth: tree_size exceeds usize".into())
+    })?;
+    if n == 0 || n > chunk_shas.len() {
+        return Err(BlobError::InvalidArgument(format!(
+            "produce_stream_sth: tree_size {tree_size} must be in 1..={} (the chunks held, in seq \
+             order)",
+            chunk_shas.len()
+        )));
+    }
+    let store = build_store(&chunk_shas[..n])?;
+    let root_hash = store
+        .root()
+        .map_err(|e| BlobError::Backend(format!("stream-sth root: {e}")))?;
+    let log_id = log_id_for_stream(stream_id);
+    let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
+    let signature = local
+        .sign_hybrid(&signing_bytes)
+        .await
+        .map_err(|e| BlobError::Backend(format!("produce_stream_sth: signer: {e}")))?;
+    Ok(SignedTreeHead {
+        log_id,
+        tree_size,
+        root_hash,
+        timestamp,
+        signature,
+        witness_signatures: Vec::new(),
+    })
+}
+
 /// v4.1 (Cut C1b) — **the anti-equivocation gate** (steps 2–4).
 ///
 /// `chunk_hashes` MUST be the first `tree_size` chunk hashes of the

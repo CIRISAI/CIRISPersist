@@ -5486,6 +5486,56 @@ impl Engine {
         }
     }
 
+    /// v51.4.0 (CIRISPersist#946; CC 3.3.1) — **the standing
+    /// `consent:community_trust` grant for `node`**, or `None`: the capture
+    /// gate's answer, folded from the rows about the node (latest grant after
+    /// the latest admitted revocation; ties on the smallest id). See
+    /// [`community_trust_consent`](crate::federation::community_trust_consent).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn community_trust_consent_for(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::community_trust_consent::community_trust_consent_for;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                community_trust_consent_for(arc.as_ref(), node_key_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                community_trust_consent_for(arc.as_ref(), node_key_id).await
+            }
+        }
+    }
+
+    /// v51.4.0 (CIRISPersist#950, for CIRISEdge#734) — **mint this node's
+    /// Signed Tree Head over a chunk-DAG file's stream**, under the engine's
+    /// PQC LocalSigner (the announcing signer; its derived key is the
+    /// producer `put_stream_sth` verifies against). `chunk_shas` are the
+    /// stream's chunk shas in `seq` order; the STH covers the first
+    /// `tree_size`. Nothing is stored — publish it with `put_stream_sth`,
+    /// which recomputes the root from this node's chunks and refuses a
+    /// disagreeing one by name. See
+    /// [`stream_sth::produce_stream_sth`](crate::federation::stream_sth::produce_stream_sth).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sign_stream_sth(
+        &self,
+        stream_id: &str,
+        chunk_shas: &[[u8; 32]],
+        tree_size: u64,
+    ) -> Result<ciris_verify_core::transparency::SignedTreeHead, crate::federation::BlobError> {
+        let local = self.announcing_signer().await?;
+        crate::federation::stream_sth::produce_stream_sth(
+            local,
+            stream_id,
+            chunk_shas,
+            tree_size,
+            chrono::Utc::now(),
+        )
+        .await
+    }
+
     /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the chunk
     /// list of a sealed DAG this node holds**, opened for `viewer_key_id`
     /// under the same authorization as [`read_blob_as`](Self::read_blob_as)

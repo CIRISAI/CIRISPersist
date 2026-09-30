@@ -1511,6 +1511,16 @@ pub trait BlobStorage: Send + Sync {
     /// Persist does NOT sign stream STHs (unlike the audit log). Witness
     /// cosignatures are stored as-provided (default empty); Cut C1b does
     /// NOT enforce a cosign quorum (best-effort tier — CEG §10.5.1).
+    /// v51.4.0 (CIRISPersist#950) — **what the producer signs, and what is
+    /// refused by name.** The producer signs over the stream's chunk shas in
+    /// `seq` order (the RFC 6962 root of the first `tree_size` leaves, CEG
+    /// §10.5.1) — mint it with
+    /// [`stream_sth::produce_stream_sth`](crate::federation::stream_sth::produce_stream_sth),
+    /// pyo3 `sign_stream_sth_json`. This door recomputes that root from ITS
+    /// OWN stored chunks and refuses a disagreeing one as
+    /// `InvalidArgument("put_stream_sth: root mismatch — …anti-equivocation
+    /// gate")`; a `tree_size` beyond the chunks it holds is refused as
+    /// `InvalidArgument("put_stream_sth: STH claims tree_size …")`.
     fn put_stream_sth(
         &self,
         sth: ciris_verify_core::transparency::SignedTreeHead,

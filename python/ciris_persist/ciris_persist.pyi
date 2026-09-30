@@ -741,6 +741,9 @@ class Engine:
     def community_dek_set_retain_past_epochs(self, community_key_id: str, retain_past_epochs: int | None = None) -> None:
         """(derived) deontic — v43.0.0 (§11.6) — the retention policy the sweep enforces. retain_past_epochs=n: the sweep may evict and destroy epochs more than n behind the curr..."""
 
+    def community_trust_consent_json(self, node_key_id: str) -> str:
+        """(derived) deontic — v51.4.0 (CIRISPersist#946; CC 3.3.1) — the standing consent:community_trust grant for node_key_id, as the attestation row's JSON, or null: lens-cor..."""
+
     def consent_peers_by_principals(self, key_id: str) -> str:
         """(derived) deontic — v44.6.0 (#857 §4) — list_consent_peers keyed by ANY key that stands for the machine (the union over its human principals and itself). JSON array of..."""
 
@@ -1495,6 +1498,9 @@ class Engine:
 
     def set_trust_threshold(self, threshold: float) -> None:
         """(derived) deontic — v3.4.0 (CIRISPersist#123) — set the trust-score admission threshold consulted by every write path. Range [0.0, 1.0]; out-of-range values are clampe..."""
+
+    def sign_stream_sth_json(self, stream_id: str, chunk_shas_hex: list[str], tree_size: int) -> str:
+        """(derived) deontic — v51.4.0 (CIRISPersist#950) — mint this node's Signed Tree Head over a chunk-DAG file's stream under the engine's local signer. chunk_shas_hex are t..."""
 
     def steward_bind(self, node_or_agent_key_id: str, infra_scopes: list[str], delegation_purpose: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by granting it infra:-only scopes (passes the node-agency gate on a node-role ke..."""

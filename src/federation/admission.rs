@@ -2643,6 +2643,9 @@ pub async fn check_promotion_admission(
     // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
     // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
     check_session_self_report_admission(row)?;
+    // CC 3.3.1 — a `consent:community_trust` grant is the node's own and lists
+    // its owner at the grant's instant (v51.4.0, CIRISPersist#946).
+    super::community_trust_consent::check_community_trust_grant_admission(directory, row).await?;
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
     // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
@@ -3290,16 +3293,68 @@ pub fn check_session_self_report_admission(row: &super::Attestation) -> Result<(
     if !dimension.starts_with(crate::federation::session_claim::SESSION_DIMENSION_PREFIX) {
         return Ok(());
     }
-    if row.attesting_key_id == row.attested_key_id {
+    if row.attesting_key_id != row.attested_key_id {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension} is a substrate SELF-REPORT (CC 3.4.3): attesting_key_id {:?} must be the \
+             attested occurrence {:?}. A third party cannot say which occurrence of someone else's \
+             self is handling an exchange — and a row that is merely ignored by the fold is still a \
+             row that replicates and is visible to any consumer reading rows directly.",
+            row.attesting_key_id, row.attested_key_id
+        )));
+    }
+    check_session_lease_bound(dimension, &row.attestation_envelope)
+}
+
+/// v51.4.0 (CIRISPersist#946; CC 3.1.3.1, the #113/#122 review bound) — **the
+/// lease is bounded, and the bound reads the claim alone.** A signature
+/// proves who supplied `claimed_at`, not that it is honest; "earliest wins"
+/// would otherwise let one occurrence hold a session indefinitely by
+/// back-dating `claimed_at` and far-dating `valid_until`. So every
+/// `session:*` row carries `claimed_at` and `valid_until` (both CC 2.6.2
+/// instants; a row without `valid_until` is malformed on this family),
+/// `claimed_at ≤ valid_until`, and `valid_until − claimed_at ≤ 86 400 s` — a
+/// lease runs forward from its claim, and for at most a day — read from the
+/// claim's own signed members and nothing else. The horizon is the row's own
+/// `valid_until`, moved only by a renewing row that supersedes it; never a
+/// consumer-local timeout.
+pub const SESSION_LEASE_MAX_SECS: i64 = 86_400;
+
+/// See [`SESSION_LEASE_MAX_SECS`]. A no-op off the `session:` family.
+pub fn check_session_lease_bound(
+    dimension: &str,
+    envelope: &serde_json::Value,
+) -> Result<(), Error> {
+    if !dimension.starts_with(crate::federation::session_claim::SESSION_DIMENSION_PREFIX) {
         return Ok(());
     }
-    Err(Error::InvalidArgument(format!(
-        "{dimension} is a substrate SELF-REPORT (CC 3.4.3): attesting_key_id {:?} must be the \
-         attested occurrence {:?}. A third party cannot say which occurrence of someone else's \
-         self is handling an exchange — and a row that is merely ignored by the fold is still a \
-         row that replicates and is visible to any consumer reading rows directly.",
-        row.attesting_key_id, row.attested_key_id
-    )))
+    let instant = |member: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        envelope
+            .get(member)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "{dimension}: `{member}` is REQUIRED on every session row as a CC 2.6.2 instant \
+                     (CC 3.1.3.1) — a row without it is malformed on this family, not a claim"
+                ))
+            })
+    };
+    let claimed_at = instant("claimed_at")?;
+    let valid_until = instant("valid_until")?;
+    if valid_until < claimed_at {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension}: valid_until {valid_until} precedes claimed_at {claimed_at} — a lease runs \
+             forward from its claim (CC 3.1.3.1)"
+        )));
+    }
+    let lease = valid_until.signed_duration_since(claimed_at).num_seconds();
+    if lease > SESSION_LEASE_MAX_SECS {
+        return Err(Error::InvalidArgument(format!(
+            "{dimension}: the lease is {lease}s, over the {SESSION_LEASE_MAX_SECS}s bound — a \
+             claim holds a session for at most a day; renew with a superseding row (CC 3.1.3.1)"
+        )));
+    }
+    Ok(())
 }
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — **the per-segment dimension case
@@ -7898,6 +7953,23 @@ async fn issuer_owned_the_producer_when(
         Ok(_) | Err(Error::AmbiguousNodeOwner { .. }) => return Ok(false),
         Err(e) => return Err(e),
     }
+    let in_force = owner_granters_in_force_at(directory, node, target.asserted_at).await?;
+    Ok(in_force.len() == 1 && in_force.contains(issuer))
+}
+
+/// v51.4.0 (factored out of the #941 rule for CIRISPersist#946) — **the owner
+/// granters whose binding over `node` was IN FORCE at `t`.** A binding is in
+/// force from its `asserted_at` until the earlier of its `expires_at` and the
+/// first admitted `withdraws` that ends it (one naming it, or its granter's
+/// bare retraction against the node). Read over the whole ownership record;
+/// resolved on every node from the same replicated rows, so a later transfer
+/// neither admits nor un-admits what was true at `t` (CC 3.2 / CC 3.3.1's
+/// "`owner_of(node)` at the grant's own instant").
+pub async fn owner_granters_in_force_at(
+    directory: &dyn super::FederationDirectory,
+    node: &str,
+    t: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::BTreeSet<String>, Error> {
     let rows = directory.list_attestations_for(node).await?;
     // PR #943 review (A→B→A) — "the issuer owned the node when `target` was
     // produced", asked of the whole ownership record, not of one binding's
@@ -7909,7 +7981,6 @@ async fn issuer_owned_the_producer_when(
     // backdates a fresh binding into another owner's era overlaps that
     // owner's binding and is refused. Only the other owner can shorten its own
     // era, by signing the withdrawal that ends it.
-    let t = target.asserted_at;
     let ended_at = |b: &super::Attestation| -> Option<chrono::DateTime<chrono::Utc>> {
         let withdrawn = rows
             .iter()
@@ -7938,18 +8009,10 @@ async fn issuer_owned_the_producer_when(
         b.attestation_type == super::types::attestation_type::DELEGATES_TO
             && is_owner_binding_envelope(&b.attestation_envelope)
     });
-    let mut issuer_in_force = false;
-    for b in owner_bindings {
-        if !in_force_at_t(b) {
-            continue;
-        }
-        if b.attesting_key_id == issuer {
-            issuer_in_force = true;
-        } else {
-            return Ok(false);
-        }
-    }
-    Ok(issuer_in_force)
+    Ok(owner_bindings
+        .filter(|b| in_force_at_t(b))
+        .map(|b| b.attesting_key_id.clone())
+        .collect())
 }
 
 /// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
