@@ -336,6 +336,22 @@ It is idempotent: a second call answers `already`.
 
 Witnesses: I202–I207 and I209, `federation::nested_manifest_invariants`.
 
+### 6.7 The chunk adopt at scale: the nonce cap by counter, and the batched door (v52.0.0, CIRISPersist#957)
+
+**The cost that grew with the stream.** The chunk floor enforces the nonce cap (CEG §10.5.3: a `(stream, epoch)` holds at most `MAX_CHUNKS_PER_EPOCH` = 2²⁴ chunks). Until v52 it did that with `SELECT COUNT(*) FROM federation_stream_chunks WHERE stream_id = ? AND epoch = ?` on every append and every adopt. That is a scan of the stream's index range, so per-chunk work grew with the chunks already held and a whole stream was quadratic. I286 reads the floor's SQLite VM steps back from its cached statements: 273 at chunk 16 against 3294 at chunk 1023 before the fix, flat after.
+
+**The counter (V165, both dialects).** `federation_stream_epoch_counts(stream_id, epoch, chunk_count)`, backfilled from the index rows by `GROUP BY`. Each append steps it with one primary-key upsert, `+1 … RETURNING chunk_count`, and refuses when the count before the step had reached the cap. The step sits inside the item's savepoint, so a refused item (the cap, a seq conflict, a moved epoch) rolls its step back. On postgres the upsert also row-locks the counter until commit, which serializes two concurrent appends to one `(stream, epoch)`; the old `COUNT` under READ COMMITTED did not. Every production `DELETE` of chunk index rows (`abandon_stream`) deletes the stream's counter rows in the same transaction; a from-disk gate holds that (I288). The cap refusal is `InvalidArgument` naming `MAX_CHUNKS_PER_EPOCH` on both backends (sqlite used to surface it as `Backend`).
+
+**The batched door.** `BlobStorage::adopt_sealed_chunks_at`, `adopt_cascade::adopt_sealed_chunks`, `Engine::adopt_sealed_chunks`, pyo3 `adopt_sealed_chunks_json`: a run of up to `MAX_CHUNKS_PER_BATCH` (64) chunks of one stream, at one epoch, under one provenance, at most `MAX_BATCH_BYTES` (32 MiB), in ONE write transaction.
+- Once per batch: the provenance's tier and binding, the WILL decision (`would_hold`), the batch bounds, and the stream's claim (owner, cohort, abandoned, reserved id). A refusal there is the outer `Err` and nothing is written.
+- Per item: the envelope's shape (never an open, I45), then in its own savepoint the blob row, the counter, the index row and the binding. An item refused there answers `Err` in its slot, in order, and the rest commit.
+- A batch in which no item landed commits nothing, so a refused first append never claims a stream (as before, when a refusal dropped the whole transaction).
+- The single door is a batch of one: `adopt_sealed_chunk` calls `adopt_sealed_chunks`, and `put_blob_chunk_floor` calls `put_blob_chunks_floor`. There is one floor body per backend. I72 requires the single door to delegate and the batch door to project the pending content sets.
+
+**Measured (this machine, sqlite, file-backed, one lane).** Wall-clock at 256 KiB chunks is dominated by disk I/O here, and repeated A/B rounds of the same binaries differ by up to 3×, so no speedup is claimed from them. At 8192 × 256 KiB the post-fix floor was faster in both interleaved rounds (50.1 s vs 62.7 s, 40.5 s vs 51.3 s); per-chunk time at the stream's end was within noise of its start both before and after. Batches of 8 showed no wall-clock gain on one lane (6.8–8.7 ms/chunk against 5.6–5.9 for single adopts). The batch door's purpose is Edge's eight lanes sharing one writer; Edge's 2 GiB bench measures that end to end.
+
+Witnesses: I286–I291, `federation::adopt_batch_invariants` and `blob_surface_gates` (I288's delete gate, I291 = I45 over the batch bodies).
+
 ### 6.4 What does not change
 
 `put_blob_scoped` keeps its contract (local author, current epoch, I17). `put_blob`
