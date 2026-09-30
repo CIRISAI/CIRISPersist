@@ -627,6 +627,35 @@ mod tests {
         }
     }
 
+    /// **I292 (literal bytes)** — only the TOP-LEVEL signature members are
+    /// stripped; a nested `signature` is content and stays, on both rules.
+    /// Pinned as literal bytes because the V1 oracle shares `write_value`
+    /// with the code under test, so an equality check against it cannot see
+    /// a strip applied at every depth.
+    #[test]
+    fn i292_a_nested_signature_member_is_kept() {
+        let v = json!({
+            "signature": "top",
+            "signature_pqc": "top-pqc",
+            "b": {"signature": "kept", "z": [ {"signature_pqc": "kept too"} ]},
+            "a": 1
+        });
+        let want = r#"{"a":1,"b":{"signature":"kept","z":[{"signature_pqc":"kept too"}]}}"#;
+        assert_eq!(
+            String::from_utf8(canonicalize_envelope_for_signing(&v).unwrap()).unwrap(),
+            want
+        );
+        assert_eq!(
+            String::from_utf8(canonicalize_envelope_for_signing_v1_pinned(&v).unwrap()).unwrap(),
+            want
+        );
+        assert_eq!(
+            pyc(json!({"signature": {"signature": 1}})),
+            r#"{"signature":{"signature":1}}"#,
+            "the V1 canonicalizer strips nothing by itself"
+        );
+    }
+
     /// **I295 (#958)** — exactly one `serde_jcs` in Cargo.lock, so the
     /// direct dependency the signing view serializes through is the one
     /// `ciris_verify_core::jcs::canonicalize` uses.
