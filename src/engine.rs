@@ -2898,6 +2898,33 @@ impl Engine {
         Ok(())
     }
 
+    /// v52.0.0 (#954) — run `key_grant::retire_withdrawn_content_set` for a
+    /// stored `withdraws` row, on this Engine's backend.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn retire_withdrawn_content_set_by_id(
+        &self,
+        withdraws_id: &str,
+    ) -> Result<u64, crate::federation::Error> {
+        use crate::federation::key_grant::retire_withdrawn_content_set;
+        use crate::federation::FederationDirectory;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                let Some(row) = arc.get_attestation(withdraws_id).await? else {
+                    return Ok(0);
+                };
+                retire_withdrawn_content_set(arc.as_ref(), &row).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                let Some(row) = arc.get_attestation(withdraws_id).await? else {
+                    return Ok(0);
+                };
+                retire_withdrawn_content_set(arc.as_ref(), &row).await
+            }
+        }
+    }
+
     /// v3.4.0 (CIRISPersist#123) — total bytes currently held by
     /// `federation_blobs`. Feeds the eviction-sweeper watermark.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -5627,6 +5654,200 @@ impl Engine {
                 .await
             }
         }
+    }
+
+    /// v52.0.0 (CIRISPersist#954, `BLOB_REPLICATION.md` §6.6) — **the chunks
+    /// child `index` of a v3 manifest lists**, opened for `viewer_key_id`
+    /// under the same authorization as [`read_blob_as`](Self::read_blob_as)
+    /// on the ROOT, then on the child row. For a file above the flat
+    /// manifest's ceiling, [`open_sealed_manifest_as`](Self::open_sealed_manifest_as)
+    /// answers `version: 3` with `children` and no `chunks`; the puller walks
+    /// the children one page at a time.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn open_sealed_manifest_page_as(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        child_index: u64,
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        Vec<crate::federation::chunk_dag_cascade::orchestrate::SealedManifestChunk>,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::open_sealed_manifest_page_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                open_sealed_manifest_page_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    child_index,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                open_sealed_manifest_page_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    child_index,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v52.0.0 (#954, `BLOB_REPLICATION.md` §6.6) — **adopt one child of a
+    /// v3 manifest**: the child's sealed envelope through
+    /// [`adopt_sealed_blob`](Self::adopt_sealed_blob) (`LocalOnly`; it is
+    /// never opened, I45), then the relation `(root, index) → child` so
+    /// eviction and promotion find it without opening the root. The root
+    /// must already be held (adopt it first). Returns the child's address.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        child_index: u64,
+        envelope: &[u8],
+        provenance: crate::federation::BlobProvenance,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        let held = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.blob_head(root_sha256).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.blob_head(root_sha256).await?,
+        };
+        if held.is_none() {
+            return Err(crate::federation::BlobError::NotHeld {
+                sha256_hex: hex::encode(root_sha256),
+            });
+        }
+        let out = self
+            .adopt_sealed_blob(
+                envelope,
+                provenance,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.record_manifest_child(root_sha256, child_index, &out.sha256)
+                    .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.record_manifest_child(root_sha256, child_index, &out.sha256)
+                    .await?
+            }
+        }
+        Ok(out.sha256)
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **abandon an unsealed stream this node
+    /// owns.** A streaming publish refused midway leaves chunk rows, index
+    /// rows and per-chunk content key-grant sets that replicate to the
+    /// owner's devices for bytes that will never be sealed. This door, for
+    /// the stream's OWNER only (this Engine's derived key) and only before a
+    /// seal: tombstones the stream (the id is never reused; the chunk door
+    /// and the seal refuse it as `stream_abandoned`), drops its index rows,
+    /// evicts its sealed chunk rows (a plaintext chunk's bytes stay: they are
+    /// content-addressed and may be shared), and WITHDRAWS every content set
+    /// this node emitted for an evicted chunk — each a `withdraws` at the
+    /// set's own cohort, which a peer admits and which retires that set's
+    /// projected grants there (`key_grant::retire_withdrawn_content_set`).
+    /// A community stream's epoch sets are not per chunk and are kept.
+    /// Idempotent: a second call answers `already: true`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn abandon_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::federation::chunk_dag_cascade::AbandonReport, crate::federation::BlobError>
+    {
+        use crate::federation::BlobStorage;
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("abandon_stream: signer: {e}"))
+        })?;
+        let floor = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
+        };
+        let mut report = crate::federation::chunk_dag_cascade::AbandonReport {
+            already: floor.already,
+            chunks_dropped: floor.chunks_dropped,
+            bytes_evicted: floor.bytes_evicted,
+            sets_withdrawn: 0,
+        };
+        let evicted: std::collections::HashSet<String> = floor
+            .evicted
+            .iter()
+            .filter(|(_, t)| {
+                *t == crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted
+            })
+            .map(|(s, _)| hex::encode(s))
+            .collect();
+        if evicted.is_empty() {
+            return Ok(report);
+        }
+        let mine = self
+            .federation_directory()
+            .list_attestations_by(&me)
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("abandon_stream: {e}")))?;
+        for set in mine.iter().filter(|r| {
+            r.attestation_type == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
+                && r.attestation_envelope
+                    .get("at_rest_sha256")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| evicted.contains(s))
+        }) {
+            self.emit_key_grant_withdraws(set).await?;
+            report.sets_withdrawn += 1;
+        }
+        Ok(report)
+    }
+
+    /// v52.0.0 (#954) — a `withdraws` of one of this node's content key-grant
+    /// sets, at the set's own cohort (a family set names its family, #953),
+    /// so it replicates to exactly the audience the set did.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn emit_key_grant_withdraws(
+        &self,
+        set: &crate::federation::Attestation,
+    ) -> Result<(), crate::federation::BlobError> {
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "abandon_stream: a withdraws needs this Engine's hybrid LocalSigner".into(),
+            )
+        })?;
+        let mut envelope = crate::federation::withdraws_attestation_envelope(
+            &set.attestation_id,
+            crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE,
+        );
+        if let Some(fam) = set.attestation_envelope.get("family_key_id") {
+            envelope["family_key_id"] = fam.clone();
+        }
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("engine-built envelope is a JSON object"),
+            set.cohort_scope.clone(),
+        );
+        self.emit_attestation(signer, input).await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("key_grant withdraws emit: {e}"))
+        })?;
+        Ok(())
     }
 
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
@@ -8713,10 +8934,23 @@ impl Engine {
         if binding.is_some() {
             self.ensure_backend_node_key().await;
         }
+        let withdraws = (attestation.attestation.attestation_type
+            == crate::federation::types::attestation_type::WITHDRAWS)
+            .then(|| attestation.attestation.attestation_id.clone());
         let outcome = self
             .federation_directory()
             .apply_replicated_attestation(attestation)
             .await?;
+        // v52.0.0 (CIRISPersist#954) — a withdrawn content key-grant set (an
+        // abandoned stream) retires its projected grants here. Read back the
+        // STORED row: the admission verdict the door stamped decides.
+        if let (
+            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
+            Some(id),
+        ) = (&outcome, withdraws)
+        {
+            self.retire_withdrawn_content_set_by_id(&id).await?;
+        }
         if let (
             crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
             Some(_),

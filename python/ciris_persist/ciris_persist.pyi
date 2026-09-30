@@ -556,6 +556,9 @@ class Engine:
     # Varying one of these changes what the mesh permits — a wrong entry here is a security finding.
     # ==============================================================
 
+    def abandon_stream_json(self, stream_id: str) -> str:
+        """(derived) deontic — v52.0.0 (CIRISPersist#954) — abandon an unsealed stream this node owns (a streaming publish refused midway): the stream is tombstoned (stream_aband..."""
+
     def accord_nonce_issued(self, family_key_id: str, nonce: str) -> bool:
         """(derived) deontic — #302 (M4) — has (family_key_id, nonce) been issued?"""
 
@@ -596,6 +599,9 @@ class Engine:
 
     def adopt_sealed_chunk_json(self, payload_json: str) -> str:
         """(derived) deontic — v46.4.0 (CIRISPersist#821, FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md §3) — the chunk twin of adopt_sealed_blob_json: take one sealed chunk of a stream thi..."""
+
+    def adopt_sealed_manifest_child_json(self, payload_json: str) -> str:
+        """(derived) deontic — v52.0.0 (CIRISPersist#954) — adopt one child of a v3 manifest (fetched by the sha256_hex its root names): stored as the sealed envelope it is, neve..."""
 
     def apply_replicated_accord_evidence(self, evidence_json: str) -> str:
         """(derived) deontic — v31.1.0 (CIRISPersist#662) — admit one replicated accord evidence bundle (JSON, as list_signed_accord_quorum_evidence_since returns its elements) b..."""
@@ -742,7 +748,7 @@ class Engine:
         """(derived) deontic — v43.0.0 (§11.6) — the retention policy the sweep enforces. retain_past_epochs=n: the sweep may evict and destroy epochs more than n behind the curr..."""
 
     def community_trust_consent_json(self, node_key_id: str) -> str:
-        """(derived) deontic — v51.4.0 (CIRISPersist#946; CC 3.3.1) — the standing consent:community_trust grant for node_key_id, as the attestation row's JSON, or null: lens-cor..."""
+        """(derived) deontic — v52.0.0 (CIRISPersist#946; CC 3.3.1) — the standing consent:community_trust grant for node_key_id, as the attestation row's JSON, or null: lens-cor..."""
 
     def consent_peers_by_principals(self, key_id: str) -> str:
         """(derived) deontic — v44.6.0 (#857 §4) — list_consent_peers keyed by ANY key that stands for the machine (the union over its human principals and itself). JSON array of..."""
@@ -922,6 +928,9 @@ class Engine:
 
     def open_sealed_manifest_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
         """(derived) deontic — v51.3.0 (CIRISPersist#947) — the chunk list of a sealed DAG this node holds, opened as viewer_key_id under the same authorization as read_blob_as (..."""
+
+    def open_sealed_manifest_page_json(self, at_rest_sha256_hex: str, child_index: int, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+        """(derived) deontic — v52.0.0 (CIRISPersist#954) — one page of a v3 manifest: the chunks child child_index lists, opened as viewer_key_id (authorized on the root as read..."""
 
     def pin_trust_from_bundle_response_json(self, response_json: str) -> str:
         """(derived) deontic — v50.0.0 (CIRISPersist#926) — the consumer half of CC 4.4 / 5.3.4: pin ciris-canonical from ONE TrustRootBundleResponse JSON (the bundle's quorum ve..."""
@@ -1500,7 +1509,7 @@ class Engine:
         """(derived) deontic — v3.4.0 (CIRISPersist#123) — set the trust-score admission threshold consulted by every write path. Range [0.0, 1.0]; out-of-range values are clampe..."""
 
     def sign_stream_sth_json(self, stream_id: str, chunk_shas_hex: list[str], tree_size: int) -> str:
-        """(derived) deontic — v51.4.0 (CIRISPersist#950) — mint this node's Signed Tree Head over a chunk-DAG file's stream under the engine's local signer. chunk_shas_hex are t..."""
+        """(derived) deontic — v52.0.0 (CIRISPersist#950) — mint this node's Signed Tree Head over a chunk-DAG file's stream under the engine's local signer. chunk_shas_hex are t..."""
 
     def steward_bind(self, node_or_agent_key_id: str, infra_scopes: list[str], delegation_purpose: str | None = None) -> str:
         """(derived) deontic — v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by granting it infra:-only scopes (passes the node-agency gate on a node-role ke..."""

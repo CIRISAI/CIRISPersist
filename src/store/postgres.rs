@@ -1219,6 +1219,13 @@ impl PostgresBackend {
         self
     }
 
+    /// v52.0.0 (#954) — set the inline cap on a SHARED backend (an Engine's
+    /// `Arc`), which [`Self::with_inline_bytes_cap`] cannot reach.
+    pub fn set_inline_bytes_cap(&self, cap: usize) {
+        self.inline_bytes_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Construct from an already-built deadpool. For tests / advanced
     /// embeddings (e.g. lens binary that wants to share a pool with
     /// other queries).
@@ -15616,6 +15623,32 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
+    async fn delete_at_rest_grants(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        recipient_key_ids: &[String],
+    ) -> Result<u64, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let recipients: Vec<String> = recipient_key_ids
+            .iter()
+            .filter(|r| r.as_str() != crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
+            .cloned()
+            .collect();
+        client
+            .execute(
+                "DELETE FROM cirislens.federation_blob_key_grants \
+                  WHERE at_rest_sha256 = $1 AND recipient_key_id = ANY($2)",
+                &[&at_rest_sha256.to_vec(), &recipients],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("delete_at_rest_grants: {e}"))
+            })
+    }
+
     async fn list_at_rest_grants(
         &self,
         at_rest_sha256: &[u8; 32],
@@ -17341,6 +17374,36 @@ impl crate::federation::BlobStorage for PostgresBackend {
         if let Some(b) = &binding {
             lock_community_tx(&tx, &b.community_key_id).await?;
         }
+        for c in &spec.children {
+            if c.body.len() > cap {
+                let _ = tx.rollback().await;
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: c.body.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(&c.sha256, &c.body)?;
+        }
+        // #954 — an abandoned stream is never sealed.
+        let abandoned = tx
+            .query_opt(
+                "SELECT (abandoned_at IS NOT NULL) AS a FROM cirislens.federation_streams \
+                  WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream_with_scope head: {e}"))
+            })?
+            .map(|r| r.safe_get_with::<bool, _, _, _>("a", crate::federation::BlobError::Backend))
+            .transpose()?
+            .unwrap_or(false);
+        if abandoned {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::blobs::stream_abandoned_refusal(
+                stream_id,
+            ));
+        }
         // §12.3 — the door listed N chunks and sealed a manifest over them;
         // if the stream has moved since, refuse rather than truncate.
         let count_row = tx
@@ -17427,6 +17490,49 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 });
             }
         }
+        // #954 — a v3 root's children, in the root's transaction (see the
+        // sqlite twin).
+        for c in &spec.children {
+            let child_sha = c.sha256.to_vec();
+            let len = i64::try_from(c.body.len()).unwrap_or(i64::MAX);
+            let idx = i64::try_from(c.index).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    cohort_scope, crypto_tier, author_key_id\
+                 ) VALUES ($1, 'inline', $2, NULL, $3, NULL, $4, $5, \
+                           (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $6)) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[&child_sha, &c.body, &len, &scope, &tier, &stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal child insert: {e}"))
+            })?;
+            if let Some(b) = &binding {
+                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&child_sha, &b.community_key_id, &b.minter_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("seal child bind: {e}"))
+                })?;
+            }
+            tx.execute(
+                "INSERT INTO cirislens.federation_manifest_children \
+                    (root_sha256, child_index, child_sha256) VALUES ($1, $2, $3) \
+                 ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                &[&sha_vec, &idx, &child_sha],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal child relation: {e}"))
+            })?;
+        }
         tx.execute(
             "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
             &[&stream_id],
@@ -17439,6 +17545,243 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::BlobError::Backend(format!("seal_stream_with_scope commit: {e}"))
         })?;
         Ok(())
+    }
+
+    async fn manifest_children(
+        &self,
+        root_sha256: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT child_index, child_sha256 FROM cirislens.federation_manifest_children \
+                  WHERE root_sha256 = $1 ORDER BY child_index ASC",
+                &[&root_sha256.to_vec()],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("manifest_children: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                let i: i64 =
+                    r.safe_get_with("child_index", crate::federation::BlobError::Backend)?;
+                let sha: Vec<u8> =
+                    r.safe_get_with("child_sha256", crate::federation::BlobError::Backend)?;
+                Ok((
+                    u64::try_from(i).map_err(|_| {
+                        crate::federation::BlobError::Backend("negative child_index".into())
+                    })?,
+                    crate::federation::stream_sth::root_hash_from_bytes(&sha)?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn record_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        index: u64,
+        child_sha256: &[u8; 32],
+    ) -> Result<(), crate::federation::BlobError> {
+        let (root, child) = (root_sha256.to_vec(), child_sha256.to_vec());
+        let idx = i64::try_from(index).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("child index exceeds i64".into())
+        })?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("record_manifest_child: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        let mut held = [false; 2];
+        for (i, sha) in [&root, &child].into_iter().enumerate() {
+            held[i] = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) AS h",
+                    &[sha],
+                )
+                .await
+                .map_err(be)?
+                .safe_get_with("h", crate::federation::BlobError::Backend)?;
+        }
+        let refusal: Option<(&str, Option<Vec<u8>>)> = if !held[0] {
+            Some(("root", None))
+        } else if !held[1] {
+            Some(("child", None))
+        } else {
+            tx.execute(
+                "INSERT INTO cirislens.federation_manifest_children \
+                    (root_sha256, child_index, child_sha256) VALUES ($1, $2, $3) \
+                 ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                &[&root, &idx, &child],
+            )
+            .await
+            .map_err(be)?;
+            let stored: Vec<u8> = tx
+                .query_one(
+                    "SELECT child_sha256 FROM cirislens.federation_manifest_children \
+                      WHERE root_sha256 = $1 AND child_index = $2",
+                    &[&root, &idx],
+                )
+                .await
+                .map_err(be)?
+                .safe_get_with("child_sha256", crate::federation::BlobError::Backend)?;
+            (stored != child).then_some(("other", Some(stored)))
+        };
+        if refusal.is_none() {
+            tx.commit().await.map_err(be)?;
+        } else {
+            let _ = tx.rollback().await;
+        }
+        crate::federation::blobs::manifest_child_record_outcome(
+            root_sha256,
+            index,
+            child_sha256,
+            refusal,
+        )
+    }
+
+    async fn abandon_stream_floor(
+        &self,
+        stream_id: &str,
+        owner_key_id: &str,
+    ) -> Result<crate::federation::AbandonFloorReport, crate::federation::BlobError> {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| {
+                crate::federation::BlobError::Backend(format!("abandon_stream_floor {what}: {e}"))
+            }
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        let head = tx
+            .query_opt(
+                "SELECT owner_key_id, (abandoned_at IS NOT NULL) AS abandoned \
+                   FROM cirislens.federation_streams WHERE stream_id = $1 FOR UPDATE",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("head"))?;
+        let Some(head) = head else {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_unknown: no stream {stream_id} is held here"
+            )));
+        };
+        let s_owner: Option<String> =
+            head.safe_get_with("owner_key_id", crate::federation::BlobError::Backend)?;
+        let abandoned: bool =
+            head.safe_get_with("abandoned", crate::federation::BlobError::Backend)?;
+        if s_owner.as_deref() != Some(owner_key_id) {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_not_owned: stream {stream_id} belongs to another writer; only its owner \
+                 abandons it (CIRISPersist#954)"
+            )));
+        }
+        if abandoned {
+            let _ = tx.rollback().await;
+            return Ok(crate::federation::AbandonFloorReport {
+                already: true,
+                ..Default::default()
+            });
+        }
+        let sealed: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM cirislens.federation_stream_chunks \
+                                 WHERE stream_id = $1 AND sealed_at IS NOT NULL) AS s",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("sealed"))?
+            .safe_get_with("s", crate::federation::BlobError::Backend)?;
+        if sealed {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_sealed: stream {stream_id} is sealed; a sealed DAG is evicted, not \
+                 abandoned (CIRISPersist#954)"
+            )));
+        }
+        let rows = tx
+            .query(
+                "SELECT c.chunk_sha, b.crypto_tier, b.size_bytes \
+                   FROM cirislens.federation_stream_chunks c \
+                   LEFT JOIN cirislens.federation_blobs b ON b.sha256 = c.chunk_sha \
+                  WHERE c.stream_id = $1 ORDER BY c.seq ASC",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("list"))?;
+        tx.execute(
+            "UPDATE cirislens.federation_streams SET abandoned_at = NOW() WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(be("stamp"))?;
+        let dropped = tx
+            .execute(
+                "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("drop"))?;
+        let mut report = crate::federation::AbandonFloorReport {
+            already: false,
+            chunks_dropped: dropped,
+            ..Default::default()
+        };
+        for r in &rows {
+            let sha: Vec<u8> =
+                r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
+            let tier: Option<String> =
+                r.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
+            let size: Option<i64> =
+                r.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+            let Some(tier) = tier
+                .as_deref()
+                .and_then(CryptoTier::parse_str)
+                .filter(|t| *t != CryptoTier::Plaintext)
+            else {
+                continue;
+            };
+            for stmt in [
+                "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
+                "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
+            ] {
+                tx.execute(stmt, &[&sha]).await.map_err(be("satellites"))?;
+            }
+            let n = tx
+                .execute(
+                    "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
+                    &[&sha],
+                )
+                .await
+                .map_err(be("evict"))?;
+            if n > 0 {
+                report.bytes_evicted += size.unwrap_or(0).max(0) as u64;
+                report.evicted.push((
+                    crate::federation::stream_sth::root_hash_from_bytes(&sha)?,
+                    tier,
+                ));
+            }
+        }
+        tx.commit().await.map_err(be("commit"))?;
+        Ok(report)
     }
 
     async fn stream_chunks(
@@ -19216,7 +19559,8 @@ impl PostgresBackend {
         })?;
         let head = tx
             .query_one(
-                "SELECT cohort_scope, community_key_id, owner_key_id \
+                "SELECT cohort_scope, community_key_id, owner_key_id, \
+                        (abandoned_at IS NOT NULL) AS abandoned \
                    FROM cirislens.federation_streams WHERE stream_id = $1",
                 &[&stream_id],
             )
@@ -19224,6 +19568,15 @@ impl PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("put_blob_chunk stream head: {e}"))
             })?;
+        // #954 — an abandoned stream takes no more chunks.
+        let s_abandoned: bool =
+            head.safe_get_with("abandoned", crate::federation::BlobError::Backend)?;
+        if s_abandoned {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::blobs::stream_abandoned_refusal(
+                stream_id,
+            ));
+        }
         let s_cohort: String =
             head.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
         let s_comm: Option<String> =
@@ -19539,14 +19892,46 @@ impl PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob tx: {e}")))?;
-        for stmt in [
-            "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
-            "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
-        ] {
-            tx.execute(stmt, &[&sha_vec]).await.map_err(|e| {
-                crate::federation::BlobError::Backend(format!("delete_blob satellites: {e}"))
+        // v52.0.0 (#954) — a v3 root's children die with it (see the sqlite twin).
+        let children: Vec<Vec<u8>> = tx
+            .query(
+                "SELECT child_sha256 FROM cirislens.federation_manifest_children \
+                  WHERE root_sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("delete_blob children: {e}"))
+            })?
+            .iter()
+            .map(|r| r.safe_get_with("child_sha256", crate::federation::BlobError::Backend))
+            .collect::<Result<_, _>>()?;
+        for sha in children.iter().chain(std::iter::once(&sha_vec)) {
+            for stmt in [
+                "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
+                "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
+            ] {
+                tx.execute(stmt, &[sha]).await.map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("delete_blob satellites: {e}"))
+                })?;
+            }
+        }
+        for sha in &children {
+            tx.execute(
+                "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[sha],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("delete_blob child: {e}"))
             })?;
         }
+        tx.execute(
+            "DELETE FROM cirislens.federation_manifest_children WHERE root_sha256 = $1",
+            &[&sha_vec],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob relation: {e}")))?;
         let n = tx
             .execute(
                 "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
