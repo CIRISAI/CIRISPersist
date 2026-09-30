@@ -5645,7 +5645,7 @@ impl PyEngine {
     ///   `"rotation_collision"` (same `key_id`, **different** pubkey — a
     ///   rotation / potential-compromise signal; CIRISAgent#809).
     /// - `key_id` — echoed for the caller's convenience.
-    /// - `existing_key_fingerprint` — present **only** for
+    /// - `existing_key_sha256_of_pubkey_base64_text` — present **only** for
     ///   `rotation_collision`: SHA-256 hex of the stored pubkey.
     ///
     /// A rotation collision is a normal return, **not** an exception —
@@ -5725,10 +5725,13 @@ impl PyEngine {
             dict.set_item("status", outcome.status())?;
             dict.set_item("key_id", key_id_for_dict)?;
             if let crate::store::KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint,
+                existing_key_sha256_of_pubkey_base64_text,
             } = &outcome
             {
-                dict.set_item("existing_key_fingerprint", existing_key_fingerprint)?;
+                dict.set_item(
+                    "existing_key_sha256_of_pubkey_base64_text",
+                    existing_key_sha256_of_pubkey_base64_text,
+                )?;
             }
             Ok(dict)
         })
@@ -10730,7 +10733,8 @@ impl PyEngine {
 
     /// v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts
     /// for `stream_id`, ascending `(k, subscriber_key_id)`, bounded by
-    /// `limit`. Returns a JSON array of serialized `DeliveryReceipt`s.
+    /// `limit`. Returns a JSON array of serialized `DeliveryReceipt`s, each
+    /// with the `received_at` this node stored it at (v52.0.0, #953).
     fn list_delivery_receipts_for(
         &self,
         py: Python<'_>,
@@ -10748,7 +10752,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         backend
-                            .list_delivery_receipts_for(&stream_id, limit)
+                            .list_stored_delivery_receipts_for(&stream_id, limit)
                             .await
                             .map_err(blob_err_to_py)
                     })
@@ -10759,7 +10763,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         backend
-                            .list_delivery_receipts_for(&stream_id, limit)
+                            .list_stored_delivery_receipts_for(&stream_id, limit)
                             .await
                             .map_err(blob_err_to_py)
                     })
@@ -11509,6 +11513,7 @@ impl PyEngine {
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
                                 supersede_proof: None,
+                                cosignatures: Vec::new(),
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -14624,6 +14629,143 @@ impl PyEngine {
         })
     }
 
+    /// v52.0.0 (CIRISPersist#957) — **the batched twin of
+    /// `adopt_sealed_chunk_json`**: a run of up to 64 sealed chunks of ONE
+    /// stream, at one epoch, under one provenance, in one write transaction.
+    /// The provenance, `would_hold` and the stream's claim are checked once; a
+    /// refusal there raises and nothing is written. Each chunk then answers
+    /// in its slot, in order.
+    ///
+    /// Payload JSON: `adopt_sealed_chunk_json`'s provenance members with
+    /// `stream_id` and `epoch`, and `chunks` in place of the one chunk:
+    /// ```json
+    /// {
+    ///   "stream_id": "…", "epoch": 0,
+    ///   "chunks": [ { "seq": 0, "envelope_b64": "…", "plaintext_size": 262144 } ],
+    ///   "author_key_id": "…", "cohort_scope": "self",
+    ///   "community_key_id": "…", "tier": "invisible_encrypted"
+    /// }
+    /// ```
+    /// Returns JSON `{"results": [ {"seq": 0, "chunk_sha256": "<hex>"} |
+    /// {"seq": 1, "error": "<refusal>"} ]}`, one per chunk, in order.
+    fn adopt_sealed_chunks_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptSealedChunksWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_chunks_json decode: {e}"))
+            })?;
+            let mut envelopes = Vec::with_capacity(wire.chunks.len());
+            for c in &wire.chunks {
+                envelopes.push((
+                    c.seq,
+                    B64.decode(&c.envelope_b64).map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "adopt_sealed_chunks_json seq {} envelope_b64 decode: {e}",
+                            c.seq
+                        ))
+                    })?,
+                    c.plaintext_size,
+                ));
+            }
+            let provenance = wire
+                .provenance
+                .into_provenance("adopt_sealed_chunks_json")?;
+            let (stream_id, epoch) = (wire.stream_id, wire.epoch);
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let items: Vec<crate::federation::AdoptChunkItem<'_>> = envelopes
+                    .iter()
+                    .map(|(seq, env, size)| crate::federation::AdoptChunkItem {
+                        seq: *seq,
+                        envelope: env,
+                        plaintext_size: *size,
+                    })
+                    .collect();
+                let results = runtime
+                    .block_on(async {
+                        engine
+                            .adopt_sealed_chunks(&stream_id, &items, epoch, provenance)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                let out: Vec<serde_json::Value> = results
+                    .iter()
+                    .zip(&items)
+                    .map(|(r, i)| match r {
+                        Ok(sha) => {
+                            serde_json::json!({ "seq": i.seq, "chunk_sha256": hex::encode(sha) })
+                        }
+                        Err(e) => serde_json::json!({ "seq": i.seq, "error": e.to_string() }),
+                    })
+                    .collect();
+                Ok(serde_json::json!({ "results": out }).to_string())
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
+    /// `consent:community_trust` grant for `node_key_id`**, as the attestation
+    /// row's JSON, or `null`: lens-core's per-seal capture gate reads this.
+    /// The fold: rows about the node, the latest admitted revocation is a
+    /// boundary (every grant at or before it is out, whichever it named), the
+    /// latest grant after it wins, ties on the smallest id; no grant, no
+    /// consent.
+    fn community_trust_consent_json(&self, py: Python<'_>, node_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let node = node_key_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let row = runtime
+                    .block_on(async move { engine.community_trust_consent_for(&node).await })
+                    .map_err(federation_err_to_py)?;
+                serde_json::to_string(&row).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#950) — **mint this node's Signed Tree Head over a
+    /// chunk-DAG file's stream** under the engine's local signer.
+    /// `chunk_shas_hex` are the stream's chunk shas in `seq` order (a
+    /// one-element list for an inline file); the STH covers the first
+    /// `tree_size` of them. Returns the serialized `SignedTreeHead`
+    /// (`{log_id, tree_size, root_hash, timestamp, signature,
+    /// witness_signatures}`) — the exact `sth_json` `put_stream_sth` takes,
+    /// with this node's derived key as the producer. Nothing is stored here.
+    /// `put_stream_sth` recomputes the root from this node's chunks and
+    /// raises `ValueError` naming a root mismatch or an over-claimed
+    /// `tree_size`.
+    fn sign_stream_sth_json(
+        &self,
+        py: Python<'_>,
+        stream_id: &str,
+        chunk_shas_hex: Vec<String>,
+        tree_size: u64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let mut shas: Vec<[u8; 32]> = Vec::with_capacity(chunk_shas_hex.len());
+            for h in &chunk_shas_hex {
+                shas.push(parse_sha256_hex(h)?);
+            }
+            let stream = stream_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sth = runtime
+                    .block_on(
+                        async move { engine.sign_stream_sth(&stream, &shas, tree_size).await },
+                    )
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&sth).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
     /// v51.3.0 (CIRISPersist#947) — **the chunk list of a sealed DAG this node
     /// holds**, opened as `viewer_key_id` under the same authorization as
     /// `read_blob_as` (`caller_aad_b64` as there; `blob_not_granted` for a
@@ -14659,6 +14801,115 @@ impl PyEngine {
                     })
                     .map_err(blob_err_to_py)?;
                 serde_json::to_string(&view).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **one page of a v3 manifest**: the chunks
+    /// child `child_index` lists, opened as `viewer_key_id` (authorized on the
+    /// root as `read_blob_as`, then on the child row). For a file above the
+    /// flat manifest's ceiling, `open_sealed_manifest_json` answers
+    /// `"version": 3` with `"children": [{"index", "sha256_hex", "first_seq",
+    /// "last_seq", "chunk_count", "size"}, …]` and an empty `"chunks"`; the
+    /// puller adopts each child with `adopt_sealed_manifest_child_json`, then
+    /// opens its page here. Returns JSON `[{"sha256_hex", "size", "seq"}, …]`.
+    /// A child not held raises `ValueError` (`blob_not_held`) naming the child.
+    #[pyo3(signature = (at_rest_sha256_hex, child_index, viewer_key_id, caller_aad_b64=None))]
+    fn open_sealed_manifest_page_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        child_index: u64,
+        viewer_key_id: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let page = runtime
+                    .block_on(async move {
+                        engine
+                            .open_sealed_manifest_page_as(
+                                &sha,
+                                child_index,
+                                &viewer,
+                                aad.as_deref(),
+                            )
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&page).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **adopt one child of a v3 manifest**
+    /// (fetched by the `sha256_hex` its root names): stored as the sealed
+    /// envelope it is, never opened, and related to the root so eviction and
+    /// promotion find it. The root must be held first. Payload JSON: the
+    /// provenance members of `adopt_sealed_blob_json` plus `"envelope_b64"`,
+    /// `"root_sha256"` (hex) and `"child_index"`. Returns JSON
+    /// `{"child_sha256": "<hex>"}`.
+    fn adopt_sealed_manifest_child_json(
+        &self,
+        py: Python<'_>,
+        payload_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptManifestChildWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_manifest_child_json decode: {e}"))
+            })?;
+            let envelope = B64.decode(&wire.envelope_b64).map_err(|e| {
+                PyValueError::new_err(format!(
+                    "adopt_sealed_manifest_child_json envelope_b64 decode: {e}"
+                ))
+            })?;
+            let root = parse_sha256_hex(&wire.root_sha256)?;
+            let index = wire.child_index;
+            let provenance = wire
+                .provenance
+                .into_provenance("adopt_sealed_manifest_child_json")?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let sha = runtime
+                    .block_on(async move {
+                        engine
+                            .adopt_sealed_manifest_child(&root, index, &envelope, provenance)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                Ok(serde_json::json!({ "child_sha256": hex::encode(sha) }).to_string())
+            })
+        })
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **abandon an unsealed stream this node
+    /// owns** (a streaming publish refused midway): the stream is tombstoned
+    /// (`stream_abandoned` on any later append or seal), its index rows go,
+    /// and its sealed chunk rows are evicted. Key-grant sets already emitted
+    /// stay (CC 3: a shared key is not un-shared). Only the stream's owner; a
+    /// sealed stream raises `ValueError` (`stream_sealed`). Idempotent.
+    /// Returns JSON `{"already", "chunks_dropped", "bytes_evicted"}`.
+    fn abandon_stream_json(&self, py: Python<'_>, stream_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let stream = stream_id.to_owned();
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let out = runtime
+                    .block_on(async move { engine.abandon_stream(&stream).await })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&out).map_err(|e| PyValueError::new_err(e.to_string()))
             })
         })
     }
@@ -24376,6 +24627,7 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
             }),
             _ => None,
         };
@@ -24674,6 +24926,7 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
             }),
             _ => None,
         };
@@ -33610,6 +33863,17 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::RosterAuthorityUnauthorized { rule, .. } => {
             PyValueError::new_err(rule_refusal_message(kind, rule))
         }
+        // v52.0.0 (#955) — the member's consent is missing or does not hold;
+        // the sibling standing refusal's type, `membership_*_unresolved` retryable.
+        crate::federation::Error::MembershipAcceptanceRefused { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
+        // v52.0.0 (#956) — a write naming a dissolved family: terminal,
+        // caller-side, the sibling roster refusals' type.
+        crate::federation::Error::GroupDissolved {
+            group_key_id,
+            dissolved_at,
+        } => PyValueError::new_err(format!("{kind}: {group_key_id} at {dissolved_at}")),
         // v50.0.0 (#916) — a device re-wrap refused on the owner-binding, the
         // roster or the device's keys: the same caller-side refusal, the same
         // type; `device_rekey_unbound` is the retryable rule.
@@ -33802,6 +34066,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             field,
             detail,
         } => PyValueError::new_err(format!("{kind}: {revocation_id} `{field}` — {detail}")),
+        // v52.0.0 (CIRISPersist#784) — caller-fault, same class as the
+        // binding refusal above; the reason token rides in the message.
+        crate::federation::Error::RevocationSubjectRefused {
+            revocation_id,
+            reason,
+            detail,
+        } => PyValueError::new_err(format!("{kind}: {revocation_id} {reason} — {detail}")),
         // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
         // rides in the message for the same reason the two above do: a Python
         // consumer must be able to tell "the row names a third party" from a
@@ -34159,6 +34430,18 @@ struct AdoptSealedBlobWire {
     disposition: String,
 }
 
+/// v52.0.0 (CIRISPersist#954) — the wire for `adopt_sealed_manifest_child_json`:
+/// the blob wire's provenance plus the child's root and index. No
+/// `disposition` — a child announces nothing; the root is what a holder claims.
+#[derive(serde::Deserialize)]
+struct AdoptManifestChildWire {
+    envelope_b64: String,
+    root_sha256: String,
+    child_index: u64,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
+}
+
 /// v46.4.0 (CIRISPersist#821) — the wire for `adopt_sealed_chunk_json`: the
 /// blob wire plus the chunk's position in its stream. No `disposition` — a
 /// chunk adopt announces nothing; the DAG's manifest is what a holder claims.
@@ -34171,6 +34454,25 @@ struct AdoptSealedChunkWire {
     plaintext_size: u64,
     #[serde(flatten)]
     provenance: ProvenanceWire,
+}
+
+/// v52.0.0 (CIRISPersist#957) — `adopt_sealed_chunks_json`'s payload: the
+/// chunk wire's provenance and stream, with a run of chunks.
+#[derive(serde::Deserialize)]
+struct AdoptSealedChunksWire {
+    stream_id: String,
+    epoch: u64,
+    chunks: Vec<AdoptSealedChunksItemWire>,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
+}
+
+/// One chunk of [`AdoptSealedChunksWire`].
+#[derive(serde::Deserialize)]
+struct AdoptSealedChunksItemWire {
+    seq: u64,
+    envelope_b64: String,
+    plaintext_size: u64,
 }
 
 fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {

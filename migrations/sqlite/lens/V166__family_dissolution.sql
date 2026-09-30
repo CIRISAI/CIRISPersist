@@ -1,0 +1,13 @@
+-- V166 — a family's terminal dissolution
+-- v52.0.0 (CIRISPersist#956)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V166__family_dissolution.sql
+--
+-- A quorum-family could not be dissolved as an amendment: a supersede with an
+-- empty roster is refused (a group has no members), so a peer's copy of the
+-- record kept a dissolved group live. A dissolution is now a quorum-verified
+-- TERMINAL amendment that sets `dissolved_at` (the instant the quorum signed)
+-- and changes nothing else. NULL on every live family; a dissolved family has
+-- no active members and every write naming it is refused
+-- `federation_group_dissolved`.
+ALTER TABLE federation_families ADD COLUMN dissolved_at TEXT NULL;

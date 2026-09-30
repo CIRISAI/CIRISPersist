@@ -7,6 +7,304 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [52.0.0] - UNRELEASED
+
+**MAJOR — the v52 bundle.** v51.4.0 and v51.5.0 were never released; their contents ship here with the queued wire breaks (#955 membership acceptance, #954 manifest ceiling, and the rest as their designs land). Sections below are grouped by issue.
+
+**From #953 — three gaps Edge's receipts and family lanes found (CIRISPersist#953; CIRISEdge#736/#738).** Additive: one new trait door, one new public type, one new envelope member on family content sets; no migration.
+
+### Fixed — a family file could not be published (CIRISPersist#953 item 1)
+A family seal's content-axis `key_grant` set named its family only as `owner_key_id`. The write gate reads a row's cohort target from the envelope's target members (`COHORT_TARGET_ENVELOPE_FIELDS`) and never from `owner_key_id`, so every family set was refused `scope_no_family_membership` at its author's own door — no family file could be published. **The set now carries `family_key_id` beside `owner_key_id` when `cohort_scope` is `family`**; the fix is persist-internal (the seal door already takes the family id as its `community_key_id` argument; a host changes nothing). `KeyGrantSet::from_attestation` refuses as `malformed` a family set whose `family_key_id` is absent or differs from `owner_key_id`, and a self set that names one. No family set was ever stored, so no stored row changes. **I199** (sqlite, postgres; RED first): alice's node seals a family blob and emits the set, bob's node admits the set, adopts the bytes and opens them; a non-member stays `NotGranted`.
+
+### Added — an inline blob's one-leaf log (CIRISPersist#953 item 2; CC 5.3.3.6)
+`put_stream_sth` recomputes the root from `federation_stream_chunks`, and an inline (≤ 1 MiB) blob has no stream rows, so no inline file could be receipted. **`stream_sth::inline_blob_stream_id(sha)`** names the log (the sha as 64 lowercase hex); both backends' chunk-hash loaders return the one leaf `[sha]` for an id of that shape when there are no stream rows and this node holds the blob `inline`, so `put_stream_sth`, `stream_inclusion_proof` and `stream_consistency_proof` all read the same log. The chunk floor now refuses a stream id shaped like a SHA-256 in either case (`refuse_reserved_stream_id`), so no chunked stream can take an inline blob's log name. A host publishes with `produce_stream_sth(local, &inline_blob_stream_id(&sha), &[sha], 1, t)` / `sign_stream_sth_json`. **I200** (sqlite, postgres): the one-leaf STH is admitted, served and proves its leaf; two leaves, an unheld blob and the uppercase spelling are refused; the chunk floor refuses the name in both cases.
+
+### Added — a listed receipt carries `received_at` (CIRISPersist#953 item 3)
+**`BlobStorage::list_stored_delivery_receipts_for`** returns **`StoredDeliveryReceipt { receipt, received_at }`** — the instant this node stored it, beside the signed receipt, not in it (the signing bytes do not change). `list_delivery_receipts_for` is that listing with the instants dropped; Python's `list_delivery_receipts_for` JSON gains `received_at` on every item (additive). **I201** (sqlite, postgres).
+
+**From #950/#946 — the receipts lane's STH producer (CIRISPersist#950, for CIRISEdge#734) and the four rows the register still owed after v51.1.0 (CIRISPersist#946).** Additive: two doors and two admission bounds; no wire, hash or migration change.
+
+### Mutation round — #953 (on the committed tree; lane = I199 + I147/I200/I201 + the key_grant unit tests, sqlite)
+Eight mutants, eight killed:
+- the family set omits `family_key_id` (I199 and the unit test);
+- the parser accepts any family target, or one on a self set (unit test);
+- the sqlite loader loses the inline fallback (I200, I201);
+- an unheld blob still becomes a leaf (I200);
+- the inline id accepts uppercase (I200);
+- the reservation is dropped, or reserves lowercase only (I200);
+- the stored listing shifts `received_at` (I201).
+
+The postgres loader and listing are exercised by I200 and I201's postgres runners. No postgres-specific mutants were run for #953.
+
+### Added — the per-stream STH producer (CIRISPersist#950)
+No production path published a per-stream Signed Tree Head for a chunk-DAG file (every `put_stream_sth` caller was a test; `sign_stream_sth` was a test helper), so a host building CC 5.3.3.6 delivery receipts had to reimplement the canonical bytes. **`stream_sth::produce_stream_sth(local, stream_id, chunk_shas, tree_size, timestamp)`** mints the STH exactly as the anti-equivocation gate recomputes it (the RFC 6962 root over the first `tree_size` chunk shas in `seq` order, `log_id_for_stream`, `SignedTreeHead::signing_bytes`, the producer's hybrid signature under the node's LocalSigner); **`Engine::sign_stream_sth`** and pyo3 **`sign_stream_sth_json(stream_id, chunk_shas_hex, tree_size)`** mint it under the engine's announcing signer (its derived key is the producer `put_stream_sth` verifies). Nothing is stored by the producer; the host publishes with `put_stream_sth`, whose doc now states what the producer signs over and that a disagreeing root is refused by name (`InvalidArgument("put_stream_sth: root mismatch — …anti-equivocation gate")`), as is an over-claimed `tree_size`. **I147** (sqlite, postgres): the engine's STH is admitted and served back; a one-leaf prefix admits; the same shas in the wrong order are refused by name; an over-claimed `tree_size` is refused by the producer; the signature verifies against the named producer only.
+
+### Fixed — the session lease is bounded (CIRISPersist#946; CC 3.1.3.1, the #113/#122 review bound)
+Every `session:*` row now carries `claimed_at` and `valid_until` (CC 2.6.2 instants; a row without either is malformed on this family and refused), `claimed_at ≤ valid_until`, and `valid_until − claimed_at ≤ 86 400 s` — read from the claim's own signed members and nothing else, so no occurrence can hold a session indefinitely by back-dating `claimed_at` and far-dating `valid_until`. `admission::check_session_lease_bound`, run beside the self-report gate at every door. The bootstrap self-report witness carries the members and gains the three refusals.
+
+### Added — the `consent:community_trust` gate and fold (CIRISPersist#946; CC 3.3.1)
+The dimension appeared only in a test. Now: **admission** (`community_trust_consent::check_community_trust_grant_admission`, every backend) — a capture grant is the NODE's own row (`attesting == attested`), and its `subject_key_ids` MUST list the node's owner **at the grant's own `asserted_at`** (`admission::owner_granters_in_force_at`, factored out of #941's in-force rule: resolved over the replicated owner-binding rows, never the receiver's current view), so the owner can always revoke on the rule-2 path whatever ownership later becomes; with no binding in force at that instant the grant is refused and not stored (persist holds no queue: the binding rows replicate first and the grant is re-put). **The fold** (`fold_community_trust`, the read door `Engine::community_trust_consent_for` / pyo3 `community_trust_consent_json`): rows about the node; the latest admitted revocation is a boundary `R` and every grant at or before it is out, whichever it named — revoking the newest never resurrects an older one; the latest grant after `R` wins, ties on the smallest id; no grant, no consent. **I148** (memory, sqlite, postgres): the un-owned, third-party and unbound grants are refused; the owned grant stands; a later grant wins; the owner's revocation of the newest leaves nothing standing; a fresh grant after it stands.
+
+### Mutation round (on the committed tree; lane = I147 + I148 + the session self-report runners + I126, on memory, sqlite and postgres)
+Nine mutants, nine killed: the lease's day bound dropped and a backwards lease admitted (the bootstrap self-report witness, all backends — its first lane filtered on the body's module and ran none of its store-level runners, a vacuous green caught by reading the lane's test count); a capture grant that need not list the owner, a third party's grant, the revocation boundary ignored, the earliest grant winning (I148, all backends); the producer rooting over every chunk and its `tree_size` bound dropped (I147, both backends); an expired or withdrawn owner binding staying in force (I126, the #941 lapse case).
+
+### Changed — evidence (CIRISPersist#946)
+`evidence/cc_impl.tsv` gains the four rows the register owed: `CLM-sealed-descriptor` (3.3.13 → `media_source.rs#check_sealed_descriptor_shape`, evidence only — #922 shipped it), `CLM-session-claim` (3.1.3.1 → `check_session_lease_bound` and `session_claim.rs#resolve_claim`), `CLM-duty` (3.1.1 → `admission.rs#check_duty_admission`; the family's own gate, #814 part 1 — the 4.5.5 row named the delegated-duty path, which is a different claim), `CLM-consent-community-trust` (3.3.1 → the gate and the fold).
+
+### #956 — a quorum family's leave and dissolve replicate as amendments (CIRISServer#700)
+A family record rewrite has reached a peer only as a quorum-proved amendment since v49. Two acts had no shape there. A dissolution (an empty roster) was refused as `group has no members`, and a self-leave had no arm that admitted it on the leaver's signature alone. So only the revocation rows travelled, and a peer's copy of the record kept the leaver and kept a dissolved group live.
+
+- **Dissolve.** `Family.dissolved_at` (V166, both dialects) is set only by a **quorum-verified TERMINAL amendment** through `supersede_family_with_quorum`, local or applied. The amendment changes nothing but `dissolved_at`; the name, founding instant, protocol, entrenchment and every seat stay byte-identical. It is bound to the `dissolved_at` the quorum signed inside the change envelope (the JCS signing bytes cover it), and it is judged as an `Add`, the strict direction.
+- **Where a dissolution is refused.** The plain `supersede_family` door (its `authorization` is the caller's own JSON), a founding record, a record whose instant the quorum did not sign, and a dissolution that also renames.
+- **After dissolution.** The family has **no active members**, and every write naming it is refused **`federation_group_dissolved`** (`Error::GroupDissolved`, Python `ValueError`, terminal). That covers a further amendment on the local door or on apply, a roster widening or revocation, a row placed at the family, and a membership proposal or reply. The identical dissolved record re-offered stays the idempotent no-op.
+- **Self-leave.** An amendment whose ONLY change removes one member from the held record is admitted on **that member's signature** over the change envelope, with no quorum. Every other seat must be identical and in order, and nothing else may change; the envelope must name the held roster as `supersedes.prior_member_key_ids` and may not dissolve. It applies on `supersede_family_with_quorum` and on replication apply. Removing someone else, leaving while renaming or re-roling a seat, and a leave the leaver did not sign all fall to the quorum.
+- **Wire.** A live family's record never carries `dissolved_at`, so every record written before v52.0.0 keeps its bytes, signature and `persist_row_hash`.
+- **Not built.** The community twin. A room's membership rides the widening planes, and its record carries trust-root and infrastructure-conformance rules that a dissolve marker would have to answer to; #956 names families.
+- **Server:** dissolve = `supersede_family_with_quorum(record with dissolved_at = t, envelope from build_membership_change_envelope(..same members..) plus "dissolved_at": t.to_rfc3339(), M-of-N signatures)`. Leave = the same door with the record minus the leaver and the envelope signed by the leaver alone.
+
+**Witnesses** (memory, sqlite, postgres; two directories, B learning every record from A's signed since-read):
+- **I280:** a quorum dissolution replicates.
+- **I281:** only a quorum terminal amendment dissolves.
+- **I282:** a dissolved family admits nothing (amendment on A and on B's apply, revocation, placed row); the identical re-offer is a no-op.
+- **I283:** a self-leave needs only the leaver.
+- **I284:** the leave arm admits only a leave.
+- **I285:** a live record carries no `dissolved_at`.
+
+**Mutation round** (committed tree, lane = I280–I284 + I178 on memory and sqlite; M14 on postgres): 14/14 killed.
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M1 | `active_family_members` ignores the dissolution | I280 |
+| M2 | the roster-authority gate admits on a dissolved family | I282 |
+| M3 | the replicated apply drops the dissolved refusal | I282 |
+| M4 | `refuse_if_dissolved` is a no-op | I282 |
+| M5 | a dissolution need not be terminal-only | I281 |
+| M6 | `dissolved_at` need not match the envelope | I281 |
+| M7 | the plain door dissolves | I281 |
+| M8 | a leave may re-role other seats | I284 |
+| M9 | the leaver's signature is not verified | I284 |
+| M10 | a leave may rename | I284 |
+| M11 | a founding record may be dissolved | I281 |
+| M12 | the write-scope gate ignores the dissolution | I282 |
+| M13 | the sqlite decoder drops `dissolved_at` | I280, I282 |
+| M14 | the postgres decoder drops `dissolved_at` | I280, I282 (postgres) |
+
+### #955 — nobody joins a family or community without their own signed acceptance (CIRISConstitution#133)
+
+**Wire / behaviour break.** Every roster GROWTH (a key not active before the growth's instant) on the widening planes — local door and replicated apply, every backend, every `consensus_protocol` including `founder_only` — now needs the member's live acceptance of a live proposal. Three `scores` claim families, no new EnvelopeKind: `membership:proposal:v1` (inviter → invitee in `subject_key_ids`, `expires_at` required, ≤ 30 days), `membership:acceptance:v1` / `membership:decline:v1` (signed by the invitee or a key acting for them; binds the proposal id, content hash and role). The group's quorum stays on the growth record: under a quorum protocol an accepted member is "accepted, awaiting the group". Expiry is judged on the two signed instants (acceptance and growth) against the proposal's `expires_at`, never a receiver's clock; a proposer's `withdraws` expires a proposal; a decline is final.
+
+Rulings (2026-09-30): **Q1** a founding record admits exactly the members who signed it (authority or co-signer) — `SignedFamily` gains `cosignatures` (V162, both dialects, persisted and served); **Q2** a supersede never adds a member (a trust-root founders' amendment may seat a key that signed that version). Persist's calls: `membership:` rides `UNREGISTERED_GATED_FAMILIES` until #133 registers it; a proposal reaches its invitee through a narrow read arm (Rust + SQL `EXISTS` over `attestation_subjects`) and a subject-apply arm (stored on a node that holds no roster); a reply is admitted wherever its proposal is held; the CC 4.5.4 no-moderator gate does not judge membership rows.
+
+Refusals: `Error::MembershipAcceptanceRefused { group_key_id, member_key_id, rule }`, kind `federation_membership_acceptance_refused`, Python `ValueError` `"<kind>: <rule>"`. Rules: `membership_acceptance_unresolved`, `membership_proposal_unresolved` (both RETRYABLE), `membership_declined`, `membership_proposal_expired`, `membership_acceptance_mismatch`, `membership_reply_conflict`, `membership_founding_member_unsigned`, `membership_supersede_cannot_add`. Engine doors: `propose_membership`, `reply_to_membership_proposal`. FSD: `FSD/MEMBERSHIP_ACCEPTANCE.md`.
+
+**Adopters.** Server: invite → `propose_membership`, accept/decline → `reply_to_membership_proposal`, then the widening; a founding roster lists only members who co-sign it; delete the interim 409. Edge: route `membership:proposal:v1` to the node of each `subject_key_ids` entry; treat `membership_*_unresolved` as re-offerable. Test fixtures: `tier_ingest::test_support::sign_{family,community}` now co-sign as every listed member; `membership_acceptance::test_support::{consent, ConsentedWidening}` write the consent before a growth.
+
+Witnesses I210–I219 (memory, sqlite, postgres): read arm both twins; reply arm; growth needs acceptance (both planes, founder_only proposer rule); decline terminal; expiry on signed instants + TTL bound + withdrawal; mismatch; founding signers (forged co-signature refused; V162 served); supersede cannot add; accepted-awaiting-the-group; two nodes end to end (subject-apply, replicated acceptance, replicated growth refused until the acceptance arrives).
+
+Mutation round (sqlite + memory lane of I210–I219): **17 / 17 killed** — growth gate skipped; reply conflict ignored; acceptance or growth after expiry admitted; withdrawn proposal live; role / hash not compared; reply signer not the invitee (**survived first**: AV-84 refused it later under another name and I211 accepted either — I211 now requires the named refusal); founding signers unchecked; family co-signatures unverified; supersede may add; subject-apply arm reverting to AV-45; `founder_only` proposer unchecked, community and family (the family arm **survived first**: no witness had one — I212 now does); read arm admitting any subject; TTL unbounded; retryable misclassified.
+
+**#955 follow-up (found by CIRISEdge#754 at prestage):** an invitee who only ever DECLINED was reported at the growth gate as `membership_acceptance_unresolved`, which is retryable. The gate ranked declines only among acceptances, and I213 had pinned that answer as expected. A decline now decides, as terminal `membership_declined`, whenever the member holds no acceptance for the group. With an acceptance on record, the accepted proposal's own verdict stands: I213's second invitee accepted an invitation that has since expired and gets `membership_proposal_expired`, not declined. RED first on memory and sqlite. Mutants: removing the decline rule (I213) and dropping the no-acceptance guard (I213's second invitee) are both killed. Postgres 30/30.
+
+### #960 — a family member's node is party to the family's content (found by Edge's family lane)
+`replication::hold::is_audience` decided the family arm from the operator's `is_family` predicate. Production never installs that predicate; only test modules do. So every family file was refused `NotPartyTo` on every member node except the author's, and no family file could replicate. The family arm now asks the named family's roster: this node is party when any of its principals is an active member of the family. Its principals are the humans it is an active occurrence of, and its own key. This is the room arm's rule on the family plane (`family_audience`). The operator predicate and the #884 speaks-for rule are kept. I199 had passed only because its fixture supplied the predicate. It now carries none, which reproduced RED first with Edge's exact refusal, and it adds a non-member negative. Mutants killed (I199, sqlite): the family arm dropped; the principals reduced to the node key; membership always true. Postgres I199 green.
+
+### #954 — a file above the flat manifest's ceiling; the abandoned stream
+
+**The ceiling (MAJOR: a new manifest version on the wire).**
+- **What changed:** a sealed manifest whose envelope would exceed the inline cap is now written as a v3 root over v2 children. Before, one file topped out near 2.5 GiB; the 2²⁴-chunk epoch cap was unreachable.
+  - Each child is sealed under `manifest_child_aad` (its own domain, its index), stored in the root's transaction, bound to the root's epoch at a community, and granted in the stream's one access set.
+  - Children are related to the root in `federation_manifest_children` (V160).
+  - A manifest that fits is byte-identical v2.
+- **Doors:**
+  - `open_sealed_manifest_as` gains `version` and `children`. A v3 view's `chunks` is empty, and Edge must walk the pages.
+  - `open_sealed_manifest_page_as` / pyo3 `open_sealed_manifest_page_json`.
+  - `adopt_sealed_manifest_child` / `adopt_sealed_manifest_child_json`.
+  - `promote_adopted_manifest_to_dag` requires every child held first.
+  - The whole and range reads walk the children.
+  - `delete_blob` takes a root's children.
+- **Wire:** a pre-v52 peer refuses a v3 root by name. That affects only files above the old ceiling, which could not exist before.
+- **Plaintext:** DAGs are not partitioned. Above the cap the floor still refuses them `InlineSizeExceeded`, and Edge's commons files keep the old ceiling.
+
+**The abandoned stream.**
+- `Engine::abandon_stream` / `abandon_stream_json` is for the owner only and only before a seal.
+  - It tombstones the stream: `federation_streams.abandoned_at` (V160). Append and seal then refuse `stream_abandoned`.
+  - It drops the index rows and evicts the sealed chunk rows. A plaintext chunk's bytes stay.
+  - It is idempotent.
+- **Not built:** withdrawing the emitted content key-grant sets. The existing withdraws gate refuses a `withdraws` naming a `key_grant` row (CC 3: a shared key cannot be retroactively un-shared). A set whose bytes never arrive stays an inert pending row on the other device. A cross-node abandon signal needs CC text first (I208 reserved).
+
+**Gates:** the parity and conn-model reds that #953 had left on the v52 branch were fixed here:
+- `list_stored_delivery_receipts_for`, `inline_blob_of_stream_id` and `refuse_reserved_stream_id` were unclassified in CALL_CLASSES;
+- the conn-model row for `list_delivery_receipts_for` had gone stale.
+
+I67 allows `abandon_stream_floor`'s grant deletes (each rides its own blob row's eviction).
+
+**Witnesses** (sqlite and postgres; `federation::nested_manifest_invariants`):
+- I202 v3 seal, whole read, three ranges, v2 below the cap, root eviction takes the children.
+- I203 a manifest that fits stays flat; the root JCS is pinned.
+- I204 two-node v3 pull: the child before its root is refused, a missing child is named, pages, chunks, promote, read.
+- I205 the child AAD is its position; its bytes are pinned.
+- I206 the parser and `check_child` refusals, and range selection.
+- I207 abandon.
+- I209 a community stream's abandon.
+
+**Mutation round** (on the committed tree 6f36fddc; lane = `nested_manifest_invariants` on sqlite, plus two postgres floor mutants on their pg runners). Fifteen mutants, fifteen killed. M1 (v3 switched off) is the pre-#954 seal: I202 and I204 fail with the manifest refused `InlineSizeExceeded`, which is the RED the witnesses were written against.
+
+| mutant | verdict | killed by |
+|---|---|---|
+| M1 v3 switch off (the pre-fix seal) | KILLED | i202 i203_a_manifest_that_fits_stays_flat i204 |
+| M2 partition overflows the cap | KILLED | i202 i203_a_manifest_that_fits_stays_flat i204 |
+| M3 child AAD under the chunk domain | KILLED | i205_a_child_opens_only_at_its_own_position |
+| M4 child sealed at index 0 | KILLED | i202 i204 |
+| M5 child continuity unchecked | KILLED | i206_the_nested_parser_refuses |
+| M6 child size sum unchecked | KILLED | i206_the_nested_parser_refuses |
+| M7 promote skips the child-held check | KILLED | i204 |
+| M8 range child selection off by one | KILLED | i202 i206_the_nested_parser_refuses |
+| M9 abandon owner unchecked (sqlite) | KILLED | i207 |
+| M10 abandon of a sealed stream admitted (sqlite) | KILLED | i207 |
+| M11 chunk floor ignores the tombstone (sqlite) | KILLED | i207 |
+| M12 abandon evicts plaintext bytes too (sqlite) | KILLED | i207 |
+| M13 root eviction leaves its children (sqlite) | KILLED | i202 |
+| M14 abandon owner unchecked (postgres) | KILLED | i207 (postgres) |
+| M15 root eviction leaves its children (postgres) | KILLED | i202 (postgres) |
+
+### #930 — the occurrence plane keeps every assertion; an unknown provenance token refuses
+
+**Fixed — an earlier node-bearing verdict could change after the fact (CIRISPersist#930, from #925 item 5).** The occurrence plane upserts the LATEST assertion per `(identity, occurrence)`. A renewal moved a binding's start forward, and an identity re-signing the pair replaced the row the occurrence had signed itself, erasing its agreement. So the CC 3.2 fold ("infrastructure does not vote") could re-judge a roster change admitted at an earlier instant. **V161** (both dialects) adds `federation_identity_occurrence_history`, append-only: both put doors write every admitted assertion in the upsert's transaction (postgres: one statement), including an assertion older than the stored row. `FederationDirectory::list_identity_occurrence_history_by_occurrence` (memory, sqlite, postgres; the capsule answers `Unsupported`, fail-closed) returns it in one order on every backend. `node_bearing_of` reads it: each assertion contributes `[max(asserted_at, agreed_from), end)`. Agreement is an instant, `occurrence_agreed_from` (the occurrence's first own signature); `occurrence_agreed_to` keeps its name as `is_some()`. The backfill copies the current rows: verdicts over pre-V161 instants are the latest-assertion ones. No wire, hash or ABI change. The PR #921 F2 witnesses now fault-inject the history read (the fold's read). Still open: the backdated-revocation clamp (FSD `SECOND_DEVICE.md` §8.5; it needs a ruling on which signed instant bounds it).
+
+**Fixed — an unknown `binding_provenance` token read as `Rooted`.** `BindingProvenance::from_token` mapped any unknown token to the authoritative `Rooted`, so a signed transport destination whose envelope carried e.g. `"ROOTED"` was admitted as authoritative. It is now fallible: an absent token keeps its documented back-compat `Rooted`; a present token that is neither `rooted` nor `advisory` refuses by name at the admission door (every backend) and when decoding a stored row (sqlite, postgres; memory holds the typed enum and is a declared parity divergence).
+
+**Witnesses:** I270 renewal, I271 re-signing, I272 before agreement, I273 revocation per assertion, I274 an older assertion arriving late, I276 the next edge, I278 trusted-local (memory, sqlite, postgres); I275 the backfill replayed (sqlite, postgres); I277 the adopter-shaped roster judgement in `rc5_adopts_invariants` (memory, sqlite, postgres); I279 the provenance token (unit + the signed route matrix leg 15 on all three backends).
+
+**Mutation round** (committed tree 5ec8927e + 2dca04e1; lane = the occurrence history witnesses + `node_bearing` + the provenance unit + the signed route matrix, sqlite+memory; M9 on postgres): **10/10 killed.**
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M0 | the fold reads the current-state row (the pre-V161 behaviour; the RED-first proof) | I270, I271, I273, I274, I275, I276, I277 |
+| M1 | sqlite signed door appends history only when the upsert applied | I274 |
+| M2 | the agreement clip dropped | I272, I278 |
+| M3 | `agreed_from` = the LATEST own signature | I270, I273, I274, I276, I277 |
+| M4 | revocation filter `>=` → `>` | I273(b) (added: survived until a revocation at an assertion's own instant was witnessed) |
+| M5 | the sqlite V161 backfill omitted | I275 |
+| M6 | an unknown provenance token reads `Rooted` | I279 (unit, matrix memory + sqlite) |
+| M7 | a trusted-local row counts as agreement | I278 |
+| M8 | memory's local door skips the history | I278 |
+| M9 | postgres's signed door writes no history row | I270–I278 on postgres, and the rc5 node-bearing runners |
+
+### #784 — a revocation names its subject by the raw key's digest, not its label
+
+**Changed — BREAKING: the revocation's subject is `revoked_key_sha256_ed25519_raw` (CIRISPersist#784).** A `key_id` is `<label>-<fingerprint>` with the keystore label in cleartext, so every revocation published its subject's label to every node it reached. `Revocation` now carries **`revoked_key_sha256_ed25519_raw`**: the SHA-256 of the key's RAW 32-byte Ed25519 public key, 64 lowercase hex (`federation::key_digest::Sha256Ed25519Raw`, the primitive `derive_key_id` truncates). It is required and SIGNED: the revocation binding goes from 7 to **8 members** (`REVOCATION_BINDING_MEMBERS`), so every revocation preimage moves. **`revoked_key_id` is now `Option<String>`**, bound as JSON `null` when absent. When present it must name a key this node holds with the same digest; otherwise the row is refused `revocation_subject_digest_mismatch`, or `revocation_subject_unresolved` (retryable) when the key is not held. A digest that is not 64 lowercase hex is refused `revocation_subject_digest_malformed`. All three come as `Error::RevocationSubjectRefused` (Python `ValueError`), from `admission::check_revocation_subject` in the shared `verify_revocation_admission`.
+
+**Changed — a digest-only revocation of a key this node does not hold is ADMITTED (decision D1).** Authority on this plane belongs to the revoker and is judged without the subject's record. Every reader keys on the digest, so the revocation bites the moment the key record arrives. This deliberately relaxes V004's "cannot revoke a key not in the directory": V163 drops the FK on `revoked_key_id`.
+
+**Changed — every reader keys on the digest.** `FederationDirectory::revocations_for(key_id)` is now PROVIDED: it resolves the held key's digest and asks the new required **`revocations_for_subject(digest)`**, so a revocation is found under every label of one key, and a key this node does not hold returns none. The following re-key to the subject as well:
+- the per-subject anti-rollback floor and ceiling (`Error::RevocationRollback` / `RevocationScrubSkew` field `revoked_key_id` renamed `revoked_key_sha256_ed25519_raw`);
+- the signed wire-index locator;
+- the key listing's `revoked` filter and the read API's `revoked_key_id` filter;
+- key deletion;
+- `register::fold_key_statement_standing` (new `subject` argument) / `resolve_key_statement_standing`.
+
+Self-revocation is judged by digest (the revoker's own key digests to the subject), so a digest-only self-revocation is still one.
+
+**Migration V163 (both dialects).** `federation_revocations.revoked_key_id` becomes NULLable with no FK, and `revoked_key_sha256_ed25519_raw` is added and indexed.
+- **Postgres** backfills it in SQL (`encode(sha256(decode(pubkey,'base64')),'hex')`), then sets NOT NULL plus a shape CHECK.
+- **SQLite** has no SHA-256, so the table is rebuilt (the V141 staged recipe; `federation_revocation_quorum_state` staged) with the column NULLable. `SqliteBackend::backfill_revocation_subject_digests` fills legacy rows at open and REFUSES the open if one stays NULL. The divergence is declared in `NULLABILITY_DIVERGENCES`.
+- SQLite now registers `ciris_sha256_ed25519_raw()` on every connection, for queries only (rusqlite `functions` feature).
+
+**Changed — directory capsule `DIRECTORY_ABI_VERSION` 6 → 7** (a payload break: `Revocations` / `SignedRevocations` carry the new `Revocation`), plus the appended op `RevocationsForSubject`.
+
+**Added — `moderation:*` rows may name `subject_sha256_ed25519_raw` (decision D2, additive).** `admission::moderation_subject_digest` is the one reading. A present malformed value is refused (`moderation_subject_digest_malformed`); label-bearing rows are NOT refused in v52.
+
+**Changed — clean-break renames:** `store::accord_key_fingerprint` → `sha256_of_pubkey_base64_text` (it hashes the base64 TEXT, which is not a key identifier), and `KeyRegistrationOutcome::RotationCollision.existing_key_fingerprint` → `existing_key_sha256_of_pubkey_base64_text`, including the Python dict key.
+
+**Not changed (deliberate):** the community and family room-removal planes still name `removed_identity_key_id`. Their rows reach exactly the audience that holds the roster, which lists every member's label, so digest-addressing them would hide nothing from anyone who receives them. That wait belongs to label-free rosters. CC erratum drafted for the steward (the preimage moved).
+
+**Witnesses** (memory, sqlite, postgres):
+- I220: the digest is the raw-key primitive (cross-checked against `derive_key_id`'s suffix; differs from the text digest).
+- I221: legacy backfill; sqlite refuses an undigestable legacy subject.
+- I222: a digest-only self-revocation found under both labels of one key, and by the statement-standing fold; two-node, delivered through the served plane to a node that holds a label the origin never saw.
+- I223: a served ban carries no substring of its subject's label.
+- I224: mismatch / unresolved / malformed.
+- I225: the digest is inside the signed bytes.
+- I226: anti-rollback is per key, across labels.
+- I227: D1, a ban of an unheld key bites on arrival.
+- I229: the moderation digest.
+
+**Mutation round** (committed tree 093abf2c; lane = the #784 witnesses + `key_digest` + the #659 projection pin, sqlite+memory; M10 on postgres): **10/10 killed.**
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M1 | the digest hashes the base64 TEXT | I220 |
+| M2 | the key_id/digest mismatch check dropped | I224 (memory, sqlite) |
+| M3 | sqlite's subject read keyed on `revoked_key_id` | I222, I222 two-node, I221 |
+| M4 | the digest omitted from the signed binding | the #659 projection pin, I225 |
+| M5 | sqlite anti-rollback keyed on `revoked_key_id` | I226 |
+| M6 | sqlite's open-time backfill skipped | I221 |
+| M7 | D1 flipped: a digest-only row refused | I222, I222 two-node, I227 (memory, sqlite) |
+| M8 | self-revocation recognised by `key_id` only | I222 (memory, sqlite, two-node) |
+| M9 | a malformed moderation digest read as absent | I229 |
+| M10 | postgres's subject read keyed on `revoked_key_id` | I221, I222, I222 two-node on postgres |
+
+**Adopters:**
+- **Edge and Server:** build `Revocation` with the digest (`Sha256Ed25519Raw::from_pubkey_base64`), `revoked_key_id: Option`, and re-mint against the 8-member binding.
+- **Implementors of `FederationDirectory`:** implement `revocations_for_subject`.
+- **Capsule consumers:** pin ABI 7.
+- **Python:** `put_revocation` / `deregister_federation_key` JSON carries `revoked_key_sha256_ed25519_raw`, and the rotation-collision dict key is renamed.
+
+### #957 — a chunk adopt costs the same at the last chunk as at the first; a batched adopt door
+
+**Fixed — the nonce cap scanned the stream on every append (CIRISPersist#957, from CIRISEdge's multi-GiB pull bench).** The chunk floor checked the CEG §10.5.3 cap (`MAX_CHUNKS_PER_EPOCH` chunks per `(stream, epoch)`) with `SELECT COUNT(*) … WHERE stream_id = ? AND epoch = ?` on every append and adopt, a scan of the stream's index range, so a whole stream was quadratic (I286 read the floor's SQLite VM steps: 273 at chunk 16, 3294 at chunk 1023). **V165** (both dialects) adds `federation_stream_epoch_counts`, backfilled by `GROUP BY`; the floor steps it with one primary-key upsert (`+1 … RETURNING`) inside the item's savepoint, so a refused item's step rolls back. On postgres the upsert row-locks the counter, serializing concurrent appends to one stream, which the old `COUNT` under READ COMMITTED did not. `abandon_stream` deletes the counters with the rows (a from-disk gate requires every production chunk-row `DELETE` to). The cap refusal is `InvalidArgument` on both backends (sqlite used to surface it as `Backend("put_blob_chunk tx: …")`).
+
+**Added — `adopt_sealed_chunks` (CIRISPersist#957).** `BlobStorage::adopt_sealed_chunks_at`, `adopt_cascade::adopt_sealed_chunks` (+ `AdoptChunkItem`), `Engine::adopt_sealed_chunks`, pyo3 `adopt_sealed_chunks_json`: up to `MAX_CHUNKS_PER_BATCH` (64) chunks / `MAX_BATCH_BYTES` (32 MiB) of one stream at one epoch under one provenance, in ONE write transaction. The provenance, `would_hold`, the bounds and the stream's claim are checked once; a refusal there is the outer `Err` with nothing written. Each item then runs in its own savepoint and answers in its slot, in order (a malformed envelope, a seq conflict, the cap refuse that item alone). A batch that lands nothing commits nothing, so a refused first append never claims a stream. `adopt_sealed_chunk` and `put_blob_chunk_floor` are now batches of one: one floor body per backend. Python: `adopt_sealed_chunks_json({stream_id, epoch, chunks:[{seq, envelope_b64, plaintext_size}], <provenance>})` → `{"results":[{"seq","chunk_sha256"} | {"seq","error"}]}`. **Rust implementors of `BlobStorage` must add `adopt_sealed_chunks_at`.**
+
+Witnesses (`federation::adopt_batch_invariants`, `blob_surface_gates`): **I286** (sqlite) floor VM steps flat in stream length (RED on the pre-fix floor); **I287** (sqlite, postgres) the cap bites exactly, refuses by name, a refusal and a seq conflict step nothing; **I288** (sqlite, postgres) counters equal the `GROUP BY` through appends, conflicts, a partial batch and `abandon_stream`, a rewrite of the abandoned id counts nothing, the same bytes under a fresh id count from one; the V165 backfill over existing rows (sqlite); the from-disk delete gate; **I289** (sqlite, postgres) a batch equals N singles (same addresses, rows, counters), a mid-batch conflict refuses one item, the cascade refuses a non-envelope item by shape and stores the rest; **I290** (sqlite, postgres) a stream-level refusal (another author, abandoned, reserved id) writes no blob row, index row or counter, and an all-refused first batch claims nothing; **I291** = I45 extended to the six new adopt bodies (21 inspected). I72 now requires the single door to delegate to the batch door.
+
+MEASURED (this machine, sqlite, file-backed, one lane; wall-clock at 256 KiB chunks is disk-bound and repeated rounds of the same binary differ by up to 3×, so no speedup is claimed): 8192 × 256 KiB single-chunk adopts, interleaved pre/post: 62.7 s → 50.1 s and 51.3 s → 40.5 s; per-chunk at the stream's end within noise of its start on both. Batches of 8 on one lane: 6.8–8.7 ms/chunk against 5.6–5.9 single — no one-lane gain. The batch door is for Edge's eight lanes on one writer; Edge's 2 GiB bench measures it end to end.
+
+### #958 — the signing form without cloning the envelope
+
+**Changed — performance, no byte change (CIRISPersist#958).** `canonicalize_envelope_for_signing` and `canonicalize_envelope_for_signing_v1_pinned` deep-cloned the whole envelope to delete two top-level members. The strip is now a filter while serializing: a borrowed `SigningView` over the top-level map through `serde_jcs` (the RFC 8785 implementation `ciris_verify_core::jcs::canonicalize` calls; a direct `serde_jcs = "=0.2.0"`, with a gate refusing a lock that holds two versions), and a skip-aware `write_object` on the Python-compat rule. Only top-level members are stripped. No hash, vector or ABI moves. **I292** proptest (2048 cases per run, four seeded runs: non-BMP vs U+E000 keys, big/exponent numbers, nested and top-level signature members, non-object values) and fixed edges: new == the pre-#958 clone-and-remove on both rules; literal bytes pin that a nested `signature` is kept. **I293**: every pinned signing vector passes unchanged. **I294** (`tests/canon_alloc_958.rs`, counting allocator): over a 262,144-entry integer-array envelope the signing form allocates 9.10 MB against 18.16 MB; the clone alone is 9.06 MB. **I295**: Cargo.lock holds one `serde_jcs`.
+
+**Mutation round** (committed tree 74638703, M11's rerun on 9668e505; lane = `adopt_batch_invariants` + `verify::canonical` + I294 + the I45/I288/I72 gates on sqlite; M8, M9, M14 on the postgres runners, non-vacuous at 0.6–1.4 s each): **14 / 14 killed**, plus M0 = I286's RED on the pre-fix floor.
+
+| # | mutant | killed by |
+|---|---|---|
+| M1 | sqlite counter never steps | I287, I288, I289 |
+| M2 | sqlite cap off by one | I287 |
+| M3 | abandon keeps the counters | I288, I290, the delete gate |
+| M4 | a refused item keeps its savepoint | I288, I290 |
+| M5 | a batch that landed nothing commits (claims the stream) | I290 |
+| M6 | the single adopt stores around the batch door | I72 |
+| M7 | V165 backfill ignores the epoch | I288 backfill |
+| M8 | postgres counter never steps | I287, I288, I289 (pg) |
+| M9 | postgres refused item released, not rolled back | I288, I289 (pg) |
+| M10 | the skip list misses `signature_pqc` | I292, I294, existing strip tests |
+| M11 | the V1 writer strips at every depth | SURVIVED the first round (the V1 oracle shares `write_value`); killed by the literal-bytes witness added for it |
+| M12 | the clone is back | I294 |
+| M13 | the signing form hard-wired to the V1 rule | I292, `for_signing_matches_the_produce_gate_byte_for_byte` |
+| M14 | postgres cap off by one | I287 (pg) |
+
+### #672 — a re-offer of a held record settles before verification (CIRISPersist#672)
+Transitive propagation had no bound on re-injection: a peer re-offering rows this node already held paid the full apply every time, and on the attestation plane each re-offer was charged to the sender's per-peer write quota before the duplicate was noticed. **`replication_policy::settle_if_held(dir, kind, record)`** now runs first in every replicated door on memory, sqlite and postgres (17 kinds). It serializes the arriving record exactly as the wire index hashes it and settles, with no state change, only when the index entry resolves to a held row whose bytes are identical. In `put_attestation` it runs after the pure envelope gates and before the per-peer quota. Misses, purged, evicted or erased rows (the lookup reloads the row) and differing bodies under a held id all take the full apply unchanged. `AccordQuorumEvidence` and `KeyGrant` are exempt, with written reasons (`SETTLE_EXEMPT`). Each settle counts on `already_held_count(kind)` and emits `persist_replication_already_held_total{kind}`. **Behaviour change:** on planes whose doors refused an identical resubmission (anti-rollback, PK conflict), a byte-identical re-offer of a held row is now idempotent success, the #771 doctrine. No wire, hash, preimage or migration change. Persist builds no hop counter; closing the relay half waits on Edge confirming that no path pushes bodies the receiver did not request (`FSD/HELD_RECORD_SETTLE.md`).
+
+Witnesses (memory, sqlite, postgres):
+- **I230:** every seeded kind (Key, Attestation, Revocation, LocationProof, Family, Community), re-offered as served, answers held and counts.
+- **I231:** a differing body is refused on its merits; a purged row whose index entry survives is admitted again.
+- **I233:** a three-node cycle returns held.
+- **I234:** 1 000 held re-offers exceed the 600-per-window quota, and all settle.
+- **I235** (from disk): every replicated door in every backend settles first, under its own kind, or is exempt with a reason.
+
+Mutation round (lane = `held_settle_invariants` on memory + sqlite; the postgres mutants on the postgres leg): 10 killed, 1 equivalent.
+- Killed:
+  - M1: the settle never settles (the pre-fix behaviour; I230, I233 and I234 red on memory and sqlite);
+  - M3: the counter is not incremented;
+  - M4 and M10: the attestation settle is removed on sqlite and postgres (I234: the quota drains);
+  - M5′, M8′, M9′: one door's settle short-circuited off (sqlite Family, memory Revocation, postgres Community);
+  - M6: a door settles under the wrong kind;
+  - M7: a settling kind is also listed as exempt;
+  - M11: the settle is placed after verification.
+- Equivalent, M2: dropping the byte compare. The lookup already requires the reloaded row's sha256 to equal the arriving bytes' hash, so the compare is defense in depth.
+- First-round note: the M5 and M9 mutants of the first round appended `&& false` after the call. That still evaluated and counted the settle, so they did not remove it. They were rerun as a leading `false &&`, which short-circuits the call.
+
 ## [51.3.0] - UNRELEASED
 
 **MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.

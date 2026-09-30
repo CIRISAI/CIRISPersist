@@ -64,6 +64,52 @@ pub fn log_id_for_stream(stream_id: &str) -> String {
     format!("{STREAM_LOG_ID_PREFIX}{stream_id}")
 }
 
+/// v52.0.0 (CIRISPersist#953) — **the stream id of an inline blob's log**:
+/// its SHA-256 as 64 lowercase hex. An inline blob has no stream rows; its
+/// log has ONE leaf, the blob's own sha, so `produce_stream_sth(local,
+/// &inline_blob_stream_id(&sha), &[sha], 1, t)` builds the STH that
+/// `put_stream_sth` accepts for it (CC 5.3.3.6: an inline file is
+/// receiptable like a chunked one).
+#[must_use]
+pub fn inline_blob_stream_id(sha: &[u8; 32]) -> String {
+    hex::encode(sha)
+}
+
+/// v52.0.0 (#953) — the inline blob a stream id names, if it has the one
+/// spelling [`inline_blob_stream_id`] produces (64 lowercase hex).
+#[must_use]
+pub fn inline_blob_of_stream_id(stream_id: &str) -> Option<[u8; 32]> {
+    if stream_id.len() != 64
+        || !stream_id
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(stream_id, &mut out).ok()?;
+    Some(out)
+}
+
+/// v52.0.0 (#953) — **a stream id shaped like a SHA-256 is reserved for the
+/// inline blob it names.** The chunk floor refuses to write stream rows
+/// under one (either case), so no chunked stream can take an inline blob's
+/// log name and turn its one-leaf STH into an equivocation.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] for a 64-hex-digit `stream_id`.
+pub fn refuse_reserved_stream_id(stream_id: &str) -> Result<(), BlobError> {
+    if stream_id.len() == 64 && stream_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(BlobError::InvalidArgument(format!(
+            "stream_id {stream_id:?} is shaped like a SHA-256; that name is reserved for the \
+             one-leaf log of the inline blob it names (CIRISPersist#953) — name the stream \
+             anything else"
+        )));
+    }
+    Ok(())
+}
+
 /// v4.1 (Cut C1b) — a [`TransparencyLeaf`] wrapping one stream chunk's
 /// 32-byte SHA-256 (a `federation_stream_chunks.chunk_sha`).
 ///
@@ -134,6 +180,65 @@ fn build_store(
             .map_err(|e| BlobError::Backend(format!("stream-sth append leaf: {e}")))?;
     }
     Ok(store)
+}
+
+/// v52.0.0 (CIRISPersist#950, for CIRISEdge#734) — **the per-stream STH
+/// producer.** The one place a Signed Tree Head over a chunk-DAG file's
+/// stream is minted: the RFC 6962 root over `chunk_shas` (the stream's
+/// `chunk_sha` values in `seq` order; the first `tree_size` of them are the
+/// leaves), the log id [`log_id_for_stream`], the signing bytes
+/// [`SignedTreeHead::signing_bytes`], and the producer's HYBRID signature
+/// under `local` — exactly what [`recompute_and_assert_root`] (the
+/// anti-equivocation gate `put_stream_sth` runs) recomputes and what
+/// `verify_stream_sth_signature` verifies against the producer's pinned
+/// keys. A host that publishes an STH through anything else reimplements
+/// these bytes; this is so it does not have to.
+///
+/// No production path publishes a stream STH on its own (`put_blob_chunks`,
+/// `put_blob_chunk_scoped` and `seal_stream_scoped` write chunks and the
+/// manifest only); the host publishes at its own "file is complete" step.
+/// A one-leaf STH over an inline file's single chunk is valid, so every file
+/// is receiptable (CC 5.3.3.6).
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] when `tree_size` is 0 or exceeds
+/// `chunk_shas.len()`; [`BlobError::Backend`] when the signer fails.
+pub async fn produce_stream_sth(
+    local: &crate::signing::LocalSigner,
+    stream_id: &str,
+    chunk_shas: &[[u8; 32]],
+    tree_size: u64,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<SignedTreeHead, BlobError> {
+    let n = usize::try_from(tree_size).map_err(|_| {
+        BlobError::InvalidArgument("produce_stream_sth: tree_size exceeds usize".into())
+    })?;
+    if n == 0 || n > chunk_shas.len() {
+        return Err(BlobError::InvalidArgument(format!(
+            "produce_stream_sth: tree_size {tree_size} must be in 1..={} (the chunks held, in seq \
+             order)",
+            chunk_shas.len()
+        )));
+    }
+    let store = build_store(&chunk_shas[..n])?;
+    let root_hash = store
+        .root()
+        .map_err(|e| BlobError::Backend(format!("stream-sth root: {e}")))?;
+    let log_id = log_id_for_stream(stream_id);
+    let signing_bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
+    let signature = local
+        .sign_hybrid(&signing_bytes)
+        .await
+        .map_err(|e| BlobError::Backend(format!("produce_stream_sth: signer: {e}")))?;
+    Ok(SignedTreeHead {
+        log_id,
+        tree_size,
+        root_hash,
+        timestamp,
+        signature,
+        witness_signatures: Vec::new(),
+    })
 }
 
 /// v4.1 (Cut C1b) — **the anti-equivocation gate** (steps 2–4).

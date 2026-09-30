@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "51.3.0"
+version = "52.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -913,6 +913,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde",
+ "serde_jcs",
  "serde_json",
  "serde_json_canonicalizer",
  "serial_test",

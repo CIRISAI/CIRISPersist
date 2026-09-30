@@ -1153,6 +1153,169 @@ pub mod two_node {
         );
     }
 
+    // ── I199 ─────────────────────────────────────────────────────────────
+    /// **I199 (CIRISPersist#953) — a family member publishes a family blob
+    /// and another member's node opens it.** The content-axis set names its
+    /// family as the cohort target the write gate reads (`family_key_id`), so
+    /// the author's own door stores it and the peer's apply door admits it.
+    /// Before #953 the set carried the family only as `owner_key_id`, and
+    /// both doors refused it `scope_no_family_membership`.
+    pub async fn exercise_i199_family_member_publishes_and_another_opens<B>(
+        a: &Node<'_, B>,
+        b: &Node<'_, B>,
+        tag: &str,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        use crate::federation::types::cohort_scope::FAMILY;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let fam = format!("{tag}-fam-{run}");
+        let alice = format!("{tag}-alice-{run}");
+        let bob = format!("{tag}-bob-{run}");
+        for n in [a, b] {
+            ts::register_hybrid_key_as(n.backend, &fam, &fam, USER).await;
+            for (ident, dev) in [(&alice, a), (&bob, b)] {
+                ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
+                n.backend
+                    .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+                        identity_key_id: ident.clone(),
+                        occurrence_key_id: dev.key.clone(),
+                        device_class: crate::federation::types::device_class::SERVER.into(),
+                        hardware_attestation: None,
+                        asserted_at: chrono::Utc::now(),
+                        valid_until: None,
+                        encryption_pubkeys: Some(dev.kem.clone()),
+                        transport_binding: None,
+                        persist_row_hash: String::new(),
+                    })
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag} I199: occurrence of {ident}: {e}"));
+            }
+            let members = [&alice, &bob]
+                .iter()
+                .map(|k| crate::federation::types::FamilyMember {
+                    key_id: (*k).clone(),
+                    joined_at: chrono::Utc::now(),
+                    role: None,
+                })
+                .collect();
+            n.backend
+                .put_family(ts::sign_family(
+                    &fam,
+                    crate::federation::types::Family {
+                        family_key_id: fam.clone(),
+                        family_name: "I199 Household".into(),
+                        members,
+                        founded_at: chrono::Utc::now(),
+                        consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
+                            .to_owned(),
+                        consensus_protocol_entrenched: false,
+                        dissolved_at: None,
+                        persist_row_hash: String::new(),
+                    },
+                ))
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I199: seed family: {e}"));
+        }
+        let sealed = encrypt_and_cascade(
+            a.backend,
+            FAMILY,
+            &fam,
+            b"the household budget",
+            None,
+            None,
+            Some(&a.key),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I199: alice's node seals the family blob: {e}"));
+        assert!(
+            sealed.granted.contains(&b.key),
+            "{tag} I199: bob's occurrence is granted at the seal: {:?}",
+            sealed.granted
+        );
+        let sha = sealed.at_rest_sha256;
+        let emitted =
+            emit_content_key_grant_with_local_signer(a.backend, &a.signer, &sha, FAMILY, &fam)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{tag} I199: the author's own door stores the family set: {e}")
+                })
+                .expect("the family set has wraps");
+        let row = a
+            .backend
+            .get_attestation(&emitted.attestation_id)
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(
+            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)
+                .unwrap(),
+            Some(fam.as_str()),
+            "{tag} I199: the set names its family where the write gate reads the target"
+        );
+        carry_key_grant(a, b, &emitted.attestation_id)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I199: bob's node admits the family set: {e}"));
+        carry_bytes(
+            a,
+            b,
+            &sha,
+            FAMILY,
+            &fam,
+            None,
+            CryptoTier::InvisibleEncrypted,
+            // #960 — NO operator family predicate: production never installs
+            // one, so bob's node must find its party-ness in the family
+            // roster, not in a predicate the test supplies.
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I199: bob's node adopts the family bytes: {e}"));
+        // #960 — and a node none of whose principals is in the family is
+        // still not party to it, on the same directory.
+        let stranger_node = format!("{tag}-stranger-node-{run}");
+        assert!(
+            !crate::federation::replication::hold::is_audience(
+                b.backend,
+                FAMILY,
+                Some(&fam),
+                &a.key,
+                |_| false,
+                &stranger_node,
+            )
+            .await
+            .unwrap(),
+            "{tag} I199: a non-member node is not audience of family content"
+        );
+        assert!(
+            crate::federation::replication::hold::is_audience(
+                b.backend,
+                FAMILY,
+                Some(&fam),
+                &a.key,
+                |_| false,
+                &b.key,
+            )
+            .await
+            .unwrap(),
+            "{tag} I199: bob's node is audience by the family roster alone"
+        );
+        assert_eq!(
+            read_any_for_viewer(b.backend, &sha, &b.key, None)
+                .await
+                .unwrap_or_else(|e| panic!("{tag} I199: bob's node opens the family blob: {e}")),
+            b"the household budget"
+        );
+        let err = read_any_for_viewer(b.backend, &sha, &format!("{tag}-stranger-{run}"), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BlobError::NotGranted { .. }),
+            "{tag} I199: a non-member stays refused: {err:?}"
+        );
+    }
+
     /// **I71 — rotation is keyed on the removal's EFFECTIVE instant** (PR
     /// #850 review). A removal admitted with a future `effective_at` (inside
     /// the skew window) and a bump-and-seal in between mint an epoch NEWER
@@ -2399,11 +2562,17 @@ mod tests {
                 .match_indices(&needle)
                 .map(|(i, _)| enclosing_fn(&prod, i))
                 .collect();
-            let allowed: std::collections::BTreeSet<String> =
-                ["delete_blob", "community_dek_evict_epoch_objects"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect();
+            // v52.0.0 (#954) — `abandon_stream_floor` evicts an abandoned
+            // stream's sealed chunk rows; each grant delete rides the delete
+            // of its own blob row in the same transaction (blob deletion).
+            let allowed: std::collections::BTreeSet<String> = [
+                "delete_blob",
+                "community_dek_evict_epoch_objects",
+                "abandon_stream_floor",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
             assert!(
                 fns.is_subset(&allowed),
                 "I67: {file}: at-rest grant deletes may ride only blob deletion, found in {fns:?}"
@@ -2467,23 +2636,35 @@ mod tests {
 
     /// **I72 (from disk) — both adopt doors reconcile pending content sets**
     /// (PR #850, round three): a self/family chunk has its own DEK and its
-    /// own set, so `adopt_sealed_chunk` projects exactly as `adopt_sealed_blob`.
+    /// own set, so the chunk adopt projects exactly as `adopt_sealed_blob`.
+    /// v52.0.0 (#957): the chunk door that stores is the batched
+    /// `adopt_sealed_chunks`; the single `adopt_sealed_chunk` is a batch of
+    /// one and must delegate to it, never store around it.
     #[test]
     fn i72_both_adopt_doors_project_pending_content_grants() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join("src/federation/adopt_cascade.rs")).unwrap();
         let prod = production_only(&text);
-        for door in ["adopt_sealed_blob", "adopt_sealed_chunk"] {
+        let body = |door: &str| {
             let start = prod.find(&format!("pub async fn {door}<")).unwrap();
             let end = prod[start + 1..]
-                .find("\npub async fn ")
+                .find("\npub ")
                 .map(|i| start + 1 + i)
                 .unwrap_or(prod.len());
+            prod[start..end].to_owned()
+        };
+        for door in ["adopt_sealed_blob", "adopt_sealed_chunks"] {
             assert!(
-                prod[start..end].contains("project_pending_content_grants("),
+                body(door).contains("project_pending_content_grants("),
                 "I72: {door} must project the pending content sets once the row names its author"
             );
         }
+        let single = body("adopt_sealed_chunk");
+        assert!(
+            single.contains("adopt_sealed_chunks(") && !single.contains("adopt_sealed_chunk_at("),
+            "I72: adopt_sealed_chunk must be a batch of one through adopt_sealed_chunks, never a \
+             second path to the floor that could skip the projection"
+        );
     }
 
     /// **I78 (from disk, #851) — the occurrence plane advertises signed-put
@@ -3207,6 +3388,15 @@ mod tests {
             let c = node(&bc, "i64-c").await;
             introduce(&[&a, &b, &c], &["i64-a", "i64-b", "i64-c"]).await;
             exercise_i64_two_minters_same_epoch(&a, &b, &c, "sqlite").await;
+        }
+
+        #[tokio::test]
+        async fn i199_family_member_publishes_and_another_opens_sqlite() {
+            let (ba, bb) = (fresh().await, fresh().await);
+            let a = node(&ba, "i199-a").await;
+            let b = node(&bb, "i199-b").await;
+            introduce(&[&a, &b], &["i199-a", "i199-b"]).await;
+            exercise_i199_family_member_publishes_and_another_opens(&a, &b, "sqlite").await;
         }
 
         #[tokio::test]
@@ -4625,6 +4815,18 @@ mod tests {
             let c = node(&bc, "i64-c").await;
             introduce(&[&a, &b, &c], &["i64-a", "i64-b", "i64-c"]).await;
             exercise_i64_two_minters_same_epoch(&a, &b, &c, "postgres").await;
+        }
+
+        #[tokio::test]
+        async fn i199_family_member_publishes_and_another_opens_postgres() {
+            let (Some(ba), Some(bb)) = (fresh().await, fresh().await) else {
+                eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+                return;
+            };
+            let a = node(&ba, "i199-a").await;
+            let b = node(&bb, "i199-b").await;
+            introduce(&[&a, &b], &["i199-a", "i199-b"]).await;
+            exercise_i199_family_member_publishes_and_another_opens(&a, &b, "postgres").await;
         }
 
         #[tokio::test]

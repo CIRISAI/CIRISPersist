@@ -113,26 +113,53 @@ pub mod epoch_minter_invariants;
 pub mod self_collective;
 // CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
 // delivered, not discovered — the send set, the re-grant doors, the minter read.
+/// v52.0.0 (CIRISPersist#957) — the chunk adopt cost and batch door witnesses
+/// (I286–I291).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod adopt_batch_invariants;
 /// v47.2.0 (CIRISPersist#853) — CC 2.3 at the bytes plane: the binding fold.
 pub mod blob_tombstone;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bytes_plane_tombstone_invariants;
+pub mod community_trust_consent;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod community_trust_consent_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+/// v52.0.0 (CIRISPersist#956) — a quorum-family's leave and dissolve replicate as amendments.
+pub mod family_dissolution;
+/// v52.0.0 (CIRISPersist#956) — I280–I285.
+#[cfg(test)]
+pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
+/// v52.0.0 (CIRISPersist#672) — I230–I235: the held-record settle.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod held_settle_invariants;
 /// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
 #[cfg(test)]
 pub mod listing_invariants;
+/// v52.0.0 (CIRISPersist#955) — the joiner's signed acceptance.
+pub mod membership_acceptance;
+/// v52.0.0 (CIRISPersist#955) — I210–I219.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod membership_acceptance_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
+/// v52.0.0 (CIRISPersist#954) — the nested manifest and abandon_stream witnesses
+/// (I202–I209).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod nested_manifest_invariants;
+/// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
+#[cfg(test)]
+pub(crate) mod occurrence_history_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
@@ -151,6 +178,8 @@ pub mod scope_classifier_invariants;
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
 #[cfg(test)]
 pub mod sweep_placement_invariants;
@@ -197,6 +226,8 @@ pub mod goal;
 pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
+// CIRISPersist#784 — a key named by the SHA-256 of its raw Ed25519 pubkey.
+pub mod key_digest;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
 // the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
 pub mod key_grant;
@@ -496,13 +527,14 @@ pub use admission::{
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
-    BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow, BlobRange, BlobStorage,
-    ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding, EvictActorReport,
-    EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestRowSpec, MemberGrant,
+    AbandonFloorReport, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow,
+    BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding,
+    EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestChildRef,
+    ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest, ParsedManifest,
     PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
     StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION,
-    CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX,
-    HOLDS_BYTES_PREFIX_HEX_LEN,
+    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
+    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
@@ -573,7 +605,7 @@ pub use replication::admission::{PeerQuotaRefusal, PeerQuotaRefused};
 // #846 (BLOB_REPLICATION.md §4/§6) — the provenance a consumer declares to the
 // adopt doors and the breadth answer it reads; named here so a Rust consumer
 // does not have to path into `replication::hold`.
-pub use adopt_cascade::{AdoptDisposition, AdoptOutcome};
+pub use adopt_cascade::{AdoptChunkItem, AdoptDisposition, AdoptOutcome};
 pub use replication::hold::{
     is_audience, is_proxy_content, would_hold, BlobProvenance, HoldBreadth, HoldContext,
 };
@@ -618,6 +650,7 @@ pub use topology::{
     FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology, WithdrawalEntry,
     DEFAULT_DELEGATION_DEPTH, MAX_DELEGATION_DEPTH,
 };
+pub use types::OccurrenceAssertion;
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
@@ -643,6 +676,20 @@ pub use types::{
     FamilyMembershipWidening, ServedFamilyMembershipWidening, SignedFamilyMembershipWidening,
 };
 pub use types::{GroupSupersedeProof, RosterCosignature, RosterEventSigner};
+
+/// v52.0.0 (CIRISPersist#930) — the ONE order every backend returns the
+/// occurrence history in: `(asserted_at, identity_key_id, attesting_key_id)`
+/// ascending, a trusted-local row (`None`) first among equals. Sorted on the
+/// parsed instant, never on a stored text spelling.
+pub fn sort_occurrence_history(rows: &mut [OccurrenceAssertion]) {
+    rows.sort_by(|a, b| {
+        (a.asserted_at, &a.identity_key_id, &a.attesting_key_id).cmp(&(
+            b.asserted_at,
+            &b.identity_key_id,
+            &b.attesting_key_id,
+        ))
+    });
+}
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
 /// revocations** fold, shared by every "currently-active membership"
@@ -944,25 +991,27 @@ where
 /// v50.0.0 (CIRISPersist#925, review H1 + item 5) — `key_id`'s own `node`
 /// bearing and the intervals it is an agreed occurrence of a `node` identity.
 ///
-/// # Agreement (review H1)
+/// # Agreement (review H1; an instant since v52.0.0, #930)
 ///
 /// An occurrence row is admitted when its signer is the IDENTITY itself
 /// (`check_signer_acts_for`), so the occurrence never has to consent: any
 /// registered `node` key N could sign `{identity: N, occurrence: H}` for a
-/// human founder H and strip H's vote. So a binding counts only when the
-/// occurrence itself signed its binding ([`occurrence_agreed_to`]). A trusted-local
-/// (unsigned) row carries no agreement. #873's principal resolver
-/// ([`FederationDirectory::active_identities_for_occurrence`]) has the same
-/// unilateral-claim shape and is a follow-up (FSD `SECOND_DEVICE.md` §8.5).
+/// human founder H and strip H's vote. So a binding counts only from the
+/// instant the occurrence itself first signed an assertion of it
+/// ([`occurrence_agreed_from`]). A trusted-local (unsigned) row carries no
+/// agreement.
 ///
-/// # The interval (review item 5)
+/// # The intervals (review item 5; every assertion since v52.0.0, #930)
 ///
-/// Every stored binding of `key_id` under a `node` identity it agreed to
-/// contributes `[asserted_at, end)`, `end` the earliest of its `valid_until`
-/// and the `effective_at` of any revocation of it that is in force against
-/// this assertion (`effective_at >= asserted_at`, the #421 re-establishment
-/// rule). The occurrence plane stores the LATEST assertion per pair, so a
-/// re-assertion moves the start forward; see FSD §8.5 for that residual.
+/// Every admitted assertion of `key_id` under a `node` identity it agreed to
+/// (the V161 history, [`FederationDirectory::list_identity_occurrence_history_by_occurrence`])
+/// contributes `[max(asserted_at, agreed_from), end)`, `end` the earliest of
+/// its `valid_until` and the `effective_at` of any revocation of it in force
+/// against that assertion (`effective_at >= asserted_at`, the #421
+/// re-establishment rule). The intervals union. Before V161 the plane kept only
+/// the latest assertion, so a renewal moved the start forward and an identity
+/// re-signing erased the occurrence's agreement, changing earlier verdicts
+/// after the fact (FSD `SECOND_DEVICE.md` §8.5).
 pub async fn node_bearing_of<F>(
     directory: &F,
     key_id: &str,
@@ -980,41 +1029,96 @@ where
     {
         return Ok((true, Vec::new()));
     }
+    let history = directory
+        .list_identity_occurrence_history_by_occurrence(key_id)
+        .await?;
+    let identities: std::collections::BTreeSet<&str> = history
+        .iter()
+        .map(|a| a.identity_key_id.as_str())
+        .filter(|i| *i != key_id)
+        .collect();
     let mut intervals = Vec::new();
-    for row in directory
-        .list_identity_occurrences_by_occurrence_key(key_id)
-        .await?
-    {
-        if row.identity_key_id == key_id {
-            continue;
-        }
+    for identity in identities {
         let node_identity = directory
-            .lookup_public_key(&row.identity_key_id)
+            .lookup_public_key(identity)
             .await?
             .is_some_and(|rec| has_node(&rec));
-        if !node_identity || !occurrence_agreed_to(directory, &row.identity_key_id, key_id).await? {
+        if !node_identity {
             continue;
         }
-        let revoked = directory
-            .list_identity_occurrence_revocations_for(&row.identity_key_id)
+        let Some(agreed_from) = agreed_from_in(&history, identity, key_id) else {
+            continue;
+        };
+        let revocations: Vec<chrono::DateTime<chrono::Utc>> = directory
+            .list_identity_occurrence_revocations_for(identity)
             .await?
             .into_iter()
-            .filter(|r| r.occurrence_key_id == key_id && r.effective_at >= row.asserted_at)
+            .filter(|r| r.occurrence_key_id == key_id)
             .map(|r| r.effective_at)
-            .min();
-        let end = match (revoked, row.valid_until) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        intervals.push((row.asserted_at, end));
+            .collect();
+        for a in history.iter().filter(|a| a.identity_key_id == identity) {
+            let revoked = revocations
+                .iter()
+                .filter(|e| **e >= a.asserted_at)
+                .min()
+                .copied();
+            let end = match (revoked, a.valid_until) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            };
+            let start = a.asserted_at.max(agreed_from);
+            if end.is_some_and(|e| e <= start) {
+                continue;
+            }
+            intervals.push((start, end));
+        }
     }
     Ok((false, intervals))
 }
 
-/// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself agree to be
-/// an occurrence of `identity`? Yes only when a stored SIGNED occurrence row for
-/// the pair was signed by `occurrence`. An identity's unilateral claim over a
-/// key is not agreement.
+/// The earliest instant `occurrence` itself signed an assertion binding it to
+/// `identity`, in `history`.
+fn agreed_from_in(
+    history: &[types::OccurrenceAssertion],
+    identity: &str,
+    occurrence: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    history
+        .iter()
+        .filter(|a| {
+            a.identity_key_id == identity
+                && a.occurrence_key_id == occurrence
+                && a.attesting_key_id.as_deref() == Some(occurrence)
+        })
+        .map(|a| a.asserted_at)
+        .min()
+}
+
+/// v52.0.0 (CIRISPersist#930) — the instant `occurrence` itself first agreed
+/// to be an occurrence of `identity`: the earliest admitted assertion of the
+/// pair that `occurrence` signed. `None` when it never did. An identity's
+/// unilateral claim over a key is not agreement, and a later re-signing by the
+/// identity does not erase it (the V161 history keeps every assertion).
+pub async fn occurrence_agreed_from<F>(
+    directory: &F,
+    identity: &str,
+    occurrence: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // v50.0.0 (review, final check) — no owner-binding arm. An owner-binding
+    // is signed by the OWNER over the key, so it is the identity's own claim
+    // again; it could only fire for a pre-gate fused identity, where it would
+    // be unilateral exactly as H1's row is.
+    let history = directory
+        .list_identity_occurrence_history_by_occurrence(occurrence)
+        .await?;
+    Ok(agreed_from_in(&history, identity, occurrence))
+}
+
+/// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself ever agree
+/// to be an occurrence of `identity`? [`occurrence_agreed_from`] is `Some`.
 pub async fn occurrence_agreed_to<F>(
     directory: &F,
     identity: &str,
@@ -1023,19 +1127,9 @@ pub async fn occurrence_agreed_to<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let signed_by_occurrence = directory
-        .list_signed_identity_occurrences_for(identity)
+    Ok(occurrence_agreed_from(directory, identity, occurrence)
         .await?
-        .iter()
-        .any(|s| {
-            s.identity_occurrence.occurrence_key_id == occurrence
-                && s.attesting_key_id == occurrence
-        });
-    // v50.0.0 (review, final check) — no owner-binding arm. An owner-binding
-    // is signed by the OWNER over the key, so it is the identity's own claim
-    // again; it could only fire for a pre-gate fused identity, where it would
-    // be unilateral exactly as H1's row is.
-    Ok(signed_by_occurrence)
+        .is_some())
 }
 
 /// v50.0.0 (CIRISPersist#925) — the `node`-bearing keys among every key that
@@ -1836,6 +1930,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn check_roster_authority_over<F>(
     directory: &F,
+    scope: &'static str,
     group_key_id: &str,
     record_members: &[types::CommunityMember],
     rules: RosterRules<'_>,
@@ -1891,7 +1986,23 @@ where
             offered_authority_key_id: primary.to_owned(),
             rule,
         }
-    })
+    })?;
+    // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
+    // instant) needs the member's own acceptance, under every protocol. The
+    // group's standing above is its decision; this is the member's consent.
+    // A role change of an active member is not a growth.
+    if !is_revocation && !matches!(state.get(&e.member.key_id), Some((true, _))) {
+        membership_acceptance::check_growth_accepted(
+            directory,
+            scope,
+            group_key_id,
+            &e.member.key_id,
+            e.member.role.as_deref(),
+            effective_at,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
@@ -1938,6 +2049,7 @@ where
     );
     Box::pin(check_roster_authority_over(
         directory,
+        types::cohort_scope::COMMUNITY,
         community_key_id,
         &community.members,
         RosterRules::of_community(&community, &nodes),
@@ -1972,6 +2084,8 @@ where
     let Some(family) = directory.lookup_family(family_key_id).await? else {
         return Ok(());
     };
+    // v52.0.0 (CIRISPersist#956) — no roster change on a dissolved family.
+    family_dissolution::refuse_if_dissolved(&family)?;
     let events = Box::pin(family_roster_events(directory, &family)).await?;
     let record: Vec<types::CommunityMember> = family
         .members
@@ -1980,6 +2094,7 @@ where
         .collect();
     Box::pin(check_roster_authority_over(
         directory,
+        types::cohort_scope::FAMILY,
         family_key_id,
         &record,
         RosterRules::of_family(&family),
@@ -3867,10 +3982,37 @@ pub trait FederationDirectory: Send + Sync {
     /// wins under most consumer policies).
     async fn put_revocation(&self, revocation: SignedRevocation) -> Result<(), Error>;
 
-    /// All revocations targeting `revoked_key_id`. Ordered by
+    /// All revocations targeting the key `revoked_key_id`. Ordered by
     /// `effective_at` DESC. Consumers walk this list and apply their
     /// policy ("is K revoked at time T?").
-    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error>;
+    ///
+    /// v52.0.0 (CIRISPersist#784) — PROVIDED, and keyed on the key's digest:
+    /// the held key's RAW pubkey digest is resolved and
+    /// [`Self::revocations_for_subject`] answers. So a revocation that names
+    /// the subject by digest alone, or under another label of the same key,
+    /// is found here too. A key this node does not hold has no digest to ask
+    /// about and returns none (ask [`Self::revocations_for_subject`] with a
+    /// digest in hand).
+    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
+        let Some(key) = self.lookup_public_key(revoked_key_id).await? else {
+            return Ok(Vec::new());
+        };
+        let digest = key_digest::Sha256Ed25519Raw::from_pubkey_base64(&key.pubkey_ed25519_base64)
+            .map_err(|e| {
+            Error::Backend(format!(
+                "revocations_for: stored pubkey of {revoked_key_id:?} is malformed: {e}"
+            ))
+        })?;
+        self.revocations_for_subject(&digest.to_hex()).await
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — all revocations whose SUBJECT is the key
+    /// with this `sha256_ed25519_raw` digest (64 lowercase hex), whether they
+    /// also name a `revoked_key_id` or not. Ordered by `effective_at` DESC.
+    async fn revocations_for_subject(
+        &self,
+        revoked_key_sha256_ed25519_raw: &str,
+    ) -> Result<Vec<Revocation>, Error>;
 
     // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
 
@@ -3983,6 +4125,18 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<IdentityOccurrence>, Error>;
+
+    /// v52.0.0 (CIRISPersist#930) — EVERY admitted assertion binding
+    /// `occurrence_key_id`, under any identity, from the append-only history
+    /// (V161): renewals, re-signings and assertions older than the stored row
+    /// included. Ordered `(asserted_at, identity_key_id, attesting_key_id)`
+    /// ascending on every backend, a trusted-local row (`None`) first among
+    /// equals. The node-bearing fold reads this, never the current-state
+    /// row, so an earlier verdict cannot move.
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<types::OccurrenceAssertion>, Error>;
 
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns `None` if the key is
@@ -5352,6 +5506,10 @@ pub trait FederationDirectory: Send + Sync {
                 "active_family_members names unknown family_key_id {family_key_id:?}"
             ))
         })?;
+        // v52.0.0 (CIRISPersist#956) — a dissolved family has no members.
+        if family.dissolved_at.is_some() {
+            return Ok(Vec::new());
+        }
         authorized_family_roster_at(self, &family, chrono::Utc::now()).await
     }
 
@@ -6181,6 +6339,16 @@ pub trait FederationDirectory: Send + Sync {
         // handed in here was verified by no one, so it is not stored (a peer
         // would refuse it anyway; this node must not serve it as its own).
         new.supersede_proof = None;
+        // v52.0.0 (CIRISPersist#956) — a dissolution enters only through
+        // `supersede_family_with_quorum`. This door's `authorization` is the
+        // caller's own JSON, verified by no one, so it cannot stand in.
+        if new.family.dissolved_at.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "family {}: a dissolution is only a quorum-verified amendment \
+                 (supersede_family_with_quorum; CIRISPersist#956)",
+                new.family.family_key_id
+            )));
+        }
         group_amendment::supersede_family_signed(self, new, authorization).await
     }
 
@@ -6694,13 +6862,30 @@ pub trait FederationDirectory: Send + Sync {
             new.family.consensus_protocol_entrenched,
             &change_envelope,
         )?;
-        self.verify_membership_quorum(
-            cohort::Cohort::Family,
-            &new.family.family_key_id,
-            &change_envelope,
-            &signatures,
-        )
-        .await?;
+        // v52.0.0 (CIRISPersist#956) — a dissolved family admits no change; a
+        // dissolution changes nothing but `dissolved_at`, and is the one the
+        // quorum signed; a self-leave is admitted on the leaver's signature.
+        family_dissolution::refuse_if_dissolved(&prior)?;
+        family_dissolution::check_dissolve_is_terminal_only(&prior, &new.family)?;
+        family_dissolution::check_dissolution_matches_envelope(&new.family, &change_envelope)?;
+        if let Some(leaver) = family_dissolution::self_leave_member(&prior, &new.family) {
+            family_dissolution::verify_self_leave_signature(
+                self,
+                &prior,
+                &change_envelope,
+                &signatures,
+                leaver,
+            )
+            .await?;
+        } else {
+            self.verify_membership_quorum(
+                cohort::Cohort::Family,
+                &new.family.family_key_id,
+                &change_envelope,
+                &signatures,
+            )
+            .await?;
+        }
         let authorization = serde_json::json!({
             "change_envelope": change_envelope,
             "quorum_signatures": signatures,
@@ -6932,7 +7117,15 @@ pub trait FederationDirectory: Send + Sync {
             let mut community_key_ids: Vec<String> = Vec::new();
             if let Some(target) = claimed_target_id {
                 let held = match plane {
-                    TargetPlane::Family => self.lookup_family(target).await?.is_some(),
+                    TargetPlane::Family => match self.lookup_family(target).await? {
+                        // v52.0.0 (CIRISPersist#956) — no row is placed at a
+                        // dissolved family, whoever writes it.
+                        Some(f) => {
+                            family_dissolution::refuse_if_dissolved(&f)?;
+                            true
+                        }
+                        None => false,
+                    },
                     TargetPlane::Room => self.lookup_community(target).await?.is_some(),
                 };
                 if !held {
@@ -8820,6 +9013,25 @@ pub enum Error {
         detail: String,
     },
 
+    /// v52.0.0 (CIRISPersist#784) — a revocation's SUBJECT is not one key
+    /// named one way: its `revoked_key_sha256_ed25519_raw` is not 64 lowercase
+    /// hex, or it also names a `revoked_key_id` whose held key has another
+    /// digest, or it names a `revoked_key_id` this node does not hold (so the
+    /// two names cannot be checked against each other; name the subject by
+    /// digest alone, or re-offer once the key record arrives).
+    /// See [`admission::check_revocation_subject`].
+    #[error("revocation {revocation_id:?}: {reason} — {detail}")]
+    RevocationSubjectRefused {
+        /// The rejected row's `revocation_id`.
+        revocation_id: String,
+        /// `revocation_subject_digest_malformed` /
+        /// `revocation_subject_digest_mismatch` /
+        /// `revocation_subject_unresolved` (retryable).
+        reason: &'static str,
+        /// What the row named and what this node holds.
+        detail: String,
+    },
+
     /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
     /// canonical (JCS) bytes exceed
     /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
@@ -9133,6 +9345,45 @@ pub enum Error {
         /// The primary signer (every signature, co-signers included, verified).
         offered_authority_key_id: String,
         /// Which clause refused; one of the rule tokens above.
+        rule: &'static str,
+    },
+
+    /// v52.0.0 (CIRISPersist#956) — a write naming a family that a
+    /// quorum-verified terminal amendment dissolved. Terminal: the group has
+    /// no members, no roster change, supersede or row placed at it is ever
+    /// admitted again, on the local door or on replication apply. Stable
+    /// `kind()` token `federation_group_dissolved`.
+    #[error(
+        "family {group_key_id:?} was dissolved at {dissolved_at} (CIRISPersist#956): a \
+         dissolved group admits no further change and no row placed at it"
+    )]
+    GroupDissolved {
+        /// The dissolved family.
+        group_key_id: String,
+        /// The instant its quorum signed the dissolution.
+        dissolved_at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — a roster change or
+    /// membership reply refused because the member's own signed consent is
+    /// missing or does not hold: no acceptance of a live proposal
+    /// (`membership_acceptance_unresolved`, RETRYABLE), a reply ahead of its
+    /// proposal (`membership_proposal_unresolved`, RETRYABLE), a decline, an
+    /// expired or withdrawn proposal, a mismatch, both replies, a founding
+    /// member who did not sign, or a supersede that adds. Stable `kind()`
+    /// token `federation_membership_acceptance_refused`; `rule` is one of the
+    /// `membership_acceptance::RULE_*` tokens.
+    #[error(
+        "membership of {member_key_id:?} in group {group_key_id:?} refused ({rule}): nobody \
+         joins a family or community without their own signed acceptance \
+         (CIRISPersist#955)"
+    )]
+    MembershipAcceptanceRefused {
+        /// The family or community.
+        group_key_id: String,
+        /// The member whose consent is missing.
+        member_key_id: String,
+        /// Which clause refused.
         rule: &'static str,
     },
 
@@ -9579,13 +9830,14 @@ pub enum Error {
     /// is the rejected row's. Equal timestamps reject too (strictly
     /// greater is required).
     #[error(
-        "anti-rollback: revocation for {revoked_key_id:?} signed_timestamp \
+        "anti-rollback: revocation for subject {revoked_key_sha256_ed25519_raw} signed_timestamp \
          {submitted_signed_timestamp} is not strictly later than existing \
          {existing_signed_timestamp}"
     )]
     RevocationRollback {
-        /// The `revoked_key_id` the new revocation targets.
-        revoked_key_id: String,
+        /// The SUBJECT the new revocation targets: its `sha256_ed25519_raw`
+        /// digest (v52.0.0, #784 — the latch is per key, not per label).
+        revoked_key_sha256_ed25519_raw: String,
         /// The latest signed_timestamp already on file for this target.
         existing_signed_timestamp: chrono::DateTime<chrono::Utc>,
         /// The submitted (rejected) signed_timestamp.
@@ -9613,15 +9865,15 @@ pub enum Error {
     /// that is not true — there is no existing revocation at that instant.
     /// See [`admission::check_revocation_scrub_skew`].
     #[error(
-        "anti-rollback ceiling: revocation for {revoked_key_id:?} scrub_timestamp \
+        "anti-rollback ceiling: revocation for subject {revoked_key_sha256_ed25519_raw} scrub_timestamp \
          {submitted_signed_timestamp} is {ahead_seconds}s ahead of this node's clock, beyond \
          the {tolerance_seconds}s tolerance. The scrub instant is a MONOTONIC LATCH per \
-         revoked_key_id, so a future-dated one blocks every later de-admission of this key \
+         subject key, so a future-dated one blocks every later de-admission of this key \
          (CIRISPersist#659)"
     )]
     RevocationScrubSkew {
-        /// The `revoked_key_id` the new revocation targets.
-        revoked_key_id: String,
+        /// The SUBJECT the new revocation targets (its `sha256_ed25519_raw`).
+        revoked_key_sha256_ed25519_raw: String,
         /// The submitted (rejected) `scrub_timestamp`.
         submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
         /// How far ahead of this node's clock it sits.
@@ -10671,6 +10923,7 @@ impl Error {
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
+            Error::RevocationSubjectRefused { .. } => "federation_revocation_subject_refused",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
@@ -10687,6 +10940,8 @@ impl Error {
                 "federation_location_authority_unauthorized"
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::MembershipAcceptanceRefused { .. } => "federation_membership_acceptance_refused",
+            Error::GroupDissolved { .. } => "federation_group_dissolved",
             Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
             Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {

@@ -76,6 +76,20 @@ pub struct DeliveryReceipt {
     pub signature: ciris_crypto::HybridSignature,
 }
 
+/// v52.0.0 (CIRISPersist#953) — a receipt as the store HOLDS it: the signed
+/// receipt and the instant this node stored it. `received_at` is the store's
+/// fact, not the subscriber's, so it rides beside the receipt rather than in
+/// it (the signing bytes do not change). It serializes flat: the receipt's
+/// members plus `received_at`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredDeliveryReceipt {
+    /// The receipt as the subscriber signed it.
+    #[serde(flatten)]
+    pub receipt: DeliveryReceipt,
+    /// When this node's `put_delivery_receipt` stored it.
+    pub received_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Build the canonical signing bytes for a receipt (§10.5.4 — the sole
 /// place this cross-impl encoding lives). Matches
 /// [`SignedTreeHead::signing_bytes`]: a `u32` little-endian length

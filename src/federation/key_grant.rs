@@ -274,6 +274,13 @@ impl KeyGrantSet {
                 m.insert("at_rest_sha256".into(), at_rest_sha256.as_str().into());
                 m.insert("cohort_scope".into(), cohort_scope.as_str().into());
                 m.insert("owner_key_id".into(), owner_key_id.as_str().into());
+                // #953 — the write gate reads a row's cohort target from the
+                // envelope's target fields, never from `owner_key_id`. A
+                // family set that named its family only as the owner was
+                // refused `scope_no_family_membership` at its author's door.
+                if cohort_scope == crate::federation::types::cohort_scope::FAMILY {
+                    m.insert("family_key_id".into(), owner_key_id.as_str().into());
+                }
             }
         }
         m.insert(
@@ -343,10 +350,29 @@ impl KeyGrantSet {
                         format!("content-axis key_grant at cohort_scope {scope:?}; only self / family carry per-blob grants"),
                     ));
                 }
+                let owner_key_id = field("owner_key_id")?;
+                // #953 — a family set names its family twice (owner slot and
+                // cohort target) and they are one id; a self set names none.
+                let named_family = env.get("family_key_id");
+                let agrees = if scope == cohort_scope::FAMILY {
+                    named_family.and_then(|v| v.as_str()) == Some(owner_key_id.as_str())
+                } else {
+                    named_family.is_none()
+                };
+                if !agrees {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        format!(
+                            "content-axis key_grant at cohort_scope {scope:?}: `family_key_id` \
+                             {named_family:?} must equal `owner_key_id` {owner_key_id:?} on a \
+                             family set and be absent on a self set"
+                        ),
+                    ));
+                }
                 KeyGrantAxis::Content {
                     at_rest_sha256,
                     cohort_scope: scope,
-                    owner_key_id: field("owner_key_id")?,
+                    owner_key_id,
                 }
             }
             (t, a) => {
@@ -1407,6 +1433,46 @@ mod tests {
                 KeyGrantSet::from_attestation(&row(set.axis.attestation_type(), env)).unwrap();
             assert_eq!(back, set);
         }
+    }
+
+    /// #953 — a family content set names its family as `family_key_id`
+    /// (the cohort target the write gate reads), equal to `owner_key_id`;
+    /// a self set names none. Anything else is `malformed`.
+    #[test]
+    fn a_family_content_set_names_its_family_as_the_target_953() {
+        let family = KeyGrantSet {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: "cd".repeat(32),
+                cohort_scope: "family".into(),
+                owner_key_id: "fam".into(),
+            },
+            wraps: vec![],
+        };
+        let env = serde_json::Value::Object(family.envelope_extra());
+        assert_eq!(env["family_key_id"], "fam");
+        let t = family.axis.attestation_type();
+        assert_eq!(
+            KeyGrantSet::from_attestation(&row(t, env.clone())).unwrap(),
+            family
+        );
+        let malformed = |env: serde_json::Value| {
+            matches!(
+                KeyGrantSet::from_attestation(&row(t, env)),
+                Err(Error::KeyGrantRefused {
+                    reason: "malformed",
+                    ..
+                })
+            )
+        };
+        let mut other = env.clone();
+        other["family_key_id"] = "fam-2".into();
+        assert!(malformed(other), "a family set naming another family");
+        let mut absent = env.clone();
+        absent.as_object_mut().unwrap().remove("family_key_id");
+        assert!(malformed(absent), "a family set naming no target");
+        let mut selfish = env;
+        selfish["cohort_scope"] = "self".into();
+        assert!(malformed(selfish), "a self set naming a family");
     }
 
     /// A type/axis disagreement is `malformed`, not a parse of whichever

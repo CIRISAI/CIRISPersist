@@ -1358,6 +1358,7 @@ fn partner_wins(a: &PartnerRecord, b: &PartnerRecord) -> bool {
 #[allow(dead_code)]
 pub mod test_support {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use base64::Engine as _;
     use ciris_crypto::{ClassicalSigner, Ed25519Signer, MlDsa65Signer, PqcSigner};
     use serde_json::json;
@@ -3610,6 +3611,7 @@ pub mod test_support {
             founded_at,
             consensus_protocol: consensus_protocol.to_owned(),
             consensus_protocol_entrenched: true,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         directory.put_family_local(family).await
@@ -4490,7 +4492,9 @@ pub mod test_support {
                 directory, &accord, &member,
             )
             .await;
-            directory.add_family_member(&accord, member, &spec).await?;
+            directory
+                .add_family_member_consented(&accord, member, &spec)
+                .await?;
         }
 
         let after = trust_root_valid(directory, &user, &accord).await?;
@@ -5305,7 +5309,9 @@ pub mod test_support {
                 directory, &accord, &member,
             )
             .await;
-            directory.add_family_member(&accord, member, &spec).await?;
+            directory
+                .add_family_member_consented(&accord, member, &spec)
+                .await?;
         }
         let after_growth = resolve_transit_eligibility(directory, &user, &peer).await?;
         assert!(

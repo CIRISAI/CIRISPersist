@@ -264,6 +264,49 @@ pub fn cohort_scope_sql_predicate_full(
                     &mut params,
                 ));
             }
+            // v52.0.0 (CIRISPersist#955) — the membership PROPOSAL arm: a
+            // proposal reaches the invitee it names (`subject_key_ids`, the
+            // V106 `attestation_subjects` projection), whatever rooms the
+            // reader is in. The attestation plane only (it is the plane that
+            // carries a cohort target column); only that one dimension.
+            if let (Some(_), Some(dim)) = (cohort_target_col, dimension_col) {
+                if !admission.self_key_ids.is_empty() {
+                    let qualifier = scope_col
+                        .rsplit_once('.')
+                        .map_or(String::new(), |(q, _)| format!("{q}."));
+                    let subjects = match backend {
+                        BackendKind::Postgres => "cirislens.attestation_subjects",
+                        BackendKind::Sqlite => "attestation_subjects",
+                    };
+                    let keys = match backend {
+                        BackendKind::Postgres => {
+                            let ph = placeholder(backend, &mut next);
+                            params.push(ScopeParam::KeyList(
+                                admission.self_key_ids.iter().cloned().collect(),
+                            ));
+                            format!("= ANY({ph})")
+                        }
+                        BackendKind::Sqlite => {
+                            let phs: Vec<String> = admission
+                                .self_key_ids
+                                .iter()
+                                .map(|k| {
+                                    params.push(ScopeParam::Key(k.clone()));
+                                    placeholder(backend, &mut next)
+                                })
+                                .collect();
+                            format!("IN ({})", phs.join(", "))
+                        }
+                    };
+                    let proposal = crate::federation::membership_acceptance::PROPOSAL_DIMENSION;
+                    targeted_branches.push(format!(
+                        "({scope_col} IN ('family','community') AND {dim} = '{proposal}' \
+                         AND EXISTS (SELECT 1 FROM {subjects} ms \
+                         WHERE ms.attestation_id = {qualifier}attestation_id \
+                         AND ms.subject_key_id {keys}))"
+                    ));
+                }
+            }
             let targeted = targeted_branches.join(" OR ");
 
             let frag = format!(

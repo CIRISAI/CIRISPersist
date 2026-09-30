@@ -2532,8 +2532,20 @@ impl Attestation {
 pub struct Revocation {
     /// UUID identifier for this revocation row.
     pub revocation_id: String,
-    /// Key being revoked.
-    pub revoked_key_id: String,
+    /// The revoked key's `key_id`, **optional since v52.0.0 (#784)**: a
+    /// `key_id` carries its keystore label in cleartext, so a revoker may
+    /// name the subject by digest alone. When present it must name a key
+    /// this node holds whose digest is [`Self::revoked_key_sha256_ed25519_raw`]
+    /// — one subject is never named two ways. Absent is bound as JSON `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_key_id: Option<String>,
+    /// v52.0.0 (#784) — **the SUBJECT**: SHA-256 of the revoked key's RAW
+    /// Ed25519 public key, 64 lowercase hex
+    /// ([`crate::federation::key_digest::Sha256Ed25519Raw`]). Required and
+    /// signed. Every reader keys on this, so a revocation bites every label
+    /// of one key, and one issued before the key record arrived bites when
+    /// it does.
+    pub revoked_key_sha256_ed25519_raw: String,
     /// Key issuing the revocation.
     pub revoking_key_id: String,
     /// Free-form reason; consumers parse if they care.
@@ -3041,6 +3053,25 @@ pub struct SignedIdentityOccurrence {
     pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
+/// v52.0.0 (CIRISPersist#930) — **one admitted occurrence assertion**, as the
+/// append-only history (V161) keeps it. The current-state plane keeps only the
+/// latest assertion per `(identity, occurrence)`; this keeps every one either
+/// put door admitted, so a fold judged at an earlier instant never changes
+/// when a later assertion lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OccurrenceAssertion {
+    /// The identity the occurrence was asserted for.
+    pub identity_key_id: String,
+    /// The occurrence key.
+    pub occurrence_key_id: String,
+    /// The assertion's own signed instant.
+    pub asserted_at: DateTime<Utc>,
+    /// The assertion's `valid_until`, if any.
+    pub valid_until: Option<DateTime<Utc>>,
+    /// Who signed it; `None` for a trusted-local (unsigned) row.
+    pub attesting_key_id: Option<String>,
+}
+
 /// One member of a [`Family`] — an IDENTITY key plus when they
 /// joined plus an optional role tag.
 ///
@@ -3093,6 +3124,15 @@ pub struct Family {
     /// instance.
     #[serde(default)]
     pub consensus_protocol_entrenched: bool,
+    /// v52.0.0 (CIRISPersist#956) — set iff a quorum-verified TERMINAL
+    /// amendment dissolved the family; the instant is the one the quorum
+    /// signed (the change envelope's `dissolved_at`). A dissolved family is
+    /// not live: it has no active members, and every write naming it is
+    /// refused [`Error::GroupDissolved`](super::Error::GroupDissolved).
+    /// Absent (never serialized) on a live family, so every record written
+    /// before v52.0.0 keeps its bytes, signature and `persist_row_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dissolved_at: Option<DateTime<Utc>>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
@@ -3150,6 +3190,14 @@ pub struct SignedFamily {
     /// record that never carried one keeps its bytes and content hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersede_proof: Option<GroupSupersedeProof>,
+    /// v52.0.0 (CIRISPersist#955, Q1 ruling) — further hybrid scrubs over the
+    /// SAME [`Family::signing_envelope`] the authority signed, the shape a
+    /// community row carries. A founding record admits exactly the members
+    /// who signed it (authority or co-signer): signing is their consent.
+    /// Persisted (V162) and served beside the authority signature. Omitted on
+    /// the wire when empty, so a single-signed record keeps its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<RosterCosignature>,
 }
 
 /// v49.0.0 (CIRISPersist#910.5, `FSD/ROOM_ROSTER_AUTHORITY.md` §10 item 5) —
@@ -5216,6 +5264,7 @@ mod persist_row_hash_v1_pin_tests {
             consensus_protocol_entrenched: false,
             // Deliberately non-empty: the projection must DROP it, so a rule
             // that started hashing it would change the answer.
+            dissolved_at: None,
             persist_row_hash: "ff".repeat(32),
         };
         let got = compute_persist_row_hash(&fam).expect("hash");
@@ -5420,6 +5469,7 @@ mod signing_preimage_pin_tests {
             founded_at: t("2026-01-01T00:00:00Z"),
             consensus_protocol: "quorum:2/3".to_owned(),
             consensus_protocol_entrenched: true,
+            dissolved_at: None,
             persist_row_hash: "aa".repeat(32),
         }
     }
@@ -5547,6 +5597,7 @@ mod signing_preimage_pin_tests {
             founded_at: t("2026-01-01T00:00:00Z"),
             consensus_protocol: "quorum:2/3".to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: "aa".repeat(32),
         }
     }

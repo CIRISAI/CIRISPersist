@@ -1601,6 +1601,7 @@ pub mod lifecycle_support {
                 role: None,
             })
             .collect();
+        ts::register_fixture_infrastructure_founder(backend).await;
         backend
             .put_community(ts::sign_community(
                 community_key_id,
@@ -1772,6 +1773,7 @@ pub mod lifecycle_support {
                     consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY
                         .to_owned(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))

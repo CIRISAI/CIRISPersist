@@ -151,6 +151,7 @@ Engine	add_peer_record_json	deontic
 Engine	adopt_scrub_upgrade	deontic	
 Engine	adopt_sealed_blob_json	deontic	
 Engine	adopt_sealed_chunk_json	deontic	
+Engine	adopt_sealed_chunks_json	deontic	
 Engine	age_band_fine_json	epistemic	
 Engine	age_band_json	epistemic	
 Engine	aggregate_audit_chain	axiotic	
@@ -746,4 +747,9 @@ Engine	trust_root_bundle_response_json	empirical
 Engine	pin_trust_from_bundle_response_json	deontic	
 Engine	open_sealed_manifest_json	deontic	
 Engine	promote_adopted_manifest_to_dag_json	deontic	
+Engine	open_sealed_manifest_page_json	deontic	
+Engine	adopt_sealed_manifest_child_json	deontic	
+Engine	abandon_stream_json	deontic	
 Engine	put_blob_chunks_signing_json	deontic	
+Engine	sign_stream_sth_json	deontic	
+Engine	community_trust_consent_json	deontic	

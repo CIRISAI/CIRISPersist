@@ -465,6 +465,106 @@ pub fn replication_policy_sha256() -> String {
 pub const REPLICATION_POLICY_HASH: &str =
     "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a";
 
+/// v52.0.0 (CIRISPersist#672) — **settle a re-offer of a record this node
+/// already holds, before any verification.**
+///
+/// Replication is pull-by-set-difference (`want = remote ∖ holdings`), so an
+/// honest cycle never re-fetches a held row. A peer that re-offers one anyway
+/// (a malicious re-injection, or a push path) used to pay the full apply:
+/// signature verify, authority walk and, on the attestation plane, a charge
+/// against its per-peer write quota before the duplicate was noticed. This is
+/// the one settle every replicated door runs first.
+///
+/// It settles ONLY when the arriving record's wire bytes hash to an index
+/// entry that RESOLVES to a held row whose bytes are identical to the
+/// arriving ones. `record` must be the type the wire index hashes for `kind`
+/// (the bare signed row, never a `Served*` wrapper). Everything else falls
+/// through to the full apply:
+/// - an index miss, or an entry whose row is gone (evicted cache row, erased
+///   or reaped row): `lookup_signed_record_by_content_hash` reloads the row
+///   and returns `None`, so an eviction never masks a re-fetch and a tombstone
+///   refusal is never masked;
+/// - a differing body under the same id: its hash names no held row;
+/// - a backend that cannot answer the lookup: the full apply is the safe
+///   direction.
+///
+/// Returns `true` when the caller must answer "already held" and do nothing.
+/// Each settle counts on [`already_held_count`] and emits the
+/// `persist_replication_already_held_total{kind}` metric event.
+pub async fn settle_if_held<D, T>(
+    dir: &D,
+    kind: EnvelopeKind,
+    record: &T,
+) -> Result<bool, crate::federation::Error>
+where
+    D: crate::federation::FederationDirectory + ?Sized,
+    T: Serialize + ?Sized,
+{
+    debug_assert!(
+        !SETTLE_EXEMPT.iter().any(|(k, _)| *k == kind),
+        "settle_if_held called for an exempt kind {kind:?}"
+    );
+    let bytes = serde_json::to_vec(record).map_err(|e| {
+        crate::federation::Error::Backend(format!("settle_if_held serialize {kind:?}: {e}"))
+    })?;
+    let hash = crate::federation::wire_index::content_hash_of_bytes(&bytes);
+    let held = match dir
+        .lookup_signed_record_by_content_hash(kind.as_str(), &hash)
+        .await
+    {
+        Ok(held) => held,
+        Err(e) => {
+            tracing::debug!(kind = kind.as_str(), error = %e, "settle_if_held: lookup unavailable; full apply");
+            return Ok(false);
+        }
+    };
+    if held.as_deref() != Some(bytes.as_slice()) {
+        return Ok(false);
+    }
+    ALREADY_HELD[kind_index(kind)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::debug!(
+        metric = "persist_replication_already_held_total",
+        kind = kind.as_str(),
+        content_hash = %hash,
+        "replicated re-offer of a held record settled before verification (#672)"
+    );
+    Ok(true)
+}
+
+/// v52.0.0 (#672) — the kinds whose doors do NOT call [`settle_if_held`],
+/// each with the reason. Every other [`EnvelopeKind`] door calls it first
+/// (gated from disk by I235).
+pub const SETTLE_EXEMPT: &[(EnvelopeKind, &str)] = &[
+    (
+        EnvelopeKind::AccordQuorumEvidence,
+        "an aggregate whose content hash moves as votes land; absent from the wire index by \
+         construction, and its receive gate re-tallies",
+    ),
+    (
+        EnvelopeKind::KeyGrant,
+        "rides the attestation store; a re-delivered set must still reach the apply door, which \
+         projects a pending set once its bytes name the author (I65 step 4)",
+    ),
+];
+
+static ALREADY_HELD: [std::sync::atomic::AtomicU64; EnvelopeKind::ALL.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; EnvelopeKind::ALL.len()];
+
+fn kind_index(kind: EnvelopeKind) -> usize {
+    EnvelopeKind::ALL
+        .iter()
+        .position(|k| *k == kind)
+        .expect("every kind is in ALL")
+}
+
+/// v52.0.0 (#672) — how many re-offers of `kind` this process settled as
+/// already held (monotonic; the `persist_replication_already_held_total`
+/// counter).
+#[must_use]
+pub fn already_held_count(kind: EnvelopeKind) -> u64 {
+    ALREADY_HELD[kind_index(kind)].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

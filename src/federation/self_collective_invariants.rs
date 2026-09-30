@@ -172,6 +172,7 @@ pub(crate) mod bodies {
                 founded_at: at("2026-06-01T00:00:00Z"),
                 consensus_protocol: "unanimous".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))

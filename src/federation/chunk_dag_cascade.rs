@@ -64,6 +64,42 @@ pub fn chunk_aad(caller_aad: Option<&[u8]>, stream_id: &str, seq: u64) -> Vec<u8
     out
 }
 
+/// v52.0.0 (CIRISPersist#954) — the domain-separation label of a nested
+/// manifest CHILD's AAD. Distinct from [`CHUNK_AAD_DOMAIN`], so a child never
+/// opens as a chunk and a chunk never opens as a child.
+pub const MANIFEST_CHILD_AAD_DOMAIN: &[u8] = b"ciris-persist:manifest-child:v1";
+
+/// v52.0.0 (#954) — **a v3 child's associated data is its index in its
+/// stream's root**: the construction of [`chunk_aad`] under
+/// [`MANIFEST_CHILD_AAD_DOMAIN`], with the child's index where a chunk has
+/// its `seq`. A child moved to another index, lifted into another stream's
+/// DAG, or presented as a chunk fails to open.
+#[must_use]
+pub fn manifest_child_aad(caller_aad: Option<&[u8]>, stream_id: &str, index: u64) -> Vec<u8> {
+    let caller = caller_aad.unwrap_or(&[]);
+    let mut out = Vec::with_capacity(
+        MANIFEST_CHILD_AAD_DOMAIN.len() + 8 + caller.len() + 8 + stream_id.len() + 8,
+    );
+    out.extend_from_slice(MANIFEST_CHILD_AAD_DOMAIN);
+    out.extend_from_slice(&(caller.len() as u64).to_be_bytes());
+    out.extend_from_slice(caller);
+    out.extend_from_slice(&(stream_id.len() as u64).to_be_bytes());
+    out.extend_from_slice(stream_id.as_bytes());
+    out.extend_from_slice(&index.to_be_bytes());
+    out
+}
+
+/// v52.0.0 (CIRISPersist#954) — what `Engine::abandon_stream` did.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct AbandonReport {
+    /// The stream was already abandoned; nothing was done (idempotent).
+    pub already: bool,
+    /// Index rows deleted.
+    pub chunks_dropped: u64,
+    /// Stored bytes of the sealed chunk rows evicted.
+    pub bytes_evicted: u64,
+}
+
 /// What `put_blob_chunk_scoped` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutChunkScopedResult {
@@ -147,8 +183,9 @@ pub mod orchestrate {
         AtRestEnvelope, AtRestError, PERSIST_SELF_RECIPIENT,
     };
     use crate::federation::blobs::{
-        BlobHead, ChunkManifest, ChunkRef, EpochBinding, ManifestRowSpec, StreamChunkRef,
-        StreamClaim, CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
+        BlobHead, ChunkManifest, ChunkRef, EpochBinding, ManifestChildRef, ManifestChildRow,
+        ManifestRowSpec, NestedManifest, ParsedManifest, StreamChunkRef, StreamClaim,
+        CHUNK_MANIFEST_VERSION, CHUNK_MANIFEST_VERSION_SEALED,
     };
     use crate::federation::community_dek::orchestrate::{
         ensure_epoch_dek, open_community_row_for_viewer, read_for_community_viewer_sealed,
@@ -443,6 +480,7 @@ pub mod orchestrate {
                             body: jcs.clone(),
                             size_bytes: total_size,
                             expected_chunk_count: chunk_count,
+                            children: Vec::new(),
                         },
                         media_type,
                         cohort_scope,
@@ -487,7 +525,18 @@ pub mod orchestrate {
                     ))
                 })?;
                 let dek = fresh_dek().map_err(map_at_rest_err)?;
-                let body = seal(&dek, &jcs, aad).map_err(map_at_rest_err)?.to_bytes();
+                // #954 — a manifest above the cap is a v3 root over sealed
+                // children, each under its own fresh DEK.
+                let (root_jcs, child_rows, child_items) =
+                    match plan_children(&manifest, backend.inline_bytes_cap())? {
+                        None => (jcs.clone(), Vec::new(), Vec::new()),
+                        Some(children) => seal_children(&children, stream_id, tier, aad, |_| {
+                            fresh_dek().map_err(map_at_rest_err)
+                        })?,
+                    };
+                let body = seal(&dek, &root_jcs, aad)
+                    .map_err(map_at_rest_err)?
+                    .to_bytes();
                 let sha: [u8; 32] = Sha256::digest(&body).into();
                 backend
                     .seal_stream_with_scope(
@@ -497,6 +546,7 @@ pub mod orchestrate {
                             size_bytes: body.len() as u64,
                             body,
                             expected_chunk_count: chunk_count,
+                            children: child_rows,
                         },
                         media_type,
                         cohort_scope,
@@ -512,6 +562,8 @@ pub mod orchestrate {
                 // through persist's self-retention, as the rekey walk does.
                 let content_master = backend.load_or_init_content_master().await?;
                 let mut items: Vec<([u8; 32], [u8; 32])> = vec![(sha, dek)];
+                // #954 (D9) — the children join the one access set.
+                items.extend(child_items);
                 for c in &listing.chunks {
                     let self_grant = backend
                         .get_at_rest_grant(&c.chunk_sha, PERSIST_SELF_RECIPIENT)
@@ -565,7 +617,16 @@ pub mod orchestrate {
                     let ensured = ensure_epoch_dek(backend, comm, minter, dek_epoch).await?;
                     let dek_epoch = ensured.epoch;
                     let report = ensured.report;
-                    let body = seal(&ensured.dek, &jcs, aad)
+                    // #954 — children under the same epoch DEK, bound to the
+                    // same epoch in the floor's transaction.
+                    let (root_jcs, child_rows, _) =
+                        match plan_children(&manifest, backend.inline_bytes_cap())? {
+                            None => (jcs.clone(), Vec::new(), Vec::new()),
+                            Some(children) => {
+                                seal_children(&children, stream_id, tier, aad, |_| Ok(ensured.dek))?
+                            }
+                        };
+                    let body = seal(&ensured.dek, &root_jcs, aad)
                         .map_err(map_at_rest_err)?
                         .to_bytes();
                     let sha: [u8; 32] = Sha256::digest(&body).into();
@@ -577,6 +638,7 @@ pub mod orchestrate {
                                 size_bytes: body.len() as u64,
                                 body: body.clone(),
                                 expected_chunk_count: chunk_count,
+                                children: child_rows,
                             },
                             media_type,
                             cohort_scope,
@@ -780,6 +842,133 @@ pub mod orchestrate {
         })
     }
 
+    /// v52.0.0 (#954) — **does this sealed manifest need children, and which?**
+    /// `None` when the v2 manifest's sealed envelope fits `cap` (it stays v2,
+    /// byte-identical, same address). Otherwise the chunks partitioned
+    /// greedily, in order, into v2 children whose envelopes each fit `cap`.
+    /// Deterministic given the cap. A plaintext (v1) manifest is never
+    /// partitioned: its row is parsed by the storage layer, and above the
+    /// cap the floor refuses it by name (`InlineSizeExceeded`).
+    pub(crate) fn plan_children(
+        manifest: &ChunkManifest,
+        cap: usize,
+    ) -> Result<Option<Vec<ChunkManifest>>, BlobError> {
+        if manifest.chunk_tier.is_none() {
+            return Ok(None);
+        }
+        let budget =
+            cap.saturating_sub(crate::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD);
+        let entry_len = |c: &ChunkRef| {
+            format!(
+                "{{\"seq\":{},\"sha\":\"{}\",\"size\":{}}}",
+                c.seq.unwrap_or_default(),
+                hex::encode(c.sha),
+                c.size
+            )
+            .len()
+        };
+        // The wrapper with a 20-digit total: an upper bound for any child.
+        let wrapper = ChunkManifest {
+            v: manifest.v,
+            total_size: u64::MAX,
+            chunks: Vec::new(),
+            chunk_tier: manifest.chunk_tier,
+            stream_id: manifest.stream_id.clone(),
+        }
+        .to_jcs_bytes()
+        .len();
+        let flat_len = wrapper
+            + manifest.chunks.iter().map(entry_len).sum::<usize>()
+            + manifest.chunks.len().saturating_sub(1);
+        if flat_len <= budget {
+            return Ok(None);
+        }
+        let mut children: Vec<ChunkManifest> = Vec::new();
+        let mut run: Vec<ChunkRef> = Vec::new();
+        let mut run_len = wrapper;
+        let close = |run: Vec<ChunkRef>| ChunkManifest {
+            v: manifest.v,
+            total_size: run.iter().map(|c| u64::from(c.size)).sum(),
+            chunks: run,
+            chunk_tier: manifest.chunk_tier,
+            stream_id: manifest.stream_id.clone(),
+        };
+        for c in &manifest.chunks {
+            let add = entry_len(c) + usize::from(!run.is_empty());
+            if !run.is_empty() && run_len + add > budget {
+                children.push(close(std::mem::take(&mut run)));
+                run_len = wrapper;
+            }
+            run_len += entry_len(c) + usize::from(!run.is_empty());
+            if run_len > budget {
+                return Err(BlobError::InvalidArgument(format!(
+                    "seal_stream_scoped: the inline cap ({cap} bytes) cannot hold a manifest \
+                     child of even one chunk (CIRISPersist#954)"
+                )));
+            }
+            run.push(c.clone());
+        }
+        if !run.is_empty() {
+            children.push(close(run));
+        }
+        Ok(Some(children))
+    }
+
+    /// v52.0.0 (#954) — seal each planned child under `dek_for(index)` with
+    /// its position-bound AAD, and build the v3 root over them. Returns the
+    /// root's JCS, the child rows for the floor, and each child's
+    /// `(sha, dek)` for the grant cascade.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn seal_children(
+        children: &[ChunkManifest],
+        stream_id: &str,
+        tier: CryptoTier,
+        caller_aad: Option<&[u8]>,
+        mut dek_for: impl FnMut(u64) -> Result<[u8; 32], BlobError>,
+    ) -> Result<(Vec<u8>, Vec<ManifestChildRow>, Vec<([u8; 32], [u8; 32])>), BlobError> {
+        let mut rows = Vec::with_capacity(children.len());
+        let mut entries = Vec::with_capacity(children.len());
+        let mut items = Vec::with_capacity(children.len());
+        for (i, child) in children.iter().enumerate() {
+            let index = i as u64;
+            let dek = dek_for(index)?;
+            let aad = manifest_child_aad(caller_aad, stream_id, index);
+            let body = seal(&dek, &child.to_jcs_bytes(), Some(&aad))
+                .map_err(map_at_rest_err)?
+                .to_bytes();
+            let sha: [u8; 32] = Sha256::digest(&body).into();
+            let (Some(first), Some(last)) = (
+                child.chunks.first().and_then(|c| c.seq),
+                child.chunks.last().and_then(|c| c.seq),
+            ) else {
+                return Err(BlobError::Backend(
+                    "seal_stream_scoped: a planned child lists no positioned chunk".into(),
+                ));
+            };
+            entries.push(ManifestChildRef {
+                chunk_count: child.chunks.len() as u64,
+                first_seq: first,
+                last_seq: last,
+                sha,
+                size: child.total_size,
+            });
+            rows.push(ManifestChildRow {
+                index,
+                sha256: sha,
+                body,
+            });
+            items.push((sha, dek));
+        }
+        let root = NestedManifest {
+            total_size: entries.iter().map(|e| e.size).sum(),
+            chunk_tier: tier,
+            stream_id: stream_id.to_owned(),
+            children: entries,
+        };
+        root.validate()?;
+        Ok((root.to_jcs_bytes(), rows, items))
+    }
+
     // ── the sealed-DAG adopt (v51.3.0, CIRISPersist#947) ─────────────────
 
     /// One chunk of an opened sealed manifest, as the puller needs it: the
@@ -812,14 +1001,39 @@ pub mod orchestrate {
         pub stream_id: String,
         /// The file's plaintext size (the sum of the chunks' sizes).
         pub total_size: u64,
-        /// The chunks, in stream order.
+        /// The manifest's schema version: `2` (every chunk listed here) or
+        /// `3` (a nested root: `chunks` is EMPTY and the chunks are in
+        /// `children`, each opened with `open_sealed_manifest_page_as`).
+        pub version: u32,
+        /// The chunks, in stream order (v2). Empty for a v3 root.
         pub chunks: Vec<SealedManifestChunk>,
+        /// v52.0.0 (#954) — a v3 root's children, in order. Empty for v2.
+        pub children: Vec<SealedManifestChildRef>,
         /// This node's inline cap: a chunk envelope above it is refused at the adopt.
         pub inline_bytes_cap: u64,
         /// The whole-read cap: a file above it is read by range only.
         pub whole_read_cap_bytes: u64,
         /// The chunk-count cap.
         pub max_chunks: u64,
+    }
+
+    /// v52.0.0 (#954) — one child of a v3 root, as the puller needs it: the
+    /// child row's address to fetch by and adopt with
+    /// `adopt_sealed_manifest_child`, and the run of chunks it lists.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct SealedManifestChildRef {
+        /// The child's index in the root.
+        pub index: u64,
+        /// The child row's content address (over its sealed envelope).
+        pub sha256_hex: String,
+        /// The first chunk's `seq`.
+        pub first_seq: u64,
+        /// The last chunk's `seq`.
+        pub last_seq: u64,
+        /// How many chunks the child lists.
+        pub chunk_count: u64,
+        /// The child's plaintext total.
+        pub size: u64,
     }
 
     /// `Engine::promote_adopted_manifest_to_dag`'s answer.
@@ -846,7 +1060,7 @@ pub mod orchestrate {
         sha256: &[u8; 32],
         viewer_key_id: &str,
         caller_aad: Option<&[u8]>,
-    ) -> Result<(BlobHead, ChunkManifest), BlobError>
+    ) -> Result<(BlobHead, ParsedManifest), BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
@@ -880,27 +1094,130 @@ pub mod orchestrate {
         }
         let jcs =
             read_sealed_inline_authorized(backend, sha256, tier, viewer_key_id, caller_aad).await?;
-        let m = ChunkManifest::from_manifest_bytes(&jcs).map_err(|e| {
+        let m = ParsedManifest::parse(&jcs).map_err(|e| {
             BlobError::InvalidArgument(format!(
                 "blob {} opened, but its plaintext is not a chunk manifest ({e}): a sealed whole \
                  blob is read with read_blob_as, not promoted",
                 hex::encode(sha256)
             ))
         })?;
-        if m.v != CHUNK_MANIFEST_VERSION_SEALED
-            || m.chunk_tier != Some(tier)
-            || m.stream_id.is_none()
+        if let ParsedManifest::Nested(root) = &m {
+            if root.chunk_tier != tier {
+                return Err(BlobError::InvalidArgument(format!(
+                    "blob {} is a v3 root at tier {:?} recorded at {tier:?}",
+                    hex::encode(sha256),
+                    root.chunk_tier
+                )));
+            }
+            return Ok((head, m));
+        }
+        let ParsedManifest::Flat(ref f) = m else {
+            unreachable!("the nested arm returned")
+        };
+        if f.v != CHUNK_MANIFEST_VERSION_SEALED
+            || f.chunk_tier != Some(tier)
+            || f.stream_id.is_none()
         {
             return Err(BlobError::InvalidArgument(format!(
                 "blob {} is not a v{CHUNK_MANIFEST_VERSION_SEALED} sealed manifest at tier {tier:?} \
                  (v = {}, chunk_tier = {:?}, stream_id = {:?})",
                 hex::encode(sha256),
-                m.v,
-                m.chunk_tier,
-                m.stream_id
+                f.v,
+                f.chunk_tier,
+                f.stream_id
             )));
         }
         Ok((head, m))
+    }
+
+    /// v52.0.0 (#954) — **open child `index` of a v3 root for a viewer.** The
+    /// child row must be held (else `NotHeld` naming the CHILD — fetch it and
+    /// adopt it with `adopt_sealed_manifest_child`), recorded at the root's
+    /// tier as an inline envelope; the viewer is authorized on the child row
+    /// itself; it opens under `manifest_child_aad(caller_aad, stream_id,
+    /// index)` and must be exactly the v2 manifest the root's entry names.
+    pub(crate) async fn open_manifest_child<B>(
+        backend: &B,
+        root: &NestedManifest,
+        index: usize,
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<ChunkManifest, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let Some(entry) = root.children.get(index) else {
+            return Err(BlobError::InvalidArgument(format!(
+                "child index {index} is outside the root's {} children",
+                root.children.len()
+            )));
+        };
+        let Some(head) = backend.blob_head(&entry.sha).await? else {
+            return Err(BlobError::NotHeld {
+                sha256_hex: hex::encode(entry.sha),
+            });
+        };
+        if head.crypto_tier != root.chunk_tier || head.storage_kind != "inline" {
+            return Err(BlobError::Backend(format!(
+                "manifest child {index} ({}) is a {:?} row at {:?}, not an inline envelope at \
+                 the root's {:?}",
+                hex::encode(entry.sha),
+                head.storage_kind,
+                head.crypto_tier,
+                root.chunk_tier
+            )));
+        }
+        authorize_viewer_by_tier(backend, &entry.sha, head.crypto_tier, viewer_key_id).await?;
+        let aad = manifest_child_aad(caller_aad, &root.stream_id, index as u64);
+        let jcs = read_sealed_inline_authorized(
+            backend,
+            &entry.sha,
+            head.crypto_tier,
+            viewer_key_id,
+            Some(&aad),
+        )
+        .await?;
+        let child = ChunkManifest::from_manifest_bytes(&jcs)?;
+        root.check_child(index, &child)?;
+        Ok(child)
+    }
+
+    /// `Engine::open_sealed_manifest_page_as` (v52.0.0, #954) — the chunks
+    /// child `index` of a v3 root lists, opened for `viewer_key_id`
+    /// (authorized on the root as `read_blob_as`, then on the child row).
+    /// A v2 manifest is `InvalidArgument`: its chunks are in the view.
+    pub async fn open_sealed_manifest_page_for_viewer<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        index: u64,
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<Vec<SealedManifestChunk>, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let (_, m) = opened_sealed_manifest(backend, sha256, viewer_key_id, caller_aad).await?;
+        let ParsedManifest::Nested(root) = m else {
+            return Err(BlobError::InvalidArgument(format!(
+                "blob {} is a v2 manifest: its chunks are listed by open_sealed_manifest_as",
+                hex::encode(sha256)
+            )));
+        };
+        let index = usize::try_from(index)
+            .map_err(|_| BlobError::InvalidArgument("child index exceeds usize".into()))?;
+        let child = open_manifest_child(backend, &root, index, viewer_key_id, caller_aad).await?;
+        Ok(chunk_views(&child))
+    }
+
+    fn chunk_views(m: &ChunkManifest) -> Vec<SealedManifestChunk> {
+        m.chunks
+            .iter()
+            .map(|c| SealedManifestChunk {
+                sha256_hex: hex::encode(c.sha),
+                size: c.size,
+                seq: c.seq.unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// `Engine::open_sealed_manifest_as` (#947 ask 2) — see
@@ -915,21 +1232,34 @@ pub mod orchestrate {
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         let (head, m) = opened_sealed_manifest(backend, sha256, viewer_key_id, caller_aad).await?;
+        let (version, chunks, children) = match &m {
+            ParsedManifest::Flat(f) => (f.v, chunk_views(f), Vec::new()),
+            ParsedManifest::Nested(n) => (
+                crate::federation::blobs::CHUNK_MANIFEST_VERSION_NESTED,
+                Vec::new(),
+                n.children
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| SealedManifestChildRef {
+                        index: i as u64,
+                        sha256_hex: hex::encode(c.sha),
+                        first_seq: c.first_seq,
+                        last_seq: c.last_seq,
+                        chunk_count: c.chunk_count,
+                        size: c.size,
+                    })
+                    .collect(),
+            ),
+        };
         Ok(SealedManifestView {
             sha256_hex: hex::encode(sha256),
             storage_kind: head.storage_kind.clone(),
             tier: head.crypto_tier.as_str().to_owned(),
-            stream_id: m.stream_id.clone().unwrap_or_default(),
-            total_size: m.total_size,
-            chunks: m
-                .chunks
-                .iter()
-                .map(|c| SealedManifestChunk {
-                    sha256_hex: hex::encode(c.sha),
-                    size: c.size,
-                    seq: c.seq.unwrap_or_default(),
-                })
-                .collect(),
+            stream_id: m.stream_id().unwrap_or_default().to_owned(),
+            total_size: m.total_size(),
+            version,
+            chunks,
+            children,
             inline_bytes_cap: backend.inline_bytes_cap() as u64,
             whole_read_cap_bytes: DAG_WHOLE_READ_CAP_BYTES,
             max_chunks: crate::federation::blobs::MAX_CHUNKS_PER_EPOCH,
@@ -956,26 +1286,76 @@ pub mod orchestrate {
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         let (head, m) = opened_sealed_manifest(backend, sha256, viewer_key_id, caller_aad).await?;
-        let stream_id = m.stream_id.clone().unwrap_or_default();
-        let chunk_count = m.chunks.len() as u64;
+        let stream_id = m.stream_id().unwrap_or_default().to_owned();
+        let chunk_count = m.chunk_count();
+        let total_size = m.total_size();
         let done = |promoted: bool| DagPromotion {
             sha256_hex: hex::encode(sha256),
             promoted,
             chunk_count,
-            total_size: m.total_size,
+            total_size,
         };
         if head.storage_kind == "chunk_dag" {
             return Ok(done(false));
         }
         let listing = backend.stream_chunks(&stream_id).await?;
-        for (i, c) in m.chunks.iter().enumerate() {
+        let by_seq: std::collections::HashMap<u64, &StreamChunkRef> =
+            listing.chunks.iter().map(|r| (r.seq, r)).collect();
+        match &m {
+            ParsedManifest::Flat(f) => {
+                check_chunks_held(&by_seq, &f.chunks, sha256, &stream_id, head.crypto_tier)?
+            }
+            ParsedManifest::Nested(root) => {
+                // #954 — every child held AND recorded (so eviction finds it
+                // without opening the root), then every chunk it lists.
+                let recorded = backend.manifest_children(sha256).await?;
+                for (i, entry) in root.children.iter().enumerate() {
+                    if !recorded.contains(&(i as u64, entry.sha)) {
+                        return Err(BlobError::InvalidArgument(format!(
+                            "child {i} ({}) of manifest {} is not held: fetch it by that sha and \
+                             adopt it with adopt_sealed_manifest_child before promoting",
+                            hex::encode(entry.sha),
+                            hex::encode(sha256)
+                        )));
+                    }
+                }
+                for i in 0..root.children.len() {
+                    let child =
+                        open_manifest_child(backend, root, i, viewer_key_id, caller_aad).await?;
+                    check_chunks_held(
+                        &by_seq,
+                        &child.chunks,
+                        sha256,
+                        &stream_id,
+                        head.crypto_tier,
+                    )?;
+                }
+            }
+        }
+        let promoted = backend
+            .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
+            .await?;
+        Ok(done(promoted))
+    }
+
+    /// The per-chunk promotion checks (#947): each chunk the manifest names
+    /// is held at its `(stream_id, seq)` with the named sha, plaintext size
+    /// and the manifest's tier.
+    fn check_chunks_held(
+        by_seq: &std::collections::HashMap<u64, &StreamChunkRef>,
+        chunks: &[ChunkRef],
+        sha256: &[u8; 32],
+        stream_id: &str,
+        tier: CryptoTier,
+    ) -> Result<(), BlobError> {
+        for (i, c) in chunks.iter().enumerate() {
             let Some(seq) = c.seq else {
                 return Err(BlobError::InvalidArgument(format!(
                     "manifest chunk [{i}] of {} carries no seq: not a positioned sealed manifest",
                     hex::encode(sha256)
                 )));
             };
-            let Some(row) = listing.chunks.iter().find(|r| r.seq == seq) else {
+            let Some(row) = by_seq.get(&seq) else {
                 return Err(BlobError::InvalidArgument(format!(
                     "chunk seq {seq} ({}) of stream {stream_id} is not held: fetch it by that sha \
                      and adopt it at (stream_id, seq) with plaintext_size {} before promoting \
@@ -998,18 +1378,15 @@ pub mod orchestrate {
                     row.plaintext_size, c.size
                 )));
             }
-            if row.crypto_tier != head.crypto_tier {
+            if row.crypto_tier != tier {
                 return Err(BlobError::InvalidArgument(format!(
                     "chunk seq {seq} of stream {stream_id} is recorded at tier {:?} but the \
                      manifest is at {:?}",
-                    row.crypto_tier, head.crypto_tier
+                    row.crypto_tier, tier
                 )));
             }
         }
-        let promoted = backend
-            .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
-            .await?;
-        Ok(done(promoted))
+        Ok(())
     }
 
     // ── the reads ────────────────────────────────────────────────────────
@@ -1225,7 +1602,7 @@ pub mod orchestrate {
                         hex::encode(sha256)
                     )));
                 }
-                m
+                ParsedManifest::Flat(m)
             }
             Some(BlobBody::Inline(_)) => {
                 if tier == CryptoTier::Plaintext {
@@ -1236,12 +1613,12 @@ pub mod orchestrate {
                 }
                 let jcs = read_sealed_inline_authorized(backend, sha256, tier, viewer_key_id, aad)
                     .await?;
-                let m = ChunkManifest::from_manifest_bytes(&jcs)?;
-                if m.chunk_tier != Some(tier) {
+                let m = ParsedManifest::parse(&jcs)?;
+                if m.chunk_tier() != Some(tier) {
                     return Err(BlobError::Backend(format!(
                         "blob {} is recorded at tier {tier:?} but its manifest says {:?}",
                         hex::encode(sha256),
-                        m.chunk_tier
+                        m.chunk_tier()
                     )));
                 }
                 m
@@ -1253,7 +1630,7 @@ pub mod orchestrate {
                 )))
             }
         };
-        let total = manifest.total_size;
+        let total = manifest.total_size();
         let (start, end) = match range {
             Some((s, e)) => (s, clamp_range(s, e, total)?),
             None => {
@@ -1294,6 +1671,62 @@ pub mod orchestrate {
         // lookup per distinct epoch in the range, not one per chunk.
         let mut authorized_epochs: std::collections::HashSet<(String, String, u64)> =
             std::collections::HashSet::new();
+        match &manifest {
+            ParsedManifest::Flat(m) => {
+                read_flat_chunks(
+                    backend,
+                    sha256,
+                    m,
+                    tier,
+                    viewer_key_id,
+                    aad,
+                    (start, end),
+                    &mut out,
+                    &mut authorized_epochs,
+                )
+                .await?
+            }
+            // #954 — the children covering the range are chosen by prefix sum
+            // BEFORE any is opened; each is opened, then read within.
+            ParsedManifest::Nested(root) => {
+                for (i, ls, le) in root.children_for_range(start, end) {
+                    let child = open_manifest_child(backend, root, i, viewer_key_id, aad).await?;
+                    read_flat_chunks(
+                        backend,
+                        sha256,
+                        &child,
+                        tier,
+                        viewer_key_id,
+                        aad,
+                        (ls, le),
+                        &mut out,
+                        &mut authorized_epochs,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The chunk loop of a sealed v2 manifest (or one v3 child) over its
+    /// local inclusive range: every covering chunk opened under its
+    /// position-bound AAD and sliced, appended to `out`.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_flat_chunks<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        manifest: &ChunkManifest,
+        tier: CryptoTier,
+        viewer_key_id: &str,
+        aad: Option<&[u8]>,
+        (start, end): (u64, u64),
+        out: &mut Vec<u8>,
+        authorized_epochs: &mut std::collections::HashSet<(String, String, u64)>,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
         // #838 (§12.10) — the manifest names the position every chunk was
         // sealed at; the parser guarantees both fields for v2.
         let stream_id = manifest.stream_id.as_deref().ok_or_else(|| {
@@ -1319,7 +1752,7 @@ pub mod orchestrate {
                 tier,
                 viewer_key_id,
                 &bound_aad,
-                &mut authorized_epochs,
+                authorized_epochs,
             )
             .await?;
             if plain.len() as u64 != u64::from(cref.size) {
@@ -1334,7 +1767,7 @@ pub mod orchestrate {
                 &plain[slice.local_start as usize..=slice.local_end_inclusive as usize],
             );
         }
-        Ok(out)
+        Ok(())
     }
 
     /// §12.4 / §12.10 — **open ONE sealed stream chunk row for a viewer,
@@ -3163,6 +3596,7 @@ pub mod invariants {
                     size_bytes: body.len() as u64,
                     body,
                     expected_chunk_count: 2,
+                    children: Vec::new(),
                 },
                 None,
                 COMMUNITY,

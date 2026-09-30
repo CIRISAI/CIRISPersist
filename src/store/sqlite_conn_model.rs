@@ -104,6 +104,8 @@ impl ReadPool {
                  PRAGMA busy_timeout = 30000;\n\
                  PRAGMA query_only = ON;",
             )?;
+            // #784 — per-connection state, like the pragmas above.
+            crate::federation::key_digest::register_sqlite_fn(&conn)?;
             free.push(conn);
         }
         Ok(Arc::new(Self {
@@ -255,6 +257,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("attach_revocation_pqc_signature", ConnClass::Write),
     ("attestations_binding_content", ConnClass::Read),
     ("backfill_trace_dedup_shard_keys", ConnClass::Write),
+    ("backfill_revocation_subject_digests", ConnClass::Write),
     ("blackhole_list", ConnClass::Read),
     ("blackhole_prune_expired", ConnClass::Write),
     ("blackhole_record_hit", ConnClass::Write),
@@ -389,7 +392,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("minter_of_blob", ConnClass::Read),
     ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
-    ("list_delivery_receipts_for", ConnClass::Read),
+    ("list_stored_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),
     ("list_families_for_member", ConnClass::Read),
     ("list_family_membership_revocations_for", ConnClass::Read),
@@ -490,6 +493,14 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         "list_identity_occurrences_by_occurrence_key",
         ConnClass::Read,
     ),
+    // v52.0.0 (#930) — the V161 append, a free fn over the writer's
+    // transaction, called from both occurrence doors.
+    ("sqlite_append_occurrence_history", ConnClass::HelperWrite),
+    // v52.0.0 (#930) — the occurrence history (V161), read by the node-bearing fold.
+    (
+        "list_identity_occurrence_history_by_occurrence",
+        ConnClass::Read,
+    ),
     ("lookup_keys_for_identity", ConnClass::Read),
     ("lookup_public_key", ConnClass::Read),
     ("lookup_role_withdrawal", ConnClass::Read),
@@ -532,13 +543,22 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("key_grant_pending_list", ConnClass::Read),
     ("key_grant_pending_delete", ConnClass::Write),
     ("put_attestation_with_origin", ConnClass::Write),
-    // #846 — the chunk floor's ONE body; `put_blob_chunk_with_scope` and
-    // `adopt_sealed_chunk_at` delegate to it and touch no connection.
-    ("put_blob_chunk_floor", ConnClass::Write),
+    // v52.0.0 (#957) — the chunk floor's ONE body, batched: ONE write
+    // transaction for a run of chunks. `put_blob_chunk_floor` is its batch of
+    // one and touches no connection; `put_blob_chunk_with_scope`,
+    // `adopt_sealed_chunk_at` and `adopt_sealed_chunks_at` delegate to them.
+    ("put_blob_chunks_floor", ConnClass::Write),
+    // #957 — one item's append, a free fn over the writer's savepoint.
+    ("sqlite_append_chunk_item", ConnClass::HelperWrite),
     ("repair_minter_sentinel", ConnClass::Write),
     ("seal_stream_with_scope", ConnClass::Write),
     // v51.3.0 (#947) — the sealed-DAG promotion: one write transaction.
     ("promote_adopted_manifest_to_dag", ConnClass::Write),
+    // v52.0.0 (CIRISPersist#954) — the nested manifest's relation and the
+    // abandoned stream.
+    ("manifest_children", ConnClass::Read),
+    ("record_manifest_child", ConnClass::Write),
+    ("abandon_stream_floor", ConnClass::Write),
     ("blob_head", ConnClass::Read),
     ("stream_chunks", ConnClass::Read),
     ("stream_chunk_at", ConnClass::Read),
@@ -603,7 +623,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("reseal_attestation_v31", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
     ("retire_goal", ConnClass::Write),
-    ("revocations_for", ConnClass::Read),
+    ("revocations_for_subject", ConnClass::Read),
     ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn
     // handed the writer's connection from inside `repair_portable_defaults_with`.

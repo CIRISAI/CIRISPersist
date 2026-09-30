@@ -342,6 +342,21 @@ impl ChunkManifest {
             #[serde(default)]
             stream_id: Option<String>,
         }
+        // v52.0.0 (#954) — a v3 root is refused by NAME, before its absent
+        // `chunks` member turns it into a parse error that says nothing.
+        #[derive(Deserialize)]
+        struct VersionOnly {
+            v: u32,
+        }
+        if serde_json::from_slice::<VersionOnly>(bytes)
+            .is_ok_and(|w| w.v == CHUNK_MANIFEST_VERSION_NESTED)
+        {
+            return Err(BlobError::Backend(
+                "chunk_dag manifest v3 is a nested root, not a flat manifest; read it through \
+                 ParsedManifest (CIRISPersist#954)"
+                    .into(),
+            ));
+        }
         let wire: ManifestWire = serde_json::from_slice(bytes)
             .map_err(|e| BlobError::Backend(format!("chunk_dag manifest JSON parse: {e}")))?;
         // #838 (§12.10) — a v2 manifest carries its POSITION: `stream_id` and
@@ -413,8 +428,9 @@ impl ChunkManifest {
             }
             (other, _) => {
                 return Err(BlobError::Backend(format!(
-                    "chunk_dag manifest schema version {other} is not known to this build \
-                     (1 = plaintext DAG, 2 = sealed DAG)"
+                    "chunk_dag manifest schema version {other} is not a flat manifest \
+                     (1 = plaintext DAG, 2 = sealed DAG; 3 = a nested root, read through \
+                     ParsedManifest)"
                 )))
             }
         };
@@ -706,6 +722,465 @@ pub enum BlobRange {
     },
 }
 
+/// v52.0.0 (CIRISPersist#954) — the `ChunkManifest` schema version of a
+/// NESTED sealed DAG's ROOT: a list of children, each an ordinary v2
+/// manifest over a contiguous run of chunks. Emitted only when the v2
+/// manifest would not fit the inline cap; a DAG that fits stays v2
+/// byte-for-byte. Depth is fixed at 2 (a child is never v3).
+pub const CHUNK_MANIFEST_VERSION_NESTED: u32 = 3;
+
+/// v52.0.0 (#954) — one child of a [`NestedManifest`]: the sealed v2
+/// manifest over chunks `first_seq ..= last_seq` (`chunk_count` of them),
+/// stored as its own inline row at `sha` (the address of its ENVELOPE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestChildRef {
+    /// How many chunks the child lists.
+    pub chunk_count: u64,
+    /// The first chunk's `seq`.
+    pub first_seq: u64,
+    /// The last chunk's `seq`.
+    pub last_seq: u64,
+    /// The child row's content address (over its sealed envelope).
+    pub sha: [u8; 32],
+    /// The child's PLAINTEXT total (the sum of its chunks' sizes).
+    pub size: u64,
+}
+
+/// v52.0.0 (#954) — **the root of a nested sealed DAG** (`v: 3`).
+///
+/// ```json
+/// {"children":[{"chunk_count":N,"first_seq":S,"last_seq":L,"sha":"<hex32>","size":<u64>},…],"chunk_tier":"<tier>","stream_id":"…","total_size":<u64>,"v":3}
+/// ```
+///
+/// Stored sealed exactly as a v2 manifest is (the caller's AAD). Each child
+/// is sealed under `manifest_child_aad(caller_aad, stream_id, index)`, so a
+/// child opens only at its own index of its own stream, and never as a
+/// chunk. Parse rules (all refusals named): at least one child; each
+/// child's `chunk_count ≥ 1` and `last_seq ≥ first_seq`; `first_seq` of
+/// child `i+1` above `last_seq` of child `i`; Σ `size` == `total_size`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedManifest {
+    /// The file's PLAINTEXT total.
+    pub total_size: u64,
+    /// The tier every chunk and child row is sealed at.
+    pub chunk_tier: crate::federation::types::cohort_scope::CryptoTier,
+    /// The stream the chunks belong to.
+    pub stream_id: String,
+    /// The children, in stream order.
+    pub children: Vec<ManifestChildRef>,
+}
+
+impl NestedManifest {
+    /// JCS-canonical bytes. Top-level keys, lexicographically:
+    /// `children` < `chunk_tier` < `stream_id` < `total_size` < `v`
+    /// (`"childr"` vs `"chunk_"`: 'i' 0x69 < 'u' 0x75); per-child keys
+    /// `chunk_count` < `first_seq` < `last_seq` < `sha` < `size`.
+    #[must_use]
+    pub fn to_jcs_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"{\"children\":[");
+        for (i, c) in self.children.iter().enumerate() {
+            if i > 0 {
+                buf.push(b',');
+            }
+            buf.extend_from_slice(
+                format!(
+                    "{{\"chunk_count\":{},\"first_seq\":{},\"last_seq\":{},\"sha\":\"{}\",\"size\":{}}}",
+                    c.chunk_count,
+                    c.first_seq,
+                    c.last_seq,
+                    hex::encode(c.sha),
+                    c.size
+                )
+                .as_bytes(),
+            );
+        }
+        buf.extend_from_slice(b"],\"chunk_tier\":\"");
+        buf.extend_from_slice(self.chunk_tier.as_str().as_bytes());
+        buf.extend_from_slice(b"\",\"stream_id\":");
+        buf.extend_from_slice(
+            serde_json::to_string(&self.stream_id)
+                .unwrap_or_else(|_| "\"\"".into())
+                .as_bytes(),
+        );
+        buf.extend_from_slice(b",\"total_size\":");
+        buf.extend_from_slice(self.total_size.to_string().as_bytes());
+        buf.extend_from_slice(b",\"v\":3}");
+        buf
+    }
+
+    /// Validate the root's own shape (the rules in the type doc).
+    pub fn validate(&self) -> Result<(), BlobError> {
+        if self.children.is_empty() {
+            return Err(BlobError::Backend(
+                "chunk_dag manifest v3 lists no children".into(),
+            ));
+        }
+        let mut sum: u64 = 0;
+        let mut prev_last: Option<u64> = None;
+        for (i, c) in self.children.iter().enumerate() {
+            if c.chunk_count == 0 || c.last_seq < c.first_seq {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest v3 child [{i}] is empty or reversed \
+                     (chunk_count {}, seq {}..={})",
+                    c.chunk_count, c.first_seq, c.last_seq
+                )));
+            }
+            if prev_last.is_some_and(|p| c.first_seq <= p) {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest v3 child [{i}] starts at seq {} but the previous child \
+                     ends at {}; children cover strictly increasing runs",
+                    c.first_seq,
+                    prev_last.unwrap_or_default()
+                )));
+            }
+            prev_last = Some(c.last_seq);
+            sum = sum.checked_add(c.size).ok_or_else(|| {
+                BlobError::Backend("chunk_dag manifest v3 child sizes overflow u64".into())
+            })?;
+        }
+        if sum != self.total_size {
+            return Err(BlobError::Backend(format!(
+                "chunk_dag manifest v3 total_size {} != sum of child sizes {sum}",
+                self.total_size
+            )));
+        }
+        Ok(())
+    }
+
+    /// Parse a v3 root from its JCS bytes (key order tolerated on input).
+    pub fn from_manifest_bytes(bytes: &[u8]) -> Result<Self, BlobError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ChildWire {
+            chunk_count: u64,
+            first_seq: u64,
+            last_seq: u64,
+            sha: String,
+            size: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RootWire {
+            v: u32,
+            total_size: u64,
+            children: Vec<ChildWire>,
+            chunk_tier: String,
+            stream_id: String,
+        }
+        let w: RootWire = serde_json::from_slice(bytes)
+            .map_err(|e| BlobError::Backend(format!("chunk_dag manifest v3 JSON parse: {e}")))?;
+        if w.v != CHUNK_MANIFEST_VERSION_NESTED {
+            return Err(BlobError::Backend(format!(
+                "chunk_dag manifest v{} parsed as a v3 root",
+                w.v
+            )));
+        }
+        let chunk_tier =
+            crate::federation::types::cohort_scope::CryptoTier::parse_str(&w.chunk_tier)
+                .filter(|t| *t != crate::federation::types::cohort_scope::CryptoTier::Plaintext)
+                .ok_or_else(|| {
+                    BlobError::Backend(format!(
+                        "chunk_dag manifest v3 chunk_tier {:?} is not a sealed tier",
+                        w.chunk_tier
+                    ))
+                })?;
+        if w.stream_id.is_empty() {
+            return Err(BlobError::Backend(
+                "chunk_dag manifest v3 carries an empty stream_id".into(),
+            ));
+        }
+        let mut children = Vec::with_capacity(w.children.len());
+        for c in w.children {
+            let mut sha = [0u8; 32];
+            hex::decode_to_slice(&c.sha, &mut sha).map_err(|e| {
+                BlobError::Backend(format!("chunk_dag manifest v3 child sha hex: {e}"))
+            })?;
+            children.push(ManifestChildRef {
+                chunk_count: c.chunk_count,
+                first_seq: c.first_seq,
+                last_seq: c.last_seq,
+                sha,
+                size: c.size,
+            });
+        }
+        let m = NestedManifest {
+            total_size: w.total_size,
+            chunk_tier,
+            stream_id: w.stream_id,
+            children,
+        };
+        m.validate()?;
+        Ok(m)
+    }
+
+    /// Check an OPENED child against its entry in this root: a v2 manifest
+    /// of this root's stream and tier, listing exactly `chunk_count` chunks
+    /// from `first_seq` to `last_seq`, whose sizes sum to `size`. A child
+    /// that is itself v3 is refused (depth ≤ 2).
+    pub fn check_child(&self, index: usize, child: &ChunkManifest) -> Result<(), BlobError> {
+        let Some(entry) = self.children.get(index) else {
+            return Err(BlobError::InvalidArgument(format!(
+                "child index {index} is outside the root's {} children",
+                self.children.len()
+            )));
+        };
+        let bad = |why: String| {
+            Err(BlobError::Backend(format!(
+                "chunk_dag manifest v3 child [{index}] {why}"
+            )))
+        };
+        if child.v != CHUNK_MANIFEST_VERSION_SEALED {
+            return bad(format!("is v{}, not a v2 manifest (depth is 2)", child.v));
+        }
+        if child.chunk_tier != Some(self.chunk_tier)
+            || child.stream_id.as_deref() != Some(self.stream_id.as_str())
+        {
+            return bad("names another stream or tier than its root".into());
+        }
+        if child.chunks.len() as u64 != entry.chunk_count {
+            return bad(format!(
+                "lists {} chunks but the root says {}",
+                child.chunks.len(),
+                entry.chunk_count
+            ));
+        }
+        let first = child.chunks.first().and_then(|c| c.seq);
+        let last = child.chunks.last().and_then(|c| c.seq);
+        if first != Some(entry.first_seq) || last != Some(entry.last_seq) {
+            return bad(format!(
+                "covers seq {first:?}..={last:?} but the root says {}..={}",
+                entry.first_seq, entry.last_seq
+            ));
+        }
+        if child.total_size != entry.size {
+            return bad(format!(
+                "totals {} but the root says {}",
+                child.total_size, entry.size
+            ));
+        }
+        child.validate_total_size()
+    }
+
+    /// The children covering the inclusive PLAINTEXT range `[start, end]`
+    /// (already clamped): `(child index, the child-local inclusive range)`.
+    /// Prefix sum over the children's sizes — the child set is chosen before
+    /// any child is opened.
+    #[must_use]
+    pub fn children_for_range(&self, start: u64, end: u64) -> Vec<(usize, u64, u64)> {
+        let mut out = Vec::new();
+        if start > end {
+            return out;
+        }
+        let mut child_start: u64 = 0;
+        for (i, c) in self.children.iter().enumerate() {
+            if c.size == 0 {
+                continue;
+            }
+            let child_end = child_start + c.size - 1;
+            if child_end >= start && child_start <= end {
+                let ls = start.saturating_sub(child_start);
+                let le = end.min(child_end) - child_start;
+                out.push((i, ls, le));
+            }
+            if child_start > end {
+                break;
+            }
+            child_start = child_end + 1;
+        }
+        out
+    }
+}
+
+/// v52.0.0 (#954) — a manifest as the opener finds it: a flat v1/v2 manifest
+/// or the root of a nested DAG. Dispatched on the `v` member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedManifest {
+    /// A v1 or v2 manifest (every chunk listed).
+    Flat(ChunkManifest),
+    /// A v3 root (the chunks are in its children).
+    Nested(NestedManifest),
+}
+
+impl ParsedManifest {
+    /// Parse manifest bytes of any known version.
+    pub fn parse(bytes: &[u8]) -> Result<Self, BlobError> {
+        #[derive(Deserialize)]
+        struct V {
+            v: u32,
+        }
+        let v: V = serde_json::from_slice(bytes)
+            .map_err(|e| BlobError::Backend(format!("chunk_dag manifest JSON parse: {e}")))?;
+        if v.v == CHUNK_MANIFEST_VERSION_NESTED {
+            NestedManifest::from_manifest_bytes(bytes).map(Self::Nested)
+        } else {
+            ChunkManifest::from_manifest_bytes(bytes).map(Self::Flat)
+        }
+    }
+
+    /// The file's plaintext total.
+    #[must_use]
+    pub fn total_size(&self) -> u64 {
+        match self {
+            Self::Flat(m) => m.total_size,
+            Self::Nested(n) => n.total_size,
+        }
+    }
+
+    /// The sealed tier the manifest declares (`None` for a v1).
+    #[must_use]
+    pub fn chunk_tier(&self) -> Option<crate::federation::types::cohort_scope::CryptoTier> {
+        match self {
+            Self::Flat(m) => m.chunk_tier,
+            Self::Nested(n) => Some(n.chunk_tier),
+        }
+    }
+
+    /// The stream the manifest was sealed from (`None` for a v1).
+    #[must_use]
+    pub fn stream_id(&self) -> Option<&str> {
+        match self {
+            Self::Flat(m) => m.stream_id.as_deref(),
+            Self::Nested(n) => Some(n.stream_id.as_str()),
+        }
+    }
+
+    /// Chunks listed across the whole DAG.
+    #[must_use]
+    pub fn chunk_count(&self) -> u64 {
+        match self {
+            Self::Flat(m) => m.chunks.len() as u64,
+            Self::Nested(n) => n.children.iter().map(|c| c.chunk_count).sum(),
+        }
+    }
+}
+
+/// v52.0.0 (CIRISPersist#957) — the most chunks one batched append or adopt
+/// carries. Above it the door refuses and the caller splits the run.
+pub const MAX_CHUNKS_PER_BATCH: usize = 64;
+
+/// v52.0.0 (#957) — the most envelope bytes one batch carries (32 MiB), so a
+/// batch holds the one writer for a bounded time.
+pub const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// v52.0.0 (#957) — one chunk of a batched append: its position, its body,
+/// and the plaintext length the body carries.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ChunkFloorItem {
+    /// The chunk's position in the stream.
+    pub seq: u64,
+    /// The chunk's bytes as stored.
+    pub body: BlobBody,
+    /// The plaintext length those bytes carry.
+    pub plaintext_size: u64,
+}
+
+/// v52.0.0 (#957) — the batch's bounds: at least one item, at most
+/// [`MAX_CHUNKS_PER_BATCH`], and at most [`MAX_BATCH_BYTES`] of inline bodies.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] naming the bound.
+pub fn check_chunk_batch_bounds(items: &[ChunkFloorItem]) -> Result<(), BlobError> {
+    if items.is_empty() {
+        return Err(BlobError::InvalidArgument(
+            "adopt_sealed_chunks: an empty batch".into(),
+        ));
+    }
+    if items.len() > MAX_CHUNKS_PER_BATCH {
+        return Err(BlobError::InvalidArgument(format!(
+            "adopt_sealed_chunks: {} chunks in one batch; at most {MAX_CHUNKS_PER_BATCH} — split the run",
+            items.len()
+        )));
+    }
+    let bytes: usize = items
+        .iter()
+        .map(|i| match &i.body {
+            BlobBody::Inline(b) => b.len(),
+            _ => 0,
+        })
+        .sum();
+    if bytes > MAX_BATCH_BYTES {
+        return Err(BlobError::InvalidArgument(format!(
+            "adopt_sealed_chunks: {bytes} bytes in one batch; at most {MAX_BATCH_BYTES} — split the run"
+        )));
+    }
+    Ok(())
+}
+
+/// v52.0.0 (#957) — the one spelling of the nonce-cap refusal (CEG §10.5.3):
+/// both backends refuse by this text, as `InvalidArgument`.
+#[must_use]
+pub fn epoch_cap_refusal(stream_id: &str, epoch: u64) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at MAX_CHUNKS_PER_EPOCH \
+         ({MAX_CHUNKS_PER_EPOCH}) — roll the epoch (STREAM-nonce counter exhaustion, CEG §10.5.3)"
+    ))
+}
+
+/// v52.0.0 (#954) — the one spelling of "this stream was abandoned": the
+/// chunk floor and the seal refuse it by this text on every backend.
+#[must_use]
+pub fn stream_abandoned_refusal(stream_id: &str) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "stream_abandoned: stream {stream_id} was abandoned by its owner; its id is tombstoned \
+         and never reused (CIRISPersist#954) — start a new stream"
+    ))
+}
+
+/// v52.0.0 (#954) — the one mapping from a backend's `record_manifest_child`
+/// outcome to its answer (`None` = recorded), so both dialects refuse with
+/// the same text.
+#[doc(hidden)]
+pub fn manifest_child_record_outcome(
+    root_sha256: &[u8; 32],
+    index: u64,
+    child_sha256: &[u8; 32],
+    refusal: Option<(&str, Option<Vec<u8>>)>,
+) -> Result<(), BlobError> {
+    match refusal {
+        None => Ok(()),
+        Some(("root", _)) => Err(BlobError::NotHeld {
+            sha256_hex: hex::encode(root_sha256),
+        }),
+        Some(("child", _)) => Err(BlobError::NotHeld {
+            sha256_hex: hex::encode(child_sha256),
+        }),
+        Some((_, other)) => Err(BlobError::InvalidArgument(format!(
+            "manifest {} child {index} is already recorded as {}, not {}",
+            hex::encode(root_sha256),
+            other.map(hex::encode).unwrap_or_default(),
+            hex::encode(child_sha256)
+        ))),
+    }
+}
+
+/// v52.0.0 (#954) — what [`BlobStorage::abandon_stream_floor`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct AbandonFloorReport {
+    /// The stream was already abandoned; nothing was done.
+    pub already: bool,
+    /// Index rows deleted.
+    pub chunks_dropped: u64,
+    /// Sealed chunk rows evicted, with their stored lengths summed.
+    pub bytes_evicted: u64,
+    /// The evicted (sealed) chunk shas, with the tier each was sealed at.
+    pub evicted: Vec<([u8; 32], crate::federation::types::cohort_scope::CryptoTier)>,
+}
+
+/// v52.0.0 (#954) — one child row the seal floor stores beside a v3 root:
+/// its index in the root and its sealed envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestChildRow {
+    /// The child's index in the root's `children`.
+    pub index: u64,
+    /// SHA-256 over `body`.
+    pub sha256: [u8; 32],
+    /// The sealed envelope.
+    pub body: Vec<u8>,
+}
+
 /// #832 (§12.4) — one covering chunk of a plaintext range: which chunk,
 /// and the chunk-local inclusive byte window to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,6 +1310,11 @@ pub struct ManifestRowSpec {
     /// How many index rows the door listed; the floor refuses if the
     /// stream now has a different count.
     pub expected_chunk_count: u64,
+    /// v52.0.0 (#954) — the child rows of a v3 root, stored in the same
+    /// transaction (each an inline row at the DAG's tier and cohort, bound to
+    /// the same epoch at a community, and related to the root in
+    /// `federation_manifest_children`). Empty for a v1 / v2 manifest.
+    pub children: Vec<ManifestChildRow>,
 }
 
 impl BlobBody {
@@ -1196,6 +1676,27 @@ pub trait BlobStorage: Send + Sync {
         binding: Option<EpochBinding>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
+    /// v52.0.0 (CIRISPersist#957) — **[`adopt_sealed_chunk_at`](Self::adopt_sealed_chunk_at),
+    /// batched**: a run of `(seq, envelope, plaintext_size)` items of ONE
+    /// stream at one epoch, in ONE write transaction. The stream's claim is
+    /// checked once; a refusal there (another owner, another cohort, an
+    /// abandoned stream, a reserved id) refuses the whole batch and writes
+    /// nothing (the outer `Err`). Each item then runs the single door's steps
+    /// in its own savepoint and answers in its slot: a seq conflict, the
+    /// nonce cap or a body the floor refuses rolls back that item only. At
+    /// most [`MAX_CHUNKS_PER_BATCH`] items and [`MAX_BATCH_BYTES`] bytes.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn adopt_sealed_chunks_at(
+        &self,
+        stream_id: &str,
+        items: Vec<(u64, Vec<u8>, u64)>,
+        epoch: u64,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: StorageFloor,
+        binding: Option<EpochBinding>,
+    ) -> impl Future<Output = Result<Vec<Result<[u8; 32], BlobError>>, BlobError>> + Send;
+
     /// v51.3.0 (CIRISPersist#947) — **promote an ADOPTED sealed manifest row
     /// to a `chunk_dag`.** [`adopt_sealed_blob_at`](Self::adopt_sealed_blob_at)
     /// stores every received envelope as `inline` (it never opens one, I45),
@@ -1428,6 +1929,43 @@ pub trait BlobStorage: Send + Sync {
         binding: Option<EpochBinding>,
     ) -> impl Future<Output = Result<(), BlobError>> + Send;
 
+    /// v52.0.0 (CIRISPersist#954) — the children a v3 root names on this
+    /// node, as `(index, child_sha)` in index order, from
+    /// `federation_manifest_children`. Empty for any other row. Read without
+    /// opening anything (I45): what eviction and serving walk.
+    fn manifest_children(
+        &self,
+        root_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<(u64, [u8; 32])>, BlobError>> + Send;
+
+    /// v52.0.0 (#954) — record that the held inline row `child_sha256` is
+    /// child `index` of the held root `root_sha256` (the adopt side of a v3
+    /// pull; the seal floor writes its own relation). Refuses by name if
+    /// either row is not held, or if `(root, index)` already names another
+    /// child. Idempotent for the same child.
+    fn record_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        index: u64,
+        child_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v52.0.0 (#954) — **the abandon floor.** In one transaction: refuse a
+    /// stream `owner_key_id` does not own ([`BlobError::InvalidArgument`],
+    /// `stream_not_owned`) or one already sealed (`stream_sealed`); answer an
+    /// already-abandoned stream with `already: true` and nothing done;
+    /// otherwise stamp `federation_streams.abandoned_at`, delete the stream's
+    /// index rows, and evict each chunk row at a SEALED tier (with its grants
+    /// and epoch binding — per-chunk content, never shared). A plaintext
+    /// chunk's bytes stay (content-addressed, possibly shared); only its
+    /// index row goes. After this, the chunk floor and the seal refuse the
+    /// stream (`stream_abandoned`).
+    fn abandon_stream_floor(
+        &self,
+        stream_id: &str,
+        owner_key_id: &str,
+    ) -> impl Future<Output = Result<AbandonFloorReport, BlobError>> + Send;
+
     /// #832 (§12.5, I37) — **the live-stream handle.** Every index row for
     /// `stream_id` in `seq` order, each joined to its chunk row's recorded
     /// tier and cohort, together with the latest STH's `tree_size` — read
@@ -1511,6 +2049,16 @@ pub trait BlobStorage: Send + Sync {
     /// Persist does NOT sign stream STHs (unlike the audit log). Witness
     /// cosignatures are stored as-provided (default empty); Cut C1b does
     /// NOT enforce a cosign quorum (best-effort tier — CEG §10.5.1).
+    /// v52.0.0 (CIRISPersist#950) — **what the producer signs, and what is
+    /// refused by name.** The producer signs over the stream's chunk shas in
+    /// `seq` order (the RFC 6962 root of the first `tree_size` leaves, CEG
+    /// §10.5.1) — mint it with
+    /// [`stream_sth::produce_stream_sth`](crate::federation::stream_sth::produce_stream_sth),
+    /// pyo3 `sign_stream_sth_json`. This door recomputes that root from ITS
+    /// OWN stored chunks and refuses a disagreeing one as
+    /// `InvalidArgument("put_stream_sth: root mismatch — …anti-equivocation
+    /// gate")`; a `tree_size` beyond the chunks it holds is refused as
+    /// `InvalidArgument("put_stream_sth: STH claims tree_size …")`.
     fn put_stream_sth(
         &self,
         sth: ciris_verify_core::transparency::SignedTreeHead,
@@ -1579,6 +2127,17 @@ pub trait BlobStorage: Send + Sync {
         limit: i64,
     ) -> impl Future<
         Output = Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, BlobError>,
+    > + Send;
+
+    /// v52.0.0 (CIRISPersist#953) — the same listing, each receipt with the
+    /// `received_at` this node stored it at. [`Self::list_delivery_receipts_for`]
+    /// is this listing with the instants dropped.
+    fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> impl Future<
+        Output = Result<Vec<crate::federation::stream_receipt::StoredDeliveryReceipt>, BlobError>,
     > + Send;
 
     /// Read a blob by its SHA-256.

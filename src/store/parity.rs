@@ -144,6 +144,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("start", Class::Plumbing),
     ("assemble_fountain_content", Class::Delegates),
     ("backfill_trace_dedup_shard_keys", Class::Delegates),
+    // v52.0.0 (#784, V163) — Plumbing: it refuses only on the substrate's own
+    // stored state (a legacy revocation whose key's stored pubkey cannot be
+    // digested), never on a caller's input; fail-closed, it refuses the open.
+    ("backfill_revocation_subject_digests", Class::Plumbing),
     ("bytes", Class::Plumbing),
     ("caller_scope_from_directory", Class::Gate),
     ("canonicalize_in_place", Class::Gate),
@@ -176,6 +180,36 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v42.0.0 (CIRISPersist#814 part 5) — Gate: refuses a `session:*` row whose
     // attester is not the attested occurrence (CC 3.4.3 substrate-self-report).
     ("check_session_self_report_admission", Class::Gate),
+    // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
+    // row whose grant shape or granter is not admissible. A statement about the input.
+    ("check_community_trust_grant_admission", Class::Gate),
+    // v52.0.0 (CIRISPersist#672) — Plumbing: the held-record settle. Its `?`
+    // propagates only a serialization failure (the substrate's own terms); a
+    // lookup error falls through to the full apply, and a settle returns early
+    // only for a byte-identical row this node already admitted, so it refuses
+    // nothing and admits nothing new.
+    ("settle_if_held", Class::Plumbing),
+    // v52.0.0 — Gate: refuses a binding_provenance token that is neither
+    // `rooted` nor `advisory` (it read `Rooted` until v52: fail-open).
+    ("from_token", Class::Gate),
+    // v52.0.0 (CIRISPersist#930) — Plumbing: the V161 history append inside the
+    // occurrence door's transaction fails only on the substrate's own terms
+    // (it refuses nothing about the caller; the door's gates ran before it),
+    // and its failure aborts the write — fail-closed, not open.
+    ("sqlite_append_occurrence_history", Class::Plumbing),
+    // v52.0.0 (#930) — Plumbing: decoding the history's own stored instant; a
+    // malformed one refuses the read (fail-closed).
+    ("parse_history_instant", Class::Plumbing),
+    // v52.0.0 (CIRISPersist#953) — Gate: refuses a chunk under a stream id
+    // shaped like a SHA-256 (reserved for an inline blob's one-leaf log). A
+    // statement about the caller's input.
+    ("refuse_reserved_stream_id", Class::Gate),
+    // v52.0.0 (#953) — Plumbing: a pure shape test that names the inline blob
+    // a stream id spells, inside the chunk-hash loader; it refuses nothing.
+    ("inline_blob_of_stream_id", Class::Plumbing),
+    // v52.0.0 (#953) — Delegates: the plain receipt listing is the stored
+    // listing with the instants dropped.
+    ("list_stored_delivery_receipts_for", Class::Delegates),
     // v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — Gate: refuses a dimension whose
     // segment breaks its manifest-declared case class. A statement about the
     // caller's input.
@@ -272,9 +306,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // the pure `check_promotion_cohort_standing` survives only as the
     // string-compare delegate inside `cohort_standing_core`'s callers.
     ("check_cohort_standing_resolved", Class::Gate),
-    // Refuses a split-brain row whose cohort-target aliases disagree; a
-    // refusal, so it contributes to the compared sequence.
-    ("envelope_cohort_target", Class::Gate),
+    // v52.0.0 (CIRISPersist#955) — Gate: AV-45 (the writer is a member of the
+    // cohort it names, the split-brain target refusal) plus the two
+    // membership arms; it replaced the direct `check_write_cohort_scope_for`
+    // and `envelope_cohort_target` calls at every put door.
+    ("check_attestation_write_scope", Class::Gate),
     // Targeted cohorts REQUIRE federation tier (every other tier is
     // signature-exempt; a membership claim needs the verified signature) —
     // PR #761 strengthened the v38.2.0 never-local form, which an unknown
@@ -313,7 +349,6 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("check_user_target_steward_binding_admission", Class::Gate),
     ("check_withdraws_admission", Class::Gate),
     ("check_write", Class::Gate),
-    ("check_write_cohort_scope_for", Class::Gate),
     ("cloned", Class::Plumbing),
     ("commit", Class::Plumbing),
     ("compute_persist_row_hash", Class::Plumbing),
@@ -609,11 +644,25 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // self-signed, claim byte-equal; refuses the write with `Conflict`.
     ("prepare_rebind", Class::Gate),
     ("prepare_sealed_manifest_row", Class::Plumbing),
-    ("prepare_stream_chunk_row", Class::Plumbing),
     ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
     // both run its sequence.
     ("put_blob_chunk_floor", Class::Delegates),
+    // v52.0.0 (CIRISPersist#957) — the chunk floor, batched: the single floor
+    // is its batch of one, and it runs every gate the single floor ran.
+    ("put_blob_chunks_floor", Class::Delegates),
+    // #957 — Gate: refuses an empty batch, more than MAX_CHUNKS_PER_BATCH
+    // items, or more than MAX_BATCH_BYTES. A statement about the input.
+    ("check_chunk_batch_bounds", Class::Gate),
+    // #957 — Plumbing: a savepoint and a cached statement fail only on the
+    // substrate's own terms (the connection, the SQL text), never on input.
+    ("savepoint", Class::Plumbing),
+    ("prepare_cached", Class::Plumbing),
+    // #957 — one item's append (blob row, nonce cap, index row, binding) as a
+    // same-file helper of the batched floor; its refusals are the item's
+    // answer (cap, seq conflict, moved epoch).
+    ("sqlite_append_chunk_item", Class::Delegates),
+    ("pg_append_chunk_item", Class::Delegates),
     ("put_family_local", Class::Delegates),
     ("put_transport_destination", Class::Delegates),
     ("query", Class::Plumbing),
@@ -874,6 +923,18 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  update inside one — and memory's read is a separate `get_attestation` that locks \
                  and releases, so without the re-ask the door would gate one row and mutate \
                  another. An extra ask of a pure refusal is the safe direction of this difference.",
+    },
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "list_signed_transport_destinations_since",
+        backend: "memory",
+        expected: &[],
+        reason: "v52.0.0 — `from_token` decodes the STORED `binding_provenance` TEXT column on \
+                 sqlite and postgres and refuses a token that is neither `rooted` nor `advisory`. \
+                 Memory stores the typed `BindingProvenance` enum and never holds a token, so \
+                 there is nothing to decode and nothing that can be malformed. The admission \
+                 door that refuses an unknown ENVELOPE token is shared by all three backends \
+                 (I279).",
     },
 ];
 

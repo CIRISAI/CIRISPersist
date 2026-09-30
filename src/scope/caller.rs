@@ -129,6 +129,30 @@ impl CallerScope {
         }
     }
 
+    /// v52.0.0 (CIRISPersist#955) — **the membership proposal arm**, the Rust
+    /// twin of the SQL `EXISTS` over `attestation_subjects`: a
+    /// `membership:proposal:v1` row at `family` / `community` is readable by a
+    /// caller whose self-collective holds one of its `subject_key_ids` (the
+    /// invitee), whatever rooms the caller is in. Callers OR it with
+    /// [`Self::admits`]; it admits nothing else.
+    #[must_use]
+    pub fn admits_membership_proposal(
+        &self,
+        cohort_scope: &str,
+        dimension: Option<&str>,
+        subject_key_ids: &[String],
+    ) -> bool {
+        use crate::federation::types::cohort_scope as cs;
+        let CallerScope::Authenticated { admission } = self else {
+            return false;
+        };
+        (cohort_scope == cs::FAMILY || cohort_scope == cs::COMMUNITY)
+            && dimension == Some(crate::federation::membership_acceptance::PROPOSAL_DIMENSION)
+            && subject_key_ids
+                .iter()
+                .any(|k| admission.self_key_ids.contains(k))
+    }
+
     /// v46.3.1 (PR #889 review, round three) — **the local-tier gate**,
     /// `FSD/V4_4_SHARED_ATTESTATION_SURFACE.md` §3: a `local`-tier row is
     /// producer-only authority (signature deferred) and is visible ONLY to

@@ -236,31 +236,88 @@ fn write_value(buf: &mut Vec<u8>, v: &serde_json::Value) {
             }
             buf.push(b']');
         }
-        serde_json::Value::Object(map) => {
-            // Python sort_keys=True: Python orders dict keys by str
-            // comparison (codepoint order). For BMP-only keys this
-            // matches lexicographic byte order of the UTF-8 form;
-            // for keys with non-BMP characters Python's order is
-            // UTF-32 (codepoint), which equals UTF-8 byte order
-            // since UTF-8 is a codepoint-preserving encoding when
-            // compared as byte sequences. Conclusion: sorting by the
-            // raw UTF-8 string bytes IS Python's sort_keys order.
-            //
-            // (Note: this differs from RFC 8785, which uses UTF-16
-            // code unit order — the divergence point above U+FFFF.
-            // We are intentionally Python-compat here, not JCS.)
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-            buf.push(b'{');
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    buf.push(b',');
-                }
-                write_string(buf, k);
-                buf.push(b':');
-                write_value(buf, map.get(*k).expect("key from map"));
-            }
-            buf.push(b'}');
+        serde_json::Value::Object(map) => write_object(buf, map, &[]),
+    }
+}
+
+/// One object in Python-compat form, leaving out the members named in
+/// `skip` — v52.0.0 (#958): the signing strip is a filter over the TOP-LEVEL
+/// members while writing, so the envelope is never cloned to delete them.
+/// Every nested object is written whole (`skip` is `&[]` below the top).
+fn write_object(
+    buf: &mut Vec<u8>,
+    map: &serde_json::Map<String, serde_json::Value>,
+    skip: &[&str],
+) {
+    // Python sort_keys=True: Python orders dict keys by str
+    // comparison (codepoint order). For BMP-only keys this
+    // matches lexicographic byte order of the UTF-8 form;
+    // for keys with non-BMP characters Python's order is
+    // UTF-32 (codepoint), which equals UTF-8 byte order
+    // since UTF-8 is a codepoint-preserving encoding when
+    // compared as byte sequences. Conclusion: sorting by the
+    // raw UTF-8 string bytes IS Python's sort_keys order.
+    //
+    // (Note: this differs from RFC 8785, which uses UTF-16
+    // code unit order — the divergence point above U+FFFF.
+    // We are intentionally Python-compat here, not JCS.)
+    let mut keys: Vec<&String> = map.keys().filter(|k| !skip.contains(&k.as_str())).collect();
+    keys.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    buf.push(b'{');
+    for (i, k) in keys.iter().enumerate() {
+        if i > 0 {
+            buf.push(b',');
+        }
+        write_string(buf, k);
+        buf.push(b':');
+        write_value(buf, map.get(*k).expect("key from map"));
+    }
+    buf.push(b'}');
+}
+
+/// v52.0.0 (CIRISPersist#958) — the top-level members a signing form leaves
+/// out: the signature container never covers itself.
+const SIGNATURE_MEMBERS: [&str; 2] = ["signature", "signature_pqc"];
+
+/// v52.0.0 (#958) — an envelope's top-level members minus
+/// [`SIGNATURE_MEMBERS`], serialized BY REFERENCE. RFC 8785 is compositional
+/// over members (`serde_jcs` sorts them by UTF-16 code units as it writes),
+/// so filtering the top-level map while serializing gives the bytes the old
+/// clone-then-remove gave, with no copy of any child.
+struct SigningView<'a>(&'a serde_json::Map<String, serde_json::Value>);
+
+impl serde::Serialize for SigningView<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let kept = || {
+            self.0
+                .iter()
+                .filter(|(k, _)| !SIGNATURE_MEMBERS.contains(&k.as_str()))
+        };
+        // `Some(len)`: the same serializer calls a `Value::Object` makes.
+        let mut m = s.serialize_map(Some(kept().count()))?;
+        for (k, v) in kept() {
+            m.serialize_entry(k, v)?;
+        }
+        m.end()
+    }
+}
+
+/// v52.0.0 (#958) — the produce gate over the signing view: the stripped
+/// envelope's canonical bytes under [`produce_canon_version`], without
+/// building the stripped envelope. A non-object envelope has nothing to
+/// strip and is canonicalized as is.
+fn produce_canonicalize_signing_form(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
+    let Some(map) = envelope.as_object() else {
+        return ceg_produce_canonicalize(envelope);
+    };
+    match produce_canon_version() {
+        CanonVersion::V2Jcs => serde_jcs::to_vec(&SigningView(map))
+            .map_err(|e| Error::Canonicalization(format!("jcs (rfc 8785): {e}"))),
+        CanonVersion::V1Python => {
+            let mut buf = Vec::with_capacity(256);
+            write_object(&mut buf, map, &SIGNATURE_MEMBERS);
+            Ok(buf)
         }
     }
 }
@@ -339,12 +396,9 @@ fn write_number(buf: &mut Vec<u8>, n: &serde_json::Number) {
 pub fn canonicalize_envelope_for_signing(
     envelope: &serde_json::Value,
 ) -> Result<Vec<u8>, super::Error> {
-    let mut value = envelope.clone();
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("signature");
-        obj.remove("signature_pqc");
-    }
-    ceg_produce_canonicalize(&value)
+    // v52.0.0 (CIRISPersist#958) — no deep clone: the strip is a filter
+    // while serializing (I292 holds the bytes to the old clone-and-remove).
+    produce_canonicalize_signing_form(envelope)
 }
 
 /// v35.0.0 (CIRISPersist#714) — the V1Python-PINNED strip-then-canonicalize
@@ -376,14 +430,14 @@ pub fn canonicalize_envelope_for_signing(
 pub fn canonicalize_envelope_for_signing_v1_pinned(
     envelope: &serde_json::Value,
 ) -> Result<Vec<u8>, super::Error> {
-    let mut value = envelope.clone();
-    if let Some(obj) = value.as_object_mut() {
-        obj.remove("signature");
-        obj.remove("signature_pqc");
+    // v52.0.0 (CIRISPersist#958) — the same V1 writer, skipping the two
+    // top-level members as it writes, instead of cloning the envelope.
+    let mut buf = Vec::with_capacity(256);
+    match envelope.as_object() {
+        Some(map) => write_object(&mut buf, map, &SIGNATURE_MEMBERS),
+        None => write_value(&mut buf, envelope),
     }
-    canonicalizer_for(CanonVersion::V1Python)
-        .canonicalize_value(&value)
-        .map_err(|e| super::Error::Canonicalization(format!("{e}")))
+    Ok(buf)
 }
 
 /// v0.4.1 (CIRISEdge ask) — SHA-256 of a body's verbatim wire
@@ -460,6 +514,164 @@ fn write_string(buf: &mut Vec<u8>, s: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The pre-#958 implementations, kept as the oracle I292 holds the new
+    /// ones to: clone the envelope, remove the two members, canonicalize.
+    fn oracle_for_signing(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
+        let mut value = envelope.clone();
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("signature");
+            obj.remove("signature_pqc");
+        }
+        ceg_produce_canonicalize(&value)
+    }
+
+    fn oracle_v1_pinned(envelope: &serde_json::Value) -> Result<Vec<u8>, Error> {
+        let mut value = envelope.clone();
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("signature");
+            obj.remove("signature_pqc");
+        }
+        canonicalizer_for(CanonVersion::V1Python).canonicalize_value(&value)
+    }
+
+    /// Random JSON for I292: nested objects and arrays, integers across i64
+    /// and u64, big integers, floats in exponent and plain forms, strings
+    /// with escapes and non-ASCII, and keys that split UTF-16 code-unit
+    /// order from codepoint order (non-BMP vs U+E000–U+FFFF), plus the two
+    /// stripped member names at the top AND nested (only the top strips).
+    fn arb_json() -> impl proptest::strategy::Strategy<Value = serde_json::Value> {
+        use proptest::prelude::*;
+        let key = prop_oneof![
+            Just("signature".to_owned()),
+            Just("signature_pqc".to_owned()),
+            Just("\u{1F600}".to_owned()),
+            Just("\u{E000}".to_owned()),
+            Just("\u{FFFD}x".to_owned()),
+            Just("a".to_owned()),
+            Just("A".to_owned()),
+            "[a-z\\\"\n\u{00E9}\u{4E2D}\u{1F4A9}]{0,6}",
+        ];
+        let number = prop_oneof![
+            any::<i64>().prop_map(|n| serde_json::json!(n)),
+            any::<u64>().prop_map(|n| serde_json::json!(n)),
+            (-1.0e30f64..1.0e30).prop_map(|f| serde_json::json!(f)),
+            prop_oneof![
+                Just("1e-7"),
+                Just("12345678901234567890123"),
+                Just("-0.0"),
+                Just("5e-324"),
+                Just("1E+21"),
+            ]
+            .prop_map(|t| serde_json::from_str::<serde_json::Value>(t).unwrap()),
+        ];
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            number,
+            "[ -~\u{00E9}\u{4E2D}\u{1F4A9}\\\"\t]{0,12}".prop_map(serde_json::Value::String),
+        ];
+        leaf.prop_recursive(4, 48, 6, move |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..6).prop_map(serde_json::Value::Array),
+                proptest::collection::btree_map(key.clone(), inner, 0..6)
+                    .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+        /// **I292 (#958)** — the borrowed signing view gives the bytes the
+        /// clone-and-remove gave, on the produce gate AND the V1-pinned audit
+        /// rule, for any envelope (objects with and without the signature
+        /// members, and non-object values).
+        #[test]
+        fn i292_the_signing_view_is_byte_identical(v in arb_json()) {
+            proptest::prop_assert_eq!(
+                canonicalize_envelope_for_signing(&v).unwrap(),
+                oracle_for_signing(&v).unwrap()
+            );
+            proptest::prop_assert_eq!(
+                canonicalize_envelope_for_signing_v1_pinned(&v).unwrap(),
+                oracle_v1_pinned(&v).unwrap()
+            );
+        }
+    }
+
+    /// **I292 (fixed cases)** — the edges named in the design, each a
+    /// top-level object carrying both signature members.
+    #[test]
+    fn i292_the_signing_view_edges() {
+        for v in [
+            json!({"signature": "s", "signature_pqc": "p", "\u{1F600}": 1, "\u{E000}": 2, "b": {"signature": "kept"}}),
+            json!({"signature": 1}),
+            json!({}),
+            json!([{"signature": "array items are not stripped"}]),
+            json!("a string envelope"),
+            serde_json::from_str::<serde_json::Value>(
+                r#"{"n": 1e-7, "m": 12345678901234567890123, "signature_pqc": null}"#,
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(
+                canonicalize_envelope_for_signing(&v).unwrap(),
+                oracle_for_signing(&v).unwrap(),
+                "{v}"
+            );
+            assert_eq!(
+                canonicalize_envelope_for_signing_v1_pinned(&v).unwrap(),
+                oracle_v1_pinned(&v).unwrap(),
+                "{v}"
+            );
+        }
+    }
+
+    /// **I292 (literal bytes)** — only the TOP-LEVEL signature members are
+    /// stripped; a nested `signature` is content and stays, on both rules.
+    /// Pinned as literal bytes because the V1 oracle shares `write_value`
+    /// with the code under test, so an equality check against it cannot see
+    /// a strip applied at every depth.
+    #[test]
+    fn i292_a_nested_signature_member_is_kept() {
+        let v = json!({
+            "signature": "top",
+            "signature_pqc": "top-pqc",
+            "b": {"signature": "kept", "z": [ {"signature_pqc": "kept too"} ]},
+            "a": 1
+        });
+        let want = r#"{"a":1,"b":{"signature":"kept","z":[{"signature_pqc":"kept too"}]}}"#;
+        assert_eq!(
+            String::from_utf8(canonicalize_envelope_for_signing(&v).unwrap()).unwrap(),
+            want
+        );
+        assert_eq!(
+            String::from_utf8(canonicalize_envelope_for_signing_v1_pinned(&v).unwrap()).unwrap(),
+            want
+        );
+        assert_eq!(
+            pyc(json!({"signature": {"signature": 1}})),
+            r#"{"signature":{"signature":1}}"#,
+            "the V1 canonicalizer strips nothing by itself"
+        );
+    }
+
+    /// **I295 (#958)** — exactly one `serde_jcs` in Cargo.lock, so the
+    /// direct dependency the signing view serializes through is the one
+    /// `ciris_verify_core::jcs::canonicalize` uses.
+    #[test]
+    fn i295_one_serde_jcs_in_the_lock() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
+        )
+        .unwrap();
+        let n = lock.matches("\nname = \"serde_jcs\"\n").count();
+        assert_eq!(
+            n, 1,
+            "I295: Cargo.lock holds {n} serde_jcs packages; the signing view and verify-core \
+             must serialize through the same one (#958)"
+        );
+    }
 
     fn pyc(v: serde_json::Value) -> String {
         let bytes = PythonJsonDumpsCanonicalizer.canonicalize_value(&v).unwrap();

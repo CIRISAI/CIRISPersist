@@ -103,6 +103,7 @@ pub mod bodies {
                         founded_at: joined,
                         consensus_protocol: c.protocol.to_owned(),
                         consensus_protocol_entrenched: false,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 )),

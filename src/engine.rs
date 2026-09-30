@@ -3499,6 +3499,7 @@ impl Engine {
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
             supersede_proof: None,
+            cosignatures: Vec::new(),
         };
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5486,6 +5487,113 @@ impl Engine {
         }
     }
 
+    /// v52.0.0 (CIRISPersist#955) — **invite `invitee` into `group`**: emit a
+    /// `membership:proposal:v1` row under this engine's signer (the inviter;
+    /// a founder under `founder_only`, any member otherwise), placed at the
+    /// group (`scope` = `family` or `community`), naming the invitee and the
+    /// offered `role`, live until `expires_at` (at most 30 days out). Returns
+    /// the proposal's attestation id — what the invitee's reply references.
+    /// The group's quorum is NOT asked here: it signs the widening that
+    /// admits the member once they accept.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn propose_membership(
+        &self,
+        scope: &str,
+        group_key_id: &str,
+        invitee_key_id: &str,
+        role: Option<&str>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String, crate::federation::Error> {
+        self.emit_attestation_self(crate::federation::membership_acceptance::proposal_input(
+            scope,
+            group_key_id,
+            invitee_key_id,
+            role,
+            expires_at,
+        ))
+        .await
+    }
+
+    /// v52.0.0 (CIRISPersist#955) — **accept (`accept = true`) or decline a
+    /// held membership proposal** under this engine's signer, which must act
+    /// for the proposal's invitee (the invitee's own key, or a node/device
+    /// bound to them). The reply binds the proposal's id, content hash and
+    /// role. A decline is final for that proposal. Returns the reply's
+    /// attestation id.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reply_to_membership_proposal(
+        &self,
+        proposal_attestation_id: &str,
+        accept: bool,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::FederationDirectory;
+        let proposal = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.get_attestation(proposal_attestation_id).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.get_attestation(proposal_attestation_id).await?,
+        }
+        .ok_or_else(|| crate::federation::Error::MembershipAcceptanceRefused {
+            group_key_id: String::new(),
+            member_key_id: String::new(),
+            rule: crate::federation::membership_acceptance::RULE_PROPOSAL_UNRESOLVED,
+        })?;
+        self.emit_attestation_self(crate::federation::membership_acceptance::reply_input(
+            &proposal, accept,
+        ))
+        .await
+    }
+
+    /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
+    /// `consent:community_trust` grant for `node`**, or `None`: the capture
+    /// gate's answer, folded from the rows about the node (latest grant after
+    /// the latest admitted revocation; ties on the smallest id). See
+    /// [`community_trust_consent`](crate::federation::community_trust_consent).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn community_trust_consent_for(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Option<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::community_trust_consent::community_trust_consent_for;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                community_trust_consent_for(arc.as_ref(), node_key_id).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                community_trust_consent_for(arc.as_ref(), node_key_id).await
+            }
+        }
+    }
+
+    /// v52.0.0 (CIRISPersist#950, for CIRISEdge#734) — **mint this node's
+    /// Signed Tree Head over a chunk-DAG file's stream**, under the engine's
+    /// PQC LocalSigner (the announcing signer; its derived key is the
+    /// producer `put_stream_sth` verifies against). `chunk_shas` are the
+    /// stream's chunk shas in `seq` order; the STH covers the first
+    /// `tree_size`. Nothing is stored — publish it with `put_stream_sth`,
+    /// which recomputes the root from this node's chunks and refuses a
+    /// disagreeing one by name. See
+    /// [`stream_sth::produce_stream_sth`](crate::federation::stream_sth::produce_stream_sth).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sign_stream_sth(
+        &self,
+        stream_id: &str,
+        chunk_shas: &[[u8; 32]],
+        tree_size: u64,
+    ) -> Result<ciris_verify_core::transparency::SignedTreeHead, crate::federation::BlobError> {
+        let local = self.announcing_signer().await?;
+        crate::federation::stream_sth::produce_stream_sth(
+            local,
+            stream_id,
+            chunk_shas,
+            tree_size,
+            chrono::Utc::now(),
+        )
+        .await
+    }
+
     /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the chunk
     /// list of a sealed DAG this node holds**, opened for `viewer_key_id`
     /// under the same authorization as [`read_blob_as`](Self::read_blob_as)
@@ -5577,6 +5685,140 @@ impl Engine {
                 .await
             }
         }
+    }
+
+    /// v52.0.0 (CIRISPersist#954, `BLOB_REPLICATION.md` §6.6) — **the chunks
+    /// child `index` of a v3 manifest lists**, opened for `viewer_key_id`
+    /// under the same authorization as [`read_blob_as`](Self::read_blob_as)
+    /// on the ROOT, then on the child row. For a file above the flat
+    /// manifest's ceiling, [`open_sealed_manifest_as`](Self::open_sealed_manifest_as)
+    /// answers `version: 3` with `children` and no `chunks`; the puller walks
+    /// the children one page at a time.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn open_sealed_manifest_page_as(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        child_index: u64,
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        Vec<crate::federation::chunk_dag_cascade::orchestrate::SealedManifestChunk>,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::open_sealed_manifest_page_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                open_sealed_manifest_page_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    child_index,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                open_sealed_manifest_page_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    child_index,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v52.0.0 (#954, `BLOB_REPLICATION.md` §6.6) — **adopt one child of a
+    /// v3 manifest**: the child's sealed envelope through
+    /// [`adopt_sealed_blob`](Self::adopt_sealed_blob) (`LocalOnly`; it is
+    /// never opened, I45), then the relation `(root, index) → child` so
+    /// eviction and promotion find it without opening the root. The root
+    /// must already be held (adopt it first). Returns the child's address.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        child_index: u64,
+        envelope: &[u8],
+        provenance: crate::federation::BlobProvenance,
+    ) -> Result<[u8; 32], crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        let held = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.blob_head(root_sha256).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.blob_head(root_sha256).await?,
+        };
+        if held.is_none() {
+            return Err(crate::federation::BlobError::NotHeld {
+                sha256_hex: hex::encode(root_sha256),
+            });
+        }
+        let out = self
+            .adopt_sealed_blob(
+                envelope,
+                provenance,
+                None,
+                crate::federation::AdoptDisposition::LocalOnly,
+            )
+            .await?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.record_manifest_child(root_sha256, child_index, &out.sha256)
+                    .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.record_manifest_child(root_sha256, child_index, &out.sha256)
+                    .await?
+            }
+        }
+        Ok(out.sha256)
+    }
+
+    /// v52.0.0 (CIRISPersist#954) — **abandon an unsealed stream this node
+    /// owns.** A streaming publish refused midway leaves chunk rows, index
+    /// rows and per-chunk content key-grant sets that replicate to the
+    /// owner's devices for bytes that will never be sealed. This door, for
+    /// the stream's OWNER only (this Engine's derived key) and only before a
+    /// seal: tombstones the stream (the id is never reused; the chunk door
+    /// and the seal refuse it as `stream_abandoned`), drops its index rows,
+    /// evicts its sealed chunk rows (a plaintext chunk's bytes stay: they are
+    /// content-addressed and may be shared). The content key-grant sets
+    /// already emitted for those chunks are NOT withdrawn: CC 3 says a shared
+    /// key cannot be retroactively un-shared, and the withdraws gate refuses
+    /// one naming a `key_grant` row. On a peer that never received the bytes
+    /// such a set stays an inert pending row; nothing opens with it.
+    /// Idempotent: a second call answers `already: true`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn abandon_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::federation::chunk_dag_cascade::AbandonReport, crate::federation::BlobError>
+    {
+        use crate::federation::BlobStorage;
+        let me = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("abandon_stream: signer: {e}"))
+        })?;
+        let floor = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
+        };
+        Ok(crate::federation::chunk_dag_cascade::AbandonReport {
+            already: floor.already,
+            chunks_dropped: floor.chunks_dropped,
+            bytes_evicted: floor.bytes_evicted,
+        })
     }
 
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
@@ -5671,6 +5913,45 @@ impl Engine {
                     &provenance,
                 )
                 .await
+            }
+        }
+    }
+
+    /// v52.0.0 (CIRISPersist#957) — **adopt a run of sealed chunks of one
+    /// stream** in one write transaction: [`adopt_sealed_chunk`](Self::adopt_sealed_chunk)
+    /// for up to [`MAX_CHUNKS_PER_BATCH`](crate::federation::blobs::MAX_CHUNKS_PER_BATCH)
+    /// chunks at one epoch under one provenance. The provenance, the WILL
+    /// decision and the stream's claim are checked once; a refusal there is
+    /// the outer `Err` and nothing is written. Each item then answers in its
+    /// slot, in order: a malformed envelope, a seq conflict or the nonce cap
+    /// refuses that item alone and the rest commit.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_chunks(
+        &self,
+        stream_id: &str,
+        items: &[crate::federation::AdoptChunkItem<'_>],
+        epoch: u64,
+        provenance: crate::federation::BlobProvenance,
+    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
+    {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::adopt_cascade::adopt_sealed_chunks;
+        let (our_key, fam) = self.local_or_family_parts().await?;
+        let ctx = crate::federation::HoldContext {
+            pressure: self.current_disk_pressure(),
+            is_local_or_family: local_or_family_predicate(our_key.clone(), fam),
+            our_key_id: &our_key,
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                adopt_sealed_chunks(arc.as_ref(), &ctx, stream_id, items, epoch, &provenance).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                adopt_sealed_chunks(arc.as_ref(), &ctx, stream_id, items, epoch, &provenance).await
             }
         }
     }
@@ -10224,6 +10505,8 @@ pub enum EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     // Gate the import to the union of its users so the no-backend
     // `--features server` build (`-D warnings`) doesn't see it as unused,
     // while postgres-only / pyo3+postgres builds (the pre-push hook is
@@ -10734,6 +11017,7 @@ mod tests {
             founded_at: chrono::Utc::now(),
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let _ = sq.put_family_local(hostile).await; // whatever it returns…
@@ -10794,12 +11078,14 @@ mod tests {
                 founded_at: chrono::Utc::now(),
                 consensus_protocol: "founder_only".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
             authority_key_id: "rogue-1".into(),
             scrub_signature_classical: "AA==".into(),
             scrub_signature_pqc: None,
             supersede_proof: None,
+            cosignatures: Vec::new(),
         };
         let err = dir
             .put_family(squat)
@@ -15539,8 +15825,12 @@ mod tests {
         // group than an unmoderated one"), and a USER key is steward-bound.
         let human = "human-39f";
         ts::register_identity_key(&*sq, human, crate::federation::types::identity_type::USER).await;
-        crate::ceg::list::drive_query_invariants::bodies::seed_room(&*sq, room, &[&node, human])
-            .await;
+        crate::ceg::list::drive_query_invariants::bodies::seed_room_signed(
+            &*sq,
+            room,
+            &[(&node, "node-39f"), (human, human)],
+        )
+        .await;
         // The (c) hook fires the sweep right after the grant lands.
         let _grant = emit_509_grant_audience_in(
             &engine,
@@ -17368,33 +17658,42 @@ mod tests {
         engine: &Engine,
         community_id: &str,
         founder_key_id: &str,
+        founder_pubkey_label: &str,
     ) {
         engine
             .federation_directory()
             .put_public_key(sweeper_test_key(community_id))
             .await
             .expect("seed community key");
+        let community = crate::federation::types::Community {
+            community_key_id: community_id.into(),
+            community_name: "cut-c-community".into(),
+            members: vec![crate::federation::types::CommunityMember {
+                key_id: founder_key_id.into(),
+                joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                role: Some("founder".into()),
+            }],
+            founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        // v52.0.0 (#955, Q1) — the founder consents by co-signing; its key
+        // carries `founder_pubkey_label`'s pubkeys, so it signs with them.
+        let (_h, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
+            founder_pubkey_label,
+            &community.signing_envelope(),
+        );
+        let mut signed =
+            crate::federation::tier_ingest::test_support::sign_community(community_id, community);
+        signed.cosignatures = vec![crate::federation::types::RosterCosignature {
+            authority_key_id: founder_key_id.into(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }];
         engine
             .federation_directory()
-            .put_community(
-                crate::federation::tier_ingest::test_support::sign_community(
-                    community_id,
-                    crate::federation::types::Community {
-                        community_key_id: community_id.into(),
-                        community_name: "cut-c-community".into(),
-                        members: vec![crate::federation::types::CommunityMember {
-                            key_id: founder_key_id.into(),
-                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                            role: Some("founder".into()),
-                        }],
-                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol:
-                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
-                        policy_blob: None,
-                        persist_row_hash: String::new(),
-                    },
-                ),
-            )
+            .put_community(signed)
             .await
             .expect("seed community");
     }
@@ -18506,7 +18805,7 @@ mod tests {
         sq.put_public_key(sweeper_test_key("moderator"))
             .await
             .expect("seed moderator");
-        seed_community_with_founder(&engine, "comm-1", &derived).await;
+        seed_community_with_founder(&engine, "comm-1", &derived, "founder").await;
 
         // Pre: not yet a moderator.
         assert!(
@@ -18584,6 +18883,7 @@ mod tests {
                 founded_at: joined,
                 consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -18651,14 +18951,14 @@ mod tests {
             )
             .await;
             assert!(
-                d.add_member(cohort, group, mem_b_row.clone(), &admit_b)
+                d.add_member_consented(cohort, group, mem_b_row.clone(), &admit_b)
                     .await
                     .expect("add_member"),
                 "{tag} add_member(mem_b) is a genuine add"
             );
             assert_eq!(d.active_members(cohort, group).await.unwrap().len(), 2);
             assert!(
-                !d.add_member(cohort, group, mem_b_row.clone(), &admit_b)
+                !d.add_member_consented(cohort, group, mem_b_row.clone(), &admit_b)
                     .await
                     .expect("add_member idempotent"),
                 "{tag} re-add(mem_b) is a no-op"
@@ -18707,6 +19007,22 @@ mod tests {
                 d, &founder, cohort, group, &mem_c_row,
             )
             .await;
+            // v52.0.0 (#955) — mem_c consents before the swap admits it.
+            crate::federation::membership_acceptance::test_support::consent(
+                d,
+                if cohort == crate::federation::cohort::Cohort::Family {
+                    crate::federation::types::cohort_scope::FAMILY
+                } else {
+                    crate::federation::types::cohort_scope::COMMUNITY
+                },
+                group,
+                &founder,
+                &mem_c_row.key_id,
+                mem_c_row.role.as_deref(),
+                mem_c_row.joined_at,
+            )
+            .await
+            .expect("mem_c consents");
             assert!(
                 d.swap_member(
                     cohort,
@@ -18805,7 +19121,7 @@ mod tests {
         );
         // self admits occurrences via the typed put, NOT the uniform add_member.
         let err = d
-            .add_member(
+            .add_member_consented(
                 Cohort::SelfId,
                 &ident,
                 RosterMember {
@@ -18883,23 +19199,27 @@ mod tests {
                 .collect()
         };
 
-        // Genesis: 3-member quorum:2/3 family (version 1).
+        // Genesis: 5-member quorum:3/5 family (version 1). v52.0.0 (#955):
+        // every founding member co-signs (the fixture signer does), and a
+        // supersede may not ADD a member, so the amendment below contracts.
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
                 family_key_id: fam.clone(),
                 family_name: "accord".into(),
-                members: mk_members(3),
+                members: mk_members(5),
                 founded_at: joined,
-                consensus_protocol: "quorum:2/3".into(),
+                consensus_protocol: "quorum:3/5".into(),
                 consensus_protocol_entrenched: true,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
         .await
         .expect("genesis put_family");
 
-        // Supersede → 5-member quorum:3/5 (the expansion the write gap blocked).
+        // Supersede → 3-member quorum:2/3 (a contraction; growth is the
+        // widening plane's, #955 Q2).
         //
         // v31.0.0 (CIRISPersist#651) — this comment used to say that because
         // `supersede_family` writes via `supersede_group_row` and not the
@@ -18916,7 +19236,42 @@ mod tests {
         // made it. `supersede_family` now hybrid-verifies the wrapper exactly
         // as `put_family` does, so the fixture seals it through the same
         // helper the genesis write above uses.
-        let auth = serde_json::json!({"membership_change": "expand 3->5", "quorum": "2/3"});
+        let grow = d
+            .supersede_family(
+                crate::federation::tier_ingest::test_support::sign_family(
+                    &fam,
+                    types::Family {
+                        family_key_id: fam.clone(),
+                        family_name: "accord".into(),
+                        members: {
+                            let mut all = mk_members(5);
+                            all.push(types::FamilyMember {
+                                key_id: fam.clone(),
+                                joined_at: joined,
+                                role: None,
+                            });
+                            all
+                        },
+                        founded_at: joined,
+                        consensus_protocol: "quorum:3/5".into(),
+                        consensus_protocol_entrenched: true,
+                        dissolved_at: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect_err("#955 Q2: a supersede never adds a member");
+        assert!(
+            matches!(
+                grow,
+                crate::federation::Error::MembershipAcceptanceRefused { rule, .. }
+                    if rule == crate::federation::membership_acceptance::RULE_SUPERSEDE_CANNOT_ADD
+            ),
+            "{grow:?}"
+        );
+        let auth = serde_json::json!({"membership_change": "contract 5->3", "quorum": "3/5"});
         let new_version = d
             .supersede_family(
                 crate::federation::tier_ingest::test_support::sign_family(
@@ -18924,26 +19279,27 @@ mod tests {
                     types::Family {
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
-                        members: mk_members(5),
+                        members: mk_members(3),
                         founded_at: joined,
-                        consensus_protocol: "quorum:3/5".into(),
+                        consensus_protocol: "quorum:2/3".into(),
                         consensus_protocol_entrenched: true,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 ),
                 Some(auth.clone()),
             )
             .await
-            .expect("supersede 3->5");
+            .expect("supersede 5->3");
         assert_eq!(new_version, 2, "supersede bumps version 1 -> 2");
 
-        // Live row is the new 5-member quorum:3/5.
+        // Live row is the new 3-member quorum:2/3.
         let live = d.lookup_family(&fam).await.unwrap().expect("live family");
-        assert_eq!(live.members.len(), 5);
-        assert_eq!(live.consensus_protocol, "quorum:3/5");
+        assert_eq!(live.members.len(), 3);
+        assert_eq!(live.consensus_protocol, "quorum:2/3");
 
-        // History chain: v1 (superseded, quorum:2/3, carries authorization) +
-        // v2 (current, quorum:3/5).
+        // History chain: v1 (superseded, quorum:3/5, carries authorization) +
+        // v2 (current, quorum:2/3).
         let hist = d
             .group_history(Cohort::Family, &fam)
             .await
@@ -18953,7 +19309,7 @@ mod tests {
         assert!(!hist[0].is_current);
         assert!(hist[0].superseded_at.is_some());
         assert_eq!(hist[0].authorization.as_ref(), Some(&auth));
-        assert_eq!(hist[0].snapshot["consensus_protocol"], "quorum:2/3");
+        assert_eq!(hist[0].snapshot["consensus_protocol"], "quorum:3/5");
         assert_eq!(hist[1].version, 2);
         assert!(hist[1].is_current);
         assert!(hist[1].superseded_at.is_none());
@@ -18964,7 +19320,7 @@ mod tests {
             .await
             .unwrap()
             .expect("v1 exists");
-        assert_eq!(v1.snapshot["consensus_protocol"], "quorum:2/3");
+        assert_eq!(v1.snapshot["consensus_protocol"], "quorum:3/5");
         assert!(d.group_at(Cohort::Family, &fam, 9).await.unwrap().is_none());
 
         // supersede on an unknown group is rejected.
@@ -18987,6 +19343,7 @@ mod tests {
                         founded_at: joined,
                         consensus_protocol: "quorum:2/3".into(),
                         consensus_protocol_entrenched: true,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 ),
@@ -19071,13 +19428,16 @@ mod tests {
                     founded_at: joined,
                     consensus_protocol: cp.into(),
                     consensus_protocol_entrenched: true,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             )
         };
 
-        // Genesis: quorum:2/3 family (3 members, M=2).
-        d.put_family(fam_row(m[..3].to_vec(), "quorum:2/3"))
+        // Genesis: quorum:3/5 family (5 founding members, each co-signing —
+        // v52.0.0, #955 Q1). A supersede may not ADD a member (Q2), so the
+        // quorum-authorized change below contracts 5 -> 4.
+        d.put_family(fam_row(m[..5].to_vec(), "quorum:3/5"))
             .await
             .expect("genesis");
 
@@ -19087,42 +19447,46 @@ mod tests {
             .build_membership_change_envelope(
                 Cohort::Family,
                 &fam,
-                &m[..5],
+                &m[..4],
                 true,
-                Some("quorum:3/5"),
+                Some("quorum:3/4"),
             )
             .await
             .expect("build change envelope");
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
 
-        // 2 of the 3 PRIOR members cosign → meets quorum:2/3.
+        // 3 of the 5 PRIOR members cosign → meets quorum:3/5.
         let v = d
             .supersede_family_with_quorum(
-                fam_row(m[..5].to_vec(), "quorum:3/5"),
+                fam_row(m[..4].to_vec(), "quorum:3/4"),
                 change.clone(),
-                vec![threshold_sign(&m[0], &bytes), threshold_sign(&m[1], &bytes)],
+                vec![
+                    threshold_sign(&m[0], &bytes),
+                    threshold_sign(&m[1], &bytes),
+                    threshold_sign(&m[2], &bytes),
+                ],
             )
             .await
-            .expect("2-of-3 quorum authorizes the 3->5 expansion");
+            .expect("3-of-5 quorum authorizes the 5->4 contraction");
         assert_eq!(v, 2);
         let live = d.lookup_family(&fam).await.unwrap().unwrap();
-        assert_eq!(live.members.len(), 5);
-        assert_eq!(live.consensus_protocol, "quorum:3/5");
+        assert_eq!(live.members.len(), 4);
+        assert_eq!(live.consensus_protocol, "quorum:3/4");
         let hist = d.group_history(Cohort::Family, &fam).await.unwrap();
         assert!(
             hist[0].authorization.is_some(),
             "v1 carries the authorization"
         );
 
-        // The group is now quorum:3/5 (M=3). Build a fresh change for the
-        // negatives (its supersedes binds to the current 5-roster).
+        // The group is now quorum:3/4 (M=3). Build a fresh change for the
+        // negatives (its supersedes binds to the current 4-roster).
         let change2 = d
             .build_membership_change_envelope(
                 Cohort::Family,
                 &fam,
-                &m[..5],
+                &m[..4],
                 true,
-                Some("quorum:3/5"),
+                Some("quorum:3/4"),
             )
             .await
             .unwrap();
@@ -19131,7 +19495,7 @@ mod tests {
         // (a) Insufficient quorum: 1 cosignature where M=3 → rejected.
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..5].to_vec(), "quorum:3/5"),
+                fam_row(m[..4].to_vec(), "quorum:3/4"),
                 change2.clone(),
                 vec![threshold_sign(&m[0], &bytes2)],
             )
@@ -19144,13 +19508,13 @@ mod tests {
         );
 
         // (b) Anti-replay: tamper the supersedes binding, cosign with a valid
-        // 3-of-5 quorum → rejected (supersedes.prior_member_key_ids mismatch).
+        // 3-of-4 quorum → rejected (supersedes.prior_member_key_ids mismatch).
         let mut tampered = change2.clone();
         tampered["supersedes"]["prior_member_key_ids"] = serde_json::json!(["ghost"]);
         let tbytes = ciris_verify_core::jcs::canonicalize(&tampered).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..5].to_vec(), "quorum:3/5"),
+                fam_row(m[..4].to_vec(), "quorum:3/4"),
                 tampered,
                 vec![
                     threshold_sign(&m[0], &tbytes),
@@ -19166,27 +19530,21 @@ mod tests {
         // (alias of m[0]) → rejected even with a valid quorum.
         let alias = format!("g35-alias-{s}");
         register_hybrid_key_aliased(d, &alias, &m[0]).await;
-        let seat_roster = vec![
-            m[0].clone(),
-            m[1].clone(),
-            m[2].clone(),
-            m[3].clone(),
-            alias.clone(),
-        ];
+        let seat_roster = vec![m[0].clone(), m[1].clone(), m[2].clone(), alias.clone()];
         let seat_change = d
             .build_membership_change_envelope(
                 Cohort::Family,
                 &fam,
                 &seat_roster,
                 true,
-                Some("quorum:3/5"),
+                Some("quorum:3/4"),
             )
             .await
             .unwrap();
         let sbytes = ciris_verify_core::jcs::canonicalize(&seat_change).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(seat_roster, "quorum:3/5"),
+                fam_row(seat_roster, "quorum:3/4"),
                 seat_change,
                 vec![
                     threshold_sign(&m[0], &sbytes),
@@ -19198,10 +19556,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), "federation_invalid_argument", "one-seat");
 
-        // Every rejection left the live row untouched (still v2, 5 members).
+        // Every rejection left the live row untouched (still v2, 4 members).
         let live2 = d.lookup_family(&fam).await.unwrap().unwrap();
-        assert_eq!(live2.members.len(), 5);
-        assert_eq!(live2.consensus_protocol, "quorum:3/5");
+        assert_eq!(live2.members.len(), 4);
+        assert_eq!(live2.consensus_protocol, "quorum:3/4");
     }
 
     #[cfg(feature = "sqlite")]
@@ -19328,6 +19686,22 @@ mod tests {
             assert_eq!(e.kind(), "federation_invalid_argument", "{what}: {e}");
             e.to_string()
         };
+        // v52.0.0 (#955, Q2) — a quorum that WOULD admit a growth still does
+        // not: a supersede never adds a member (joining is proposal →
+        // acceptance → widening). The protocol decides the quorum (the
+        // refusals above it); the addition is refused after it.
+        let refused_add = |r: Result<u32, crate::federation::Error>, what: &str| {
+            let e = r.expect_err(what);
+            assert!(
+                matches!(
+                    e,
+                    crate::federation::Error::MembershipAcceptanceRefused { rule, .. }
+                        if rule
+                            == crate::federation::membership_acceptance::RULE_SUPERSEDE_CANNOT_ADD
+                ),
+                "{what}: {e}"
+            );
+        };
 
         // founder_only, 3 members (1 founder): a plain member alone is refused;
         // ONE founder signature admits (a strict majority would need 2).
@@ -19346,10 +19720,11 @@ mod tests {
         );
         assert!(msg.contains("founder_only"), "{msg}");
         assert_eq!(live_len(room.clone()).await, 3);
-        attempt(room.clone(), grown, 1, "founder_only", vec![ks[0].clone()])
-            .await
-            .expect("founder_only: one founder admits");
-        assert_eq!(live_len(room).await, 4);
+        refused_add(
+            attempt(room.clone(), grown, 1, "founder_only", vec![ks[0].clone()]).await,
+            "founder_only: one founder has the quorum, and a supersede still cannot add",
+        );
+        assert_eq!(live_len(room).await, 3);
 
         // unanimous, 3: two of three refused (a strict majority would admit);
         // all three admit.
@@ -19368,23 +19743,27 @@ mod tests {
         );
         assert!(msg.contains("unanimous: 2 of 3"), "{msg}");
         assert_eq!(live_len(room.clone()).await, 3);
-        attempt(room.clone(), grown, 0, "unanimous", ks[..3].to_vec())
-            .await
-            .expect("unanimous: 3 of 3 admits");
-        assert_eq!(live_len(room).await, 4);
+        refused_add(
+            attempt(room.clone(), grown, 0, "unanimous", ks[..3].to_vec()).await,
+            "unanimous: 3 of 3 has the quorum, and a supersede still cannot add",
+        );
+        assert_eq!(live_len(room).await, 3);
 
         // quorum:1/3 — M is absolute: one signature admits.
         let (room, ks) = setup("q13", 3, 1, 0, "quorum:1/3").await;
-        attempt(
+        let r = attempt(
             room.clone(),
             ks[..4].to_vec(),
             0,
             "quorum:1/3",
             vec![ks[2].clone()],
         )
-        .await
-        .expect("quorum:1/3: one signature admits");
-        assert_eq!(live_len(room).await, 4);
+        .await;
+        refused_add(
+            r,
+            "quorum:1/3: one signature has the quorum, and a supersede still cannot add",
+        );
+        assert_eq!(live_len(room).await, 3);
 
         // majority, 4: two refused (half is not more than half); three admit.
         let (room, ks) = setup("mj", 4, 1, 0, "majority").await;
@@ -19395,10 +19774,11 @@ mod tests {
         );
         assert!(msg.contains("majority: 2 of 4"), "{msg}");
         assert_eq!(live_len(room.clone()).await, 4);
-        attempt(room.clone(), grown, 0, "majority", ks[1..4].to_vec())
-            .await
-            .expect("majority: 3 of 4 admits");
-        assert_eq!(live_len(room).await, 5);
+        refused_add(
+            attempt(room.clone(), grown, 0, "majority", ks[1..4].to_vec()).await,
+            "majority: 3 of 4 has the quorum, and a supersede still cannot add",
+        );
+        assert_eq!(live_len(room).await, 4);
 
         // A signer outside the prior roster never counts, even under the
         // cheapest protocol (the incoming key cannot admit itself).
@@ -19461,9 +19841,10 @@ mod tests {
         );
         assert!(msg.contains("Add"), "the addition half refused: {msg}");
         assert_eq!(live_len(room.clone()).await, 4);
-        attempt(room.clone(), mixed, 0, rq, ks[..3].to_vec())
-            .await
-            .expect("reverse_quorum: mixed change on 3 of 4");
+        refused_add(
+            attempt(room.clone(), mixed, 0, rq, ks[..3].to_vec()).await,
+            "reverse_quorum: a mixed change on 3 of 4 still adds",
+        );
         let live: std::collections::BTreeSet<String> = d
             .lookup_community(&room)
             .await
@@ -19473,7 +19854,7 @@ mod tests {
             .into_iter()
             .map(|m| m.key_id)
             .collect();
-        assert!(live.contains(&ks[5]) && !live.contains(&ks[3]));
+        assert!(!live.contains(&ks[5]) && live.contains(&ks[3]));
 
         // An undeclared custom protocol cannot be evaluated: refused, whoever signs.
         let (room, ks) = setup("cu", 2, 1, 1, "custom:council").await;
@@ -19518,6 +19899,7 @@ mod tests {
                     founded_at: joined,
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             )
@@ -19547,16 +19929,18 @@ mod tests {
             d.lookup_family(&fam).await.unwrap().unwrap().members.len(),
             2
         );
-        d.supersede_family_with_quorum(
-            family(&fk),
-            change,
-            vec![ts::threshold_sign(&fk[0], &bytes)],
-        )
-        .await
-        .expect("founder_only family: one founder admits");
+        refused_add(
+            d.supersede_family_with_quorum(
+                family(&fk),
+                change,
+                vec![ts::threshold_sign(&fk[0], &bytes)],
+            )
+            .await,
+            "founder_only family: one founder has the quorum, and a supersede still cannot add",
+        );
         assert_eq!(
             d.lookup_family(&fam).await.unwrap().unwrap().members.len(),
-            3
+            2
         );
     }
 
@@ -19738,6 +20122,7 @@ mod tests {
                 founded_at: joined,
                 consensus_protocol: "founder_only".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -19762,7 +20147,7 @@ mod tests {
         )
         .await;
         assert!(d
-            .add_member(Cohort::Family, &fam, newcomer, &admit)
+            .add_member_consented(Cohort::Family, &fam, newcomer, &admit)
             .await
             .expect("add_member"));
         // revoke → §9 removed event (family FS is inherent fresh-per-write)
@@ -20022,7 +20407,7 @@ mod tests {
         sq.put_public_key(user_test_key_derived_for(&derived, "founder"))
             .await
             .expect("seed founder");
-        seed_community_with_founder(&engine, "comm-1", &derived).await;
+        seed_community_with_founder(&engine, "comm-1", &derived, "founder").await;
 
         // The founder IS a named moderator (community authority root,
         // steward-bound) → as-self duty-holder → ADMIT.
@@ -20072,7 +20457,7 @@ mod tests {
         pg.put_public_key(sweeper_test_key(&moderator))
             .await
             .expect("seed moderator");
-        seed_community_with_founder(&engine, &community, &derived).await;
+        seed_community_with_founder(&engine, &community, &derived, &label).await;
 
         let appt = engine
             .add_moderator(&signer, &community, &moderator, SCOPE_MODERATE)
@@ -20117,7 +20502,7 @@ mod tests {
         pg.put_public_key(user_test_key_derived_for(&derived, &label))
             .await
             .expect("seed founder");
-        seed_community_with_founder(&engine, &community, &derived).await;
+        seed_community_with_founder(&engine, &community, &derived, &label).await;
 
         let content_sha = "b".repeat(64);
         let att_id = engine

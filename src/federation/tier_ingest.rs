@@ -257,6 +257,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     crate::federation::admission::check_revocation_envelope_binding(row)?;
+    crate::federation::admission::check_revocation_subject(directory, row).await?;
     verify_envelope_hybrid_signature(
         directory,
         &row.revoking_key_id,
@@ -378,15 +379,25 @@ where
             attesting_key_id: signed.authority_key_id.clone(),
         });
     }
+    let envelope = signed.family.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.family.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v52.0.0 (CIRISPersist#955, Q1) — a founding member's consent is their
+    // co-signature; one that does not verify is refused, never counted.
+    verify_roster_cosignatures(
+        directory,
+        "family",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// v38.5.0 (CIRISPersist#771) — **the attestation twin of
@@ -1175,6 +1186,35 @@ pub mod test_support {
         )
     }
 
+    /// v52.0.0 (CIRISPersist#784) — the subject digest of a key registered
+    /// with [`hybrid_pubkeys`]`(pubkey_source_key_id)` (as
+    /// [`register_hybrid_key`] / [`register_hybrid_key_as`] do).
+    pub fn subject_digest_of(pubkey_source_key_id: &str) -> String {
+        let (ed, _) = hybrid_pubkeys(pubkey_source_key_id);
+        crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&ed)
+            .expect("fixture pubkey decodes")
+            .to_hex()
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — the subject digest of a key `dir` HOLDS,
+    /// read from its stored pubkey (for fixtures that register keys some
+    /// other way than [`hybrid_pubkeys`]).
+    pub async fn held_subject_digest<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+    ) -> String {
+        let key = dir
+            .lookup_public_key(key_id)
+            .await
+            .expect("lookup_public_key")
+            .unwrap_or_else(|| panic!("fixture key {key_id:?} is not held"));
+        crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+            &key.pubkey_ed25519_base64,
+        )
+        .expect("fixture pubkey decodes")
+        .to_hex()
+    }
+
     /// v31.0.0 (CIRISPersist#659) — **seal a [`Revocation`](crate::federation::Revocation):
     /// bind its typed columns into `revocation_envelope`, then hybrid-sign the
     /// result** under the row's own `revoking_key_id` (the key
@@ -1552,13 +1592,24 @@ pub mod test_support {
         authority_key_id: &str,
         family: crate::federation::types::Family,
     ) -> crate::federation::SignedFamily {
-        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &family.signing_envelope());
+        let envelope = family.signing_envelope();
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &envelope);
+        // v52.0.0 (CIRISPersist#955, Q1) — every listed member co-signs: a
+        // founding member's signature on the record is their consent, so the
+        // fixture signs as a real founding does. A witness of the unsigned
+        // case replaces `cosignatures` itself.
+        let cosignatures = founding_cosignatures(
+            authority_key_id,
+            family.members.iter().map(|m| m.key_id.as_str()),
+            &envelope,
+        );
         crate::federation::SignedFamily {
             family,
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
+            cosignatures,
         }
     }
 
@@ -1679,8 +1730,37 @@ pub mod test_support {
         }
     }
 
+    /// v52.0.0 (CIRISPersist#955, Q1) — register the placeholder founder
+    /// [`fixture_members`] seats on an `infrastructure` fixture. A founding
+    /// member consents by co-signing the record, so the seat must be a key
+    /// whose signature verifies.
+    pub async fn register_fixture_infrastructure_founder<
+        D: crate::federation::FederationDirectory + ?Sized,
+    >(
+        dir: &D,
+    ) {
+        if dir
+            .lookup_public_key(FIXTURE_INFRASTRUCTURE_FOUNDER)
+            .await
+            .expect("lookup")
+            .is_some()
+        {
+            return;
+        }
+        register_hybrid_key_as(
+            dir,
+            FIXTURE_INFRASTRUCTURE_FOUNDER,
+            FIXTURE_INFRASTRUCTURE_FOUNDER,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+    }
+
+    /// The placeholder founder [`fixture_members`] seats.
+    pub const FIXTURE_INFRASTRUCTURE_FOUNDER: &str = "fixture-infrastructure-founder";
+
     /// v50.0.0 (review) — `members` plus, when `policy_blob` labels the
-    /// fixture `infrastructure`, one founder (an unregistered human seat): an
+    /// fixture `infrastructure`, one founder (a registered human seat): an
     /// infrastructure record with no founder is refused
     /// (`INFRA_RULE_NO_FOUNDER`), and these fixtures test other things.
     pub fn fixture_members(
@@ -1696,7 +1776,7 @@ pub mod test_support {
             .any(|m| m.role.as_deref() == Some(crate::federation::admission::MEMBER_ROLE_FOUNDER));
         if infra && !has_founder {
             members.push(crate::federation::types::CommunityMember {
-                key_id: "fixture-infrastructure-founder".into(),
+                key_id: FIXTURE_INFRASTRUCTURE_FOUNDER.into(),
                 joined_at: "2026-01-01T00:00:00Z".parse().expect("rfc3339"),
                 role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
             });
@@ -1727,17 +1807,44 @@ pub mod test_support {
         authority_key_id: &str,
         community: crate::federation::types::Community,
     ) -> crate::federation::SignedCommunity {
-        let (_hash, classical, pqc) =
-            sign_envelope(authority_key_id, &community.signing_envelope());
+        let envelope = community.signing_envelope();
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &envelope);
+        // v52.0.0 (CIRISPersist#955, Q1) — see [`sign_family`].
+        let cosignatures = founding_cosignatures(
+            authority_key_id,
+            community.members.iter().map(|m| m.key_id.as_str()),
+            &envelope,
+        );
         crate::federation::SignedCommunity {
             community,
             authority_key_id: authority_key_id.to_owned(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
-            cosignatures: Vec::new(),
+            cosignatures,
             lineage: Vec::new(),
         }
+    }
+
+    /// v52.0.0 (CIRISPersist#955, Q1) — a co-signature over `envelope` from
+    /// every listed member except the authority (each once).
+    pub fn founding_cosignatures<'a>(
+        authority_key_id: &str,
+        members: impl Iterator<Item = &'a str>,
+        envelope: &serde_json::Value,
+    ) -> Vec<crate::federation::types::RosterCosignature> {
+        let mut seen = std::collections::BTreeSet::new();
+        members
+            .filter(|m| *m != authority_key_id && seen.insert((*m).to_owned()))
+            .map(|m| {
+                let (_h, classical, pqc) = sign_envelope(m, envelope);
+                crate::federation::types::RosterCosignature {
+                    authority_key_id: m.to_owned(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                }
+            })
+            .collect()
     }
 
     /// v38.2.0 (CIRISPersist#757 / CIRISServer chat wiring) — **an

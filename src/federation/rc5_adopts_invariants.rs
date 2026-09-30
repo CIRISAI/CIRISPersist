@@ -21,6 +21,7 @@ pub mod bodies {
         INFRA_RULE_NODE_BEARING_FOUNDER, INFRA_RULE_PROTOCOL_NOT_QUORUM,
         MAX_MODERATION_DELEGATION_DEPTH,
     };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::federation::tier_ingest::test_support as ts;
     use crate::federation::types::{
         attestation_type, identity_type as it, Community, CommunityMember,
@@ -170,7 +171,7 @@ pub mod bodies {
         member: &str,
         t: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Error> {
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             signer,
             widening_at(room, member, t),
         ))
@@ -267,7 +268,7 @@ pub mod bodies {
         ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: H1 — the human is still a founder: {e}"));
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             &human,
             CommunityMembershipWidening {
                 community_key_id: room.clone(),
@@ -417,7 +418,7 @@ pub mod bodies {
             persist_row_hash: String::new(),
         };
         let err = d
-            .put_community_membership_widening(ts::sign_community_membership_widening(
+            .put_community_membership_widening_consented(ts::sign_community_membership_widening(
                 &human,
                 w("founder"),
             ))
@@ -428,7 +429,7 @@ pub mod bodies {
             INFRA_RULE_NODE_BEARING_FOUNDER,
             "{err}"
         );
-        d.put_community_membership_widening(ts::sign_community_membership_widening(
+        d.put_community_membership_widening_consented(ts::sign_community_membership_widening(
             &human,
             w("member"),
         ))
@@ -602,6 +603,65 @@ pub mod bodies {
         widen_by(d, &install2, &room2, &second, t1)
             .await
             .expect_err("(5) a binding asserted before t1 makes the install node-bearing at t1");
+    }
+
+    /// **I277 (v52.0.0, CIRISPersist#930) — a roster change judged at an old
+    /// instant is not re-judged by a later renewal.** The install is
+    /// `node`-bearing from t2 and its widening at t3 is refused. Later, the
+    /// install renews its agreement and the identity re-signs the pair. Before
+    /// V161 that moved the stored binding's start past t3, so the same widening
+    /// at t3 was then ADMITTED and the fold's earlier verdict flipped.
+    pub async fn node_bearing_verdict_survives_a_later_renewal(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        _host: &str,
+    ) {
+        let human = format!("human-{tag}");
+        let install = format!("install-{tag}");
+        let node_identity = format!("node-id-{tag}");
+        let [refused, again] = ["refused", "again"].map(|n| format!("{n}-{tag}"));
+        for k in [&human, &refused, &again] {
+            ts::register_hybrid_key_as(d, k, k, it::USER).await;
+        }
+        ts::register_hybrid_key_as(d, &install, &install, it::PRIMITIVE).await;
+        ts::register_hybrid_key_as(d, &node_identity, &node_identity, it::NODE).await;
+        let room = format!("root-{tag}");
+        authorized_room_key(d, &room).await;
+        plant_legacy(
+            d,
+            ts::sign_community(
+                &human,
+                infra_room(
+                    &room,
+                    "quorum:1/2",
+                    vec![seat(&human, "founder"), seat(&install, "founder")],
+                ),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag}: the legacy room: {e}"));
+        let (t2, t3) = (ago(160), ago(120));
+        occurrence_of_at(d, &node_identity, &install, t2).await;
+        widen_by(d, &install, &room, &refused, t3)
+            .await
+            .expect_err("I277: the install is node-bearing at t3");
+        // The renewal and the identity's re-signing, both after t3.
+        identity_claims_at(d, &node_identity, &install, ago(21)).await;
+        occurrence_agrees_at(d, &node_identity, &install, ago(20)).await;
+        widen_by(
+            d,
+            &install,
+            &room,
+            &again,
+            t3 + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect_err("I277: a later renewal must not make the install voting at t3");
+        let now = active(d, &room).await;
+        assert!(
+            !now.contains(&refused) && !now.contains(&again),
+            "{tag} I277: neither refused widening stands"
+        );
     }
 
     /// **#925 review M2 — the last-founder rule.** A `node`-bearing founder is
@@ -816,6 +876,10 @@ pub mod bodies {
         // so `quorum:1/1` over three founders would let one of them admit
         // alone, and `quorum:2/3` over two would demand a founder who is not
         // there.
+        // v52.0.0 (#955, Q1) — founding members co-sign, so they are keys.
+        for f in [format!("f2-{tag}"), format!("f3-{tag}")] {
+            ts::register_hybrid_key_as(d, &f, &f, it::USER).await;
+        }
         let three = vec![
             seat(&human, "founder"),
             seat(&format!("f2-{tag}"), "founder"),
@@ -1095,9 +1159,9 @@ pub mod bodies {
         let mut founder = widening_at(&room, &h4, ago(40));
         founder.role = Some("founder".into());
         let err = d
-            .put_community_membership_widening(by_two(ts::sign_community_membership_widening(
-                &h1, founder,
-            )))
+            .put_community_membership_widening_consented(by_two(
+                ts::sign_community_membership_widening(&h1, founder),
+            ))
             .await
             .expect_err("adding a founder would leave N stale");
         assert_eq!(
@@ -1105,10 +1169,9 @@ pub mod bodies {
             crate::federation::admission::INFRA_RULE_QUORUM_N_NOT_FOUNDERS,
             "{err}"
         );
-        d.put_community_membership_widening(by_two(ts::sign_community_membership_widening(
-            &h1,
-            widening_at(&room, &m, ago(30)),
-        )))
+        d.put_community_membership_widening_consented(by_two(
+            ts::sign_community_membership_widening(&h1, widening_at(&room, &m, ago(30))),
+        ))
         .await
         .unwrap_or_else(|e| panic!("{tag}: a plain member is admitted: {e}"));
         let removal = |signer: &String, t| {
@@ -1879,7 +1942,8 @@ pub mod bodies {
         tag: &str,
     ) {
         use crate::federation::directory_double::FaultInjectingDirectory;
-        const READ: &str = "list_identity_occurrences_by_occurrence_key";
+        // v52.0.0 (#930) — the fold's read is the occurrence HISTORY.
+        const READ: &str = "list_identity_occurrence_history_by_occurrence";
         let d = inner.as_ref();
         let (room, h1, h2) = conformant_room(d, tag).await;
         let founders = || vec![seat(&h1, "founder"), seat(&h2, "founder")];
@@ -2209,7 +2273,7 @@ mod runners {
                     let Some(d) = $fresh.await else { return };
                     let arm = |n: u32| {
                         d.test_hooks()
-                            .fail_next("list_identity_occurrences_by_occurrence_key", n)
+                            .fail_next("list_identity_occurrence_history_by_occurrence", n)
                     };
                     super::super::bodies::f2_b_a_transient_failure_never_degrades_at_the_door(
                         &d as &dyn FederationDirectory,
@@ -2260,6 +2324,7 @@ mod runners {
                 }
                 keyed!(node_founder_seat_does_not_vote);
                 keyed!(node_bearing_is_judged_at_the_change_instant);
+                keyed!(node_bearing_verdict_survives_a_later_renewal);
                 keyed!(node_bearing_founder_holds_no_last_founder_power);
                 keyed!(node_bearing_founder_roots_no_moderation);
                 keyed!(node_bearing_founder_is_no_reverse_quorum_duty_holder);

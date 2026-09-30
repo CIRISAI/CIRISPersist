@@ -233,6 +233,10 @@ struct State {
     /// the V059 PG/SQLite composite-PK shape.
     federation_identity_occurrences:
         HashMap<(String, String), crate::federation::IdentityOccurrence>,
+    /// v52.0.0 (CIRISPersist#930) — the V161 mirror: every assertion either
+    /// put door admitted, append-only, unique on
+    /// `(identity, occurrence, asserted_at, attesting)`.
+    federation_identity_occurrence_history: Vec<crate::federation::OccurrenceAssertion>,
     /// v14.1.0 (CIRISPersist#418, replication read) — signature container for
     /// signed-put occurrences, keyed like `federation_identity_occurrences`
     /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
@@ -442,6 +446,10 @@ struct State {
     /// family's current version carries, keyed by `family_key_id`. Absent for
     /// a founding record or one superseded without a quorum.
     federation_family_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
+    /// v52.0.0 (CIRISPersist#955, V162 mirror) — a family's founding
+    /// co-signatures, keyed by `family_key_id`. Absent when single-signed.
+    federation_family_cosignatures:
+        HashMap<String, Vec<crate::federation::types::RosterCosignature>>,
     /// v49.0.0 (CIRISPersist#910.5, V155 mirror) — the community twin of
     /// `federation_family_supersede_proofs`, keyed by `community_key_id`.
     federation_community_supersede_proofs: HashMap<String, crate::federation::GroupSupersedeProof>,
@@ -934,6 +942,7 @@ impl Default for MemoryBackend {
                 federation_goals: HashMap::new(),
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
+                federation_identity_occurrence_history: Vec::new(),
                 federation_identity_occurrence_sigs: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
@@ -976,6 +985,7 @@ impl Default for MemoryBackend {
                 federation_family_authority_sigs: HashMap::new(),
                 federation_community_authority_sigs: HashMap::new(),
                 federation_family_supersede_proofs: HashMap::new(),
+                federation_family_cosignatures: HashMap::new(),
                 federation_community_supersede_proofs: HashMap::new(),
                 federation_community_cosignatures: HashMap::new(),
                 federation_community_lineages: HashMap::new(),
@@ -2156,8 +2166,24 @@ impl Backend for MemoryBackend {
             // keys (as attesting/attested/revoking/revoked/scrub_key_id)
             // must go before the federation_keys delete.
             let revs_before = state.federation_revocations.len();
+            // v52.0.0 (#784) — a revocation OF one of these keys is found by
+            // its subject digest, whatever label (if any) it named.
+            let target_digests: Vec<String> = target_key_ids
+                .iter()
+                .filter_map(|k| state.federation_keys.get(k))
+                .filter_map(|rec| {
+                    crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+                        &rec.pubkey_ed25519_base64,
+                    )
+                    .ok()
+                    .map(|d| d.to_hex())
+                })
+                .collect();
             state.federation_revocations.retain(|r| {
-                !(target_key_ids.contains(&r.revoked_key_id)
+                !(r.revoked_key_id
+                    .as_ref()
+                    .is_some_and(|k| target_key_ids.contains(k))
+                    || target_digests.contains(&r.revoked_key_sha256_ed25519_raw)
                     || target_key_ids.contains(&r.revoking_key_id)
                     || target_key_ids.contains(&r.scrub_key_id))
             });
@@ -2822,6 +2848,34 @@ impl crate::federation::renditions::HeldBlobScope for MemoryBackend {
     }
 }
 
+/// v52.0.0 (CIRISPersist#930) — the V161 append, unique on the assertion's key.
+fn append_occurrence_history(
+    state: &mut State,
+    row: &crate::federation::IdentityOccurrence,
+    attesting_key_id: Option<String>,
+) {
+    let exists = state
+        .federation_identity_occurrence_history
+        .iter()
+        .any(|a| {
+            a.identity_key_id == row.identity_key_id
+                && a.occurrence_key_id == row.occurrence_key_id
+                && a.asserted_at == row.asserted_at
+                && a.attesting_key_id == attesting_key_id
+        });
+    if !exists {
+        state
+            .federation_identity_occurrence_history
+            .push(crate::federation::OccurrenceAssertion {
+                identity_key_id: row.identity_key_id.clone(),
+                occurrence_key_id: row.occurrence_key_id.clone(),
+                asserted_at: row.asserted_at,
+                valid_until: row.valid_until,
+                attesting_key_id,
+            });
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for MemoryBackend {
     fn as_dyn_directory(&self) -> &dyn crate::federation::FederationDirectory {
@@ -2876,6 +2930,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Key,
+            &record,
+        )
+        .await?
+        {
+            return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
+        }
         MemoryBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -3307,6 +3372,22 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             crate::federation::SubjectGate::Ingest,
         )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held federation-tier row
+        // settles here: AHEAD of the per-peer quota (a duplicate did no work
+        // and must not spend the sender's budget) and of every verify. Only
+        // an index hit that resolves to a byte-identical held row settles; an
+        // oversized or otherwise inadmissible row is never held, so it misses
+        // and meets the pure gates below exactly as before.
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION
+            && crate::federation::replication_policy::settle_if_held(
+                self,
+                crate::federation::replication_policy::EnvelopeKind::Attestation,
+                &row,
+            )
+            .await?
+        {
+            return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+        }
 
         if !row.attesting_key_id.is_empty() {
             // Per-peer write quota. It LEADS the state-consulting checks because
@@ -3612,17 +3693,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // owner-signed community row inexpressible on the whole substrate).
         // Runs AFTER the closed-set value validation in tier 1 and
         // BEFORE persist (verify-then-gate-then-persist, MISSION §1.6).
-        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+        // v52.0.0 (CIRISPersist#955) — AV-45 plus the two membership arms (a
+        // proposal reaching its invitee, a reply at a group its signer is not in).
+        crate::federation::membership_acceptance::check_attestation_write_scope(
             self,
-            &row.attesting_key_id,
+            &row,
             "put_attestation",
-            &row.cohort_scope,
-            // v38.2.0 (#757) — the target the producer SIGNED into the
-            // envelope. Was hardcoded `None`, which made AV-45 refuse every
-            // family/community placement and left an owner-signed community
-            // row inexpressible (promotion, the only other door, re-seals
-            // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -3868,6 +3944,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
         // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
         crate::federation::admission::check_session_self_report_admission(&row)?;
+        // CC 3.3.1 — a `consent:community_trust` grant is the node's own and
+        // lists its owner at the grant's instant (v52.0.0, CIRISPersist#946).
+        crate::federation::community_trust_consent::check_community_trust_grant_admission(
+            self, &row,
+        )
+        .await?;
         // CC 3.1 — a lowercase family stem, or the row evades every family gate
         // (v42.0.0, CIRISPersist#814).
         crate::federation::admission::check_dimension_case_rule(&row)?;
@@ -5097,6 +5179,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Revocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         let mut row = revocation.revocation;
         // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
         // envelope is stored as the JCS bytes its scrub signature and
@@ -5172,13 +5265,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let latest = state
                 .federation_revocations
                 .iter()
-                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .filter(|r| r.revoked_key_sha256_ed25519_raw == row.revoked_key_sha256_ed25519_raw)
                 .map(|r| r.scrub_timestamp)
                 .max();
             if let Some(existing) = latest {
                 if row.scrub_timestamp <= existing {
                     return Err(crate::federation::Error::RevocationRollback {
-                        revoked_key_id: row.revoked_key_id.clone(),
+                        revoked_key_sha256_ed25519_raw: row.revoked_key_sha256_ed25519_raw.clone(),
                         existing_signed_timestamp: existing,
                         submitted_signed_timestamp: row.scrub_timestamp,
                     });
@@ -5198,12 +5291,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // counts as held across an await for auto-trait purposes).
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
-            if !state.federation_keys.contains_key(&row.revoked_key_id) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "revoked_key_id {} does not exist in federation_keys",
-                    row.revoked_key_id
-                )));
-            }
+            // v52.0.0 (#784, V163) — no FK on the subject: a digest-only
+            // revocation may precede the key record, and a named
+            // `revoked_key_id` was checked against the digest at admission.
             if !state.federation_keys.contains_key(&row.revoking_key_id) {
                 return Err(crate::federation::Error::InvalidArgument(format!(
                     "revoking_key_id {} does not exist in federation_keys",
@@ -5228,18 +5318,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 let latest = state
                     .federation_revocations
                     .iter()
-                    .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                    .filter(|r| {
+                        r.revoked_key_sha256_ed25519_raw == row.revoked_key_sha256_ed25519_raw
+                    })
                     .map(|r| r.scrub_timestamp)
                     .max();
                 crate::federation::admission::check_revocation_anti_rollback(
-                    &row.revoked_key_id,
+                    &row.revoked_key_sha256_ed25519_raw,
                     latest,
                     row.scrub_timestamp,
                 )?;
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             let key = crate::federation::wire_index::record_key(&[
-                ("revoked_key_id", row.revoked_key_id.as_str()),
+                (
+                    "revoked_key_sha256_ed25519_raw",
+                    row.revoked_key_sha256_ed25519_raw.as_str(),
+                ),
                 ("revocation_id", row.revocation_id.as_str()),
             ]);
             // v31.1.0 (CIRISPersist#655) — THIS node's admission position,
@@ -5269,15 +5364,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
-    async fn revocations_for(
+    async fn revocations_for_subject(
         &self,
-        revoked_key_id: &str,
+        revoked_key_sha256_ed25519_raw: &str,
     ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state
             .federation_revocations
             .iter()
-            .filter(|r| r.revoked_key_id == revoked_key_id)
+            .filter(|r| r.revoked_key_sha256_ed25519_raw == revoked_key_sha256_ed25519_raw)
             .cloned()
             .collect();
         // Match postgres ORDER BY effective_at DESC.
@@ -5291,6 +5386,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrence,
+            &occurrence,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v14.0.0 (CIRISPersist#418) — verify the signature gate BEFORE any write
         // (before locking; the gate locks state internally). Backend-symmetric.
         crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
@@ -5318,6 +5424,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v52.0.0 (#930) — history whether or not the upsert takes it.
+            append_occurrence_history(&mut state, &row, Some(occurrence.attesting_key_id.clone()));
             // Last-signed-wins: only a strictly-newer asserted_at supersedes.
             let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
             let newer = state
@@ -5408,6 +5516,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // replicated row diverge from its own envelope. Memory previously
             // HashMap::inserted unconditionally — the one-backend divergence this
             // whole issue is about.
+            // v52.0.0 (#930) — a trusted-local assertion is history too, even
+            // when the signed row below stays authoritative.
+            append_occurrence_history(&mut state, &row, None);
             let pk = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
             if state.federation_identity_occurrence_sigs.contains_key(&pk) {
                 return Ok(());
@@ -5521,6 +5632,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         signed: &crate::federation::SignedTransportDestination,
     ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::TransportDestination,
+            signed,
+        )
+        .await?
+        {
+            return Ok(
+                crate::federation::self_at_login::TransportDestinationApplyOutcome::Unchanged,
+            );
+        }
         use crate::federation::TransportDestinationApplyOutcome as Outcome;
         // #443 — the admission gate BEFORE any write (before locking; the
         // gate locks state internally). Backend-symmetric.
@@ -5809,6 +5933,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::OccurrenceAssertion>, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks
+            .fail_if_armed("list_identity_occurrence_history_by_occurrence")?;
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_identity_occurrence_history
+            .iter()
+            .filter(|a| a.occurrence_key_id == occurrence_key_id)
+            .cloned()
+            .collect();
+        crate::federation::sort_occurrence_history(&mut rows);
+        Ok(rows)
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -5833,6 +5975,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Family,
+            &family,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE the
         // state lock (the verify resolves keys via the directory, which
         // locks itself). Hybrid-Strict vs the authority's registered
@@ -5853,6 +6006,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             scrub_signature_classical,
             scrub_signature_pqc,
             supersede_proof,
+            cosignatures,
         } = family;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
@@ -5887,6 +6041,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         .remove(&family_key_id);
                 }
             }
+            // v52.0.0 (#955, V162 mirror) — the founding members' consent.
+            state
+                .federation_family_cosignatures
+                .insert(family_key_id.clone(), cosignatures);
             // v36.0.0 (#668) — attaching the authority signature is what makes
             // the row visible to the signed serve cursor; re-stamp the serve
             // position here (V130 mirror).
@@ -5993,6 +6151,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         scrub_signature_classical,
                         scrub_signature_pqc,
                         supersede_proof,
+                        cosignatures,
                     } = serde_json::from_value(new_snapshot).map_err(|e| {
                         Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                     })?;
@@ -6059,6 +6218,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             state.federation_family_supersede_proofs.remove(&key);
                         }
                     }
+                    state
+                        .federation_family_cosignatures
+                        .insert(key.clone(), cosignatures);
                     // v36.0.0 (#668/#707-class) — a supersede rewrites the served
                     // bytes; the serve position moves with them.
                     let rows = family_rows(&state);
@@ -6721,6 +6883,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
         // write (before locking; the gate locks state internally).
         crate::federation::admission::verify_signed_identity_occurrence_revocation(
@@ -6898,6 +7071,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE the
         // state lock (the verify resolves keys via the directory, which
         // locks itself). Was FK-existence only — a forged removal was
@@ -7035,6 +7219,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step. THE worst-case E4 hole: an unverified
         // removal here rotates the community DEK epoch below — an
@@ -7217,6 +7412,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         widening: crate::federation::SignedCommunityMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipWidening,
+            &widening,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
         // door; see the sqlite twin for the legs.
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
@@ -7346,6 +7552,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipWidening,
+            &widening,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v49.0.0 (CIRISPersist#910, FSD `ROOM_ROSTER_AUTHORITY.md` §10.1) —
         // the family twin of the room's widening door; see the sqlite twin.
         crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
@@ -7440,6 +7657,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         listing: crate::federation::SignedCommunityMembershipListing,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipListing,
+            &listing,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
         // mirror; see the sqlite twin.
         crate::federation::listing::check_community_membership_listing(self, &listing).await?;
@@ -7947,6 +8175,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::LocationProof,
+            &proof,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_location_proof_admission(self, &proof).await?;
@@ -8044,6 +8283,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         signed: crate::federation::SignedOrganization,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Organization,
+            &signed.organization,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let mut row = signed.organization;
         let now = chrono::Utc::now();
@@ -8106,6 +8356,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         signed: crate::federation::SignedOrgMembership,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::OrgMembership,
+            &signed.org_membership,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let mut row = signed.org_membership;
         let now = chrono::Utc::now();
@@ -8163,6 +8424,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         signed: crate::federation::SignedPartnerRecord,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::PartnerRecord,
+            &signed,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(
@@ -8478,6 +8750,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             .federation_family_supersede_proofs
                             .get(&f.family_key_id)
                             .cloned(),
+                        cosignatures: state
+                            .federation_family_cosignatures
+                            .get(&f.family_key_id)
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                 })
             })
@@ -11434,6 +11711,17 @@ impl MemoryBackend {
         community: crate::federation::SignedCommunity,
         door: crate::federation::CommunityDoor,
     ) -> Result<crate::federation::group_amendment::CommunityWrite, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Community,
+            &community,
+        )
+        .await?
+        {
+            return Ok(crate::federation::group_amendment::CommunityWrite::Unchanged);
+        }
         // Test-only (PR #921 review, F3): a rival write that won the race
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
@@ -12199,6 +12487,7 @@ mod accord_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use crate::schema::CompleteTrace;
     use crate::schema::{ComponentType, SchemaVersion, TraceLevel};
     use crate::store::decompose::decompose;
@@ -13959,7 +14248,9 @@ mod tests {
         // cannot certify a revocation this substrate's own put door refuses.
         crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
-            revoked_key_id: revoked.into(),
+            revoked_key_id: Some(revoked.into()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of(revoked),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -17780,6 +18071,29 @@ mod tests {
         .await;
     }
 
+    /// v52.0.0 (CIRISPersist#784) — I222–I227, subjects by digest, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn digest_subjects_memory_784() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("rev784-node-mem");
+        crate::federation::admission::r2_test_support::exercise_784_digest_subjects(
+            &backend,
+            "mem784",
+            "rev784-node-mem",
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222 two nodes, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn digest_subjects_two_node_memory_784() {
+        let (a, b) = (MemoryBackend::new(), MemoryBackend::new());
+        crate::federation::admission::r2_test_support::exercise_784_two_node(&a, &b, "mem784n")
+            .await;
+    }
+
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
     /// anti-rollback floor and its new ceiling, on memory. The first two were
     /// live on sqlite and postgres and ABSENT here.
@@ -18764,6 +19078,10 @@ mod tests {
             .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            backend,
+        )
+        .await;
         let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
             .put_community(
@@ -19262,7 +19580,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, group, joiner_row, &admit)
+            .add_member_consented(Cohort::Affiliations, group, joiner_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added, "genuine add returns true");
@@ -19851,6 +20169,7 @@ mod tests {
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -20571,7 +20890,7 @@ mod tests {
         )
         .await;
         assert!(backend
-            .add_community_member("addc-comm", member("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         let active = backend.active_community_members("addc-comm").await.unwrap();
@@ -20592,7 +20911,7 @@ mod tests {
         // BEFORE the gate, because nothing is written and there is nothing to
         // authorize (CIRISPersist#654).
         assert!(!backend
-            .add_community_member("addc-comm", member("addc-1"), &admit)
+            .add_community_member_consented("addc-comm", member("addc-1"), &admit)
             .await
             .unwrap());
         assert_eq!(
@@ -20610,7 +20929,7 @@ mod tests {
         // is no stored roster to have signed over).
         assert!(matches!(
             backend
-                .add_community_member("no-such-comm", member("addc-2"), &admit)
+                .add_community_member_consented("no-such-comm", member("addc-2"), &admit)
                 .await
                 .unwrap_err(),
             crate::federation::Error::UnstewardedCommunityMember { .. }
@@ -22694,6 +23013,7 @@ mod tests {
                 founded_at: now,
                 consensus_protocol: crate::federation::types::consensus_protocol::MAJORITY.into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -24560,6 +24880,7 @@ mod tests {
             founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         // Honest: signed by the authority it claims to be — admits.
@@ -24702,6 +25023,7 @@ mod tests {
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -25003,6 +25325,7 @@ mod tests {
             founded_at: "2026-07-01T00:00:00Z".parse().unwrap(),
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let signed =

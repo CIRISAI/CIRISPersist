@@ -809,12 +809,14 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
             founded_at: ts,
             consensus_protocol: "founder_only".to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         },
         authority_key_id: rogue.clone(),
         scrub_signature_classical: "AA==".to_owned(),
         scrub_signature_pqc: None,
         supersede_proof: None,
+        cosignatures: Vec::new(),
     };
     let err = dir
         .put_family(squat)

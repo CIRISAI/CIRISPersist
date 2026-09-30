@@ -152,6 +152,10 @@ struct Offer<'a> {
     /// A family's `consensus_protocol_entrenched`; `None` for a community.
     entrenched: Option<bool>,
     proof: Option<&'a GroupSupersedeProof>,
+    /// v52.0.0 (#956) — when the amendment's only change removes one member
+    /// from the held family record: that member and the held record. Its
+    /// signature alone authorizes it.
+    self_leave: Option<(&'a str, &'a super::types::Family)>,
 }
 
 /// What this node holds under the offered id.
@@ -170,22 +174,39 @@ where
     F: FederationDirectory + ?Sized,
 {
     let f = &family.family;
-    let Some(stored) = dir.lookup_family(&f.family_key_id).await? else {
+    let Some(held) = dir.lookup_family(&f.family_key_id).await? else {
+        // v52.0.0 (#955, Q1) — a founding record admits only its signers.
+        check_family_founding(dir, family).await?;
         return Ok(OccupiedRoute::Insert);
     };
+    let offered_hash = super::types::compute_persist_row_hash(f)?;
+    // v52.0.0 (#956) — a differing record under a dissolved id is refused;
+    // a dissolution changes nothing but `dissolved_at` and is the one the
+    // quorum signed. (An identical re-offer stays a no-op below.)
+    if held.persist_row_hash != offered_hash {
+        super::family_dissolution::refuse_if_dissolved(&held)?;
+        super::family_dissolution::check_dissolve_is_terminal_only(&held, f)?;
+        if let Some(proof) = family.supersede_proof.as_ref() {
+            super::family_dissolution::check_dissolution_matches_envelope(
+                f,
+                &proof.change_envelope,
+            )?;
+        }
+    }
     let offer = Offer {
         cohort: Cohort::Family,
         kind: "family",
         group_key_id: &f.family_key_id,
-        offered_hash: super::types::compute_persist_row_hash(f)?,
+        offered_hash,
         member_key_ids: f.members.iter().map(|m| m.key_id.as_str()).collect(),
         consensus_protocol: &f.consensus_protocol,
         entrenched: Some(f.consensus_protocol_entrenched),
         proof: family.supersede_proof.as_ref(),
+        self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
     };
     let stored = Stored {
-        persist_row_hash: stored.persist_row_hash,
-        entrenched: stored.consensus_protocol_entrenched,
+        persist_row_hash: held.persist_row_hash.clone(),
+        entrenched: held.consensus_protocol_entrenched,
     };
     if !admit_amendment(dir, &offer, &stored).await? {
         return Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged));
@@ -211,6 +232,8 @@ where
 {
     let c = &community.community;
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
+        // v52.0.0 (#955, Q1) — a founding record admits only its signers.
+        check_community_founding(dir, community).await?;
         return Ok(OccupiedRoute::Insert);
     };
     // v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — a trust-root row is
@@ -224,7 +247,10 @@ where
         let applied =
             super::canonical_community::apply_trust_root_chain_counted(dir, community).await;
         return match lost_race(dir, &c.community_key_id, &offered_hash, applied).await? {
-            None => Ok(OccupiedRoute::Insert),
+            None => {
+                check_community_founding(dir, community).await?;
+                Ok(OccupiedRoute::Insert)
+            }
             Some(0) => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
             Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
         };
@@ -238,6 +264,7 @@ where
         consensus_protocol: &c.consensus_protocol,
         entrenched: None,
         proof: community.supersede_proof.as_ref(),
+        self_leave: None,
     };
     let stored = Stored {
         persist_row_hash: stored.persist_row_hash,
@@ -258,6 +285,66 @@ where
             _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
         },
     )
+}
+
+/// v52.0.0 (CIRISPersist#955, Q1) — a founding family admits only the members
+/// who signed it (its authority or a co-signer).
+async fn check_family_founding<F>(dir: &F, family: &SignedFamily) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // v52.0.0 (#956) — a family is never founded dissolved.
+    super::family_dissolution::check_founding_not_dissolved(&family.family)?;
+    let signers: Vec<&str> = std::iter::once(family.authority_key_id.as_str())
+        .chain(
+            family
+                .cosignatures
+                .iter()
+                .map(|c| c.authority_key_id.as_str()),
+        )
+        .collect();
+    let members: Vec<&str> = family
+        .family
+        .members
+        .iter()
+        .map(|m| m.key_id.as_str())
+        .collect();
+    super::membership_acceptance::check_founding_signers(
+        dir,
+        &family.family.family_key_id,
+        &members,
+        &signers,
+    )
+    .await
+}
+
+/// v52.0.0 (CIRISPersist#955, Q1) — the community twin of
+/// [`check_family_founding`].
+async fn check_community_founding<F>(dir: &F, community: &SignedCommunity) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let signers: Vec<&str> = std::iter::once(community.authority_key_id.as_str())
+        .chain(
+            community
+                .cosignatures
+                .iter()
+                .map(|c| c.authority_key_id.as_str()),
+        )
+        .collect();
+    let members: Vec<&str> = community
+        .community
+        .members
+        .iter()
+        .map(|m| m.key_id.as_str())
+        .collect();
+    super::membership_acceptance::check_founding_signers(
+        dir,
+        &community.community.community_key_id,
+        &members,
+        &signers,
+    )
+    .await
 }
 
 /// PR #921 review (Codex F3) — a supersede that lost its race. The
@@ -322,13 +409,40 @@ where
         offer.consensus_protocol,
         &proof.change_envelope,
     )?;
-    dir.verify_membership_quorum(
-        offer.cohort,
+    // v52.0.0 (#955, Q2) — an amendment never adds; joining is proposal →
+    // acceptance → widening, which carries the signed instant expiry needs.
+    super::membership_acceptance::check_supersede_adds_no_member(
         offer.group_key_id,
-        &proof.change_envelope,
-        &proof.quorum_signatures,
-    )
-    .await?;
+        &offer.member_key_ids.iter().copied().collect::<Vec<_>>(),
+        &super::membership_acceptance::supersede_allowed_members(
+            dir,
+            offer.cohort,
+            offer.group_key_id,
+        )
+        .await?,
+    )?;
+    match offer.self_leave {
+        // v52.0.0 (#956) — leaving needs no quorum: the leaver's signature.
+        Some((leaver, held)) => {
+            super::family_dissolution::verify_self_leave_signature(
+                dir,
+                held,
+                &proof.change_envelope,
+                &proof.quorum_signatures,
+                leaver,
+            )
+            .await?;
+        }
+        None => {
+            dir.verify_membership_quorum(
+                offer.cohort,
+                offer.group_key_id,
+                &proof.change_envelope,
+                &proof.quorum_signatures,
+            )
+            .await?;
+        }
+    }
     Ok(true)
 }
 
@@ -433,6 +547,24 @@ where
 {
     super::check_consensus_protocol_form(&new.family.consensus_protocol)?;
     super::verify_family_admission(dir, &new).await?;
+    // v52.0.0 (#956) — a dissolved family admits no change, on either door.
+    super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
+        .await?;
+    // v52.0.0 (#955, Q2) — an amendment never adds a member.
+    super::membership_acceptance::check_supersede_adds_no_member(
+        &new.family.family_key_id,
+        &new.family
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect::<Vec<_>>(),
+        &super::membership_acceptance::supersede_allowed_members(
+            dir,
+            Cohort::Family,
+            &new.family.family_key_id,
+        )
+        .await?,
+    )?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
     // the signature that authorizes it travel together, because the way they
     // go stale is by being able to move apart (#651).
@@ -460,6 +592,34 @@ where
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
     super::verify_community_admission(dir, &new).await?;
+    // v52.0.0 (#955, Q2) — an amendment never adds a member. The one
+    // exception is a trust-root founders' amendment (#926 HIGH-3: its founder
+    // seats move ONLY through the record): a founder it seats signed that very
+    // version, and signing the record is consent (Q1) — no proposal, so no
+    // expiry to judge.
+    let mut allowed = super::membership_acceptance::supersede_allowed_members(
+        dir,
+        cohort,
+        &new.community.community_key_id,
+    )
+    .await?;
+    if super::canonical_community::is_trust_root_grade(&new.community) {
+        for signer in std::iter::once(new.authority_key_id.as_str())
+            .chain(new.cosignatures.iter().map(|c| c.authority_key_id.as_str()))
+        {
+            allowed.insert(signer.to_owned());
+            allowed.insert(super::admission::admission_identity_for_writer(dir, signer).await?);
+        }
+    }
+    super::membership_acceptance::check_supersede_adds_no_member(
+        &new.community.community_key_id,
+        &new.community
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect::<Vec<_>>(),
+        &allowed,
+    )?;
     // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — the supersede is gated as the
     // record it replaces was: an infrastructure record stays quorum:M/N with
     // no node-bearing founder.

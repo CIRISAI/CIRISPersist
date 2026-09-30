@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 108 delegations, generated. Every one: fault first, then delegate.
+// 109 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -567,6 +567,17 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.list_hybrid_pending_revocations(limit).await
+    }
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<types::OccurrenceAssertion>, Error> {
+        if let Some(e) = self.faulted("list_identity_occurrence_history_by_occurrence") {
+            return Err(e);
+        }
+        self.inner
+            .list_identity_occurrence_history_by_occurrence(occurrence_key_id)
+            .await
     }
     async fn list_identity_occurrence_revocations_for(
         &self,
@@ -1109,11 +1120,16 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_revocation(revocation).await
     }
-    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
-        if let Some(e) = self.faulted("revocations_for") {
+    async fn revocations_for_subject(
+        &self,
+        revoked_key_sha256_ed25519_raw: &str,
+    ) -> Result<Vec<Revocation>, Error> {
+        if let Some(e) = self.faulted("revocations_for_subject") {
             return Err(e);
         }
-        self.inner.revocations_for(revoked_key_id).await
+        self.inner
+            .revocations_for_subject(revoked_key_sha256_ed25519_raw)
+            .await
     }
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         if let Some(e) = self.faulted("rewrap_own_epochs_for_device") {

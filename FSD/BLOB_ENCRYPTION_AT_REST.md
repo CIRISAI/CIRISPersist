@@ -2213,6 +2213,18 @@ and d.
 
 ---
 
+### 12.12 The nested manifest and the abandoned stream (#954)
+
+A sealed manifest whose envelope would exceed the inline cap is a v3 root over
+v2 children, each sealed under `manifest_child_aad(caller_aad, stream_id,
+index)` — a domain distinct from §12.10's `chunk_aad`, so a child opens only at
+its own index and never as a chunk (I205). The children are stored in the
+root's transaction at the DAG's tier, bound to its epoch at a community, and
+granted in the stream's one access set (§12.3, D9). An owner may abandon an
+unsealed stream: tombstoned, index rows dropped, sealed chunks evicted; the
+key-grant sets already emitted stay (CC 3). The full account is
+`FSD/BLOB_REPLICATION.md` §6.6.
+
 ## 13. Summary
 
 CIRISPersist can encrypt the *content* of every substrate at rest —

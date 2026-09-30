@@ -466,6 +466,7 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
         founded_at,
         consensus_protocol: ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL.to_owned(),
         consensus_protocol_entrenched: true,
+        dissolved_at: None,
         persist_row_hash: String::new(),
     }
 }
@@ -4741,6 +4742,7 @@ mod tests {
             founded_at: fam.founded_at,
             consensus_protocol: "quorum:1/1".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let err = backend
@@ -4750,9 +4752,17 @@ mod tests {
             ))
             .await
             .expect_err("a family with an unregistered member must be refused");
+        // v52.0.0 (#955, Q1) — a founding member consents by co-signing, so an
+        // unregistered member is refused where its co-signature cannot verify
+        // (before the registration check behind it can run); either way the
+        // refusal names the unregistered key.
         assert!(
-            format!("{err:?}").contains("not a registered"),
-            "expected member-not-registered error, got {err:?}"
+            matches!(
+                &err,
+                crate::federation::Error::FederationTierUnverified { attesting_key_id, .. }
+                    if attesting_key_id == "not-a-registered-key"
+            ) || format!("{err:?}").contains("not a registered"),
+            "expected the unregistered member refused, got {err:?}"
         );
     }
 

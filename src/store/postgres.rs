@@ -311,6 +311,17 @@ impl PostgresBackend {
         community: crate::federation::SignedCommunity,
         door: crate::federation::CommunityDoor,
     ) -> Result<crate::federation::group_amendment::CommunityWrite, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Community,
+            &community,
+        )
+        .await?
+        {
+            return Ok(crate::federation::group_amendment::CommunityWrite::Unchanged);
+        }
         // Test-only (PR #921 review, F3): a rival write that won the race
         // lands here, after any read the caller made and before this write's
         // own gates and reads.
@@ -887,6 +898,205 @@ pub struct PostgresBackend {
 /// read `enabled` and a destroy that read `no binding` could both commit.
 /// Released at commit or rollback; per community, so unrelated communities
 /// never wait on each other.
+/// #957 — one chunk of a batch, validated and hashed, ready for the tx.
+struct PgChunkRow {
+    seq: u64,
+    seq_i64: i64,
+    plaintext_i64: i64,
+    sha256: [u8; 32],
+    storage_kind: &'static str,
+    bytes_inline: Option<Vec<u8>>,
+    external_ref: Option<String>,
+    size_bytes: i64,
+}
+
+/// #957 — an item's validation, outside the transaction.
+fn pg_prepare_chunk_item(
+    item: &crate::federation::blobs::ChunkFloorItem,
+    cap: usize,
+    floor: crate::federation::StorageFloor,
+) -> Result<PgChunkRow, crate::federation::BlobError> {
+    let row = crate::federation::blobs::prepare_stream_chunk_row(
+        &item.body,
+        cap,
+        floor,
+        item.plaintext_size,
+    )?;
+    let seq_i64 = i64::try_from(item.seq).map_err(|_| {
+        crate::federation::BlobError::InvalidArgument(
+            "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
+        )
+    })?;
+    let plaintext_i64 = i64::try_from(item.plaintext_size).map_err(|_| {
+        crate::federation::BlobError::InvalidArgument(
+            "put_blob_chunk: plaintext_size exceeds i64".into(),
+        )
+    })?;
+    Ok(PgChunkRow {
+        seq: item.seq,
+        seq_i64,
+        plaintext_i64,
+        sha256: row.sha256,
+        storage_kind: row.storage_kind,
+        bytes_inline: row.bytes_inline,
+        external_ref: row.external_ref,
+        size_bytes: row.size_bytes,
+    })
+}
+
+/// #957 — what one item's savepoint did.
+enum PgItemAppended {
+    Ok,
+    SeqConflict,
+    CapReached,
+    EpochMoved,
+}
+
+/// #957 — the batch's per-item constants.
+struct PgChunkTx<'a> {
+    stream_id: &'a str,
+    epoch_i64: i64,
+    scope: &'a str,
+    tier: &'a str,
+    owner_key_id: Option<&'a str>,
+    binding: Option<&'a crate::federation::EpochBinding>,
+    bind_as_declared: bool,
+}
+
+/// #957 — one item's append inside its savepoint: the blob row, the nonce
+/// cap by the counter, the index row, the binding. Anything but `Ok` means
+/// the caller rolls the savepoint back.
+async fn pg_append_chunk_item(
+    tx: &tokio_postgres::Transaction<'_>,
+    c: &PgChunkTx<'_>,
+    row: &PgChunkRow,
+) -> Result<PgItemAppended, crate::federation::BlobError> {
+    let be = |what: &'static str| {
+        move |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk {what}: {e}"))
+        }
+    };
+    // 1. The chunk's bytes land as a normal federation_blobs row.
+    //    Content-addressed + idempotent. Carries the cohort and the tier the
+    //    door resolved (§11.1 / §12.1). #846 (§5) — the chunk's author is the
+    //    claimed owner.
+    let sha_vec = row.sha256.to_vec();
+    let media_type_null: Option<String> = None;
+    tx.execute(
+        "INSERT INTO cirislens.federation_blobs (\
+            sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+            cohort_scope, crypto_tier, author_key_id\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (sha256) DO NOTHING",
+        &[
+            &sha_vec,
+            &row.storage_kind,
+            &row.bytes_inline,
+            &row.external_ref,
+            &row.size_bytes,
+            &media_type_null,
+            &c.scope,
+            &c.tier,
+            &c.owner_key_id,
+        ],
+    )
+    .await
+    .map_err(be("blob insert"))?;
+
+    // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b). v52.0.0 (#957):
+    //    the V165 counter, stepped and read back in one statement — a
+    //    primary-key upsert that also row-locks the (stream, epoch) counter
+    //    until commit, where it was a COUNT(*) over the stream's index range
+    //    (quadratic per stream, and not serialized under READ COMMITTED).
+    let counted: i64 = tx
+        .query_one(
+            "INSERT INTO cirislens.federation_stream_epoch_counts (stream_id, epoch, chunk_count) \
+             VALUES ($1, $2, 1) \
+             ON CONFLICT (stream_id, epoch) DO UPDATE \
+               SET chunk_count = cirislens.federation_stream_epoch_counts.chunk_count + 1 \
+             RETURNING chunk_count",
+            &[&c.stream_id, &c.epoch_i64],
+        )
+        .await
+        .map_err(be("epoch counter"))?
+        .safe_get_with(0usize, crate::federation::BlobError::Backend)?;
+    if crate::federation::blobs::epoch_chunk_cap_reached(u64::try_from(counted - 1).unwrap_or(0)) {
+        return Ok(PgItemAppended::CapReached);
+    }
+
+    // 3. The stream-index row. The (stream_id, seq) PK enforces
+    //    monotonicity — a re-used seq is a PK conflict (NOT idempotent: the
+    //    append-only rule). V142: the chunk's PLAINTEXT size beside its
+    //    stored size.
+    let inserted = tx
+        .execute(
+            "INSERT INTO cirislens.federation_stream_chunks (\
+                stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (stream_id, seq) DO NOTHING",
+            &[
+                &c.stream_id,
+                &row.seq_i64,
+                &sha_vec,
+                &c.epoch_i64,
+                &row.size_bytes,
+                &row.plaintext_i64,
+            ],
+        )
+        .await
+        .map_err(be("index insert"))?;
+    if inserted == 0 {
+        return Ok(PgItemAppended::SeqConflict);
+    }
+
+    // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
+    //    conditional on the epoch still being the community's current enabled
+    //    one. Refused ⇒ the item rolls back.
+    if let Some(b) = c.binding {
+        let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+        // #846 (§3) — an ADOPT records the binding as the author's fact, with
+        // no key-state precondition; a WRITE binds the current enabled epoch
+        // (I17). #848 — every chunk binds `(community, minter, epoch)`.
+        let bind_sql = if c.bind_as_declared {
+            "INSERT INTO cirislens.federation_community_blob_epoch \
+                (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (at_rest_sha256) DO NOTHING"
+        } else {
+            "INSERT INTO cirislens.federation_community_blob_epoch \
+                (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+             SELECT $1, $2, $3, $4 \
+              WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                             WHERE community_key_id = $2 AND minter_key_id = $3 AND epoch = $4 \
+                               AND key_state = 'enabled') \
+                AND $4 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                                    WHERE community_key_id = $2 AND minter_key_id = $3), 0) \
+             ON CONFLICT (at_rest_sha256) DO NOTHING"
+        };
+        let n = tx
+            .execute(
+                bind_sql,
+                &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+            )
+            .await
+            .map_err(be("bind"))?;
+        let already: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
+                                  AND minter_key_id = $3 AND epoch = $4) AS b",
+                &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+            )
+            .await
+            .map_err(be("bind check"))?
+            .safe_get_with("b", crate::federation::BlobError::Backend)?;
+        if n == 0 && !already {
+            return Ok(PgItemAppended::EpochMoved);
+        }
+    }
+    Ok(PgItemAppended::Ok)
+}
+
 async fn lock_community_tx(
     tx: &tokio_postgres::Transaction<'_>,
     community_key_id: &str,
@@ -1217,6 +1427,13 @@ impl PostgresBackend {
         self.inline_bytes_cap
             .store(cap, std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// v52.0.0 (#954) — set the inline cap on a SHARED backend (an Engine's
+    /// `Arc`), which [`Self::with_inline_bytes_cap`] cannot reach.
+    pub fn set_inline_bytes_cap(&self, cap: usize) {
+        self.inline_bytes_cap
+            .store(cap, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Construct from an already-built deadpool. For tests / advanced
@@ -2642,6 +2859,9 @@ impl Backend for PostgresBackend {
                     .execute(
                         "DELETE FROM cirislens.federation_revocations \
                          WHERE revoked_key_id = ANY($1::text[]) \
+                            OR revoked_key_sha256_ed25519_raw IN \
+                               (SELECT encode(sha256(decode(k.pubkey_ed25519_base64, 'base64')), 'hex') \
+                                  FROM cirislens.federation_keys k WHERE k.key_id = ANY($1::text[])) \
                             OR revoking_key_id = ANY($1::text[]) \
                             OR scrub_key_id    = ANY($1::text[])",
                         &[&target_key_ids],
@@ -3467,7 +3687,8 @@ fn pg_row_to_transport_destination(
         transport_x25519_pubkey_base64: row.safe_get_with(6, FErr::Backend)?,
         binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
             provenance_token.as_deref(),
-        ),
+        )
+        .map_err(|e| FErr::Backend(e.to_string()))?,
         epoch,
         retired_at: row.safe_get_with(9, FErr::Backend)?,
     })
@@ -4624,6 +4845,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Key,
+            &record,
+        )
+        .await?
+        {
+            return Ok(crate::federation::register::ReplicatedKeyOutcome::Unchanged);
+        }
         PostgresBackend::apply_replicated_key_record(self, record).await
     }
 
@@ -5495,6 +5727,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             crate::federation::SubjectGate::Ingest,
         )?;
         crate::federation::genesis::check_genesis_attestation_reserved(&row)?;
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held federation-tier row
+        // settles here: AHEAD of the per-peer quota (a duplicate did no work
+        // and must not spend the sender's budget) and of every verify. Only
+        // an index hit that resolves to a byte-identical held row settles; an
+        // oversized or otherwise inadmissible row is never held, so it misses
+        // and meets the pure gates below exactly as before.
+        if row.tier == crate::federation::types::attestation_tier::FEDERATION
+            && crate::federation::replication_policy::settle_if_held(
+                self,
+                crate::federation::replication_policy::EnvelopeKind::Attestation,
+                &row,
+            )
+            .await?
+        {
+            return Ok(crate::federation::AttestationOutcome::AlreadyHeld);
+        }
         if !row.attesting_key_id.is_empty() {
             // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write
             // quota. It LEADS the state-consulting checks because it is the
@@ -5820,17 +6068,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // Runs AFTER the closed-set value validation in tier 1 and BEFORE
         // persist_row_hash + INSERT so a refused row leaves no trace
         // (verify-then-gate-then-persist, MISSION §1.6).
-        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+        // v52.0.0 (CIRISPersist#955) — AV-45 plus the two membership arms (a
+        // proposal reaching its invitee, a reply at a group its signer is not in).
+        crate::federation::membership_acceptance::check_attestation_write_scope(
             self,
-            &row.attesting_key_id,
+            &row,
             "put_attestation",
-            &row.cohort_scope,
-            // v38.2.0 (#757) — the target the producer SIGNED into the
-            // envelope. Was hardcoded `None`, which made AV-45 refuse every
-            // family/community placement and left an owner-signed community
-            // row inexpressible (promotion, the only other door, re-seals
-            // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -6119,6 +6362,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // CC 3.4.3 — `session:*` is a substrate self-report (v42.0.0,
         // CIRISPersist#814 part 5; the rc5 re-vendor exposed the gap).
         crate::federation::admission::check_session_self_report_admission(&row)?;
+        // CC 3.3.1 — a `consent:community_trust` grant is the node's own and
+        // lists its owner at the grant's instant (v52.0.0, CIRISPersist#946).
+        crate::federation::community_trust_consent::check_community_trust_grant_admission(
+            self, &row,
+        )
+        .await?;
         // CC 3.1 — a lowercase family stem, or the row evades every family gate
         // (v42.0.0, CIRISPersist#814).
         crate::federation::admission::check_dimension_case_rule(&row)?;
@@ -7347,6 +7596,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Revocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         let mut row = revocation.revocation;
         // v31.0.0 (CIRISPersist#647) — CANONICAL AT REST: the revocation
         // envelope is stored as the JCS bytes its scrub signature and
@@ -7412,8 +7672,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        check_revocation_anti_rollback_postgres(&client, &row.revoked_key_id, row.scrub_timestamp)
-            .await?;
+        // v52.0.0 (#784) — per SUBJECT, and the subject is the digest.
+        check_revocation_anti_rollback_postgres(
+            &client,
+            &row.revoked_key_sha256_ed25519_raw,
+            row.scrub_timestamp,
+        )
+        .await?;
 
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
         // one that was SIGNED, and must be coherent with `effective_at`.
@@ -7476,9 +7741,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash, admitted_at\
+                    revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                    $16, $17)",
+                    $16, $17, $18)",
                 &[
                     &row.revocation_id,
                     &row.revoked_key_id,
@@ -7497,6 +7762,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.revoked_after,
                     &row.persist_row_hash,
                     &admitted_at,
+                    &row.revoked_key_sha256_ed25519_raw,
                 ],
             )
             .await
@@ -7516,7 +7782,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self.index_stored_record(
             "Revocation",
             &crate::federation::wire_index::record_key(&[
-                ("revoked_key_id", row.revoked_key_id.as_str()),
+                (
+                    "revoked_key_sha256_ed25519_raw",
+                    row.revoked_key_sha256_ed25519_raw.as_str(),
+                ),
                 ("revocation_id", row.revocation_id.as_str()),
             ]),
         )
@@ -7524,9 +7793,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
-    async fn revocations_for(
+    async fn revocations_for_subject(
         &self,
-        revoked_key_id: &str,
+        revoked_key_sha256_ed25519_raw: &str,
     ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
         let client = self
             .get_client()
@@ -7538,14 +7807,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash \
+                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
                  FROM cirislens.federation_revocations \
-                 WHERE revoked_key_id = $1 \
+                 WHERE revoked_key_sha256_ed25519_raw = $1 \
                  ORDER BY effective_at DESC",
-                &[&revoked_key_id],
+                &[&revoked_key_sha256_ed25519_raw],
             )
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))?;
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("revocations_for_subject: {e}"))
+            })?;
         rows.into_iter().map(pg_row_to_revocation).collect()
     }
 
@@ -7555,6 +7826,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrence,
+            &occurrence,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
         // producer envelope + signer authority + C4 BEFORE any write (one gate,
         // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
@@ -7601,9 +7883,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await?;
         // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
         // stale/equal replay is a safe no-op (poisoned/older row can't win).
-        let occurrence_applied = client
-            .execute(
-                "INSERT INTO cirislens.federation_identity_occurrences (\
+        // v52.0.0 (#930) — ONE statement: the current-state upsert, and the
+        // assertion appended to the V161 history whether or not the upsert
+        // took it (an older verified assertion still bounded a binding).
+        let occurrence_applied: i64 = client
+            .query_one(
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id, signed_envelope, signature\
+                    ) VALUES ($1, $2, $5, $6, $10, $11, $12) ON CONFLICT DO NOTHING\
+                 ), up AS (\
+                 INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
                     pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
@@ -7623,7 +7914,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     signature = EXCLUDED.signature, \
                     transport_binding = EXCLUDED.transport_binding, \
                     admitted_at = EXCLUDED.admitted_at \
-                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at",
+                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
+                 RETURNING 1) SELECT COUNT(*) FROM up",
                 &[
                     &row.identity_key_id,
                     &row.occurrence_key_id,
@@ -7642,6 +7934,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ],
             )
             .await
+            .and_then(|r| r.try_get::<_, i64>(0))
             .map_err(|e| {
                 let msg = e.to_string();
                 if msg.contains("foreign key") {
@@ -7722,9 +8015,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_identity_occurrences")
             .await?;
+        // v52.0.0 (#930) — ONE statement: the upsert and the history row (a
+        // trusted-local assertion bounds an interval; it is never agreement).
         client
             .execute(
-                "INSERT INTO cirislens.federation_identity_occurrences (\
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id\
+                    ) VALUES ($1, $2, $5, $6, '') ON CONFLICT DO NOTHING\
+                 ) \
+                 INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
                     pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
@@ -7862,6 +8163,49 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::OccurrenceAssertion>, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks
+            .fail_if_armed("list_identity_occurrence_history_by_occurrence")?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                    attesting_key_id \
+                 FROM cirislens.federation_identity_occurrence_history \
+                 WHERE occurrence_key_id = $1",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_identity_occurrence_history_by_occurrence: {e}"
+                ))
+            })?;
+        let mk = crate::federation::Error::Backend;
+        let mut out = rows
+            .iter()
+            .map(|r| {
+                let attesting: String = r.safe_get_with("attesting_key_id", mk)?;
+                Ok(crate::federation::OccurrenceAssertion {
+                    identity_key_id: r.safe_get_with("identity_key_id", mk)?,
+                    occurrence_key_id: r.safe_get_with("occurrence_key_id", mk)?,
+                    asserted_at: r.safe_get_with("asserted_at", mk)?,
+                    valid_until: r.safe_get_with("valid_until", mk)?,
+                    attesting_key_id: (!attesting.is_empty()).then_some(attesting),
+                })
+            })
+            .collect::<Result<Vec<_>, crate::federation::Error>>()?;
+        crate::federation::sort_occurrence_history(&mut out);
+        Ok(out)
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -7893,6 +8237,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Family,
+            &family,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
@@ -7911,8 +8266,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             scrub_signature_classical,
             scrub_signature_pqc,
             supersede_proof,
+            cosignatures,
         } = family;
         let supersede_proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
+        // v52.0.0 (#955, V162) — the founding members' consent.
+        let cosignatures_value = serde_json::to_value(&cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
@@ -7937,7 +8296,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "UPDATE cirislens.federation_families \
                     SET authority_key_id = $2, scrub_signature_classical = $3, \
-                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6 \
+                        scrub_signature_pqc = $4, admitted_at = $5, supersede_proof = $6, \
+                        cosignatures = $7 \
                   WHERE family_key_id = $1",
                 &[
                     &family_key_id,
@@ -7948,6 +8308,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     // v49.0.0 (#910.5) — a first copy of an amended version
                     // keeps its proof, so the next peer can apply it.
                     &supersede_proof_value,
+                    &cosignatures_value,
                 ],
             )
             .await
@@ -7994,8 +8355,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "INSERT INTO cirislens.federation_families (\
                     family_key_id, family_name, members, founded_at, \
                     consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    admitted_at, dissolved_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &row.family_key_id,
                     &row.family_name,
@@ -8005,6 +8366,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.consensus_protocol_entrenched,
                     &row.persist_row_hash,
                     &admitted_at,
+                    &row.dissolved_at,
                 ],
             )
             .await
@@ -8070,10 +8432,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_signature_classical,
                     scrub_signature_pqc,
                     supersede_proof,
+                    cosignatures,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 let proof_value = pg_supersede_proof_value(supersede_proof.as_ref())?;
+                let cosignatures_value = serde_json::to_value(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
                 new_fam.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_fam)?;
                 let members_value = serde_json::to_value(&new_fam.members)
@@ -8085,7 +8450,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let prior = tx
                     .query_opt(
                         "SELECT version, family_key_id, family_name, members, founded_at, \
-                                consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                                consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                          FROM cirislens.federation_families WHERE family_key_id = $1 \
                          FOR UPDATE",
                         &[&new_fam.family_key_id],
@@ -8142,7 +8507,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
                         scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13 \
+                        supersede_proof = $13, cosignatures = $14, dissolved_at = $15 \
                      WHERE family_key_id = $1",
                     &[
                         &new_fam.family_key_id,
@@ -8162,6 +8527,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &scrub_signature_pqc,
                         &admitted_at,
                         &proof_value,
+                        &cosignatures_value,
+                        &new_fam.dissolved_at,
                     ],
                 )
                 .await
@@ -8353,7 +8720,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             client
                 .query_opt(
                     "SELECT version, family_key_id, family_name, members, founded_at, \
-                            consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                      FROM cirislens.federation_families WHERE family_key_id = $1",
                     &[&group_key_id],
                 )
@@ -8412,7 +8779,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                  FROM cirislens.federation_families WHERE family_key_id = $1",
                 &[&family_key_id],
             )
@@ -8437,7 +8804,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                  FROM cirislens.federation_families \
                  WHERE members @> $1 \
                     OR family_key_id IN ( \
@@ -9122,6 +9489,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::IdentityOccurrenceRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
         // write (the revocation-plane mirror of the #418 occurrence gate).
         crate::federation::admission::verify_signed_identity_occurrence_revocation(
@@ -9274,6 +9652,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
@@ -9381,6 +9770,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipRevocation,
+            &revocation,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step. THE worst-case E4 hole: an unverified
         // removal here rotates the community DEK epoch below — an
@@ -9614,6 +10014,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedCommunityMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipWidening,
+            &widening,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v48.0.0 (CIRISPersist#860, FSD §3.2) — the mirror of the revocation
         // door; see the sqlite twin for the legs.
         crate::federation::verify_community_membership_widening_admission(self, &widening).await?;
@@ -9735,6 +10146,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         widening: crate::federation::SignedFamilyMembershipWidening,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::FamilyMembershipWidening,
+            &widening,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v49.0.0 (CIRISPersist#910) — the family twin of the room's widening
         // door; see the sqlite twin for the legs.
         crate::federation::verify_family_membership_widening_admission(self, &widening).await?;
@@ -9820,6 +10242,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         listing: crate::federation::SignedCommunityMembershipListing,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::CommunityMembershipListing,
+            &listing,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v49.0.0 (CIRISPersist#912) — the one listing door, then the V156
         // insert; see the sqlite twin.
         crate::federation::listing::check_community_membership_listing(self, &listing).await?;
@@ -10232,6 +10665,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::LocationProof,
+            &proof,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
         // other admission step.
         crate::federation::verify_location_proof_admission(self, &proof).await?;
@@ -10559,6 +11003,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: &crate::federation::SignedTransportDestination,
     ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::TransportDestination,
+            signed,
+        )
+        .await?
+        {
+            return Ok(
+                crate::federation::self_at_login::TransportDestinationApplyOutcome::Unchanged,
+            );
+        }
         use crate::federation::TransportDestinationApplyOutcome as Outcome;
         // #443 — the admission gate BEFORE any write (one gate, all backends).
         crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
@@ -11323,6 +11780,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedOrganization,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::Organization,
+            &signed.organization,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let mut row = signed.organization;
         operational::check_skew_and_payment(
@@ -11400,6 +11868,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedOrgMembership,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::OrgMembership,
+            &signed.org_membership,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         let mut row = signed.org_membership;
         operational::check_skew_and_payment(
@@ -11475,6 +11954,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         signed: crate::federation::SignedPartnerRecord,
     ) -> Result<(), crate::federation::Error> {
+        // v52.0.0 (CIRISPersist#672) — a re-offer of a held record settles here,
+        // before any verification (`replication_policy::settle_if_held`).
+        if crate::federation::replication_policy::settle_if_held(
+            self,
+            crate::federation::replication_policy::EnvelopeKind::PartnerRecord,
+            &signed,
+        )
+        .await?
+        {
+            return Ok(());
+        }
         use crate::federation::operational;
         operational::check_skew_and_payment(
             signed.partner_record.asserted_at,
@@ -12229,7 +12719,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash, admitted_at \
+                        revoked_after, persist_row_hash, admitted_at, \
+                        revoked_key_sha256_ed25519_raw \
                  FROM cirislens.federation_revocations \
                  WHERE ($1::timestamptz IS NULL OR \
                         (admitted_at, revocation_id::text) > ($1, $2)) \
@@ -13296,7 +13787,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash \
+                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
                  FROM cirislens.federation_revocations WHERE revocation_id = $1",
                 &[&revocation_id],
             )
@@ -17296,6 +17787,45 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(sha)
     }
 
+    async fn adopt_sealed_chunks_at(
+        &self,
+        stream_id: &str,
+        items: Vec<(u64, Vec<u8>, u64)>,
+        epoch: u64,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
+    {
+        // #846 (§6.2, I50) — the AUTHOR is the claimed owner, as for one chunk.
+        let claim = crate::federation::StreamClaim {
+            community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
+            owner_key_id: Some(author_key_id.to_owned()),
+        };
+        let items = items
+            .into_iter()
+            .map(
+                |(seq, envelope, plaintext_size)| crate::federation::blobs::ChunkFloorItem {
+                    seq,
+                    body: crate::federation::BlobBody::Inline(envelope),
+                    plaintext_size,
+                },
+            )
+            .collect();
+        self.put_blob_chunks_floor(
+            stream_id,
+            items,
+            epoch,
+            cohort_scope,
+            floor,
+            binding,
+            claim,
+            true,
+        )
+        .await
+    }
+
     async fn seal_stream_with_scope(
         &self,
         stream_id: &str,
@@ -17334,6 +17864,36 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
         if let Some(b) = &binding {
             lock_community_tx(&tx, &b.community_key_id).await?;
+        }
+        for c in &spec.children {
+            if c.body.len() > cap {
+                let _ = tx.rollback().await;
+                return Err(crate::federation::BlobError::InlineSizeExceeded {
+                    size: c.body.len(),
+                    cap,
+                });
+            }
+            crate::federation::blobs::verify_inline_hash(&c.sha256, &c.body)?;
+        }
+        // #954 — an abandoned stream is never sealed.
+        let abandoned = tx
+            .query_opt(
+                "SELECT (abandoned_at IS NOT NULL) AS a FROM cirislens.federation_streams \
+                  WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal_stream_with_scope head: {e}"))
+            })?
+            .map(|r| r.safe_get_with::<bool, _, _, _>("a", crate::federation::BlobError::Backend))
+            .transpose()?
+            .unwrap_or(false);
+        if abandoned {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::blobs::stream_abandoned_refusal(
+                stream_id,
+            ));
         }
         // §12.3 — the door listed N chunks and sealed a manifest over them;
         // if the stream has moved since, refuse rather than truncate.
@@ -17421,6 +17981,49 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 });
             }
         }
+        // #954 — a v3 root's children, in the root's transaction (see the
+        // sqlite twin).
+        for c in &spec.children {
+            let child_sha = c.sha256.to_vec();
+            let len = i64::try_from(c.body.len()).unwrap_or(i64::MAX);
+            let idx = i64::try_from(c.index).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO cirislens.federation_blobs (\
+                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                    cohort_scope, crypto_tier, author_key_id\
+                 ) VALUES ($1, 'inline', $2, NULL, $3, NULL, $4, $5, \
+                           (SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $6)) \
+                 ON CONFLICT (sha256) DO NOTHING",
+                &[&child_sha, &c.body, &len, &scope, &tier, &stream_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal child insert: {e}"))
+            })?;
+            if let Some(b) = &binding {
+                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                tx.execute(
+                    "INSERT INTO cirislens.federation_community_blob_epoch \
+                        (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (at_rest_sha256) DO NOTHING",
+                    &[&child_sha, &b.community_key_id, &b.minter_key_id, &ep],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("seal child bind: {e}"))
+                })?;
+            }
+            tx.execute(
+                "INSERT INTO cirislens.federation_manifest_children \
+                    (root_sha256, child_index, child_sha256) VALUES ($1, $2, $3) \
+                 ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                &[&sha_vec, &idx, &child_sha],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("seal child relation: {e}"))
+            })?;
+        }
         tx.execute(
             "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
             &[&stream_id],
@@ -17433,6 +18036,250 @@ impl crate::federation::BlobStorage for PostgresBackend {
             crate::federation::BlobError::Backend(format!("seal_stream_with_scope commit: {e}"))
         })?;
         Ok(())
+    }
+
+    async fn manifest_children(
+        &self,
+        root_sha256: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT child_index, child_sha256 FROM cirislens.federation_manifest_children \
+                  WHERE root_sha256 = $1 ORDER BY child_index ASC",
+                &[&root_sha256.to_vec()],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("manifest_children: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                let i: i64 =
+                    r.safe_get_with("child_index", crate::federation::BlobError::Backend)?;
+                let sha: Vec<u8> =
+                    r.safe_get_with("child_sha256", crate::federation::BlobError::Backend)?;
+                Ok((
+                    u64::try_from(i).map_err(|_| {
+                        crate::federation::BlobError::Backend("negative child_index".into())
+                    })?,
+                    crate::federation::stream_sth::root_hash_from_bytes(&sha)?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn record_manifest_child(
+        &self,
+        root_sha256: &[u8; 32],
+        index: u64,
+        child_sha256: &[u8; 32],
+    ) -> Result<(), crate::federation::BlobError> {
+        let (root, child) = (root_sha256.to_vec(), child_sha256.to_vec());
+        let idx = i64::try_from(index).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("child index exceeds i64".into())
+        })?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("record_manifest_child: {e}"))
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        let mut held = [false; 2];
+        for (i, sha) in [&root, &child].into_iter().enumerate() {
+            held[i] = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM cirislens.federation_blobs WHERE sha256 = $1) AS h",
+                    &[sha],
+                )
+                .await
+                .map_err(be)?
+                .safe_get_with("h", crate::federation::BlobError::Backend)?;
+        }
+        let refusal: Option<(&str, Option<Vec<u8>>)> = if !held[0] {
+            Some(("root", None))
+        } else if !held[1] {
+            Some(("child", None))
+        } else {
+            tx.execute(
+                "INSERT INTO cirislens.federation_manifest_children \
+                    (root_sha256, child_index, child_sha256) VALUES ($1, $2, $3) \
+                 ON CONFLICT (root_sha256, child_index) DO NOTHING",
+                &[&root, &idx, &child],
+            )
+            .await
+            .map_err(be)?;
+            let stored: Vec<u8> = tx
+                .query_one(
+                    "SELECT child_sha256 FROM cirislens.federation_manifest_children \
+                      WHERE root_sha256 = $1 AND child_index = $2",
+                    &[&root, &idx],
+                )
+                .await
+                .map_err(be)?
+                .safe_get_with("child_sha256", crate::federation::BlobError::Backend)?;
+            (stored != child).then_some(("other", Some(stored)))
+        };
+        if refusal.is_none() {
+            tx.commit().await.map_err(be)?;
+        } else {
+            let _ = tx.rollback().await;
+        }
+        crate::federation::blobs::manifest_child_record_outcome(
+            root_sha256,
+            index,
+            child_sha256,
+            refusal,
+        )
+    }
+
+    async fn abandon_stream_floor(
+        &self,
+        stream_id: &str,
+        owner_key_id: &str,
+    ) -> Result<crate::federation::AbandonFloorReport, crate::federation::BlobError> {
+        use crate::federation::types::cohort_scope::CryptoTier;
+        let be = |what: &'static str| {
+            move |e: tokio_postgres::Error| {
+                crate::federation::BlobError::Backend(format!("abandon_stream_floor {what}: {e}"))
+            }
+        };
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
+        let head = tx
+            .query_opt(
+                "SELECT owner_key_id, (abandoned_at IS NOT NULL) AS abandoned \
+                   FROM cirislens.federation_streams WHERE stream_id = $1 FOR UPDATE",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("head"))?;
+        let Some(head) = head else {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_unknown: no stream {stream_id} is held here"
+            )));
+        };
+        let s_owner: Option<String> =
+            head.safe_get_with("owner_key_id", crate::federation::BlobError::Backend)?;
+        let abandoned: bool =
+            head.safe_get_with("abandoned", crate::federation::BlobError::Backend)?;
+        if s_owner.as_deref() != Some(owner_key_id) {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_not_owned: stream {stream_id} belongs to another writer; only its owner \
+                 abandons it (CIRISPersist#954)"
+            )));
+        }
+        if abandoned {
+            let _ = tx.rollback().await;
+            return Ok(crate::federation::AbandonFloorReport {
+                already: true,
+                ..Default::default()
+            });
+        }
+        let sealed: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM cirislens.federation_stream_chunks \
+                                 WHERE stream_id = $1 AND sealed_at IS NOT NULL) AS s",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("sealed"))?
+            .safe_get_with("s", crate::federation::BlobError::Backend)?;
+        if sealed {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::BlobError::InvalidArgument(format!(
+                "stream_sealed: stream {stream_id} is sealed; a sealed DAG is evicted, not \
+                 abandoned (CIRISPersist#954)"
+            )));
+        }
+        let rows = tx
+            .query(
+                "SELECT c.chunk_sha, b.crypto_tier, b.size_bytes \
+                   FROM cirislens.federation_stream_chunks c \
+                   LEFT JOIN cirislens.federation_blobs b ON b.sha256 = c.chunk_sha \
+                  WHERE c.stream_id = $1 ORDER BY c.seq ASC",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("list"))?;
+        tx.execute(
+            "UPDATE cirislens.federation_streams SET abandoned_at = NOW() WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(be("stamp"))?;
+        let dropped = tx
+            .execute(
+                "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be("drop"))?;
+        // #957 — the stream's (stream, epoch) counters go with its rows.
+        tx.execute(
+            "DELETE FROM cirislens.federation_stream_epoch_counts WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(be("drop counters"))?;
+        let mut report = crate::federation::AbandonFloorReport {
+            already: false,
+            chunks_dropped: dropped,
+            ..Default::default()
+        };
+        for r in &rows {
+            let sha: Vec<u8> =
+                r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
+            let tier: Option<String> =
+                r.safe_get_with("crypto_tier", crate::federation::BlobError::Backend)?;
+            let size: Option<i64> =
+                r.safe_get_with("size_bytes", crate::federation::BlobError::Backend)?;
+            let Some(tier) = tier
+                .as_deref()
+                .and_then(CryptoTier::parse_str)
+                .filter(|t| *t != CryptoTier::Plaintext)
+            else {
+                continue;
+            };
+            for stmt in [
+                "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
+                "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
+            ] {
+                tx.execute(stmt, &[&sha]).await.map_err(be("satellites"))?;
+            }
+            let n = tx
+                .execute(
+                    "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
+                    &[&sha],
+                )
+                .await
+                .map_err(be("evict"))?;
+            if n > 0 {
+                report.bytes_evicted += size.unwrap_or(0).max(0) as u64;
+                report.evicted.push((
+                    crate::federation::stream_sth::root_hash_from_bytes(&sha)?,
+                    tier,
+                ));
+            }
+        }
+        tx.commit().await.map_err(be("commit"))?;
+        Ok(report)
     }
 
     async fn stream_chunks(
@@ -18320,13 +19167,29 @@ impl crate::federation::BlobStorage for PostgresBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, crate::federation::BlobError>
     {
+        Ok(self
+            .list_stored_delivery_receipts_for(stream_id, limit)
+            .await?
+            .into_iter()
+            .map(|s| s.receipt)
+            .collect())
+    }
+
+    async fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> Result<
+        Vec<crate::federation::stream_receipt::StoredDeliveryReceipt>,
+        crate::federation::BlobError,
+    > {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob \
+                "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob, received_at \
                    FROM cirislens.federation_stream_delivery_receipts \
                   WHERE stream_id = $1 \
                   ORDER BY k ASC, subscriber_key_id ASC \
@@ -18336,7 +19199,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!(
-                    "list_delivery_receipts_for query: {e}"
+                    "list_stored_delivery_receipts_for query: {e}"
                 ))
             })?;
 
@@ -18351,23 +19214,29 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 row.safe_get_with("chunk_root", crate::federation::BlobError::Backend)?;
             let signature_blob: Vec<u8> =
                 row.safe_get_with("signature_blob", crate::federation::BlobError::Backend)?;
+            let received_at: chrono::DateTime<chrono::Utc> =
+                row.safe_get_with("received_at", crate::federation::BlobError::Backend)?;
             let chunk_root = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
             let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
-            out.push(crate::federation::stream_receipt::DeliveryReceipt {
+            let receipt = crate::federation::stream_receipt::DeliveryReceipt {
                 stream_id: stream_id.to_string(),
                 subscriber_key_id,
                 epoch: u64::try_from(epoch_i64).map_err(|_| {
                     crate::federation::BlobError::Backend(
-                        "list_delivery_receipts_for: negative epoch".into(),
+                        "list_stored_delivery_receipts_for: negative epoch".into(),
                     )
                 })?,
                 k: u64::try_from(k_i64).map_err(|_| {
                     crate::federation::BlobError::Backend(
-                        "list_delivery_receipts_for: negative k".into(),
+                        "list_stored_delivery_receipts_for: negative k".into(),
                     )
                 })?,
                 chunk_root,
                 signature,
+            };
+            out.push(crate::federation::stream_receipt::StoredDeliveryReceipt {
+                receipt,
+                received_at,
             });
         }
         Ok(out)
@@ -19075,6 +19944,26 @@ async fn pg_load_stream_chunk_hashes(
             &sha_vec,
         )?);
     }
+    // v52.0.0 (#953) — no stream rows, and the id names an inline blob this
+    // node holds: the log is that blob's one leaf.
+    if out.is_empty() {
+        if let Some(sha) = crate::federation::stream_sth::inline_blob_of_stream_id(stream_id) {
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM cirislens.federation_blobs \
+                      WHERE sha256 = $1 AND storage_kind = 'inline')",
+                    &[&sha.to_vec()],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("load inline blob leaf: {e}"))
+                })?;
+            let held: bool = row.safe_get_with(0usize, crate::federation::BlobError::Backend)?;
+            if held {
+                out.push(sha);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -19101,30 +19990,74 @@ impl PostgresBackend {
         claim: crate::federation::StreamClaim,
         bind_as_declared: bool,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
+        // #957 — one append is a batch of one: one floor spelling.
+        let mut out = self
+            .put_blob_chunks_floor(
+                stream_id,
+                vec![crate::federation::blobs::ChunkFloorItem {
+                    seq,
+                    body,
+                    plaintext_size,
+                }],
+                epoch,
+                cohort_scope,
+                floor,
+                binding,
+                claim,
+                bind_as_declared,
+            )
+            .await?;
+        out.pop().expect("a batch of one answers with one result")
+    }
+
+    /// v52.0.0 (CIRISPersist#957) — **the chunk floor, batched**, the
+    /// postgres twin of the sqlite floor: the stream's row once (a refusal
+    /// there refuses the whole batch, nothing written), then per item a
+    /// savepoint running the blob row, the nonce cap by the V165 counter
+    /// (`+1 … RETURNING`, which also row-locks the (stream, epoch) counter
+    /// for the rest of the transaction, so two concurrent appends to one
+    /// stream cannot both pass the cap), the index row, and the binding. An
+    /// item refused there rolls back its savepoint and answers `Err` in its
+    /// slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn put_blob_chunks_floor(
+        &self,
+        stream_id: &str,
+        items: Vec<crate::federation::blobs::ChunkFloorItem>,
+        epoch: u64,
+        cohort_scope: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+        claim: crate::federation::StreamClaim,
+        bind_as_declared: bool,
+    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
+    {
         use crate::federation::BlobStorage as _;
         floor.check_scope(cohort_scope)?;
+        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
+        crate::federation::blobs::check_chunk_batch_bounds(&items)?;
         let cap = self.inline_bytes_cap();
-        // Validation + hash-on-write (computes the chunk's content SHA) +
-        // the §12.3 floor check (the body is what the token says it is).
-        let row =
-            crate::federation::blobs::prepare_stream_chunk_row(&body, cap, floor, plaintext_size)?;
         // u64 → i64 binds (tokio_postgres has no ToSql for u64).
-        let seq_i64 = i64::try_from(seq).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
-            )
-        })?;
         let epoch_i64 = i64::try_from(epoch).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
                 "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is BIGINT"
                     .into(),
             )
         })?;
-        let plaintext_i64 = i64::try_from(plaintext_size).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: plaintext_size exceeds i64".into(),
-            )
-        })?;
+        // Per item: validation + hash-on-write + the §12.3 floor check. A
+        // refusal here is that item's answer; it never enters the transaction.
+        let mut results: Vec<Option<Result<[u8; 32], crate::federation::BlobError>>> =
+            Vec::with_capacity(items.len());
+        let mut ready: Vec<(usize, PgChunkRow)> = Vec::with_capacity(items.len());
+        for (slot, item) in items.into_iter().enumerate() {
+            match pg_prepare_chunk_item(&item, cap, floor) {
+                Ok(row) => {
+                    results.push(None);
+                    ready.push((slot, row));
+                }
+                Err(e) => results.push(Some(Err(e))),
+            }
+        }
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
 
@@ -19132,7 +20065,7 @@ impl PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
+        let mut tx = client
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
@@ -19167,7 +20100,8 @@ impl PostgresBackend {
         })?;
         let head = tx
             .query_one(
-                "SELECT cohort_scope, community_key_id, owner_key_id \
+                "SELECT cohort_scope, community_key_id, owner_key_id, \
+                        (abandoned_at IS NOT NULL) AS abandoned \
                    FROM cirislens.federation_streams WHERE stream_id = $1",
                 &[&stream_id],
             )
@@ -19175,6 +20109,15 @@ impl PostgresBackend {
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!("put_blob_chunk stream head: {e}"))
             })?;
+        // #954 — an abandoned stream takes no more chunks.
+        let s_abandoned: bool =
+            head.safe_get_with("abandoned", crate::federation::BlobError::Backend)?;
+        if s_abandoned {
+            let _ = tx.rollback().await;
+            return Err(crate::federation::blobs::stream_abandoned_refusal(
+                stream_id,
+            ));
+        }
         let s_cohort: String =
             head.safe_get_with("cohort_scope", crate::federation::BlobError::Backend)?;
         let s_comm: Option<String> =
@@ -19221,153 +20164,77 @@ impl PostgresBackend {
             ));
         }
 
-        // 1. The chunk's bytes land as a normal federation_blobs row.
-        //    Content-addressed + idempotent: a re-PUT of identical bytes
-        //    is a no-op (ON CONFLICT DO NOTHING), exactly like
-        //    store_blob_local / the put_blob_chunks chunk rows. Carries
-        //    the cohort and the tier the door resolved (§11.1 / §12.1).
-        let sha_vec = row.sha256.to_vec();
-        let media_type_null: Option<String> = None;
-        // #846 (§5) — the chunk's author is the claimed owner.
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier, author_key_id\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec,
-                &row.storage_kind,
-                &row.bytes_inline,
-                &row.external_ref,
-                &row.size_bytes,
-                &media_type_null,
-                &scope,
-                &tier,
-                &claim.owner_key_id,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk blob insert: {e}"))
-        })?;
-
-        // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the STREAM
-        //    nonce's per-epoch counter_be must never wrap. A given
-        //    (stream_id, epoch) holds at most MAX_CHUNKS_PER_EPOCH chunks;
-        //    past that the producer MUST roll the epoch. Checked in-tx so
-        //    a concurrent append can't slip past the cap.
-        let epoch_chunk_count: i64 = tx
-            .query_one(
-                "SELECT COUNT(*) FROM cirislens.federation_stream_chunks \
-                  WHERE stream_id = $1 AND epoch = $2",
-                &[&stream_id, &epoch_i64],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk epoch count: {e}"))
-            })?
-            .get(0);
-        if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at \
-                 MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch (STREAM-nonce counter \
-                 exhaustion, CEG §10.5.3)",
-                crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
-            )));
-        }
-
-        // 3. The stream-index row. The (stream_id, seq) PK enforces
-        //    monotonicity — a re-used seq is a PK conflict, mapped to
-        //    InvalidArgument (NOT idempotent: the append-only rule).
-        //    V142: the chunk's PLAINTEXT size beside its stored size.
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_stream_chunks (\
-                    stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
-                 ) VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (stream_id, seq) DO NOTHING",
-                &[
-                    &stream_id,
-                    &seq_i64,
-                    &sha_vec,
-                    &epoch_i64,
-                    &row.size_bytes,
-                    &plaintext_i64,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk index insert: {e}"))
+        let ctx = PgChunkTx {
+            stream_id,
+            epoch_i64,
+            scope: &scope,
+            tier: &tier,
+            owner_key_id: claim.owner_key_id.as_deref(),
+            binding: binding.as_ref(),
+            bind_as_declared,
+        };
+        let mut landed = false;
+        for (slot, row) in &ready {
+            let sp = tx.savepoint("chunk_item").await.map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk savepoint: {e}"))
             })?;
-        if inserted == 0 {
-            // PK conflict on (stream_id, seq) — monotonicity violation.
-            // Roll back the whole txn (the blob row too, if it was new).
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "stream {stream_id} seq {seq} already exists"
-            )));
-        }
-
-        // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
-        //    conditional on the epoch still being the community's current
-        //    enabled one. Refused ⇒ the whole append rolls back.
-        if let Some(b) = &binding {
-            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-            // #846 (§3) — an ADOPT records the binding as the author's fact,
-            // with no key-state precondition; a WRITE binds the current
-            // enabled epoch (I17).
-            // #848 — every chunk binds `(community, minter, epoch)`.
-            let bind_sql = if bind_as_declared {
-                "INSERT INTO cirislens.federation_community_blob_epoch \
-                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (at_rest_sha256) DO NOTHING"
-            } else {
-                "INSERT INTO cirislens.federation_community_blob_epoch \
-                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                 SELECT $1, $2, $3, $4 \
-                  WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
-                                 WHERE community_key_id = $2 AND minter_key_id = $3 AND epoch = $4 \
-                                   AND key_state = 'enabled') \
-                    AND $4 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
-                                        WHERE community_key_id = $2 AND minter_key_id = $3), 0) \
-                 ON CONFLICT (at_rest_sha256) DO NOTHING"
+            let got = pg_append_chunk_item(&sp, &ctx, row).await?;
+            let answer = match got {
+                PgItemAppended::Ok => {
+                    sp.commit().await.map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "put_blob_chunk release: {e}"
+                        ))
+                    })?;
+                    landed = true;
+                    Ok(row.sha256)
+                }
+                refused => {
+                    // No blob row, no index row, no counter step, no binding.
+                    sp.rollback().await.map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "put_blob_chunk rollback to savepoint: {e}"
+                        ))
+                    })?;
+                    Err(match refused {
+                        PgItemAppended::SeqConflict => {
+                            crate::federation::BlobError::InvalidArgument(format!(
+                                "stream {stream_id} seq {} already exists",
+                                row.seq
+                            ))
+                        }
+                        PgItemAppended::CapReached => {
+                            crate::federation::blobs::epoch_cap_refusal(stream_id, epoch)
+                        }
+                        PgItemAppended::EpochMoved => {
+                            let b = binding
+                                .as_ref()
+                                .expect("EpochMoved only arises with a binding");
+                            crate::federation::BlobError::EpochNotCurrent {
+                                community_key_id: b.community_key_id.clone(),
+                                epoch: b.epoch,
+                            }
+                        }
+                        PgItemAppended::Ok => unreachable!("handled above"),
+                    })
+                }
             };
-            let n = tx
-                .execute(
-                    bind_sql,
-                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind: {e}"))
-                })?;
-            let already_row = tx
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
-                                      AND minter_key_id = $3 AND epoch = $4) AS b",
-                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind check: {e}"))
-                })?;
-            let already: bool =
-                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
-            if n == 0 && !already {
-                let _ = tx.rollback().await;
-                return Err(crate::federation::BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id.clone(),
-                    epoch: b.epoch,
-                });
-            }
+            results[*slot] = Some(answer);
         }
 
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
-        })?;
-        Ok(row.sha256)
+        // Nothing landed ⇒ nothing is written, the stream row either: a
+        // refused first append does not claim the stream.
+        if landed {
+            tx.commit().await.map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
+            })?;
+        } else {
+            let _ = tx.rollback().await;
+        }
+        Ok(results
+            .into_iter()
+            .map(|r| r.expect("every slot answered"))
+            .collect())
     }
 
     /// v3.4.0 (CIRISPersist#123) — fetch the next `limit` eviction
@@ -19490,14 +20357,46 @@ impl PostgresBackend {
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob tx: {e}")))?;
-        for stmt in [
-            "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
-            "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
-        ] {
-            tx.execute(stmt, &[&sha_vec]).await.map_err(|e| {
-                crate::federation::BlobError::Backend(format!("delete_blob satellites: {e}"))
+        // v52.0.0 (#954) — a v3 root's children die with it (see the sqlite twin).
+        let children: Vec<Vec<u8>> = tx
+            .query(
+                "SELECT child_sha256 FROM cirislens.federation_manifest_children \
+                  WHERE root_sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("delete_blob children: {e}"))
+            })?
+            .iter()
+            .map(|r| r.safe_get_with("child_sha256", crate::federation::BlobError::Backend))
+            .collect::<Result<_, _>>()?;
+        for sha in children.iter().chain(std::iter::once(&sha_vec)) {
+            for stmt in [
+                "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
+                "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
+            ] {
+                tx.execute(stmt, &[sha]).await.map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("delete_blob satellites: {e}"))
+                })?;
+            }
+        }
+        for sha in &children {
+            tx.execute(
+                "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
+                &[sha],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("delete_blob child: {e}"))
             })?;
         }
+        tx.execute(
+            "DELETE FROM cirislens.federation_manifest_children WHERE root_sha256 = $1",
+            &[&sha_vec],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob relation: {e}")))?;
         let n = tx
             .execute(
                 "DELETE FROM cirislens.federation_blobs WHERE sha256 = $1",
@@ -21326,6 +22225,8 @@ fn pg_row_to_revocation(
     Ok(crate::federation::Revocation {
         revocation_id: row.safe_get_with("revocation_id", mk_err)?,
         revoked_key_id: row.safe_get_with("revoked_key_id", mk_err)?,
+        revoked_key_sha256_ed25519_raw: row
+            .safe_get_with("revoked_key_sha256_ed25519_raw", mk_err)?,
         revoking_key_id: row.safe_get_with("revoking_key_id", mk_err)?,
         reason: row.safe_get_with("reason", mk_err)?,
         revoked_at: row.safe_get_with("revoked_at", mk_err)?,
@@ -21433,6 +22334,7 @@ fn pg_row_to_family(
         consensus_protocol: row.safe_get_with("consensus_protocol", mk_err)?,
         consensus_protocol_entrenched: row
             .safe_get_with("consensus_protocol_entrenched", mk_err)?,
+        dissolved_at: row.safe_get_with("dissolved_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -21872,6 +22774,8 @@ fn pg_row_to_signed_family(
         row.safe_get_with("scrub_signature_classical", mk_err)?;
     let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
     let supersede_proof = pg_supersede_proof(&row)?;
+    // v52.0.0 (#955, V162) — the founding co-signatures.
+    let cosignatures = pg_roster_cosignatures(&row)?;
     let family = pg_row_to_family(row)?;
     Ok(crate::federation::SignedFamily {
         family,
@@ -21879,6 +22783,7 @@ fn pg_row_to_signed_family(
         scrub_signature_classical,
         scrub_signature_pqc,
         supersede_proof,
+        cosignatures,
     })
 }
 
@@ -22108,13 +23013,15 @@ fn pg_row_to_signed_community_membership_widening(
 /// admits (no prior row → no rollback possible).
 async fn check_revocation_anti_rollback_postgres(
     client: &deadpool_postgres::Object,
-    revoked_key_id: &str,
+    revoked_key_sha256_ed25519_raw: &str,
     submitted_ts: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
+    let revoked_key_id = revoked_key_sha256_ed25519_raw;
     let row = client
         .query_opt(
             "SELECT scrub_timestamp FROM cirislens.federation_revocations \
-             WHERE revoked_key_id = $1 ORDER BY scrub_timestamp DESC LIMIT 1",
+             WHERE revoked_key_sha256_ed25519_raw = $1 \
+             ORDER BY scrub_timestamp DESC LIMIT 1",
             &[&revoked_key_id],
         )
         .await
@@ -24011,7 +24918,10 @@ impl crate::read::ReadEngine for PostgresBackend {
             let op = if revoked { "EXISTS" } else { "NOT EXISTS" };
             where_parts.push(format!(
                 "{op} (SELECT 1 FROM cirislens.federation_revocations r \
-                     WHERE r.revoked_key_id = cirislens.federation_keys.key_id)"
+                     WHERE r.revoked_key_sha256_ed25519_raw = {})",
+                crate::federation::key_digest::postgres_sql_expr(
+                    "cirislens.federation_keys.pubkey_ed25519_base64"
+                )
             ));
         }
         if let Some(pqc) = filter.pqc_completed {
@@ -24468,8 +25378,14 @@ impl crate::read::ReadEngine for PostgresBackend {
         let mut where_parts: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         if let Some(k) = &filter.revoked_key_id {
+            // v52.0.0 (#784) — the subject is the digest.
             params.push(Box::new(k.clone()));
-            where_parts.push(format!("revoked_key_id = ${}", params.len()));
+            let n = params.len();
+            where_parts.push(format!(
+                "(revoked_key_id = ${n} OR revoked_key_sha256_ed25519_raw = \
+                  (SELECT {} FROM cirislens.federation_keys k WHERE k.key_id = ${n}))",
+                crate::federation::key_digest::postgres_sql_expr("k.pubkey_ed25519_base64")
+            ));
         }
         if let Some(k) = &filter.revoking_key_id {
             params.push(Box::new(k.clone()));
@@ -24509,7 +25425,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash \
+                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
              FROM cirislens.federation_revocations \
              {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC \
@@ -26908,6 +27824,7 @@ pub(crate) mod postgres_serial_scan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
     use chrono::TimeZone;
 
     fn pg_dsn() -> Option<String> {
@@ -27578,6 +28495,95 @@ mod tests {
             &node,
         )
         .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222–I227, subjects by digest, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn digest_subjects_postgres_784() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let node = format!("rev784-node-pg-{}", uuid::Uuid::new_v4().simple());
+        backend.set_node_key_id(&node);
+        crate::federation::admission::r2_test_support::exercise_784_digest_subjects(
+            &backend,
+            &format!("pg784-{}", uuid::Uuid::new_v4().simple()),
+            &node,
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222 two nodes (two databases), on postgres.
+    #[tokio::test]
+    async fn digest_subjects_two_node_postgres_784() {
+        let (Some(da), Some(db)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn())
+        else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let a = PostgresBackend::connect(&da).await.expect("connect a");
+        a.run_migrations().await.expect("migrations a");
+        let b = PostgresBackend::connect(&db).await.expect("connect b");
+        b.run_migrations().await.expect("migrations b");
+        crate::federation::admission::r2_test_support::exercise_784_two_node(
+            &a,
+            &b,
+            &format!("pg784n-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — **I221 on postgres: V163 backfills a
+    /// legacy revocation's subject digest in SQL**, from the key it named, and
+    /// the column is then NOT NULL.
+    #[tokio::test]
+    async fn i221_v163_backfills_the_legacy_revocation_subject_postgres_784() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend
+            .run_migrations_through(162)
+            .await
+            .expect("through V162");
+        let (pk, _) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("k784-legacy-pg");
+        let client = backend.get_client().await.unwrap();
+        client
+            .batch_execute(&format!(
+                "INSERT INTO cirislens.federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                   identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, \
+                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('k1','{pk}','hybrid','node','ref1','2026-01-01T00:00:00Z','{{}}','\\x00','sig', \
+                   'k1','2026-01-01T00:00:01Z','h','2026-01-01T00:00:01Z'); \
+                 INSERT INTO cirislens.federation_revocations (revocation_id, revoked_key_id, \
+                   revoking_key_id, revoked_at, effective_at, revocation_envelope, original_content_hash, \
+                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('r1','k1','k1','2026-01-05T00:00:00Z','2026-01-05T00:00:00Z','{{}}','\\x00', \
+                   'sig','k1','2026-01-05T00:00:01Z','h','2026-01-05T00:00:01Z');"
+            ))
+            .await
+            .expect("seed the V162 shape");
+        drop(client);
+        backend.run_migrations().await.expect("V163 runs");
+        let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&pk)
+            .unwrap()
+            .to_hex();
+        use crate::federation::FederationDirectory as _;
+        let found = backend.revocations_for_subject(&digest).await.unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.revocation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1"],
+            "I221: the SQL backfill digests the RAW key bytes exactly as Rust does"
+        );
     }
 
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
@@ -33257,7 +34263,9 @@ mod tests {
             crate::federation::tier_ingest::test_support::seal_revocation(
                 crate::federation::Revocation {
                     revocation_id: id.clone(),
-                    revoked_key_id: subject.to_owned(),
+                    revoked_key_id: Some(subject.to_owned()),
+                    revoked_key_sha256_ed25519_raw:
+                        crate::federation::tier_ingest::test_support::subject_digest_of(subject),
                     revoking_key_id: subject.to_owned(),
                     reason: Some("test".into()),
                     revoked_at: now,
@@ -33872,6 +34880,7 @@ mod tests {
                     founded_at: now,
                     consensus_protocol: "unanimous".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             )
@@ -34049,6 +35058,10 @@ mod tests {
             .await
             .unwrap();
 
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            &backend,
+        )
+        .await;
         let community = |key: &str, members: Vec<&str>, policy: Option<serde_json::Value>| {
             crate::federation::tier_ingest::test_support::sign_community(
                 key,
@@ -34397,7 +35410,7 @@ mod tests {
         )
         .await;
         let added = backend
-            .add_member(Cohort::Affiliations, &coop, carol_row, &admit)
+            .add_member_consented(Cohort::Affiliations, &coop, carol_row, &admit)
             .await
             .expect("affiliations add_member");
         assert!(added);
@@ -34643,6 +35656,7 @@ mod tests {
                     founded_at: now,
                     consensus_protocol: "unanimous".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -34684,7 +35698,7 @@ mod tests {
         let admit =
             crate::federation::cohort::test_support::admit_family(&alice, &fam_before, &bob_row);
         assert!(backend
-            .add_family_member(&fam, bob_row, &admit)
+            .add_family_member_consented(&fam, bob_row, &admit)
             .await
             .expect("signed roster grow"));
 
@@ -34728,7 +35742,7 @@ mod tests {
 
         // Idempotent re-add: no-op, no duplicate roster entry.
         assert!(!backend
-            .add_family_member(
+            .add_family_member_consented(
                 &fam,
                 crate::federation::FamilyMember {
                     key_id: bob.clone(),
@@ -34917,7 +35931,9 @@ mod tests {
         let rev = crate::federation::tier_ingest::test_support::seal_revocation(
             crate::federation::Revocation {
                 revocation_id: rev_id.clone(),
-                revoked_key_id: revoked_id.clone(),
+                revoked_key_id: Some(revoked_id.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&revoked_id),
                 revoking_key_id: revoking_id.clone(),
                 reason: Some("test".into()),
                 revoked_at: now,
@@ -34953,7 +35969,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].revoked_key_id, revoked_id);
+        assert_eq!(
+            page.items[0].revoked_key_id.as_deref(),
+            Some(revoked_id.as_str())
+        );
         assert_eq!(page.items[0].revoking_key_id, revoking_id);
     }
 
@@ -38270,6 +39289,10 @@ mod tests {
                 .unwrap();
         }
 
+        crate::federation::tier_ingest::test_support::register_fixture_infrastructure_founder(
+            &backend,
+        )
+        .await;
         // Build a community keyed by a fresh run-scoped id with `members`
         // + optional cohort_subkind.
         let put_comm = |cid: &str, members: Vec<&str>, subkind: Option<&str>| {
@@ -39409,6 +40432,7 @@ mod tests {
                     founded_at: chrono::Utc::now(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -39735,7 +40759,9 @@ mod tests {
         let rev = crate::federation::tier_ingest::test_support::seal_revocation(
             crate::federation::Revocation {
                 revocation_id: rev_id.clone(),
-                revoked_key_id: target.clone(),
+                revoked_key_id: Some(target.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&target),
                 revoking_key_id: steward.clone(),
                 reason: Some("test".into()),
                 revoked_at: now,
@@ -41410,7 +42436,9 @@ mod tests {
                 revocation: crate::federation::tier_ingest::test_support::seal_revocation(
                     crate::federation::Revocation {
                         revocation_id: rev_id.clone(),
-                        revoked_key_id: target.clone(),
+                        revoked_key_id: Some(target.clone()),
+                        revoked_key_sha256_ed25519_raw:
+                            crate::federation::tier_ingest::test_support::subject_digest_of(&target),
                         revoking_key_id: steward.clone(),
                         reason: Some("test".into()),
                         revoked_at: chrono::Utc::now(),
@@ -43874,6 +44902,12 @@ mod tests {
                 &[&stream],
             )
             .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_epoch_counts WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
         for sha in &shas {
             let _ = backend.delete_blob(sha).await;
         }
@@ -44133,6 +45167,12 @@ mod tests {
         let _ = client
             .execute(
                 "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_epoch_counts WHERE stream_id = $1",
                 &[&stream],
             )
             .await;
@@ -45877,7 +46917,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_register_accord_public_key_classifies_outcomes() {
-        use crate::store::{accord_key_fingerprint, KeyRegistrationOutcome};
+        use crate::store::{sha256_of_pubkey_base64_text, KeyRegistrationOutcome};
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -45904,8 +46944,11 @@ mod tests {
             .unwrap();
         match collision {
             KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint,
-            } => assert_eq!(existing_key_fingerprint, accord_key_fingerprint("pubA")),
+                existing_key_sha256_of_pubkey_base64_text,
+            } => assert_eq!(
+                existing_key_sha256_of_pubkey_base64_text,
+                sha256_of_pubkey_base64_text("pubA")
+            ),
             other => panic!("expected RotationCollision, got {other:?}"),
         }
         // Non-destructive: the stored pubkey is unchanged.
@@ -47204,7 +48247,7 @@ mod tests {
             )
             .await;
         assert!(backend
-            .add_community_member(&comm, member(&u2, None), &admit_u2)
+            .add_community_member_consented(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
         assert_eq!(
@@ -47214,7 +48257,7 @@ mod tests {
         // idempotent re-add (the stale spec is reused deliberately — the no-op
         // returns before the gate; nothing is written, so nothing to authorize).
         assert!(!backend
-            .add_community_member(&comm, member(&u2, None), &admit_u2)
+            .add_community_member_consented(&comm, member(&u2, None), &admit_u2)
             .await
             .unwrap());
         // v48.0.0 (#860): the RECORD never grows — u2 rides the widening
@@ -47761,6 +48804,7 @@ mod tests {
             founded_at: now,
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let signed =
@@ -48041,6 +49085,7 @@ mod tests {
                 consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
                     .to_owned(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             })
             .await
@@ -48788,6 +49833,7 @@ mod tests {
             founded_at: now,
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let signed = crate::federation::tier_ingest::test_support::sign_family(&auth, family_row);
