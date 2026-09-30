@@ -291,6 +291,29 @@ where
     Ok(out)
 }
 
+/// v52.0.0 (#960) — is any principal of this node (its own key, or a human
+/// it is an active occurrence of) an active member of `family_key_id`?
+pub async fn family_audience<D>(
+    directory: &D,
+    our_key_id: &str,
+    family_key_id: &str,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let mut principals: HashSet<String> = directory
+        .active_identities_for_occurrence(our_key_id)
+        .await?
+        .into_iter()
+        .collect();
+    principals.insert(our_key_id.to_owned());
+    Ok(directory
+        .active_family_members(family_key_id)
+        .await?
+        .iter()
+        .any(|m| principals.contains(&m.key_id)))
+}
+
 /// #846 (§4) — the pure core of [`is_audience`]: is a node whose active
 /// community memberships are `member_communities` party to content at
 /// `cohort_scope` / `community_key_id`?
@@ -356,6 +379,17 @@ where
         author_local =
             crate::federation::self_collective::speaks_for(directory, our_key_id, author_key_id)
                 .await?;
+    }
+    // v52.0.0 (CIRISPersist#960) — the FAMILY arm by the family's own
+    // roster. The operator predicate is test-only in practice (production
+    // never installs one), so a family member's node was never party to the
+    // family's content: this node is party when any of its principals — the
+    // humans it is an occurrence of, and its own key — is an active member
+    // of the named family. The room arm's rule, on the family plane.
+    if !author_local && cs::target_plane(cohort_scope) == Some(cs::TargetPlane::Family) {
+        if let Some(fam) = community_key_id {
+            author_local = family_audience(directory, our_key_id, fam).await?;
+        }
     }
     // Only the community arms need the walk; do not pay for it otherwise.
     let members = if cs::target_plane(cohort_scope) == Some(cs::TargetPlane::Room) {

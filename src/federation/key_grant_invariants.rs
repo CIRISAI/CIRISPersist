@@ -1265,10 +1265,42 @@ pub mod two_node {
             &fam,
             None,
             CryptoTier::InvisibleEncrypted,
-            std::slice::from_ref(&a.key),
+            // #960 — NO operator family predicate: production never installs
+            // one, so bob's node must find its party-ness in the family
+            // roster, not in a predicate the test supplies.
+            &[],
         )
         .await
         .unwrap_or_else(|e| panic!("{tag} I199: bob's node adopts the family bytes: {e}"));
+        // #960 — and a node none of whose principals is in the family is
+        // still not party to it, on the same directory.
+        let stranger_node = format!("{tag}-stranger-node-{run}");
+        assert!(
+            !crate::federation::replication::hold::is_audience(
+                b.backend,
+                FAMILY,
+                Some(&fam),
+                &a.key,
+                |_| false,
+                &stranger_node,
+            )
+            .await
+            .unwrap(),
+            "{tag} I199: a non-member node is not audience of family content"
+        );
+        assert!(
+            crate::federation::replication::hold::is_audience(
+                b.backend,
+                FAMILY,
+                Some(&fam),
+                &a.key,
+                |_| false,
+                &b.key,
+            )
+            .await
+            .unwrap(),
+            "{tag} I199: bob's node is audience by the family roster alone"
+        );
         assert_eq!(
             read_any_for_viewer(b.backend, &sha, &b.key, None)
                 .await
