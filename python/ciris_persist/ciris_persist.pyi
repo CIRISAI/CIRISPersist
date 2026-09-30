@@ -600,6 +600,9 @@ class Engine:
     def adopt_sealed_chunk_json(self, payload_json: str) -> str:
         """(derived) deontic — v46.4.0 (CIRISPersist#821, FSD/DRIVE_QUERY_AND_CHUNK_ADOPT.md §3) — the chunk twin of adopt_sealed_blob_json: take one sealed chunk of a stream thi..."""
 
+    def adopt_sealed_chunks_json(self, payload_json: str) -> str:
+        """(derived) deontic — v52.0.0 (CIRISPersist#957) — the batched twin of adopt_sealed_chunk_json: a run of up to 64 sealed chunks of ONE stream, at one epoch, under one pr..."""
+
     def adopt_sealed_manifest_child_json(self, payload_json: str) -> str:
         """(derived) deontic — v52.0.0 (CIRISPersist#954) — adopt one child of a v3 manifest (fetched by the sha256_hex its root names): stored as the sealed envelope it is, neve..."""
 

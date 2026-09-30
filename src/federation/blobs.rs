@@ -1055,6 +1055,70 @@ impl ParsedManifest {
     }
 }
 
+/// v52.0.0 (CIRISPersist#957) — the most chunks one batched append or adopt
+/// carries. Above it the door refuses and the caller splits the run.
+pub const MAX_CHUNKS_PER_BATCH: usize = 64;
+
+/// v52.0.0 (#957) — the most envelope bytes one batch carries (32 MiB), so a
+/// batch holds the one writer for a bounded time.
+pub const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// v52.0.0 (#957) — one chunk of a batched append: its position, its body,
+/// and the plaintext length the body carries.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ChunkFloorItem {
+    /// The chunk's position in the stream.
+    pub seq: u64,
+    /// The chunk's bytes as stored.
+    pub body: BlobBody,
+    /// The plaintext length those bytes carry.
+    pub plaintext_size: u64,
+}
+
+/// v52.0.0 (#957) — the batch's bounds: at least one item, at most
+/// [`MAX_CHUNKS_PER_BATCH`], and at most [`MAX_BATCH_BYTES`] of inline bodies.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] naming the bound.
+pub fn check_chunk_batch_bounds(items: &[ChunkFloorItem]) -> Result<(), BlobError> {
+    if items.is_empty() {
+        return Err(BlobError::InvalidArgument(
+            "adopt_sealed_chunks: an empty batch".into(),
+        ));
+    }
+    if items.len() > MAX_CHUNKS_PER_BATCH {
+        return Err(BlobError::InvalidArgument(format!(
+            "adopt_sealed_chunks: {} chunks in one batch; at most {MAX_CHUNKS_PER_BATCH} — split the run",
+            items.len()
+        )));
+    }
+    let bytes: usize = items
+        .iter()
+        .map(|i| match &i.body {
+            BlobBody::Inline(b) => b.len(),
+            _ => 0,
+        })
+        .sum();
+    if bytes > MAX_BATCH_BYTES {
+        return Err(BlobError::InvalidArgument(format!(
+            "adopt_sealed_chunks: {bytes} bytes in one batch; at most {MAX_BATCH_BYTES} — split the run"
+        )));
+    }
+    Ok(())
+}
+
+/// v52.0.0 (#957) — the one spelling of the nonce-cap refusal (CEG §10.5.3):
+/// both backends refuse by this text, as `InvalidArgument`.
+#[must_use]
+pub fn epoch_cap_refusal(stream_id: &str, epoch: u64) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at MAX_CHUNKS_PER_EPOCH \
+         ({MAX_CHUNKS_PER_EPOCH}) — roll the epoch (STREAM-nonce counter exhaustion, CEG §10.5.3)"
+    ))
+}
+
 /// v52.0.0 (#954) — the one spelling of "this stream was abandoned": the
 /// chunk floor and the seal refuse it by this text on every backend.
 #[must_use]
@@ -1611,6 +1675,27 @@ pub trait BlobStorage: Send + Sync {
         floor: StorageFloor,
         binding: Option<EpochBinding>,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
+
+    /// v52.0.0 (CIRISPersist#957) — **[`adopt_sealed_chunk_at`](Self::adopt_sealed_chunk_at),
+    /// batched**: a run of `(seq, envelope, plaintext_size)` items of ONE
+    /// stream at one epoch, in ONE write transaction. The stream's claim is
+    /// checked once; a refusal there (another owner, another cohort, an
+    /// abandoned stream, a reserved id) refuses the whole batch and writes
+    /// nothing (the outer `Err`). Each item then runs the single door's steps
+    /// in its own savepoint and answers in its slot: a seq conflict, the
+    /// nonce cap or a body the floor refuses rolls back that item only. At
+    /// most [`MAX_CHUNKS_PER_BATCH`] items and [`MAX_BATCH_BYTES`] bytes.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn adopt_sealed_chunks_at(
+        &self,
+        stream_id: &str,
+        items: Vec<(u64, Vec<u8>, u64)>,
+        epoch: u64,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: StorageFloor,
+        binding: Option<EpochBinding>,
+    ) -> impl Future<Output = Result<Vec<Result<[u8; 32], BlobError>>, BlobError>> + Send;
 
     /// v51.3.0 (CIRISPersist#947) — **promote an ADOPTED sealed manifest row
     /// to a `chunk_dag`.** [`adopt_sealed_blob_at`](Self::adopt_sealed_blob_at)

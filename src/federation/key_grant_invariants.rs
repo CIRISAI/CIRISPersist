@@ -2603,23 +2603,35 @@ mod tests {
 
     /// **I72 (from disk) — both adopt doors reconcile pending content sets**
     /// (PR #850, round three): a self/family chunk has its own DEK and its
-    /// own set, so `adopt_sealed_chunk` projects exactly as `adopt_sealed_blob`.
+    /// own set, so the chunk adopt projects exactly as `adopt_sealed_blob`.
+    /// v52.0.0 (#957): the chunk door that stores is the batched
+    /// `adopt_sealed_chunks`; the single `adopt_sealed_chunk` is a batch of
+    /// one and must delegate to it, never store around it.
     #[test]
     fn i72_both_adopt_doors_project_pending_content_grants() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join("src/federation/adopt_cascade.rs")).unwrap();
         let prod = production_only(&text);
-        for door in ["adopt_sealed_blob", "adopt_sealed_chunk"] {
+        let body = |door: &str| {
             let start = prod.find(&format!("pub async fn {door}<")).unwrap();
             let end = prod[start + 1..]
-                .find("\npub async fn ")
+                .find("\npub ")
                 .map(|i| start + 1 + i)
                 .unwrap_or(prod.len());
+            prod[start..end].to_owned()
+        };
+        for door in ["adopt_sealed_blob", "adopt_sealed_chunks"] {
             assert!(
-                prod[start..end].contains("project_pending_content_grants("),
+                body(door).contains("project_pending_content_grants("),
                 "I72: {door} must project the pending content sets once the row names its author"
             );
         }
+        let single = body("adopt_sealed_chunk");
+        assert!(
+            single.contains("adopt_sealed_chunks(") && !single.contains("adopt_sealed_chunk_at("),
+            "I72: adopt_sealed_chunk must be a batch of one through adopt_sealed_chunks, never a \
+             second path to the floor that could skip the projection"
+        );
     }
 
     /// **I78 (from disk, #851) — the occurrence plane advertises signed-put

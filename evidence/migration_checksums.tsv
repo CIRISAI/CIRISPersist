@@ -311,3 +311,5 @@ sqlite	161	identity_occurrence_history	3655158105052434642
 postgres	161	identity_occurrence_history	4095184552785224585
 sqlite	163	revocation_subject_digest	13083273423762522287
 postgres	163	revocation_subject_digest	3781799730581939265
+sqlite	165	stream_epoch_counts	932718697052247095
+postgres	165	stream_epoch_counts	15192852104165500850

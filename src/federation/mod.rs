@@ -592,7 +592,7 @@ pub use replication::admission::{PeerQuotaRefusal, PeerQuotaRefused};
 // #846 (BLOB_REPLICATION.md §4/§6) — the provenance a consumer declares to the
 // adopt doors and the breadth answer it reads; named here so a Rust consumer
 // does not have to path into `replication::hold`.
-pub use adopt_cascade::{AdoptDisposition, AdoptOutcome};
+pub use adopt_cascade::{AdoptChunkItem, AdoptDisposition, AdoptOutcome};
 pub use replication::hold::{
     is_audience, is_proxy_content, would_hold, BlobProvenance, HoldBreadth, HoldContext,
 };

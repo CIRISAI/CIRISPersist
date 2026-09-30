@@ -67,12 +67,32 @@ async fn resolve_adopt<B>(
 where
     B: BlobStorage + Sync + ?Sized,
 {
+    check_envelope_shape(envelope)?;
+    resolve_provenance(backend, our_key_id, provenance).await
+}
+
+/// The envelope-shape half of [`resolve_adopt`]: a structural parse, NOT an
+/// open (I45).
+fn check_envelope_shape(envelope: &[u8]) -> Result<(), BlobError> {
     AtRestEnvelope::from_bytes(envelope).map_err(|e| {
         BlobError::InvalidArgument(format!(
             "adopt: the bytes do not have the at-rest envelope shape ({e}); an adopt stores \
              sealed bytes verbatim and nothing else"
         ))
     })?;
+    Ok(())
+}
+
+/// The provenance half of [`resolve_adopt`]: the tier, the floor token, and
+/// the binding to write AS DECLARED. Per stream, so a batch runs it once.
+async fn resolve_provenance<B>(
+    backend: &B,
+    our_key_id: &str,
+    provenance: &BlobProvenance,
+) -> Result<(StorageFloor, Option<EpochBinding>), BlobError>
+where
+    B: BlobStorage + Sync + ?Sized,
+{
     let binding = match provenance.tier {
         CryptoTier::Plaintext => {
             return Err(BlobError::InvalidArgument(format!(
@@ -237,31 +257,101 @@ where
     B: BlobStorage + FederationDirectory + Sync,
     F: Fn(&str) -> bool,
 {
-    let (floor, binding) = resolve_adopt(backend, ctx.our_key_id, envelope, provenance).await?;
-    would_hold(backend, ctx, provenance).await?;
-    let sha256 = backend
-        .adopt_sealed_chunk_at(
-            stream_id,
+    // #957 — one chunk is a batch of one: one door spelling.
+    let mut out = adopt_sealed_chunks(
+        backend,
+        ctx,
+        stream_id,
+        &[AdoptChunkItem {
             seq,
-            envelope.to_vec(),
-            epoch,
+            envelope,
             plaintext_size,
+        }],
+        epoch,
+        provenance,
+    )
+    .await?;
+    out.pop().expect("a batch of one answers with one result")
+}
+
+/// v52.0.0 (CIRISPersist#957) — one chunk of a batched adopt: its position,
+/// the sealed envelope verbatim, and the plaintext length it carries.
+#[derive(Debug, Clone, Copy)]
+pub struct AdoptChunkItem<'a> {
+    /// The chunk's position in the stream.
+    pub seq: u64,
+    /// The sealed chunk envelope, as received.
+    pub envelope: &'a [u8],
+    /// The plaintext length the envelope carries.
+    pub plaintext_size: u64,
+}
+
+/// v52.0.0 (CIRISPersist#957) — **adopt a run of sealed chunks of one
+/// stream**: [`adopt_sealed_chunk`]'s steps once per batch where they are
+/// per-stream (the provenance's tier and binding, the WILL decision) and
+/// once per item where they are per-chunk (the envelope's shape — never an
+/// open, I45 — the floor, the pending content-set projection).
+///
+/// The outer `Err` refuses the whole batch with nothing written: the
+/// provenance, `would_hold`, the batch bounds, or the stream's claim at the
+/// floor. Otherwise each item answers in its slot, in order: a malformed
+/// envelope, a seq conflict or the nonce cap refuses that item alone.
+pub async fn adopt_sealed_chunks<B, F>(
+    backend: &B,
+    ctx: &HoldContext<'_, F>,
+    stream_id: &str,
+    items: &[AdoptChunkItem<'_>],
+    epoch: u64,
+    provenance: &BlobProvenance,
+) -> Result<Vec<Result<[u8; 32], BlobError>>, BlobError>
+where
+    B: BlobStorage + FederationDirectory + Sync,
+    F: Fn(&str) -> bool,
+{
+    // Shape first, per item (I45: a structural check, not an open).
+    let mut answers: Vec<Option<Result<[u8; 32], BlobError>>> = items
+        .iter()
+        .map(|i| check_envelope_shape(i.envelope).err().map(Err))
+        .collect();
+    let shaped: Vec<(usize, &AdoptChunkItem<'_>)> = items
+        .iter()
+        .enumerate()
+        .filter(|(n, _)| answers[*n].is_none())
+        .collect();
+    if shaped.is_empty() {
+        return Ok(answers.into_iter().map(|a| a.expect("answered")).collect());
+    }
+    let (floor, binding) = resolve_provenance(backend, ctx.our_key_id, provenance).await?;
+    would_hold(backend, ctx, provenance).await?;
+    let stored = backend
+        .adopt_sealed_chunks_at(
+            stream_id,
+            shaped
+                .iter()
+                .map(|(_, i)| (i.seq, i.envelope.to_vec(), i.plaintext_size))
+                .collect(),
+            epoch,
             &provenance.cohort_scope,
             &provenance.author_key_id,
             floor,
             binding,
         )
         .await?;
-    // #848 §13 (PR #850 review, round three) — a self/family chunk has its
-    // own DEK and its own content-axis set; the set that arrived before the
-    // chunk projects here, exactly as for a blob.
-    crate::federation::key_grant::project_pending_content_grants(
-        backend,
-        &sha256,
-        &provenance.cohort_scope,
-        &provenance.author_key_id,
-    )
-    .await
-    .map_err(|e| BlobError::Backend(format!("pending key_grant projection: {e}")))?;
-    Ok(sha256)
+    for ((slot, _), got) in shaped.iter().zip(stored) {
+        if let Ok(sha256) = &got {
+            // #848 §13 (PR #850 review, round three) — a self/family chunk
+            // has its own DEK and its own content-axis set; the set that
+            // arrived before the chunk projects here, exactly as for a blob.
+            crate::federation::key_grant::project_pending_content_grants(
+                backend,
+                sha256,
+                &provenance.cohort_scope,
+                &provenance.author_key_id,
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("pending key_grant projection: {e}")))?;
+        }
+        answers[*slot] = Some(got);
+    }
+    Ok(answers.into_iter().map(|a| a.expect("answered")).collect())
 }

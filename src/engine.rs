@@ -5859,6 +5859,45 @@ impl Engine {
         }
     }
 
+    /// v52.0.0 (CIRISPersist#957) — **adopt a run of sealed chunks of one
+    /// stream** in one write transaction: [`adopt_sealed_chunk`](Self::adopt_sealed_chunk)
+    /// for up to [`MAX_CHUNKS_PER_BATCH`](crate::federation::blobs::MAX_CHUNKS_PER_BATCH)
+    /// chunks at one epoch under one provenance. The provenance, the WILL
+    /// decision and the stream's claim are checked once; a refusal there is
+    /// the outer `Err` and nothing is written. Each item then answers in its
+    /// slot, in order: a malformed envelope, a seq conflict or the nonce cap
+    /// refuses that item alone and the rest commit.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_sealed_chunks(
+        &self,
+        stream_id: &str,
+        items: &[crate::federation::AdoptChunkItem<'_>],
+        epoch: u64,
+        provenance: crate::federation::BlobProvenance,
+    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
+    {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::adopt_cascade::adopt_sealed_chunks;
+        let (our_key, fam) = self.local_or_family_parts().await?;
+        let ctx = crate::federation::HoldContext {
+            pressure: self.current_disk_pressure(),
+            is_local_or_family: local_or_family_predicate(our_key.clone(), fam),
+            our_key_id: &our_key,
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                adopt_sealed_chunks(arc.as_ref(), &ctx, stream_id, items, epoch, &provenance).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                adopt_sealed_chunks(arc.as_ref(), &ctx, stream_id, items, epoch, &provenance).await
+            }
+        }
+    }
+
     /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — write a
     /// `cohort_scope: self | family` blob through the **at-rest DEK
     /// cascade** (the [`CryptoTier::InvisibleEncrypted`](crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted)

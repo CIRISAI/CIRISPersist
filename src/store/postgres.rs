@@ -887,6 +887,205 @@ pub struct PostgresBackend {
 /// read `enabled` and a destroy that read `no binding` could both commit.
 /// Released at commit or rollback; per community, so unrelated communities
 /// never wait on each other.
+/// #957 — one chunk of a batch, validated and hashed, ready for the tx.
+struct PgChunkRow {
+    seq: u64,
+    seq_i64: i64,
+    plaintext_i64: i64,
+    sha256: [u8; 32],
+    storage_kind: &'static str,
+    bytes_inline: Option<Vec<u8>>,
+    external_ref: Option<String>,
+    size_bytes: i64,
+}
+
+/// #957 — an item's validation, outside the transaction.
+fn pg_prepare_chunk_item(
+    item: &crate::federation::blobs::ChunkFloorItem,
+    cap: usize,
+    floor: crate::federation::StorageFloor,
+) -> Result<PgChunkRow, crate::federation::BlobError> {
+    let row = crate::federation::blobs::prepare_stream_chunk_row(
+        &item.body,
+        cap,
+        floor,
+        item.plaintext_size,
+    )?;
+    let seq_i64 = i64::try_from(item.seq).map_err(|_| {
+        crate::federation::BlobError::InvalidArgument(
+            "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
+        )
+    })?;
+    let plaintext_i64 = i64::try_from(item.plaintext_size).map_err(|_| {
+        crate::federation::BlobError::InvalidArgument(
+            "put_blob_chunk: plaintext_size exceeds i64".into(),
+        )
+    })?;
+    Ok(PgChunkRow {
+        seq: item.seq,
+        seq_i64,
+        plaintext_i64,
+        sha256: row.sha256,
+        storage_kind: row.storage_kind,
+        bytes_inline: row.bytes_inline,
+        external_ref: row.external_ref,
+        size_bytes: row.size_bytes,
+    })
+}
+
+/// #957 — what one item's savepoint did.
+enum PgItemAppended {
+    Ok,
+    SeqConflict,
+    CapReached,
+    EpochMoved,
+}
+
+/// #957 — the batch's per-item constants.
+struct PgChunkTx<'a> {
+    stream_id: &'a str,
+    epoch_i64: i64,
+    scope: &'a str,
+    tier: &'a str,
+    owner_key_id: Option<&'a str>,
+    binding: Option<&'a crate::federation::EpochBinding>,
+    bind_as_declared: bool,
+}
+
+/// #957 — one item's append inside its savepoint: the blob row, the nonce
+/// cap by the counter, the index row, the binding. Anything but `Ok` means
+/// the caller rolls the savepoint back.
+async fn pg_append_chunk_item(
+    tx: &tokio_postgres::Transaction<'_>,
+    c: &PgChunkTx<'_>,
+    row: &PgChunkRow,
+) -> Result<PgItemAppended, crate::federation::BlobError> {
+    let be = |what: &'static str| {
+        move |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("put_blob_chunk {what}: {e}"))
+        }
+    };
+    // 1. The chunk's bytes land as a normal federation_blobs row.
+    //    Content-addressed + idempotent. Carries the cohort and the tier the
+    //    door resolved (§11.1 / §12.1). #846 (§5) — the chunk's author is the
+    //    claimed owner.
+    let sha_vec = row.sha256.to_vec();
+    let media_type_null: Option<String> = None;
+    tx.execute(
+        "INSERT INTO cirislens.federation_blobs (\
+            sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+            cohort_scope, crypto_tier, author_key_id\
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (sha256) DO NOTHING",
+        &[
+            &sha_vec,
+            &row.storage_kind,
+            &row.bytes_inline,
+            &row.external_ref,
+            &row.size_bytes,
+            &media_type_null,
+            &c.scope,
+            &c.tier,
+            &c.owner_key_id,
+        ],
+    )
+    .await
+    .map_err(be("blob insert"))?;
+
+    // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b). v52.0.0 (#957):
+    //    the V165 counter, stepped and read back in one statement — a
+    //    primary-key upsert that also row-locks the (stream, epoch) counter
+    //    until commit, where it was a COUNT(*) over the stream's index range
+    //    (quadratic per stream, and not serialized under READ COMMITTED).
+    let counted: i64 = tx
+        .query_one(
+            "INSERT INTO cirislens.federation_stream_epoch_counts (stream_id, epoch, chunk_count) \
+             VALUES ($1, $2, 1) \
+             ON CONFLICT (stream_id, epoch) DO UPDATE \
+               SET chunk_count = cirislens.federation_stream_epoch_counts.chunk_count + 1 \
+             RETURNING chunk_count",
+            &[&c.stream_id, &c.epoch_i64],
+        )
+        .await
+        .map_err(be("epoch counter"))?
+        .safe_get_with(0usize, crate::federation::BlobError::Backend)?;
+    if crate::federation::blobs::epoch_chunk_cap_reached(u64::try_from(counted - 1).unwrap_or(0)) {
+        return Ok(PgItemAppended::CapReached);
+    }
+
+    // 3. The stream-index row. The (stream_id, seq) PK enforces
+    //    monotonicity — a re-used seq is a PK conflict (NOT idempotent: the
+    //    append-only rule). V142: the chunk's PLAINTEXT size beside its
+    //    stored size.
+    let inserted = tx
+        .execute(
+            "INSERT INTO cirislens.federation_stream_chunks (\
+                stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
+             ) VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (stream_id, seq) DO NOTHING",
+            &[
+                &c.stream_id,
+                &row.seq_i64,
+                &sha_vec,
+                &c.epoch_i64,
+                &row.size_bytes,
+                &row.plaintext_i64,
+            ],
+        )
+        .await
+        .map_err(be("index insert"))?;
+    if inserted == 0 {
+        return Ok(PgItemAppended::SeqConflict);
+    }
+
+    // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
+    //    conditional on the epoch still being the community's current enabled
+    //    one. Refused ⇒ the item rolls back.
+    if let Some(b) = c.binding {
+        let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+        // #846 (§3) — an ADOPT records the binding as the author's fact, with
+        // no key-state precondition; a WRITE binds the current enabled epoch
+        // (I17). #848 — every chunk binds `(community, minter, epoch)`.
+        let bind_sql = if c.bind_as_declared {
+            "INSERT INTO cirislens.federation_community_blob_epoch \
+                (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (at_rest_sha256) DO NOTHING"
+        } else {
+            "INSERT INTO cirislens.federation_community_blob_epoch \
+                (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+             SELECT $1, $2, $3, $4 \
+              WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
+                             WHERE community_key_id = $2 AND minter_key_id = $3 AND epoch = $4 \
+                               AND key_state = 'enabled') \
+                AND $4 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                                    WHERE community_key_id = $2 AND minter_key_id = $3), 0) \
+             ON CONFLICT (at_rest_sha256) DO NOTHING"
+        };
+        let n = tx
+            .execute(
+                bind_sql,
+                &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+            )
+            .await
+            .map_err(be("bind"))?;
+        let already: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
+                                WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
+                                  AND minter_key_id = $3 AND epoch = $4) AS b",
+                &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+            )
+            .await
+            .map_err(be("bind check"))?
+            .safe_get_with("b", crate::federation::BlobError::Backend)?;
+        if n == 0 && !already {
+            return Ok(PgItemAppended::EpochMoved);
+        }
+    }
+    Ok(PgItemAppended::Ok)
+}
+
 async fn lock_community_tx(
     tx: &tokio_postgres::Transaction<'_>,
     community_key_id: &str,
@@ -17387,6 +17586,45 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(sha)
     }
 
+    async fn adopt_sealed_chunks_at(
+        &self,
+        stream_id: &str,
+        items: Vec<(u64, Vec<u8>, u64)>,
+        epoch: u64,
+        cohort_scope: &str,
+        author_key_id: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
+    {
+        // #846 (§6.2, I50) — the AUTHOR is the claimed owner, as for one chunk.
+        let claim = crate::federation::StreamClaim {
+            community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
+            owner_key_id: Some(author_key_id.to_owned()),
+        };
+        let items = items
+            .into_iter()
+            .map(
+                |(seq, envelope, plaintext_size)| crate::federation::blobs::ChunkFloorItem {
+                    seq,
+                    body: crate::federation::BlobBody::Inline(envelope),
+                    plaintext_size,
+                },
+            )
+            .collect();
+        self.put_blob_chunks_floor(
+            stream_id,
+            items,
+            epoch,
+            cohort_scope,
+            floor,
+            binding,
+            claim,
+            true,
+        )
+        .await
+    }
+
     async fn seal_stream_with_scope(
         &self,
         stream_id: &str,
@@ -17792,6 +18030,13 @@ impl crate::federation::BlobStorage for PostgresBackend {
             )
             .await
             .map_err(be("drop"))?;
+        // #957 — the stream's (stream, epoch) counters go with its rows.
+        tx.execute(
+            "DELETE FROM cirislens.federation_stream_epoch_counts WHERE stream_id = $1",
+            &[&stream_id],
+        )
+        .await
+        .map_err(be("drop counters"))?;
         let mut report = crate::federation::AbandonFloorReport {
             already: false,
             chunks_dropped: dropped,
@@ -19544,31 +19789,74 @@ impl PostgresBackend {
         claim: crate::federation::StreamClaim,
         bind_as_declared: bool,
     ) -> Result<[u8; 32], crate::federation::BlobError> {
+        // #957 — one append is a batch of one: one floor spelling.
+        let mut out = self
+            .put_blob_chunks_floor(
+                stream_id,
+                vec![crate::federation::blobs::ChunkFloorItem {
+                    seq,
+                    body,
+                    plaintext_size,
+                }],
+                epoch,
+                cohort_scope,
+                floor,
+                binding,
+                claim,
+                bind_as_declared,
+            )
+            .await?;
+        out.pop().expect("a batch of one answers with one result")
+    }
+
+    /// v52.0.0 (CIRISPersist#957) — **the chunk floor, batched**, the
+    /// postgres twin of the sqlite floor: the stream's row once (a refusal
+    /// there refuses the whole batch, nothing written), then per item a
+    /// savepoint running the blob row, the nonce cap by the V165 counter
+    /// (`+1 … RETURNING`, which also row-locks the (stream, epoch) counter
+    /// for the rest of the transaction, so two concurrent appends to one
+    /// stream cannot both pass the cap), the index row, and the binding. An
+    /// item refused there rolls back its savepoint and answers `Err` in its
+    /// slot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn put_blob_chunks_floor(
+        &self,
+        stream_id: &str,
+        items: Vec<crate::federation::blobs::ChunkFloorItem>,
+        epoch: u64,
+        cohort_scope: &str,
+        floor: crate::federation::StorageFloor,
+        binding: Option<crate::federation::EpochBinding>,
+        claim: crate::federation::StreamClaim,
+        bind_as_declared: bool,
+    ) -> Result<Vec<Result<[u8; 32], crate::federation::BlobError>>, crate::federation::BlobError>
+    {
         use crate::federation::BlobStorage as _;
         floor.check_scope(cohort_scope)?;
         crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
+        crate::federation::blobs::check_chunk_batch_bounds(&items)?;
         let cap = self.inline_bytes_cap();
-        // Validation + hash-on-write (computes the chunk's content SHA) +
-        // the §12.3 floor check (the body is what the token says it is).
-        let row =
-            crate::federation::blobs::prepare_stream_chunk_row(&body, cap, floor, plaintext_size)?;
         // u64 → i64 binds (tokio_postgres has no ToSql for u64).
-        let seq_i64 = i64::try_from(seq).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: seq exceeds i64 — federation_stream_chunks.seq is BIGINT".into(),
-            )
-        })?;
         let epoch_i64 = i64::try_from(epoch).map_err(|_| {
             crate::federation::BlobError::InvalidArgument(
                 "put_blob_chunk: epoch exceeds i64 — federation_stream_chunks.epoch is BIGINT"
                     .into(),
             )
         })?;
-        let plaintext_i64 = i64::try_from(plaintext_size).map_err(|_| {
-            crate::federation::BlobError::InvalidArgument(
-                "put_blob_chunk: plaintext_size exceeds i64".into(),
-            )
-        })?;
+        // Per item: validation + hash-on-write + the §12.3 floor check. A
+        // refusal here is that item's answer; it never enters the transaction.
+        let mut results: Vec<Option<Result<[u8; 32], crate::federation::BlobError>>> =
+            Vec::with_capacity(items.len());
+        let mut ready: Vec<(usize, PgChunkRow)> = Vec::with_capacity(items.len());
+        for (slot, item) in items.into_iter().enumerate() {
+            match pg_prepare_chunk_item(&item, cap, floor) {
+                Ok(row) => {
+                    results.push(None);
+                    ready.push((slot, row));
+                }
+                Err(e) => results.push(Some(Err(e))),
+            }
+        }
         let scope = cohort_scope.to_owned();
         let tier = floor.tier().as_str().to_owned();
 
@@ -19576,7 +19864,7 @@ impl PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let tx = client
+        let mut tx = client
             .transaction()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("begin tx: {e}")))?;
@@ -19675,153 +19963,77 @@ impl PostgresBackend {
             ));
         }
 
-        // 1. The chunk's bytes land as a normal federation_blobs row.
-        //    Content-addressed + idempotent: a re-PUT of identical bytes
-        //    is a no-op (ON CONFLICT DO NOTHING), exactly like
-        //    store_blob_local / the put_blob_chunks chunk rows. Carries
-        //    the cohort and the tier the door resolved (§11.1 / §12.1).
-        let sha_vec = row.sha256.to_vec();
-        let media_type_null: Option<String> = None;
-        // #846 (§5) — the chunk's author is the claimed owner.
-        tx.execute(
-            "INSERT INTO cirislens.federation_blobs (\
-                sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                cohort_scope, crypto_tier, author_key_id\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (sha256) DO NOTHING",
-            &[
-                &sha_vec,
-                &row.storage_kind,
-                &row.bytes_inline,
-                &row.external_ref,
-                &row.size_bytes,
-                &media_type_null,
-                &scope,
-                &tier,
-                &claim.owner_key_id,
-            ],
-        )
-        .await
-        .map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk blob insert: {e}"))
-        })?;
-
-        // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the STREAM
-        //    nonce's per-epoch counter_be must never wrap. A given
-        //    (stream_id, epoch) holds at most MAX_CHUNKS_PER_EPOCH chunks;
-        //    past that the producer MUST roll the epoch. Checked in-tx so
-        //    a concurrent append can't slip past the cap.
-        let epoch_chunk_count: i64 = tx
-            .query_one(
-                "SELECT COUNT(*) FROM cirislens.federation_stream_chunks \
-                  WHERE stream_id = $1 AND epoch = $2",
-                &[&stream_id, &epoch_i64],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk epoch count: {e}"))
-            })?
-            .get(0);
-        if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "put_blob_chunk: (stream_id={stream_id}, epoch={epoch}) is at \
-                 MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch (STREAM-nonce counter \
-                 exhaustion, CEG §10.5.3)",
-                crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
-            )));
-        }
-
-        // 3. The stream-index row. The (stream_id, seq) PK enforces
-        //    monotonicity — a re-used seq is a PK conflict, mapped to
-        //    InvalidArgument (NOT idempotent: the append-only rule).
-        //    V142: the chunk's PLAINTEXT size beside its stored size.
-        let inserted = tx
-            .execute(
-                "INSERT INTO cirislens.federation_stream_chunks (\
-                    stream_id, seq, chunk_sha, epoch, size_bytes, plaintext_size_bytes\
-                 ) VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (stream_id, seq) DO NOTHING",
-                &[
-                    &stream_id,
-                    &seq_i64,
-                    &sha_vec,
-                    &epoch_i64,
-                    &row.size_bytes,
-                    &plaintext_i64,
-                ],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("put_blob_chunk index insert: {e}"))
+        let ctx = PgChunkTx {
+            stream_id,
+            epoch_i64,
+            scope: &scope,
+            tier: &tier,
+            owner_key_id: claim.owner_key_id.as_deref(),
+            binding: binding.as_ref(),
+            bind_as_declared,
+        };
+        let mut landed = false;
+        for (slot, row) in &ready {
+            let sp = tx.savepoint("chunk_item").await.map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk savepoint: {e}"))
             })?;
-        if inserted == 0 {
-            // PK conflict on (stream_id, seq) — monotonicity violation.
-            // Roll back the whole txn (the blob row too, if it was new).
-            return Err(crate::federation::BlobError::InvalidArgument(format!(
-                "stream {stream_id} seq {seq} already exists"
-            )));
-        }
-
-        // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS TRANSACTION,
-        //    conditional on the epoch still being the community's current
-        //    enabled one. Refused ⇒ the whole append rolls back.
-        if let Some(b) = &binding {
-            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-            // #846 (§3) — an ADOPT records the binding as the author's fact,
-            // with no key-state precondition; a WRITE binds the current
-            // enabled epoch (I17).
-            // #848 — every chunk binds `(community, minter, epoch)`.
-            let bind_sql = if bind_as_declared {
-                "INSERT INTO cirislens.federation_community_blob_epoch \
-                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (at_rest_sha256) DO NOTHING"
-            } else {
-                "INSERT INTO cirislens.federation_community_blob_epoch \
-                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                 SELECT $1, $2, $3, $4 \
-                  WHERE EXISTS (SELECT 1 FROM cirislens.federation_community_dek \
-                                 WHERE community_key_id = $2 AND minter_key_id = $3 AND epoch = $4 \
-                                   AND key_state = 'enabled') \
-                    AND $4 = COALESCE((SELECT epoch FROM cirislens.federation_community_dek_epoch \
-                                        WHERE community_key_id = $2 AND minter_key_id = $3), 0) \
-                 ON CONFLICT (at_rest_sha256) DO NOTHING"
+            let got = pg_append_chunk_item(&sp, &ctx, row).await?;
+            let answer = match got {
+                PgItemAppended::Ok => {
+                    sp.commit().await.map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "put_blob_chunk release: {e}"
+                        ))
+                    })?;
+                    landed = true;
+                    Ok(row.sha256)
+                }
+                refused => {
+                    // No blob row, no index row, no counter step, no binding.
+                    sp.rollback().await.map_err(|e| {
+                        crate::federation::BlobError::Backend(format!(
+                            "put_blob_chunk rollback to savepoint: {e}"
+                        ))
+                    })?;
+                    Err(match refused {
+                        PgItemAppended::SeqConflict => {
+                            crate::federation::BlobError::InvalidArgument(format!(
+                                "stream {stream_id} seq {} already exists",
+                                row.seq
+                            ))
+                        }
+                        PgItemAppended::CapReached => {
+                            crate::federation::blobs::epoch_cap_refusal(stream_id, epoch)
+                        }
+                        PgItemAppended::EpochMoved => {
+                            let b = binding
+                                .as_ref()
+                                .expect("EpochMoved only arises with a binding");
+                            crate::federation::BlobError::EpochNotCurrent {
+                                community_key_id: b.community_key_id.clone(),
+                                epoch: b.epoch,
+                            }
+                        }
+                        PgItemAppended::Ok => unreachable!("handled above"),
+                    })
+                }
             };
-            let n = tx
-                .execute(
-                    bind_sql,
-                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind: {e}"))
-                })?;
-            let already_row = tx
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM cirislens.federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = $1 AND community_key_id = $2 \
-                                      AND minter_key_id = $3 AND epoch = $4) AS b",
-                    &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
-                )
-                .await
-                .map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("put_blob_chunk bind check: {e}"))
-                })?;
-            let already: bool =
-                already_row.safe_get_with("b", crate::federation::BlobError::Backend)?;
-            if n == 0 && !already {
-                let _ = tx.rollback().await;
-                return Err(crate::federation::BlobError::EpochNotCurrent {
-                    community_key_id: b.community_key_id.clone(),
-                    epoch: b.epoch,
-                });
-            }
+            results[*slot] = Some(answer);
         }
 
-        tx.commit().await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
-        })?;
-        Ok(row.sha256)
+        // Nothing landed ⇒ nothing is written, the stream row either: a
+        // refused first append does not claim the stream.
+        if landed {
+            tx.commit().await.map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_blob_chunk commit: {e}"))
+            })?;
+        } else {
+            let _ = tx.rollback().await;
+        }
+        Ok(results
+            .into_iter()
+            .map(|r| r.expect("every slot answered"))
+            .collect())
     }
 
     /// v3.4.0 (CIRISPersist#123) — fetch the next `limit` eviction
@@ -44473,6 +44685,12 @@ mod tests {
                 &[&stream],
             )
             .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_epoch_counts WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
         for sha in &shas {
             let _ = backend.delete_blob(sha).await;
         }
@@ -44732,6 +44950,12 @@ mod tests {
         let _ = client
             .execute(
                 "DELETE FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                &[&stream],
+            )
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_stream_epoch_counts WHERE stream_id = $1",
                 &[&stream],
             )
             .await;
