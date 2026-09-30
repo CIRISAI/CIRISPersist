@@ -2195,6 +2195,11 @@ fn cohort_standing_core(
     if row.attested_key_id != producer && resolve(&row.attested_key_id) != producer_identity {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
     }
+    // v52.0.0 (CIRISPersist#955) — AV-84's one exception: a membership
+    // proposal names its invitee (exactly one) in `subject_key_ids`.
+    if super::membership_acceptance::is_invitee_subject_list(row) {
+        return Ok(());
+    }
     if let Some(foreign) = row
         .subject_key_ids
         .iter()
@@ -2258,6 +2263,11 @@ pub async fn check_cohort_standing_resolved(
             != producer_identity
     {
         return refuse(CohortStandingRefusal::AttestedParty, &row.attested_key_id);
+    }
+    // v52.0.0 (CIRISPersist#955) — see `cohort_standing_core`: a proposal
+    // names its one invitee.
+    if super::membership_acceptance::is_invitee_subject_list(row) {
+        return Ok(());
     }
     for subject in &row.subject_key_ids {
         if subject.as_str() != producer

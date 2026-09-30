@@ -3499,6 +3499,7 @@ impl Engine {
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
             supersede_proof: None,
+            cosignatures: Vec::new(),
         };
         match &self.backend {
             #[cfg(feature = "postgres")]
@@ -5484,6 +5485,62 @@ impl Engine {
                 .await
             }
         }
+    }
+
+    /// v52.0.0 (CIRISPersist#955) — **invite `invitee` into `group`**: emit a
+    /// `membership:proposal:v1` row under this engine's signer (the inviter;
+    /// a founder under `founder_only`, any member otherwise), placed at the
+    /// group (`scope` = `family` or `community`), naming the invitee and the
+    /// offered `role`, live until `expires_at` (at most 30 days out). Returns
+    /// the proposal's attestation id — what the invitee's reply references.
+    /// The group's quorum is NOT asked here: it signs the widening that
+    /// admits the member once they accept.
+    pub async fn propose_membership(
+        &self,
+        scope: &str,
+        group_key_id: &str,
+        invitee_key_id: &str,
+        role: Option<&str>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<String, crate::federation::Error> {
+        self.emit_attestation_self(crate::federation::membership_acceptance::proposal_input(
+            scope,
+            group_key_id,
+            invitee_key_id,
+            role,
+            expires_at,
+        ))
+        .await
+    }
+
+    /// v52.0.0 (CIRISPersist#955) — **accept (`accept = true`) or decline a
+    /// held membership proposal** under this engine's signer, which must act
+    /// for the proposal's invitee (the invitee's own key, or a node/device
+    /// bound to them). The reply binds the proposal's id, content hash and
+    /// role. A decline is final for that proposal. Returns the reply's
+    /// attestation id.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reply_to_membership_proposal(
+        &self,
+        proposal_attestation_id: &str,
+        accept: bool,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::FederationDirectory;
+        let proposal = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.get_attestation(proposal_attestation_id).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.get_attestation(proposal_attestation_id).await?,
+        }
+        .ok_or_else(|| crate::federation::Error::MembershipAcceptanceRefused {
+            group_key_id: String::new(),
+            member_key_id: String::new(),
+            rule: crate::federation::membership_acceptance::RULE_PROPOSAL_UNRESOLVED,
+        })?;
+        self.emit_attestation_self(crate::federation::membership_acceptance::reply_input(
+            &proposal, accept,
+        ))
+        .await
     }
 
     /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
@@ -10984,6 +11041,7 @@ mod tests {
             scrub_signature_classical: "AA==".into(),
             scrub_signature_pqc: None,
             supersede_proof: None,
+            cosignatures: Vec::new(),
         };
         let err = dir
             .put_family(squat)

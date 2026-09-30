@@ -133,6 +133,11 @@ pub mod group_amendment_invariants;
 /// v49.0.0 (CIRISPersist#912) — I183: the membership listing plane.
 #[cfg(test)]
 pub mod listing_invariants;
+/// v52.0.0 (CIRISPersist#955) — the joiner's signed acceptance.
+pub mod membership_acceptance;
+/// v52.0.0 (CIRISPersist#955) — I210–I219.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod membership_acceptance_invariants;
 /// v49.0.0 (CIRISPersist#908) — the moderation walk read at an instant, in one room.
 #[cfg(test)]
 pub mod moderation_walk_asof_invariants;
@@ -1846,6 +1851,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn check_roster_authority_over<F>(
     directory: &F,
+    scope: &'static str,
     group_key_id: &str,
     record_members: &[types::CommunityMember],
     rules: RosterRules<'_>,
@@ -1901,7 +1907,23 @@ where
             offered_authority_key_id: primary.to_owned(),
             rule,
         }
-    })
+    })?;
+    // v52.0.0 (CIRISPersist#955) — a GROWTH (a key not active before this
+    // instant) needs the member's own acceptance, under every protocol. The
+    // group's standing above is its decision; this is the member's consent.
+    // A role change of an active member is not a growth.
+    if !is_revocation && !matches!(state.get(&e.member.key_id), Some((true, _))) {
+        membership_acceptance::check_growth_accepted(
+            directory,
+            scope,
+            group_key_id,
+            &e.member.key_id,
+            e.member.role.as_deref(),
+            effective_at,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// v49.0.0 (CIRISPersist#908, FSD §4) — the door's standing check for one
@@ -1948,6 +1970,7 @@ where
     );
     Box::pin(check_roster_authority_over(
         directory,
+        types::cohort_scope::COMMUNITY,
         community_key_id,
         &community.members,
         RosterRules::of_community(&community, &nodes),
@@ -1990,6 +2013,7 @@ where
         .collect();
     Box::pin(check_roster_authority_over(
         directory,
+        types::cohort_scope::FAMILY,
         family_key_id,
         &record,
         RosterRules::of_family(&family),
@@ -9146,6 +9170,29 @@ pub enum Error {
         rule: &'static str,
     },
 
+    /// v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — a roster change or
+    /// membership reply refused because the member's own signed consent is
+    /// missing or does not hold: no acceptance of a live proposal
+    /// (`membership_acceptance_unresolved`, RETRYABLE), a reply ahead of its
+    /// proposal (`membership_proposal_unresolved`, RETRYABLE), a decline, an
+    /// expired or withdrawn proposal, a mismatch, both replies, a founding
+    /// member who did not sign, or a supersede that adds. Stable `kind()`
+    /// token `federation_membership_acceptance_refused`; `rule` is one of the
+    /// `membership_acceptance::RULE_*` tokens.
+    #[error(
+        "membership of {member_key_id:?} in group {group_key_id:?} refused ({rule}): nobody \
+         joins a family or community without their own signed acceptance \
+         (CIRISPersist#955)"
+    )]
+    MembershipAcceptanceRefused {
+        /// The family or community.
+        group_key_id: String,
+        /// The member whose consent is missing.
+        member_key_id: String,
+        /// Which clause refused.
+        rule: &'static str,
+    },
+
     /// v50.0.0 (CIRISPersist#916, FSD `SECOND_DEVICE.md` §3) — the re-wrap of a
     /// member's community DEK epochs to a new device was refused. Nothing is
     /// granted. Authority is the member's owner-binding over the device, never
@@ -10697,6 +10744,7 @@ impl Error {
                 "federation_location_authority_unauthorized"
             }
             Error::RosterAuthorityUnauthorized { .. } => "federation_roster_authority_unauthorized",
+            Error::MembershipAcceptanceRefused { .. } => "federation_membership_acceptance_refused",
             Error::DeviceRekeyRefused { .. } => "federation_device_rekey_refused",
             Error::MembershipListingRefused { .. } => "federation_membership_listing_refused",
             Error::AccordDimensionRequiresAccordHolder { .. } => {

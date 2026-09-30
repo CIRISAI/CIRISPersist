@@ -4804,17 +4804,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // membership). Runs AFTER the closed-set value validation in tier
         // 1 and BEFORE persist_row_hash + INSERT: a refused row leaves no
         // trace (verify-then-gate-then-persist, MISSION §1.6).
-        crate::federation::FederationDirectory::check_write_cohort_scope_for(
+        // v52.0.0 (CIRISPersist#955) — AV-45 plus the two membership arms (a
+        // proposal reaching its invitee, a reply at a group its signer is not in).
+        crate::federation::membership_acceptance::check_attestation_write_scope(
             self,
-            &row.attesting_key_id,
+            &row,
             "put_attestation",
-            &row.cohort_scope,
-            // v38.2.0 (#757) — the target the producer SIGNED into the
-            // envelope. Was hardcoded `None`, which made AV-45 refuse every
-            // family/community placement and left an owner-signed community
-            // row inexpressible (promotion, the only other door, re-seals
-            // with this node's key).
-            crate::federation::admission::envelope_cohort_target(&row.attestation_envelope)?,
         )
         .await?;
 
@@ -6863,8 +6858,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             scrub_signature_classical,
             scrub_signature_pqc,
             supersede_proof,
+            cosignatures,
         } = family;
         let supersede_proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+        // v52.0.0 (#955, V162) — the founding members' consent travels with the
+        // authority signature it sits beside.
+        let cosignatures_json = serde_json::to_string(&cosignatures)
+            .map_err(|e| crate::federation::Error::Backend(format!("cosignatures encode: {e}")))?;
         let family_key_id = row.family_key_id.clone();
         self.put_family_local(row).await?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
@@ -6887,7 +6887,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             conn.execute(
                 "UPDATE federation_families \
                     SET authority_key_id = ?2, scrub_signature_classical = ?3, \
-                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6 \
+                        scrub_signature_pqc = ?4, admitted_at = ?5, supersede_proof = ?6, \
+                        cosignatures = ?7 \
                   WHERE family_key_id = ?1",
                 rusqlite::params![
                     family_key_id_for_db,
@@ -6898,6 +6899,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     // v49.0.0 (#910.5) — a first copy of an amended version
                     // keeps its proof, so the next peer can apply it.
                     supersede_proof_json,
+                    cosignatures_json,
                 ],
             )?;
             Ok(())
@@ -7027,10 +7029,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_classical,
                     scrub_signature_pqc,
                     supersede_proof,
+                    cosignatures,
                 } = serde_json::from_value(new_snapshot).map_err(|e| {
                     Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
                 })?;
                 let proof_json = sqlite_supersede_proof_json(supersede_proof.as_ref())?;
+                let cosignatures_json = serde_json::to_string(&cosignatures)
+                    .map_err(|e| Error::Backend(format!("cosignatures encode: {e}")))?;
                 let stale = stale.clone();
                 new_fam.persist_row_hash =
                     crate::federation::types::compute_persist_row_hash(&new_fam)?;
@@ -7098,7 +7103,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
                             scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13 \
+                            supersede_proof = ?13, cosignatures = ?14 \
                          WHERE family_key_id = ?1",
                         rusqlite::params![
                             new_fam.family_key_id,
@@ -7118,6 +7123,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             scrub_signature_pqc,
                             admitted_at.to_rfc3339(),
                             proof_json,
+                            cosignatures_json,
                         ],
                     )?;
                     tx.commit()?;
@@ -21514,6 +21520,8 @@ fn sqlite_row_to_signed_family(
     let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
     let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
     let supersede_proof = sqlite_supersede_proof(row)?;
+    // v52.0.0 (#955, V162) — the founding co-signatures, same codec.
+    let cosignatures = sqlite_roster_cosignatures(row)?;
     let family = sqlite_row_to_family(row)?;
     Ok(crate::federation::SignedFamily {
         family,
@@ -21521,6 +21529,7 @@ fn sqlite_row_to_signed_family(
         scrub_signature_classical,
         scrub_signature_pqc,
         supersede_proof,
+        cosignatures,
     })
 }
 

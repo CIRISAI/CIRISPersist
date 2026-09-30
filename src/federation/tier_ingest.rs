@@ -378,15 +378,25 @@ where
             attesting_key_id: signed.authority_key_id.clone(),
         });
     }
+    let envelope = signed.family.signing_envelope();
     verify_envelope_hybrid_signature(
         directory,
         &signed.authority_key_id,
-        &signed.family.signing_envelope(),
+        &envelope,
         &signed.scrub_signature_classical,
         signed.scrub_signature_pqc.as_deref(),
     )
+    .await?;
+    // v52.0.0 (CIRISPersist#955, Q1) — a founding member's consent is their
+    // co-signature; one that does not verify is refused, never counted.
+    verify_roster_cosignatures(
+        directory,
+        "family",
+        &signed.authority_key_id,
+        &envelope,
+        &signed.cosignatures,
+    )
     .await
-    .map(|_| ())
 }
 
 /// v38.5.0 (CIRISPersist#771) — **the attestation twin of
@@ -1559,6 +1569,7 @@ pub mod test_support {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
+            cosignatures: Vec::new(),
         }
     }
 

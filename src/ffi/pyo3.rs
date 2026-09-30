@@ -11510,6 +11510,7 @@ impl PyEngine {
                                 scrub_signature_classical,
                                 scrub_signature_pqc,
                                 supersede_proof: None,
+                                cosignatures: Vec::new(),
                             })
                             .await
                             .map_err(federation_err_to_py)
@@ -24546,6 +24547,7 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
             }),
             _ => None,
         };
@@ -24844,6 +24846,7 @@ impl PyEngine {
                 scrub_signature_classical: String::new(),
                 scrub_signature_pqc: None,
                 supersede_proof: None,
+                cosignatures: Vec::new(),
             }),
             _ => None,
         };
@@ -33778,6 +33781,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v49.0.0 (#908) — the same standing-not-signature refusal as #734;
         // `roster_authority_not_established` is the retryable rule.
         crate::federation::Error::RosterAuthorityUnauthorized { rule, .. } => {
+            PyValueError::new_err(rule_refusal_message(kind, rule))
+        }
+        // v52.0.0 (#955) — the member's consent is missing or does not hold;
+        // the sibling standing refusal's type, `membership_*_unresolved` retryable.
+        crate::federation::Error::MembershipAcceptanceRefused { rule, .. } => {
             PyValueError::new_err(rule_refusal_message(kind, rule))
         }
         // v50.0.0 (#916) — a device re-wrap refused on the owner-binding, the

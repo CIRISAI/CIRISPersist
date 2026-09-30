@@ -171,6 +171,8 @@ where
 {
     let f = &family.family;
     let Some(stored) = dir.lookup_family(&f.family_key_id).await? else {
+        // v52.0.0 (#955, Q1) — a founding record admits only its signers.
+        check_family_founding(dir, family).await?;
         return Ok(OccupiedRoute::Insert);
     };
     let offer = Offer {
@@ -211,6 +213,8 @@ where
 {
     let c = &community.community;
     let Some(stored) = dir.lookup_community(&c.community_key_id).await? else {
+        // v52.0.0 (#955, Q1) — a founding record admits only its signers.
+        check_community_founding(dir, community).await?;
         return Ok(OccupiedRoute::Insert);
     };
     // v50.0.0 (CIRISPersist#926 re-check, HIGH-A) — a trust-root row is
@@ -224,7 +228,10 @@ where
         let applied =
             super::canonical_community::apply_trust_root_chain_counted(dir, community).await;
         return match lost_race(dir, &c.community_key_id, &offered_hash, applied).await? {
-            None => Ok(OccupiedRoute::Insert),
+            None => {
+                check_community_founding(dir, community).await?;
+                Ok(OccupiedRoute::Insert)
+            }
             Some(0) => Ok(OccupiedRoute::Settled(CommunityWrite::Unchanged)),
             Some(_) => Ok(OccupiedRoute::Settled(CommunityWrite::Superseded)),
         };
@@ -258,6 +265,64 @@ where
             _ => OccupiedRoute::Settled(CommunityWrite::Superseded),
         },
     )
+}
+
+/// v52.0.0 (CIRISPersist#955, Q1) — a founding family admits only the members
+/// who signed it (its authority or a co-signer).
+async fn check_family_founding<F>(dir: &F, family: &SignedFamily) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let signers: Vec<&str> = std::iter::once(family.authority_key_id.as_str())
+        .chain(
+            family
+                .cosignatures
+                .iter()
+                .map(|c| c.authority_key_id.as_str()),
+        )
+        .collect();
+    let members: Vec<&str> = family
+        .family
+        .members
+        .iter()
+        .map(|m| m.key_id.as_str())
+        .collect();
+    super::membership_acceptance::check_founding_signers(
+        dir,
+        &family.family.family_key_id,
+        &members,
+        &signers,
+    )
+    .await
+}
+
+/// v52.0.0 (CIRISPersist#955, Q1) — the community twin of
+/// [`check_family_founding`].
+async fn check_community_founding<F>(dir: &F, community: &SignedCommunity) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let signers: Vec<&str> = std::iter::once(community.authority_key_id.as_str())
+        .chain(
+            community
+                .cosignatures
+                .iter()
+                .map(|c| c.authority_key_id.as_str()),
+        )
+        .collect();
+    let members: Vec<&str> = community
+        .community
+        .members
+        .iter()
+        .map(|m| m.key_id.as_str())
+        .collect();
+    super::membership_acceptance::check_founding_signers(
+        dir,
+        &community.community.community_key_id,
+        &members,
+        &signers,
+    )
+    .await
 }
 
 /// PR #921 review (Codex F3) — a supersede that lost its race. The
@@ -321,6 +386,18 @@ where
         &offer.member_key_ids,
         offer.consensus_protocol,
         &proof.change_envelope,
+    )?;
+    // v52.0.0 (#955, Q2) — an amendment never adds; joining is proposal →
+    // acceptance → widening, which carries the signed instant expiry needs.
+    super::membership_acceptance::check_supersede_adds_no_member(
+        offer.group_key_id,
+        &offer.member_key_ids.iter().copied().collect::<Vec<_>>(),
+        &super::membership_acceptance::supersede_allowed_members(
+            dir,
+            offer.cohort,
+            offer.group_key_id,
+        )
+        .await?,
     )?;
     dir.verify_membership_quorum(
         offer.cohort,
@@ -433,6 +510,21 @@ where
 {
     super::check_consensus_protocol_form(&new.family.consensus_protocol)?;
     super::verify_family_admission(dir, &new).await?;
+    // v52.0.0 (#955, Q2) — an amendment never adds a member.
+    super::membership_acceptance::check_supersede_adds_no_member(
+        &new.family.family_key_id,
+        &new.family
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect::<Vec<_>>(),
+        &super::membership_acceptance::supersede_allowed_members(
+            dir,
+            Cohort::Family,
+            &new.family.family_key_id,
+        )
+        .await?,
+    )?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
     // the signature that authorizes it travel together, because the way they
     // go stale is by being able to move apart (#651).
@@ -460,6 +552,21 @@ where
 {
     super::check_consensus_protocol_form(&new.community.consensus_protocol)?;
     super::verify_community_admission(dir, &new).await?;
+    // v52.0.0 (#955, Q2) — an amendment never adds a member.
+    super::membership_acceptance::check_supersede_adds_no_member(
+        &new.community.community_key_id,
+        &new.community
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect::<Vec<_>>(),
+        &super::membership_acceptance::supersede_allowed_members(
+            dir,
+            cohort,
+            &new.community.community_key_id,
+        )
+        .await?,
+    )?;
     // v50.0.0 (CIRISPersist#925/#927, CC 3.2) — the supersede is gated as the
     // record it replaces was: an infrastructure record stays quorum:M/N with
     // no node-bearing founder.

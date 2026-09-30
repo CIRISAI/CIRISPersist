@@ -1,0 +1,15 @@
+-- V162 — a family row's founding co-signatures
+-- v52.0.0 (CIRISPersist#955, FSD MEMBERSHIP_ACCEPTANCE.md §9 Q1)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V162__family_cosignatures.sql
+--
+-- Operator ruling (2026-09-30): nobody joins a family without their own signed
+-- consent, and a founding-roster member's consent is their signature on the
+-- founding record. A family row carried ONE authority signature (a community
+-- row gained co-signatures in V158), so the founding members' consent had
+-- nowhere to live. `cosignatures` is a JSON array of
+-- `{authority_key_id, scrub_signature_classical, scrub_signature_pqc}` over the
+-- SAME signing envelope the authority signed, `'[]'` for every existing and
+-- every single-signed row, and it is served beside the authority signature so
+-- a peer re-derives which founding members consented.
+ALTER TABLE federation_families ADD COLUMN cosignatures TEXT NOT NULL DEFAULT '[]';
