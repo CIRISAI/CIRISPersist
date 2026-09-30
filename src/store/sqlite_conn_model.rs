@@ -490,6 +490,14 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
         "list_identity_occurrences_by_occurrence_key",
         ConnClass::Read,
     ),
+    // v52.0.0 (#930) — the V161 append, a free fn over the writer's
+    // transaction, called from both occurrence doors.
+    ("sqlite_append_occurrence_history", ConnClass::HelperWrite),
+    // v52.0.0 (#930) — the occurrence history (V161), read by the node-bearing fold.
+    (
+        "list_identity_occurrence_history_by_occurrence",
+        ConnClass::Read,
+    ),
     ("lookup_keys_for_identity", ConnClass::Read),
     ("lookup_public_key", ConnClass::Read),
     ("lookup_role_withdrawal", ConnClass::Read),

@@ -3474,7 +3474,8 @@ fn pg_row_to_transport_destination(
         transport_x25519_pubkey_base64: row.safe_get_with(6, FErr::Backend)?,
         binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
             provenance_token.as_deref(),
-        ),
+        )
+        .map_err(|e| FErr::Backend(e.to_string()))?,
         epoch,
         retired_at: row.safe_get_with(9, FErr::Backend)?,
     })
@@ -7614,9 +7615,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await?;
         // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
         // stale/equal replay is a safe no-op (poisoned/older row can't win).
-        let occurrence_applied = client
-            .execute(
-                "INSERT INTO cirislens.federation_identity_occurrences (\
+        // v52.0.0 (#930) — ONE statement: the current-state upsert, and the
+        // assertion appended to the V161 history whether or not the upsert
+        // took it (an older verified assertion still bounded a binding).
+        let occurrence_applied: i64 = client
+            .query_one(
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id, signed_envelope, signature\
+                    ) VALUES ($1, $2, $5, $6, $10, $11, $12) ON CONFLICT DO NOTHING\
+                 ), up AS (\
+                 INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
                     pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
@@ -7636,7 +7646,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     signature = EXCLUDED.signature, \
                     transport_binding = EXCLUDED.transport_binding, \
                     admitted_at = EXCLUDED.admitted_at \
-                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at",
+                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at \
+                 RETURNING 1) SELECT COUNT(*) FROM up",
                 &[
                     &row.identity_key_id,
                     &row.occurrence_key_id,
@@ -7655,6 +7666,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ],
             )
             .await
+            .and_then(|r| r.try_get::<_, i64>(0))
             .map_err(|e| {
                 let msg = e.to_string();
                 if msg.contains("foreign key") {
@@ -7735,9 +7747,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let admitted_at = self
             .next_plane_position(&client, "federation_identity_occurrences")
             .await?;
+        // v52.0.0 (#930) — ONE statement: the upsert and the history row (a
+        // trusted-local assertion bounds an interval; it is never agreement).
         client
             .execute(
-                "INSERT INTO cirislens.federation_identity_occurrences (\
+                "WITH hist AS (\
+                    INSERT INTO cirislens.federation_identity_occurrence_history (\
+                        identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                        attesting_key_id\
+                    ) VALUES ($1, $2, $5, $6, '') ON CONFLICT DO NOTHING\
+                 ) \
+                 INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
                     pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
@@ -7873,6 +7893,49 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter()
             .map(pg_row_to_identity_occurrence)
             .collect()
+    }
+
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::OccurrenceAssertion>, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks
+            .fail_if_armed("list_identity_occurrence_history_by_occurrence")?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, asserted_at, valid_until, \
+                    attesting_key_id \
+                 FROM cirislens.federation_identity_occurrence_history \
+                 WHERE occurrence_key_id = $1",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_identity_occurrence_history_by_occurrence: {e}"
+                ))
+            })?;
+        let mk = crate::federation::Error::Backend;
+        let mut out = rows
+            .iter()
+            .map(|r| {
+                let attesting: String = r.safe_get_with("attesting_key_id", mk)?;
+                Ok(crate::federation::OccurrenceAssertion {
+                    identity_key_id: r.safe_get_with("identity_key_id", mk)?,
+                    occurrence_key_id: r.safe_get_with("occurrence_key_id", mk)?,
+                    asserted_at: r.safe_get_with("asserted_at", mk)?,
+                    valid_until: r.safe_get_with("valid_until", mk)?,
+                    attesting_key_id: (!attesting.is_empty()).then_some(attesting),
+                })
+            })
+            .collect::<Result<Vec<_>, crate::federation::Error>>()?;
+        crate::federation::sort_occurrence_history(&mut out);
+        Ok(out)
     }
 
     async fn lookup_identity_for_occurrence(

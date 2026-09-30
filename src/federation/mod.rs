@@ -140,6 +140,9 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
+#[cfg(test)]
+pub(crate) mod occurrence_history_invariants;
 /// v50.0.0 (CIRISPersist#925/#927/#928) — the CC rc5 adopts, every backend.
 #[cfg(test)]
 pub mod rc5_adopts_invariants;
@@ -628,6 +631,7 @@ pub use topology::{
     FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology, WithdrawalEntry,
     DEFAULT_DELEGATION_DEPTH, MAX_DELEGATION_DEPTH,
 };
+pub use types::OccurrenceAssertion;
 pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, AttestationReseal, Community, CommunityMember, CommunityMembershipRevocation,
@@ -653,6 +657,20 @@ pub use types::{
     FamilyMembershipWidening, ServedFamilyMembershipWidening, SignedFamilyMembershipWidening,
 };
 pub use types::{GroupSupersedeProof, RosterCosignature, RosterEventSigner};
+
+/// v52.0.0 (CIRISPersist#930) — the ONE order every backend returns the
+/// occurrence history in: `(asserted_at, identity_key_id, attesting_key_id)`
+/// ascending, a trusted-local row (`None`) first among equals. Sorted on the
+/// parsed instant, never on a stored text spelling.
+pub fn sort_occurrence_history(rows: &mut [OccurrenceAssertion]) {
+    rows.sort_by(|a, b| {
+        (a.asserted_at, &a.identity_key_id, &a.attesting_key_id).cmp(&(
+            b.asserted_at,
+            &b.identity_key_id,
+            &b.attesting_key_id,
+        ))
+    });
+}
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
 /// revocations** fold, shared by every "currently-active membership"
@@ -954,25 +972,27 @@ where
 /// v50.0.0 (CIRISPersist#925, review H1 + item 5) — `key_id`'s own `node`
 /// bearing and the intervals it is an agreed occurrence of a `node` identity.
 ///
-/// # Agreement (review H1)
+/// # Agreement (review H1; an instant since v52.0.0, #930)
 ///
 /// An occurrence row is admitted when its signer is the IDENTITY itself
 /// (`check_signer_acts_for`), so the occurrence never has to consent: any
 /// registered `node` key N could sign `{identity: N, occurrence: H}` for a
-/// human founder H and strip H's vote. So a binding counts only when the
-/// occurrence itself signed its binding ([`occurrence_agreed_to`]). A trusted-local
-/// (unsigned) row carries no agreement. #873's principal resolver
-/// ([`FederationDirectory::active_identities_for_occurrence`]) has the same
-/// unilateral-claim shape and is a follow-up (FSD `SECOND_DEVICE.md` §8.5).
+/// human founder H and strip H's vote. So a binding counts only from the
+/// instant the occurrence itself first signed an assertion of it
+/// ([`occurrence_agreed_from`]). A trusted-local (unsigned) row carries no
+/// agreement.
 ///
-/// # The interval (review item 5)
+/// # The intervals (review item 5; every assertion since v52.0.0, #930)
 ///
-/// Every stored binding of `key_id` under a `node` identity it agreed to
-/// contributes `[asserted_at, end)`, `end` the earliest of its `valid_until`
-/// and the `effective_at` of any revocation of it that is in force against
-/// this assertion (`effective_at >= asserted_at`, the #421 re-establishment
-/// rule). The occurrence plane stores the LATEST assertion per pair, so a
-/// re-assertion moves the start forward; see FSD §8.5 for that residual.
+/// Every admitted assertion of `key_id` under a `node` identity it agreed to
+/// (the V161 history, [`FederationDirectory::list_identity_occurrence_history_by_occurrence`])
+/// contributes `[max(asserted_at, agreed_from), end)`, `end` the earliest of
+/// its `valid_until` and the `effective_at` of any revocation of it in force
+/// against that assertion (`effective_at >= asserted_at`, the #421
+/// re-establishment rule). The intervals union. Before V161 the plane kept only
+/// the latest assertion, so a renewal moved the start forward and an identity
+/// re-signing erased the occurrence's agreement, changing earlier verdicts
+/// after the fact (FSD `SECOND_DEVICE.md` §8.5).
 pub async fn node_bearing_of<F>(
     directory: &F,
     key_id: &str,
@@ -990,41 +1010,96 @@ where
     {
         return Ok((true, Vec::new()));
     }
+    let history = directory
+        .list_identity_occurrence_history_by_occurrence(key_id)
+        .await?;
+    let identities: std::collections::BTreeSet<&str> = history
+        .iter()
+        .map(|a| a.identity_key_id.as_str())
+        .filter(|i| *i != key_id)
+        .collect();
     let mut intervals = Vec::new();
-    for row in directory
-        .list_identity_occurrences_by_occurrence_key(key_id)
-        .await?
-    {
-        if row.identity_key_id == key_id {
-            continue;
-        }
+    for identity in identities {
         let node_identity = directory
-            .lookup_public_key(&row.identity_key_id)
+            .lookup_public_key(identity)
             .await?
             .is_some_and(|rec| has_node(&rec));
-        if !node_identity || !occurrence_agreed_to(directory, &row.identity_key_id, key_id).await? {
+        if !node_identity {
             continue;
         }
-        let revoked = directory
-            .list_identity_occurrence_revocations_for(&row.identity_key_id)
+        let Some(agreed_from) = agreed_from_in(&history, identity, key_id) else {
+            continue;
+        };
+        let revocations: Vec<chrono::DateTime<chrono::Utc>> = directory
+            .list_identity_occurrence_revocations_for(identity)
             .await?
             .into_iter()
-            .filter(|r| r.occurrence_key_id == key_id && r.effective_at >= row.asserted_at)
+            .filter(|r| r.occurrence_key_id == key_id)
             .map(|r| r.effective_at)
-            .min();
-        let end = match (revoked, row.valid_until) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        intervals.push((row.asserted_at, end));
+            .collect();
+        for a in history.iter().filter(|a| a.identity_key_id == identity) {
+            let revoked = revocations
+                .iter()
+                .filter(|e| **e >= a.asserted_at)
+                .min()
+                .copied();
+            let end = match (revoked, a.valid_until) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            };
+            let start = a.asserted_at.max(agreed_from);
+            if end.is_some_and(|e| e <= start) {
+                continue;
+            }
+            intervals.push((start, end));
+        }
     }
     Ok((false, intervals))
 }
 
-/// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself agree to be
-/// an occurrence of `identity`? Yes only when a stored SIGNED occurrence row for
-/// the pair was signed by `occurrence`. An identity's unilateral claim over a
-/// key is not agreement.
+/// The earliest instant `occurrence` itself signed an assertion binding it to
+/// `identity`, in `history`.
+fn agreed_from_in(
+    history: &[types::OccurrenceAssertion],
+    identity: &str,
+    occurrence: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    history
+        .iter()
+        .filter(|a| {
+            a.identity_key_id == identity
+                && a.occurrence_key_id == occurrence
+                && a.attesting_key_id.as_deref() == Some(occurrence)
+        })
+        .map(|a| a.asserted_at)
+        .min()
+}
+
+/// v52.0.0 (CIRISPersist#930) — the instant `occurrence` itself first agreed
+/// to be an occurrence of `identity`: the earliest admitted assertion of the
+/// pair that `occurrence` signed. `None` when it never did. An identity's
+/// unilateral claim over a key is not agreement, and a later re-signing by the
+/// identity does not erase it (the V161 history keeps every assertion).
+pub async fn occurrence_agreed_from<F>(
+    directory: &F,
+    identity: &str,
+    occurrence: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // v50.0.0 (review, final check) — no owner-binding arm. An owner-binding
+    // is signed by the OWNER over the key, so it is the identity's own claim
+    // again; it could only fire for a pre-gate fused identity, where it would
+    // be unilateral exactly as H1's row is.
+    let history = directory
+        .list_identity_occurrence_history_by_occurrence(occurrence)
+        .await?;
+    Ok(agreed_from_in(&history, identity, occurrence))
+}
+
+/// v50.0.0 (CIRISPersist#925 review H1) — did `occurrence` itself ever agree
+/// to be an occurrence of `identity`? [`occurrence_agreed_from`] is `Some`.
 pub async fn occurrence_agreed_to<F>(
     directory: &F,
     identity: &str,
@@ -1033,19 +1108,9 @@ pub async fn occurrence_agreed_to<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let signed_by_occurrence = directory
-        .list_signed_identity_occurrences_for(identity)
+    Ok(occurrence_agreed_from(directory, identity, occurrence)
         .await?
-        .iter()
-        .any(|s| {
-            s.identity_occurrence.occurrence_key_id == occurrence
-                && s.attesting_key_id == occurrence
-        });
-    // v50.0.0 (review, final check) — no owner-binding arm. An owner-binding
-    // is signed by the OWNER over the key, so it is the identity's own claim
-    // again; it could only fire for a pre-gate fused identity, where it would
-    // be unilateral exactly as H1's row is.
-    Ok(signed_by_occurrence)
+        .is_some())
 }
 
 /// v50.0.0 (CIRISPersist#925) — the `node`-bearing keys among every key that
@@ -3993,6 +4058,18 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         occurrence_key_id: &str,
     ) -> Result<Vec<IdentityOccurrence>, Error>;
+
+    /// v52.0.0 (CIRISPersist#930) — EVERY admitted assertion binding
+    /// `occurrence_key_id`, under any identity, from the append-only history
+    /// (V161): renewals, re-signings and assertions older than the stored row
+    /// included. Ordered `(asserted_at, identity_key_id, attesting_key_id)`
+    /// ascending on every backend, a trusted-local row (`None`) first among
+    /// equals. The node-bearing fold reads this, never the current-state
+    /// row, so an earlier verdict cannot move.
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<types::OccurrenceAssertion>, Error>;
 
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns `None` if the key is

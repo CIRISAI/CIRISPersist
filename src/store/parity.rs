@@ -179,6 +179,17 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
     // row whose grant shape or granter is not admissible. A statement about the input.
     ("check_community_trust_grant_admission", Class::Gate),
+    // v52.0.0 — Gate: refuses a binding_provenance token that is neither
+    // `rooted` nor `advisory` (it read `Rooted` until v52: fail-open).
+    ("from_token", Class::Gate),
+    // v52.0.0 (CIRISPersist#930) — Plumbing: the V161 history append inside the
+    // occurrence door's transaction fails only on the substrate's own terms
+    // (it refuses nothing about the caller; the door's gates ran before it),
+    // and its failure aborts the write — fail-closed, not open.
+    ("sqlite_append_occurrence_history", Class::Plumbing),
+    // v52.0.0 (#930) — Plumbing: decoding the history's own stored instant; a
+    // malformed one refuses the read (fail-closed).
+    ("parse_history_instant", Class::Plumbing),
     // v52.0.0 (CIRISPersist#953) — Gate: refuses a chunk under a stream id
     // shaped like a SHA-256 (reserved for an inline blob's one-leaf log). A
     // statement about the caller's input.
@@ -887,6 +898,18 @@ pub(crate) const DECLARED_DIVERGENCES: &[DeclaredDivergence] = &[
                  update inside one — and memory's read is a separate `get_attestation` that locks \
                  and releases, so without the re-ask the door would gate one row and mutate \
                  another. An extra ask of a pure refusal is the safe direction of this difference.",
+    },
+    DeclaredDivergence {
+        trait_name: "FederationDirectory",
+        method: "list_signed_transport_destinations_since",
+        backend: "memory",
+        expected: &[],
+        reason: "v52.0.0 — `from_token` decodes the STORED `binding_provenance` TEXT column on \
+                 sqlite and postgres and refuses a token that is neither `rooted` nor `advisory`. \
+                 Memory stores the typed `BindingProvenance` enum and never holds a token, so \
+                 there is nothing to decode and nothing that can be malformed. The admission \
+                 door that refuses an unknown ENVELOPE token is shared by all three backends \
+                 (I279).",
     },
 ];
 

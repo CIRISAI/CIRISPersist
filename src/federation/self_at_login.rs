@@ -252,11 +252,23 @@ impl BindingProvenance {
             BindingProvenance::Advisory => "advisory",
         }
     }
-    /// Parse from the stored token; unknown/NULL ⇒ the back-compat `Rooted`.
-    pub fn from_token(s: Option<&str>) -> Self {
+    /// Parse from the stored or enveloped token. An ABSENT token (NULL, a
+    /// pre-#413 row) is the back-compat `Rooted`.
+    ///
+    /// # Errors
+    ///
+    /// v52.0.0 — a PRESENT token that is neither `"rooted"` nor `"advisory"`
+    /// refuses by name. Until v52 it read as `Rooted`, so a signed transport
+    /// destination whose envelope carried any unknown token was admitted as
+    /// authoritative (malformed is a refusal, not absence).
+    pub fn from_token(s: Option<&str>) -> Result<Self, crate::federation::Error> {
         match s {
-            Some("advisory") => BindingProvenance::Advisory,
-            _ => BindingProvenance::Rooted,
+            None | Some("rooted") => Ok(BindingProvenance::Rooted),
+            Some("advisory") => Ok(BindingProvenance::Advisory),
+            Some(other) => Err(crate::federation::Error::InvalidArgument(format!(
+                "binding_provenance token {other:?} is neither \"rooted\" nor \"advisory\" \
+                 — refused (an unknown token is malformed, never the authoritative default)"
+            ))),
         }
     }
 }
@@ -428,26 +440,32 @@ mod tests {
 
     /// v13.9.0 (CIRISPersist#413) — `BindingProvenance` back-compat: an untagged
     /// (pre-#413, NULL) row reads as `Rooted` (its authoritative-by-assumption
-    /// intent); an unknown token also fails safe to `Rooted`; tokens round-trip.
+    /// intent); tokens round-trip. **I279** (v52.0.0): an unknown PRESENT token
+    /// refuses; until v52 it read as `Rooted`, the fail-open this pins.
     #[test]
     fn binding_provenance_token_back_compat() {
         assert_eq!(BindingProvenance::default(), BindingProvenance::Rooted);
         assert_eq!(
-            BindingProvenance::from_token(None),
+            BindingProvenance::from_token(None).unwrap(),
             BindingProvenance::Rooted
         );
         assert_eq!(
-            BindingProvenance::from_token(Some("advisory")),
+            BindingProvenance::from_token(Some("advisory")).unwrap(),
             BindingProvenance::Advisory
         );
         assert_eq!(
-            BindingProvenance::from_token(Some("rooted")),
+            BindingProvenance::from_token(Some("rooted")).unwrap(),
             BindingProvenance::Rooted
         );
-        assert_eq!(
-            BindingProvenance::from_token(Some("nonsense")),
-            BindingProvenance::Rooted
-        );
+        for bad in ["nonsense", "Rooted", "ROOTED", ""] {
+            assert!(
+                matches!(
+                    BindingProvenance::from_token(Some(bad)),
+                    Err(crate::federation::Error::InvalidArgument(_))
+                ),
+                "I279: {bad:?} must refuse, never read as Rooted"
+            );
+        }
         assert_eq!(BindingProvenance::Rooted.as_str(), "rooted");
         assert_eq!(BindingProvenance::Advisory.as_str(), "advisory");
     }
@@ -1143,6 +1161,38 @@ pub(crate) mod test_support {
                 "an unsigned liveness refresh must leave a signed transport_destination \
                  still verifiable by a remote peer (#541)",
             );
+
+        // (15) I279 (v52.0.0) — an UNKNOWN provenance token in the signed
+        // envelope refuses. Until v52 it read as `Rooted`, matched the typed
+        // `Rooted` row, and was admitted as authoritative.
+        let r_bad = route(&alice_id, "i279", "d-bad", 0, "2026-06-20T00:00:00Z");
+        let mut env_bad = serde_json::to_value(&r_bad).unwrap();
+        env_bad["binding_provenance"] = serde_json::json!("ROOTED");
+        let (env_bad, sig_bad) = produce_signed_identity_occurrence(alice.as_ref(), env_bad)
+            .await
+            .unwrap();
+        let bad = SignedTransportDestination {
+            transport_destination: r_bad,
+            attesting_key_id: alice_id.clone(),
+            signed_envelope: env_bad,
+            signature: sig_bad,
+        };
+        let e = dir
+            .put_signed_transport_destination(&bad)
+            .await
+            .expect_err("I279: an unknown provenance token must refuse, never read as Rooted");
+        assert!(
+            e.to_string().contains("binding_provenance"),
+            "I279: refused by name: {e}"
+        );
+        assert!(
+            dir.list_transport_destinations_for(&alice_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.transport_kind != "i279"),
+            "I279: nothing stored"
+        );
     }
 
     /// v21.17.1 (CIRISPersist#541) — THE INVARIANT, mechanically: no sequence of

@@ -233,6 +233,10 @@ struct State {
     /// the V059 PG/SQLite composite-PK shape.
     federation_identity_occurrences:
         HashMap<(String, String), crate::federation::IdentityOccurrence>,
+    /// v52.0.0 (CIRISPersist#930) — the V161 mirror: every assertion either
+    /// put door admitted, append-only, unique on
+    /// `(identity, occurrence, asserted_at, attesting)`.
+    federation_identity_occurrence_history: Vec<crate::federation::OccurrenceAssertion>,
     /// v14.1.0 (CIRISPersist#418, replication read) — signature container for
     /// signed-put occurrences, keyed like `federation_identity_occurrences`
     /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
@@ -934,6 +938,7 @@ impl Default for MemoryBackend {
                 federation_goals: HashMap::new(),
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
+                federation_identity_occurrence_history: Vec::new(),
                 federation_identity_occurrence_sigs: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
@@ -2819,6 +2824,34 @@ impl crate::federation::renditions::HeldBlobScope for MemoryBackend {
         _sha256: &[u8; 32],
     ) -> Result<Option<String>, crate::federation::Error> {
         Ok(None)
+    }
+}
+
+/// v52.0.0 (CIRISPersist#930) — the V161 append, unique on the assertion's key.
+fn append_occurrence_history(
+    state: &mut State,
+    row: &crate::federation::IdentityOccurrence,
+    attesting_key_id: Option<String>,
+) {
+    let exists = state
+        .federation_identity_occurrence_history
+        .iter()
+        .any(|a| {
+            a.identity_key_id == row.identity_key_id
+                && a.occurrence_key_id == row.occurrence_key_id
+                && a.asserted_at == row.asserted_at
+                && a.attesting_key_id == attesting_key_id
+        });
+    if !exists {
+        state
+            .federation_identity_occurrence_history
+            .push(crate::federation::OccurrenceAssertion {
+                identity_key_id: row.identity_key_id.clone(),
+                occurrence_key_id: row.occurrence_key_id.clone(),
+                asserted_at: row.asserted_at,
+                valid_until: row.valid_until,
+                attesting_key_id,
+            });
     }
 }
 
@@ -5324,6 +5357,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 )));
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v52.0.0 (#930) — history whether or not the upsert takes it.
+            append_occurrence_history(&mut state, &row, Some(occurrence.attesting_key_id.clone()));
             // Last-signed-wins: only a strictly-newer asserted_at supersedes.
             let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
             let newer = state
@@ -5414,6 +5449,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // replicated row diverge from its own envelope. Memory previously
             // HashMap::inserted unconditionally — the one-backend divergence this
             // whole issue is about.
+            // v52.0.0 (#930) — a trusted-local assertion is history too, even
+            // when the signed row below stays authoritative.
+            append_occurrence_history(&mut state, &row, None);
             let pk = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
             if state.federation_identity_occurrence_sigs.contains_key(&pk) {
                 return Ok(());
@@ -5812,6 +5850,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.identity_key_id.cmp(&b.identity_key_id));
+        Ok(rows)
+    }
+
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::OccurrenceAssertion>, crate::federation::Error> {
+        #[cfg(test)]
+        self.test_hooks
+            .fail_if_armed("list_identity_occurrence_history_by_occurrence")?;
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_identity_occurrence_history
+            .iter()
+            .filter(|a| a.occurrence_key_id == occurrence_key_id)
+            .cloned()
+            .collect();
+        crate::federation::sort_occurrence_history(&mut rows);
         Ok(rows)
     }
 
