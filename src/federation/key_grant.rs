@@ -1163,37 +1163,6 @@ where
         }
     }
 
-    // v52.0.0 (CIRISPersist#954) — a content set its own signer has
-    // withdrawn (the stream it keyed was abandoned) is stored as the signed
-    // row it is and projects NOTHING; a pending index row for it is dropped.
-    // Order-independent with `retire_withdrawn_content_set`, which undoes a
-    // projection made before the withdrawal arrived.
-    if let KeyGrantAxis::Content {
-        at_rest_sha256,
-        cohort_scope,
-        ..
-    } = &parsed.axis
-    {
-        if content_set_withdrawn(backend, &row_id, signer).await? {
-            if let Some(sha) = hex::decode(at_rest_sha256)
-                .ok()
-                .and_then(|v| <[u8; 32]>::try_from(v).ok())
-            {
-                backend
-                    .key_grant_pending_delete(&sha, cohort_scope, &row_id)
-                    .await
-                    .map_err(map_blob_err)?;
-            }
-            return Ok(KeyGrantAdmission {
-                wraps_offered: parsed.wraps.len(),
-                axis: parsed.axis,
-                attestation: outcome,
-                wraps_written: 0,
-                pending: false,
-            });
-        }
-    }
-
     if pending {
         let KeyGrantAxis::Content {
             at_rest_sha256,
@@ -1375,10 +1344,7 @@ where
         let Some(row) = backend.get_attestation(&attestation_id).await? else {
             continue;
         };
-        // v52.0.0 (#954) — a set its signer withdrew (an abandoned stream)
-        // never projects, whichever arrived first.
-        let projectable = !content_set_withdrawn(backend, &attestation_id, &signer).await?
-            && row.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
+        let projectable = row.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
             && row.scrub_key_id == signer
             && KeyGrantSet::from_attestation(&row).ok().is_some_and(|parsed| {
                 matches!(&parsed.axis, KeyGrantAxis::Content { at_rest_sha256, cohort_scope: set_scope, .. }
@@ -1400,92 +1366,6 @@ where
             .map_err(map_blob_err)?;
     }
     Ok(written)
-}
-
-/// v52.0.0 (CIRISPersist#954) — **has `signer` withdrawn the content set
-/// `set_attestation_id`?** True iff this node holds an ADMITTED `withdraws`
-/// by `signer` whose envelope references the set (the write door stamped its
-/// `withdraws_admission_rule` — the verdict is read, never re-derived, #945).
-pub async fn content_set_withdrawn<D>(
-    directory: &D,
-    set_attestation_id: &str,
-    signer: &str,
-) -> Result<bool, Error>
-where
-    D: FederationDirectory + Sync,
-{
-    Ok(directory
-        .list_attestations_by(signer)
-        .await?
-        .iter()
-        .any(|r| {
-            r.attestation_type == crate::federation::types::attestation_type::WITHDRAWS
-                && r.withdraws_admission_rule.is_some()
-                && crate::federation::precedence::references_attestation_id_from_envelope(
-                    &r.attestation_envelope,
-                ) == Some(set_attestation_id)
-        }))
-}
-
-/// v52.0.0 (#954) — **retire a withdrawn content set on this node**: the
-/// grants it projected (one per wrap recipient, on its blob) are deleted and
-/// its pending index row dropped. persist's own self-retention is never a
-/// wrap and is never touched. Called when a `withdraws` of a stored
-/// `key_grant:content` set by the set's own signer is admitted; returns the
-/// grant rows removed. A row that is not a content set, or whose signer is
-/// not the withdrawer, is left alone (`Ok(0)`).
-pub async fn retire_withdrawn_content_set<B>(
-    backend: &B,
-    withdraws: &Attestation,
-) -> Result<u64, Error>
-where
-    B: BlobStorage + FederationDirectory + Sync,
-{
-    if withdraws.attestation_type != crate::federation::types::attestation_type::WITHDRAWS
-        || withdraws.withdraws_admission_rule.is_none()
-    {
-        return Ok(0);
-    }
-    let Some(target) = crate::federation::precedence::references_attestation_id_from_envelope(
-        &withdraws.attestation_envelope,
-    ) else {
-        return Ok(0);
-    };
-    let Some(set_row) = backend.get_attestation(target).await? else {
-        return Ok(0);
-    };
-    if set_row.attestation_type != KEY_GRANT_CONTENT_ATTESTATION_TYPE
-        || set_row.attesting_key_id != withdraws.attesting_key_id
-    {
-        return Ok(0);
-    }
-    let parsed = KeyGrantSet::from_attestation(&set_row)?;
-    let KeyGrantAxis::Content {
-        at_rest_sha256,
-        cohort_scope,
-        ..
-    } = &parsed.axis
-    else {
-        return Ok(0);
-    };
-    let sha: [u8; 32] = hex::decode(at_rest_sha256)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .ok_or_else(|| refuse(KeyGrantRefusalReason::Malformed, "at_rest_sha256"))?;
-    backend
-        .key_grant_pending_delete(&sha, cohort_scope, &set_row.attestation_id)
-        .await
-        .map_err(map_blob_err)?;
-    let recipients: Vec<String> = parsed
-        .wraps
-        .iter()
-        .map(|w| w.recipient_key_id.clone())
-        .filter(|r| r != crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
-        .collect();
-    backend
-        .delete_at_rest_grants(&sha, &recipients)
-        .await
-        .map_err(map_blob_err)
 }
 
 #[cfg(test)]

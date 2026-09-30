@@ -2898,33 +2898,6 @@ impl Engine {
         Ok(())
     }
 
-    /// v52.0.0 (#954) — run `key_grant::retire_withdrawn_content_set` for a
-    /// stored `withdraws` row, on this Engine's backend.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    async fn retire_withdrawn_content_set_by_id(
-        &self,
-        withdraws_id: &str,
-    ) -> Result<u64, crate::federation::Error> {
-        use crate::federation::key_grant::retire_withdrawn_content_set;
-        use crate::federation::FederationDirectory;
-        match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => {
-                let Some(row) = arc.get_attestation(withdraws_id).await? else {
-                    return Ok(0);
-                };
-                retire_withdrawn_content_set(arc.as_ref(), &row).await
-            }
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => {
-                let Some(row) = arc.get_attestation(withdraws_id).await? else {
-                    return Ok(0);
-                };
-                retire_withdrawn_content_set(arc.as_ref(), &row).await
-            }
-        }
-    }
-
     /// v3.4.0 (CIRISPersist#123) — total bytes currently held by
     /// `federation_blobs`. Feeds the eviction-sweeper watermark.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -5761,11 +5734,11 @@ impl Engine {
     /// seal: tombstones the stream (the id is never reused; the chunk door
     /// and the seal refuse it as `stream_abandoned`), drops its index rows,
     /// evicts its sealed chunk rows (a plaintext chunk's bytes stay: they are
-    /// content-addressed and may be shared), and WITHDRAWS every content set
-    /// this node emitted for an evicted chunk — each a `withdraws` at the
-    /// set's own cohort, which a peer admits and which retires that set's
-    /// projected grants there (`key_grant::retire_withdrawn_content_set`).
-    /// A community stream's epoch sets are not per chunk and are kept.
+    /// content-addressed and may be shared). The content key-grant sets
+    /// already emitted for those chunks are NOT withdrawn: CC 3 says a shared
+    /// key cannot be retroactively un-shared, and the withdraws gate refuses
+    /// one naming a `key_grant` row. On a peer that never received the bytes
+    /// such a set stays an inert pending row; nothing opens with it.
     /// Idempotent: a second call answers `already: true`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn abandon_stream(
@@ -5783,71 +5756,11 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(arc) => arc.abandon_stream_floor(stream_id, &me).await?,
         };
-        let mut report = crate::federation::chunk_dag_cascade::AbandonReport {
+        Ok(crate::federation::chunk_dag_cascade::AbandonReport {
             already: floor.already,
             chunks_dropped: floor.chunks_dropped,
             bytes_evicted: floor.bytes_evicted,
-            sets_withdrawn: 0,
-        };
-        let evicted: std::collections::HashSet<String> = floor
-            .evicted
-            .iter()
-            .filter(|(_, t)| {
-                *t == crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted
-            })
-            .map(|(s, _)| hex::encode(s))
-            .collect();
-        if evicted.is_empty() {
-            return Ok(report);
-        }
-        let mine = self
-            .federation_directory()
-            .list_attestations_by(&me)
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("abandon_stream: {e}")))?;
-        for set in mine.iter().filter(|r| {
-            r.attestation_type == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
-                && r.attestation_envelope
-                    .get("at_rest_sha256")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| evicted.contains(s))
-        }) {
-            self.emit_key_grant_withdraws(set).await?;
-            report.sets_withdrawn += 1;
-        }
-        Ok(report)
-    }
-
-    /// v52.0.0 (#954) — a `withdraws` of one of this node's content key-grant
-    /// sets, at the set's own cohort (a family set names its family, #953),
-    /// so it replicates to exactly the audience the set did.
-    #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    async fn emit_key_grant_withdraws(
-        &self,
-        set: &crate::federation::Attestation,
-    ) -> Result<(), crate::federation::BlobError> {
-        let signer = self.local_signer.as_ref().ok_or_else(|| {
-            crate::federation::BlobError::Backend(
-                "abandon_stream: a withdraws needs this Engine's hybrid LocalSigner".into(),
-            )
-        })?;
-        let mut envelope = crate::federation::withdraws_attestation_envelope(
-            &set.attestation_id,
-            crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE,
-        );
-        if let Some(fam) = set.attestation_envelope.get("family_key_id") {
-            envelope["family_key_id"] = fam.clone();
-        }
-        let input = crate::federation::EmitAttestationInput::with_envelope(
-            crate::federation::types::attestation_type::WITHDRAWS,
-            crate::federation::envelope::EnvelopeCore::from_value(envelope)
-                .expect("engine-built envelope is a JSON object"),
-            set.cohort_scope.clone(),
-        );
-        self.emit_attestation(signer, input).await.map_err(|e| {
-            crate::federation::BlobError::Backend(format!("key_grant withdraws emit: {e}"))
-        })?;
-        Ok(())
+        })
     }
 
     /// v51.3.0 (CIRISPersist#947 ask 3) — **store a plaintext chunk DAG and
@@ -8934,23 +8847,10 @@ impl Engine {
         if binding.is_some() {
             self.ensure_backend_node_key().await;
         }
-        let withdraws = (attestation.attestation.attestation_type
-            == crate::federation::types::attestation_type::WITHDRAWS)
-            .then(|| attestation.attestation.attestation_id.clone());
         let outcome = self
             .federation_directory()
             .apply_replicated_attestation(attestation)
             .await?;
-        // v52.0.0 (CIRISPersist#954) — a withdrawn content key-grant set (an
-        // abandoned stream) retires its projected grants here. Read back the
-        // STORED row: the admission verdict the door stamped decides.
-        if let (
-            crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
-            Some(id),
-        ) = (&outcome, withdraws)
-        {
-            self.retire_withdrawn_content_set_by_id(&id).await?;
-        }
         if let (
             crate::federation::attestation_apply::ReplicatedAttestationOutcome::Inserted,
             Some(_),

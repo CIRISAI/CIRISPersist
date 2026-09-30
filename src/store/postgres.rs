@@ -15623,32 +15623,6 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(())
     }
 
-    async fn delete_at_rest_grants(
-        &self,
-        at_rest_sha256: &[u8; 32],
-        recipient_key_ids: &[String],
-    ) -> Result<u64, crate::federation::BlobError> {
-        let client = self
-            .get_client()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
-        let recipients: Vec<String> = recipient_key_ids
-            .iter()
-            .filter(|r| r.as_str() != crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
-            .cloned()
-            .collect();
-        client
-            .execute(
-                "DELETE FROM cirislens.federation_blob_key_grants \
-                  WHERE at_rest_sha256 = $1 AND recipient_key_id = ANY($2)",
-                &[&at_rest_sha256.to_vec(), &recipients],
-            )
-            .await
-            .map_err(|e| {
-                crate::federation::BlobError::Backend(format!("delete_at_rest_grants: {e}"))
-            })
-    }
-
     async fn list_at_rest_grants(
         &self,
         at_rest_sha256: &[u8; 32],

@@ -98,9 +98,6 @@ pub struct AbandonReport {
     pub chunks_dropped: u64,
     /// Stored bytes of the sealed chunk rows evicted.
     pub bytes_evicted: u64,
-    /// Content key-grant sets this node had emitted for the evicted chunks,
-    /// now withdrawn (each a `withdraws` at the set's own cohort).
-    pub sets_withdrawn: u64,
 }
 
 /// What `put_blob_chunk_scoped` did.
@@ -1321,6 +1318,8 @@ pub mod orchestrate {
                             hex::encode(sha256)
                         )));
                     }
+                }
+                for i in 0..root.children.len() {
                     let child =
                         open_manifest_child(backend, root, i, viewer_key_id, caller_aad).await?;
                     check_chunks_held(

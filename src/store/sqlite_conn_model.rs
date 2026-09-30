@@ -544,7 +544,6 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("manifest_children", ConnClass::Read),
     ("record_manifest_child", ConnClass::Write),
     ("abandon_stream_floor", ConnClass::Write),
-    ("delete_at_rest_grants", ConnClass::Write),
     ("blob_head", ConnClass::Read),
     ("stream_chunks", ConnClass::Read),
     ("stream_chunk_at", ConnClass::Read),

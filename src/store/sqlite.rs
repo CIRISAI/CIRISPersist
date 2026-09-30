@@ -14487,34 +14487,6 @@ impl crate::federation::BlobStorage for SqliteBackend {
         })
     }
 
-    async fn delete_at_rest_grants(
-        &self,
-        at_rest_sha256: &[u8; 32],
-        recipient_key_ids: &[String],
-    ) -> Result<u64, crate::federation::BlobError> {
-        let sha_vec = at_rest_sha256.to_vec();
-        let recipients: Vec<String> = recipient_key_ids
-            .iter()
-            .filter(|r| r.as_str() != crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT)
-            .cloned()
-            .collect();
-        self.write(move |conn| -> Result<u64, rusqlite::Error> {
-            let tx = conn.transaction()?;
-            let mut n = 0u64;
-            for r in &recipients {
-                n += tx.execute(
-                    "DELETE FROM federation_blob_key_grants \
-                      WHERE at_rest_sha256 = ?1 AND recipient_key_id = ?2",
-                    rusqlite::params![sha_vec, r],
-                )? as u64;
-            }
-            tx.commit()?;
-            Ok(n)
-        })
-        .await
-        .map_err(|e| crate::federation::BlobError::Backend(format!("delete_at_rest_grants: {e}")))
-    }
-
     async fn list_at_rest_grants(
         &self,
         at_rest_sha256: &[u8; 32],

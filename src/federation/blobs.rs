@@ -342,6 +342,21 @@ impl ChunkManifest {
             #[serde(default)]
             stream_id: Option<String>,
         }
+        // v52.0.0 (#954) — a v3 root is refused by NAME, before its absent
+        // `chunks` member turns it into a parse error that says nothing.
+        #[derive(Deserialize)]
+        struct VersionOnly {
+            v: u32,
+        }
+        if serde_json::from_slice::<VersionOnly>(bytes)
+            .is_ok_and(|w| w.v == CHUNK_MANIFEST_VERSION_NESTED)
+        {
+            return Err(BlobError::Backend(
+                "chunk_dag manifest v3 is a nested root, not a flat manifest; read it through \
+                 ParsedManifest (CIRISPersist#954)"
+                    .into(),
+            ));
+        }
         let wire: ManifestWire = serde_json::from_slice(bytes)
             .map_err(|e| BlobError::Backend(format!("chunk_dag manifest JSON parse: {e}")))?;
         // #838 (§12.10) — a v2 manifest carries its POSITION: `stream_id` and
@@ -2540,16 +2555,6 @@ pub trait BlobStorage: Send + Sync {
         at_rest_sha256: &[u8; 32],
         cohort_scope: &str,
     ) -> impl Future<Output = Result<Vec<(String, String)>, BlobError>> + Send;
-
-    /// v52.0.0 (CIRISPersist#954) — delete the at-rest grants on
-    /// `at_rest_sha256` held by each of `recipient_key_ids` (a withdrawn
-    /// content set's projection). persist's self-retention is refused as a
-    /// target — it is never a wrap. Returns the rows deleted.
-    fn delete_at_rest_grants(
-        &self,
-        at_rest_sha256: &[u8; 32],
-        recipient_key_ids: &[String],
-    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 
     /// #848 §13 (V146) — retire one pending row. Idempotent.
     fn key_grant_pending_delete(

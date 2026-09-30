@@ -14814,11 +14814,10 @@ impl PyEngine {
     /// v52.0.0 (CIRISPersist#954) — **abandon an unsealed stream this node
     /// owns** (a streaming publish refused midway): the stream is tombstoned
     /// (`stream_abandoned` on any later append or seal), its index rows go,
-    /// its sealed chunk rows are evicted, and every content key-grant set this
-    /// node emitted for them is withdrawn (peers then retire those grants).
-    /// Only the stream's owner; a sealed stream raises `ValueError`
-    /// (`stream_sealed`). Idempotent. Returns JSON `{"already",
-    /// "chunks_dropped", "bytes_evicted", "sets_withdrawn"}`.
+    /// and its sealed chunk rows are evicted. Key-grant sets already emitted
+    /// stay (CC 3: a shared key is not un-shared). Only the stream's owner; a
+    /// sealed stream raises `ValueError` (`stream_sealed`). Idempotent.
+    /// Returns JSON `{"already", "chunks_dropped", "bytes_evicted"}`.
     fn abandon_stream_json(&self, py: Python<'_>, stream_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
