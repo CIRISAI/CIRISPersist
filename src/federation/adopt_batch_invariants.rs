@@ -388,6 +388,7 @@ pub(crate) mod bodies {
     }
 
     /// Adopt chunk `seq` of `stream` at the self tier, owned by `author`.
+    #[cfg(feature = "sqlite")]
     pub(crate) async fn adopt_one<B>(b: &B, stream: &str, author: &str, seq: u64, plaintext: &[u8])
     where
         B: BlobStorage + Sync,
