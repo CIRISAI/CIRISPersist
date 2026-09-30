@@ -104,6 +104,8 @@ impl ReadPool {
                  PRAGMA busy_timeout = 30000;\n\
                  PRAGMA query_only = ON;",
             )?;
+            // #784 — per-connection state, like the pragmas above.
+            crate::federation::key_digest::register_sqlite_fn(&conn)?;
             free.push(conn);
         }
         Ok(Arc::new(Self {
@@ -255,6 +257,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("attach_revocation_pqc_signature", ConnClass::Write),
     ("attestations_binding_content", ConnClass::Read),
     ("backfill_trace_dedup_shard_keys", ConnClass::Write),
+    ("backfill_revocation_subject_digests", ConnClass::Write),
     ("blackhole_list", ConnClass::Read),
     ("blackhole_prune_expired", ConnClass::Write),
     ("blackhole_record_hit", ConnClass::Write),
@@ -616,7 +619,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("reseal_attestation_v31", ConnClass::Write),
     ("resolve_scores", ConnClass::Read),
     ("retire_goal", ConnClass::Write),
-    ("revocations_for", ConnClass::Read),
+    ("revocations_for_subject", ConnClass::Read),
     ("revoke_trust", ConnClass::Write),
     // #845 (I55) — the nine documented steps, in one transaction: a free fn
     // handed the writer's connection from inside `repair_portable_defaults_with`.

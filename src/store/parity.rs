@@ -144,6 +144,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("start", Class::Plumbing),
     ("assemble_fountain_content", Class::Delegates),
     ("backfill_trace_dedup_shard_keys", Class::Delegates),
+    // v52.0.0 (#784, V163) — Plumbing: it refuses only on the substrate's own
+    // stored state (a legacy revocation whose key's stored pubkey cannot be
+    // digested), never on a caller's input; fail-closed, it refuses the open.
+    ("backfill_revocation_subject_digests", Class::Plumbing),
     ("bytes", Class::Plumbing),
     ("caller_scope_from_directory", Class::Gate),
     ("canonicalize_in_place", Class::Gate),

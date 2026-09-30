@@ -2532,8 +2532,20 @@ impl Attestation {
 pub struct Revocation {
     /// UUID identifier for this revocation row.
     pub revocation_id: String,
-    /// Key being revoked.
-    pub revoked_key_id: String,
+    /// The revoked key's `key_id`, **optional since v52.0.0 (#784)**: a
+    /// `key_id` carries its keystore label in cleartext, so a revoker may
+    /// name the subject by digest alone. When present it must name a key
+    /// this node holds whose digest is [`Self::revoked_key_sha256_ed25519_raw`]
+    /// — one subject is never named two ways. Absent is bound as JSON `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_key_id: Option<String>,
+    /// v52.0.0 (#784) — **the SUBJECT**: SHA-256 of the revoked key's RAW
+    /// Ed25519 public key, 64 lowercase hex
+    /// ([`crate::federation::key_digest::Sha256Ed25519Raw`]). Required and
+    /// signed. Every reader keys on this, so a revocation bites every label
+    /// of one key, and one issued before the key record arrived bites when
+    /// it does.
+    pub revoked_key_sha256_ed25519_raw: String,
     /// Key issuing the revocation.
     pub revoking_key_id: String,
     /// Free-form reason; consumers parse if they care.

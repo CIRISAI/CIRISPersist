@@ -64,7 +64,7 @@ pub use postgres::PostgresBackend;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteBackend;
 pub use types::{
-    accord_key_fingerprint, classify_key_registration, AuditEntry, ClaimParams, GraphNode,
+    classify_key_registration, sha256_of_pubkey_base64_text, AuditEntry, ClaimParams, GraphNode,
     KeyRegistrationOutcome, ServiceCorrelation, Task, TraceEventRow, TraceLlmCallRow,
     VerificationSource,
 };

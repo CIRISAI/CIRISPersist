@@ -985,6 +985,8 @@ impl SqliteBackend {
                 // pragma can fix, and it is stated here so the next person
                 // does not read this block as a guarantee it is not.
             )?;
+            // #784 — the key digest in SQL (queries only; see `key_digest`).
+            crate::federation::key_digest::register_sqlite_fn(&conn)?;
             Ok(conn)
         })()
         .map_err(|e| Error::Backend(format!("sqlite pragmas: {e}")))
@@ -1468,6 +1470,8 @@ impl Backend for SqliteBackend {
         // #226 (V094) — backfill shard_key for legacy rows, before the
         // engine serves any write. See `backfill_trace_dedup_shard_keys`.
         self.backfill_trace_dedup_shard_keys().await?;
+        // #784 (V163) — every revocation's subject digest, before any read.
+        self.backfill_revocation_subject_digests().await?;
         Ok(())
     }
 
@@ -1538,6 +1542,9 @@ impl Backend for SqliteBackend {
                             let mut rev_stmt = tx.prepare(
                                 "DELETE FROM federation_revocations \
                              WHERE revoked_key_id = ?1 \
+                                OR revoked_key_sha256_ed25519_raw = \
+                                   (SELECT ciris_sha256_ed25519_raw(pubkey_ed25519_base64) \
+                                      FROM federation_keys WHERE key_id = ?1) \
                                 OR revoking_key_id = ?1 \
                                 OR scrub_key_id    = ?1",
                             )?;
@@ -2366,6 +2373,52 @@ impl SqliteBackend {
     /// this runs; every new insert writes a non-`NULL` shard, so after the
     /// one-time backfill this is a near-free empty-index probe on each boot.
     /// Runs inside `run_migrations`, BEFORE the engine serves any write.
+    /// v52.0.0 (CIRISPersist#784, V163) — fill `revoked_key_sha256_ed25519_raw`
+    /// on revocations written before the column existed. SQLite has no
+    /// SHA-256, so V163 could not; the connection's registered
+    /// [`crate::federation::key_digest::SQLITE_FN`] can. Every such row names a
+    /// held key (V004's FK held until V163). A row left without a digest is
+    /// invisible to every reader, which key on it, so the open is REFUSED
+    /// rather than served with a revocation nobody can see.
+    async fn backfill_revocation_subject_digests(&self) -> Result<(), Error> {
+        let left = self
+            .write(move |conn| -> Result<i64, rusqlite::Error> {
+                conn.execute(
+                    &format!(
+                        "UPDATE federation_revocations \
+                            SET revoked_key_sha256_ed25519_raw = \
+                                (SELECT {f}(k.pubkey_ed25519_base64) FROM federation_keys k \
+                                  WHERE k.key_id = federation_revocations.revoked_key_id) \
+                          WHERE revoked_key_sha256_ed25519_raw IS NULL",
+                        f = crate::federation::key_digest::SQLITE_FN
+                    ),
+                    [],
+                )?;
+                conn.query_row(
+                    "SELECT COUNT(*) FROM federation_revocations \
+                      WHERE revoked_key_sha256_ed25519_raw IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .map_err(|e| Error::Migration {
+                sqlstate: None,
+                detail: format!("V163 revocation subject backfill: {e}"),
+            })?;
+        if left != 0 {
+            return Err(Error::Migration {
+                sqlstate: None,
+                detail: format!(
+                    "V163: {left} revocation(s) name no held key with a decodable Ed25519 \
+                     pubkey, so their subject digest cannot be computed; every revocation \
+                     reader keys on it (CIRISPersist#784)"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     async fn backfill_trace_dedup_shard_keys(&self) -> Result<(), Error> {
         const BATCH: i64 = 5_000;
         self.write(move |conn| -> Result<(), rusqlite::Error> {
@@ -6350,8 +6403,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
         )?;
-        check_revocation_anti_rollback_sqlite(self, &row.revoked_key_id, row.scrub_timestamp)
-            .await?;
+        // v52.0.0 (#784) — per SUBJECT, and the subject is the digest: an
+        // older revocation under another label of the same key cannot roll
+        // back a newer one.
+        check_revocation_anti_rollback_sqlite(
+            self,
+            &row.revoked_key_sha256_ed25519_raw,
+            row.scrub_timestamp,
+        )
+        .await?;
 
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
         // one that was SIGNED, and must be coherent with `effective_at`.
@@ -6372,7 +6432,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v31.1.0 (CIRISPersist#655) — the wire-index locator, derived before
         // the INSERT closure takes `row` by move.
         let wire_index_key = crate::federation::wire_index::record_key(&[
-            ("revoked_key_id", row.revoked_key_id.as_str()),
+            (
+                "revoked_key_sha256_ed25519_raw",
+                row.revoked_key_sha256_ed25519_raw.as_str(),
+            ),
             ("revocation_id", row.revocation_id.as_str()),
         ]);
         // THIS node's admission position (V123). Not the producer's clock —
@@ -6414,9 +6477,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash, admitted_at\
+                    revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                    ?16, ?17)",
+                    ?16, ?17, ?18)",
                 rusqlite::params![
                     row.revocation_id,
                     row.revoked_key_id,
@@ -6435,6 +6498,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.revoked_after.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
                     admitted_at.to_rfc3339(),
+                    row.revoked_key_sha256_ed25519_raw,
                 ],
             )?;
             Ok(())
@@ -6458,11 +6522,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
-    async fn revocations_for(
+    async fn revocations_for_subject(
         &self,
-        revoked_key_id: &str,
+        revoked_key_sha256_ed25519_raw: &str,
     ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
-        let key = revoked_key_id.to_owned();
+        let digest = revoked_key_sha256_ed25519_raw.to_owned();
         self.read(
             move |conn| -> Result<Vec<crate::federation::Revocation>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
@@ -6470,17 +6534,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash \
+                        revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
                      FROM federation_revocations \
-                     WHERE revoked_key_id = ?1 \
+                     WHERE revoked_key_sha256_ed25519_raw = ?1 \
                      ORDER BY effective_at DESC",
                 )?;
-                let rows = stmt.query_map([&key], sqlite_row_to_revocation)?;
+                let rows = stmt.query_map([&digest], sqlite_row_to_revocation)?;
                 rows.collect()
             },
         )
         .await
-        .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))
+        .map_err(|e| crate::federation::Error::Backend(format!("revocations_for_subject: {e}")))
     }
 
     // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
@@ -11158,7 +11222,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash, \
+                        revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw, \
                         COALESCE(admitted_at, scrub_timestamp) AS admitted_at \
                  FROM federation_revocations \
                  WHERE (?1 IS NULL OR COALESCE(admitted_at, scrub_timestamp) > ?1 OR \
@@ -12257,7 +12321,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash \
+                        revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
                      FROM federation_revocations WHERE revocation_id = ?1",
                         [&id],
                         sqlite_row_to_revocation,
@@ -20932,6 +20996,7 @@ fn sqlite_row_to_revocation(
     Ok(crate::federation::Revocation {
         revocation_id: row.get("revocation_id")?,
         revoked_key_id: row.get("revoked_key_id")?,
+        revoked_key_sha256_ed25519_raw: row.get("revoked_key_sha256_ed25519_raw")?,
         revoking_key_id: row.get("revoking_key_id")?,
         reason: row.get("reason")?,
         revoked_at: parse_rfc3339(&revoked_at),
@@ -21867,15 +21932,17 @@ fn sqlite_row_to_signed_community_membership_widening(
 /// admits (no prior row → no rollback possible).
 async fn check_revocation_anti_rollback_sqlite(
     backend: &SqliteBackend,
-    revoked_key_id: &str,
+    revoked_key_sha256_ed25519_raw: &str,
     submitted_ts: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
-    let revoked_key_id_owned = revoked_key_id.to_owned();
+    let revoked_key_id_owned = revoked_key_sha256_ed25519_raw.to_owned();
+    let revoked_key_id = revoked_key_sha256_ed25519_raw;
     let latest = backend
         .read(move |conn| -> Result<Option<String>, rusqlite::Error> {
             conn.query_row(
                 "SELECT scrub_timestamp FROM federation_revocations \
-                 WHERE revoked_key_id = ?1 ORDER BY scrub_timestamp DESC LIMIT 1",
+                 WHERE revoked_key_sha256_ed25519_raw = ?1 \
+                 ORDER BY scrub_timestamp DESC LIMIT 1",
                 rusqlite::params![revoked_key_id_owned],
                 |row| row.get::<_, String>(0),
             )
@@ -23698,7 +23765,9 @@ impl crate::read::ReadEngine for SqliteBackend {
             let op = if revoked { "EXISTS" } else { "NOT EXISTS" };
             parts.push(format!(
                 "{op} (SELECT 1 FROM federation_revocations r \
-                     WHERE r.revoked_key_id = federation_keys.key_id)"
+                     WHERE r.revoked_key_sha256_ed25519_raw = \
+                           {}(federation_keys.pubkey_ed25519_base64))",
+                crate::federation::key_digest::SQLITE_FN
             ));
         }
         if let Some(pqc) = filter.pqc_completed {
@@ -24150,8 +24219,15 @@ impl crate::read::ReadEngine for SqliteBackend {
         let mut parts: Vec<String> = Vec::new();
         let mut binds: Vec<SqlValue> = Vec::new();
         if let Some(k) = &filter.revoked_key_id {
+            // v52.0.0 (#784) — the subject is the digest: a row naming this
+            // key by digest alone, or under another label, matches too.
             binds.push(SqlValue::Text(k.clone()));
-            parts.push(format!("revoked_key_id = ?{}", binds.len()));
+            let n = binds.len();
+            parts.push(format!(
+                "(revoked_key_id = ?{n} OR revoked_key_sha256_ed25519_raw = \
+                  (SELECT {f}(pubkey_ed25519_base64) FROM federation_keys WHERE key_id = ?{n}))",
+                f = crate::federation::key_digest::SQLITE_FN
+            ));
         }
         if let Some(k) = &filter.revoking_key_id {
             binds.push(SqlValue::Text(k.clone()));
@@ -24189,7 +24265,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, \
                     scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
-                    pqc_completed_at, observed_region, revoked_after, persist_row_hash \
+                    pqc_completed_at, observed_region, revoked_after, persist_row_hash, \
+                    revoked_key_sha256_ed25519_raw \
              FROM federation_revocations {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC LIMIT ?{p_limit}"
         );
@@ -27346,6 +27423,88 @@ mod accord_tests {
             "rev659-node-sq",
         )
         .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222–I227, subjects by digest, on sqlite.
+    #[tokio::test]
+    async fn digest_subjects_sqlite_784() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_node_key_id("rev784-node-sq");
+        crate::federation::admission::r2_test_support::exercise_784_digest_subjects(
+            &backend,
+            "sq784",
+            "rev784-node-sq",
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222 two nodes, on sqlite.
+    #[tokio::test]
+    async fn digest_subjects_two_node_sqlite_784() {
+        let a = SqliteBackend::open_in_memory().await.unwrap();
+        a.run_migrations().await.unwrap();
+        let b = SqliteBackend::open_in_memory().await.unwrap();
+        b.run_migrations().await.unwrap();
+        crate::federation::admission::r2_test_support::exercise_784_two_node(&a, &b, "sq784n")
+            .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — **I221: V163's subject digest is filled at
+    /// open for a revocation written before it existed**, from the key it
+    /// named; and a legacy row whose key's stored pubkey cannot be digested
+    /// REFUSES the open rather than serving a revocation no reader can find.
+    #[tokio::test]
+    async fn i221_open_backfills_the_legacy_revocation_subject_784() {
+        let (pk, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys("k784-legacy");
+        let seed = |pubkey: &str| {
+            format!(
+                "INSERT INTO federation_keys (key_id, pubkey_ed25519_base64, algorithm, identity_type, \
+                   identity_ref, valid_from, registration_envelope, original_content_hash, \
+                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('k1','{pubkey}','hybrid','node','ref1','2026-01-01T00:00:00+00:00','{{}}',X'00','sig', \
+                   'k1','2026-01-01T00:00:01+00:00','h','2026-01-01T00:00:01+00:00'); \
+                 INSERT INTO federation_revocations (revocation_id, revoked_key_id, revoking_key_id, \
+                   revoked_at, effective_at, revocation_envelope, original_content_hash, \
+                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('r1','k1','k1','2026-01-05T00:00:00+00:00','2026-01-05T00:00:00+00:00','{{}}',X'00', \
+                   'sig','k1','2026-01-05T00:00:01+00:00','h','2026-01-05T00:00:01+00:00');"
+            )
+        };
+        // The good row.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations_through(162).await.unwrap();
+        backend.conn.lock().execute_batch(&seed(&pk)).unwrap();
+        backend
+            .run_migrations()
+            .await
+            .expect("the backfill fills the legacy row");
+        let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&pk)
+            .unwrap()
+            .to_hex();
+        use crate::federation::FederationDirectory as _;
+        let found = backend.revocations_for_subject(&digest).await.unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.revocation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1"],
+            "I221: the legacy revocation is found by its subject digest"
+        );
+        assert_eq!(found[0].revoked_key_id.as_deref(), Some("k1"));
+        // The row whose key cannot be digested.
+        let bad = SqliteBackend::open_in_memory().await.unwrap();
+        bad.run_migrations_through(162).await.unwrap();
+        bad.conn
+            .lock()
+            .execute_batch(&seed("pk-not-a-key"))
+            .unwrap();
+        let e = bad
+            .run_migrations()
+            .await
+            .expect_err("an undigestable legacy subject refuses the open");
+        assert!(format!("{e}").contains("V163"), "I221: {e}");
     }
 
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
@@ -30912,7 +31071,9 @@ mod tests {
         // through the one shared producer.
         crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
-            revoked_key_id: revoked.into(),
+            revoked_key_id: Some(revoked.into()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of(revoked),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -40841,7 +41002,7 @@ mod tests {
     /// the SHA-256 fingerprint of the **stored** (original) pubkey.
     #[tokio::test]
     async fn sqlite_register_accord_public_key_classifies_outcomes() {
-        use crate::store::{accord_key_fingerprint, KeyRegistrationOutcome};
+        use crate::store::{sha256_of_pubkey_base64_text, KeyRegistrationOutcome};
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
 
@@ -40867,10 +41028,10 @@ mod tests {
             .unwrap();
         match collision {
             KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint,
+                existing_key_sha256_of_pubkey_base64_text,
             } => assert_eq!(
-                existing_key_fingerprint,
-                accord_key_fingerprint("pubA"),
+                existing_key_sha256_of_pubkey_base64_text,
+                sha256_of_pubkey_base64_text("pubA"),
                 "fingerprint is of the STORED key, not the incoming one"
             ),
             other => panic!("expected RotationCollision, got {other:?}"),

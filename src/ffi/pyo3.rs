@@ -5645,7 +5645,7 @@ impl PyEngine {
     ///   `"rotation_collision"` (same `key_id`, **different** pubkey — a
     ///   rotation / potential-compromise signal; CIRISAgent#809).
     /// - `key_id` — echoed for the caller's convenience.
-    /// - `existing_key_fingerprint` — present **only** for
+    /// - `existing_key_sha256_of_pubkey_base64_text` — present **only** for
     ///   `rotation_collision`: SHA-256 hex of the stored pubkey.
     ///
     /// A rotation collision is a normal return, **not** an exception —
@@ -5725,10 +5725,13 @@ impl PyEngine {
             dict.set_item("status", outcome.status())?;
             dict.set_item("key_id", key_id_for_dict)?;
             if let crate::store::KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint,
+                existing_key_sha256_of_pubkey_base64_text,
             } = &outcome
             {
-                dict.set_item("existing_key_fingerprint", existing_key_fingerprint)?;
+                dict.set_item(
+                    "existing_key_sha256_of_pubkey_base64_text",
+                    existing_key_sha256_of_pubkey_base64_text,
+                )?;
             }
             Ok(dict)
         })
@@ -33972,6 +33975,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
             field,
             detail,
         } => PyValueError::new_err(format!("{kind}: {revocation_id} `{field}` — {detail}")),
+        // v52.0.0 (CIRISPersist#784) — caller-fault, same class as the
+        // binding refusal above; the reason token rides in the message.
+        crate::federation::Error::RevocationSubjectRefused {
+            revocation_id,
+            reason,
+            detail,
+        } => PyValueError::new_err(format!("{kind}: {revocation_id} {reason} — {detail}")),
         // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
         // rides in the message for the same reason the two above do: a Python
         // consumer must be able to tell "the row names a third party" from a

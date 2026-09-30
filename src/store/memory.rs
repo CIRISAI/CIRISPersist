@@ -2161,8 +2161,24 @@ impl Backend for MemoryBackend {
             // keys (as attesting/attested/revoking/revoked/scrub_key_id)
             // must go before the federation_keys delete.
             let revs_before = state.federation_revocations.len();
+            // v52.0.0 (#784) — a revocation OF one of these keys is found by
+            // its subject digest, whatever label (if any) it named.
+            let target_digests: Vec<String> = target_key_ids
+                .iter()
+                .filter_map(|k| state.federation_keys.get(k))
+                .filter_map(|rec| {
+                    crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+                        &rec.pubkey_ed25519_base64,
+                    )
+                    .ok()
+                    .map(|d| d.to_hex())
+                })
+                .collect();
             state.federation_revocations.retain(|r| {
-                !(target_key_ids.contains(&r.revoked_key_id)
+                !(r.revoked_key_id
+                    .as_ref()
+                    .is_some_and(|k| target_key_ids.contains(k))
+                    || target_digests.contains(&r.revoked_key_sha256_ed25519_raw)
                     || target_key_ids.contains(&r.revoking_key_id)
                     || target_key_ids.contains(&r.scrub_key_id))
             });
@@ -5211,13 +5227,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let latest = state
                 .federation_revocations
                 .iter()
-                .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                .filter(|r| r.revoked_key_sha256_ed25519_raw == row.revoked_key_sha256_ed25519_raw)
                 .map(|r| r.scrub_timestamp)
                 .max();
             if let Some(existing) = latest {
                 if row.scrub_timestamp <= existing {
                     return Err(crate::federation::Error::RevocationRollback {
-                        revoked_key_id: row.revoked_key_id.clone(),
+                        revoked_key_sha256_ed25519_raw: row.revoked_key_sha256_ed25519_raw.clone(),
                         existing_signed_timestamp: existing,
                         submitted_signed_timestamp: row.scrub_timestamp,
                     });
@@ -5237,12 +5253,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // counts as held across an await for auto-trait purposes).
         let wire_index_key = {
             let mut state = self.state.lock().expect("memory backend lock");
-            if !state.federation_keys.contains_key(&row.revoked_key_id) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "revoked_key_id {} does not exist in federation_keys",
-                    row.revoked_key_id
-                )));
-            }
+            // v52.0.0 (#784, V163) — no FK on the subject: a digest-only
+            // revocation may precede the key record, and a named
+            // `revoked_key_id` was checked against the digest at admission.
             if !state.federation_keys.contains_key(&row.revoking_key_id) {
                 return Err(crate::federation::Error::InvalidArgument(format!(
                     "revoking_key_id {} does not exist in federation_keys",
@@ -5267,18 +5280,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 let latest = state
                     .federation_revocations
                     .iter()
-                    .filter(|r| r.revoked_key_id == row.revoked_key_id)
+                    .filter(|r| {
+                        r.revoked_key_sha256_ed25519_raw == row.revoked_key_sha256_ed25519_raw
+                    })
                     .map(|r| r.scrub_timestamp)
                     .max();
                 crate::federation::admission::check_revocation_anti_rollback(
-                    &row.revoked_key_id,
+                    &row.revoked_key_sha256_ed25519_raw,
                     latest,
                     row.scrub_timestamp,
                 )?;
             }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             let key = crate::federation::wire_index::record_key(&[
-                ("revoked_key_id", row.revoked_key_id.as_str()),
+                (
+                    "revoked_key_sha256_ed25519_raw",
+                    row.revoked_key_sha256_ed25519_raw.as_str(),
+                ),
                 ("revocation_id", row.revocation_id.as_str()),
             ]);
             // v31.1.0 (CIRISPersist#655) — THIS node's admission position,
@@ -5308,15 +5326,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
-    async fn revocations_for(
+    async fn revocations_for_subject(
         &self,
-        revoked_key_id: &str,
+        revoked_key_sha256_ed25519_raw: &str,
     ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
         let mut rows: Vec<_> = state
             .federation_revocations
             .iter()
-            .filter(|r| r.revoked_key_id == revoked_key_id)
+            .filter(|r| r.revoked_key_sha256_ed25519_raw == revoked_key_sha256_ed25519_raw)
             .cloned()
             .collect();
         // Match postgres ORDER BY effective_at DESC.
@@ -14021,7 +14039,9 @@ mod tests {
         // cannot certify a revocation this substrate's own put door refuses.
         crate::federation::tier_ingest::test_support::seal_revocation(Revocation {
             revocation_id: id.into(),
-            revoked_key_id: revoked.into(),
+            revoked_key_id: Some(revoked.into()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of(revoked),
             revoking_key_id: revoking.into(),
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
@@ -17840,6 +17860,29 @@ mod tests {
             "rev659-node-mem",
         )
         .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222–I227, subjects by digest, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn digest_subjects_memory_784() {
+        let backend = MemoryBackend::new();
+        backend.set_node_key_id("rev784-node-mem");
+        crate::federation::admission::r2_test_support::exercise_784_digest_subjects(
+            &backend,
+            "mem784",
+            "rev784-node-mem",
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222 two nodes, on memory.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn digest_subjects_two_node_memory_784() {
+        let (a, b) = (MemoryBackend::new(), MemoryBackend::new());
+        crate::federation::admission::r2_test_support::exercise_784_two_node(&a, &b, "mem784n")
+            .await;
     }
 
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the

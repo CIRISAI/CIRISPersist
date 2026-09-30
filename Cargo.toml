@@ -744,7 +744,7 @@ ndarray              = { version = "0.16", optional = true }
 # (CIRISVerify v1.6.4 hit + fixed this same trap). On iOS we link
 # against the system one instead. Both Cargo target tables below
 # resolve to the same dep entry; cargo unifies on the version pin.
-rusqlite = { version = "0.31", features = ["chrono", "serde_json"], optional = true }
+rusqlite = { version = "0.31", features = ["chrono", "serde_json", "functions"], optional = true }
 
 # Phase 1 robustness — local journal for outage tolerance (FSD §3.4)
 redb = "4"
@@ -789,7 +789,7 @@ tokio-stream = "0.1"
 #
 # Drop `bundled` on every desktop target (Linux / macOS / Windows)
 # AND on iOS. The base `[dependencies]` table has
-# `rusqlite = { features = ["chrono", "serde_json"] }` with no
+# `rusqlite = { features = ["chrono", "serde_json", "functions"] }` with no
 # `bundled` → rusqlite/libsqlite3-sys link against the platform's
 # libsqlite3 dynamically. Both persist.so and edge.so resolve
 # `libsqlite3.so.0` through the same `dlopen` call → ONE library
@@ -851,7 +851,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v18.0.0
 [target.'cfg(target_os = "android")'.dependencies]
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
-rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json", "functions"], optional = true }
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v18.0.0", version = "18", features = ["pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,

@@ -209,6 +209,8 @@ pub mod goal;
 pub(crate) mod group_amendment;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
+// CIRISPersist#784 — a key named by the SHA-256 of its raw Ed25519 pubkey.
+pub mod key_digest;
 // CIRISPersist#848 (BLOB_REPLICATION.md Part II) — key transport:
 // the CC 3 `key_grant` on the sixteenth replicated kind; per-minter epochs.
 pub mod key_grant;
@@ -3942,10 +3944,37 @@ pub trait FederationDirectory: Send + Sync {
     /// wins under most consumer policies).
     async fn put_revocation(&self, revocation: SignedRevocation) -> Result<(), Error>;
 
-    /// All revocations targeting `revoked_key_id`. Ordered by
+    /// All revocations targeting the key `revoked_key_id`. Ordered by
     /// `effective_at` DESC. Consumers walk this list and apply their
     /// policy ("is K revoked at time T?").
-    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error>;
+    ///
+    /// v52.0.0 (CIRISPersist#784) — PROVIDED, and keyed on the key's digest:
+    /// the held key's RAW pubkey digest is resolved and
+    /// [`Self::revocations_for_subject`] answers. So a revocation that names
+    /// the subject by digest alone, or under another label of the same key,
+    /// is found here too. A key this node does not hold has no digest to ask
+    /// about and returns none (ask [`Self::revocations_for_subject`] with a
+    /// digest in hand).
+    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
+        let Some(key) = self.lookup_public_key(revoked_key_id).await? else {
+            return Ok(Vec::new());
+        };
+        let digest = key_digest::Sha256Ed25519Raw::from_pubkey_base64(&key.pubkey_ed25519_base64)
+            .map_err(|e| {
+            Error::Backend(format!(
+                "revocations_for: stored pubkey of {revoked_key_id:?} is malformed: {e}"
+            ))
+        })?;
+        self.revocations_for_subject(&digest.to_hex()).await
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — all revocations whose SUBJECT is the key
+    /// with this `sha256_ed25519_raw` digest (64 lowercase hex), whether they
+    /// also name a `revoked_key_id` or not. Ordered by `effective_at` DESC.
+    async fn revocations_for_subject(
+        &self,
+        revoked_key_sha256_ed25519_raw: &str,
+    ) -> Result<Vec<Revocation>, Error>;
 
     // ── CEG 0.7 identity_occurrence + family (v3.12.0, #153) ───────
 
@@ -8907,6 +8936,25 @@ pub enum Error {
         detail: String,
     },
 
+    /// v52.0.0 (CIRISPersist#784) — a revocation's SUBJECT is not one key
+    /// named one way: its `revoked_key_sha256_ed25519_raw` is not 64 lowercase
+    /// hex, or it also names a `revoked_key_id` whose held key has another
+    /// digest, or it names a `revoked_key_id` this node does not hold (so the
+    /// two names cannot be checked against each other; name the subject by
+    /// digest alone, or re-offer once the key record arrives).
+    /// See [`admission::check_revocation_subject`].
+    #[error("revocation {revocation_id:?}: {reason} — {detail}")]
+    RevocationSubjectRefused {
+        /// The rejected row's `revocation_id`.
+        revocation_id: String,
+        /// `revocation_subject_digest_malformed` /
+        /// `revocation_subject_digest_mismatch` /
+        /// `revocation_subject_unresolved` (retryable).
+        reason: &'static str,
+        /// What the row named and what this node holds.
+        detail: String,
+    },
+
     /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
     /// canonical (JCS) bytes exceed
     /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
@@ -9666,13 +9714,14 @@ pub enum Error {
     /// is the rejected row's. Equal timestamps reject too (strictly
     /// greater is required).
     #[error(
-        "anti-rollback: revocation for {revoked_key_id:?} signed_timestamp \
+        "anti-rollback: revocation for subject {revoked_key_sha256_ed25519_raw} signed_timestamp \
          {submitted_signed_timestamp} is not strictly later than existing \
          {existing_signed_timestamp}"
     )]
     RevocationRollback {
-        /// The `revoked_key_id` the new revocation targets.
-        revoked_key_id: String,
+        /// The SUBJECT the new revocation targets: its `sha256_ed25519_raw`
+        /// digest (v52.0.0, #784 — the latch is per key, not per label).
+        revoked_key_sha256_ed25519_raw: String,
         /// The latest signed_timestamp already on file for this target.
         existing_signed_timestamp: chrono::DateTime<chrono::Utc>,
         /// The submitted (rejected) signed_timestamp.
@@ -9700,15 +9749,15 @@ pub enum Error {
     /// that is not true — there is no existing revocation at that instant.
     /// See [`admission::check_revocation_scrub_skew`].
     #[error(
-        "anti-rollback ceiling: revocation for {revoked_key_id:?} scrub_timestamp \
+        "anti-rollback ceiling: revocation for subject {revoked_key_sha256_ed25519_raw} scrub_timestamp \
          {submitted_signed_timestamp} is {ahead_seconds}s ahead of this node's clock, beyond \
          the {tolerance_seconds}s tolerance. The scrub instant is a MONOTONIC LATCH per \
-         revoked_key_id, so a future-dated one blocks every later de-admission of this key \
+         subject key, so a future-dated one blocks every later de-admission of this key \
          (CIRISPersist#659)"
     )]
     RevocationScrubSkew {
-        /// The `revoked_key_id` the new revocation targets.
-        revoked_key_id: String,
+        /// The SUBJECT the new revocation targets (its `sha256_ed25519_raw`).
+        revoked_key_sha256_ed25519_raw: String,
         /// The submitted (rejected) `scrub_timestamp`.
         submitted_signed_timestamp: chrono::DateTime<chrono::Utc>,
         /// How far ahead of this node's clock it sits.
@@ -10758,6 +10807,7 @@ impl Error {
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::RevocationEnvelopeUnbound { .. } => "federation_revocation_envelope_unbound",
+            Error::RevocationSubjectRefused { .. } => "federation_revocation_subject_refused",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",

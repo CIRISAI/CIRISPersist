@@ -240,6 +240,13 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// preserving a reachable path to a known under-serving read would keep
 /// the vulnerability alive in exactly the consumers slowest to upgrade.
 ///
+/// v7 (v52.0.0, CIRISPersist#784) — a PAYLOAD break, like v6's: the
+/// [`Revocation`] carried by `DirectoryOpResult::Revocations` /
+/// `SignedRevocations` names its subject by `revoked_key_sha256_ed25519_raw`
+/// (required) and its `revoked_key_id` became optional. An older consumer
+/// serde-fails on a digest-only row. `RevocationsForSubject` is APPENDED
+/// (growth). The enum-body digests move only for that growth.
+///
 /// Consumers MUST check the field at capsule-receive time:
 ///
 /// ```ignore
@@ -252,7 +259,7 @@ type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 ///     "persist directory_capsule ABI version mismatch — pin floor too low"
 /// );
 /// ```
-pub const DIRECTORY_ABI_VERSION: u32 = 6;
+pub const DIRECTORY_ABI_VERSION: u32 = 7;
 
 /// A `FederationDirectory` operation, serialized by the consumer and
 /// dispatched inside persist's `.so`.
@@ -1069,6 +1076,14 @@ pub enum DirectoryOp {
     WithdrawsAdmissionDepth {
         /// The `withdraws` row's id.
         attestation_id: String,
+    },
+    /// v52.0.0 (CIRISPersist#784) —
+    /// [`FederationDirectory::revocations_for_subject`]: the revocations whose
+    /// SUBJECT is this `sha256_ed25519_raw` digest, whether or not the key is
+    /// held. Result rides `Revocations`. APPEND-ONLY (Growth).
+    RevocationsForSubject {
+        /// The subject key's `sha256_ed25519_raw` (64 lowercase hex).
+        revoked_key_sha256_ed25519_raw: String,
     },
 }
 
@@ -2067,6 +2082,15 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::RevocationsForSubject {
+            revoked_key_sha256_ed25519_raw,
+        } => match dir
+            .revocations_for_subject(&revoked_key_sha256_ed25519_raw)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::Revocations(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
     }
 }
 
@@ -3233,6 +3257,24 @@ impl FederationDirectory for OpsDirectory {
         match self
             .run_op(&DirectoryOp::RevocationsFor {
                 revoked_key_id: revoked_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Revocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    /// v52.0.0 (CIRISPersist#784) — routed, as `revocations_for` is.
+    async fn revocations_for_subject(
+        &self,
+        revoked_key_sha256_ed25519_raw: &str,
+    ) -> Result<Vec<Revocation>, Error> {
+        match self
+            .run_op(&DirectoryOp::RevocationsForSubject {
+                revoked_key_sha256_ed25519_raw: revoked_key_sha256_ed25519_raw.to_owned(),
             })
             .await?
         {
@@ -5080,7 +5122,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "9050c899ce3233018639118740a87793f393015db3dcdbeb2e56628962bcd034",
+            "bd3273da1e686a1166e59423cc3a58694a419ccf50ce4ff5f8800d0b04f97a18",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \

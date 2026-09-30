@@ -1120,11 +1120,16 @@ impl FederationDirectory for FaultInjectingDirectory {
         }
         self.inner.put_revocation(revocation).await
     }
-    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
-        if let Some(e) = self.faulted("revocations_for") {
+    async fn revocations_for_subject(
+        &self,
+        revoked_key_sha256_ed25519_raw: &str,
+    ) -> Result<Vec<Revocation>, Error> {
+        if let Some(e) = self.faulted("revocations_for_subject") {
             return Err(e);
         }
-        self.inner.revocations_for(revoked_key_id).await
+        self.inner
+            .revocations_for_subject(revoked_key_sha256_ed25519_raw)
+            .await
     }
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         if let Some(e) = self.faulted("rewrap_own_epochs_for_device") {

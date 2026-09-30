@@ -592,7 +592,7 @@ pub enum KeyRegistrationOutcome {
     /// key material.
     RotationCollision {
         /// SHA-256 (hex) of the stored `public_key_base64`.
-        existing_key_fingerprint: String,
+        existing_key_sha256_of_pubkey_base64_text: String,
     },
 }
 
@@ -607,9 +607,12 @@ impl KeyRegistrationOutcome {
     }
 }
 
-/// SHA-256 (hex) of a stored pubkey base64 — the stable fingerprint
-/// carried on [`KeyRegistrationOutcome::RotationCollision`].
-pub fn accord_key_fingerprint(public_key_base64: &str) -> String {
+/// SHA-256 (hex) of a stored pubkey's base64 TEXT — the diagnostic carried on
+/// [`KeyRegistrationOutcome::RotationCollision`]. Not a key identifier: the
+/// key's digest is over its RAW bytes,
+/// [`crate::federation::key_digest::Sha256Ed25519Raw`] (v52.0.0, #784
+/// renamed this from `accord_key_fingerprint` so the two cannot be confused).
+pub fn sha256_of_pubkey_base64_text(public_key_base64: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(public_key_base64.as_bytes()))
 }
@@ -644,7 +647,7 @@ pub fn classify_key_registration(
             KeyRegistrationOutcome::AlreadyRegistered
         }
         Some(existing) => KeyRegistrationOutcome::RotationCollision {
-            existing_key_fingerprint: accord_key_fingerprint(existing),
+            existing_key_sha256_of_pubkey_base64_text: sha256_of_pubkey_base64_text(existing),
         },
         None => KeyRegistrationOutcome::AlreadyRegistered,
     }
@@ -675,10 +678,17 @@ mod keyreg_tests {
         let out = classify_key_registration(false, Some("pubOLD"), "pubNEW");
         match out {
             KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint,
+                existing_key_sha256_of_pubkey_base64_text,
             } => {
-                assert_eq!(existing_key_fingerprint, accord_key_fingerprint("pubOLD"));
-                assert_eq!(existing_key_fingerprint.len(), 64, "sha256 hex");
+                assert_eq!(
+                    existing_key_sha256_of_pubkey_base64_text,
+                    sha256_of_pubkey_base64_text("pubOLD")
+                );
+                assert_eq!(
+                    existing_key_sha256_of_pubkey_base64_text.len(),
+                    64,
+                    "sha256 hex"
+                );
             }
             other => panic!("expected RotationCollision, got {other:?}"),
         }
@@ -702,7 +712,7 @@ mod keyreg_tests {
         );
         assert_eq!(
             KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint: "x".into()
+                existing_key_sha256_of_pubkey_base64_text: "x".into()
             }
             .status(),
             "rotation_collision"
