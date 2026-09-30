@@ -17086,12 +17086,28 @@ impl crate::federation::BlobStorage for SqliteBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, crate::federation::BlobError>
     {
+        Ok(self
+            .list_stored_delivery_receipts_for(stream_id, limit)
+            .await?
+            .into_iter()
+            .map(|s| s.receipt)
+            .collect())
+    }
+
+    async fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> Result<
+        Vec<crate::federation::stream_receipt::StoredDeliveryReceipt>,
+        crate::federation::BlobError,
+    > {
         let stream_id_owned = stream_id.to_string();
-        type ReceiptRow = (String, i64, i64, Vec<u8>, Vec<u8>);
+        type ReceiptRow = (String, i64, i64, Vec<u8>, Vec<u8>, String);
         let rows = self
             .read(move |conn| -> Result<Vec<ReceiptRow>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
-                    "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob \
+                    "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob, received_at \
                    FROM federation_stream_delivery_receipts \
                   WHERE stream_id = ?1 \
                   ORDER BY k ASC, subscriber_key_id ASC \
@@ -17099,7 +17115,14 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 )?;
                 let mapped = stmt
                     .query_map(rusqlite::params![stream_id_owned, limit], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(mapped)
@@ -17107,29 +17130,40 @@ impl crate::federation::BlobStorage for SqliteBackend {
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!(
-                    "list_delivery_receipts_for query: {e}"
+                    "list_stored_delivery_receipts_for query: {e}"
                 ))
             })?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (subscriber_key_id, epoch_i64, k_i64, root_vec, signature_blob) in rows {
+        for (subscriber_key_id, epoch_i64, k_i64, root_vec, signature_blob, received_at) in rows {
             let chunk_root = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
             let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
-            out.push(crate::federation::stream_receipt::DeliveryReceipt {
+            let received_at = chrono::DateTime::parse_from_rfc3339(&received_at)
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!(
+                        "list_stored_delivery_receipts_for: received_at {received_at:?}: {e}"
+                    ))
+                })?
+                .with_timezone(&chrono::Utc);
+            let receipt = crate::federation::stream_receipt::DeliveryReceipt {
                 stream_id: stream_id.to_string(),
                 subscriber_key_id,
                 epoch: u64::try_from(epoch_i64).map_err(|_| {
                     crate::federation::BlobError::Backend(
-                        "list_delivery_receipts_for: negative epoch".into(),
+                        "list_stored_delivery_receipts_for: negative epoch".into(),
                     )
                 })?,
                 k: u64::try_from(k_i64).map_err(|_| {
                     crate::federation::BlobError::Backend(
-                        "list_delivery_receipts_for: negative k".into(),
+                        "list_stored_delivery_receipts_for: negative k".into(),
                     )
                 })?,
                 chunk_root,
                 signature,
+            };
+            out.push(crate::federation::stream_receipt::StoredDeliveryReceipt {
+                receipt,
+                received_at,
             });
         }
         Ok(out)
@@ -17900,6 +17934,25 @@ fn sqlite_load_stream_chunk_hashes(
             sha_vec,
         )?);
     }
+    // v51.5.0 (#953) — no stream rows, and the id names an inline blob this
+    // node holds: the log is that blob's one leaf.
+    if out.is_empty() {
+        if let Some(sha) = crate::federation::stream_sth::inline_blob_of_stream_id(stream_id) {
+            let held: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM federation_blobs \
+                      WHERE sha256 = ?1 AND storage_kind = 'inline')",
+                    rusqlite::params![sha.to_vec()],
+                    |r| r.get(0),
+                )
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("load inline blob leaf: {e}"))
+                })?;
+            if held {
+                out.push(sha);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -17934,6 +17987,7 @@ impl SqliteBackend {
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use crate::federation::BlobStorage as _;
         floor.check_scope(cohort_scope)?;
+        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
         let cap = self.inline_bytes_cap();
         // Validation + hash-on-write (computes the chunk's content SHA) +
         // the §12.3 floor check (the body is what the token says it is).

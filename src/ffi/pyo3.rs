@@ -10730,7 +10730,8 @@ impl PyEngine {
 
     /// v4.1 (CIRISPersist#142, Cut C4) — list stored delivery receipts
     /// for `stream_id`, ascending `(k, subscriber_key_id)`, bounded by
-    /// `limit`. Returns a JSON array of serialized `DeliveryReceipt`s.
+    /// `limit`. Returns a JSON array of serialized `DeliveryReceipt`s, each
+    /// with the `received_at` this node stored it at (v51.5.0, #953).
     fn list_delivery_receipts_for(
         &self,
         py: Python<'_>,
@@ -10748,7 +10749,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         backend
-                            .list_delivery_receipts_for(&stream_id, limit)
+                            .list_stored_delivery_receipts_for(&stream_id, limit)
                             .await
                             .map_err(blob_err_to_py)
                     })
@@ -10759,7 +10760,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         backend
-                            .list_delivery_receipts_for(&stream_id, limit)
+                            .list_stored_delivery_receipts_for(&stream_id, limit)
                             .await
                             .map_err(blob_err_to_py)
                     })

@@ -64,6 +64,52 @@ pub fn log_id_for_stream(stream_id: &str) -> String {
     format!("{STREAM_LOG_ID_PREFIX}{stream_id}")
 }
 
+/// v51.5.0 (CIRISPersist#953) — **the stream id of an inline blob's log**:
+/// its SHA-256 as 64 lowercase hex. An inline blob has no stream rows; its
+/// log has ONE leaf, the blob's own sha, so `produce_stream_sth(local,
+/// &inline_blob_stream_id(&sha), &[sha], 1, t)` builds the STH that
+/// `put_stream_sth` accepts for it (CC 5.3.3.6: an inline file is
+/// receiptable like a chunked one).
+#[must_use]
+pub fn inline_blob_stream_id(sha: &[u8; 32]) -> String {
+    hex::encode(sha)
+}
+
+/// v51.5.0 (#953) — the inline blob a stream id names, if it has the one
+/// spelling [`inline_blob_stream_id`] produces (64 lowercase hex).
+#[must_use]
+pub fn inline_blob_of_stream_id(stream_id: &str) -> Option<[u8; 32]> {
+    if stream_id.len() != 64
+        || !stream_id
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(stream_id, &mut out).ok()?;
+    Some(out)
+}
+
+/// v51.5.0 (#953) — **a stream id shaped like a SHA-256 is reserved for the
+/// inline blob it names.** The chunk floor refuses to write stream rows
+/// under one (either case), so no chunked stream can take an inline blob's
+/// log name and turn its one-leaf STH into an equivocation.
+///
+/// # Errors
+///
+/// [`BlobError::InvalidArgument`] for a 64-hex-digit `stream_id`.
+pub fn refuse_reserved_stream_id(stream_id: &str) -> Result<(), BlobError> {
+    if stream_id.len() == 64 && stream_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(BlobError::InvalidArgument(format!(
+            "stream_id {stream_id:?} is shaped like a SHA-256; that name is reserved for the \
+             one-leaf log of the inline blob it names (CIRISPersist#953) — name the stream \
+             anything else"
+        )));
+    }
+    Ok(())
+}
+
 /// v4.1 (Cut C1b) — a [`TransparencyLeaf`] wrapping one stream chunk's
 /// 32-byte SHA-256 (a `federation_stream_chunks.chunk_sha`).
 ///

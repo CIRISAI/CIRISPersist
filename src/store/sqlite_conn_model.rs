@@ -390,6 +390,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("list_holders_sized", ConnClass::Read),
     ("list_consent_revocations", ConnClass::Read),
     ("list_delivery_receipts_for", ConnClass::Read),
+    ("list_stored_delivery_receipts_for", ConnClass::Read),
     ("list_expired_attestation_ids", ConnClass::Read),
     ("list_families_for_member", ConnClass::Read),
     ("list_family_membership_revocations_for", ConnClass::Read),

@@ -274,6 +274,13 @@ impl KeyGrantSet {
                 m.insert("at_rest_sha256".into(), at_rest_sha256.as_str().into());
                 m.insert("cohort_scope".into(), cohort_scope.as_str().into());
                 m.insert("owner_key_id".into(), owner_key_id.as_str().into());
+                // #953 — the write gate reads a row's cohort target from the
+                // envelope's target fields, never from `owner_key_id`. A
+                // family set that named its family only as the owner was
+                // refused `scope_no_family_membership` at its author's door.
+                if cohort_scope == crate::federation::types::cohort_scope::FAMILY {
+                    m.insert("family_key_id".into(), owner_key_id.as_str().into());
+                }
             }
         }
         m.insert(
@@ -343,10 +350,29 @@ impl KeyGrantSet {
                         format!("content-axis key_grant at cohort_scope {scope:?}; only self / family carry per-blob grants"),
                     ));
                 }
+                let owner_key_id = field("owner_key_id")?;
+                // #953 — a family set names its family twice (owner slot and
+                // cohort target) and they are one id; a self set names none.
+                let named_family = env.get("family_key_id");
+                let agrees = if scope == cohort_scope::FAMILY {
+                    named_family.and_then(|v| v.as_str()) == Some(owner_key_id.as_str())
+                } else {
+                    named_family.is_none()
+                };
+                if !agrees {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        format!(
+                            "content-axis key_grant at cohort_scope {scope:?}: `family_key_id` \
+                             {named_family:?} must equal `owner_key_id` {owner_key_id:?} on a \
+                             family set and be absent on a self set"
+                        ),
+                    ));
+                }
                 KeyGrantAxis::Content {
                     at_rest_sha256,
                     cohort_scope: scope,
-                    owner_key_id: field("owner_key_id")?,
+                    owner_key_id,
                 }
             }
             (t, a) => {

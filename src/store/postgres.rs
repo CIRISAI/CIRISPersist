@@ -18326,13 +18326,29 @@ impl crate::federation::BlobStorage for PostgresBackend {
         limit: i64,
     ) -> Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, crate::federation::BlobError>
     {
+        Ok(self
+            .list_stored_delivery_receipts_for(stream_id, limit)
+            .await?
+            .into_iter()
+            .map(|s| s.receipt)
+            .collect())
+    }
+
+    async fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> Result<
+        Vec<crate::federation::stream_receipt::StoredDeliveryReceipt>,
+        crate::federation::BlobError,
+    > {
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob \
+                "SELECT subscriber_key_id, epoch, k, chunk_root, signature_blob, received_at \
                    FROM cirislens.federation_stream_delivery_receipts \
                   WHERE stream_id = $1 \
                   ORDER BY k ASC, subscriber_key_id ASC \
@@ -18342,7 +18358,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::BlobError::Backend(format!(
-                    "list_delivery_receipts_for query: {e}"
+                    "list_stored_delivery_receipts_for query: {e}"
                 ))
             })?;
 
@@ -18357,23 +18373,29 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 row.safe_get_with("chunk_root", crate::federation::BlobError::Backend)?;
             let signature_blob: Vec<u8> =
                 row.safe_get_with("signature_blob", crate::federation::BlobError::Backend)?;
+            let received_at: chrono::DateTime<chrono::Utc> =
+                row.safe_get_with("received_at", crate::federation::BlobError::Backend)?;
             let chunk_root = crate::federation::stream_sth::root_hash_from_bytes(&root_vec)?;
             let signature = crate::federation::stream_sth::deserialize_signature(&signature_blob)?;
-            out.push(crate::federation::stream_receipt::DeliveryReceipt {
+            let receipt = crate::federation::stream_receipt::DeliveryReceipt {
                 stream_id: stream_id.to_string(),
                 subscriber_key_id,
                 epoch: u64::try_from(epoch_i64).map_err(|_| {
                     crate::federation::BlobError::Backend(
-                        "list_delivery_receipts_for: negative epoch".into(),
+                        "list_stored_delivery_receipts_for: negative epoch".into(),
                     )
                 })?,
                 k: u64::try_from(k_i64).map_err(|_| {
                     crate::federation::BlobError::Backend(
-                        "list_delivery_receipts_for: negative k".into(),
+                        "list_stored_delivery_receipts_for: negative k".into(),
                     )
                 })?,
                 chunk_root,
                 signature,
+            };
+            out.push(crate::federation::stream_receipt::StoredDeliveryReceipt {
+                receipt,
+                received_at,
             });
         }
         Ok(out)
@@ -19081,6 +19103,26 @@ async fn pg_load_stream_chunk_hashes(
             &sha_vec,
         )?);
     }
+    // v51.5.0 (#953) — no stream rows, and the id names an inline blob this
+    // node holds: the log is that blob's one leaf.
+    if out.is_empty() {
+        if let Some(sha) = crate::federation::stream_sth::inline_blob_of_stream_id(stream_id) {
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM cirislens.federation_blobs \
+                      WHERE sha256 = $1 AND storage_kind = 'inline')",
+                    &[&sha.to_vec()],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("load inline blob leaf: {e}"))
+                })?;
+            let held: bool = row.safe_get_with(0usize, crate::federation::BlobError::Backend)?;
+            if held {
+                out.push(sha);
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -19109,6 +19151,7 @@ impl PostgresBackend {
     ) -> Result<[u8; 32], crate::federation::BlobError> {
         use crate::federation::BlobStorage as _;
         floor.check_scope(cohort_scope)?;
+        crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
         let cap = self.inline_bytes_cap();
         // Validation + hash-on-write (computes the chunk's content SHA) +
         // the §12.3 floor check (the body is what the token says it is).

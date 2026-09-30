@@ -1591,6 +1591,17 @@ pub trait BlobStorage: Send + Sync {
         Output = Result<Vec<crate::federation::stream_receipt::DeliveryReceipt>, BlobError>,
     > + Send;
 
+    /// v51.5.0 (CIRISPersist#953) — the same listing, each receipt with the
+    /// `received_at` this node stored it at. [`Self::list_delivery_receipts_for`]
+    /// is this listing with the instants dropped.
+    fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> impl Future<
+        Output = Result<Vec<crate::federation::stream_receipt::StoredDeliveryReceipt>, BlobError>,
+    > + Send;
+
     /// Read a blob by its SHA-256.
     ///
     /// Returns the [`BlobBody`] variant matching the row's stored
