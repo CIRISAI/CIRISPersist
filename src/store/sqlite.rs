@@ -18430,6 +18430,33 @@ fn sqlite_load_stream_chunk_hashes(
     Ok(out)
 }
 
+/// #957 — the VM steps a cached statement ran since the last read, reset.
+fn vm_steps(st: &rusqlite::Statement<'_>) -> u64 {
+    u64::try_from(st.reset_status(rusqlite::StatementStatus::VmStep)).unwrap_or(0)
+}
+
+/// #957 (I286) — the chunk floor's SQLite VM-step cost per call, keyed by
+/// stream id (unique per test), so a witness can read what one append cost.
+#[cfg(test)]
+pub(crate) mod chunk_floor_cost {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static COST: LazyLock<Mutex<HashMap<String, u64>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    pub(crate) fn record(stream_id: &str, steps: u64) {
+        COST.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stream_id.to_owned(), steps);
+    }
+    /// The last call's cost for `stream_id`.
+    pub(crate) fn last(stream_id: &str) -> Option<u64> {
+        COST.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(stream_id)
+            .copied()
+    }
+}
+
 // ─── Eviction sweeper helpers (v3.4.0, CIRISPersist#123) ───────────
 //
 // Inherent methods, not trait methods — the Engine layer owns the
@@ -18510,105 +18537,126 @@ impl SqliteBackend {
             /// #954 — the stream was abandoned.
             StreamAbandoned,
         }
+        let cost_stream = stream_id_owned.clone();
         let outcome = self.write(move |conn| -> Result<Appended, rusqlite::Error> {
             let tx = conn.transaction()?;
-            // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in
-            //    this transaction, then compared: a stream belongs to its
-            //    first append. Refused ⇒ nothing below runs, nothing is
-            //    stored. A NULL owner (unclaimed) is adopted by the first
-            //    attributed claim.
-            tx.execute(
-                "INSERT INTO federation_streams \
-                    (stream_id, cohort_scope, community_key_id, owner_key_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (stream_id) DO NOTHING",
-                rusqlite::params![
-                    stream_id_owned,
-                    scope,
-                    claim_tx.community_key_id,
-                    claim_tx.owner_key_id,
-                    now_iso,
-                ],
-            )?;
-            let (s_cohort, s_comm, s_owner, s_abandoned): (
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-            ) = tx.query_row(
-                "SELECT cohort_scope, community_key_id, owner_key_id, abandoned_at \
-                   FROM federation_streams WHERE stream_id = ?1",
-                rusqlite::params![stream_id_owned],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
-            if s_abandoned.is_some() {
-                return Ok(Appended::StreamAbandoned);
-            }
-            if s_cohort != scope || s_comm != claim_tx.community_key_id {
-                return Ok(Appended::StreamElsewhere {
-                    cohort_scope: s_cohort,
-                    community_key_id: s_comm,
-                });
-            }
-            match (&s_owner, &claim_tx.owner_key_id) {
-                (None, None) => {}
-                (Some(owner), Some(mine)) if owner == mine => {}
-                (None, Some(mine)) => {
-                    // Adopt. The predicate makes two adopters resolve to one.
-                    let n = tx.execute(
-                        "UPDATE federation_streams SET owner_key_id = ?2 \
-                          WHERE stream_id = ?1 AND owner_key_id IS NULL",
-                        rusqlite::params![stream_id_owned, mine],
+            // #957 — every floor statement is a cached prepared statement, so
+            // its SQLite VM-step cost can be read back (I286 measures it).
+            let mut steps: u64 = 0;
+            let r = (|| -> Result<Appended, rusqlite::Error> {
+                // 0. #837 (§12.9 / I41) — the STREAM's row, insert-if-absent in
+                //    this transaction, then compared: a stream belongs to its
+                //    first append. Refused ⇒ nothing below runs, nothing is
+                //    stored. A NULL owner (unclaimed) is adopted by the first
+                //    attributed claim.
+                {
+                    let mut st = tx.prepare_cached(
+                        "INSERT INTO federation_streams \
+                            (stream_id, cohort_scope, community_key_id, owner_key_id, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5) \
+                         ON CONFLICT (stream_id) DO NOTHING",
                     )?;
-                    if n == 0 {
+                    st.execute(rusqlite::params![
+                        stream_id_owned,
+                        scope,
+                        claim_tx.community_key_id,
+                        claim_tx.owner_key_id,
+                        now_iso,
+                    ])?;
+                    steps += vm_steps(&st);
+                }
+                let (s_cohort, s_comm, s_owner, s_abandoned): (
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = {
+                    let mut st = tx.prepare_cached(
+                        "SELECT cohort_scope, community_key_id, owner_key_id, abandoned_at \
+                           FROM federation_streams WHERE stream_id = ?1",
+                    )?;
+                    let v = st.query_row(rusqlite::params![stream_id_owned], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?;
+                    steps += vm_steps(&st);
+                    v
+                };
+                if s_abandoned.is_some() {
+                    return Ok(Appended::StreamAbandoned);
+                }
+                if s_cohort != scope || s_comm != claim_tx.community_key_id {
+                    return Ok(Appended::StreamElsewhere {
+                        cohort_scope: s_cohort,
+                        community_key_id: s_comm,
+                    });
+                }
+                match (&s_owner, &claim_tx.owner_key_id) {
+                    (None, None) => {}
+                    (Some(owner), Some(mine)) if owner == mine => {}
+                    (None, Some(mine)) => {
+                        // Adopt. The predicate makes two adopters resolve to one.
+                        let n = tx.execute(
+                            "UPDATE federation_streams SET owner_key_id = ?2 \
+                              WHERE stream_id = ?1 AND owner_key_id IS NULL",
+                            rusqlite::params![stream_id_owned, mine],
+                        )?;
+                        if n == 0 {
+                            return Ok(Appended::StreamForeign {
+                                cohort_scope: s_cohort,
+                                community_key_id: s_comm,
+                            });
+                        }
+                    }
+                    _ => {
                         return Ok(Appended::StreamForeign {
                             cohort_scope: s_cohort,
                             community_key_id: s_comm,
-                        });
+                        })
                     }
                 }
-                _ => {
-                    return Ok(Appended::StreamForeign {
-                        cohort_scope: s_cohort,
-                        community_key_id: s_comm,
-                    })
+                // 1. The chunk's bytes as a normal federation_blobs row
+                //    (content-addressed + idempotent), carrying the cohort and
+                //    the tier the door resolved (§11.1 / §12.1).
+                let sha_vec = row.sha256.to_vec();
+                // #846 (§5) — the chunk's author is the claimed owner.
+                {
+                    let mut st = tx.prepare_cached(
+                        "INSERT INTO federation_blobs (\
+                            sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
+                            last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, ?7, ?8, ?9) \
+                         ON CONFLICT (sha256) DO NOTHING",
+                    )?;
+                    st.execute(rusqlite::params![
+                        sha_vec,
+                        row.storage_kind,
+                        row.bytes_inline,
+                        row.external_ref,
+                        row.size_bytes,
+                        now_iso,
+                        scope,
+                        tier,
+                        claim_tx.owner_key_id,
+                    ])?;
+                    steps += vm_steps(&st);
                 }
-            }
-            // 1. The chunk's bytes as a normal federation_blobs row
-            //    (content-addressed + idempotent), carrying the cohort and
-            //    the tier the door resolved (§11.1 / §12.1).
-            let sha_vec = row.sha256.to_vec();
-            // #846 (§5) — the chunk's author is the claimed owner.
-            tx.execute(
-                "INSERT INTO federation_blobs (\
-                    sha256, storage_kind, bytes_inline, external_ref, size_bytes, media_type, \
-                    last_accessed_at, access_count, cohort_scope, crypto_tier, author_key_id\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 0, ?7, ?8, ?9) \
-                 ON CONFLICT (sha256) DO NOTHING",
-                rusqlite::params![
-                    sha_vec,
-                    row.storage_kind,
-                    row.bytes_inline,
-                    row.external_ref,
-                    row.size_bytes,
-                    now_iso,
-                    scope,
-                    tier,
-                    claim_tx.owner_key_id,
-                ],
-            )?;
-            // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the
-            //    STREAM nonce's per-epoch counter_be must never wrap. A
-            //    given (stream_id, epoch) holds at most
-            //    MAX_CHUNKS_PER_EPOCH chunks; past that the producer MUST
-            //    roll the epoch. Checked in-tx (count + insert atomic) so
-            //    a concurrent append can't slip past the cap.
-            let epoch_chunk_count: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM federation_stream_chunks \
-                  WHERE stream_id = ?1 AND epoch = ?2",
-                    rusqlite::params![stream_id_owned, epoch_i64],
-                    |r| r.get(0),
-                )?;
+                // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): the
+                //    STREAM nonce's per-epoch counter_be must never wrap. A
+                //    given (stream_id, epoch) holds at most
+                //    MAX_CHUNKS_PER_EPOCH chunks; past that the producer MUST
+                //    roll the epoch. Checked in-tx (count + insert atomic) so
+                //    a concurrent append can't slip past the cap.
+                let epoch_chunk_count: i64 = {
+                    let mut st = tx.prepare_cached(
+                        "SELECT COUNT(*) FROM federation_stream_chunks \
+                          WHERE stream_id = ?1 AND epoch = ?2",
+                    )?;
+                    let v = st.query_row(rusqlite::params![stream_id_owned, epoch_i64], |r| {
+                        r.get(0)
+                    })?;
+                    steps += vm_steps(&st);
+                    v
+                };
                 if crate::federation::blobs::epoch_chunk_cap_reached(epoch_chunk_count as u64) {
                     // Surface as a rusqlite error so the closure's error arm
                     // maps it; the caller sees InvalidArgument.
@@ -18616,77 +18664,92 @@ impl SqliteBackend {
                         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                         Some(format!(
                             "put_blob_chunk: (stream_id={stream_id_owned}, epoch={epoch}) \
-                         is at MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch \
-                         (STREAM-nonce counter exhaustion, CEG §10.5.3)",
-                        crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
-                    )),
-                ));
-            }
-            // 3. The stream-index row. (stream_id, seq) PK = monotonicity.
-            //    V142: the chunk's PLAINTEXT size beside its stored size.
-            let inserted = tx.execute(
-                "INSERT INTO federation_stream_chunks (\
-                    stream_id, seq, chunk_sha, epoch, size_bytes, created_at, plaintext_size_bytes\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT (stream_id, seq) DO NOTHING",
-                rusqlite::params![
-                    stream_id_owned,
-                    seq_i64,
-                    sha_vec,
-                    epoch_i64,
-                    row.size_bytes,
-                    now_iso,
-                    plaintext_i64,
-                ],
-            )?;
-            if inserted == 0 {
-                // PK conflict → roll back (drop the tx without commit).
-                return Ok(Appended::SeqConflict);
-            }
-            // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS
-            //    TRANSACTION, conditional on the epoch still being the
-            //    community's current enabled one. Refused ⇒ the whole
-            //    append rolls back: no blob row, no index row, no orphan.
-            if let Some(b) = &bind {
-                let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
-                // #848 — every chunk binds `(community, minter, epoch)`.
-                let n = if bind_as_declared {
-                    // #846 (§3) — the binding is the AUTHOR's fact: recorded
-                    // as declared, with no key-state precondition.
-                    tx.execute(
-                        "INSERT INTO federation_community_blob_epoch \
-                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                         VALUES (?1, ?2, ?3, ?4) \
-                         ON CONFLICT (at_rest_sha256) DO NOTHING",
-                        rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
-                    )?
-                } else {
-                    tx.execute(
-                        "INSERT INTO federation_community_blob_epoch \
-                            (at_rest_sha256, community_key_id, minter_key_id, epoch) \
-                         SELECT ?1, ?2, ?3, ?4 \
-                          WHERE EXISTS (SELECT 1 FROM federation_community_dek \
-                                         WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
-                                           AND key_state = 'enabled') \
-                           AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
-                                               WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
-                         ON CONFLICT (at_rest_sha256) DO NOTHING",
-                        rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
-                    )?
-                };
-                let already: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch \
-                                    WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 \
-                                      AND minter_key_id = ?3 AND epoch = ?4)",
-                    rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
-                    |r| r.get(0),
-                )?;
-                if n == 0 && !already {
-                    return Ok(Appended::EpochMoved);
+                             is at MAX_CHUNKS_PER_EPOCH ({}) — roll the epoch \
+                             (STREAM-nonce counter exhaustion, CEG §10.5.3)",
+                            crate::federation::blobs::MAX_CHUNKS_PER_EPOCH
+                        )),
+                    ));
                 }
+                // 3. The stream-index row. (stream_id, seq) PK = monotonicity.
+                //    V142: the chunk's PLAINTEXT size beside its stored size.
+                let inserted = {
+                    let mut st = tx.prepare_cached(
+                        "INSERT INTO federation_stream_chunks (\
+                            stream_id, seq, chunk_sha, epoch, size_bytes, created_at, plaintext_size_bytes\
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                         ON CONFLICT (stream_id, seq) DO NOTHING",
+                    )?;
+                    let n = st.execute(rusqlite::params![
+                        stream_id_owned,
+                        seq_i64,
+                        sha_vec,
+                        epoch_i64,
+                        row.size_bytes,
+                        now_iso,
+                        plaintext_i64,
+                    ])?;
+                    steps += vm_steps(&st);
+                    n
+                };
+                if inserted == 0 {
+                    // PK conflict → roll back (drop the tx without commit).
+                    return Ok(Appended::SeqConflict);
+                }
+                // 4. #832 (§12.3 / I17) — the epoch binding, IN THIS
+                //    TRANSACTION, conditional on the epoch still being the
+                //    community's current enabled one. Refused ⇒ the whole
+                //    append rolls back: no blob row, no index row, no orphan.
+                if let Some(b) = &bind {
+                    let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+                    // #848 — every chunk binds `(community, minter, epoch)`.
+                    let n = if bind_as_declared {
+                        // #846 (§3) — the binding is the AUTHOR's fact: recorded
+                        // as declared, with no key-state precondition.
+                        tx.execute(
+                            "INSERT INTO federation_community_blob_epoch \
+                                (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                             VALUES (?1, ?2, ?3, ?4) \
+                             ON CONFLICT (at_rest_sha256) DO NOTHING",
+                            rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+                        )?
+                    } else {
+                        tx.execute(
+                            "INSERT INTO federation_community_blob_epoch \
+                                (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                             SELECT ?1, ?2, ?3, ?4 \
+                              WHERE EXISTS (SELECT 1 FROM federation_community_dek \
+                                             WHERE community_key_id = ?2 AND minter_key_id = ?3 AND epoch = ?4 \
+                                               AND key_state = 'enabled') \
+                               AND ?4 = COALESCE((SELECT epoch FROM federation_community_dek_epoch \
+                                                   WHERE community_key_id = ?2 AND minter_key_id = ?3), 0) \
+                             ON CONFLICT (at_rest_sha256) DO NOTHING",
+                            rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+                        )?
+                    };
+                    let already: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM federation_community_blob_epoch \
+                                        WHERE at_rest_sha256 = ?1 AND community_key_id = ?2 \
+                                          AND minter_key_id = ?3 AND epoch = ?4)",
+                        rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+                        |r| r.get(0),
+                    )?;
+                    if n == 0 && !already {
+                        return Ok(Appended::EpochMoved);
+                    }
+                }
+                Ok(Appended::Ok)
+            })();
+            #[cfg(test)]
+            chunk_floor_cost::record(&cost_stream, steps);
+            #[cfg(not(test))]
+            let _ = (&cost_stream, steps);
+            match r {
+                Ok(Appended::Ok) => {
+                    tx.commit()?;
+                    Ok(Appended::Ok)
+                }
+                other => other,
             }
-            tx.commit()?;
-            Ok(Appended::Ok)
         })
         .await
         .map_err(|e| crate::federation::BlobError::Backend(format!("put_blob_chunk tx: {e}")))?;

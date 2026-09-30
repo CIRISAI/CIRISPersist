@@ -113,6 +113,10 @@ pub mod epoch_minter_invariants;
 pub mod self_collective;
 // CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
 // delivered, not discovered — the send set, the re-grant doors, the minter read.
+/// v52.0.0 (CIRISPersist#957) — the chunk adopt cost and batch door witnesses
+/// (I286–I291).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod adopt_batch_invariants;
 /// v47.2.0 (CIRISPersist#853) — CC 2.3 at the bytes plane: the binding fold.
 pub mod blob_tombstone;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
