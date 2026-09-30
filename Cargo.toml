@@ -608,6 +608,13 @@ serde         = { version = "1", features = ["derive"] }
 # string-backed Number internally). Externally observable behavior
 # is unchanged for code using stable APIs (Number::as_f64 etc.).
 serde_json    = { version = "1", features = ["arbitrary_precision", "raw_value"] }
+# v52.0.0 (CIRISPersist#958) — the signing form is serialized from a BORROWED
+# view of the envelope (no deep clone), through the same RFC 8785
+# implementation `ciris_verify_core::jcs::canonicalize` calls. Pinned to the
+# exact version verify-core resolves; `canonical::tests::i295_*` refuses a
+# Cargo.lock holding two serde_jcs versions. Drop this when CIRISVerify
+# exports a JCS entry taking any `Serialize`.
+serde_jcs     = "=0.2.0"
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 sha2          = "0.10"
 # v1.10.1 (CIRISPersist#87 review H2) — scrub master-key material on

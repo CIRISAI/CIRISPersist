@@ -543,9 +543,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("key_grant_pending_list", ConnClass::Read),
     ("key_grant_pending_delete", ConnClass::Write),
     ("put_attestation_with_origin", ConnClass::Write),
-    // #846 — the chunk floor's ONE body; `put_blob_chunk_with_scope` and
-    // `adopt_sealed_chunk_at` delegate to it and touch no connection.
-    ("put_blob_chunk_floor", ConnClass::Write),
+    // v52.0.0 (#957) — the chunk floor's ONE body, batched: ONE write
+    // transaction for a run of chunks. `put_blob_chunk_floor` is its batch of
+    // one and touches no connection; `put_blob_chunk_with_scope`,
+    // `adopt_sealed_chunk_at` and `adopt_sealed_chunks_at` delegate to them.
+    ("put_blob_chunks_floor", ConnClass::Write),
+    // #957 — one item's append, a free fn over the writer's savepoint.
+    ("sqlite_append_chunk_item", ConnClass::HelperWrite),
     ("repair_minter_sentinel", ConnClass::Write),
     ("seal_stream_with_scope", ConnClass::Write),
     // v51.3.0 (#947) — the sealed-DAG promotion: one write transaction.

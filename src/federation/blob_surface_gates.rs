@@ -578,6 +578,23 @@ mod tests {
             "pub async fn adopt_sealed_chunk<",
             "\n}\n",
         );
+        // v52.0.0 (#957, I291) — the batched door and the two halves
+        // `resolve_adopt` was split into.
+        check(
+            "src/federation/adopt_cascade.rs",
+            "pub async fn adopt_sealed_chunks<",
+            "\n}\n",
+        );
+        check(
+            "src/federation/adopt_cascade.rs",
+            "fn check_envelope_shape(",
+            "\n}\n",
+        );
+        check(
+            "src/federation/adopt_cascade.rs",
+            "async fn resolve_provenance<",
+            "\n}\n",
+        );
         // v46.0.0 (#876) — `resolve_adopt` became `async fn resolve_adopt<B>`
         // when the binding's minter stopped being inferred from the author;
         // the anchor moves with the spelling (an exact-match identifier has
@@ -599,19 +616,89 @@ mod tests {
             "pub async fn adopt_sealed_chunk(",
             "\n    }\n",
         );
+        check(
+            "src/engine.rs",
+            "pub async fn adopt_sealed_chunks(",
+            "\n    }\n",
+        );
         for rel in ["src/store/sqlite.rs", "src/store/postgres.rs"] {
             check(rel, "async fn adopt_sealed_blob_at(", "\n    }\n");
             check(rel, "async fn adopt_sealed_chunk_at(", "\n    }\n");
+            check(rel, "async fn adopt_sealed_chunks_at(", "\n    }\n");
             check(rel, "async fn put_blob_chunk_floor(", "\n    }\n");
+            check(rel, "async fn put_blob_chunks_floor(", "\n    }\n");
         }
+        check(
+            "src/store/sqlite.rs",
+            "fn sqlite_append_chunk_item(",
+            "\n}\n",
+        );
+        check(
+            "src/store/postgres.rs",
+            "async fn pg_append_chunk_item(",
+            "\n}\n",
+        );
         assert_eq!(
-            inspected, 11,
-            "I45: expected 3 orchestration + 2 Engine + 6 floor bodies, inspected {inspected} — \
-             a door this gate cannot find is a door it cannot hold"
+            inspected, 21,
+            "I45: expected 6 orchestration + 3 Engine + 10 floor + 2 per-item bodies, inspected \
+             {inspected} — a door this gate cannot find is a door it cannot hold"
         );
         assert!(
             offenders.is_empty(),
             "I45: the adopt path grew a decrypt — a receiver would peek at what it relays:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    // ── I288 (from disk) ─────────────────────────────────────────────────
+    /// v52.0.0 (CIRISPersist#957) — **every production DELETE of stream chunk
+    /// rows clears that stream's (stream, epoch) counters** (V165), so the
+    /// nonce cap never counts rows that are gone. The counter is only exact
+    /// if no delete can run without it.
+    #[test]
+    fn i288_every_stream_chunk_delete_clears_its_counters() {
+        let mut deletes = 0usize;
+        let mut offenders = Vec::new();
+        for (rel, table) in [
+            (
+                "src/store/sqlite.rs",
+                "DELETE FROM federation_stream_chunks",
+            ),
+            (
+                "src/store/postgres.rs",
+                "DELETE FROM cirislens.federation_stream_chunks",
+            ),
+        ] {
+            let text = production_only(&src(rel));
+            let mut i = 0;
+            while let Some(off) = text[i..].find(table) {
+                let at = i + off;
+                let start = text[..at].rfind("fn ").unwrap_or(0);
+                let end = text[at..]
+                    .find("\n    }\n")
+                    .map(|e| at + e)
+                    .unwrap_or(text.len());
+                deletes += 1;
+                if !text[start..end].contains("federation_stream_epoch_counts") {
+                    let name = text[start..]
+                        .lines()
+                        .next()
+                        .unwrap_or("?")
+                        .trim()
+                        .to_owned();
+                    offenders.push(format!("  {rel}: `{name}`"));
+                }
+                i = at + 1;
+            }
+        }
+        assert!(
+            deletes >= 2,
+            "I288: expected the abandon floors' deletes on both backends, found {deletes}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "I288: a delete of stream chunk rows that leaves the counters behind (the nonce \
+             cap would count chunks that are gone):\n{}",
             offenders.join("\n")
         );
     }
@@ -645,11 +732,20 @@ mod tests {
                 "\n}\n",
                 "would_hold(",
             ),
+            // v52.0.0 (#957) — the chunk door that decides is the batched one;
+            // the single `adopt_sealed_chunk` is its batch of one and must
+            // delegate to it (checked below), never accept around it.
+            (
+                "src/federation/adopt_cascade.rs",
+                "pub async fn adopt_sealed_chunks<",
+                "\n}\n",
+                "would_hold(",
+            ),
             (
                 "src/federation/adopt_cascade.rs",
                 "pub async fn adopt_sealed_chunk<",
                 "\n}\n",
-                "would_hold(",
+                "adopt_sealed_chunks(",
             ),
             (
                 "src/engine.rs",

@@ -638,11 +638,25 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // self-signed, claim byte-equal; refuses the write with `Conflict`.
     ("prepare_rebind", Class::Gate),
     ("prepare_sealed_manifest_row", Class::Plumbing),
-    ("prepare_stream_chunk_row", Class::Plumbing),
     ("project_route", Class::Plumbing),
     // #846 — the chunk floor's one body; the write door and the adopt door
     // both run its sequence.
     ("put_blob_chunk_floor", Class::Delegates),
+    // v52.0.0 (CIRISPersist#957) — the chunk floor, batched: the single floor
+    // is its batch of one, and it runs every gate the single floor ran.
+    ("put_blob_chunks_floor", Class::Delegates),
+    // #957 — Gate: refuses an empty batch, more than MAX_CHUNKS_PER_BATCH
+    // items, or more than MAX_BATCH_BYTES. A statement about the input.
+    ("check_chunk_batch_bounds", Class::Gate),
+    // #957 — Plumbing: a savepoint and a cached statement fail only on the
+    // substrate's own terms (the connection, the SQL text), never on input.
+    ("savepoint", Class::Plumbing),
+    ("prepare_cached", Class::Plumbing),
+    // #957 — one item's append (blob row, nonce cap, index row, binding) as a
+    // same-file helper of the batched floor; its refusals are the item's
+    // answer (cap, seq conflict, moved epoch).
+    ("sqlite_append_chunk_item", Class::Delegates),
+    ("pg_append_chunk_item", Class::Delegates),
     ("put_family_local", Class::Delegates),
     ("put_transport_destination", Class::Delegates),
     ("query", Class::Plumbing),

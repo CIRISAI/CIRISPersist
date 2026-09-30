@@ -113,6 +113,10 @@ pub mod epoch_minter_invariants;
 pub mod self_collective;
 // CIRISPersist#884 (`FSD/SELF_COLLECTIVE_TRANSFER.md`) — I137–I140: self/family bytes are
 // delivered, not discovered — the send set, the re-grant doors, the minter read.
+/// v52.0.0 (CIRISPersist#957) — the chunk adopt cost and batch door witnesses
+/// (I286–I291).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod adopt_batch_invariants;
 /// v47.2.0 (CIRISPersist#853) — CC 2.3 at the bytes plane: the binding fold.
 pub mod blob_tombstone;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
@@ -593,7 +597,7 @@ pub use replication::admission::{PeerQuotaRefusal, PeerQuotaRefused};
 // #846 (BLOB_REPLICATION.md §4/§6) — the provenance a consumer declares to the
 // adopt doors and the breadth answer it reads; named here so a Rust consumer
 // does not have to path into `replication::hold`.
-pub use adopt_cascade::{AdoptDisposition, AdoptOutcome};
+pub use adopt_cascade::{AdoptChunkItem, AdoptDisposition, AdoptOutcome};
 pub use replication::hold::{
     is_audience, is_proxy_content, would_hold, BlobProvenance, HoldBreadth, HoldContext,
 };

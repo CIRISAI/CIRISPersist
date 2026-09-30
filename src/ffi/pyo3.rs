@@ -14629,6 +14629,83 @@ impl PyEngine {
         })
     }
 
+    /// v52.0.0 (CIRISPersist#957) — **the batched twin of
+    /// `adopt_sealed_chunk_json`**: a run of up to 64 sealed chunks of ONE
+    /// stream, at one epoch, under one provenance, in one write transaction.
+    /// The provenance, `would_hold` and the stream's claim are checked once; a
+    /// refusal there raises and nothing is written. Each chunk then answers
+    /// in its slot, in order.
+    ///
+    /// Payload JSON: `adopt_sealed_chunk_json`'s provenance members with
+    /// `stream_id` and `epoch`, and `chunks` in place of the one chunk:
+    /// ```json
+    /// {
+    ///   "stream_id": "…", "epoch": 0,
+    ///   "chunks": [ { "seq": 0, "envelope_b64": "…", "plaintext_size": 262144 } ],
+    ///   "author_key_id": "…", "cohort_scope": "self",
+    ///   "community_key_id": "…", "tier": "invisible_encrypted"
+    /// }
+    /// ```
+    /// Returns JSON `{"results": [ {"seq": 0, "chunk_sha256": "<hex>"} |
+    /// {"seq": 1, "error": "<refusal>"} ]}`, one per chunk, in order.
+    fn adopt_sealed_chunks_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            let wire: AdoptSealedChunksWire = serde_json::from_str(payload_json).map_err(|e| {
+                PyValueError::new_err(format!("adopt_sealed_chunks_json decode: {e}"))
+            })?;
+            let mut envelopes = Vec::with_capacity(wire.chunks.len());
+            for c in &wire.chunks {
+                envelopes.push((
+                    c.seq,
+                    B64.decode(&c.envelope_b64).map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "adopt_sealed_chunks_json seq {} envelope_b64 decode: {e}",
+                            c.seq
+                        ))
+                    })?,
+                    c.plaintext_size,
+                ));
+            }
+            let provenance = wire
+                .provenance
+                .into_provenance("adopt_sealed_chunks_json")?;
+            let (stream_id, epoch) = (wire.stream_id, wire.epoch);
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let items: Vec<crate::federation::AdoptChunkItem<'_>> = envelopes
+                    .iter()
+                    .map(|(seq, env, size)| crate::federation::AdoptChunkItem {
+                        seq: *seq,
+                        envelope: env,
+                        plaintext_size: *size,
+                    })
+                    .collect();
+                let results = runtime
+                    .block_on(async {
+                        engine
+                            .adopt_sealed_chunks(&stream_id, &items, epoch, provenance)
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                let out: Vec<serde_json::Value> = results
+                    .iter()
+                    .zip(&items)
+                    .map(|(r, i)| match r {
+                        Ok(sha) => {
+                            serde_json::json!({ "seq": i.seq, "chunk_sha256": hex::encode(sha) })
+                        }
+                        Err(e) => serde_json::json!({ "seq": i.seq, "error": e.to_string() }),
+                    })
+                    .collect();
+                Ok(serde_json::json!({ "results": out }).to_string())
+            })
+        })
+    }
+
     /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
     /// `consent:community_trust` grant for `node_key_id`**, as the attestation
     /// row's JSON, or `null`: lens-core's per-seal capture gate reads this.
@@ -34371,6 +34448,25 @@ struct AdoptSealedChunkWire {
     plaintext_size: u64,
     #[serde(flatten)]
     provenance: ProvenanceWire,
+}
+
+/// v52.0.0 (CIRISPersist#957) — `adopt_sealed_chunks_json`'s payload: the
+/// chunk wire's provenance and stream, with a run of chunks.
+#[derive(serde::Deserialize)]
+struct AdoptSealedChunksWire {
+    stream_id: String,
+    epoch: u64,
+    chunks: Vec<AdoptSealedChunksItemWire>,
+    #[serde(flatten)]
+    provenance: ProvenanceWire,
+}
+
+/// One chunk of [`AdoptSealedChunksWire`].
+#[derive(serde::Deserialize)]
+struct AdoptSealedChunksItemWire {
+    seq: u64,
+    envelope_b64: String,
+    plaintext_size: u64,
 }
 
 fn parse_put_blob_payload(json: &str) -> PyResult<PutBlobPayload> {

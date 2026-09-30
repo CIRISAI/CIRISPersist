@@ -195,6 +195,39 @@ Self-revocation is judged by digest (the revoker's own key digests to the subjec
 - **Capsule consumers:** pin ABI 7.
 - **Python:** `put_revocation` / `deregister_federation_key` JSON carries `revoked_key_sha256_ed25519_raw`, and the rotation-collision dict key is renamed.
 
+### #957 — a chunk adopt costs the same at the last chunk as at the first; a batched adopt door
+
+**Fixed — the nonce cap scanned the stream on every append (CIRISPersist#957, from CIRISEdge's multi-GiB pull bench).** The chunk floor checked the CEG §10.5.3 cap (`MAX_CHUNKS_PER_EPOCH` chunks per `(stream, epoch)`) with `SELECT COUNT(*) … WHERE stream_id = ? AND epoch = ?` on every append and adopt, a scan of the stream's index range, so a whole stream was quadratic (I286 read the floor's SQLite VM steps: 273 at chunk 16, 3294 at chunk 1023). **V165** (both dialects) adds `federation_stream_epoch_counts`, backfilled by `GROUP BY`; the floor steps it with one primary-key upsert (`+1 … RETURNING`) inside the item's savepoint, so a refused item's step rolls back. On postgres the upsert row-locks the counter, serializing concurrent appends to one stream, which the old `COUNT` under READ COMMITTED did not. `abandon_stream` deletes the counters with the rows (a from-disk gate requires every production chunk-row `DELETE` to). The cap refusal is `InvalidArgument` on both backends (sqlite used to surface it as `Backend("put_blob_chunk tx: …")`).
+
+**Added — `adopt_sealed_chunks` (CIRISPersist#957).** `BlobStorage::adopt_sealed_chunks_at`, `adopt_cascade::adopt_sealed_chunks` (+ `AdoptChunkItem`), `Engine::adopt_sealed_chunks`, pyo3 `adopt_sealed_chunks_json`: up to `MAX_CHUNKS_PER_BATCH` (64) chunks / `MAX_BATCH_BYTES` (32 MiB) of one stream at one epoch under one provenance, in ONE write transaction. The provenance, `would_hold`, the bounds and the stream's claim are checked once; a refusal there is the outer `Err` with nothing written. Each item then runs in its own savepoint and answers in its slot, in order (a malformed envelope, a seq conflict, the cap refuse that item alone). A batch that lands nothing commits nothing, so a refused first append never claims a stream. `adopt_sealed_chunk` and `put_blob_chunk_floor` are now batches of one: one floor body per backend. Python: `adopt_sealed_chunks_json({stream_id, epoch, chunks:[{seq, envelope_b64, plaintext_size}], <provenance>})` → `{"results":[{"seq","chunk_sha256"} | {"seq","error"}]}`. **Rust implementors of `BlobStorage` must add `adopt_sealed_chunks_at`.**
+
+Witnesses (`federation::adopt_batch_invariants`, `blob_surface_gates`): **I286** (sqlite) floor VM steps flat in stream length (RED on the pre-fix floor); **I287** (sqlite, postgres) the cap bites exactly, refuses by name, a refusal and a seq conflict step nothing; **I288** (sqlite, postgres) counters equal the `GROUP BY` through appends, conflicts, a partial batch and `abandon_stream`, a rewrite of the abandoned id counts nothing, the same bytes under a fresh id count from one; the V165 backfill over existing rows (sqlite); the from-disk delete gate; **I289** (sqlite, postgres) a batch equals N singles (same addresses, rows, counters), a mid-batch conflict refuses one item, the cascade refuses a non-envelope item by shape and stores the rest; **I290** (sqlite, postgres) a stream-level refusal (another author, abandoned, reserved id) writes no blob row, index row or counter, and an all-refused first batch claims nothing; **I291** = I45 extended to the six new adopt bodies (21 inspected). I72 now requires the single door to delegate to the batch door.
+
+MEASURED (this machine, sqlite, file-backed, one lane; wall-clock at 256 KiB chunks is disk-bound and repeated rounds of the same binary differ by up to 3×, so no speedup is claimed): 8192 × 256 KiB single-chunk adopts, interleaved pre/post: 62.7 s → 50.1 s and 51.3 s → 40.5 s; per-chunk at the stream's end within noise of its start on both. Batches of 8 on one lane: 6.8–8.7 ms/chunk against 5.6–5.9 single — no one-lane gain. The batch door is for Edge's eight lanes on one writer; Edge's 2 GiB bench measures it end to end.
+
+### #958 — the signing form without cloning the envelope
+
+**Changed — performance, no byte change (CIRISPersist#958).** `canonicalize_envelope_for_signing` and `canonicalize_envelope_for_signing_v1_pinned` deep-cloned the whole envelope to delete two top-level members. The strip is now a filter while serializing: a borrowed `SigningView` over the top-level map through `serde_jcs` (the RFC 8785 implementation `ciris_verify_core::jcs::canonicalize` calls; a direct `serde_jcs = "=0.2.0"`, with a gate refusing a lock that holds two versions), and a skip-aware `write_object` on the Python-compat rule. Only top-level members are stripped. No hash, vector or ABI moves. **I292** proptest (2048 cases per run, four seeded runs: non-BMP vs U+E000 keys, big/exponent numbers, nested and top-level signature members, non-object values) and fixed edges: new == the pre-#958 clone-and-remove on both rules; literal bytes pin that a nested `signature` is kept. **I293**: every pinned signing vector passes unchanged. **I294** (`tests/canon_alloc_958.rs`, counting allocator): over a 262,144-entry integer-array envelope the signing form allocates 9.10 MB against 18.16 MB; the clone alone is 9.06 MB. **I295**: Cargo.lock holds one `serde_jcs`.
+
+**Mutation round** (committed tree 74638703, M11's rerun on 9668e505; lane = `adopt_batch_invariants` + `verify::canonical` + I294 + the I45/I288/I72 gates on sqlite; M8, M9, M14 on the postgres runners, non-vacuous at 0.6–1.4 s each): **14 / 14 killed**, plus M0 = I286's RED on the pre-fix floor.
+
+| # | mutant | killed by |
+|---|---|---|
+| M1 | sqlite counter never steps | I287, I288, I289 |
+| M2 | sqlite cap off by one | I287 |
+| M3 | abandon keeps the counters | I288, I290, the delete gate |
+| M4 | a refused item keeps its savepoint | I288, I290 |
+| M5 | a batch that landed nothing commits (claims the stream) | I290 |
+| M6 | the single adopt stores around the batch door | I72 |
+| M7 | V165 backfill ignores the epoch | I288 backfill |
+| M8 | postgres counter never steps | I287, I288, I289 (pg) |
+| M9 | postgres refused item released, not rolled back | I288, I289 (pg) |
+| M10 | the skip list misses `signature_pqc` | I292, I294, existing strip tests |
+| M11 | the V1 writer strips at every depth | SURVIVED the first round (the V1 oracle shares `write_value`); killed by the literal-bytes witness added for it |
+| M12 | the clone is back | I294 |
+| M13 | the signing form hard-wired to the V1 rule | I292, `for_signing_matches_the_produce_gate_byte_for_byte` |
+| M14 | postgres cap off by one | I287 (pg) |
+
 ## [51.3.0] - UNRELEASED
 
 **MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.
