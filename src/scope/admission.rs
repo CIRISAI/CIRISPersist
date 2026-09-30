@@ -410,6 +410,7 @@ mod revocation_honesty_tests {
                 founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
                 consensus_protocol: "unanimous".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -475,6 +476,7 @@ mod revocation_honesty_tests {
                 founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
                 consensus_protocol: "unanimous".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))

@@ -3551,6 +3551,7 @@ mod charter_threshold_tests {
             founded_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             consensus_protocol: cp.into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         }
     }

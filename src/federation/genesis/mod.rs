@@ -466,6 +466,7 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
         founded_at,
         consensus_protocol: ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL.to_owned(),
         consensus_protocol_entrenched: true,
+        dissolved_at: None,
         persist_row_hash: String::new(),
     }
 }
@@ -4741,6 +4742,7 @@ mod tests {
             founded_at: fam.founded_at,
             consensus_protocol: "quorum:1/1".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let err = backend

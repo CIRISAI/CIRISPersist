@@ -314,6 +314,10 @@ where
     };
     check_membership_row_shape(row)?;
     let group = group_of(row)?;
+    // v52.0.0 (#956) — no invitation to, or reply about, a dissolved family.
+    if row.cohort_scope == cohort_scope::FAMILY {
+        super::family_dissolution::refuse_if_held_family_dissolved(dir, &group).await?;
+    }
     match kind {
         MembershipRow::Proposal => {
             if !group_is_held(dir, &row.cohort_scope, &group).await? {

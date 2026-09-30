@@ -10976,6 +10976,7 @@ mod tests {
             founded_at: chrono::Utc::now(),
             consensus_protocol: "founder_only".into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let _ = sq.put_family_local(hostile).await; // whatever it returns…
@@ -11036,6 +11037,7 @@ mod tests {
                 founded_at: chrono::Utc::now(),
                 consensus_protocol: "founder_only".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
             authority_key_id: "rogue-1".into(),
@@ -18840,6 +18842,7 @@ mod tests {
                 founded_at: joined,
                 consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -19167,6 +19170,7 @@ mod tests {
                 founded_at: joined,
                 consensus_protocol: "quorum:3/5".into(),
                 consensus_protocol_entrenched: true,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))
@@ -19210,6 +19214,7 @@ mod tests {
                         founded_at: joined,
                         consensus_protocol: "quorum:3/5".into(),
                         consensus_protocol_entrenched: true,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 ),
@@ -19237,6 +19242,7 @@ mod tests {
                         founded_at: joined,
                         consensus_protocol: "quorum:2/3".into(),
                         consensus_protocol_entrenched: true,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 ),
@@ -19296,6 +19302,7 @@ mod tests {
                         founded_at: joined,
                         consensus_protocol: "quorum:2/3".into(),
                         consensus_protocol_entrenched: true,
+                        dissolved_at: None,
                         persist_row_hash: String::new(),
                     },
                 ),
@@ -19380,6 +19387,7 @@ mod tests {
                     founded_at: joined,
                     consensus_protocol: cp.into(),
                     consensus_protocol_entrenched: true,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             )
@@ -19850,6 +19858,7 @@ mod tests {
                     founded_at: joined,
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             )
@@ -20072,6 +20081,7 @@ mod tests {
                 founded_at: joined,
                 consensus_protocol: "founder_only".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             },
         ))

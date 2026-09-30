@@ -33791,6 +33791,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::MembershipAcceptanceRefused { rule, .. } => {
             PyValueError::new_err(rule_refusal_message(kind, rule))
         }
+        // v52.0.0 (#956) — a write naming a dissolved family: terminal,
+        // caller-side, the sibling roster refusals' type.
+        crate::federation::Error::GroupDissolved {
+            group_key_id,
+            dissolved_at,
+        } => PyValueError::new_err(format!("{kind}: {group_key_id} at {dissolved_at}")),
         // v50.0.0 (#916) — a device re-wrap refused on the owner-binding, the
         // roster or the device's keys: the same caller-side refusal, the same
         // type; `device_rekey_unbound` is the retryable rule.

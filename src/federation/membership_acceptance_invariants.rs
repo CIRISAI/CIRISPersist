@@ -107,6 +107,7 @@ pub(crate) mod bodies {
             founded_at: ms(Utc::now() - Duration::days(1)),
             consensus_protocol: protocol.to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
         let env = f.signing_envelope();
@@ -790,6 +791,7 @@ pub(crate) mod bodies {
                 founded_at: ms(Utc::now()),
                 consensus_protocol: "majority".into(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             };
             let mut signed = ts::sign_family(&founder, f);

@@ -228,6 +228,7 @@ pub mod test_support {
                     founded_at: now,
                     consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))

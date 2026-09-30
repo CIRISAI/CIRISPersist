@@ -7092,8 +7092,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "INSERT INTO federation_families (\
                     family_key_id, family_name, members, founded_at, \
                     consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    admitted_at, dissolved_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     row.family_key_id,
                     row.family_name,
@@ -7103,6 +7103,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.consensus_protocol_entrenched as i64,
                     row.persist_row_hash,
                     admitted_at.to_rfc3339(),
+                    row.dissolved_at.map(|t| t.to_rfc3339()),
                 ],
             )?;
             Ok(())
@@ -7198,7 +7199,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         .query_row(
                             "SELECT version, family_key_id, family_name, members, founded_at, \
                                     consensus_protocol, consensus_protocol_entrenched, \
-                                    persist_row_hash \
+                                    dissolved_at, persist_row_hash \
                              FROM federation_families WHERE family_key_id = ?1",
                             [&new_fam.family_key_id],
                             |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
@@ -7254,7 +7255,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
                             scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14 \
+                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15 \
                          WHERE family_key_id = ?1",
                         rusqlite::params![
                             new_fam.family_key_id,
@@ -7275,6 +7276,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             admitted_at.to_rfc3339(),
                             proof_json,
                             cosignatures_json,
+                            new_fam.dissolved_at.map(|t| t.to_rfc3339()),
                         ],
                     )?;
                     tx.commit()?;
@@ -7481,7 +7483,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let live: Option<(u32, serde_json::Value)> = if cohort == Cohort::Family {
                 conn.query_row(
                     "SELECT version, family_key_id, family_name, members, founded_at, \
-                            consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                      FROM federation_families WHERE family_key_id = ?1",
                     [&key],
                     |r| {
@@ -7538,7 +7540,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move |conn| -> Result<Option<crate::federation::Family>, rusqlite::Error> {
                 conn.query_row(
                     "SELECT family_key_id, family_name, members, founded_at, \
-                        consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                        consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                      FROM federation_families WHERE family_key_id = ?1",
                     [&key],
                     sqlite_row_to_family,
@@ -7565,7 +7567,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move |conn| -> Result<Vec<crate::federation::Family>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT family_key_id, family_name, members, founded_at, \
-                        consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                        consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
                      FROM federation_families \
                      WHERE EXISTS ( \
                          SELECT 1 FROM json_each(federation_families.members) \
@@ -21276,6 +21278,22 @@ fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fede
         })?;
     let founded_at: String = row.get("founded_at")?;
     let entrenched: i64 = row.get("consensus_protocol_entrenched")?;
+    // v52.0.0 (#956) — strict: a dissolution instant that does not parse is a
+    // refusal, never "now" (parse_rfc3339's fallback) and never "live".
+    let dissolved_at = row
+        .get::<_, Option<String>>("dissolved_at")?
+        .map(|t| {
+            chrono::DateTime::parse_from_rfc3339(&t)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+                    )
+                })
+        })
+        .transpose()?;
     Ok(crate::federation::Family {
         family_key_id: row.get("family_key_id")?,
         family_name: row.get("family_name")?,
@@ -21283,6 +21301,7 @@ fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fede
         founded_at: parse_rfc3339(&founded_at),
         consensus_protocol: row.get("consensus_protocol")?,
         consensus_protocol_entrenched: entrenched != 0,
+        dissolved_at,
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -30074,6 +30093,7 @@ mod tests {
                     founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
                     consensus_protocol: "founder_only".into(),
                     consensus_protocol_entrenched: false,
+                    dissolved_at: None,
                     persist_row_hash: String::new(),
                 },
             ))
@@ -32383,6 +32403,7 @@ mod tests {
             founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
             consensus_protocol: consensus_protocol.into(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         }
     }
@@ -37296,6 +37317,7 @@ mod tests {
                 consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
                     .to_owned(),
                 consensus_protocol_entrenched: false,
+                dissolved_at: None,
                 persist_row_hash: String::new(),
             })
             .await
@@ -52563,6 +52585,7 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
             founded_at: joined,
             consensus_protocol: protocol.to_owned(),
             consensus_protocol_entrenched: false,
+            dissolved_at: None,
             persist_row_hash: String::new(),
         };
 
