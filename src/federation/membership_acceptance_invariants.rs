@@ -578,7 +578,10 @@ pub(crate) mod bodies {
         let e = widen_community(d, &cid, &[&founder], &k, None, now)
             .await
             .expect_err("I213: no growth after a decline");
-        assert_eq!(rule_of(&e), RULE_ACCEPTANCE_UNRESOLVED, "I213: {e}");
+        // a decline-only history is TERMINAL, never the retryable "not held
+        // yet" (CIRISEdge#754 found the gate ranked declines only among
+        // acceptances)
+        assert_eq!(rule_of(&e), RULE_DECLINED, "I213: {e}");
         // an acceptance first, then a decline: the decline is refused too, and
         // a later proposal is a new invitation
         let p2 = proposal(
@@ -599,6 +602,38 @@ pub(crate) mod bodies {
         widen_community(d, &cid, &[&founder], &k, None, now)
             .await
             .expect("I213: the second invitation, accepted, admits");
+        // J declines one invitation and accepts another that has since
+        // expired: with an acceptance on record the decline does not decide,
+        // and the answer is EXPIRED, not declined
+        let j = format!("i213-j-{s}");
+        reg(d, &[&j]).await;
+        let pa = proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &j,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        put(d, &pa).await.unwrap();
+        put(d, &reply(&j, &j, &pa, false, now)).await.unwrap();
+        let t0 = now - Duration::days(20);
+        let pb = proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &j,
+            None,
+            t0,
+            Some(Duration::days(7)),
+        );
+        put(d, &pb).await.unwrap();
+        put(d, &reply(&j, &j, &pb, true, t0)).await.unwrap();
+        let e = widen_community(d, &cid, &[&founder], &j, None, now)
+            .await
+            .expect_err("I213: growth past the accepted invitation's expiry");
+        assert_eq!(rule_of(&e), RULE_PROPOSAL_EXPIRED, "I213: {e}");
     }
 
     // ── I214 ──────────────────────────────────────────────────────────────

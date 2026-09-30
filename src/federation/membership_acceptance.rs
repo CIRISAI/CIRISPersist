@@ -471,6 +471,24 @@ where
         }
         return Ok(());
     }
+    // A member who only ever DECLINED an invitation to this group is refused
+    // terminally, not "not held yet". Only when no acceptance for the group
+    // exists: a decline of an older invitation must not turn a newer
+    // acceptance whose proposal has not arrived into a terminal refusal.
+    let in_group =
+        |r: &&Attestation| r.cohort_scope == scope && group_of(r).ok().as_deref() == Some(group);
+    let any_acceptance = replies
+        .iter()
+        .filter(in_group)
+        .any(|r| membership_row(r) == Some(MembershipRow::Acceptance));
+    if !any_acceptance
+        && replies
+            .iter()
+            .filter(in_group)
+            .any(|r| membership_row(r) == Some(MembershipRow::Decline))
+    {
+        note(RULE_DECLINED);
+    }
     Err(refuse(
         group,
         member,
