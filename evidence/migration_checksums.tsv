@@ -313,3 +313,5 @@ sqlite	162	family_cosignatures	16404834741622517764
 postgres	162	family_cosignatures	5611462457761447786
 sqlite	163	revocation_subject_digest	13083273423762522287
 postgres	163	revocation_subject_digest	3781799730581939265
+sqlite	166	family_dissolution	4661524673910244022
+postgres	166	family_dissolution	10124180317187184355

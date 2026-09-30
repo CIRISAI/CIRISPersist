@@ -547,17 +547,9 @@ where
 {
     super::check_consensus_protocol_form(&new.family.consensus_protocol)?;
     super::verify_family_admission(dir, &new).await?;
-    // v52.0.0 (#956) — a dissolved family admits no change, and a dissolution
-    // enters only as a quorum-verified amendment (never the plain door).
+    // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
         .await?;
-    if new.family.dissolved_at.is_some() && authorization.is_none() {
-        return Err(Error::InvalidArgument(format!(
-            "family {}: a dissolution is only a quorum-verified amendment \
-             (supersede_family_with_quorum; CIRISPersist#956)",
-            new.family.family_key_id
-        )));
-    }
     // v52.0.0 (#955, Q2) — an amendment never adds a member.
     super::membership_acceptance::check_supersede_adds_no_member(
         &new.family.family_key_id,

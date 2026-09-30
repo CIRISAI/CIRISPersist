@@ -126,6 +126,9 @@ pub(crate) mod community_trust_consent_invariants;
 pub mod consent_sweep_principals_invariants;
 /// v52.0.0 (CIRISPersist#956) — a quorum-family's leave and dissolve replicate as amendments.
 pub mod family_dissolution;
+/// v52.0.0 (CIRISPersist#956) — I280–I285.
+#[cfg(test)]
+pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
@@ -6329,6 +6332,16 @@ pub trait FederationDirectory: Send + Sync {
         // handed in here was verified by no one, so it is not stored (a peer
         // would refuse it anyway; this node must not serve it as its own).
         new.supersede_proof = None;
+        // v52.0.0 (CIRISPersist#956) — a dissolution enters only through
+        // `supersede_family_with_quorum`. This door's `authorization` is the
+        // caller's own JSON, verified by no one, so it cannot stand in.
+        if new.family.dissolved_at.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "family {}: a dissolution is only a quorum-verified amendment \
+                 (supersede_family_with_quorum; CIRISPersist#956)",
+                new.family.family_key_id
+            )));
+        }
         group_amendment::supersede_family_signed(self, new, authorization).await
     }
 
