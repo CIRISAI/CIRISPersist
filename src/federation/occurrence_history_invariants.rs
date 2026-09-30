@@ -159,6 +159,24 @@ pub(crate) mod bodies {
             bearing(d, &install, ago(50)).await,
             "{tag} I273: re-established after"
         );
+
+        // (b) A revocation effective at EXACTLY an assertion's instant ends
+        // that assertion (`effective_at >= asserted_at`, the #421 rule): a
+        // re-establishment must be strictly later than the revocation.
+        let tag_b = format!("{tag}-b");
+        let (node_b, install_b) = keys(d, &tag_b).await;
+        bound_at(d, &node_b, &install_b, ago(300)).await;
+        let at = ago(200);
+        signed(d, &install_b, &node_b, &install_b, at).await;
+        d.put_identity_occurrence_revocation(
+            ts::signed_occurrence_revocation(&node_b, &node_b, &install_b, at).await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I273(b): revocation: {e}"));
+        assert!(
+            !bearing(d, &install_b, ago(150)).await,
+            "{tag} I273(b): a revocation at an assertion's own instant ends it"
+        );
     }
 
     pub(crate) async fn i274_an_older_assertion_arriving_late_counts(
