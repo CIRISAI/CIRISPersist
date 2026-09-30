@@ -2649,6 +2649,9 @@ impl Backend for PostgresBackend {
                     .execute(
                         "DELETE FROM cirislens.federation_revocations \
                          WHERE revoked_key_id = ANY($1::text[]) \
+                            OR revoked_key_sha256_ed25519_raw IN \
+                               (SELECT encode(sha256(decode(k.pubkey_ed25519_base64, 'base64')), 'hex') \
+                                  FROM cirislens.federation_keys k WHERE k.key_id = ANY($1::text[])) \
                             OR revoking_key_id = ANY($1::text[]) \
                             OR scrub_key_id    = ANY($1::text[])",
                         &[&target_key_ids],
@@ -7426,8 +7429,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        check_revocation_anti_rollback_postgres(&client, &row.revoked_key_id, row.scrub_timestamp)
-            .await?;
+        // v52.0.0 (#784) — per SUBJECT, and the subject is the digest.
+        check_revocation_anti_rollback_postgres(
+            &client,
+            &row.revoked_key_sha256_ed25519_raw,
+            row.scrub_timestamp,
+        )
+        .await?;
 
         // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
         // one that was SIGNED, and must be coherent with `effective_at`.
@@ -7490,9 +7498,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash, admitted_at\
+                    revoked_after, persist_row_hash, admitted_at, revoked_key_sha256_ed25519_raw\
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                    $16, $17)",
+                    $16, $17, $18)",
                 &[
                     &row.revocation_id,
                     &row.revoked_key_id,
@@ -7511,6 +7519,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.revoked_after,
                     &row.persist_row_hash,
                     &admitted_at,
+                    &row.revoked_key_sha256_ed25519_raw,
                 ],
             )
             .await
@@ -7530,7 +7539,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         self.index_stored_record(
             "Revocation",
             &crate::federation::wire_index::record_key(&[
-                ("revoked_key_id", row.revoked_key_id.as_str()),
+                (
+                    "revoked_key_sha256_ed25519_raw",
+                    row.revoked_key_sha256_ed25519_raw.as_str(),
+                ),
                 ("revocation_id", row.revocation_id.as_str()),
             ]),
         )
@@ -7538,9 +7550,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
-    async fn revocations_for(
+    async fn revocations_for_subject(
         &self,
-        revoked_key_id: &str,
+        revoked_key_sha256_ed25519_raw: &str,
     ) -> Result<Vec<crate::federation::Revocation>, crate::federation::Error> {
         let client = self
             .get_client()
@@ -7552,14 +7564,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash \
+                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
                  FROM cirislens.federation_revocations \
-                 WHERE revoked_key_id = $1 \
+                 WHERE revoked_key_sha256_ed25519_raw = $1 \
                  ORDER BY effective_at DESC",
-                &[&revoked_key_id],
+                &[&revoked_key_sha256_ed25519_raw],
             )
             .await
-            .map_err(|e| crate::federation::Error::Backend(format!("revocations_for: {e}")))?;
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("revocations_for_subject: {e}"))
+            })?;
         rows.into_iter().map(pg_row_to_revocation).collect()
     }
 
@@ -12305,7 +12319,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        revoked_after, persist_row_hash, admitted_at \
+                        revoked_after, persist_row_hash, admitted_at, \
+                        revoked_key_sha256_ed25519_raw \
                  FROM cirislens.federation_revocations \
                  WHERE ($1::timestamptz IS NULL OR \
                         (admitted_at, revocation_id::text) > ($1, $2)) \
@@ -13372,7 +13387,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash \
+                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
                  FROM cirislens.federation_revocations WHERE revocation_id = $1",
                 &[&revocation_id],
             )
@@ -21797,6 +21812,8 @@ fn pg_row_to_revocation(
     Ok(crate::federation::Revocation {
         revocation_id: row.safe_get_with("revocation_id", mk_err)?,
         revoked_key_id: row.safe_get_with("revoked_key_id", mk_err)?,
+        revoked_key_sha256_ed25519_raw: row
+            .safe_get_with("revoked_key_sha256_ed25519_raw", mk_err)?,
         revoking_key_id: row.safe_get_with("revoking_key_id", mk_err)?,
         reason: row.safe_get_with("reason", mk_err)?,
         revoked_at: row.safe_get_with("revoked_at", mk_err)?,
@@ -22579,13 +22596,15 @@ fn pg_row_to_signed_community_membership_widening(
 /// admits (no prior row → no rollback possible).
 async fn check_revocation_anti_rollback_postgres(
     client: &deadpool_postgres::Object,
-    revoked_key_id: &str,
+    revoked_key_sha256_ed25519_raw: &str,
     submitted_ts: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), crate::federation::Error> {
+    let revoked_key_id = revoked_key_sha256_ed25519_raw;
     let row = client
         .query_opt(
             "SELECT scrub_timestamp FROM cirislens.federation_revocations \
-             WHERE revoked_key_id = $1 ORDER BY scrub_timestamp DESC LIMIT 1",
+             WHERE revoked_key_sha256_ed25519_raw = $1 \
+             ORDER BY scrub_timestamp DESC LIMIT 1",
             &[&revoked_key_id],
         )
         .await
@@ -24482,7 +24501,10 @@ impl crate::read::ReadEngine for PostgresBackend {
             let op = if revoked { "EXISTS" } else { "NOT EXISTS" };
             where_parts.push(format!(
                 "{op} (SELECT 1 FROM cirislens.federation_revocations r \
-                     WHERE r.revoked_key_id = cirislens.federation_keys.key_id)"
+                     WHERE r.revoked_key_sha256_ed25519_raw = {})",
+                crate::federation::key_digest::postgres_sql_expr(
+                    "cirislens.federation_keys.pubkey_ed25519_base64"
+                )
             ));
         }
         if let Some(pqc) = filter.pqc_completed {
@@ -24939,8 +24961,14 @@ impl crate::read::ReadEngine for PostgresBackend {
         let mut where_parts: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         if let Some(k) = &filter.revoked_key_id {
+            // v52.0.0 (#784) — the subject is the digest.
             params.push(Box::new(k.clone()));
-            where_parts.push(format!("revoked_key_id = ${}", params.len()));
+            let n = params.len();
+            where_parts.push(format!(
+                "(revoked_key_id = ${n} OR revoked_key_sha256_ed25519_raw = \
+                  (SELECT {} FROM cirislens.federation_keys k WHERE k.key_id = ${n}))",
+                crate::federation::key_digest::postgres_sql_expr("k.pubkey_ed25519_base64")
+            ));
         }
         if let Some(k) = &filter.revoking_key_id {
             params.push(Box::new(k.clone()));
@@ -24980,7 +25008,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    revoked_after, persist_row_hash \
+                    revoked_after, persist_row_hash, revoked_key_sha256_ed25519_raw \
              FROM cirislens.federation_revocations \
              {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC \
@@ -28049,6 +28077,95 @@ mod tests {
             &node,
         )
         .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222–I227, subjects by digest, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn digest_subjects_postgres_784() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let node = format!("rev784-node-pg-{}", uuid::Uuid::new_v4().simple());
+        backend.set_node_key_id(&node);
+        crate::federation::admission::r2_test_support::exercise_784_digest_subjects(
+            &backend,
+            &format!("pg784-{}", uuid::Uuid::new_v4().simple()),
+            &node,
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — I222 two nodes (two databases), on postgres.
+    #[tokio::test]
+    async fn digest_subjects_two_node_postgres_784() {
+        let (Some(da), Some(db)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn())
+        else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let a = PostgresBackend::connect(&da).await.expect("connect a");
+        a.run_migrations().await.expect("migrations a");
+        let b = PostgresBackend::connect(&db).await.expect("connect b");
+        b.run_migrations().await.expect("migrations b");
+        crate::federation::admission::r2_test_support::exercise_784_two_node(
+            &a,
+            &b,
+            &format!("pg784n-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await;
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — **I221 on postgres: V163 backfills a
+    /// legacy revocation's subject digest in SQL**, from the key it named, and
+    /// the column is then NOT NULL.
+    #[tokio::test]
+    async fn i221_v163_backfills_the_legacy_revocation_subject_postgres_784() {
+        let Some(dsn) = crate::test_pg::empty_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend
+            .run_migrations_through(162)
+            .await
+            .expect("through V162");
+        let (pk, _) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("k784-legacy-pg");
+        let client = backend.get_client().await.unwrap();
+        client
+            .batch_execute(&format!(
+                "INSERT INTO cirislens.federation_keys (key_id, pubkey_ed25519_base64, algorithm, \
+                   identity_type, identity_ref, valid_from, registration_envelope, original_content_hash, \
+                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('k1','{pk}','hybrid','node','ref1','2026-01-01T00:00:00Z','{{}}','\\x00','sig', \
+                   'k1','2026-01-01T00:00:01Z','h','2026-01-01T00:00:01Z'); \
+                 INSERT INTO cirislens.federation_revocations (revocation_id, revoked_key_id, \
+                   revoking_key_id, revoked_at, effective_at, revocation_envelope, original_content_hash, \
+                   scrub_signature_classical, scrub_key_id, scrub_timestamp, persist_row_hash, admitted_at) \
+                 VALUES ('r1','k1','k1','2026-01-05T00:00:00Z','2026-01-05T00:00:00Z','{{}}','\\x00', \
+                   'sig','k1','2026-01-05T00:00:01Z','h','2026-01-05T00:00:01Z');"
+            ))
+            .await
+            .expect("seed the V162 shape");
+        drop(client);
+        backend.run_migrations().await.expect("V163 runs");
+        let digest = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&pk)
+            .unwrap()
+            .to_hex();
+        use crate::federation::FederationDirectory as _;
+        let found = backend.revocations_for_subject(&digest).await.unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.revocation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1"],
+            "I221: the SQL backfill digests the RAW key bytes exactly as Rust does"
+        );
     }
 
     /// v31.0.0 (CIRISPersist#659) — the closed-set region gate, the
@@ -33728,7 +33845,9 @@ mod tests {
             crate::federation::tier_ingest::test_support::seal_revocation(
                 crate::federation::Revocation {
                     revocation_id: id.clone(),
-                    revoked_key_id: subject.to_owned(),
+                    revoked_key_id: Some(subject.to_owned()),
+                    revoked_key_sha256_ed25519_raw:
+                        crate::federation::tier_ingest::test_support::subject_digest_of(subject),
                     revoking_key_id: subject.to_owned(),
                     reason: Some("test".into()),
                     revoked_at: now,
@@ -35388,7 +35507,9 @@ mod tests {
         let rev = crate::federation::tier_ingest::test_support::seal_revocation(
             crate::federation::Revocation {
                 revocation_id: rev_id.clone(),
-                revoked_key_id: revoked_id.clone(),
+                revoked_key_id: Some(revoked_id.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&revoked_id),
                 revoking_key_id: revoking_id.clone(),
                 reason: Some("test".into()),
                 revoked_at: now,
@@ -35424,7 +35545,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].revoked_key_id, revoked_id);
+        assert_eq!(
+            page.items[0].revoked_key_id.as_deref(),
+            Some(revoked_id.as_str())
+        );
         assert_eq!(page.items[0].revoking_key_id, revoking_id);
     }
 
@@ -40206,7 +40330,9 @@ mod tests {
         let rev = crate::federation::tier_ingest::test_support::seal_revocation(
             crate::federation::Revocation {
                 revocation_id: rev_id.clone(),
-                revoked_key_id: target.clone(),
+                revoked_key_id: Some(target.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&target),
                 revoking_key_id: steward.clone(),
                 reason: Some("test".into()),
                 revoked_at: now,
@@ -41881,7 +42007,9 @@ mod tests {
                 revocation: crate::federation::tier_ingest::test_support::seal_revocation(
                     crate::federation::Revocation {
                         revocation_id: rev_id.clone(),
-                        revoked_key_id: target.clone(),
+                        revoked_key_id: Some(target.clone()),
+                        revoked_key_sha256_ed25519_raw:
+                            crate::federation::tier_ingest::test_support::subject_digest_of(&target),
                         revoking_key_id: steward.clone(),
                         reason: Some("test".into()),
                         revoked_at: chrono::Utc::now(),
@@ -46348,7 +46476,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_register_accord_public_key_classifies_outcomes() {
-        use crate::store::{accord_key_fingerprint, KeyRegistrationOutcome};
+        use crate::store::{sha256_of_pubkey_base64_text, KeyRegistrationOutcome};
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -46375,8 +46503,11 @@ mod tests {
             .unwrap();
         match collision {
             KeyRegistrationOutcome::RotationCollision {
-                existing_key_fingerprint,
-            } => assert_eq!(existing_key_fingerprint, accord_key_fingerprint("pubA")),
+                existing_key_sha256_of_pubkey_base64_text,
+            } => assert_eq!(
+                existing_key_sha256_of_pubkey_base64_text,
+                sha256_of_pubkey_base64_text("pubA")
+            ),
             other => panic!("expected RotationCollision, got {other:?}"),
         }
         // Non-destructive: the stored pubkey is unchanged.

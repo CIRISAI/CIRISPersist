@@ -257,6 +257,7 @@ where
     F: FederationDirectory + ?Sized,
 {
     crate::federation::admission::check_revocation_envelope_binding(row)?;
+    crate::federation::admission::check_revocation_subject(directory, row).await?;
     verify_envelope_hybrid_signature(
         directory,
         &row.revoking_key_id,
@@ -1173,6 +1174,35 @@ pub mod test_support {
             B64.encode(&ed_sig),
             Some(B64.encode(&pqc_sig)),
         )
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — the subject digest of a key registered
+    /// with [`hybrid_pubkeys`]`(pubkey_source_key_id)` (as
+    /// [`register_hybrid_key`] / [`register_hybrid_key_as`] do).
+    pub fn subject_digest_of(pubkey_source_key_id: &str) -> String {
+        let (ed, _) = hybrid_pubkeys(pubkey_source_key_id);
+        crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&ed)
+            .expect("fixture pubkey decodes")
+            .to_hex()
+    }
+
+    /// v52.0.0 (CIRISPersist#784) — the subject digest of a key `dir` HOLDS,
+    /// read from its stored pubkey (for fixtures that register keys some
+    /// other way than [`hybrid_pubkeys`]).
+    pub async fn held_subject_digest<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+    ) -> String {
+        let key = dir
+            .lookup_public_key(key_id)
+            .await
+            .expect("lookup_public_key")
+            .unwrap_or_else(|| panic!("fixture key {key_id:?} is not held"));
+        crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+            &key.pubkey_ed25519_base64,
+        )
+        .expect("fixture pubkey decodes")
+        .to_hex()
     }
 
     /// v31.0.0 (CIRISPersist#659) — **seal a [`Revocation`](crate::federation::Revocation):

@@ -1319,9 +1319,12 @@ pub struct KeyStatementFold {
 }
 
 /// v25.1.0 (CIRISPersist#570 ask 4) — **the pure fold**: a function of
-/// `(key_id, revocations, statement_at, now)` and nothing else.
+/// `(key_id, subject, revocations, statement_at, now)` and nothing else.
 ///
-/// A revocation is CONSIDERED iff it names `key_id` and has taken effect
+/// A revocation is CONSIDERED iff its SUBJECT is `subject` — the key's
+/// `sha256_ed25519_raw` digest (v52.0.0, #784: never the label-bearing
+/// `key_id`, so a digest-only revocation and one under another label of the
+/// same key both count) — and it has taken effect
 /// (`effective_at <= now`) — a future-dated de-admission has not happened yet.
 /// A considered revocation COVERS the statement iff
 /// [`Revocation::suspects_statement_at`](super::types::Revocation::suspects_statement_at).
@@ -1333,13 +1336,14 @@ pub struct KeyStatementFold {
 #[must_use]
 pub fn fold_key_statement_standing(
     key_id: &str,
+    subject: &str,
     revocations: &[super::types::Revocation],
     statement_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> KeyStatementFold {
     let considered: Vec<&super::types::Revocation> = revocations
         .iter()
-        .filter(|r| r.revoked_key_id == key_id && r.effective_at <= now)
+        .filter(|r| r.revoked_key_sha256_ed25519_raw == subject && r.effective_at <= now)
         .collect();
     let mut covered_by: Vec<String> = Vec::new();
     let mut any_unbounded = false;
@@ -1411,13 +1415,31 @@ pub async fn resolve_key_statement_standing<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let revocations = match directory.revocations_for(key_id).await {
-        Ok(rows) => rows,
-        Err(Error::Unsupported { .. }) => Vec::new(),
+    // v52.0.0 (#784) — the subject is the held key's digest; an unheld key
+    // has none, and nothing can be about it.
+    let subject = match directory.lookup_public_key(key_id).await {
+        Ok(Some(k)) => {
+            super::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&k.pubkey_ed25519_base64)
+                .map(|d| d.to_hex())
+                .map_err(|e| {
+                    Error::Backend(format!("stored pubkey of {key_id:?} is malformed: {e}"))
+                })?
+        }
+        Ok(None) | Err(Error::Unsupported { .. }) => String::new(),
         Err(e) => return Err(e),
+    };
+    let revocations = if subject.is_empty() {
+        Vec::new()
+    } else {
+        match directory.revocations_for_subject(&subject).await {
+            Ok(rows) => rows,
+            Err(Error::Unsupported { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        }
     };
     Ok(fold_key_statement_standing(
         key_id,
+        &subject,
         &revocations,
         statement_at,
         now,
@@ -2249,6 +2271,12 @@ mod bound_tests {
         s.parse().expect("rfc3339")
     }
 
+    /// A stand-in subject digest per fixture key name (64 lowercase hex).
+    fn subject_of(key: &str) -> String {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(key.as_bytes()))
+    }
+
     fn rev(
         id: &str,
         key: &str,
@@ -2262,7 +2290,8 @@ mod bound_tests {
         }
         super::super::types::Revocation {
             revocation_id: id.to_owned(),
-            revoked_key_id: key.to_owned(),
+            revoked_key_id: Some(key.to_owned()),
+            revoked_key_sha256_ed25519_raw: subject_of(key),
             revoking_key_id: "k-admin".to_owned(),
             reason: None,
             revoked_at: ts(effective_at),
@@ -2459,6 +2488,7 @@ mod bound_tests {
         // Only the bounded revocation: Monday stands.
         let f = fold_key_statement_standing(
             "k-bad",
+            &subject_of("k-bad"),
             std::slice::from_ref(&bounded),
             ts("2026-08-01T00:00:00Z"),
             now,
@@ -2474,6 +2504,7 @@ mod bound_tests {
         // …and Wednesday does not.
         let f = fold_key_statement_standing(
             "k-bad",
+            &subject_of("k-bad"),
             std::slice::from_ref(&bounded),
             ts("2026-08-02T12:00:00Z"),
             now,
@@ -2485,6 +2516,7 @@ mod bound_tests {
         // restrictions compose, leniencies do not.
         let f = fold_key_statement_standing(
             "k-bad",
+            &subject_of("k-bad"),
             &[bounded.clone(), unbounded.clone()],
             ts("2026-08-01T00:00:00Z"),
             now,
@@ -2498,7 +2530,13 @@ mod bound_tests {
     fn a_future_dated_revocation_is_not_yet_considered() {
         let now = ts("2026-08-01T00:00:00Z");
         let future = rev("r-1", "k-bad", "2026-09-01T00:00:00Z", None);
-        let f = fold_key_statement_standing("k-bad", &[future], ts("2026-07-01T00:00:00Z"), now);
+        let f = fold_key_statement_standing(
+            "k-bad",
+            &subject_of("k-bad"),
+            &[future],
+            ts("2026-07-01T00:00:00Z"),
+            now,
+        );
         assert_eq!(f.standing, KeyStatementStanding::Stands);
         assert_eq!(f.considered, 0);
     }
@@ -2507,7 +2545,13 @@ mod bound_tests {
     fn another_keys_revocation_does_not_reach_this_one() {
         let now = ts("2026-08-10T00:00:00Z");
         let other = rev("r-1", "k-other", "2026-08-02T10:00:00Z", None);
-        let f = fold_key_statement_standing("k-bad", &[other], ts("2026-08-05T00:00:00Z"), now);
+        let f = fold_key_statement_standing(
+            "k-bad",
+            &subject_of("k-bad"),
+            &[other],
+            ts("2026-08-05T00:00:00Z"),
+            now,
+        );
         assert_eq!(f.standing, KeyStatementStanding::Stands);
         assert_eq!(f.considered, 0);
     }
@@ -2607,7 +2651,9 @@ pub(crate) mod bound_test_support {
             revocation: crate::federation::tier_ingest::test_support::seal_revocation(
                 super::super::types::Revocation {
                     revocation_id: uuid::Uuid::new_v4().to_string(),
-                    revoked_key_id: revoked.to_owned(),
+                    revoked_key_id: Some(revoked.to_owned()),
+                    revoked_key_sha256_ed25519_raw:
+                        crate::federation::tier_ingest::test_support::subject_digest_of(revoked),
                     revoking_key_id: revoker.to_owned(),
                     reason: Some("compromise".to_owned()),
                     revoked_at: effective_at,
@@ -3248,7 +3294,9 @@ mod tests {
         let revocation = crate::federation::tier_ingest::test_support::seal_revocation(
             crate::federation::Revocation {
                 revocation_id: uuid::Uuid::new_v4().to_string(),
-                revoked_key_id: dereg_id.clone(),
+                revoked_key_id: Some(dereg_id.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&dereg_id),
                 revoking_key_id: dereg_id.clone(),
                 reason: Some("consent:replication withdrawn".to_owned()),
                 revoked_at: now,
@@ -3279,7 +3327,7 @@ mod tests {
             1,
             "(e) deregistered key must carry a revocation the consumer honors on read"
         );
-        assert_eq!(revs[0].revoked_key_id, dereg_id);
+        assert_eq!(revs[0].revoked_key_id.as_deref(), Some(dereg_id.as_str()));
 
         // (g) v31.0.0 (CIRISPersist#659, one plane wider) — THE HEADLINE, at
         // the REAL production door. A granting authority's signature over ONE

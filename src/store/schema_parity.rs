@@ -227,16 +227,30 @@ pub(crate) struct NullabilityDivergence {
 /// backends. The replayer could not read V080's `DROP NOT NULL`, so it believed
 /// postgres still strict and the declarations were written to match the
 /// replayer's fiction, not the databases. Same blindness as #828, opposite sign.
-pub(crate) const NULLABILITY_DIVERGENCES: &[NullabilityDivergence] = &[NullabilityDivergence {
-    table: "cirisnode.scheduled_takedown_actions",
-    column: "notice_contribution_id",
-    postgres_not_null: false,
-    reason: "The one divergence pointing the other way: sqlite is STRICTER, refusing a NULL \
+pub(crate) const NULLABILITY_DIVERGENCES: &[NullabilityDivergence] = &[
+    NullabilityDivergence {
+        table: "cirisnode.scheduled_takedown_actions",
+        column: "notice_contribution_id",
+        postgres_not_null: false,
+        reason: "The one divergence pointing the other way: sqlite is STRICTER, refusing a NULL \
                  postgres accepts. A cirisnode table persist stores for but does not admit \
                  through a federation door, so no persist caller can observe the difference; it \
                  would become observable the moment a door writes this table, which is why it is \
                  pinned and not merely tolerated.",
-}];
+    },
+    NullabilityDivergence {
+        table: "cirislens.federation_revocations",
+        column: "revoked_key_sha256_ed25519_raw",
+        postgres_not_null: true,
+        reason: "v52.0.0 (CIRISPersist#784, V163) — postgres computes the subject digest for \
+                 existing rows in SQL and then declares NOT NULL; sqlite has no SHA-256, so its \
+                 migration cannot, and the column stays NULLable there. \
+                 `SqliteBackend::backfill_revocation_subject_digests` fills every legacy row at \
+                 open, before any read, and REFUSES the open if one stays NULL; every insert \
+                 stamps it. So no sqlite reader can observe a NULL, which is why it is pinned \
+                 here rather than tolerated.",
+    },
+];
 
 /// A table whose INSERT column set differs between `sqlite.rs` and
 /// `postgres.rs`.

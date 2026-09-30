@@ -6145,13 +6145,13 @@ pub fn check_observed_region(observed_region: &str) -> Result<(), Error> {
 /// own lookup and hands the answer here, so a fix to the rule cannot land on two
 /// backends out of three.
 pub fn check_revocation_anti_rollback(
-    revoked_key_id: &str,
+    revoked_key_sha256_ed25519_raw: &str,
     latest_stored: Option<chrono::DateTime<chrono::Utc>>,
     submitted: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Error> {
     match latest_stored {
         Some(existing) if submitted <= existing => Err(Error::RevocationRollback {
-            revoked_key_id: revoked_key_id.to_owned(),
+            revoked_key_sha256_ed25519_raw: revoked_key_sha256_ed25519_raw.to_owned(),
             existing_signed_timestamp: existing,
             submitted_signed_timestamp: submitted,
         }),
@@ -8401,7 +8401,16 @@ pub fn revocation_binding(row: &super::Revocation) -> Vec<(&'static str, serde_j
         ),
         (
             REVOKED_KEY_ID_ENVELOPE_FIELD,
-            serde_json::Value::from(row.revoked_key_id.as_str()),
+            // v52.0.0 (#784) — optional; absence is an assertion (JSON null),
+            // as `reason` below.
+            match row.revoked_key_id.as_deref() {
+                Some(s) => serde_json::Value::from(s),
+                None => serde_json::Value::Null,
+            },
+        ),
+        (
+            REVOKED_KEY_SHA256_ED25519_RAW_ENVELOPE_FIELD,
+            serde_json::Value::from(row.revoked_key_sha256_ed25519_raw.as_str()),
         ),
         (
             REVOKING_KEY_ID_ENVELOPE_FIELD,
@@ -8434,8 +8443,13 @@ pub fn revocation_binding(row: &super::Revocation) -> Vec<(&'static str, serde_j
 
 /// [`revocation_binding`] member: the row's IDENTITY.
 pub const REVOCATION_ID_ENVELOPE_FIELD: &str = "revocation_id";
-/// [`revocation_binding`] member: **the SUBJECT** — which key loses standing.
+/// [`revocation_binding`] member: the subject's `key_id`, or JSON `null` when
+/// the revoker named it by digest alone (v52.0.0, #784).
 pub const REVOKED_KEY_ID_ENVELOPE_FIELD: &str = "revoked_key_id";
+/// [`revocation_binding`] member (v52.0.0, #784): **the SUBJECT** — the SHA-256
+/// of the revoked key's RAW Ed25519 public key, 64 lowercase hex. Carries no
+/// label.
+pub const REVOKED_KEY_SHA256_ED25519_RAW_ENVELOPE_FIELD: &str = "revoked_key_sha256_ed25519_raw";
 /// [`revocation_binding`] member: who took the standing away.
 pub const REVOKING_KEY_ID_ENVELOPE_FIELD: &str = "revoking_key_id";
 /// [`revocation_binding`] member: the stated reason (absent ⇔ column `None`).
@@ -8465,9 +8479,10 @@ pub const SCRUB_TIMESTAMP_ENVELOPE_FIELD: &str = "scrub_timestamp";
 /// pins the two together, because #658 is the recorded cost of a published
 /// member set that disagrees with the enforced one during the release that
 /// forces every producer to re-mint against it.
-pub const REVOCATION_BINDING_MEMBERS: [&str; 7] = [
+pub const REVOCATION_BINDING_MEMBERS: [&str; 8] = [
     REVOCATION_ID_ENVELOPE_FIELD,
     REVOKED_KEY_ID_ENVELOPE_FIELD,
+    REVOKED_KEY_SHA256_ED25519_RAW_ENVELOPE_FIELD,
     REVOKING_KEY_ID_ENVELOPE_FIELD,
     REASON_ENVELOPE_FIELD,
     REVOKED_AT_ENVELOPE_FIELD,
@@ -8514,6 +8529,67 @@ pub fn bind_revocation_into_envelope(row: &mut super::Revocation) -> Result<(), 
     })?;
     for (field, value) in binding {
         obj.insert(field.to_owned(), value);
+    }
+    Ok(())
+}
+
+/// v52.0.0 (CIRISPersist#784) — **one subject, named one way.**
+///
+/// The digest is the subject: 64 lowercase hex, always. A `revoked_key_id`
+/// beside it is a second name for the same key, admitted only when this node
+/// holds that key and its RAW Ed25519 pubkey digests to the same value —
+/// otherwise one signed row would ban one key under a label that belongs to
+/// another. A row naming a `revoked_key_id` this node does not hold is
+/// refused RETRYABLE (`revocation_subject_unresolved`): the two names cannot
+/// be checked yet.
+///
+/// A digest-only row is admitted whether or not the key is held (decision
+/// D1 on #784): authority on this plane is the REVOKER's, judged without the
+/// subject's record, and every reader keys on the digest, so the ban bites
+/// when the key arrives. This deliberately relaxes V004's "cannot revoke a
+/// key not in the directory".
+///
+/// Runs inside [`super::tier_ingest::verify_revocation_admission`], the
+/// verifier every backend's put and apply share.
+///
+/// # Errors
+/// [`Error::RevocationSubjectRefused`].
+pub async fn check_revocation_subject<F>(
+    directory: &F,
+    row: &super::Revocation,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let refuse = |reason: &'static str, detail: String| Error::RevocationSubjectRefused {
+        revocation_id: row.revocation_id.clone(),
+        reason,
+        detail,
+    };
+    let digest = super::key_digest::Sha256Ed25519Raw::parse(&row.revoked_key_sha256_ed25519_raw)
+        .map_err(|e| refuse("revocation_subject_digest_malformed", e))?;
+    let Some(key_id) = row.revoked_key_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(key) = directory.lookup_public_key(key_id).await? else {
+        return Err(refuse(
+            "revocation_subject_unresolved",
+            format!(
+                "`revoked_key_id` {key_id:?} is not held here, so it cannot be checked against \
+                 the digest; name the subject by digest alone or re-offer once the key arrives"
+            ),
+        ));
+    };
+    let held = super::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&key.pubkey_ed25519_base64)
+        .map_err(|e| refuse("revocation_subject_unresolved", format!("{key_id:?}: {e}")))?;
+    if held != digest {
+        return Err(refuse(
+            "revocation_subject_digest_mismatch",
+            format!(
+                "`revoked_key_id` {key_id:?} digests to {held}, the row names {digest} — one \
+                 subject is never named two ways"
+            ),
+        ));
     }
     Ok(())
 }
@@ -8719,7 +8795,7 @@ pub fn check_revocation_scrub_skew(
         return Ok(());
     }
     Err(Error::RevocationScrubSkew {
-        revoked_key_id: row.revoked_key_id.clone(),
+        revoked_key_sha256_ed25519_raw: row.revoked_key_sha256_ed25519_raw.clone(),
         submitted_signed_timestamp: row.scrub_timestamp,
         ahead_seconds: (row.scrub_timestamp - now).num_seconds(),
         tolerance_seconds: max_skew.num_seconds(),
@@ -8763,15 +8839,22 @@ pub async fn check_revocation_authority(
     directory: &dyn super::FederationDirectory,
     row: &super::Revocation,
 ) -> Result<(), Error> {
-    // Self-revocation: always. See the doc above — this is the remedy path.
-    if row.revoking_key_id == row.revoked_key_id {
-        return Ok(());
-    }
     // An unattributed revocation cannot be authorised against anything. The
     // existing `revoking_key_id.is_empty()` paths predate attribution and are
     // left alone rather than silently re-classified as self-revocation.
     if row.revoking_key_id.is_empty() {
         return Ok(());
+    }
+    // Self-revocation: always. See the doc above — this is the remedy path.
+    // v52.0.0 (#784) — "self" is the KEY, not the label: the revoker's own
+    // held key digests to the subject. A digest-only self-revocation is still
+    // one, and a row naming the revoker's key_id with another digest is not.
+    if let Some(revoker) = directory.lookup_public_key(&row.revoking_key_id).await? {
+        if super::key_digest::Sha256Ed25519Raw::from_pubkey_base64(&revoker.pubkey_ed25519_base64)
+            .is_ok_and(|d| d.to_hex() == row.revoked_key_sha256_ed25519_raw)
+        {
+            return Ok(());
+        }
     }
     let Some(node) = directory.node_key_id() else {
         return Err(Error::NodeIdentityUnset {
@@ -8790,7 +8873,7 @@ pub async fn check_revocation_authority(
     if conferred.is_none() {
         return Err(Error::DelegatedScopeUnauthorized {
             signer: row.revoking_key_id.clone(),
-            on_behalf_of: row.revoked_key_id.clone(),
+            on_behalf_of: row.revoked_key_sha256_ed25519_raw.clone(),
             scope: DELEGATION_SCOPE_SLASH.to_owned(),
         });
     }
@@ -13865,6 +13948,37 @@ pub async fn check_consent_for_key_admission(
     )))
 }
 
+/// v52.0.0 (CIRISPersist#784, decision D2) — the envelope member a
+/// `moderation:*` row names its SUBJECT KEY by, without the label a `key_id`
+/// carries: the SHA-256 of the key's RAW Ed25519 public key, 64 lowercase hex.
+/// Additive and optional in v52 (a label-bearing row is not refused).
+pub const MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD: &str = "subject_sha256_ed25519_raw";
+
+/// v52.0.0 (#784, D2) — the subject key a `moderation:*` row names by digest,
+/// if it names one. The one reading every consumer uses, so the member means
+/// the same thing everywhere.
+///
+/// # Errors
+/// [`Error::InvalidArgument`] (`moderation_subject_digest_malformed`) for a
+/// present member that is not a string of 64 lowercase hex digits.
+pub fn moderation_subject_digest(
+    envelope: &serde_json::Value,
+) -> Result<Option<super::key_digest::Sha256Ed25519Raw>, Error> {
+    let Some(v) = envelope.get(MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD) else {
+        return Ok(None);
+    };
+    v.as_str()
+        .ok_or_else(|| "not a string".to_owned())
+        .and_then(super::key_digest::Sha256Ed25519Raw::parse)
+        .map(Some)
+        .map_err(|e| {
+            Error::InvalidArgument(format!(
+                "moderation_subject_digest_malformed: `{MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD}` \
+                 {v}: {e} (CIRISPersist#784)"
+            ))
+        })
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25 §11.10) — `put_attestation`
 /// entry point for the **report → `scores`** half of the moderation gate.
 /// A no-op (`Ok(())`) for any attestation that is not a `scores` row on a
@@ -13889,6 +14003,9 @@ pub async fn check_delegated_duty_scores_admission(
         return Ok(());
     };
     let duty = if dimension.starts_with(MODERATION_DIMENSION_PREFIX) {
+        // v52.0.0 (#784, D2) — a present subject digest must be well formed;
+        // a malformed one is refused, not read as absent.
+        moderation_subject_digest(&row.attestation_envelope)?;
         DELEGATION_SCOPE_MODERATE
     } else if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
         DELEGATION_SCOPE_REVIEW
@@ -15467,7 +15584,9 @@ mod tests {
         let t: chrono::DateTime<chrono::Utc> = "2026-08-01T00:00:00Z".parse().expect("rfc3339");
         super::super::Revocation {
             revocation_id: "rid-1".to_owned(),
-            revoked_key_id: "k-subject".to_owned(),
+            revoked_key_id: Some("k-subject".to_owned()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of("k-subject"),
             revoking_key_id: "k-moderator".to_owned(),
             reason: reason.map(str::to_owned),
             revoked_at: t,
@@ -15482,6 +15601,83 @@ mod tests {
             observed_region: "us".to_owned(),
             revoked_after: None,
             persist_row_hash: String::new(),
+        }
+    }
+
+    /// v52.0.0 (CIRISPersist#784, D2) — **I229: a `moderation:*` row may name
+    /// its subject key by digest**; the one reader resolves it, and a malformed
+    /// digest is refused at admission rather than read as absent.
+    #[tokio::test]
+    async fn i229_moderation_names_its_subject_by_digest_784() {
+        let d = crate::federation::key_digest::Sha256Ed25519Raw::from_pubkey_bytes(&[9u8; 32]);
+        let env = |subject: serde_json::Value| {
+            serde_json::json!({
+                "kind": "scores",
+                "dimension": "moderation:spam:v1",
+                "community_id": "c-784",
+                MODERATION_SUBJECT_DIGEST_ENVELOPE_FIELD: subject,
+            })
+        };
+        assert_eq!(
+            moderation_subject_digest(&env(d.to_hex().into())).unwrap(),
+            Some(d)
+        );
+        assert_eq!(
+            moderation_subject_digest(&serde_json::json!({ "dimension": "moderation:x:v1" }))
+                .unwrap(),
+            None
+        );
+        for bad in [
+            serde_json::Value::from(d.to_hex().to_uppercase()),
+            serde_json::Value::from("frank-laptop-abc"),
+            serde_json::Value::from(7),
+        ] {
+            assert!(
+                moderation_subject_digest(&env(bad.clone())).is_err(),
+                "{bad}"
+            );
+        }
+        // Through the admission gate: the shape is judged before authority.
+        let dir = crate::store::memory::MemoryBackend::new();
+        let mut row = rev_row_scores_784(env(serde_json::Value::from("not-a-digest")));
+        let e = check_delegated_duty_scores_admission(&dir, &row)
+            .await
+            .expect_err("a malformed subject digest is refused");
+        assert!(
+            format!("{e}").contains("moderation_subject_digest_malformed"),
+            "I229: {e}"
+        );
+        row.attestation_envelope = env(d.to_hex().into());
+        let e = check_delegated_duty_scores_admission(&dir, &row).await;
+        assert!(
+            !format!("{e:?}").contains("moderation_subject_digest_malformed"),
+            "I229: a well-formed digest passes the shape check: {e:?}"
+        );
+    }
+
+    fn rev_row_scores_784(envelope: serde_json::Value) -> super::super::Attestation {
+        super::super::Attestation {
+            attestation_id: "a-784".into(),
+            attesting_key_id: "k-784".into(),
+            attested_key_id: "k-784".into(),
+            attestation_type: attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k-784".into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![],
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+            additional_scrubs: vec![],
         }
     }
 
@@ -22378,7 +22574,9 @@ pub(crate) mod r2_test_support {
         let build = |revoked: &str, at: chrono::DateTime<Utc>| {
             seal_revocation(Revocation {
                 revocation_id: uuid::Uuid::new_v4().to_string(),
-                revoked_key_id: revoked.to_owned(),
+                revoked_key_id: Some(revoked.to_owned()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(revoked),
                 revoking_key_id: moderator.clone(),
                 reason: Some("the #659 slash the moderator really performed".to_owned()),
                 revoked_at: at,
@@ -22440,7 +22638,7 @@ pub(crate) mod r2_test_support {
         // (b) THE RE-PASTE — the moderator's own signature, over the moderator's
         //     own preimage, pointed at a key it never named.
         let mut lifted = honest.clone();
-        lifted.revoked_key_id.clone_from(&unnamed);
+        lifted.revoked_key_id = Some(unnamed.clone());
         refused(lifted, "(b)", "revoked_key_id".to_owned()).await;
 
         // (c) THE UNBOUNDED FAN-OUT — same subject, fresh identity. One
@@ -22549,6 +22747,275 @@ pub(crate) mod r2_test_support {
         );
     }
 
+    /// v52.0.0 (CIRISPersist#784) — **a revocation names its subject by
+    /// digest, and every reader finds it that way.** I222–I227 on one backend:
+    ///
+    /// - I222: a digest-only SELF-revocation is admitted and `revocations_for`
+    ///   finds it under BOTH labels of the one key; the key listing's
+    ///   `revoked` filter and the statement-standing fold see it too.
+    /// - I223/I227 (D1): a slash moderator's digest-only revocation of a key
+    ///   this node does NOT hold is admitted, its served bytes carry no
+    ///   substring of the subject's label, and it bites the moment the key
+    ///   record arrives.
+    /// - I224: `key_id` beside a different key's digest is
+    ///   `revocation_subject_digest_mismatch`; a `key_id` not held is
+    ///   `revocation_subject_unresolved`; an uppercase digest is
+    ///   `revocation_subject_digest_malformed`.
+    /// - I225: the digest is SIGNED — a sealed row re-pointed at another
+    ///   key's digest is refused by the binding gate, naming the member.
+    /// - I226: anti-rollback is per KEY: an older revocation under the other
+    ///   label of the same key cannot land after a newer one.
+    pub(crate) async fn exercise_784_digest_subjects(
+        dir: &dyn FederationDirectory,
+        tag: &str,
+        node: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support::{
+            held_subject_digest, register_hybrid_key, register_hybrid_key_as, seal_revocation,
+            subject_digest_of,
+        };
+        use crate::federation::{Revocation, SignedRevocation};
+        let now = truncate_to_substrate_resolution(Utc::now()) - chrono::Duration::minutes(10);
+        let mk = |revoker: &str, key_id: Option<&str>, digest: &str, at: chrono::DateTime<Utc>| {
+            seal_revocation(Revocation {
+                revocation_id: uuid::Uuid::new_v4().to_string(),
+                revoked_key_id: key_id.map(str::to_owned),
+                revoked_key_sha256_ed25519_raw: digest.to_owned(),
+                revoking_key_id: revoker.to_owned(),
+                reason: Some("784".to_owned()),
+                revoked_at: at,
+                effective_at: at,
+                revocation_envelope: serde_json::json!({}),
+                original_content_hash: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
+                scrub_key_id: revoker.to_owned(),
+                scrub_timestamp: at,
+                pqc_completed_at: None,
+                observed_region: "us".to_owned(),
+                revoked_after: None,
+                persist_row_hash: String::new(),
+            })
+        };
+        let put = |r: Revocation| dir.put_revocation(SignedRevocation { revocation: r });
+        let reason_of = |e: &Error| match e {
+            Error::RevocationSubjectRefused { reason, .. } => *reason,
+            other => panic!("({tag}) #784: expected RevocationSubjectRefused, got {other}"),
+        };
+
+        // ── I222: one key, two labels; a digest-only self-revocation. ──
+        let label_a = format!("frank-laptop784-{tag}");
+        let label_b = format!("frank-phone784-{tag}");
+        register_hybrid_key(dir, &label_a).await;
+        register_hybrid_key_as(
+            dir,
+            &label_b,
+            &label_a,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let digest = subject_digest_of(&label_a);
+        assert_eq!(held_subject_digest(dir, &label_b).await, digest);
+        put(mk(&label_a, None, &digest, now))
+            .await
+            .unwrap_or_else(|e| panic!("({tag}) I222: a digest-only self-revocation: {e}"));
+        for label in [&label_a, &label_b] {
+            let found = dir.revocations_for(label).await.unwrap();
+            assert_eq!(
+                found.len(),
+                1,
+                "({tag}) I222: `revocations_for({label})` finds the digest-only revocation"
+            );
+            assert!(found[0].revoked_key_id.is_none());
+            let fold = crate::federation::register::resolve_key_statement_standing(
+                dir,
+                label,
+                now + chrono::Duration::minutes(1),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                fold.standing.is_suspect(),
+                "({tag}) I222: the standing fold sees it under {label}: {fold:?}"
+            );
+        }
+
+        // ── I226: per-KEY anti-rollback across labels. ──
+        let e = put(mk(
+            &label_a,
+            Some(&label_b),
+            &digest,
+            now - chrono::Duration::minutes(1),
+        ))
+        .await
+        .expect_err("an older revocation of the same key under the other label");
+        assert_eq!(
+            e.kind(),
+            "federation_revocation_rollback",
+            "({tag}) I226: refused by the per-subject floor: {e}"
+        );
+
+        // ── I224: one subject, one way. ──
+        let other = format!("other784-{tag}");
+        register_hybrid_key(dir, &other).await;
+        let other_digest = subject_digest_of(&other);
+        let e = put(mk(&other, Some(&other), &digest, now))
+            .await
+            .expect_err("a key_id beside another key's digest");
+        assert_eq!(
+            reason_of(&e),
+            "revocation_subject_digest_mismatch",
+            "({tag}) I224"
+        );
+        let e = put(mk(
+            &other,
+            Some(&format!("ghost784-{tag}")),
+            &other_digest,
+            now,
+        ))
+        .await
+        .expect_err("a key_id this node does not hold");
+        assert_eq!(
+            reason_of(&e),
+            "revocation_subject_unresolved",
+            "({tag}) I224"
+        );
+        let e = put(mk(&other, None, &other_digest.to_uppercase(), now))
+            .await
+            .expect_err("an uppercase digest");
+        assert_eq!(
+            reason_of(&e),
+            "revocation_subject_digest_malformed",
+            "({tag}) I224"
+        );
+
+        // ── I225: the digest is inside the signed bytes. ──
+        let mut repointed = mk(&other, None, &other_digest, now);
+        repointed.revoked_key_sha256_ed25519_raw = digest.clone();
+        let e = put(repointed)
+            .await
+            .expect_err("a sealed row re-pointed at another key");
+        assert_eq!(
+            e.kind(),
+            "federation_revocation_envelope_unbound",
+            "({tag}) I225: {e}"
+        );
+        assert!(
+            format!("{e}").contains(REVOKED_KEY_SHA256_ED25519_RAW_ENVELOPE_FIELD),
+            "({tag}) I225: the refusal names the digest member: {e}"
+        );
+
+        // ── I223 + I227 (D1): a moderator bans a key this node has never seen. ──
+        let moderator = format!("mod784-{tag}");
+        let root = format!("root784-{tag}");
+        let unseen = format!("unseen-alice784-{tag}");
+        register_hybrid_key(dir, &moderator).await;
+        confer_scope_from_trusted_root(dir, node, &root, &moderator, DELEGATION_SCOPE_SLASH).await;
+        let unseen_digest = subject_digest_of(&unseen);
+        assert!(dir.lookup_public_key(&unseen).await.unwrap().is_none());
+        let ban = mk(&moderator, None, &unseen_digest, now);
+        let ban_id = ban.revocation_id.clone();
+        put(ban).await.unwrap_or_else(|e| {
+            panic!("({tag}) I227: a digest-only ban of an unheld key is admitted (D1): {e}")
+        });
+        let served = dir
+            .list_signed_revocations_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.revocation.revocation_id == ban_id)
+            .expect("the ban is served");
+        let bytes = serde_json::to_string(&crate::federation::SignedRevocation {
+            revocation: served.revocation,
+        })
+        .unwrap();
+        assert!(
+            !bytes.contains("unseen-alice") && !bytes.contains(&unseen),
+            "({tag}) I223: the served ban carries no substring of its subject's label"
+        );
+        assert!(dir.revocations_for(&unseen).await.unwrap().is_empty());
+        register_hybrid_key(dir, &unseen).await;
+        let bites = dir.revocations_for(&unseen).await.unwrap();
+        assert_eq!(
+            bites
+                .iter()
+                .map(|r| r.revocation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![ban_id.as_str()],
+            "({tag}) I227: the ban bites the moment the key record arrives"
+        );
+    }
+
+    /// I222 (two nodes, delivered through the plane) — node A admits a
+    /// digest-only self-revocation; node B applies the SERVED row and finds it
+    /// under a second label of the same key that A never saw.
+    pub(crate) async fn exercise_784_two_node(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::tier_ingest::test_support::{
+            register_hybrid_key, register_hybrid_key_as, seal_revocation, subject_digest_of,
+        };
+        let label_a = format!("dev1-784n-{tag}");
+        let label_b = format!("dev2-784n-{tag}");
+        register_hybrid_key(a, &label_a).await;
+        register_hybrid_key(b, &label_a).await;
+        register_hybrid_key_as(
+            b,
+            &label_b,
+            &label_a,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+        let at = truncate_to_substrate_resolution(Utc::now()) - chrono::Duration::minutes(5);
+        let row = seal_revocation(crate::federation::Revocation {
+            revocation_id: uuid::Uuid::new_v4().to_string(),
+            revoked_key_id: None,
+            revoked_key_sha256_ed25519_raw: subject_digest_of(&label_a),
+            revoking_key_id: label_a.clone(),
+            reason: None,
+            revoked_at: at,
+            effective_at: at,
+            revocation_envelope: serde_json::json!({}),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: label_a.clone(),
+            scrub_timestamp: at,
+            pqc_completed_at: None,
+            observed_region: "us".to_owned(),
+            revoked_after: None,
+            persist_row_hash: String::new(),
+        });
+        let id = row.revocation_id.clone();
+        a.put_revocation(crate::federation::SignedRevocation { revocation: row })
+            .await
+            .expect("A admits");
+        let served = a
+            .list_signed_revocations_since(None, u32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.revocation.revocation_id == id)
+            .expect("A serves it");
+        b.put_revocation(crate::federation::SignedRevocation {
+            revocation: served.revocation,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("({tag}) I222: B applies the served digest-only row: {e}"));
+        let found = b.revocations_for(&label_b).await.unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|r| r.revocation_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![id.as_str()],
+            "({tag}) I222: B finds it under a label A never held"
+        );
+    }
+
     /// **v31.0.0 (CIRISPersist#659) — the two gates MEMORY never ran, and the
     /// anti-rollback CEILING none of the three had.**
     ///
@@ -22582,7 +23049,9 @@ pub(crate) mod r2_test_support {
         let build = |scrub_at: chrono::DateTime<Utc>, region: &str| {
             seal_revocation(Revocation {
                 revocation_id: uuid::Uuid::new_v4().to_string(),
-                revoked_key_id: holder.clone(),
+                revoked_key_id: Some(holder.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&holder),
                 revoking_key_id: holder.clone(),
                 reason: Some("retiring my own key".to_owned()),
                 revoked_at: base,
@@ -26960,7 +27429,9 @@ pub(crate) mod backend_parity_test_support {
         let (och, sig_c, sig_p) = ts::sign_envelope(who, &envelope);
         ts::seal_revocation(Revocation {
             revocation_id: id.to_owned(),
-            revoked_key_id: who.to_owned(),
+            revoked_key_id: Some(who.to_owned()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of(who),
             revoking_key_id: who.to_owned(),
             reason: Some("660 parity".to_owned()),
             revoked_at: at,

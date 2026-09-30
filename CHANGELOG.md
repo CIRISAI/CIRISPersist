@@ -121,6 +121,66 @@ I67 allows `abandon_stream_floor`'s grant deletes (each rides its own blob row's
 | M8 | memory's local door skips the history | I278 |
 | M9 | postgres's signed door writes no history row | I270–I278 on postgres, and the rc5 node-bearing runners |
 
+### #784 — a revocation names its subject by the raw key's digest, not its label
+
+**Changed — BREAKING: the revocation's subject is `revoked_key_sha256_ed25519_raw` (CIRISPersist#784).** A `key_id` is `<label>-<fingerprint>` with the keystore label in cleartext, so every revocation published its subject's label to every node it reached. `Revocation` now carries **`revoked_key_sha256_ed25519_raw`**: the SHA-256 of the key's RAW 32-byte Ed25519 public key, 64 lowercase hex (`federation::key_digest::Sha256Ed25519Raw`, the primitive `derive_key_id` truncates). It is required and SIGNED: the revocation binding goes from 7 to **8 members** (`REVOCATION_BINDING_MEMBERS`), so every revocation preimage moves. **`revoked_key_id` is now `Option<String>`**, bound as JSON `null` when absent. When present it must name a key this node holds with the same digest; otherwise the row is refused `revocation_subject_digest_mismatch`, or `revocation_subject_unresolved` (retryable) when the key is not held. A digest that is not 64 lowercase hex is refused `revocation_subject_digest_malformed`. All three come as `Error::RevocationSubjectRefused` (Python `ValueError`), from `admission::check_revocation_subject` in the shared `verify_revocation_admission`.
+
+**Changed — a digest-only revocation of a key this node does not hold is ADMITTED (decision D1).** Authority on this plane belongs to the revoker and is judged without the subject's record. Every reader keys on the digest, so the revocation bites the moment the key record arrives. This deliberately relaxes V004's "cannot revoke a key not in the directory": V163 drops the FK on `revoked_key_id`.
+
+**Changed — every reader keys on the digest.** `FederationDirectory::revocations_for(key_id)` is now PROVIDED: it resolves the held key's digest and asks the new required **`revocations_for_subject(digest)`**, so a revocation is found under every label of one key, and a key this node does not hold returns none. The following re-key to the subject as well:
+- the per-subject anti-rollback floor and ceiling (`Error::RevocationRollback` / `RevocationScrubSkew` field `revoked_key_id` renamed `revoked_key_sha256_ed25519_raw`);
+- the signed wire-index locator;
+- the key listing's `revoked` filter and the read API's `revoked_key_id` filter;
+- key deletion;
+- `register::fold_key_statement_standing` (new `subject` argument) / `resolve_key_statement_standing`.
+
+Self-revocation is judged by digest (the revoker's own key digests to the subject), so a digest-only self-revocation is still one.
+
+**Migration V163 (both dialects).** `federation_revocations.revoked_key_id` becomes NULLable with no FK, and `revoked_key_sha256_ed25519_raw` is added and indexed.
+- **Postgres** backfills it in SQL (`encode(sha256(decode(pubkey,'base64')),'hex')`), then sets NOT NULL plus a shape CHECK.
+- **SQLite** has no SHA-256, so the table is rebuilt (the V141 staged recipe; `federation_revocation_quorum_state` staged) with the column NULLable. `SqliteBackend::backfill_revocation_subject_digests` fills legacy rows at open and REFUSES the open if one stays NULL. The divergence is declared in `NULLABILITY_DIVERGENCES`.
+- SQLite now registers `ciris_sha256_ed25519_raw()` on every connection, for queries only (rusqlite `functions` feature).
+
+**Changed — directory capsule `DIRECTORY_ABI_VERSION` 6 → 7** (a payload break: `Revocations` / `SignedRevocations` carry the new `Revocation`), plus the appended op `RevocationsForSubject`.
+
+**Added — `moderation:*` rows may name `subject_sha256_ed25519_raw` (decision D2, additive).** `admission::moderation_subject_digest` is the one reading. A present malformed value is refused (`moderation_subject_digest_malformed`); label-bearing rows are NOT refused in v52.
+
+**Changed — clean-break renames:** `store::accord_key_fingerprint` → `sha256_of_pubkey_base64_text` (it hashes the base64 TEXT, which is not a key identifier), and `KeyRegistrationOutcome::RotationCollision.existing_key_fingerprint` → `existing_key_sha256_of_pubkey_base64_text`, including the Python dict key.
+
+**Not changed (deliberate):** the community and family room-removal planes still name `removed_identity_key_id`. Their rows reach exactly the audience that holds the roster, which lists every member's label, so digest-addressing them would hide nothing from anyone who receives them. That wait belongs to label-free rosters. CC erratum drafted for the steward (the preimage moved).
+
+**Witnesses** (memory, sqlite, postgres):
+- I220: the digest is the raw-key primitive (cross-checked against `derive_key_id`'s suffix; differs from the text digest).
+- I221: legacy backfill; sqlite refuses an undigestable legacy subject.
+- I222: a digest-only self-revocation found under both labels of one key, and by the statement-standing fold; two-node, delivered through the served plane to a node that holds a label the origin never saw.
+- I223: a served ban carries no substring of its subject's label.
+- I224: mismatch / unresolved / malformed.
+- I225: the digest is inside the signed bytes.
+- I226: anti-rollback is per key, across labels.
+- I227: D1, a ban of an unheld key bites on arrival.
+- I229: the moderation digest.
+
+**Mutation round** (committed tree 093abf2c; lane = the #784 witnesses + `key_digest` + the #659 projection pin, sqlite+memory; M10 on postgres): **10/10 killed.**
+
+| # | Mutant | Killed by |
+|---|---|---|
+| M1 | the digest hashes the base64 TEXT | I220 |
+| M2 | the key_id/digest mismatch check dropped | I224 (memory, sqlite) |
+| M3 | sqlite's subject read keyed on `revoked_key_id` | I222, I222 two-node, I221 |
+| M4 | the digest omitted from the signed binding | the #659 projection pin, I225 |
+| M5 | sqlite anti-rollback keyed on `revoked_key_id` | I226 |
+| M6 | sqlite's open-time backfill skipped | I221 |
+| M7 | D1 flipped: a digest-only row refused | I222, I222 two-node, I227 (memory, sqlite) |
+| M8 | self-revocation recognised by `key_id` only | I222 (memory, sqlite, two-node) |
+| M9 | a malformed moderation digest read as absent | I229 |
+| M10 | postgres's subject read keyed on `revoked_key_id` | I221, I222, I222 two-node on postgres |
+
+**Adopters:**
+- **Edge and Server:** build `Revocation` with the digest (`Sha256Ed25519Raw::from_pubkey_base64`), `revoked_key_id: Option`, and re-mint against the 8-member binding.
+- **Implementors of `FederationDirectory`:** implement `revocations_for_subject`.
+- **Capsule consumers:** pin ABI 7.
+- **Python:** `put_revocation` / `deregister_federation_key` JSON carries `revoked_key_sha256_ed25519_raw`, and the rotation-collision dict key is renamed.
+
 ## [51.3.0] - UNRELEASED
 
 **MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.

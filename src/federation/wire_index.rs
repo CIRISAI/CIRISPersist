@@ -272,10 +272,12 @@ pub async fn reload_record_bytes(
         // targeted through `revocations_for` (the subject read) and wraps in
         // the SAME `SignedRevocation` shape `list_signed_revocations_since`
         // returns, so both derivations hash identical bytes.
+        // v52.0.0 (#784) — located by the SUBJECT digest, never the
+        // label-bearing key_id (a digest-only row has no key_id at all).
         "Revocation" => {
-            let revoked_key_id = record_key_field(record_key_json, "revoked_key_id")?;
+            let subject = record_key_field(record_key_json, "revoked_key_sha256_ed25519_raw")?;
             let revocation_id = record_key_field(record_key_json, "revocation_id")?;
-            let rows = dir.revocations_for(&revoked_key_id).await?;
+            let rows = dir.revocations_for_subject(&subject).await?;
             match rows.into_iter().find(|r| r.revocation_id == revocation_id) {
                 Some(revocation) => Some(
                     serde_json::to_vec(&super::SignedRevocation { revocation })
@@ -625,7 +627,10 @@ pub async fn wire_refs_for_subject(
     // this read answers.
     for revocation in dir.revocations_for(subject_key_id).await? {
         let rk = record_key(&[
-            ("revoked_key_id", &revocation.revoked_key_id),
+            (
+                "revoked_key_sha256_ed25519_raw",
+                &revocation.revoked_key_sha256_ed25519_raw,
+            ),
             ("revocation_id", &revocation.revocation_id),
         ]);
         let wrapped = super::SignedRevocation { revocation };
@@ -755,7 +760,10 @@ pub async fn all_kind_hash_keys(
     // every node holding it.
     for r in dir.list_signed_revocations_since(None, u32::MAX).await? {
         let rk = record_key(&[
-            ("revoked_key_id", &r.revocation.revoked_key_id),
+            (
+                "revoked_key_sha256_ed25519_raw",
+                &r.revocation.revoked_key_sha256_ed25519_raw,
+            ),
             ("revocation_id", &r.revocation.revocation_id),
         ]);
         let wrapped = super::SignedRevocation {

@@ -2037,7 +2037,9 @@ pub(crate) mod carriage_tests {
         let revocation_id = uuid::Uuid::new_v4().to_string();
         let row = seal_revocation(crate::federation::types::Revocation {
             revocation_id: revocation_id.clone(),
-            revoked_key_id: subject.clone(),
+            revoked_key_id: Some(subject.clone()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of(&subject),
             revoking_key_id: subject.clone(),
             reason: Some("compromise".to_owned()),
             revoked_at: now,
@@ -2066,7 +2068,10 @@ pub(crate) mod carriage_tests {
             .iter()
             .find(|r| r.revocation.revocation_id == revocation_id)
             .expect("the stored revocation must be served");
-        assert_eq!(served.revocation.revoked_key_id, subject);
+        assert_eq!(
+            served.revocation.revoked_key_id.as_deref(),
+            Some(subject.as_str())
+        );
 
         // ── The cursor is a cursor: `since` at the row's own resume PAIR
         //    excludes it, so a caller resuming from its last page does not
@@ -2130,7 +2135,9 @@ pub(crate) mod carriage_tests {
         let late_id = uuid::Uuid::new_v4().to_string();
         let late_row = seal_revocation(crate::federation::types::Revocation {
             revocation_id: late_id.clone(),
-            revoked_key_id: late_subject.clone(),
+            revoked_key_id: Some(late_subject.clone()),
+            revoked_key_sha256_ed25519_raw:
+                crate::federation::tier_ingest::test_support::subject_digest_of(&late_subject),
             revoking_key_id: late_subject.clone(),
             reason: Some("compromise".to_owned()),
             revoked_at: old_instant,

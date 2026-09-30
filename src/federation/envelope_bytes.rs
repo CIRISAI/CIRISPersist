@@ -381,7 +381,9 @@ pub(crate) mod test_support {
         let revocation = crate::federation::tier_ingest::test_support::seal_revocation(
             crate::federation::Revocation {
                 revocation_id: rev_id.clone(),
-                revoked_key_id: rev_kid.clone(),
+                revoked_key_id: Some(rev_kid.clone()),
+                revoked_key_sha256_ed25519_raw:
+                    crate::federation::tier_ingest::test_support::subject_digest_of(&rev_kid),
                 revoking_key_id: rev_kid.clone(),
                 reason: Some("644 byte-exactness witness".to_owned()),
                 revoked_at: now,
@@ -411,7 +413,7 @@ pub(crate) mod test_support {
             .expect("revocations_for");
         let reloaded_rev = revs
             .iter()
-            .find(|r| r.revoked_key_id == rev_kid)
+            .find(|r| r.revoked_key_id.as_deref() == Some(rev_kid.as_str()))
             .expect("the revocation we just wrote is there");
         assert_envelope_bytes_eq(
             "federation_revocations.revocation_envelope",
