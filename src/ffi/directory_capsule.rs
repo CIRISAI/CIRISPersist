@@ -3263,6 +3263,18 @@ impl FederationDirectory for OpsDirectory {
             method: "list_identity_occurrences_by_occurrence_key",
         })
     }
+    // v52.0.0 (CIRISPersist#930) — not routed, like the current-state read
+    // above: the node-bearing fold runs on the Engine's own backend.
+    // `Unsupported` is an error, never an empty history — fail-closed.
+    async fn list_identity_occurrence_history_by_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::OccurrenceAssertion>, Error> {
+        let _ = occurrence_key_id;
+        Err(Error::Unsupported {
+            method: "list_identity_occurrence_history_by_occurrence",
+        })
+    }
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,

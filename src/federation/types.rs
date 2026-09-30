@@ -3041,6 +3041,25 @@ pub struct SignedIdentityOccurrence {
     pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
+/// v52.0.0 (CIRISPersist#930) — **one admitted occurrence assertion**, as the
+/// append-only history (V161) keeps it. The current-state plane keeps only the
+/// latest assertion per `(identity, occurrence)`; this keeps every one either
+/// put door admitted, so a fold judged at an earlier instant never changes
+/// when a later assertion lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OccurrenceAssertion {
+    /// The identity the occurrence was asserted for.
+    pub identity_key_id: String,
+    /// The occurrence key.
+    pub occurrence_key_id: String,
+    /// The assertion's own signed instant.
+    pub asserted_at: DateTime<Utc>,
+    /// The assertion's `valid_until`, if any.
+    pub valid_until: Option<DateTime<Utc>>,
+    /// Who signed it; `None` for a trusted-local (unsigned) row.
+    pub attesting_key_id: Option<String>,
+}
+
 /// One member of a [`Family`] — an IDENTITY key plus when they
 /// joined plus an optional role tag.
 ///

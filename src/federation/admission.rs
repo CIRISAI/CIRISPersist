@@ -5114,12 +5114,12 @@ pub async fn verify_signed_transport_destination(
     }
     // `binding_provenance` comes ONLY from the verified envelope (the AV-42 /
     // #336 hijack asserted `Rooted` on an unauthenticated wire field). An
-    // absent/unknown token reads `Rooted` per the V100 back-compat rule, so a
-    // typed `Advisory` with an envelope that omits the field DIVERGES —
-    // fail-closed either way.
+    // ABSENT token reads `Rooted` per the V100 back-compat rule, so a typed
+    // `Advisory` with an envelope that omits the field DIVERGES. v52.0.0 — an
+    // UNKNOWN token refuses (it read `Rooted` until then: fail-open).
     let env_provenance = crate::federation::self_at_login::BindingProvenance::from_token(
         opt_str_field("binding_provenance")?.as_deref(),
-    );
+    )?;
     if env_provenance != row.binding_provenance {
         return Err(diverges("binding_provenance"));
     }
