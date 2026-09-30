@@ -732,11 +732,20 @@ mod tests {
                 "\n}\n",
                 "would_hold(",
             ),
+            // v52.0.0 (#957) — the chunk door that decides is the batched one;
+            // the single `adopt_sealed_chunk` is its batch of one and must
+            // delegate to it (checked below), never accept around it.
+            (
+                "src/federation/adopt_cascade.rs",
+                "pub async fn adopt_sealed_chunks<",
+                "\n}\n",
+                "would_hold(",
+            ),
             (
                 "src/federation/adopt_cascade.rs",
                 "pub async fn adopt_sealed_chunk<",
                 "\n}\n",
-                "would_hold(",
+                "adopt_sealed_chunks(",
             ),
             (
                 "src/engine.rs",
