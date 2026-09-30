@@ -5035,10 +5035,14 @@ mod tests {
     /// puts in the vtable a consumer reads at runtime. A single assertion
     /// comparing them to each other would hold trivially while both drifted.
     #[test]
-    fn abi_version_pinned_at_6() {
+    fn abi_version_pinned_at_7() {
         assert_eq!(
-            DIRECTORY_ABI_VERSION, 6,
-            "v50.0.0 (CIRISPersist#928): ReachabilityVerdict, the payload of the \
+            DIRECTORY_ABI_VERSION, 7,
+            "v52.0.0 (CIRISPersist#784): the Revocation carried by Revocations / \
+             SignedRevocations names its subject by revoked_key_sha256_ed25519_raw and its \
+             revoked_key_id became optional — a consumer built against 6 fails to decode a \
+             digest-only row. Previous move: \
+             v50.0.0 (CIRISPersist#928): ReachabilityVerdict, the payload of the \
              existing Reachability result, gained BeyondDepthCap — a consumer built \
              against 5 fails to decode it on the hot path. Previous move: the RESULT \
              wire gained a variant in v38.5.0 \
@@ -5053,7 +5057,7 @@ mod tests {
              built for"
         );
         assert_eq!(
-            PERSIST_DIRECTORY_VTABLE.abi_version, 6,
+            PERSIST_DIRECTORY_VTABLE.abi_version, 7,
             "the shipped vtable must advertise what consumers pin against"
         );
     }
