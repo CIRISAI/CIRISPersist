@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790675292118,
+  "lastUpdate": 1790732770897,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -100001,6 +100001,420 @@ window.BENCHMARK_DATA = {
             "name": "projection_for/publish_sweep",
             "value": 174,
             "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/self_live",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/unrecognized_scope",
+            "value": 0,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "412a679f04c0455a747abd6deec37f4d0c70ee4e",
+          "message": "v51.3.0: the sealed chunk-DAG adopt — a second device reads a sealed DAG as the file (#947, for CIRISEdge#717)\n\nv51.3.0 (MINOR, additive): the sealed chunk-DAG adopt — a second device reads a sealed DAG as the file, not as its manifest (#947, for CIRISEdge#717 and CIRISServer's second-device files). Three doors, no wire, hash or migration change. Built on v51.2.0.\n\nCloses #947.\n\n\n**MINOR — the sealed chunk-DAG adopt (CIRISPersist#947, for CIRISEdge#717; found by CIRISServer's second-device files ladder).** Additive: three doors, no wire, hash or migration change.\n\n### Fixed — a second device reads a sealed chunk-DAG as the file, not as its manifest (CIRISPersist#947)\nSince edge v33 every self file whose sealed size crosses 1 MiB is a sealed DAG. The holder serves the manifest's address as an inline envelope, and the receiver's only door, `adopt_sealed_blob`, stores every received envelope as `storage_kind = 'inline'` (it never opens one, I45) — so on the owner's second device `read_blob_as` took the inline branch and returned the manifest JSON as the file (CIRISServer measured 518 / 610 / 9,529 bytes served for 1 MiB and 24 MiB files). Adopting every chunk beside it changed nothing: no door turned the row into a DAG, and the receive-side witness (I143) read chunks by position, never the file through its manifest.\n\n- **`Engine::open_sealed_manifest_as(sha, viewer, caller_aad)`** (pyo3 `open_sealed_manifest_json(sha_hex, viewer, caller_aad_b64=None)`; ask 2): the chunk list of a sealed DAG this node holds — `{sha, size, seq}` per chunk, `stream_id`, `total_size`, the row's current `storage_kind`, and the three bounds the puller checks before it fetches (`inline_bytes_cap`, `whole_read_cap_bytes`, `max_chunks`). Authorized exactly as `read_blob_as` (a stranger is `NotGranted` and learns nothing; a withdrawn blob refuses). A plaintext row, a sealed whole blob or a v1 manifest is `InvalidArgument`, named — which is ask 4 by another route: the envelope's header shows nothing without decrypting, so the answer comes from the opened bytes, to an authorized viewer.\n- **`Engine::promote_adopted_manifest_to_dag(sha, viewer, caller_aad)`** (pyo3 `promote_adopted_manifest_to_dag_json`; ask 1, the \"adopt the manifest after its chunks\" shape): opens the held manifest as the viewer, requires every chunk it names to be held under the manifest's `stream_id` at its `seq` with the named sha, plaintext size and tier (the checks `prepare_chunk_rows` makes for a plaintext DAG, made against the adopted chunk ROWS; the first missing chunk is named by `(seq, sha)` and nothing is written), then the new storage floor `promote_adopted_manifest_to_dag` (sqlite, postgres) flips the row to `chunk_dag` and stamps the stream sealed in one transaction — the shape `seal_stream_with_scope` writes at the origin. `size_bytes` stays the envelope's length, as at the origin (the plaintext total lives in the opened manifest). Idempotent: `promoted: false` when it already was. The adopt path itself still never decrypts (I45's gate is unchanged); this door is a viewer's, under the read's authorization.\n- **The pull**, as Edge will run it: `adopt_sealed_blob_json` (the manifest, as received) → `open_sealed_manifest_json` → for each chunk, fetch by `sha256_hex` and `adopt_sealed_chunk_json` at `(stream_id, seq)` with `plaintext_size = size` → `promote_adopted_manifest_to_dag_json` → `read_blob_as` / `read_blob_range_as` serve the file.\n- **`Engine::put_blob_chunks_signing(manifest, chunks, author_key_id)`** (pyo3 `put_blob_chunks_signing_json`, the `put_blob_chunks_json` payload plus `author_key_id`; ask 3): stores a plaintext DAG through `put_blob_chunks` and announces its manifest (`holds_bytes`, this node's claim) through `put_blob_signing` — the shape a commons stream is announced with at the origin — so a pulled commons DAG is not a silent holder.\n\n**I144** (two nodes, sqlite and postgres): A seals a three-chunk `self` stream; B, the owner's other device, receives the content sets, adopts the manifest as received and — pinned — reads the manifest JSON as the file; a stranger cannot open the chunk list; B opens it; promotion is refused naming `seq 0` while no chunk is held and `seq 1` after one; B adopts every chunk at the manifest's `(stream_id, seq)`, promotes, and reads the file whole and across a chunk boundary by range; a second promotion is `promoted: false`; the stranger still reads nothing. **I145**: `put_blob_chunks_signing` stores a plaintext DAG that reads whole and lists this node as a holder; the plaintext DAG is refused by the sealed opener.\n\n### Mutation round (on the committed tree; lane = I144 + I145 on sqlite and postgres)\n| # | Mutant | Verdict |\n|---|---|---|\n| D1 | the opener skips the tier authorization | EQUIVALENT by layering: the DEK recovery behind it refuses the same viewer (`read_for_viewer_sealed` needs the viewer's grant; the community path its epoch grant), so a stranger is `NotGranted` either way — the tier check stays as the read's first gate, as in `read_any_range_for_viewer` |\n| D2 | a missing chunk falls back to the first held row | KILLED by I144 on both backends, after the witness was sharpened: a missing chunk is named as missing, never as a mismatch of the held one |\n| D3 | the chunk sha is not checked against the manifest | KILLED by I144 (s2: the wrong chunk at the right position) |\n| D4 | sqlite: the floor does not flip the row | KILLED by I144 (the read after promotion) |\n| D5 | postgres: the floor does not flip the row | KILLED by I144 |\n| D6 | the orchestration's idempotency return dropped | EQUIVALENT by layering: the floor answers `Ok(false)` for a `chunk_dag` row itself |\n| D7 | `put_blob_chunks_signing` does not announce | KILLED by I145 on both backends |\n| D8 | sqlite: the floor's chunk-count check dropped | EQUIVALENT by layering: the orchestration requires every named chunk before it reaches the floor; the count is the floor's own defence, stated |\n\n\n## Gates\n- `scripts/certify.sh full` on `9d40671`: 34/34 legs green (LANES=1)\n- Full lanes on `9d40671` (unfiltered): sqlite 3678/3678, postgres 3608/3608, union lib green\n- Gate chain on `9d40671`: fmt, feature axes, dirdouble, pyi, clippy ×3, docver, featmatrix, six feature test lanes, sqlite without pyo3: all green\n- Mutation: five killed, three equivalent by layering (table in the CHANGELOG).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01XRci8K5HAaLpmTtrsDHVMM",
+          "timestamp": "2026-09-29T20:00:50-05:00",
+          "tree_id": "5396f43673b06c8ec959b17a3eee47f79bcde0fb",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/412a679f04c0455a747abd6deec37f4d0c70ee4e"
+        },
+        "date": 1790732767610,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40425241,
+            "range": "± 41050",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3456937,
+            "range": "± 308866",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 12782,
+            "range": "± 307",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 19609,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 32463,
+            "range": "± 256",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 91861,
+            "range": "± 581",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 223,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 523,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 598,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2066,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 79,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 251,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1106,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 37035,
+            "range": "± 1306",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 84076,
+            "range": "± 2989",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 269051,
+            "range": "± 7338",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 12993,
+            "range": "± 1045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 14054,
+            "range": "± 1076",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 19365,
+            "range": "± 1380",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 37852,
+            "range": "± 2498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 9275697,
+            "range": "± 29304",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4892730,
+            "range": "± 62735",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 367240,
+            "range": "± 19461",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 968150,
+            "range": "± 20431",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 45667686,
+            "range": "± 848480",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1509206,
+            "range": "± 61596",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7817265,
+            "range": "± 147395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 114355915,
+            "range": "± 617620",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3825321,
+            "range": "± 498875",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 20429467,
+            "range": "± 316586",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/1000",
+            "value": 87839,
+            "range": "± 287",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/1000",
+            "value": 242974,
+            "range": "± 9306",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/1000",
+            "value": 281391,
+            "range": "± 10845",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/4000",
+            "value": 1298398,
+            "range": "± 13816",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/4000",
+            "value": 288984,
+            "range": "± 13897",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/4000",
+            "value": 442806,
+            "range": "± 15045",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_scores_seek/16000",
+            "value": 21817429,
+            "range": "± 429711",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_subject_seek/16000",
+            "value": 438690,
+            "range": "± 12778",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/list_attestation_log_full_walk/16000",
+            "value": 1073664,
+            "range": "± 11288",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/256",
+            "value": 83598,
+            "range": "± 1567",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/1024",
+            "value": 357738,
+            "range": "± 2978",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/4096",
+            "value": 1844517,
+            "range": "± 17367",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "scores_read/resolve_scores_fold/8192",
+            "value": 2229654,
+            "range": "± 19958",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/64",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/1024",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_encrypt/16384",
+            "value": 70,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/64",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/1024",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "secrets_decrypt/16384",
+            "value": 65,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 133170,
+            "range": "± 16345",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 122118,
+            "range": "± 17878",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 6526,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 41285,
+            "range": "± 230",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 385266,
+            "range": "± 2560",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/block_on_noop",
+            "value": 1,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/spawn_blocking_noop",
+            "value": 683,
+            "range": "± 50",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/raw_sqlite_write",
+            "value": 122,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "storage_floor/next_sequence_full",
+            "value": 297,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "projection_for/publish_sweep",
+            "value": 192,
+            "range": "± 1",
             "unit": "ns/iter"
           },
           {
