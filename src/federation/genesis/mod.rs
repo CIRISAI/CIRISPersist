@@ -26,15 +26,26 @@
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
 pub mod bundle;
+/// CIRISPersist#973 — verify a ceremony's two outputs before they are baked.
+pub mod ceremony_verify;
+pub use ceremony_verify::{
+    verify_ceremony_outputs, CeremonyOutputsRefusal, CeremonyOutputsRefused,
+    CeremonyOutputsVerified,
+};
 /// v47.4.0 (CIRISPersist#805) — the `CIRIS_TEST_TRUST_ROOT*` block minter.
 #[cfg(feature = "test-anchor")]
 pub mod test_anchor_block;
+/// CIRISPersist#973 — the software ceremony minter (dry run).
+#[cfg(feature = "test-anchor")]
+pub mod test_ceremony;
 pub use bundle::{
     bake_assembled_genesis, parse_genesis_bundle, verify_bundle_quorum, BakeItemOutcome,
     GenesisAuthorization, GenesisBakeReport, GenesisBundle,
 };
 #[cfg(feature = "test-anchor")]
 pub use test_anchor_block::*;
+#[cfg(feature = "test-anchor")]
+pub use test_ceremony::*;
 
 pub mod posture;
 pub use posture::{
@@ -116,6 +127,62 @@ pub fn test_anchor_registration_envelope(
     envelope
 }
 
+/// The synthesized test-anchor holder row for one slot — the ONE spelling,
+/// shared by [`test_anchor_genesis_records`] (slots read from the env) and
+/// the dry-run ceremony minter (slots taken from a minted block,
+/// CIRISPersist#973), so a bundle's carried holders are byte-for-byte the
+/// rows the boot seed installs.
+#[cfg(feature = "test-anchor")]
+pub(crate) fn test_anchor_holder_record(
+    key_id: &str,
+    pubkey_ed25519_base64: String,
+    pqc_pubkey: Option<String>,
+    envelope: serde_json::Value,
+    canonical: &[u8],
+    scrub_ed: Option<String>,
+    scrub_pqc: Option<String>,
+) -> SignedKeyRecord {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
+        .parse()
+        .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
+    SignedKeyRecord {
+        record: crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64,
+            pqc_completed_at: pqc_pubkey.as_ref().map(|_| ts),
+            pubkey_ml_dsa_65_base64: pqc_pubkey,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::ACCORD_HOLDER.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: ts,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: hex::encode(Sha256::digest(canonical)),
+            scrub_signature_classical: scrub_ed
+                .unwrap_or_else(|| B64.encode(b"test-anchor-placeholder")),
+            scrub_signature_pqc: scrub_pqc,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: ts,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            // The V-schema requires accord_holder rows to CARRY evidence;
+            // this is the SoftwareOnly_TEST custody marker (the tier
+            // verify's accord_custody_attestation admits under the same
+            // gate, CIRISVerify#202) — honest about what it is, never a
+            // fabricated hardware claim.
+            attestation_evidence: Some(serde_json::json!({
+                "tier": "SoftwareOnly_TEST",
+                "test_anchor": true,
+            })),
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        },
+    }
+}
+
 /// v17.1.0 (CIRISPersist#449, CIRISVerify#202) — the SYNTHESIZED test-anchor
 /// holder rows: one deterministic self-signed `accord_holder` record per
 /// `CIRIS_TEST_TRUST_ROOT` pubkey (`test-accord-holder-{i}`), so the genesis
@@ -187,7 +254,6 @@ pub fn test_anchor_registration_envelope(
 pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
-    use sha2::{Digest, Sha256};
 
     /// The i-th comma-separated slot of `var`, trimmed; `None` when the var
     /// is unset or the slot is missing/empty.
@@ -214,9 +280,6 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
             );
         }
     }
-    let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
-        .parse()
-        .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
     let mut out = Vec::with_capacity(keys.len());
     for (i, ed) in keys.iter().enumerate() {
         let key_id = format!("test-accord-holder-{i}");
@@ -266,39 +329,15 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
                 );
             }
         }
-        out.push(SignedKeyRecord {
-            record: crate::federation::KeyRecord {
-                key_id: key_id.clone(),
-                pubkey_ed25519_base64,
-                pqc_completed_at: pqc_pubkey.as_ref().map(|_| ts),
-                pubkey_ml_dsa_65_base64: pqc_pubkey,
-                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-                identity_type: crate::federation::types::identity_type::ACCORD_HOLDER.to_owned(),
-                identity_ref: key_id.clone(),
-                valid_from: ts,
-                valid_until: None,
-                registration_envelope: envelope,
-                original_content_hash: hex::encode(Sha256::digest(&canonical)),
-                scrub_signature_classical: scrub_ed
-                    .unwrap_or_else(|| B64.encode(b"test-anchor-placeholder")),
-                scrub_signature_pqc: scrub_pqc,
-                scrub_key_id: key_id.clone(),
-                scrub_timestamp: ts,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // The V-schema requires accord_holder rows to CARRY evidence;
-                // this is the SoftwareOnly_TEST custody marker (the tier
-                // verify's accord_custody_attestation admits under the same
-                // gate, CIRISVerify#202) — honest about what it is, never a
-                // fabricated hardware claim.
-                attestation_evidence: Some(serde_json::json!({
-                    "tier": "SoftwareOnly_TEST",
-                    "test_anchor": true,
-                })),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        });
+        out.push(test_anchor_holder_record(
+            &key_id,
+            pubkey_ed25519_base64,
+            pqc_pubkey,
+            envelope,
+            &canonical,
+            scrub_ed,
+            scrub_pqc,
+        ));
     }
     Some(out)
 }
@@ -603,6 +642,69 @@ where
 /// requires.
 const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 
+/// CIRISPersist#973 — the software ceremony this process boots against, when
+/// one is installed. Test-anchor only.
+#[cfg(feature = "test-anchor")]
+type InstalledTestCeremony = (
+    &'static GenesisBundle,
+    Option<&'static super::SignedCommunity>,
+);
+
+#[cfg(feature = "test-anchor")]
+static TEST_CEREMONY: std::sync::RwLock<Option<InstalledTestCeremony>> =
+    std::sync::RwLock::new(None);
+
+/// CIRISPersist#973 — **install a software ceremony's outputs for this
+/// process**: from now on, while the test anchor is live, every reader of the
+/// compiled bundle and community asset reads these instead, and the boot seed
+/// runs its full leg order against them (it otherwise skips everything past
+/// the family under a test anchor). The dry run of a re-mint: mint (or have
+/// the host's ceremony routes produce) the two artifacts, install them, boot.
+///
+/// A second call replaces the first (a re-mint). The values are leaked: this
+/// is a per-process test fixture, never a production path — the whole seam is
+/// compiled out without the `test-anchor` feature, and inert unless the
+/// runtime test-anchor override is armed.
+#[cfg(feature = "test-anchor")]
+pub fn install_test_ceremony_outputs(
+    bundle: GenesisBundle,
+    community: Option<super::SignedCommunity>,
+) {
+    let bundle: &'static GenesisBundle = Box::leak(Box::new(bundle));
+    let community: Option<&'static super::SignedCommunity> =
+        community.map(|c| &*Box::leak(Box::new(c)));
+    *TEST_CEREMONY.write().expect("test ceremony lock") = Some((bundle, community));
+}
+
+/// CIRISPersist#973 — remove an installed software ceremony.
+#[cfg(feature = "test-anchor")]
+pub fn clear_test_ceremony_outputs() {
+    *TEST_CEREMONY.write().expect("test ceremony lock") = None;
+}
+
+/// The installed software ceremony, honoured ONLY while the test-anchor
+/// override is live.
+#[cfg(feature = "test-anchor")]
+fn installed_test_ceremony() -> Option<InstalledTestCeremony> {
+    if !test_anchor_override_active() {
+        return None;
+    }
+    *TEST_CEREMONY.read().expect("test ceremony lock")
+}
+
+/// CIRISPersist#973 — is a software ceremony installed and honoured? Const
+/// `false` on a production build.
+pub(crate) fn test_ceremony_installed() -> bool {
+    #[cfg(feature = "test-anchor")]
+    {
+        installed_test_ceremony().is_some()
+    }
+    #[cfg(not(feature = "test-anchor"))]
+    {
+        false
+    }
+}
+
 /// Parse-once accessor for the baked canonical genesis **bundle**
 /// (v23.0.0, CIRISPersist#551 item 1 — replaces `canonical_genesis_records`;
 /// the bare `[{record}]` parse path is deleted, see [`parse_genesis_bundle`]).
@@ -614,6 +716,13 @@ const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 /// constant; caught by [`tests::canonical_seed_is_a_bundle_and_is_2of3_accord_conferred`]).
 pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     use std::sync::OnceLock;
+    // #973 — under a live test anchor with a software ceremony installed, the
+    // ceremony's bundle stands in for the compiled one. Compiled out of a
+    // production build.
+    #[cfg(feature = "test-anchor")]
+    if let Some((bundle, _)) = installed_test_ceremony() {
+        return bundle;
+    }
     static PARSED: OnceLock<GenesisBundle> = OnceLock::new();
     PARSED.get_or_init(|| {
         parse_genesis_bundle(CANONICAL_SEED_JSON)
@@ -2954,7 +3063,9 @@ where
     // canonical under the test anchor instead (CIRISVerify#202 /
     // CIRISServer#258), so skip the bake rather than brick the boot. Dead
     // code on a prod build (the fence compiles the branch out).
-    if test_anchor_override_active() {
+    // #973 — unless a software ceremony is installed: then every leg below
+    // runs against ITS bundle and community, which the test roster signed.
+    if test_anchor_override_active() && !test_ceremony_installed() {
         tracing::warn!(
             "CIRIS_TESTING_MODE: test trust root active — skipping the baked \
              2-of-3 canonical genesis seed (the harness mints its own canonical \
@@ -2988,6 +3099,11 @@ const CANONICAL_COMMUNITY_SEED_JSON: &str = include_str!("canonical_community_se
 /// (build-time-checked by the pin test).
 pub fn canonical_community_asset() -> Option<&'static super::SignedCommunity> {
     use std::sync::OnceLock;
+    // #973 — the test-ceremony seam; see [`canonical_genesis_bundle`].
+    #[cfg(feature = "test-anchor")]
+    if let Some((_, community)) = installed_test_ceremony() {
+        return community;
+    }
     static PARSED: OnceLock<Option<super::SignedCommunity>> = OnceLock::new();
     PARSED
         .get_or_init(|| {
@@ -4074,6 +4190,60 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// CIRISPersist#973 — **the software-ceremony seam is fenced, from disk.**
+    /// Every item that lets a process boot against something other than the
+    /// compiled bundle and community asset sits directly under
+    /// `#[cfg(feature = "test-anchor")]`, and the accessors consult the seam
+    /// only inside that cfg. A production build therefore contains none of it
+    /// (the `sqlite`-only build compiling is the other half).
+    #[test]
+    fn the_test_ceremony_seam_is_fenced_973() {
+        let src = include_str!("mod.rs");
+        let cfg = "#[cfg(feature = \"test-anchor\")]";
+        for item in [
+            "pub mod test_ceremony;",
+            "pub use test_ceremony::*;",
+            "type InstalledTestCeremony",
+            "static TEST_CEREMONY:",
+            "pub fn install_test_ceremony_outputs(",
+            "pub fn clear_test_ceremony_outputs(",
+            "fn installed_test_ceremony(",
+            "pub(crate) fn test_anchor_holder_record(",
+        ] {
+            let at = src
+                .find(item)
+                .unwrap_or_else(|| panic!("seam item {item:?} not found"));
+            let before: Vec<&str> = src[..at]
+                .lines()
+                .rev()
+                .skip_while(|l| l.trim().is_empty())
+                .take_while(|l| !l.trim().is_empty())
+                .collect();
+            assert!(
+                before.iter().any(|l| l.trim() == cfg),
+                "{item:?} is not under {cfg}: {before:?}"
+            );
+        }
+        // Each READ of the seam is itself under the cfg. The needle is
+        // assembled so this test's own text does not count.
+        let call = ["installed_test_", "ceremony()"].concat();
+        let fenced: usize = [
+            format!("{cfg}\n    if let Some((bundle, _)) = {call}"),
+            format!("{cfg}\n    if let Some((_, community)) = {call}"),
+            format!("{cfg}\n    {{\n        {call}.is_some()"),
+        ]
+        .iter()
+        .map(|p| src.matches(p.as_str()).count())
+        .sum();
+        assert_eq!(fenced, 3, "the three fenced reads");
+        assert_eq!(
+            src.matches(&call).count(),
+            fenced + 1,
+            "a read of the test-ceremony seam outside {cfg} (the definition + 3 reads)"
+        );
+        assert!(include_str!("test_ceremony.rs").contains("`test-anchor` feature"));
+    }
+
     /// CIRISPersist#973 — **the community asset is pinned.** Until a ceremony
     /// bakes it the file is JSON `null` and the leg is inert; a bake replaces
     /// the file AND this digest in one commit, so the bytes a node boots on

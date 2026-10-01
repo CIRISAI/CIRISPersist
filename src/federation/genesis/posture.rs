@@ -474,7 +474,9 @@ where
     // not seedable by construction (its A1/B1 scrubs cannot verify against the
     // swapped SW roster), so the seeder skips it and the posture must skip it
     // too. Dead code on a prod build.
-    if super::test_anchor_override_active() {
+    // #973 — with a software ceremony installed the seeder runs every leg
+    // against it, so the posture evaluates every leg too.
+    if super::test_anchor_override_active() && !super::test_ceremony_installed() {
         return GenesisPosture::Entrenched;
     }
     if let Err(f) = super::verify_canonical_seeded(dir).await {

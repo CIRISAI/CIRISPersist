@@ -1401,6 +1401,46 @@ pub mod test_support {
             }
         }
 
+        /// CIRISPersist#973 — an identity whose hybrid pair comes from GIVEN
+        /// seeds rather than from its label: a test-anchor holder
+        /// (`test-accord-holder-{i}`), whose keys are the block's, signs the
+        /// dry-run ceremony as itself.
+        ///
+        /// # Errors
+        ///
+        /// A seed the signer rejects.
+        pub fn from_seeds(
+            key_id: &str,
+            ed_seed: &[u8; 32],
+            mldsa_seed: &[u8; 32],
+        ) -> Result<Self, crate::federation::Error> {
+            let bad = |what: &str, e: String| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "Identity::from_seeds: {what}: {e}"
+                ))
+            };
+            Ok(Self {
+                key_id: key_id.to_owned(),
+                ed: Ed25519Signer::from_seed(ed_seed).map_err(|e| bad("ed25519", e.to_string()))?,
+                mldsa: MlDsa65Signer::from_seed(mldsa_seed)
+                    .map_err(|e| bad("ml-dsa-65", e.to_string()))?,
+            })
+        }
+
+        /// CIRISPersist#973 — the hybrid scrub of `envelope` (through the CEG
+        /// produce canonicalizer) by this identity: `(original_content_hash,
+        /// classical, pqc)`, the shape every federation-tier row carries.
+        pub fn sign_envelope(
+            &self,
+            envelope: &serde_json::Value,
+        ) -> (String, String, Option<String>) {
+            crate::federation::tier_ingest::test_support::sign_envelope_with(
+                &self.ed,
+                &self.mldsa,
+                envelope,
+            )
+        }
+
         /// v21.0.0 (#502 E9) — this identity as a REGISTERED `steward`
         /// `KeyRecord` (identity_type = steward, carrying this identity's
         /// pubkeys) so `resolve_steward_roster` finds it in the directory.
