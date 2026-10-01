@@ -98,6 +98,32 @@ The delegation rows in I348/I349 are re-minted by SOFTWARE holders on a bare bac
 
 **Mutation round (sqlite lane `remint_invariants`), 9/9 killed:** door refusal mapped to `Divergent` (I346, I346b); seed not inert without an asset (I345); verify not inert without an asset (I345); held record ignored (I345, I347); held comparison inverted (I345, I347); verify calls a held community absent (I345, I347); equal vintage supersedes (I348); supersede skipped on a newer instant (I348, I349); rollback allowed (I348). Not mutated: "the leg writes through a local door" — no trusted-local community door exists to route it through.
 
+### #973 — the software ceremony minter and the outputs verifier
+For CIRISServer's dry run of the 0.5.219 re-mint, and to close the gaps the boot-leg section above listed.
+
+**`mint_test_ceremony(ed_seeds[3], node_seed, produced_at)`** (feature `test-anchor`; `genesis/test_ceremony.rs`) mints, for three software holders `test-accord-holder-{0,1,2}`, the two artifacts a ceremony outputs, in the shapes the boot path reads:
+- the **bundle** (`canonical_seed.json`'s shape): the holders as carried, one serve node (`test-canonical-node-0`, typed `canonical,node`, its record scrubbed by all three), the three delegation rows (`genesis-charter` carrying `witness_quorum: 0`, `genesis-grant:test-canonical-node-0`, `genesis-lifecycle`), each scrubbed by all three and stamped 1 ms apart from `produced_at`, and all three authorizations;
+- the **community asset** (`canonical_community_seed.json`'s shape): the `ciris-canonical` birth, founders = the three holders, all three signing, the node a `member` that signs nothing.
+
+The anchor block is returned beside them and is exactly what `mint_test_anchor_block` mints (its format and pin do not move). `examples/mint_test_ceremony.rs` writes both files and prints the block. There is no pyo3 door: `mint_test_anchor_block` has none either.
+
+**The dry-run boot seam** (feature `test-anchor`): `install_test_ceremony_outputs(bundle, community)` / `install_test_ceremony_outputs_json(..)` / `clear_test_ceremony_outputs()`. While the runtime test-anchor override is live, an installed ceremony stands in for the compiled bundle and community asset for every reader, the boot seed runs its full leg order against it (it otherwise stops after the family under a test anchor), and `genesis_posture` evaluates every leg. Call it before constructing the Engine. Without the override the seam is inert; without the feature it is not compiled.
+
+**`verify_ceremony_outputs(bundle_json, community_json)`** (not feature-gated; `genesis/ceremony_verify.rs`) is the check the bake runs before a ceremony's two files are compiled in. It re-implements no rule: on a throwaway in-memory directory holding this build's accord holders and the accord family, it applies the bundle through `bake_assembled_genesis` and the birth through the signed `put_community` door, then requires the community to resolve live. A refusal names its stage: `ceremony_outputs_malformed`, `ceremony_holder_roster_mismatch`, `ceremony_bundle_quorum`, `ceremony_bundle_bake`, `ceremony_serve_node`, `ceremony_delegation_row`, `ceremony_community_birth`, `ceremony_community_not_live`, with the door's own words as the detail.
+
+Witnesses (`tests/test_ceremony_973.rs`, its own process because it arms the override; sqlite and memory, postgres for the boot):
+- **I350** the minted outputs verify offline (3 authorizations, 3 rows, 3 founders, node seated); the block is the #805 block; not-three seeds refused.
+- **I351** a fresh node boots fully seeded from the artifacts through `seed_delegation_plane` and the community leg, `genesis_posture` is `Entrenched`, the community resolves live with the node seated (memory, sqlite, postgres). Control: with no ceremony installed nothing past the family is seeded.
+- **I352** the upgrade end to end: a node seeded from an older ceremony boots against a re-mint with strictly newer instants; the three ids are kept and superseded; the held community is left in place (`HeldDiffers`).
+- **I353** a re-mint stamped 15 minutes ahead is refused before anything is removed; the boot seed returns `Absent(delegation)`, the old rows stay, never `Divergent`.
+- **I354** the verifier refuses by stage: malformed, one authorization, a foreign holder, a founder who did not sign, a node the bundle does not anchor, a tampered birth, a row or node altered after authorization, and a correctly authorized future-dated bundle.
+- **I355** a refused community asset boots `Absent(community)` with the rest seeded; **I355b** the seam is inert once the override is disarmed.
+- A from-disk gate holds every seam item and every read of the seam under `#[cfg(feature = "test-anchor")]`.
+
+Mutation round (lane = the file above + the gate, `sqlite test-anchor`), **11 of 11 killed**: the boot seed and the posture each ignoring an installed ceremony (I351, I355); the community accessor ignoring the seam; the seam honoured without the override (I355b); the verifier skipping the roster check, ignoring a skipped row, and misnaming the quorum stage (I354); the minter omitting `witness_quorum`, signing the birth with two holders, and authorizing with two (I350); a seam item losing its fence (the gate).
+
+**Found while witnessing, not changed here:** after a refused re-mint (I353) `verify_delegation_plane_seeded` returns `Ok` and the posture reads `Entrenched` on the OLDER stored rows. Its doc says a stored row older than the compiled one is a rollback. The comparison passes the raw bundle row as the "stored" side of `candidate_is_strictly_newer`, which classifies an un-normalized bundle row as not v31-shaped, so any conformant stored row reads as its successor. I353 does not pin that posture.
+
 ## [52.0.1] - UNRELEASED
 
 **PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.
