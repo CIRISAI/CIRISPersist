@@ -2638,6 +2638,10 @@ async fn transit_eligibility_walk(
     }
     Ok((TransitEligibility::denied(), roots_walked))
 }
+/// #973 (CC 3.2 T6) — the refusal token for a charter whose non-zero
+/// `witness_quorum` is below a strict majority of its witness directory.
+pub const CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY: &str =
+    "charter_witness_quorum_below_majority";
 
 /// v24.0.0 (CIRISPersist#557) — the FAMILY-charter admission gate: a charter
 /// that names a constitutional family must be signed by that family's QUORUM,

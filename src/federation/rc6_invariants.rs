@@ -370,6 +370,15 @@ pub(crate) mod bodies {
     /// The accord's charter with rc6 members (mirrors
     /// `canonical_community_invariants::bodies::charter_the_accord`).
     async fn charter_the_accord_with(d: &dyn FederationDirectory, members: serde_json::Value) {
+        try_charter_the_accord_with(d, members)
+            .await
+            .expect("the accord charters itself 3-of-3");
+    }
+
+    async fn try_charter_the_accord_with(
+        d: &dyn FederationDirectory,
+        members: serde_json::Value,
+    ) -> Result<(), Error> {
         use crate::federation::trust_root::{
             pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION,
         };
@@ -401,7 +410,7 @@ pub(crate) mod bodies {
             attestation: charter,
         })
         .await
-        .expect("the accord charters itself 3-of-3");
+        .map(|_| ())
     }
 
     /// A consumer's `trust:accepts:v1` edge to the root, optionally naming the
@@ -724,6 +733,144 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .expect("a signed row is held")
+    }
+
+    /// The I340/I341 shape: with witnessed mode OFF, a cosign is stored as
+    /// evidence and judges nothing — the founders' amendment is the current
+    /// head, the lineage is live, and nothing is "held behind a witness".
+    async fn off_mode_judges_on_the_founders(d: &dyn FederationDirectory, tag: &str) {
+        let holders = born(d).await;
+        if tag == "explicit-0" {
+            charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 0 })).await;
+        }
+        assert_eq!(
+            d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+                .await
+                .unwrap(),
+            Out::Inserted,
+            "({tag}) a cosign is still stored as evidence"
+        );
+        assert_eq!(
+            d_view(d).await.judged,
+            None,
+            "({tag}) witnessed mode is off: one cosign engages nothing"
+        );
+        put_conferred(d, &holders, "new-steward", "user,steward").await;
+        let v2 = swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "new-steward");
+        founders_supersede(d, v2, &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("the founders amend");
+        let view = d_view(d).await;
+        assert_eq!(view.judged, None, "({tag}) still off after an amendment");
+        assert_eq!(view.unwitnessed_tail, 0, "({tag}) nothing is held back");
+        assert!(view.equivocation.is_none());
+        let r = cc::resolve_community(d, CANON)
+            .await
+            .unwrap()
+            .expect("rooted");
+        assert!(
+            r.founders.contains(&"new-steward".to_owned()),
+            "({tag}) the founder-quorum head is current: {r:?}"
+        );
+        assert!(r.live, "({tag}) live on the founders' quorum");
+        assert!(!r.witnessed, "({tag}) reported unwitnessed");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+    }
+
+    /// **I340** (#973; CC 3.2 T6) — a charter SILENT on `witness_quorum` is in
+    /// witnessed mode off. No internal default is substituted.
+    pub async fn i340_a_silent_charter_is_witnessed_mode_off(d: &dyn FederationDirectory) {
+        off_mode_judges_on_the_founders(d, "silent").await;
+    }
+
+    /// **I341** — an explicit `witness_quorum: 0` is the same state as silence.
+    pub async fn i341_an_explicit_zero_is_the_same_as_silence(d: &dyn FederationDirectory) {
+        off_mode_judges_on_the_founders(d, "explicit-0").await;
+    }
+
+    /// **I342** — with witnessed mode off, attaching is by an out-of-band
+    /// anchor only: an edge naming the head this node holds attaches (no
+    /// cosign needed, the window does not apply); one naming another head, or
+    /// none under a charter that declares a window, is refused.
+    pub async fn i342_off_mode_attaches_by_anchor_only(d: &dyn FederationDirectory) {
+        born(d).await;
+        // a 1 s window over a birth pinned days ago: only the anchor can attach
+        charter_the_accord_with(
+            d,
+            serde_json::json!({ "attach_window_secs": 1, "witness_quorum": 0 }),
+        )
+        .await;
+        let head = d
+            .lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        for (i, name) in ["i342-a", "i342-b", "i342-c"].iter().enumerate() {
+            ts::register_hybrid_key_as(d, name, name, identity_type::USER).await;
+            let _ = i;
+        }
+        assert_stale(accept_edge(d, "i342-a", None).await, "out-of-band anchor");
+        assert_stale(
+            accept_edge(d, "i342-b", Some(&"ab".repeat(32))).await,
+            "not the head this node holds",
+        );
+        accept_edge(d, "i342-c", Some(&head))
+            .await
+            .expect("I342: the anchor naming the held head attaches with no cosign");
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, "i342-c", CANON)
+                .await
+                .unwrap()
+                .edge_exists
+        );
+    }
+
+    /// **I343** — an explicit, valid quorum keeps working as before: under
+    /// `witness_quorum: 2` one cosign engages nothing and two witness the head.
+    pub async fn i343_an_explicit_quorum_still_witnesses(d: &dyn FederationDirectory) {
+        born(d).await;
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+            .await
+            .unwrap();
+        assert_eq!(d_view(d).await.judged, None, "one of two");
+        d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w2", None).await)
+            .await
+            .unwrap();
+        assert_eq!(d_view(d).await.judged, Some(0), "two of two: witnessed");
+        assert!(
+            cc::resolve_community(d, CANON)
+                .await
+                .unwrap()
+                .unwrap()
+                .witnessed
+        );
+    }
+
+    /// **I344** — a charter declaring `witness_quorum: 1` is refused at
+    /// admission by name (CC 3.2 T6: zero, or a strict majority of the
+    /// directory and at least 2), and nothing is stored.
+    pub async fn i344_a_quorum_of_one_is_refused_at_the_charter(d: &dyn FederationDirectory) {
+        born(d).await;
+        let e = try_charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 1 }))
+            .await
+            .expect_err("I344: a quorum of one is not a valid charter value");
+        assert!(
+            matches!(&e, Error::CharterInvalid { detail }
+                if detail.contains(crate::federation::trust_root::CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY)),
+            "{e:?}"
+        );
+        assert!(
+            cc::charter_members_for(d, CANON).await.unwrap().is_none(),
+            "I344: the refused charter is not stored"
+        );
+        // 0 and 2 are both admitted
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 0 })).await;
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
     }
 
     /// **I195** — the liveness margin.
@@ -1202,6 +1349,46 @@ mod runners {
                     super::super::bodies::i197_a_deferred_cosign_is_rechecked_on_arrival(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i340() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i340_a_silent_charter_is_witnessed_mode_off(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i341() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i341_an_explicit_zero_is_the_same_as_silence(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i342() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i342_off_mode_attaches_by_anchor_only(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i343() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i343_an_explicit_quorum_still_witnesses(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i344() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i344_a_quorum_of_one_is_refused_at_the_charter(
+                        &d as &dyn FederationDirectory,
                     )
                     .await
                 }
