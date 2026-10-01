@@ -18,6 +18,8 @@ Witnesses:
 - the #814/#946 session witness on memory, sqlite and postgres gains three cases: a claim past the ttl with a live lease holds the session (RED first, with the server's symptom), a lapsed lease holds nothing, and a renewal keeps the holder and its `claimed_at`;
 - a unit test pins the lease boundary (exclusive), an unparsable lease, and the pre-v52 ttl fallback.
 
+Mutation round, 4/4 killed: back to the ttl rule (the session witness, memory and sqlite), an inclusive lease end, an unparsable lease read as live, and the pre-v52 fallback flipped (the unit test).
+
 ## [52.0.0] - 2026-09-30
 
 **MAJOR — the v52 bundle.** v51.4.0 and v51.5.0 were never released; their contents ship here with the queued wire breaks (#955 membership acceptance, #954 manifest ceiling, and the rest as their designs land). Sections below are grouped by issue.
