@@ -16810,7 +16810,10 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT DISTINCT community_key_id FROM cirislens.federation_community_dek_epoch \
+                // v52.0.1 (#967) — the key state too: a room that never
+                // rotated has DEK rows but no pointer row.
+                "SELECT community_key_id FROM cirislens.federation_community_dek \
+                 UNION SELECT community_key_id FROM cirislens.federation_community_dek_epoch \
                  ORDER BY community_key_id",
                 &[],
             )

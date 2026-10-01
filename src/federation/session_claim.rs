@@ -118,6 +118,28 @@ pub fn claim_is_live(
     now.signed_duration_since(claim.claimed_at) < ttl
 }
 
+/// v52.0.1 — **a claim row is live while its signed lease runs.** Since
+/// v52.0.0 (#946) every admitted claim carries `valid_until`, so liveness is
+/// `now < valid_until`, judged at read time; a renewal keeps `claimed_at`
+/// and extends `valid_until`, and the earliest-wins merge stays stable. The
+/// consumer's `ttl` horizon remains only for a row stored before v52 that
+/// carries no `valid_until`. A `valid_until` that does not parse is not live.
+#[must_use]
+pub fn row_is_live(
+    envelope: &serde_json::Value,
+    claim: &SessionClaim,
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: chrono::Duration,
+) -> bool {
+    match envelope.get("valid_until") {
+        None => claim_is_live(claim, now, ttl),
+        Some(v) => v
+            .as_str()
+            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+            .is_some_and(|until| now < until),
+    }
+}
+
 /// Read `(community_id, session_id, claimed_at)` out of a claim row's signed
 /// envelope. `None` for any row that is not a well-formed claim — a row that
 /// cannot say which session it claims is not a claim, and must not be folded
@@ -186,7 +208,7 @@ pub async fn handler_for(
             };
             if community == community_key_id
                 && session == session_id
-                && claim_is_live(&claim, now, ttl)
+                && row_is_live(&row.attestation_envelope, &claim, now, ttl)
             {
                 claims.push(claim);
             }
@@ -308,6 +330,45 @@ mod tests {
         assert_eq!(
             renewed.claimed_at, holder.claimed_at,
             "#782: renewal must not move `claimed_at`, or the holder loses its own session"
+        );
+    }
+
+    /// v52.0.1 — the signed lease decides; the ttl only covers a row stored
+    /// before v52 with no `valid_until`; an unparsable lease is not live.
+    #[test]
+    fn row_liveness_reads_the_signed_lease_5201() {
+        let c = claim("node-a", "2026-08-30T12:00:00Z");
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-30T12:05:00Z".parse().unwrap();
+        let ttl = chrono::Duration::seconds(60);
+        let env = |until: Option<&str>| match until {
+            Some(u) => serde_json::json!({ "valid_until": u }),
+            None => serde_json::json!({}),
+        };
+        assert!(row_is_live(
+            &env(Some("2026-08-30T12:10:00Z")),
+            &c,
+            now,
+            ttl
+        ));
+        assert!(!row_is_live(
+            &env(Some("2026-08-30T12:04:59Z")),
+            &c,
+            now,
+            ttl
+        ));
+        assert!(
+            !row_is_live(&env(Some("2026-08-30T12:05:00Z")), &c, now, ttl),
+            "lease end is exclusive"
+        );
+        assert!(!row_is_live(&env(Some("tomorrow")), &c, now, ttl));
+        assert!(
+            !row_is_live(&env(None), &c, now, ttl),
+            "pre-v52 row past the ttl"
+        );
+        let recent = claim("node-a", "2026-08-30T12:04:30Z");
+        assert!(
+            row_is_live(&env(None), &recent, now, ttl),
+            "pre-v52 row within the ttl"
         );
     }
 

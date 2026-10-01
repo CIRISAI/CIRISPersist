@@ -7,7 +7,41 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [52.0.0] - UNRELEASED
+## [52.0.1] - UNRELEASED
+
+**PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.
+
+### Fixed — session liveness reads the signed lease (#946 read side)
+v52.0.0 made `valid_until` mandatory on every `session:*` row and prescribed renewal by `supersedes` that keeps `claimed_at`. But `session_claim::handler_for` still judged liveness as `now − claimed_at < ttl`, so a renewed session read as expired after one ttl and dropped. Liveness is now **`now < valid_until`**, read from the row's signed envelope at read time (`session_claim::row_is_live`). A renewal keeps `claimed_at`, so the earliest-wins merge is stable. The caller's `ttl` remains only for a row stored before v52 with no `valid_until`. An unparsable `valid_until` is not live. `SessionClaim` and `claim_is_live` are unchanged.
+
+Witnesses:
+- the #814/#946 session witness on memory, sqlite and postgres gains three cases: a claim past the ttl with a live lease holds the session (RED first, with the server's symptom), a lapsed lease holds nothing, and a renewal keeps the holder and its `claimed_at`;
+- a unit test pins the lease boundary (exclusive), an unparsable lease, and the pre-v52 ttl fallback.
+
+Mutation round, 4/4 killed: back to the ttl rule (the session witness, memory and sqlite), an inclusive lease end, an unparsable lease read as live, and the pre-v52 fallback flipped (the unit test).
+
+### #967 — a never-rotated room is re-wrapped for a late device
+`BlobStorage::community_dek_communities()` enumerated only the minters' pointer table `federation_community_dek_epoch`. That table gets a row on an epoch bump or a retain policy, so a room only ever at epoch 0 was invisible to the #916 re-wrap walk (`rewrap_own_epochs_to_member_devices`, the receive-door `rewrap_after_admission` path). That covers every pair room and any group with no revocation. A member's device arriving after epoch 0 was minted was never granted it, and read `NotGranted` forever. Both backends now enumerate the **union** of the epoch key state (`federation_community_dek`, a row at every mint) and the pointer table. The retention sweep, the other caller, is a no-op for a community with no policy. No pointer row is fabricated at mint.
+
+**I188(k)** (sqlite, postgres; two nodes, the I188 fixture): A seals once (epoch 0, no bump, no retain policy). bob's late device binding arrives through the engine door. The room is enumerated, the device holds epoch 0, epoch 0's set carries its wrap, and the device opens it. RED first on both the enumeration and the missing grant (Edge's repro: comms=[], changed=[]).
+
+Mutation round:
+
+| Mutant | Result |
+|---|---|
+| M1: sqlite pointer-only query | killed (I188(k)) |
+| M2: postgres pointer-only query | killed (I188(k)) |
+| M3: `UNION ALL` | **equivalent**: a community in both tables is walked twice; the re-wrap and the sweep are idempotent |
+| M4: key-state half only | **equivalent**: a pointer-only community holds no DEK, so there is nothing to re-wrap or sweep |
+
+### Fixed — a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964)
+`persist_row_hash` truncates every instant to microseconds. For a 7–9 digit fraction it kept the trailing zeros (`.123000789` → `.123000`). But postgres stores microseconds, and the read-back row serializes them the way chrono's `AutoSi` does: `.123`, or no fraction at all. So about one instant in a thousand made a stored row hash differently from itself. A faithful re-offer of that row was then booked `AlreadyPresentIdentical` instead of `Unchanged`, and #672's settle missed it. This was the intermittent I189 red in CI and certify.
+
+The truncated fraction now collapses to 0, 3 or 6 digits exactly as chrono prints a microsecond value. Strings of six or fewer digits are untouched, and no pinned vector moved. A row whose instant has such a fraction, written before v52.0.1, keeps its stored hash; only the rare trailing-zero case computes differently.
+
+I189 now pins such an instant, which made it a deterministic RED on postgres before the fix. A unit test checks each rewrite against chrono's own output. Mutants 3/3 killed: the zero arm, the millisecond arm, and the old rule.
+
+## [52.0.0] - 2026-09-30
 
 **MAJOR — the v52 bundle.** v51.4.0 and v51.5.0 were never released; their contents ship here with the queued wire breaks (#955 membership acceptance, #954 manifest ceiling, and the rest as their designs land). Sections below are grouped by issue.
 
