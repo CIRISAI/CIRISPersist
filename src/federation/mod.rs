@@ -157,6 +157,9 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod node_seat_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
