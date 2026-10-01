@@ -867,7 +867,47 @@ pub(crate) mod bodies {
         );
         // 0 and 2 are both admitted
         charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 0 })).await;
-        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await; // the KEY-root charter door (a self-loop charter) applies the same rule
+        let root = "i344-key-root";
+        ts::register_hybrid_key_as(d, root, root, identity_type::USER).await;
+        let key_charter = |quorum: u64| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let commitment = crate::federation::trust_root::pre_rotation_commitment(&[
+                "i344-succ-a".to_owned(),
+                "i344-succ-b".to_owned(),
+            ])
+            .unwrap();
+            let mut row = crate::federation::operational::test_support::signed_trust_attestation(
+                &id,
+                root,
+                root,
+                crate::federation::types::attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "references_attestation_id": id,
+                    "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+                    "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+                    "pre_rotation_commitment": commitment,
+                    "witness_quorum": quorum,
+                }),
+            );
+            ts::reseal(&mut row);
+            crate::federation::SignedAttestation { attestation: row }
+        };
+        let token = crate::federation::trust_root::CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY;
+        let e = d
+            .put_attestation(key_charter(1))
+            .await
+            .expect_err("I344: a key root's charter with a quorum of one");
+        assert!(
+            matches!(&e, Error::CharterInvalid { detail } if detail.contains(token)),
+            "{e:?}"
+        );
+        if let Err(e) = d.put_attestation(key_charter(2)).await {
+            assert!(
+                !e.to_string().contains(token),
+                "I344: a quorum of two is never refused under this rule: {e:?}"
+            );
+        }
     }
 
     /// **I195** — the liveness margin.
