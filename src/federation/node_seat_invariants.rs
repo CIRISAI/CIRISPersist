@@ -183,6 +183,25 @@ pub(crate) mod bodies {
             !seated(d, &cid, BLESSED).await,
             "I339: not seated in the community"
         );
+        // A FAMILY that shares the infrastructure community's id is still a
+        // family: the exemption is read for the community plane only.
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        m::found_family(d, CANON, "founder_only", &[&founder], &[])
+            .await
+            .expect("I339: a family under the same id");
+        m::widen_family(d, CANON, &founder, BLESSED, None, chrono::Utc::now())
+            .await
+            .expect_err("I339: a node in a family named like the infrastructure community");
+        assert!(
+            !d.active_family_members(CANON)
+                .await
+                .unwrap()
+                .iter()
+                .any(|x| x.key_id == BLESSED),
+            "I339: not seated in that family"
+        );
     }
 }
 
