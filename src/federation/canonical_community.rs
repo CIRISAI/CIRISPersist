@@ -202,32 +202,83 @@ pub fn check_trust_root_shape(community: &Community) -> Result<(), Error> {
     Ok(())
 }
 
-/// #925 (CC 3.2 rc5, "infrastructure does not vote") plus CC 3.2 T2 — a
-/// founder of a trust-root community is a HUMAN key at `at`: `user` in its own
-/// `identity_type` set, and NOT node-bearing by #925's one predicate
-/// ([`is_node_bearing_key_at`](super::is_node_bearing_key_at) — its own set,
-/// or an agreed occurrence of a `node` identity at `at`). Also returns the
-/// earliest occurrence-interval edge after `at`, where the answer may change
-/// ([`node_bearing_at_with_next`](super::node_bearing_at_with_next)).
-async fn founder_is_human_at<F>(
+/// CIRISPersist#972 — the arm a founder of an infrastructure
+/// community counts under at an instant. ONE predicate, read by the door
+/// ([`check_founder_eligible`]) and by the chain / liveness folds
+/// ([`Memo::founder_counts`]): two copies of "who is a founder" is how a row
+/// is admitted and then counts nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FounderArm {
+    /// A CURRENT seat of the conferring accord family (its revocation-folded
+    /// roster at the instant). Human-held by the holder triple (CC 4.2.3): no
+    /// `user` type and no `steward` conferral are asked. Leaving the accord
+    /// roster ends it (CC 3.2 T7).
+    Holder,
+    /// A `user` key that still has to show an accord-conferred `steward`
+    /// (CC 3.2 T2) — the rule for every founder who is not an accord holder.
+    Steward,
+    /// Node-bearing (#925, "infrastructure does not vote"), or neither a
+    /// seated holder nor a `user` key.
+    Neither,
+}
+
+/// Is `key_id` a seat of the conferring accord family at `at`? Asked of this
+/// node's stored family and its roster planes
+/// ([`authorized_family_roster_at`](super::authorized_family_roster_at), the
+/// fold the accord quorum itself is counted over) — never of the key's own
+/// `identity_type`, which is the key's word.
+async fn accord_holder_seated_at<F>(
+    directory: &F,
+    key_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(family) =
+        super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
+    else {
+        return Ok(false);
+    };
+    match super::authorized_family_roster_at(directory, &family, at).await {
+        Ok(seats) => Ok(seats.iter().any(|m| m.key_id == key_id)),
+        Err(Error::Unsupported { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`FounderArm`] of `record` at `at`, plus the earliest occurrence-interval
+/// edge after `at` where the node-bearing answer may change
+/// ([`node_bearing_at_with_next`](super::node_bearing_at_with_next)). The
+/// holder arm changes at the accord family's roster events
+/// ([`family_event_instants`]), which the caller bounds.
+async fn founder_arm_at<F>(
     directory: &F,
     record: &KeyRecord,
     at: chrono::DateTime<chrono::Utc>,
-) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), Error>
+) -> Result<(FounderArm, Option<chrono::DateTime<chrono::Utc>>), Error>
 where
     F: FederationDirectory + ?Sized,
 {
     let (node_bearing, next_edge) =
         super::node_bearing_at_with_next(directory, &record.key_id, at).await?;
-    Ok((
-        identity_type::set_contains(&record.identity_type, identity_type::USER) && !node_bearing,
-        next_edge,
-    ))
+    let arm = if node_bearing {
+        FounderArm::Neither
+    } else if accord_holder_seated_at(directory, &record.key_id, at).await? {
+        FounderArm::Holder
+    } else if identity_type::set_contains(&record.identity_type, identity_type::USER) {
+        FounderArm::Steward
+    } else {
+        FounderArm::Neither
+    };
+    Ok((arm, next_edge))
 }
 
-/// One founder is eligible: a key record here, human (#925), and an
-/// accord-conferred `steward` whose conferral has not been withdrawn (CC 3.2
-/// T2). The conferral is judged against the COMPILED accord holder roster
+/// One founder is eligible ([`founder_arm_at`]): a key record here, not
+/// node-bearing (#925), and EITHER a current seat of the conferring accord
+/// family (#972 — nothing more is asked of a seated holder) OR a `user` key
+/// with an accord-conferred `steward` whose conferral has not been withdrawn
+/// (CC 3.2 T2). The conferral is judged against the COMPILED accord holder roster
 /// (`accord_holder_roster_key_ids`, the ceremony plane every key-plane
 /// conferral uses); the row's own quorum is judged against the family's
 /// revocation-folded roster ([`accord_quorum_over_community`]).
@@ -253,13 +304,18 @@ where
             format!("founder {founder:?} has no key record on this node"),
         ));
     };
-    if !founder_is_human_at(directory, &record, now).await?.0 {
+    let arm = founder_arm_at(directory, &record, now).await?.0;
+    if arm == FounderArm::Holder {
+        return Ok(());
+    }
+    if arm == FounderArm::Neither {
         return Err(violation(
             community_key_id,
             super::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
             format!(
-                "founder {founder:?} is not a human key (identity_type {:?}): a node-bearing key \
-                 MUST NOT be a founder of an infrastructure community (CIRISPersist#925)",
+                "founder {founder:?} is not a human key (identity_type {:?}, and not a current \
+                 seat of the accord family): a node-bearing key MUST NOT be a founder of an \
+                 infrastructure community (CIRISPersist#925)",
                 record.identity_type
             ),
         ));
@@ -542,6 +598,9 @@ struct Memo {
     valid_until: Option<chrono::DateTime<chrono::Utc>>,
     records: std::collections::HashMap<String, Option<KeyRecord>>,
     conferred: std::collections::HashMap<String, bool>,
+    /// The accord family's roster event instants (#972): the holder arm of
+    /// [`FounderArm`] changes at them. Read once per verdict.
+    accord_events: Option<Vec<chrono::DateTime<chrono::Utc>>>,
     /// Per community: every self-signed resignation instant of each key,
     /// ascending (a re-seated founder may resign again; the earliest alone
     /// would mask the later one behind the re-seat floor).
@@ -558,6 +617,7 @@ impl Memo {
             valid_until: None,
             records: std::collections::HashMap::new(),
             conferred: std::collections::HashMap::new(),
+            accord_events: None,
             resignations: std::collections::HashMap::new(),
         }
     }
@@ -695,7 +755,9 @@ impl Memo {
     }
 
     /// Does `key_id` count as a founder of `community_key_id` at `at` (`None`
-    /// = the verdict's `now`)? A human key at that instant (#925's
+    /// = the verdict's `now`)? By the ONE founder predicate
+    /// ([`founder_arm_at`], #972): a seated accord holder at that instant, not
+    /// resigned by its own signature — or a human key at that instant (#925's
     /// [`is_node_bearing_key_at`](super::is_node_bearing_key_at)),
     /// accord-conferred as a steward, not resigned by its own signature, and
     /// not withdrawn — or, for a link instant, withdrawn only AFTER it (a
@@ -729,9 +791,18 @@ impl Memo {
             return Ok(false);
         };
         let when = at.unwrap_or(self.now);
-        let (human, next_edge) = founder_is_human_at(directory, &rec, when).await?;
+        let (arm, next_edge) = founder_arm_at(directory, &rec, when).await?;
         if at.is_none() {
             if let Some(t) = next_edge {
+                self.bound(t);
+            }
+            // #972 — a holder joining or leaving the accord roster changes
+            // the arm, so those instants bound the verdict too.
+            if self.accord_events.is_none() {
+                self.accord_events =
+                    Some(family_event_instants(directory, accord_family_key_id()).await?);
+            }
+            for t in self.accord_events.clone().unwrap_or_default() {
                 self.bound(t);
             }
             for r in self
@@ -741,14 +812,22 @@ impl Memo {
                 self.bound(r);
             }
         }
-        if !human || !self.conferred(directory, key_id).await? {
-            return Ok(false);
+        match arm {
+            FounderArm::Neither => return Ok(false),
+            FounderArm::Steward if !self.conferred(directory, key_id).await? => return Ok(false),
+            FounderArm::Holder | FounderArm::Steward => {}
         }
         if self
             .resigned_within(directory, community_key_id, key_id, seated_since, when)
             .await?
         {
             return Ok(false);
+        }
+        // The `steward` role withdrawal is the steward arm's alone: a seated
+        // holder was never conferred `steward`, and leaves by leaving the
+        // accord roster.
+        if arm == FounderArm::Holder {
+            return Ok(true);
         }
         Ok(
             match directory
