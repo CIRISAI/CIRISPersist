@@ -47,7 +47,7 @@ Storage: **V159** `federation_lineage_head_cosigns` on both dialects — PK `(li
 `trust:charter:v1` (the self-loop `delegates_to` with `infra:` scope) gains two typed envelope members, carried in the scrub-signed bytes so changing either is a charter re-scrub by the conferring roster, refused as a plain config edit:
 - `attach_window_secs: u64` — the freshness window for attaching;
 - `witness_cadence_secs: u64` — the re-commit cadence (T6 §3);
-- `witness_quorum: u32` (optional, default 1) — how many independent witnesses make a head "witnessed". The rulings say "the witness quorum" without a number; persist's default is ONE independent witness, charter-overridable, stated here so it is not re-asked.
+- `witness_quorum: u32` (optional) — how many independent witnesses make a head "witnessed". **Absent or `0` is witnessed mode off (§8, CIRISPersist#973); persist substitutes no default.** A value of `1` is refused at charter admission.
 
 They are typed members of `EnvelopeCore` (`paths::ATTACH_WINDOW_SECS`, `paths::WITNESS_CADENCE_SECS`, `paths::WITNESS_QUORUM`), so **`ENVELOPE_VOCABULARY_SHA256` re-pins** (the I120 discipline: the test that asserts the pin stays; the CHANGELOG names old and new). Shipped defaults for `ciris-canonical` / `humanity-accord`: `attach_window_secs = 604800` (7 d), `witness_cadence_secs = 86400` (24 h) — CC 5.3.4. A charter that declares no `attach_window_secs` makes its root attachable only through an out-of-band anchor naming a specific head (T5).
 
@@ -135,7 +135,7 @@ Domain label dropped (STH cosign accepted as lineage cosign); founder-witness ad
 - A v50 node adopts unwitnessed heads first-seen-wins; a v51 node holding a witnessed head refuses a v50 peer's unwitnessed competitor. Until the first witness cosigns a lineage, v51 behaves as v50 (`ever_witnessed`).
 - Server#693 serves the cosign route and the head beside the bundle; Edge attaches through `pin_trust_from_bundle_response`; the canonical node re-commits both lineages at least once per cadence (Server).
 - Residual: the witness set's own standing is judged by `identity_type` and non-foundership only; a witness's revocation un-counts its cosigns from its `revoked_after` (every instant keyed, `valid_until`-bounded).
-- Residual: `witness_quorum` default 1 is persist's choice pending CC text; a charter may raise it.
+- `witness_quorum`: superseded by §8 — silence and `0` are witnessed mode off; there is no default.
 
 ### 6.1 Mutation round (v51.0.0, on the committed tree; lane = rc6 + v51 + I190 + media + #929 witnesses on memory, sqlite, postgres)
 
@@ -189,3 +189,24 @@ Lane: rc6 + v51 + I190 + lineage_witness + I34b, on memory, sqlite and postgres.
 | R16b | the window addition is unchecked | KILLED | I194 (2^53 − 1 s window) |
 
 Two first-draft witnesses were measuring a neighbouring fact, and both were rebuilt before their mutant was killed. I125b read the attested column, which the projections never write; it now reads the replication peer set. I194 used a `u64::MAX` window, which canonicalization turns into a float; it now uses 2^53 − 1. A third lane stall came from the harness (`empty_dsn` never reaped) and was fixed there.
+
+## 8. Witnessed mode off (CIRISPersist#973; CC 3.2 T6, operator ruling 2026-10-01)
+
+CC 3.2 T6: "A charter MAY declare `witness_quorum: 0` with no `witnesses[]`: the lineage's **witnessed mode is off**. Then a head counts as current when it carries a valid founder-quorum signature and descends by `prev_head_digest` from a head the consumer holds out of band … and T4a's attach gate reads as *attach only through an out-of-band anchor* (T5): no head is fresh by cosignature, so none is attachable by cosignature." And: "**A charter silent on `witness_quorum` is in witnessed mode off**, exactly as one declaring `0` … a substrate MUST NOT substitute an internal default." And: "A non-zero `witness_quorum` below ⌊n/2⌋ + 1 stays refused."
+
+As built:
+
+- `lineage_witness::declared_witness_quorum` is the one reading of the charter member: absent → `0`. `DEFAULT_WITNESS_QUORUM` is removed. `witnessed()` is false at quorum `0`.
+- `witnessed_head` returns "never witnessed" (`judged: None`, no tail, no equivocation) when the mode is off, whatever cosigns are held. The head is the founders' latest admitted version, as before rc6. Cosigns are still admitted and stored by the door as evidence.
+- `check_attach_freshness` in off mode: an edge naming the head this node holds attaches (the T5 anchor; the window is not applied, since no cosignature exists to be fresh); an edge naming another head is refused; an edge naming no head is refused when the charter declares a window, and admitted when it declares none (the pre-rc6 edge shape under a pre-rc6 charter, unchanged — the gate re-runs wherever an edge is put, so refusing that shape would refuse edges already in the field).
+- `RootWitnessView` gains `held_head`; `quorum` is `0` in off mode.
+- Charter admission (`trust_root::check_charter_witness_quorum`, both charter doors) refuses `witness_quorum: 1` naming `charter_witness_quorum_below_majority`.
+
+**In the field.** A lineage whose charter is silent and for which no cosign is held (every lineage in production today) reads the same before and after: it was "never witnessed, judged as before rc6", and it still is. The reading changes only where a silent charter met a held cosign: one cosign used to engage witnessed mode (the default of 1) and no longer does. An anchor attach naming the held head used to be refused as unwitnessed under a silent charter and is now admitted.
+
+### Not yet built
+
+- The witness directory: `witnesses[]` inside the charter, a head's cosignatures judged against its PARENT's directory, and the majority check `witness_quorum = ⌊n/2⌋ + 1` over that directory's size. Until it exists a non-zero quorum counts any registered key typed `witness` that is not a founder's person (§3.2), and only the value `1` is refused at admission. Tracked on CIRISPersist#974.
+- Descent from an out-of-band head by `prev_head_digest`: persist's chain is the stored version lineage each put door verified from the accord birth; the `lineage_head` object of CC 3.2 T6 is not a separate stored object.
+
+Invariants I340–I344 (memory, sqlite, postgres): a silent charter is off; an explicit `0` is the same state; off mode attaches by anchor only; an explicit quorum of 2 still witnesses; a quorum of 1 is refused at the charter.

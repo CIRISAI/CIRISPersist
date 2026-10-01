@@ -225,7 +225,8 @@ pub mod paths {
     /// signal, never a validity leg).
     pub const WITNESS_CADENCE_SECS: &str = "witness_cadence_secs";
     /// v51.0.0 (CIRISPersist#938) — a charter member: how many independent
-    /// witnesses make a head "witnessed" (default 1).
+    /// witnesses make a head "witnessed". Absent or `0` is witnessed mode off
+    /// (#973, CC 3.2 T6); no default is substituted.
     pub const WITNESS_QUORUM: &str = "witness_quorum";
     /// v51.0.0 (CIRISPersist#937) — on a `trust:accepts:v1` acceptance edge:
     /// the lineage head (its `persist_row_hash`) the consumer attaches under.

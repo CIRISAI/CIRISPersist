@@ -1858,15 +1858,17 @@ where
     }))
 }
 
-/// The witness quorum a lineage's charter declares, or the default (FSD §1.3).
+/// The witness quorum a lineage's charter declares; `0` when the charter is
+/// silent or declares zero — witnessed mode off (#973, CC 3.2 T6).
 async fn witness_quorum_for<F>(directory: &F, community: &Community) -> Result<u32, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    Ok(charter_members_for(directory, &community.community_key_id)
-        .await?
-        .and_then(|c| c.witness_quorum)
-        .unwrap_or(super::lineage_witness::DEFAULT_WITNESS_QUORUM))
+    Ok(super::lineage_witness::declared_witness_quorum(
+        charter_members_for(directory, &community.community_key_id)
+            .await?
+            .and_then(|c| c.witness_quorum),
+    ))
 }
 
 /// The witnessed-head computation over the chain this node holds and every
@@ -1910,6 +1912,17 @@ where
         .collect();
     let founder_principals = principals_of(directory, &founders_all).await?;
     let quorum = witness_quorum_for(directory, &head.community).await?;
+    // #973 (CC 3.2 T6) — witnessed mode OFF: the head is current on the
+    // founders' quorum and its descent, exactly as before rc6. Cosigns held
+    // are evidence and judge nothing: no witnessed prefix, no equivocation.
+    if !super::lineage_witness::witnessed_mode_on(quorum) {
+        return Ok(WitnessedHead {
+            judged: None,
+            unwitnessed_tail: 0,
+            equivocation: None,
+            latest_cosign_at,
+        });
+    }
     // Witnessed mode engages only once some version of this chain has actually
     // reached the QUORUM (PR #943 review: one cosign under a quorum of two
     // must not roll a multi-version lineage back to its birth). Until then the
@@ -2086,6 +2099,27 @@ where
     // default for ciris-canonical / humanity-accord is 7 days), every attach
     // needs the witnessed head; an edge that names a head is judged under any
     // charter (the T5 anchor).
+    // #973 (CC 3.2 T6, witnessed mode off) — no head is fresh by cosignature,
+    // so none is attachable by cosignature: an attach is by an out-of-band
+    // anchor to the head this node holds (T5), and the window does not apply.
+    let off = !super::lineage_witness::witnessed_mode_on(view.quorum);
+    if off {
+        return match (presented, view.held_head.as_ref()) {
+            // The pre-rc6 edge shape under a pre-rc6 charter (no window, no
+            // head named) is unchanged: edges already in the field re-admit.
+            (None, _) if charter.attach_window_secs.is_none() => Ok(()),
+            (None, _) => refuse(format!(
+                "the lineage of {root} is in witnessed mode off: attaching requires an \
+                 out-of-band anchor naming the head (`{}`), never a cosignature (CC 3.2 T6)",
+                paths::ATTACHED_HEAD_DIGEST
+            )),
+            (Some(p), Some((held, _))) if p == held => Ok(()),
+            (Some(p), _) => refuse(format!(
+                "the presented head {p} is not the head this node holds for {root}: in \
+                 witnessed mode off an attach names the current head as its anchor"
+            )),
+        };
+    }
     let Some(presented) = presented else {
         if charter.attach_window_secs.is_none() {
             return Ok(());
@@ -2141,7 +2175,11 @@ where
 pub struct RootWitnessView {
     /// The served head when witnessed: digest and signer-stamped instant.
     pub witnessed_head: Option<(String, chrono::DateTime<chrono::Utc>)>,
-    /// The charter's quorum (default 1).
+    /// The head this node holds for the lineage, witnessed or not: the anchor
+    /// an attach names while witnessed mode is off (#973).
+    pub held_head: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    /// The charter's quorum; `0` = witnessed mode off (a silent charter, or
+    /// one declaring zero — no default is substituted).
     pub quorum: u32,
     /// The community fold's detail (`None` for a family root).
     pub community: Option<WitnessedHead>,
@@ -2159,12 +2197,17 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::lineage_witness::{effective_cosigns, principals_of, witnessed};
-    let quorum = charter_members_for(directory, root)
-        .await?
-        .and_then(|c| c.witness_quorum)
-        .unwrap_or(super::lineage_witness::DEFAULT_WITNESS_QUORUM);
+    let quorum = super::lineage_witness::declared_witness_quorum(
+        charter_members_for(directory, root)
+            .await?
+            .and_then(|c| c.witness_quorum),
+    );
     if let Some(signed) = lookup_signed_community(directory, root).await? {
         let chain = chain_of(&signed);
+        let held_head = match chain.last() {
+            Some(h) => Some((row_hash(&h.community)?, head_instant(h))),
+            None => None,
+        };
         let w = witnessed_head(directory, &chain, now).await?;
         let witnessed_head = match w.judged {
             Some(i) => Some((row_hash(&chain[i].community)?, head_instant(&chain[i]))),
@@ -2173,6 +2216,7 @@ where
         let latest = w.latest_cosign_at;
         return Ok(Some(RootWitnessView {
             witnessed_head,
+            held_head,
             quorum,
             community: Some(w),
             latest_cosign_at: latest,
@@ -2199,6 +2243,7 @@ where
     .then(|| (fam.persist_row_hash.clone(), fam.founded_at));
     Ok(Some(RootWitnessView {
         witnessed_head,
+        held_head: Some((fam.persist_row_hash.clone(), fam.founded_at)),
         quorum,
         community: None,
         latest_cosign_at: effective.iter().map(|c| c.signed_at).max(),

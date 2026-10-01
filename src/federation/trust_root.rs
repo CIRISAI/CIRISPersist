@@ -2643,6 +2643,28 @@ async fn transit_eligibility_walk(
 pub const CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY: &str =
     "charter_witness_quorum_below_majority";
 
+/// #973 (CC 3.2 T6) — a charter's `witness_quorum` is `0` / absent (witnessed
+/// mode off) or a strict majority of its witness directory and at least 2.
+/// The directory (`witnesses[]`, the parent-directory rule) is not built yet
+/// (FSD `TRUST_ROOT_RC6.md`, "not yet built"), so the one value refusable
+/// without it is refused here: `1`, which no directory makes a majority ≥ 2.
+///
+/// # Errors
+///
+/// [`Error::CharterInvalid`] naming [`CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY`].
+pub fn check_charter_witness_quorum(envelope: &serde_json::Value) -> Result<(), Error> {
+    match envelope.get(super::envelope::paths::WITNESS_QUORUM) {
+        Some(v) if v.as_u64() == Some(1) => Err(Error::CharterInvalid {
+            detail: format!(
+                "{CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY}: `witness_quorum` 1 is not a \
+                 valid charter value — declare 0 (witnessed mode off) or a strict majority \
+                 of the witness directory, at least 2 (CC 3.2 T6)"
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// v24.0.0 (CIRISPersist#557) — the FAMILY-charter admission gate: a charter
 /// that names a constitutional family must be signed by that family's QUORUM,
 /// and it is refused at the write chokepoint if it is not.
@@ -2699,6 +2721,7 @@ where
         return Ok(());
     }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
+    check_charter_witness_quorum(&row.attestation_envelope)?;
 
     // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
     // item 2 — see the type-level doc.
@@ -2819,6 +2842,7 @@ where
         return Ok(());
     }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
+    check_charter_witness_quorum(envelope)?;
 
     // 1. Pre-rotation commitment: present + well-formed, always.
     if !charter_commitment_well_formed(envelope) {

@@ -96,6 +96,33 @@ pub(crate) mod bodies {
         c
     }
 
+    /// #973 — the pre-existing witnesses were written when a silent charter
+    /// meant a quorum of ONE. Silence is now witnessed mode off and a quorum
+    /// of one is not a valid charter value, so they run under an explicit
+    /// quorum of 2 ([`born_witnessed`]) and every witness act is made by a
+    /// witness AND its twin (`w1` + `w1t`): one act still crosses the quorum.
+    async fn wit(d: &dyn FederationDirectory, c: LineageHeadCosign) -> Result<Out, Error> {
+        let mut twin = c.clone();
+        twin.witness_key_id = format!("{}t", c.witness_key_id);
+        twin.signature_classical = String::new();
+        twin.signature_pqc = None;
+        let bytes = crate::verify::canonical::ceg_produce_canonicalize(&twin.signing_envelope())
+            .expect("cosign envelope canonicalizes");
+        let sig = ts::threshold_sign(&twin.witness_key_id, &bytes);
+        twin.signature_classical = sig.ed25519_signature_base64;
+        twin.signature_pqc = sig.mldsa65_signature_base64;
+        let out = d.put_lineage_head_cosign(c).await;
+        let _ = d.put_lineage_head_cosign(twin).await;
+        out
+    }
+
+    /// [`born`] under a charter declaring `witness_quorum: 2`.
+    async fn born_witnessed(d: &dyn FederationDirectory) -> Vec<ops::Identity> {
+        let holders = born(d).await;
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        holders
+    }
+
     async fn born(d: &dyn FederationDirectory) -> Vec<ops::Identity> {
         let holders = stand_up(d).await;
         d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
@@ -103,6 +130,8 @@ pub(crate) mod bodies {
             .expect("the accord births the row");
         ts::register_hybrid_key_as(d, "w1", "w1", identity_type::WITNESS).await;
         ts::register_hybrid_key_as(d, "w2", "w2", identity_type::WITNESS).await;
+        ts::register_hybrid_key_as(d, "w1t", "w1t", identity_type::WITNESS).await;
+        ts::register_hybrid_key_as(d, "w2t", "w2t", identity_type::WITNESS).await;
         ts::register_hybrid_key_as(d, "plain-user", "plain-user", identity_type::USER).await;
         holders
     }
@@ -119,14 +148,11 @@ pub(crate) mod bodies {
 
     /// **I191** — the door.
     pub async fn i191_the_cosign_door(d: &dyn FederationDirectory) {
-        let holders = born(d).await;
+        let holders = born_witnessed(d).await;
         let good = cosign_held_head(d, CANON, "w1", None).await;
+        assert_eq!(wit(d, good.clone()).await.unwrap(), Out::Inserted);
         assert_eq!(
-            d.put_lineage_head_cosign(good.clone()).await.unwrap(),
-            Out::Inserted
-        );
-        assert_eq!(
-            d.put_lineage_head_cosign(good.clone()).await.unwrap(),
+            wit(d, good.clone()).await.unwrap(),
             Out::Unchanged,
             "the identical cosign is held once"
         );
@@ -141,7 +167,7 @@ pub(crate) mod bodies {
             .expect("the first cosign counts");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(
-            d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+            wit(d, cosign_held_head(d, CANON, "w1", None).await)
                 .await
                 .unwrap(),
             Out::Inserted,
@@ -164,14 +190,17 @@ pub(crate) mod bodies {
         let family = cc::accord_family_key_id();
         let fam = d.lookup_family(family).await.unwrap().expect("seeded");
         assert_eq!(
-            d.put_lineage_head_cosign(cosign_for(
-                family,
-                &fam.persist_row_hash,
-                fam.founded_at,
-                "w1",
-                None,
-                chrono::Utc::now(),
-            ))
+            wit(
+                d,
+                cosign_for(
+                    family,
+                    &fam.persist_row_hash,
+                    fam.founded_at,
+                    "w1",
+                    None,
+                    chrono::Utc::now(),
+                )
+            )
             .await
             .unwrap(),
             Out::Inserted
@@ -202,23 +231,14 @@ pub(crate) mod bodies {
             None,
             at("2026-09-21T00:00:00Z"),
         );
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::WitnessNotValidAt,
-        );
+        refused(wit(d, c).await.unwrap(), R::WitnessNotValidAt);
         // unregistered witness
         let mut c = cosign_held_head(d, CANON, "w1", None).await;
         c.witness_key_id = "nobody".into();
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::WitnessNotRegistered,
-        );
+        refused(wit(d, c).await.unwrap(), R::WitnessNotRegistered);
         // registered, not a witness
         let c = cosign_held_head(d, CANON, "plain-user", None).await;
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::WitnessNotWitnessType,
-        );
+        refused(wit(d, c).await.unwrap(), R::WitnessNotWitnessType);
         // a founder of the lineage, even with identity_type witness added
         let row = swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "founder-witness");
         // seat founder-witness through the record, then it may not witness
@@ -227,17 +247,11 @@ pub(crate) mod bodies {
             .await
             .expect("re-seat");
         let c = cosign_held_head(d, CANON, "founder-witness", None).await;
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::WitnessIsFounder,
-        );
+        refused(wit(d, c).await.unwrap(), R::WitnessIsFounder);
         // bad signature
         let mut c = cosign_held_head(d, CANON, "w2", None).await;
         c.signature_classical = c.signature_classical.chars().rev().collect();
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::SignatureInvalid,
-        );
+        refused(wit(d, c).await.unwrap(), R::SignatureInvalid);
         // wrong head instant (re-signed, so the signature is valid)
         let held = d.lookup_community(CANON).await.unwrap().unwrap();
         let c = cosign_for(
@@ -248,10 +262,7 @@ pub(crate) mod bodies {
             None,
             chrono::Utc::now(),
         );
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::HeadInstantMismatch,
-        );
+        refused(wit(d, c).await.unwrap(), R::HeadInstantMismatch);
         // skew: signed far in the future
         let s = cc::lookup_signed_community(d, CANON)
             .await
@@ -265,7 +276,7 @@ pub(crate) mod bodies {
             None,
             chrono::Utc::now() + chrono::Duration::hours(2),
         );
-        refused(d.put_lineage_head_cosign(c).await.unwrap(), R::Skew);
+        refused(wit(d, c).await.unwrap(), R::Skew);
         // an unknown head is held as evidence
         let c = cosign_for(
             CANON,
@@ -275,14 +286,11 @@ pub(crate) mod bodies {
             None,
             chrono::Utc::now(),
         );
-        assert_eq!(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            Out::HeldForUnknownHead
-        );
+        assert_eq!(wit(d, c).await.unwrap(), Out::HeldForUnknownHead);
         // malformed digest
         let mut c = cosign_held_head(d, CANON, "w2", None).await;
         c.head_digest_sha256_hex = "not-hex".into();
-        refused(d.put_lineage_head_cosign(c).await.unwrap(), R::Malformed);
+        refused(wit(d, c).await.unwrap(), R::Malformed);
         // a prior that is a LATER held version than the head is not an ancestor
         let head_v2 = d
             .lookup_community(CANON)
@@ -304,22 +312,19 @@ pub(crate) mod bodies {
             Some(&head_v2),
             chrono::Utc::now(),
         );
-        refused(
-            d.put_lineage_head_cosign(c).await.unwrap(),
-            R::PriorNotAncestor,
-        );
+        refused(wit(d, c).await.unwrap(), R::PriorNotAncestor);
     }
 
     /// **I192** — the witnessed head.
     pub async fn i192_the_witnessed_head(d: &dyn FederationDirectory) {
-        let holders = born(d).await;
+        let holders = born_witnessed(d).await;
         // never witnessed: judged as before rc6
         let v = d_view(d).await;
         assert_eq!(v.judged, None);
         assert!(cc::resolve_community(d, CANON).await.unwrap().is_some());
         // witness the birth
         assert_eq!(
-            d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+            wit(d, cosign_held_head(d, CANON, "w1", None).await)
                 .await
                 .unwrap(),
             Out::Inserted
@@ -355,9 +360,12 @@ pub(crate) mod bodies {
             .persist_row_hash
             .clone();
         assert_eq!(
-            d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w2", Some(&birth_digest)).await)
-                .await
-                .unwrap(),
+            wit(
+                d,
+                cosign_held_head(d, CANON, "w2", Some(&birth_digest)).await
+            )
+            .await
+            .unwrap(),
             Out::Inserted
         );
         let view = d_view(d).await;
@@ -468,7 +476,7 @@ pub(crate) mod bodies {
         // on a calendar date)
         charter_the_accord_with(
             d,
-            serde_json::json!({ "attach_window_secs": LONG_WINDOW, "witness_quorum": 1 }),
+            serde_json::json!({ "attach_window_secs": LONG_WINDOW, "witness_quorum": 2 }),
         )
         .await;
         let head = d
@@ -482,7 +490,7 @@ pub(crate) mod bodies {
             "requires the witnessed lineage head",
         );
         assert_stale(accept_edge(d, consumer, Some(&head)).await, "not witnessed");
-        d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+        wit(d, cosign_held_head(d, CANON, "w1", None).await)
             .await
             .unwrap();
         assert_stale(
@@ -501,7 +509,7 @@ pub(crate) mod bodies {
         // the window shrinks to 1 s (the birth is days old): a NEW attach is stale …
         charter_the_accord_with(
             d,
-            serde_json::json!({ "attach_window_secs": 1, "witness_quorum": 1 }),
+            serde_json::json!({ "attach_window_secs": 1, "witness_quorum": 2 }),
         )
         .await;
         let late = "i194-late";
@@ -524,7 +532,7 @@ pub(crate) mod bodies {
         // reaches the arithmetic): ~285 million years, past chrono's range.
         charter_the_accord_with(
             d,
-            serde_json::json!({ "attach_window_secs": 9_007_199_254_740_991_u64, "witness_quorum": 1 }),
+            serde_json::json!({ "attach_window_secs": 9_007_199_254_740_991_u64, "witness_quorum": 2 }),
         )
         .await;
         let huge = "i194-huge";
@@ -537,7 +545,7 @@ pub(crate) mod bodies {
         // attaches and the held-but-unwitnessed v2 does not.
         charter_the_accord_with(
             d,
-            serde_json::json!({ "attach_window_secs": LONG_WINDOW, "witness_quorum": 1 }),
+            serde_json::json!({ "attach_window_secs": LONG_WINDOW, "witness_quorum": 2 }),
         )
         .await;
         put_conferred(d, &holders, "fr-steward", "user,steward").await;
@@ -578,8 +586,8 @@ pub(crate) mod bodies {
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
     ) {
-        let ha = born_on(a).await;
-        let hb = born_on(b).await;
+        let ha = born_witnessed(a).await;
+        let hb = born_witnessed(b).await;
         for (d, h) in [(a, &ha), (b, &hb)] {
             put_conferred(d, h, "eq-steward", "user,steward").await;
             ts::register_hybrid_key_as(d, "eq-serve-node", "eq-serve-node", identity_type::NODE)
@@ -601,7 +609,7 @@ pub(crate) mod bodies {
         );
         // both nodes witness the birth
         for d in [a, b] {
-            d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+            wit(d, cosign_held_head(d, CANON, "w1", None).await)
                 .await
                 .unwrap();
         }
@@ -622,29 +630,24 @@ pub(crate) mod bodies {
         .expect("b: H2b");
         let cos_a = cosign_held_head(a, CANON, "w1", Some(&birth_digest)).await;
         let cos_b = cosign_held_head(b, CANON, "w1", Some(&birth_digest)).await;
-        assert_eq!(
-            a.put_lineage_head_cosign(cos_a.clone()).await.unwrap(),
-            Out::Inserted
-        );
-        assert_eq!(
-            b.put_lineage_head_cosign(cos_b.clone()).await.unwrap(),
-            Out::Inserted
-        );
+        assert_eq!(wit(a, cos_a.clone()).await.unwrap(), Out::Inserted);
+        assert_eq!(wit(b, cos_b.clone()).await.unwrap(), Out::Inserted);
         assert_eq!(
             d_view(a).await.judged,
             Some(1),
             "a adopts its witnessed H2a"
         );
         // a receives the witness plane's cosign of b's head: evidence, frozen at the birth
-        assert_eq!(
-            a.put_lineage_head_cosign(cos_b).await.unwrap(),
-            Out::HeldForUnknownHead
-        );
+        assert_eq!(wit(a, cos_b).await.unwrap(), Out::HeldForUnknownHead);
         let view = d_view(a).await;
         assert_eq!(view.judged, Some(0), "frozen at the last common ancestor");
         let e = view.equivocation.expect("equivocation is reported");
         assert_eq!(e.fork_digest, birth_digest);
-        assert_eq!(e.competing_witnesses, vec!["w1".to_owned()]);
+        assert_eq!(
+            e.competing_witnesses,
+            vec!["w1".to_owned(), "w1t".to_owned()],
+            "the quorum of two that signed both heads"
+        );
         let r = cc::resolve_community(a, CANON)
             .await
             .unwrap()
@@ -658,10 +661,7 @@ pub(crate) mod bodies {
             "emitted once"
         );
         // b, symmetrically
-        assert_eq!(
-            b.put_lineage_head_cosign(cos_a).await.unwrap(),
-            Out::HeldForUnknownHead
-        );
+        assert_eq!(wit(b, cos_a).await.unwrap(), Out::HeldForUnknownHead);
         assert_eq!(d_view(b).await.judged, Some(0));
     }
 
@@ -670,8 +670,8 @@ pub(crate) mod bodies {
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
     ) {
-        let ha = born_on(a).await;
-        let hb = born_on(b).await;
+        let ha = born_witnessed(a).await;
+        let hb = born_witnessed(b).await;
         for (d, h) in [(a, &ha), (b, &hb)] {
             put_conferred(d, h, "rs-steward", "user,steward").await;
             put_conferred(d, h, "rs-steward-2", "user,steward").await;
@@ -691,12 +691,9 @@ pub(crate) mod bodies {
         .await
         .expect("b: v2");
         let cos = cosign_held_head(b, CANON, "w1", Some(&birth_digest)).await;
-        b.put_lineage_head_cosign(cos.clone()).await.unwrap();
+        wit(b, cos.clone()).await.unwrap();
         // a (restored to the birth) learns of the witnessed head through the plane
-        assert_eq!(
-            a.put_lineage_head_cosign(cos).await.unwrap(),
-            Out::HeldForUnknownHead
-        );
+        assert_eq!(wit(a, cos).await.unwrap(), Out::HeldForUnknownHead);
         let e = founders_supersede(
             a,
             swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "rs-steward-2"),
@@ -1151,11 +1148,11 @@ pub(crate) mod bodies {
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
     ) {
-        let ha = born_on(a).await;
-        let hb = born_on(b).await;
+        let ha = born_witnessed(a).await;
+        let hb = born_witnessed(b).await;
         for (d, h) in [(a, &ha), (b, &hb)] {
             put_conferred(d, h, "dc-steward", "user,steward").await;
-            d.put_lineage_head_cosign(cosign_held_head(d, CANON, "w1", None).await)
+            wit(d, cosign_held_head(d, CANON, "w1", None).await)
                 .await
                 .unwrap();
         }
@@ -1187,10 +1184,7 @@ pub(crate) mod bodies {
             Some(&birth_digest),
             chrono::Utc::now(),
         );
-        assert_eq!(
-            a.put_lineage_head_cosign(lie).await.unwrap(),
-            Out::HeldForUnknownHead
-        );
+        assert_eq!(wit(a, lie).await.unwrap(), Out::HeldForUnknownHead);
         a.put_community(v2.clone()).await.expect("a applies v2");
         let view = d_view(a).await;
         assert_eq!(
@@ -1207,10 +1201,7 @@ pub(crate) mod bodies {
             Some(&birth_digest),
             chrono::Utc::now(),
         );
-        assert_eq!(
-            a.put_lineage_head_cosign(honest).await.unwrap(),
-            Out::Inserted
-        );
+        assert_eq!(wit(a, honest).await.unwrap(), Out::Inserted);
         assert_eq!(d_view(a).await.judged, Some(1));
     }
 

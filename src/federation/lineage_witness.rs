@@ -17,9 +17,20 @@ use serde::{Deserialize, Serialize};
 /// The domain label, a signed member of the envelope.
 pub const LINEAGE_HEAD_COSIGN_DOMAIN: &str = "ciris.lineage_head_cosign.v1";
 
-/// The default witness quorum when a charter declares none (`witness_quorum`):
-/// ONE independent witness. Persist's choice pending CC text (FSD §1.3).
-pub const DEFAULT_WITNESS_QUORUM: u32 = 1;
+/// #973 (CC 3.2 T6, "Witnessed mode off") — **the quorum a charter declares,
+/// with no default substituted.** A charter silent on `witness_quorum`, or
+/// declaring `0`, is in witnessed mode OFF: this returns `0`, and every reader
+/// asks [`witnessed_mode_on`] before it counts a cosign.
+#[must_use]
+pub fn declared_witness_quorum(charter_value: Option<u32>) -> u32 {
+    charter_value.unwrap_or(0)
+}
+
+/// Witnessed mode is on only by an explicit non-zero charter value.
+#[must_use]
+pub fn witnessed_mode_on(quorum: u32) -> bool {
+    quorum > 0
+}
 
 /// A witness's cosignature over one head of one lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,14 +443,16 @@ where
 
 /// `witnessed(head)` — at least `quorum` effective cosigns for `head_digest`
 /// from DISTINCT PERSONS, none of whom is a founder's person (FSD §3.2; PR
-/// #943 review: one identity's several keys count once). Pure.
+/// #943 review: one identity's several keys count once). Pure. With witnessed
+/// mode off (`quorum == 0`, #973) nothing is witnessed, whatever is held.
 pub fn witnessed(
     effective: &[EffectiveCosign],
     head_digest: &str,
     founder_principals: &std::collections::BTreeSet<String>,
     quorum: u32,
 ) -> bool {
-    witnesses_of(effective, head_digest, founder_principals).len() as u32 >= quorum.max(1)
+    witnessed_mode_on(quorum)
+        && witnesses_of(effective, head_digest, founder_principals).len() as u32 >= quorum
 }
 
 /// The distinct non-founder persons whose effective cosigns name `head_digest`.
@@ -524,6 +537,13 @@ mod tests {
             !witnessed(&only_founder, "h", &founders, 1),
             "a lineage witnessed solely by its founders is unwitnessed"
         );
-        assert!(witnessed(&cs, "h", &founders, 0), "quorum 0 reads as 1");
+        assert!(
+            !witnessed(&cs, "h", &founders, 0),
+            "quorum 0 is witnessed mode off: nothing is witnessed (#973)"
+        );
+        assert_eq!(declared_witness_quorum(None), 0, "silence is not a default");
+        assert_eq!(declared_witness_quorum(Some(0)), 0);
+        assert_eq!(declared_witness_quorum(Some(2)), 2);
+        assert!(!witnessed_mode_on(0) && witnessed_mode_on(2));
     }
 }
