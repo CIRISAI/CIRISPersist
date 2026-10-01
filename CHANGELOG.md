@@ -34,6 +34,13 @@ Mutation round:
 | M3: `UNION ALL` | **equivalent**: a community in both tables is walked twice; the re-wrap and the sweep are idempotent |
 | M4: key-state half only | **equivalent**: a pointer-only community holds no DEK, so there is nothing to re-wrap or sweep |
 
+### Fixed — a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964)
+`persist_row_hash` truncates every instant to microseconds. For a 7–9 digit fraction it kept the trailing zeros (`.123000789` → `.123000`). But postgres stores microseconds, and the read-back row serializes them the way chrono's `AutoSi` does: `.123`, or no fraction at all. So about one instant in a thousand made a stored row hash differently from itself. A faithful re-offer of that row was then booked `AlreadyPresentIdentical` instead of `Unchanged`, and #672's settle missed it. This was the intermittent I189 red in CI and certify.
+
+The truncated fraction now collapses to 0, 3 or 6 digits exactly as chrono prints a microsecond value. Strings of six or fewer digits are untouched, and no pinned vector moved. A row whose instant has such a fraction, written before v52.0.1, keeps its stored hash; only the rare trailing-zero case computes differently.
+
+I189 now pins such an instant, which made it a deterministic RED on postgres before the fix. A unit test checks each rewrite against chrono's own output. Mutants 3/3 killed: the zero arm, the millisecond arm, and the old rule.
+
 ## [52.0.0] - 2026-09-30
 
 **MAJOR — the v52 bundle.** v51.4.0 and v51.5.0 were never released; their contents ship here with the queued wire breaks (#955 membership acceptance, #954 manifest ceiling, and the rest as their designs land). Sections below are grouped by issue.
