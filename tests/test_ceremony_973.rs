@@ -350,15 +350,58 @@ async fn i354_verifier_refuses_by_name() {
     let e = reason(verify_ceremony_outputs(&bj, &serde_json::to_string(&c3).unwrap()).await);
     assert_eq!(e.reason, R::CommunityBirth, "{e}");
 
-    // a tampered delegation row
+    // a delegation row or a serve node altered after the holders authorized
+    // the bundle: the authorization digest binds both, so the quorum fails
     let mut b3 = c.bundle.clone();
     b3.attestations[1].attestation.attestation_envelope["scope"] =
         serde_json::json!(["infra:serve"]);
     let e = reason(verify_ceremony_outputs(&serde_json::to_string(&b3).unwrap(), &cj).await);
-    assert!(
-        matches!(e.reason, R::BundleQuorum | R::BundleBake | R::DelegationRow),
-        "{e}"
+    assert_eq!(e.reason, R::BundleQuorum, "{e}");
+    let mut b4 = c.bundle.clone();
+    b4.serve_nodes[0].record.identity_type = "canonical,node,steward".into();
+    let e = reason(verify_ceremony_outputs(&serde_json::to_string(&b4).unwrap(), &cj).await);
+    assert_eq!(e.reason, R::BundleQuorum, "{e}");
+
+    // a correctly authorized bundle whose rows the write door refuses (stamped
+    // 15 minutes ahead): caught at the bake stage, by the door's own rule
+    let f = mint(900);
+    let e = reason(
+        verify_ceremony_outputs(&f.bundle_json().unwrap(), &f.community_json().unwrap()).await,
     );
+    assert_eq!(e.reason, R::DelegationRow, "{e}");
+    assert!(e.detail.contains("ahead of now"), "{e}");
+}
+
+/// **I355b — the seam is honoured only while the override is live.** With a
+/// ceremony installed and the anchor disarmed, every reader sees the compiled
+/// artifacts again.
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i355b_seam_is_inert_without_the_override() {
+    let c = mint(-5);
+    let baked_holder = accord_holder_genesis_records()[0].record.key_id.clone();
+    {
+        let _armed = Armed::with(&c.block);
+        install_test_ceremony_outputs(c.bundle.clone(), Some(c.community.clone()));
+        assert_eq!(
+            canonical_genesis_bundle().holders[0].record.key_id,
+            "test-accord-holder-0"
+        );
+        assert!(canonical_community_asset().is_some());
+        // Disarm WITHOUT clearing the installed ceremony.
+        for k in TEST_ANCHOR_ENV_VARS {
+            std::env::remove_var(k);
+        }
+        assert_eq!(
+            canonical_genesis_bundle().holders[0].record.key_id,
+            baked_holder,
+            "I355b: disarmed, the compiled bundle is what every reader sees"
+        );
+        assert!(
+            canonical_community_asset().is_none(),
+            "I355b: disarmed, the compiled (unbaked) community asset"
+        );
+    }
 }
 
 /// **I355 — a tampered community asset never stops the boot**: the leg is
