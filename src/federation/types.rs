@@ -4847,8 +4847,28 @@ fn truncate_rfc3339_to_microseconds(s: &str) -> Option<String> {
     }
     // Only rewrite something that really is an instant.
     chrono::DateTime::parse_from_rfc3339(s).ok()?;
+    // v52.0.1 (CIRISPersist#964) — after truncation, print the fraction the
+    // way chrono's `AutoSi` prints a MICROSECOND value: none when it is zero,
+    // three digits when it is whole milliseconds, else six. Postgres stores
+    // the instant at microseconds and the read-back row serializes it that
+    // way, so `.123000789` must hash as `.123`, not `.123000` — else a
+    // stored row re-offered byte-for-byte hashes differently from itself
+    // (about 1 instant in 1000). A fraction of six or fewer digits is left
+    // exactly as written, as before.
+    let micros = &s[frac_start..frac_start + 6];
+    let keep = if micros == "000000" {
+        0
+    } else if micros.ends_with("000") {
+        3
+    } else {
+        6
+    };
     let mut out = String::with_capacity(s.len());
-    out.push_str(&s[..frac_start + 6]);
+    if keep == 0 {
+        out.push_str(&s[..dot]);
+    } else {
+        out.push_str(&s[..frac_start + keep]);
+    }
     out.push_str(&s[frac_start + frac_len..]);
     Some(out)
 }
@@ -6242,6 +6262,43 @@ mod tests {
                 .as_deref(),
             Some("2026-06-01T00:00:00.123456+02:00"),
         );
+    }
+
+    /// v52.0.1 (CIRISPersist#964) — a truncated fraction prints the way
+    /// chrono prints a MICROSECOND instant (postgres's read-back), so a
+    /// nanosecond instant and its microsecond read-back hash the same.
+    #[test]
+    fn a_truncated_instant_matches_its_microsecond_read_back_964() {
+        for (ns, read_back) in [
+            ("2026-06-01T00:00:00.123000789Z", "2026-06-01T00:00:00.123Z"),
+            ("2026-06-01T00:00:00.000000789Z", "2026-06-01T00:00:00Z"),
+            ("2026-06-01T00:00:00.120000500Z", "2026-06-01T00:00:00.120Z"),
+            (
+                "2026-06-01T00:00:00.000123789Z",
+                "2026-06-01T00:00:00.000123Z",
+            ),
+            (
+                "2026-06-01T00:00:00.123000789+02:00",
+                "2026-06-01T00:00:00.123+02:00",
+            ),
+        ] {
+            assert_eq!(
+                super::truncate_rfc3339_to_microseconds(ns).as_deref(),
+                Some(read_back),
+                "{ns}"
+            );
+            // the read-back form is already canonical
+            assert!(super::truncate_rfc3339_to_microseconds(read_back).is_none());
+            // and it is what chrono prints for the microsecond value
+            let t: chrono::DateTime<chrono::FixedOffset> = ns.parse().unwrap();
+            let us = chrono::DateTime::from_timestamp_micros(t.timestamp_micros())
+                .unwrap()
+                .with_timezone(t.offset());
+            assert_eq!(
+                us.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, read_back.ends_with('Z')),
+                read_back
+            );
+        }
     }
 
     /// v23.0.0 (CIRISPersist#551 item 6) — the Rust field is

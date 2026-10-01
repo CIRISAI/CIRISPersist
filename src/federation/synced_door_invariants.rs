@@ -196,7 +196,13 @@ pub mod bodies {
         seat(a.seat, p, tag).await;
         seat(b.seat, p, tag).await;
         let id = format!("{tag}-row");
-        let row = scores_row(&id, &p.author, &p.author, "trust:demo:v1");
+        let mut row = scores_row(&id, &p.author, &p.author, "trust:demo:v1");
+        // #964 — an instant whose microseconds end in 000 with a sub-µs tail:
+        // postgres stores .123000, and the read-back row serializes it as
+        // .123. The stored-row re-offer must still hash to the stored hash.
+        row.scrub_timestamp =
+            chrono::DateTime::from_timestamp(row.scrub_timestamp.timestamp(), 123_000_789)
+                .expect("instant");
         let deco = decorated(&row);
         let rival = rival(&row);
         let forged = forged(&row, &rival);
