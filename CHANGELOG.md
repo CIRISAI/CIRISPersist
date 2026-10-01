@@ -7,7 +7,45 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [52.0.1] - UNRELEASED
+## [52.0.2] - UNRELEASED
+
+**PATCH — a thread with no persist tokio runtime gets a pool connection instead of aborting the process (CIRISServer#705; the same root cause as CIRISPersist#354).** No wire, hash, ABI or migration change.
+
+### Fixed — the pool's connector runs on persist's own runtime (CIRISServer#705, CIRISPersist#354)
+The persist and edge wheels each statically link their own tokio. Edge holds the concrete `PostgresBackend` and calls `get_client` from its own runtime thread. When the pool must CREATE a connection (first use from that path, a recycle failure, killed connections), deadpool calls the `Box<dyn Connect>` that persist's `.so` built. Its tokio-postgres DNS/TCP and `tokio::spawn(connection)` run against PERSIST's tokio, which has no runtime on edge's thread. "There is no reactor running" panicked there, and the unwind crossed into edge's std as a foreign exception: the process aborted (rc=-6). It was intermittent and postgres-only; the single-cdylib server was immune.
+
+**`store::postgres_runtime_connect::PersistRuntimeConnect`** now wraps deadpool's connector at BOTH pool-construction arms (TLS and non-TLS, through one `persist_runtime_pool`). The decision is made inside persist's code, where `Handle::try_current()` asks persist's own tokio:
+- **with persist's runtime on the thread** (the server's one cdylib, every pyo3 path), it connects inline as before;
+- **without one**, it spawns the connect on the runtime handle captured when the backend was built and awaits the `JoinHandle` (a waker, no reactor needed). The connection driver lands on persist's runtime, where it must live.
+- **A panic in the hop** comes back as a `JoinError` mapped to an error, never an unwind across the boundary.
+
+`tokio_postgres::Error` has no public constructor, so a failed hop returns a config-parse error whose cause names `ciris_persist_runtime_hop_failed`, and the join error is logged. A pool supplied by the caller through `PostgresBackend::from_pool` is the caller's and is not wrapped.
+
+Witnesses (postgres, a database per test):
+- **I320:** a backend built in persist's runtime hands a new connection to a thread with NO tokio runtime, which then runs `SELECT 1`. It was RED first with "there is no reactor running", the exact production panic, and asserts the connection came by a hop.
+- **I320b:** a connector that panics on persist's runtime returns an error to that thread, not an unwind.
+- **I321:** a thread with persist's runtime connects inline, with no hop.
+- A unit test pins the hop-failure error.
+
+Mutation round, 5/5 killed:
+
+| Mutant | Killed by |
+|---|---|
+| M1 hop condition removed (always inline) | I320 |
+| M2 runtime handle captured as None | I320 |
+| M3 `JoinError` re-raised as an unwind | I320b |
+| M4 non-TLS pool site left on `create_pool` | I320 |
+| M5 TLS pool site left on `create_pool` | I320 under `--features tls` |
+
+**For v53, an audit of the same class:** any other trait object built inside persist's `.so` and handed RAW to a foreign caller runs against persist's tokio on a foreign thread:
+- the keyring signer from `keyring_signer_capsule` (any `spawn_blocking` or tokio timer on its sign path);
+- the cirisaudit `merkle_signer`;
+- the `schema_resolver`;
+- the `blob_storage` and `trust_scoring` capsules.
+
+`catch_unwind` at the capsule op-future boundaries (`directory_capsule` build_op) is the defensive backstop. Edge's own structural fix is to stop lifting the raw `BackendDispatch` for verify and rooting.
+
+## [52.0.1] - 2026-10-01
 
 **PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.
 
