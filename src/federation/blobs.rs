@@ -3335,7 +3335,11 @@ pub trait BlobStorage: Send + Sync {
     ) -> impl Future<Output = Result<Option<u64>, BlobError>> + Send;
 
     /// v43.0.0 (§11.6) — every community this node holds a DEK epoch record
-    /// for. The sweep's enumeration: exactly the set with anything to sweep.
+    /// for: the union of the epoch key state and the minters' pointer rows.
+    /// v52.0.1 (CIRISPersist#967) — the key state is load-bearing: a room
+    /// that never rotated and has no retain policy has key rows but no
+    /// pointer row, and the #916 re-wrap walk enumerates through here. The
+    /// retention sweep is a no-op for a community with no policy.
     fn community_dek_communities(
         &self,
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;

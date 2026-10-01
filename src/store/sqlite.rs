@@ -15470,7 +15470,10 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn community_dek_communities(&self) -> Result<Vec<String>, crate::federation::BlobError> {
         self.read(move |conn| -> Result<Vec<String>, rusqlite::Error> {
             let mut st = conn.prepare(
-                "SELECT DISTINCT community_key_id FROM federation_community_dek_epoch \
+                // v52.0.1 (#967) — the key state too: a room that never
+                // rotated has DEK rows but no pointer row.
+                "SELECT community_key_id FROM federation_community_dek \
+                 UNION SELECT community_key_id FROM federation_community_dek_epoch \
                  ORDER BY community_key_id",
             )?;
             let out: Vec<String> = st

@@ -1447,6 +1447,69 @@ pub(crate) mod two_node {
             "(D) no set is ever signed for an epoch this node did not mint"
         );
     }
+
+    /// **I188(k) — CIRISPersist#967: a room that NEVER rotated is re-wrapped
+    /// too.** Its only epoch is 0: no bump, no retain policy, so the minter's
+    /// pointer table holds no row for it. The enumeration the #916 walk uses
+    /// must still name it, and a member device arriving after epoch 0 was
+    /// minted must be granted epoch 0 — the pair-room case (CIRISEdge#768).
+    pub(crate) async fn i188k_a_never_rotated_room_rewraps<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let bob = format!("em-bob-{run}");
+        let (a, b) = (l.ba.as_ref(), l.bb.as_ref());
+        l.engine_a
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"epoch zero only", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("(k) A seals at epoch 0: {e}"));
+        assert_eq!(
+            a.community_dek_retain_past_epochs(&l.comm, &l.node_a)
+                .await
+                .unwrap(),
+            None,
+            "(k) precondition: no retain policy"
+        );
+        assert!(
+            a.community_dek_communities()
+                .await
+                .unwrap()
+                .contains(&l.comm),
+            "(k) a room with key state at epoch 0 is enumerated (#967)"
+        );
+        let d = device(a, b, &format!("dk-{run}")).await;
+        anchor_local(a, &bob, &d).await;
+        let binding = bind_on_b(b, &bob, &d.key, run).await;
+        l.engine_a
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("(k) A admits bob's binding: {e}"));
+        assert!(
+            a.community_dek_has_member_grant(&l.comm, &l.node_a, 0, &d.key)
+                .await
+                .unwrap(),
+            "(k) the late device holds epoch 0 of a never-rotated room (#967)"
+        );
+        let set = set_carrying(a, &l.comm, &l.node_a, 0, &d.key)
+            .await
+            .expect("(k) epoch 0's set carries the late device");
+        let set = KeyGrantSet::from_attestation(&set).unwrap();
+        let wrap = set
+            .wraps
+            .iter()
+            .find(|w| w.recipient_key_id == d.key)
+            .expect("(k) the wrap");
+        let dek = unwrap_dek_v2_json(&d.private, &wrap.wrapped_dek)
+            .unwrap_or_else(|e| panic!("(k) the device opens its wrap: {e}"));
+        assert_eq!(dek.len(), 32, "(k) a 32-byte DEK");
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1477,6 +1540,39 @@ mod run_two_node {
             return;
         };
         super::two_node::i188_the_minter_rewraps_its_own_history(
+            &a,
+            &b,
+            &suffix(),
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::postgres::PostgresBackend,
+                >,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i188k_never_rotated_sqlite() {
+        super::two_node::i188k_a_never_rotated_room_rewraps(
+            "sqlite::memory:",
+            "sqlite::memory:",
+            &suffix(),
+            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::sqlite::SqliteBackend,
+                >,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i188k_never_rotated_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        super::two_node::i188k_a_never_rotated_room_rewraps(
             &a,
             &b,
             &suffix(),
