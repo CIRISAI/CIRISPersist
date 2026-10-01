@@ -3096,7 +3096,21 @@ pub(crate) mod bodies {
             &e,
             crate::federation::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
         );
-        assert_not_stored(d).await;
+        assert_not_stored(d).await; // A seated holder is still a founder who can RESIGN from the community
+                                    // by its own signature: the resignation un-counts it (the counting
+                                    // rule applies to both arms).
+        d.put_community(signed(canonical_row(&HOLDERS), &HOLDERS))
+            .await
+            .expect("I334: born by the three holders");
+        d.put_community_membership_revocation(founder_revocation(&["B1"], "B1"))
+            .await
+            .expect("I334: holder-founder B1 resigns from the community");
+        match cc::stored_standing(d, CANON).await.unwrap() {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains("B1"), "I334: {reason}")
+            }
+            other => panic!("I334: a resigned holder-founder does not count: {other:?}"),
+        }
     }
 
     /// (m) — MEDIUM-C: a second read with every input unchanged verifies no
