@@ -7,7 +7,18 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [52.0.0] - UNRELEASED
+## [52.0.1] - UNRELEASED
+
+**PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706).** No wire, hash or migration change.
+
+### Fixed — session liveness reads the signed lease (#946 read side)
+v52.0.0 made `valid_until` mandatory on every `session:*` row and prescribed renewal by `supersedes` that keeps `claimed_at`. But `session_claim::handler_for` still judged liveness as `now − claimed_at < ttl`, so a renewed session read as expired after one ttl and dropped. Liveness is now **`now < valid_until`**, read from the row's signed envelope at read time (`session_claim::row_is_live`). A renewal keeps `claimed_at`, so the earliest-wins merge is stable. The caller's `ttl` remains only for a row stored before v52 with no `valid_until`. An unparsable `valid_until` is not live. `SessionClaim` and `claim_is_live` are unchanged.
+
+Witnesses:
+- the #814/#946 session witness on memory, sqlite and postgres gains three cases: a claim past the ttl with a live lease holds the session (RED first, with the server's symptom), a lapsed lease holds nothing, and a renewal keeps the holder and its `claimed_at`;
+- a unit test pins the lease boundary (exclusive), an unparsable lease, and the pre-v52 ttl fallback.
+
+## [52.0.0] - 2026-09-30
 
 **MAJOR — the v52 bundle.** v51.4.0 and v51.5.0 were never released; their contents ship here with the queued wire breaks (#955 membership acceptance, #954 manifest ceiling, and the rest as their designs land). Sections below are grouped by issue.
 

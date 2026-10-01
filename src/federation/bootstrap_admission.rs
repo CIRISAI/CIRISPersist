@@ -1937,6 +1937,68 @@ pub mod test_support {
                 "({tag}) #946: got {err}"
             );
         }
+        // v52.0.1 — LIVENESS is the claim's signed `valid_until`, judged at
+        // read time. A claim older than the consumer's ttl whose lease is
+        // live still holds the session; an expired lease does not; a renewal
+        // that keeps `claimed_at` and extends `valid_until` keeps the holder.
+        {
+            use crate::federation::session_claim::handler_for;
+            let ttl = chrono::Duration::seconds(60);
+            let put_claim = |session: &'static str,
+                             from: chrono::DateTime<chrono::Utc>,
+                             until: chrono::DateTime<chrono::Utc>| {
+                let mut r = scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &occurrence,
+                    &occurrence,
+                    "session:claim:v1",
+                );
+                r.attestation_envelope["community_id"] = serde_json::json!(format!("room-{run}"));
+                r.attestation_envelope["session_id"] = serde_json::json!(session);
+                r.attestation_envelope["claimed_at"] = serde_json::json!(from.to_rfc3339());
+                r.attestation_envelope["valid_until"] = serde_json::json!(until.to_rfc3339());
+                ts::reseal(&mut r);
+                dir.put_attestation(SignedAttestation { attestation: r })
+            };
+            let room = format!("room-{run}");
+            let at = now - chrono::Duration::seconds(120);
+            put_claim("live-lease", at, now + chrono::Duration::seconds(600))
+                .await
+                .unwrap();
+            assert_eq!(
+                handler_for(dir, &occurrence, &room, "live-lease", now, ttl)
+                    .await
+                    .unwrap()
+                    .map(|c| c.occurrence_key_id),
+                Some(occurrence.clone()),
+                "({tag}) a claim past the ttl whose signed lease is live holds the session"
+            );
+            put_claim("lapsed", at, now - chrono::Duration::seconds(10))
+                .await
+                .unwrap();
+            assert_eq!(
+                handler_for(dir, &occurrence, &room, "lapsed", now, ttl)
+                    .await
+                    .unwrap(),
+                None,
+                "({tag}) a lapsed lease holds nothing"
+            );
+            put_claim("renewed", at, now - chrono::Duration::seconds(10))
+                .await
+                .unwrap();
+            put_claim("renewed", at, now + chrono::Duration::seconds(600))
+                .await
+                .unwrap();
+            let held = handler_for(dir, &occurrence, &room, "renewed", now, ttl)
+                .await
+                .unwrap()
+                .expect("the renewal holds the session");
+            assert_eq!(
+                held.claimed_at.timestamp(),
+                at.timestamp(),
+                "({tag}) renewal keeps claimed_at"
+            );
+        }
         let theirs = uuid::Uuid::new_v4().to_string();
         let mut bad = scores_row(&theirs, &stranger, &occurrence, "session:claim:v1");
         lease(&mut bad, now, 3_600);
