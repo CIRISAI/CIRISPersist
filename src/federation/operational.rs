@@ -1841,6 +1841,24 @@ pub mod test_support {
         directory: &dyn crate::federation::FederationDirectory,
         holder: &Identity,
     ) -> Result<(), crate::federation::Error> {
+        register_accord_holder_as(
+            directory,
+            holder,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await
+    }
+
+    /// [`register_accord_holder`] with the record's own `identity_type` set
+    /// chosen by the caller. The historical fixture types its holders `node`;
+    /// the baked production holders are typed `accord_holder`
+    /// (`genesis/accord_holder_seed.json`), which is the shape #972's
+    /// holder-as-founder witnesses need.
+    pub async fn register_accord_holder_as(
+        directory: &dyn crate::federation::FederationDirectory,
+        holder: &Identity,
+        own_identity_type: &str,
+    ) -> Result<(), crate::federation::Error> {
         use sha2::{Digest, Sha256};
         let m = holder.member();
         let registration_envelope = json!({ "key_id": holder.key_id });
@@ -1869,7 +1887,7 @@ pub mod test_support {
             pubkey_ed25519_base64: m.ed25519_public_key_base64,
             pubkey_ml_dsa_65_base64: m.mldsa65_public_key_base64,
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
+            identity_type: own_identity_type.to_owned(),
             identity_ref: holder.key_id.clone(),
             valid_from: pinned,
             valid_until: None,

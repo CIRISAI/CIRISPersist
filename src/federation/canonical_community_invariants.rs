@@ -2941,6 +2941,164 @@ pub(crate) mod bodies {
         assert_eq!(cache.computations(), computed, "nothing computed");
     }
 
+    // ── #972 — a seated accord holder founds an infrastructure community ──
+
+    /// The I330–I334 fixture: the genesis holders registered as the BAKED
+    /// production records are typed (`accord_holder`, not the historical
+    /// fixture's `node`), the entrenched accord family, and one serve node.
+    pub(crate) async fn stand_up_holders(d: &dyn FederationDirectory) -> Vec<ops::Identity> {
+        let mut holders = Vec::new();
+        for rec in crate::federation::genesis::effective_accord_holder_records().iter() {
+            let h = ops::Identity::new(&rec.record.key_id);
+            ops::register_accord_holder_as(d, &h, identity_type::ACCORD_HOLDER)
+                .await
+                .unwrap_or_else(|e| panic!("holder {} typed accord_holder: {e}", h.key_id));
+            holders.push(h);
+        }
+        crate::federation::genesis::seed_accord_family(d)
+            .await
+            .expect("accord family");
+        ts::register_hybrid_key_as(d, SERVE_NODE, SERVE_NODE, identity_type::NODE).await;
+        holders
+    }
+
+    const HOLDERS: [&str; 3] = ["A1", "B1", "C1"];
+
+    /// **I330 — three seated accord holders found the community, and it is
+    /// LIVE.** No `user` type, no `steward` conferral, no record rewritten.
+    /// Before #972 the door refused them; with only the door patched the
+    /// chain and liveness folds counted them as zero founders (stalled).
+    pub async fn i330_accord_holders_found_and_are_live(d: &dyn FederationDirectory) {
+        stand_up_holders(d).await;
+        d.put_community(signed(canonical_row(&HOLDERS), &HOLDERS))
+            .await
+            .expect("I330: a community founded by the three seated accord holders admits");
+        match cc::stored_standing(d, CANON).await.unwrap() {
+            cc::StoredStanding::Rooted(_) => {}
+            other => panic!("I330: every recorded founder counts (Rooted), got {other:?}"),
+        }
+        let r = cc::resolve_community(d, CANON)
+            .await
+            .unwrap()
+            .expect("I330: resolves");
+        assert_eq!(r.founders, HOLDERS.to_vec(), "{r:?}");
+        assert!(
+            r.live,
+            "I330: 3 counting founders at quorum:2/3 is live: {r:?}"
+        );
+    }
+
+    /// **I331 — a holder who leaves the accord roster stops counting as a
+    /// founder at that instant (T7).**
+    pub async fn i331_a_departed_holder_stops_counting(d: &dyn FederationDirectory) {
+        stand_up_holders(d).await;
+        d.put_community(signed(canonical_row(&HOLDERS), &HOLDERS))
+            .await
+            .expect("I331: born");
+        let t = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let mut rev = ts::sign_family_membership_revocation(
+            "A1",
+            crate::federation::types::FamilyMembershipRevocation {
+                family_key_id: cc::accord_family_key_id().to_owned(),
+                removed_identity_key_id: "C1".to_owned(),
+                removed_at: t,
+                effective_at: t,
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        );
+        ts::cosign_family_membership_revocation(&mut rev, "B1");
+        d.put_family_membership_revocation(rev)
+            .await
+            .expect("I331: the accord's 2-of-3 revokes holder C1");
+        assert!(
+            matches!(
+                cc::stored_standing_at(d, CANON, t - chrono::Duration::seconds(1))
+                    .await
+                    .unwrap(),
+                cc::StoredStanding::Rooted(_)
+            ),
+            "I331: before the instant C1 still counts"
+        );
+        match cc::stored_standing_at(d, CANON, t + chrono::Duration::seconds(1))
+            .await
+            .unwrap()
+        {
+            cc::StoredStanding::Stalled { reason, .. } => {
+                assert!(reason.contains("C1"), "I331: names the founder: {reason}")
+            }
+            other => panic!("I331: after the instant C1 does not count (Stalled), got {other:?}"),
+        }
+    }
+
+    /// **I332 — a node-bearing key on the accord roster is still refused as a
+    /// founder (#925).** The historical fixture types its holders `node`.
+    pub async fn i332_a_node_bearing_holder_is_refused(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        let e = d
+            .put_community(signed(canonical_row(&HOLDERS), &HOLDERS))
+            .await
+            .expect_err("I332: node-bearing holders are not founders");
+        assert_violation(
+            &e,
+            crate::federation::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
+        );
+        assert_not_stored(d).await;
+    }
+
+    /// **I333 — the steward path is unchanged and mixes with the holder
+    /// path.** One seated holder beside two accord-conferred `user,steward`
+    /// founders; a self-declared steward beside holders is still refused.
+    pub async fn i333_the_steward_path_still_works(d: &dyn FederationDirectory) {
+        let holders = stand_up_holders(d).await;
+        for f in [FOUNDERS[0], FOUNDERS[1]] {
+            put_conferred(d, &holders, f, "user,steward").await;
+        }
+        ts::register_hybrid_key_as(d, "sf2-steward", "sf2-steward", "user,steward").await;
+        let e = d
+            .put_community(signed(
+                canonical_row(&["A1", "B1", "sf2-steward"]),
+                &["A1", "B1", "sf2-steward"],
+            ))
+            .await
+            .expect_err("I333: a self-declared steward is not a founder");
+        assert!(
+            matches!(&e, Error::RoleNotAccordConferred { key_id, .. } if key_id == "sf2-steward"),
+            "{e:?}"
+        );
+        let mixed = ["A1", FOUNDERS[0], FOUNDERS[1]];
+        d.put_community(signed(canonical_row(&mixed), &["A1", "B1"]))
+            .await
+            .expect("I333: a holder beside two conferred stewards admits");
+        let r = cc::resolve_community(d, CANON).await.unwrap().unwrap();
+        assert_eq!(r.founders, mixed.to_vec(), "{r:?}");
+        assert!(r.live, "I333: {r:?}");
+    }
+
+    /// **I334 — a key typed `accord_holder` in its OWN record that is not a
+    /// seat of the accord family is not a founder.** The roster decides, not
+    /// the record's word.
+    pub async fn i334_a_non_roster_accord_holder_is_refused(d: &dyn FederationDirectory) {
+        stand_up_holders(d).await;
+        let stray = ops::Identity::new("zz-holder");
+        ops::register_accord_holder_as(d, &stray, identity_type::ACCORD_HOLDER)
+            .await
+            .expect("I334: a hardware-attested accord_holder-typed record registers");
+        let e = d
+            .put_community(signed(
+                canonical_row(&["A1", "B1", "zz-holder"]),
+                &["A1", "B1", "zz-holder"],
+            ))
+            .await
+            .expect_err("I334: typed accord_holder, off the roster");
+        assert_violation(
+            &e,
+            crate::federation::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
+        );
+        assert_not_stored(d).await;
+    }
+
     /// (m) — MEDIUM-C: a second read with every input unchanged verifies no
     /// signature (the directory's standing cache serves it); a holder
     /// revocation in the accord family is a changed input, recomputes, and
@@ -3381,6 +3539,46 @@ mod run {
                         &b as &dyn FederationDirectory,
                         &c as &dyn FederationDirectory,
                         &f as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i330() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i330_accord_holders_found_and_are_live(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i331() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i331_a_departed_holder_stops_counting(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i332() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i332_a_node_bearing_holder_is_refused(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i333() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i333_the_steward_path_still_works(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i334() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i334_a_non_roster_accord_holder_is_refused(
+                        &d as &dyn FederationDirectory,
                     )
                     .await
                 }
