@@ -7,6 +7,41 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.0.0] - UNRELEASED
+
+### #972 — a seated accord holder founds an infrastructure community
+Operator ruling 2026-10-01 (posted on #926): the three founders of `ciris-canonical` ARE the baked accord holders A1/B1/C1. The founder check asked every founder for a `user` type and an accord-conferred `steward`; the baked holder records are typed `accord_holder`, so they were refused at the door ("is not a human key").
+
+**One founder predicate, read everywhere a founder is admitted or counted** (`canonical_community::founder_arm_at` → `FounderArm::{Holder, Steward, Neither}`):
+- **Holder:** a CURRENT seat of the conferring accord family, on its revocation-folded roster at the instant (`authorized_family_roster_at`, the fold the accord quorum is itself counted over). No `user` type, no `steward` conferral, no baked record rewritten. The roster decides, never the key's own `identity_type`. Leaving the accord roster ends it at that instant (CC 3.2 T7).
+- **Steward:** unchanged — a `user` key with an accord-conferred `steward`, for every founder who is not a seated holder.
+- **Neither:** node-bearing (#925), or neither of the above.
+
+The door (`check_founder_eligible`) and the chain / liveness fold (`Memo::founder_counts`) both read it. Patching the door alone would have admitted the row and then counted its founders as zero: a community stalled from birth. A holder-founder can still resign from the community by its own signature; the `steward` role-withdrawal lookup applies to the steward arm only. The accord family's roster events bound the cached standing.
+
+**Witnesses** (memory, sqlite, postgres; RED first — the door refused `A1` as "not a human key"):
+- **I330** three holders typed only `accord_holder` found the community; it is `Rooted` and `live`.
+- **I331** a holder revoked from the accord family stops counting at that instant (`Rooted` one second before, `Stalled` naming it one second after).
+- **I332** node-bearing keys on the accord roster are refused as founders.
+- **I333** a holder beside two accord-conferred stewards admits and is live; a self-declared steward beside holders is still `RoleNotAccordConferred`.
+- **I334** a key typed `accord_holder` in its own record but not on the roster is refused; a holder-founder's own resignation un-counts it.
+- I190 (the steward path) stays green.
+
+Test support: `register_accord_holder_as(dir, holder, identity_type)`; the historical fixture keeps typing its holders `node`.
+
+**Mutation round** (committed tree; lane = I330–I334 + I190 a/c/k/m/r, memory and sqlite):
+
+| Mutant | Result |
+|---|---|
+| M1 door does not admit the holder arm directly | killed (I330, I331, I333, I334) |
+| M2 the folds ask a holder for a `steward` conferral (the door-only patch) | killed (I330 not `Rooted`/live, I331, I333, I334) |
+| M3 the holder arm judged at the wall clock, not as-of | killed (I331) |
+| M4 the holder arm reads the key's own `identity_type` | killed (I331, I334) |
+| M5 the node-bearing exclusion dropped | killed (I190 r); I332 stays green because the roster door refuses a node-bearing founder under the same rule |
+| M6 a holder skips the resignation fold | killed (I334) |
+| M7 accord roster events not bounded in the memo | survived — equivalent: the birth's accord-quorum count (`accord_quorum_at`) bounds the same family events in the same memo, so the cache already ends there |
+| M8 the holder arm also asks for `user` | killed (I330, I331, I333, I334) |
+
 ## [52.0.1] - UNRELEASED
 
 **PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.
