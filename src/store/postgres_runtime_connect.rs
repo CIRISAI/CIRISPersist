@@ -163,6 +163,43 @@ mod tests {
         rt.shutdown_background();
     }
 
+    /// I320b — a connect that PANICS on persist's runtime comes back to a
+    /// thread without one as an ERROR. Across two `.so`s an unwind there is
+    /// the abort; a `JoinError` must never be re-raised.
+    #[test]
+    fn i320b_a_panicking_connect_is_an_error_not_an_unwind() {
+        struct Panics;
+        impl deadpool_postgres::Connect for Panics {
+            fn connect(&self, _: &tokio_postgres::Config) -> super::ConnectFuture<'_> {
+                Box::pin(async { panic!("connect panicked on persist's runtime") })
+            }
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("persist runtime");
+        let wrapped = Arc::new(rt.block_on(async { super::PersistRuntimeConnect::new(Panics) }));
+        let joined = std::thread::spawn(move || {
+            let cfg = tokio_postgres::Config::new();
+            block_on_no_runtime(async move {
+                deadpool_postgres::Connect::connect(&*wrapped, &cfg)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:?}"))
+            })
+        })
+        .join();
+        match joined {
+            Ok(Err(e)) => assert!(e.contains("ciris_persist_runtime_hop_failed"), "{e}"),
+            other => panic!(
+                "I320b: expected an error, got {:?}",
+                other.map(|r| r.is_ok())
+            ),
+        }
+        rt.shutdown_background();
+    }
+
     /// I321 — with persist's runtime on the polling thread (the server's one
     /// cdylib, every pyo3 path) the connector connects INLINE: no hop.
     #[test]
