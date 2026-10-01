@@ -169,6 +169,9 @@ pub mod rc5_adopts_invariants;
 /// v51.0.0 — the rc6 trust-root security set (I191–I196).
 #[cfg(test)]
 pub(crate) mod rc6_invariants;
+/// CIRISPersist#973 — I345–I349, the community boot leg and the re-bake path.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod remint_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.

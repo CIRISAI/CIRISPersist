@@ -2966,7 +2966,162 @@ where
     verify_canonical_seeded(dir).await?;
     seed_delegation_plane(dir).await?;
     verify_delegation_plane_seeded(dir).await?;
+    // #973 — the community birth, last: it is admitted THROUGH the key plane
+    // and the delegation plane above. Inert until a ceremony bakes the asset.
+    seed_canonical_community(dir).await?;
+    verify_canonical_community_seeded(dir).await?;
     Ok(())
+}
+
+/// CIRISPersist#973 — the baked `ciris-canonical` community birth record, as
+/// the re-mint ceremony outputs it: a [`SignedCommunity`](super::SignedCommunity),
+/// or JSON `null` while no ceremony has baked one. Pinned by SHA-256 in
+/// [`tests::canonical_community_asset_is_pinned`].
+const CANONICAL_COMMUNITY_SEED_JSON: &str = include_str!("canonical_community_seed.json");
+
+/// Parse-once accessor for the baked community birth. `None` until a ceremony
+/// bakes it — every caller treats `None` as "this leg does not exist yet".
+///
+/// # Panics
+///
+/// Panics if the embedded JSON is neither `null` nor a `SignedCommunity`
+/// (build-time-checked by the pin test).
+pub fn canonical_community_asset() -> Option<&'static super::SignedCommunity> {
+    use std::sync::OnceLock;
+    static PARSED: OnceLock<Option<super::SignedCommunity>> = OnceLock::new();
+    PARSED
+        .get_or_init(|| {
+            serde_json::from_str(CANONICAL_COMMUNITY_SEED_JSON)
+                .expect("embedded canonical_community_seed.json must be null or a SignedCommunity")
+        })
+        .as_ref()
+}
+
+/// CIRISPersist#973 — what the community boot leg did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityLegOutcome {
+    /// No asset is compiled in: nothing read, nothing written.
+    NotBaked,
+    /// The birth was admitted through the signed door.
+    Installed,
+    /// This node already holds exactly the baked birth.
+    AlreadyHeld,
+    /// This node holds a DIFFERENT record under the id — a chain that has
+    /// moved past the birth, or another ceremony's. Left untouched: the
+    /// compiled asset is a floor, never the identity (the #665 rule).
+    HeldDiffers,
+}
+
+/// CIRISPersist#973 — **seed the baked community birth at boot.** See
+/// [`seed_canonical_community_from`]; this passes the compiled asset.
+///
+/// # Errors
+///
+/// As [`seed_canonical_community_from`].
+pub async fn seed_canonical_community<D>(dir: &D) -> Result<CommunityLegOutcome, GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    seed_canonical_community_from(dir, canonical_community_asset()).await
+}
+
+/// CIRISPersist#973 — the community boot leg over a given asset.
+///
+/// - no asset ⇒ [`CommunityLegOutcome::NotBaked`], without a read;
+/// - the id is held ⇒ nothing is written ([`AlreadyHeld`](CommunityLegOutcome::AlreadyHeld)
+///   or [`HeldDiffers`](CommunityLegOutcome::HeldDiffers));
+/// - otherwise the birth goes through the ordinary SIGNED
+///   [`put_community`](super::FederationDirectory::put_community) door —
+///   signature, trust-root shape, founders, accord quorum, founding rule —
+///   never a trusted-local write.
+///
+/// # Errors
+///
+/// Only [`GenesisFault::Absent`] (the door refused or errored: a node
+/// awaiting its ceremony) and [`GenesisFault::Unreadable`] (the directory
+/// could not be asked). NEVER `Divergent`: nothing this leg finds may stop a
+/// boot.
+pub async fn seed_canonical_community_from<D>(
+    dir: &D,
+    asset: Option<&super::SignedCommunity>,
+) -> Result<CommunityLegOutcome, GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Community;
+    let Some(birth) = asset else {
+        return Ok(CommunityLegOutcome::NotBaked);
+    };
+    let id = &birth.community.community_key_id;
+    let held = dir
+        .lookup_community(id)
+        .await
+        .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup community {id}: {e}")))?;
+    if let Some(held) = held {
+        let same = match (
+            super::types::compute_persist_row_hash(&held),
+            super::types::compute_persist_row_hash(&birth.community),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same {
+            return Ok(CommunityLegOutcome::AlreadyHeld);
+        }
+        tracing::info!(
+            community_key_id = %id,
+            "genesis community seed: this node holds a record under the baked id that is not              the baked birth — leaving it in place (CIRISPersist#973)"
+        );
+        return Ok(CommunityLegOutcome::HeldDiffers);
+    }
+    match dir.put_community(birth.clone()).await {
+        Ok(()) => Ok(CommunityLegOutcome::Installed),
+        Err(e) => Err(GenesisFault::absent(
+            LEG,
+            format!("seed community {id}: {e} (is the key and delegation plane seeded first?)"),
+        )),
+    }
+}
+
+/// CIRISPersist#973 — the community leg's presence check: with an asset
+/// baked, the id it names is held. `Ok` without a read when no asset is baked.
+///
+/// # Errors
+///
+/// [`GenesisFault::Absent`] / [`GenesisFault::Unreadable`] only.
+pub async fn verify_canonical_community_seeded<D>(dir: &D) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    verify_canonical_community_seeded_for(dir, canonical_community_asset()).await
+}
+
+/// [`verify_canonical_community_seeded`] over a given asset.
+///
+/// # Errors
+///
+/// [`GenesisFault::Absent`] / [`GenesisFault::Unreadable`] only.
+pub async fn verify_canonical_community_seeded_for<D>(
+    dir: &D,
+    asset: Option<&super::SignedCommunity>,
+) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Community;
+    let Some(birth) = asset else { return Ok(()) };
+    let id = &birth.community.community_key_id;
+    match dir.lookup_community(id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(GenesisFault::absent(
+            LEG,
+            format!("community {id} not seeded"),
+        )),
+        Err(e) => Err(GenesisFault::unreadable(
+            LEG,
+            format!("lookup community {id}: {e}"),
+        )),
+    }
 }
 
 /// v31.1.0 — **install the baked bundle's DELEGATION PLANE at boot.**
@@ -3919,6 +4074,32 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// CIRISPersist#973 — **the community asset is pinned.** Until a ceremony
+    /// bakes it the file is JSON `null` and the leg is inert; a bake replaces
+    /// the file AND this digest in one commit, so the bytes a node boots on
+    /// are the bytes that were reviewed.
+    #[test]
+    fn canonical_community_asset_is_pinned() {
+        use sha2::{Digest, Sha256};
+        const PINNED_SHA256: &str =
+            "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed";
+        assert_eq!(
+            hex::encode(Sha256::digest(
+                super::CANONICAL_COMMUNITY_SEED_JSON.as_bytes()
+            )),
+            PINNED_SHA256,
+            "canonical_community_seed.json changed without its pin"
+        );
+        // Not baked on this branch: the leg must not exist for a boot.
+        assert!(super::canonical_community_asset().is_none());
+        assert_eq!(super::GenesisLeg::Community.as_str(), "community");
+        assert_eq!(
+            super::GenesisLeg::ALL.last(),
+            Some(&super::GenesisLeg::Community),
+            "the community leg is established last"
+        );
+    }
+
     /// v31.1.0 (CIRISPersist#665 review) — **equal vintage is not a successor.**
     ///
     /// Two v31-conformant statements bearing the same envelope-bound

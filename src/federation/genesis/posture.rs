@@ -91,6 +91,17 @@ pub enum GenesisLeg {
     /// precondition of those gates would stop the ceremony establishing the
     /// very leg it exists to establish.
     Delegation,
+    /// CIRISPersist#973 — the baked `ciris-canonical` COMMUNITY birth record:
+    /// the roster the root's lineage starts from. Seeded after the delegation
+    /// plane through the signed `put_community` door, and only once a ceremony
+    /// has baked the asset ([`super::canonical_community_asset`]); until then
+    /// this leg is not evaluated at all.
+    ///
+    /// Reported, and excluded from [`require_constitutional_root`] for the
+    /// reason `Canonical` and `Delegation` are. Its fault is only ever
+    /// `Absent` or `Unreadable`: a birth the door refuses is a node awaiting
+    /// its ceremony, never a tampered root, so this leg can never stop a boot.
+    Community,
 }
 
 impl GenesisLeg {
@@ -102,6 +113,7 @@ impl GenesisLeg {
             Self::Family => "family",
             Self::Canonical => "canonical",
             Self::Delegation => "delegation",
+            Self::Community => "community",
         }
     }
 
@@ -111,6 +123,7 @@ impl GenesisLeg {
         Self::Family,
         Self::Canonical,
         Self::Delegation,
+        Self::Community,
     ];
 }
 
@@ -475,7 +488,13 @@ where
     // — on a root whose conferral rows can never be installed. A posture that
     // cannot see the plane conferring everything is not reporting on a trust
     // root; it is reporting on a key list.
-    match super::verify_delegation_plane_seeded(dir).await {
+    if let Err(f) = super::verify_delegation_plane_seeded(dir).await {
+        return f.into();
+    }
+    // #973 — the FIFTH leg, evaluated only when a ceremony has baked the
+    // community asset. With no asset compiled in this is `Ok` without a read,
+    // so the posture is exactly what it was before the leg existed.
+    match super::verify_canonical_community_seeded(dir).await {
         Ok(()) => GenesisPosture::Entrenched,
         Err(f) => f.into(),
     }
