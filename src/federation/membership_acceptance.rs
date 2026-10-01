@@ -405,6 +405,38 @@ where
     }
 }
 
+/// **A node gives no acceptance** (CIRISPersist#972; CC 3.1.3.2: "a node
+/// member of an `infrastructure` community is seated by the founders' quorum
+/// … the seat is valid when the founders' quorum signed the record and the
+/// node's own key record carries the conferring family's m-of-n scrub").
+///
+/// The ONE predicate both the growth gate and the founding rule read: `member`
+/// needs no acceptance in `community` at `at` iff the community is
+/// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
+/// its own key record carries the accord's m-of-n scrub. The founders' quorum
+/// is the caller's roster-authority check and is not weakened here. The owner
+/// binding is NOT read: it is `self`-scope on the node and no other node can
+/// see it; the claim is enforced where the node operates. A person in the
+/// same community, and a node anywhere else, still needs what they needed.
+pub async fn node_seated_without_acceptance<F>(
+    dir: &F,
+    community: &super::types::Community,
+    member: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if super::community_subkind(community) != Some(super::admission::COHORT_SUBKIND_INFRASTRUCTURE)
+    {
+        return Ok(false);
+    }
+    if !super::is_node_bearing_key_at(dir, member, at).await? {
+        return Ok(false);
+    }
+    super::admission::key_record_carries_accord_scrub(dir, member).await
+}
+
 /// **The growth gate** (FSD §5): `member` joins `group` at `growth_instant`
 /// with `role` only on an admitted acceptance of a live proposal for that
 /// group and role, not declined, signed no later than the proposal's
@@ -421,6 +453,16 @@ pub async fn check_growth_accepted<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // #972 — a node of an infrastructure community is seated by the founders'
+    // quorum (the caller's standing check, already passed) and gives no
+    // acceptance.
+    if scope == cohort_scope::COMMUNITY {
+        if let Some(c) = dir.lookup_community(group).await? {
+            if node_seated_without_acceptance(dir, &c, member, growth_instant).await? {
+                return Ok(());
+            }
+        }
+    }
     let replies = replies_of(dir, member).await?;
     let mut worst: Option<&'static str> = None;
     let mut note = |rule: &'static str| {
@@ -523,6 +565,27 @@ where
         return Err(refuse(group, m, RULE_FOUNDING_MEMBER_UNSIGNED));
     }
     Ok(())
+}
+
+/// The founding rule for a COMMUNITY (#972): the persons it lists signed it
+/// ([`check_founding_signers`]); a node of an `infrastructure` community is
+/// seated by those signatures and never signs
+/// ([`node_seated_without_acceptance`], at the record's `founded_at`).
+pub async fn check_community_founding_signers<F>(
+    dir: &F,
+    community: &super::types::Community,
+    signers: &[&str],
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut persons: Vec<&str> = Vec::with_capacity(community.members.len());
+    for m in &community.members {
+        if !node_seated_without_acceptance(dir, community, &m.key_id, community.founded_at).await? {
+            persons.push(m.key_id.as_str());
+        }
+    }
+    check_founding_signers(dir, &community.community_key_id, &persons, signers).await
 }
 
 /// **The supersede rule** (Q2): an amendment's roster may keep, re-list or

@@ -332,16 +332,9 @@ where
                 .map(|c| c.authority_key_id.as_str()),
         )
         .collect();
-    let members: Vec<&str> = community
-        .community
-        .members
-        .iter()
-        .map(|m| m.key_id.as_str())
-        .collect();
-    super::membership_acceptance::check_founding_signers(
+    super::membership_acceptance::check_community_founding_signers(
         dir,
-        &community.community.community_key_id,
-        &members,
+        &community.community,
         &signers,
     )
     .await

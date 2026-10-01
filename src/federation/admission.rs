@@ -11601,6 +11601,28 @@ where
             .is_ok())
 }
 
+/// CIRISPersist#972 (CC 3.1.3.2, "a node gives no acceptance") — does
+/// `key_id`'s OWN key record carry the conferring family's m-of-n scrub? The
+/// accord's blessing of a node, re-verified from the row's cryptography against
+/// the live accord roster ([`verify_accord_family_coscrub`]); no role claim is
+/// read. `false` for an unknown key.
+pub(crate) async fn key_record_carries_accord_scrub<F>(
+    directory: &F,
+    key_id: &str,
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let Some(row) = directory.lookup_public_key(key_id).await? else {
+        return Ok(false);
+    };
+    Ok(
+        verify_accord_family_coscrub(directory, &row, &accord_holder_roster_key_ids())
+            .await
+            .is_ok(),
+    )
+}
+
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
 /// their own signable holders).
 // v30.3.0 (CIRISPersist#611) — `?Sized`-generic for the same reason
