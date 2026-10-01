@@ -42,6 +42,40 @@ Test support: `register_accord_holder_as(dir, holder, identity_type)`; the histo
 | M7 accord roster events not bounded in the memo | survived — equivalent: the birth's accord-quorum count (`accord_quorum_at`) bounds the same family events in the same memo, so the cache already ends there |
 | M8 the holder arm also asks for `user` | killed (I330, I331, I333, I334) |
 
+### #972 — a node is seated in an infrastructure community without an acceptance
+Operator ruling 2026-10-01 (posted on #926, and on #973): "Nodes do not vote/consent, they have no agency." CC 3.1.3.2 (rc6): *"a node member of an `infrastructure` community is seated by the founders' quorum on the widening alone … the seat is valid when the founders' quorum signed the record and the node's own key record carries the conferring family's m-of-n scrub … The same holds at founding: a node listed in an `infrastructure` community's founding record is seated by the founders' signatures on that record and never signs it."* v52 asked every new member for an acceptance and every listed founding member for a signature, so `ciris-canonical-1` could not be seated.
+
+**One predicate, read at both sites** (`membership_acceptance::node_seated_without_acceptance`): the community is `infrastructure`, the member key is node-bearing at the record's instant (#925's predicate), and the node's own key record carries the accord's m-of-n scrub (`admission::key_record_carries_accord_scrub`, re-verified from the row against the live accord roster; no role claim is read). The founders' quorum is the roster-authority check that already ran, unchanged.
+- **Widening** (`check_growth_accepted`): such a node needs no acceptance row.
+- **Founding** (`check_community_founding_signers`): the founding rule counts only the persons the record lists.
+- **The owner binding is not read.** It is `self`-scope on the node and no other node can see it; the claim is enforced where the node operates.
+- **Unchanged:** a person in the same community still needs their acceptance; a node in an ordinary community or a family is still refused; a family never reads the exemption, even one that shares the community's id.
+
+Not changed, and worth knowing: a node whose OWNER signed a founding record is still counted as signed (the founding rule compares identities, and a claimed node resolves to its owner). That is v52 behaviour and is how an ordinary community lists its founder's own node.
+
+**Witnesses** (memory, sqlite, postgres; RED first — I335 `membership_founding_member_unsigned`, I336 `membership_acceptance_unresolved`):
+- **I335** the birth row seats an accord-scrubbed node that never signed it.
+- **I336** a widening seats such a node on the founders' 2-of-3 with no acceptance; one founder of three is refused by the roster rule, not the acceptance gate.
+- **I337** a node whose key record lacks the accord's scrub is refused at the founding and on the plane.
+- **I338** a person with an accord-scrubbed record still needs their acceptance.
+- **I339** the same blessed, claimed node is refused in an ordinary community (founding and widening), in a family, and in a family that shares the infrastructure community's id.
+
+**Mutation round** (lane = I335–I339, memory and sqlite): 7 killed, 1 equivalent.
+
+| Mutant | Result |
+|---|---|
+| M1 the infrastructure test dropped | killed (I339) |
+| M2 the node-bearing test dropped | killed (I338) |
+| M3 the accord scrub not required | killed (I337) |
+| M4 the widening site reverted | killed (I336) |
+| M5 the founding site reverted | killed (I335) |
+| M6 the founding exempts every member | killed (I337, I339) |
+| M7 the scope test dropped at the widening | killed (I339, the same-id family) — survived until that case was added |
+| M8 the scrub read accepts an unknown key | equivalent: an unknown key is not node-bearing, and that test runs first |
+
+### Test support — the accord-holder evidence nonce is captured once per process
+`fresh_accord_holder_evidence()` read the clock on every call and quantized to the hour. A fixture that registers one identity twice therefore put two different records whenever the test straddled hh:00:00, and the second was (correctly) refused: `key_id A1 already exists with different content`. That was the intermittent certify red on v52.0.2 (`accord_carriage::exclusion_carriage_postgres`, 10:59:50–11:00:00). The instant is now the process's first captured hour, reused while younger than 12 h (`process_nonce_instant`), with a witness that injects the clock at hh:59:59.9 and hh+1:00:00.1. Not a product change.
+
 ## [52.0.1] - UNRELEASED
 
 **PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.
