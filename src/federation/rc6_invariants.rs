@@ -826,6 +826,182 @@ pub(crate) mod bodies {
         );
     }
 
+    /// A signed acceptance edge for `consumer` → the canonical root, unstored.
+    fn accept_edge_row(
+        id: &str,
+        consumer: &str,
+        head: Option<&str>,
+        scope: &str,
+    ) -> crate::federation::SignedAttestation {
+        let mut env = serde_json::json!({
+            "references_attestation_id": id,
+            "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+            "scope": [scope],
+        });
+        if let Some(h) = head {
+            env["attached_head_digest"] = serde_json::Value::String(h.to_owned());
+        }
+        let mut edge = crate::federation::operational::test_support::signed_trust_attestation(
+            id,
+            consumer,
+            CANON,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            env,
+        );
+        ts::reseal(&mut edge);
+        crate::federation::SignedAttestation { attestation: edge }
+    }
+
+    fn assert_unnamed(r: Result<String, Error>, what: &str) {
+        match r {
+            Err(e) if e.kind() == "trust_root_head_unnamed" => {}
+            other => panic!("{what}: expected trust_root_head_unnamed, got {other:?}"),
+        }
+    }
+
+    /// **I356** (#973; CC 3.2 T4a rc6) — a NEW acceptance edge that names no
+    /// head is refused by name in every mode: witnessed mode off (a silent
+    /// charter with no window, the shape that used to admit) and witnessed
+    /// mode on, with or without a window.
+    pub async fn i356_a_new_headless_edge_is_refused_in_every_mode(d: &dyn FederationDirectory) {
+        born(d).await;
+        for name in ["i356-off", "i356-on", "i356-win"] {
+            ts::register_hybrid_key_as(d, name, name, identity_type::USER).await;
+        }
+        assert_unnamed(
+            accept_edge(d, "i356-off", None).await,
+            "off, silent charter",
+        );
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        assert_unnamed(
+            accept_edge(d, "i356-on", None).await,
+            "witnessed, no window",
+        );
+        charter_the_accord_with(
+            d,
+            serde_json::json!({ "attach_window_secs": LONG_WINDOW, "witness_quorum": 2 }),
+        )
+        .await;
+        assert_unnamed(accept_edge(d, "i356-win", None).await, "witnessed, window");
+        for name in ["i356-off", "i356-on", "i356-win"] {
+            assert!(
+                !crate::federation::trust_root::trust_root_valid(d, name, CANON)
+                    .await
+                    .unwrap()
+                    .edge_exists,
+                "I356: a refused edge is not stored ({name})"
+            );
+        }
+    }
+
+    /// **I357** — an edge this node ALREADY holds with no head (admitted
+    /// before the node held the lineage: the pre-enforcement shape) stays
+    /// valid, and re-putting the same edge re-runs nothing — in off mode and
+    /// after the charter turns witnessing and a window on.
+    pub async fn i357_a_held_headless_edge_stays_valid(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        let consumer = "i357-consumer";
+        ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, CANON, CANON, identity_type::USER).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let edge = accept_edge_row(
+            &id,
+            consumer,
+            None,
+            crate::federation::trust_root::INFRA_SERVE_SCOPE,
+        );
+        d.put_attestation(edge.clone())
+            .await
+            .expect("I357: admitted before this node held the lineage");
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .expect("the lineage arrives");
+        d.put_attestation(edge.clone())
+            .await
+            .expect("I357: the same edge re-put in off mode is not re-judged");
+        charter_the_accord_with(
+            d,
+            serde_json::json!({ "attach_window_secs": 1, "witness_quorum": 2 }),
+        )
+        .await;
+        d.put_attestation(edge.clone())
+            .await
+            .expect("I357: nor under a witnessed charter with a lapsed window");
+        d.apply_replicated_attestation(edge)
+            .await
+            .expect("I357: nor when it is replicated back");
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, consumer, CANON)
+                .await
+                .unwrap()
+                .edge_exists,
+            "I357: attached stays attached"
+        );
+    }
+
+    /// **I358** — a held edge's id re-offered with DIFFERENT content and no
+    /// head is a new edge: refused, and the held row is untouched.
+    pub async fn i358_a_changed_edge_under_a_held_id_is_new(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        let consumer = "i358-consumer";
+        ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, CANON, CANON, identity_type::USER).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let held = accept_edge_row(
+            &id,
+            consumer,
+            None,
+            crate::federation::trust_root::INFRA_SERVE_SCOPE,
+        );
+        d.put_attestation(held.clone()).await.expect("held");
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .expect("the lineage arrives");
+        let changed = accept_edge_row(&id, consumer, None, "infra:attest");
+        let e = d
+            .put_attestation(changed)
+            .await
+            .expect_err("I358: a different edge under the held id");
+        // The id-conflict door answers before the attach gate on every
+        // backend; either refusal leaves the held edge as it was.
+        assert!(
+            matches!(e.kind(), "federation_conflict" | "trust_root_head_unnamed"),
+            "I358: {e:?}"
+        );
+        let after = d.get_attestation(&id).await.unwrap().expect("still held");
+        assert_eq!(
+            after.original_content_hash, held.attestation.original_content_hash,
+            "I358: the held edge is untouched"
+        );
+    }
+
+    /// **I359** — a new edge naming the head this node holds attaches in off
+    /// mode under a silent charter with no window: the anchor is enough.
+    pub async fn i359_a_new_edge_naming_the_held_head_attaches_off(d: &dyn FederationDirectory) {
+        born(d).await;
+        let consumer = "i359-consumer";
+        ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        let head = d
+            .lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        assert_stale(
+            accept_edge(d, consumer, Some(&"cd".repeat(32))).await,
+            "not the head this node holds",
+        );
+        accept_edge(d, consumer, Some(&head))
+            .await
+            .expect("I359: the anchored head attaches");
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, consumer, CANON)
+                .await
+                .unwrap()
+                .edge_exists
+        );
+    }
+
     /// **I343** — an explicit, valid quorum keeps working as before: under
     /// `witness_quorum: 2` one cosign engages nothing and two witness the head.
     pub async fn i343_an_explicit_quorum_still_witnesses(d: &dyn FederationDirectory) {
@@ -1380,6 +1556,38 @@ mod runners {
                     super::super::bodies::i197_a_deferred_cosign_is_rechecked_on_arrival(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i356() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i356_a_new_headless_edge_is_refused_in_every_mode(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i357() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i357_a_held_headless_edge_stays_valid(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i358() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i358_a_changed_edge_under_a_held_id_is_new(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i359() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i359_a_new_edge_naming_the_held_head_attaches_off(
+                        &d as &dyn FederationDirectory,
                     )
                     .await
                 }
