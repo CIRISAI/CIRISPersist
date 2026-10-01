@@ -157,6 +157,9 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+/// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod node_seat_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
@@ -166,6 +169,9 @@ pub mod rc5_adopts_invariants;
 /// v51.0.0 — the rc6 trust-root security set (I191–I196).
 #[cfg(test)]
 pub(crate) mod rc6_invariants;
+/// CIRISPersist#973 — I345–I349, the community boot leg and the re-bake path.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod remint_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.

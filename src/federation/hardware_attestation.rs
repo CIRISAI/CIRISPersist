@@ -1173,11 +1173,14 @@ pub mod test_support {
     /// gate is SATISFIED rather than bypassed — the row proves the same
     /// custody claim on memory, sqlite and postgres alike.
     ///
-    /// The nonce is captured at call time, so it is always inside
-    /// `max_nonce_age`. Tests exercising the stale arm build their own value
-    /// with a back-dated `nonce_captured_at`.
+    /// The nonce is captured ONCE per process ([`process_nonce_instant`]) and
+    /// kept while it is young, so it is always inside `max_nonce_age` and
+    /// byte-stable for a whole test. Tests exercising the stale arm build
+    /// their own value with a back-dated `nonce_captured_at`.
     pub fn fresh_accord_holder_evidence() -> serde_json::Value {
-        use chrono::Timelike as _;
+        static NONCE: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> =
+            std::sync::Mutex::new(None);
+        let captured = process_nonce_instant(&NONCE, chrono::Utc::now());
         serde_json::json!({
             "platform_attestation": {
                 "Android": {
@@ -1189,17 +1192,41 @@ pub mod test_support {
                     "strongbox_backed": true,
                 }
             },
-            // v47.3.0 (CIRISPersist#901) — the instant is quantized to the
-            // hour: still fresh (≤24h), and byte-stable within a test, so a
-            // fixture that registers the same synthetic identity twice puts
-            // the SAME record (a re-put with a fresher nonce is a Conflict).
-            "nonce_captured_at": chrono::Utc::now()
-                .with_minute(0)
-                .and_then(|t| t.with_second(0))
-                .and_then(|t| t.with_nanosecond(0))
-                .expect("a whole hour is a valid instant")
-                .to_rfc3339(),
+            // A fixture that registers the same synthetic identity twice must
+            // put the SAME record (a re-put with a different nonce is a
+            // Conflict), so the instant is the process's one captured hour.
+            "nonce_captured_at": captured.to_rfc3339(),
         })
+    }
+
+    /// How long a captured nonce instant is reused before a new one is taken:
+    /// well inside the default `max_nonce_age` (24 h), and far longer than
+    /// any test.
+    const NONCE_REUSE: chrono::Duration = chrono::Duration::hours(12);
+
+    /// The process's nonce instant at `now`: the hour first captured, reused
+    /// while it is younger than [`NONCE_REUSE`]. Reading the clock per call
+    /// and quantizing to the hour made a fixture that registered one identity
+    /// twice fail whenever the test straddled hh:00:00 (an intermittent
+    /// certify red, about once per hour for the test's own duration).
+    pub(crate) fn process_nonce_instant(
+        state: &std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        use chrono::Timelike as _;
+        let mut held = state.lock().unwrap_or_else(|e| e.into_inner());
+        match *held {
+            Some(t) if now >= t && now - t < NONCE_REUSE => t,
+            _ => {
+                let t = now
+                    .with_minute(0)
+                    .and_then(|t| t.with_second(0))
+                    .and_then(|t| t.with_nanosecond(0))
+                    .expect("a whole hour is a valid instant");
+                *held = Some(t);
+                t
+            }
+        }
     }
 
     /// Attach [`fresh_accord_holder_evidence`] to `row` iff it actually
@@ -1211,6 +1238,31 @@ pub mod test_support {
         // accord_holder: a valid root is as attested as its holders, and any
         // fixture key may be seated or stand as a Key-kind root.
         row.attestation_evidence = Some(fresh_accord_holder_evidence());
+    }
+
+    #[cfg(test)]
+    mod nonce_tests {
+        use super::process_nonce_instant;
+
+        /// A test that straddles the top of the hour gets ONE nonce instant;
+        /// a process older than the reuse window takes a fresh one.
+        #[test]
+        fn the_nonce_instant_does_not_move_at_the_top_of_the_hour() {
+            let state = std::sync::Mutex::new(None);
+            let before: chrono::DateTime<chrono::Utc> = "2026-10-01T10:59:59.900Z".parse().unwrap();
+            let after: chrono::DateTime<chrono::Utc> = "2026-10-01T11:00:00.100Z".parse().unwrap();
+            let a = process_nonce_instant(&state, before);
+            let b = process_nonce_instant(&state, after);
+            assert_eq!(a, b, "one record for one identity across hh:00:00");
+            assert_eq!(a.to_rfc3339(), "2026-10-01T10:00:00+00:00");
+            let much_later = after + chrono::Duration::hours(13);
+            let c = process_nonce_instant(&state, much_later);
+            assert_eq!(
+                c.to_rfc3339(),
+                "2026-10-02T00:00:00+00:00",
+                "recaptured, still fresh"
+            );
+        }
     }
 }
 

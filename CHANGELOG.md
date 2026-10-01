@@ -70,6 +70,62 @@ Test support: `register_accord_holder_as(dir, holder, identity_type)`; the histo
 | M7 accord roster events not bounded in the memo | survived — equivalent: the birth's accord-quorum count (`accord_quorum_at`) bounds the same family events in the same memo, so the cache already ends there |
 | M8 the holder arm also asks for `user` | killed (I330, I331, I333, I334) |
 
+### #972 — a node is seated in an infrastructure community without an acceptance
+Operator ruling 2026-10-01 (posted on #926, and on #973): "Nodes do not vote/consent, they have no agency." CC 3.1.3.2 (rc6): *"a node member of an `infrastructure` community is seated by the founders' quorum on the widening alone … the seat is valid when the founders' quorum signed the record and the node's own key record carries the conferring family's m-of-n scrub … The same holds at founding: a node listed in an `infrastructure` community's founding record is seated by the founders' signatures on that record and never signs it."* v52 asked every new member for an acceptance and every listed founding member for a signature, so `ciris-canonical-1` could not be seated.
+
+**One predicate, read at both sites** (`membership_acceptance::node_seated_without_acceptance`): the community is `infrastructure`, the member key is node-bearing at the record's instant (#925's predicate), and the node's own key record carries the accord's m-of-n scrub (`admission::key_record_carries_accord_scrub`, re-verified from the row against the live accord roster; no role claim is read). The founders' quorum is the roster-authority check that already ran, unchanged.
+- **Widening** (`check_growth_accepted`): such a node needs no acceptance row.
+- **Founding** (`check_community_founding_signers`): the founding rule counts only the persons the record lists.
+- **The owner binding is not read.** It is `self`-scope on the node and no other node can see it; the claim is enforced where the node operates.
+- **Unchanged:** a person in the same community still needs their acceptance; a node in an ordinary community or a family is still refused; a family never reads the exemption, even one that shares the community's id.
+
+Not changed, and worth knowing: a node whose OWNER signed a founding record is still counted as signed (the founding rule compares identities, and a claimed node resolves to its owner). That is v52 behaviour and is how an ordinary community lists its founder's own node.
+
+**Witnesses** (memory, sqlite, postgres; RED first — I335 `membership_founding_member_unsigned`, I336 `membership_acceptance_unresolved`):
+- **I335** the birth row seats an accord-scrubbed node that never signed it.
+- **I336** a widening seats such a node on the founders' 2-of-3 with no acceptance; one founder of three is refused by the roster rule, not the acceptance gate.
+- **I337** a node whose key record lacks the accord's scrub is refused at the founding and on the plane.
+- **I338** a person with an accord-scrubbed record still needs their acceptance.
+- **I339** the same blessed, claimed node is refused in an ordinary community (founding and widening), in a family, and in a family that shares the infrastructure community's id.
+
+**Mutation round** (lane = I335–I339, memory and sqlite): 7 killed, 1 equivalent.
+
+| Mutant | Result |
+|---|---|
+| M1 the infrastructure test dropped | killed (I339) |
+| M2 the node-bearing test dropped | killed (I338) |
+| M3 the accord scrub not required | killed (I337) |
+| M4 the widening site reverted | killed (I336) |
+| M5 the founding site reverted | killed (I335) |
+| M6 the founding exempts every member | killed (I337, I339) |
+| M7 the scope test dropped at the widening | killed (I339, the same-id family) — survived until that case was added |
+| M8 the scrub read accepts an unknown key | equivalent: an unknown key is not node-bearing, and that test runs first |
+
+### Test support — the accord-holder evidence nonce is captured once per process
+`fresh_accord_holder_evidence()` read the clock on every call and quantized to the hour. A fixture that registers one identity twice therefore put two different records whenever the test straddled hh:00:00, and the second was (correctly) refused: `key_id A1 already exists with different content`. That was the intermittent certify red on v52.0.2 (`accord_carriage::exclusion_carriage_postgres`, 10:59:50–11:00:00). The instant is now the process's first captured hour, reused while younger than 12 h (`process_nonce_instant`), with a witness that injects the clock at hh:59:59.9 and hh+1:00:00.1. Not a product change.
+
+### #973 — the community boot leg and the re-bake path
+
+**The boot leg.** `genesis::seed_canonical_community` runs last in `seed_family_and_canonical`, after the delegation plane. It seeds the baked `ciris-canonical` birth record (`genesis/canonical_community_seed.json`, a `SignedCommunity`) through the ordinary signed `put_community` door: signature, trust-root shape, founders, accord quorum and the founding rule all run. There is no trusted-local write.
+
+- **Inert until baked.** The asset is JSON `null` on this branch, pinned by SHA-256 (`canonical_community_asset_is_pinned`). With no asset the leg makes no read and no write, and `genesis_posture` does not evaluate it, so a boot is what it was before the leg existed. A ceremony bake replaces the file and its pin in one commit.
+- **It can never stop a boot.** A birth the door refuses is `GenesisFault::Absent`, a directory that cannot be read is `Unreadable`, and nothing is `Divergent`. A refused birth writes nothing.
+- **A held record is never touched.** If the node already holds the id, the leg writes nothing: the baked birth is `AlreadyHeld`, anything else is `HeldDiffers` and stays (the compiled asset is a floor, not the identity).
+- **Reported.** New `GenesisLeg::Community` (token `community`), last in `GenesisLeg::ALL`; not required by `require_constitutional_root`, like `canonical` and `delegation`. Skipped under the test-anchor override with the canonical seed. Additive for posture consumers.
+
+**The re-bake path (no product change; witnessed).** A re-minted bundle that keeps the three delegation ids supersedes the stored rows only when its signed `asserted_at` is STRICTLY newer. An equal instant with different content is not a successor: the stored row stays (`LeftAsNewerCeremony`) and the boot does not fault. A re-minted row whose `asserted_at` is more than 300 s ahead of the node's clock is refused at the write door and the leg stays `Absent`; the ceremony must stamp instants that are new and not in the future. A row carrying a third co-scrub (C1 beside A1 and B1) verifies and stores, fresh and as a successor. A byte-identical canonical server record is `Unchanged`.
+
+**Witnesses I345–I349** (memory, sqlite, postgres), in the ceremony's shape: the three seated accord holders found the community and all sign once; the listed node never signs.
+- I345: no asset ⇒ `NotBaked`, nothing read or written; with an asset ⇒ `Installed`, then `AlreadyHeld`.
+- I346 / I346b: an under-quorum birth, a tampered birth, and a birth on a node with no roster are each `Absent(community)`, `refuses_boot()` false, nothing stored.
+- I347: a different held record ⇒ `HeldDiffers`, untouched.
+- I348: same ids — identical ⇒ `AlreadyCurrent`; equal instant ⇒ left; strictly newer ⇒ `Superseded` with the id kept; the old row offered again ⇒ refused (no rollback); byte-identical server record ⇒ `Unchanged`.
+- I349: three co-scrubs store (`A1` + `B1`, `C1`) and settle to `AlreadyCurrent`.
+
+The delegation rows in I348/I349 are re-minted by SOFTWARE holders on a bare backend, since the real holders' keys are in hardware. The path from the previous real ceremony to today's baked bundle keeps its existing witness (`assert_rebake_supersedes_prior_ceremony`). `genesis_posture` with a baked asset is not witnessed here: it reads the compiled asset, which is `null` until the ceremony.
+
+**Mutation round (sqlite lane `remint_invariants`), 9/9 killed:** door refusal mapped to `Divergent` (I346, I346b); seed not inert without an asset (I345); verify not inert without an asset (I345); held record ignored (I345, I347); held comparison inverted (I345, I347); verify calls a held community absent (I345, I347); equal vintage supersedes (I348); supersede skipped on a newer instant (I348, I349); rollback allowed (I348). Not mutated: "the leg writes through a local door" — no trusted-local community door exists to route it through.
+
 ## [52.0.1] - UNRELEASED
 
 **PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.

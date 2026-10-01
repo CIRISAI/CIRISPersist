@@ -97,6 +97,20 @@ A role change for an already-active member is not a growth and needs no acceptan
 
 **Supersede (Q2):** a supersede's roster may keep, re-list or drop members but never add one (`membership_supersede_cannot_add`), on the local door and the replicated amendment. One exception: a trust-root-grade community's founders' amendment (#926 HIGH-3 — founder seats move only through the record) may seat a key that SIGNED that version; signing is consent (Q1) and there is no proposal whose expiry could be judged.
 
+### 5.1 A node gives no acceptance (CIRISPersist#972; CC 3.1.3.2)
+
+Operator ruling 2026-10-01: "Nodes do not vote/consent, they have no agency." A node member of an `infrastructure` community is seated by the founders' quorum and is never asked for an acceptance, on the widening plane and at the founding alike.
+
+One predicate, `node_seated_without_acceptance(community, member, at)`, read by the growth gate and by the community founding rule:
+
+1. the community's `cohort_subkind` is `infrastructure`;
+2. the member key is node-bearing at the record's instant (the #925 predicate: its own `identity_type` set, or an agreed occurrence of a `node` identity);
+3. the node's own key record carries the conferring family's m-of-n scrub — the accord's, re-verified from the row against the live accord roster.
+
+The founders' quorum is the roster-authority check (§4), which runs first and is unchanged. The owner binding is NOT read here: it is `self`-scope on the node, so no other node could verify it, and carrying it in a bundle would publish a person-to-node custody edge. The claim (CC 6.1.5.3) is enforced where the node operates.
+
+Unchanged: a person in an infrastructure community still needs an acceptance (or, at the founding, their signature); a node in an ordinary community or in any family is not exempt. Witnesses I335–I339.
+
 ## 6. Decline, withdrawal, leave
 - A decline is terminal for its proposal; a new invitation is a new proposal.
 - The proposer may withdraw a proposal with the ordinary `withdraws`; a withdrawn proposal is treated as expired.
