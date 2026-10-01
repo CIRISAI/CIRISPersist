@@ -189,3 +189,26 @@ Lane: rc6 + v51 + I190 + lineage_witness + I34b, on memory, sqlite and postgres.
 | R16b | the window addition is unchecked | KILLED | I194 (2^53 − 1 s window) |
 
 Two first-draft witnesses were measuring a neighbouring fact, and both were rebuilt before their mutant was killed. I125b read the attested column, which the projections never write; it now reads the replication peer set. I194 used a `u64::MAX` window, which canonicalization turns into a float; it now uses 2^53 − 1. A third lane stall came from the harness (`empty_dsn` never reaped) and was fixed there.
+
+## 8. The community boot leg and the re-bake (CIRISPersist#973)
+
+**Boot leg.** After the delegation plane, boot seeds the baked `ciris-canonical` birth record through the signed `put_community` door (`genesis::seed_canonical_community`). The asset is `genesis/canonical_community_seed.json`: JSON `null` until a ceremony bakes a `SignedCommunity`, pinned by SHA-256 in a unit test.
+
+| state | what the leg does | reported |
+|---|---|---|
+| no asset baked | nothing: no read, no write | not evaluated |
+| id not held | `put_community` (every gate runs) | `Installed`, or `Absent(community)` if the door refuses |
+| the baked birth is held | nothing | `AlreadyHeld` |
+| a different record is held | nothing; the held record stays | `HeldDiffers` |
+
+The leg's fault is only ever `Absent` (the door refused: a node awaiting its ceremony) or `Unreadable` (the directory could not be asked). It is never `Divergent`, so it cannot stop a boot. `GenesisLeg::Community` is reported by `genesis_posture` once an asset is baked and is not required by `require_constitutional_root`.
+
+**Re-bake on an upgrading node.** The three delegation ids are kept. A re-minted row replaces the stored one only when it is a verifiable holder statement with a STRICTLY newer signed `asserted_at` (#665). Rules the ceremony must follow:
+- stamp instants strictly newer than the stored rows: an equal instant with different content is not a successor and the stored row stays;
+- do not stamp instants ahead of the fleet's clocks: a row more than 300 s in the future is refused at the write door;
+- a third co-scrub is admitted and stored;
+- the canonical server record, if unchanged, must be byte-identical (`Unchanged`); if it changes it needs a strictly newer `valid_from`.
+
+The `humanity-accord` family row needs nothing: the seats and the protocol are unchanged.
+
+Witnesses I345–I349 (memory, sqlite, postgres). Not yet built: the software ceremony minter for a dry run, and a boot test over a baked asset (it reads the compiled file).

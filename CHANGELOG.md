@@ -76,6 +76,28 @@ Not changed, and worth knowing: a node whose OWNER signed a founding record is s
 ### Test support — the accord-holder evidence nonce is captured once per process
 `fresh_accord_holder_evidence()` read the clock on every call and quantized to the hour. A fixture that registers one identity twice therefore put two different records whenever the test straddled hh:00:00, and the second was (correctly) refused: `key_id A1 already exists with different content`. That was the intermittent certify red on v52.0.2 (`accord_carriage::exclusion_carriage_postgres`, 10:59:50–11:00:00). The instant is now the process's first captured hour, reused while younger than 12 h (`process_nonce_instant`), with a witness that injects the clock at hh:59:59.9 and hh+1:00:00.1. Not a product change.
 
+### #973 — the community boot leg and the re-bake path
+
+**The boot leg.** `genesis::seed_canonical_community` runs last in `seed_family_and_canonical`, after the delegation plane. It seeds the baked `ciris-canonical` birth record (`genesis/canonical_community_seed.json`, a `SignedCommunity`) through the ordinary signed `put_community` door: signature, trust-root shape, founders, accord quorum and the founding rule all run. There is no trusted-local write.
+
+- **Inert until baked.** The asset is JSON `null` on this branch, pinned by SHA-256 (`canonical_community_asset_is_pinned`). With no asset the leg makes no read and no write, and `genesis_posture` does not evaluate it, so a boot is what it was before the leg existed. A ceremony bake replaces the file and its pin in one commit.
+- **It can never stop a boot.** A birth the door refuses is `GenesisFault::Absent`, a directory that cannot be read is `Unreadable`, and nothing is `Divergent`. A refused birth writes nothing.
+- **A held record is never touched.** If the node already holds the id, the leg writes nothing: the baked birth is `AlreadyHeld`, anything else is `HeldDiffers` and stays (the compiled asset is a floor, not the identity).
+- **Reported.** New `GenesisLeg::Community` (token `community`), last in `GenesisLeg::ALL`; not required by `require_constitutional_root`, like `canonical` and `delegation`. Skipped under the test-anchor override with the canonical seed. Additive for posture consumers.
+
+**The re-bake path (no product change; witnessed).** A re-minted bundle that keeps the three delegation ids supersedes the stored rows only when its signed `asserted_at` is STRICTLY newer. An equal instant with different content is not a successor: the stored row stays (`LeftAsNewerCeremony`) and the boot does not fault. A re-minted row whose `asserted_at` is more than 300 s ahead of the node's clock is refused at the write door and the leg stays `Absent`; the ceremony must stamp instants that are new and not in the future. A row carrying a third co-scrub (C1 beside A1 and B1) verifies and stores, fresh and as a successor. A byte-identical canonical server record is `Unchanged`.
+
+**Witnesses I345–I349** (memory, sqlite, postgres), in the ceremony's shape: the three seated accord holders found the community and all sign once; the listed node never signs.
+- I345: no asset ⇒ `NotBaked`, nothing read or written; with an asset ⇒ `Installed`, then `AlreadyHeld`.
+- I346 / I346b: an under-quorum birth, a tampered birth, and a birth on a node with no roster are each `Absent(community)`, `refuses_boot()` false, nothing stored.
+- I347: a different held record ⇒ `HeldDiffers`, untouched.
+- I348: same ids — identical ⇒ `AlreadyCurrent`; equal instant ⇒ left; strictly newer ⇒ `Superseded` with the id kept; the old row offered again ⇒ refused (no rollback); byte-identical server record ⇒ `Unchanged`.
+- I349: three co-scrubs store (`A1` + `B1`, `C1`) and settle to `AlreadyCurrent`.
+
+The delegation rows in I348/I349 are re-minted by SOFTWARE holders on a bare backend, since the real holders' keys are in hardware. The path from the previous real ceremony to today's baked bundle keeps its existing witness (`assert_rebake_supersedes_prior_ceremony`). `genesis_posture` with a baked asset is not witnessed here: it reads the compiled asset, which is `null` until the ceremony.
+
+**Mutation round (sqlite lane `remint_invariants`), 9/9 killed:** door refusal mapped to `Divergent` (I346, I346b); seed not inert without an asset (I345); verify not inert without an asset (I345); held record ignored (I345, I347); held comparison inverted (I345, I347); verify calls a held community absent (I345, I347); equal vintage supersedes (I348); supersede skipped on a newer instant (I348, I349); rollback allowed (I348). Not mutated: "the leg writes through a local door" — no trusted-local community door exists to route it through.
+
 ## [52.0.1] - UNRELEASED
 
 **PATCH — a renewed session claim stays live (found by CIRISServer adopting v52, #706), and a room that never rotated re-wraps for a late device (CIRISPersist#967, found by CIRISEdge#768), and a stored row re-offered byte-for-byte hashes the same on postgres (CIRISPersist#964, the intermittent I189 red).** No wire, hash or migration change.
