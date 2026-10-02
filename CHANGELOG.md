@@ -9,6 +9,9 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### #971 — the evidence rows for CLM-membership-consent (CC 3.1.3.2)
+Evidence only. `evidence/cc_impl.tsv` gains four rows under `CLM-membership-consent`, naming the #955 code that v52 shipped: the growth gate `membership_acceptance.rs#check_growth_accepted`, the founding-signers checks `#check_founding_signers` and `#check_community_founding_signers`, and the supersede refusal `#check_supersede_adds_no_member`. The exact-count pin in `supersets.rs` moves 160 → 164.
+
 ### #973 — a charter silent on witness_quorum, or declaring 0, is in witnessed mode off
 CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quorum = 0`: silence and `0` are one state, witnessed mode off, and "a substrate MUST NOT substitute an internal default". Persist substituted a default of 1 (`DEFAULT_WITNESS_QUORUM`) for a silent charter and read `0` as `1`.
 
