@@ -156,6 +156,10 @@ struct Offer<'a> {
     /// from the held family record: that member and the held record. Its
     /// signature alone authorizes it.
     self_leave: Option<(&'a str, &'a super::types::Family)>,
+    /// v53.0.0 (CC 4.2.6) — the amendment is an accord holder's recovery,
+    /// verified on its own proof ([`verify_accord_recovery`](super::accord_recovery::verify_accord_recovery)):
+    /// the recovery key's signature over the statement, no quorum, one seat.
+    recovery: bool,
 }
 
 /// What this node holds under the offered id.
@@ -203,6 +207,9 @@ where
         entrenched: Some(f.consensus_protocol_entrenched),
         proof: family.supersede_proof.as_ref(),
         self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
+        recovery: super::accord_recovery::verify_accord_recovery(dir, family)
+            .await?
+            .is_some(),
     };
     let stored = Stored {
         persist_row_hash: held.persist_row_hash.clone(),
@@ -265,6 +272,7 @@ where
         entrenched: None,
         proof: community.supersede_proof.as_ref(),
         self_leave: None,
+        recovery: false,
     };
     let stored = Stored {
         persist_row_hash: stored.persist_row_hash,
@@ -389,6 +397,13 @@ where
         proof,
         &stored.persist_row_hash,
     )?;
+    // v53.0.0 (CC 4.2.6) — a recovery's proof is not a membership change
+    // envelope and carries no quorum: it was verified whole (statement bound
+    // to this prior and this version, one seat, the recovery key's stored
+    // material and signature, not spent) before this offer was built.
+    if offer.recovery {
+        return Ok(true);
+    }
     if let Some(offered_entrenched) = offer.entrenched {
         check_family_entrenchment(
             stored.entrenched,

@@ -181,38 +181,16 @@ where
         .lookup_family(&draft.next.family_key_id)
         .await?
         .ok_or_else(|| Error::InvalidArgument(format!("no family {}", draft.next.family_key_id)))?;
-    let recovery_key_id = draft
-        .statement
-        .get("recovery_key_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let new_holder = draft
-        .statement
-        .get("new_holder_key_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_owned();
-    let signed = SignedFamily {
-        family: draft.next,
-        authority_key_id: new_holder,
-        scrub_signature_classical: new_holder_signature.0,
-        scrub_signature_pqc: Some(new_holder_signature.1),
-        supersede_proof: Some(super::types::GroupSupersedeProof {
-            prior_persist_row_hash: held.persist_row_hash,
-            change_envelope: draft.statement.clone(),
-            quorum_signatures: vec![ciris_verify_core::threshold::ThresholdSignature {
-                member_id: recovery_key_id,
-                ed25519_signature_base64: recovery_signature.0,
-                mldsa65_signature_base64: Some(recovery_signature.1),
-            }],
-        }),
-        cosignatures: Vec::new(),
-    };
+    let signed = recovery_version(
+        &held.persist_row_hash,
+        &draft,
+        recovery_signature,
+        new_holder_signature,
+    );
     // Judged here with its reason, then admitted by the accord's one door.
     verify_accord_recovery(directory, &signed).await?;
     let authorization = serde_json::json!({
-        "change_envelope": draft.statement,
+        "change_envelope": draft.statement.clone(),
         "quorum_signatures": signed
             .supersede_proof
             .as_ref()
@@ -220,6 +198,43 @@ where
             .unwrap_or_default(),
     });
     super::group_amendment::supersede_family_signed(directory, signed, Some(authorization)).await
+}
+
+/// **The signed recovery version** a draft and its two signatures form: the
+/// record signed by the new key, the supersede proof carrying the statement
+/// and the recovery key's signature, naming `held_head` as its prior. What
+/// [`recover_accord_holder`] submits and what a peer receives.
+#[must_use]
+pub fn recovery_version(
+    held_head: &str,
+    draft: &AccordRecoveryDraft,
+    recovery_signature: (String, String),
+    new_holder_signature: (String, String),
+) -> SignedFamily {
+    let field = |k: &str| {
+        draft
+            .statement
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    SignedFamily {
+        family: draft.next.clone(),
+        authority_key_id: field("new_holder_key_id"),
+        scrub_signature_classical: new_holder_signature.0,
+        scrub_signature_pqc: Some(new_holder_signature.1),
+        supersede_proof: Some(super::types::GroupSupersedeProof {
+            prior_persist_row_hash: held_head.to_owned(),
+            change_envelope: draft.statement.clone(),
+            quorum_signatures: vec![ciris_verify_core::threshold::ThresholdSignature {
+                member_id: field("recovery_key_id"),
+                ed25519_signature_base64: recovery_signature.0,
+                mldsa65_signature_base64: Some(recovery_signature.1),
+            }],
+        }),
+        cosignatures: Vec::new(),
+    }
 }
 
 /// The recovery statements this accord's version chain records, oldest first.
@@ -462,21 +477,4 @@ where
         detail: format!("accord_recovery_signature: {e}"),
     })?;
     Ok(Some(new.to_owned()))
-}
-
-/// The accord door's predicate form of [`verify_accord_recovery`]: a refusal
-/// is `false` (the door then refuses the reserved id), a read failure stays an
-/// error.
-pub(crate) async fn is_recovery_version<F>(
-    directory: &F,
-    signed: &SignedFamily,
-) -> Result<bool, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    match verify_accord_recovery(directory, signed).await {
-        Ok(found) => Ok(found.is_some()),
-        Err(Error::CharterInvalid { .. }) => Ok(false),
-        Err(e) => Err(e),
-    }
 }
