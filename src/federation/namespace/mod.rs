@@ -333,7 +333,7 @@ pub fn is_withdraw_or_revocation(attestation_type: &str) -> bool {
 /// |---|---|---|---|---|---|---|---|
 /// | `KeyRecord` | SelfOwn | SelfOwn | Cohort | Cohort | ✱ | ✱ | ✱ |
 /// | `TransportDestination` | SelfOwn | SelfOwn | Cohort | Cohort | **Cohort** | **Cohort** | ✱ |
-/// | `FountainContent` | SelfOwn | SelfOwn | Cohort | Cohort | Cohort | Cohort | ✱ |
+/// | `FountainContent` | **Cohort** | **Cohort** | Cohort | Cohort | Cohort | Cohort | ✱ |
 /// | `HardCaseEvent` | SelfOwn | SelfOwn | Cohort | Cohort | Cohort | Cohort | **Cohort** |
 /// | `Attestation` | *per dimension FAMILY — the table below* |
 ///
@@ -348,7 +348,17 @@ pub fn is_withdraw_or_revocation(attestation_type: &str) -> bool {
 /// keeps ✱ because a relay/serve node's ROLE is to be reachable.
 /// `FountainContent` mirrors the route row at the bytes layer (advertisement ≠
 /// availability; discovery rides the manifest/attestation plane, the bytes are
-/// pulled by the swarm). `HardCaseEvent` rows carry `subject_key_id` and the
+/// pulled by the swarm) at the commons tiers. At `self` / `family` it is
+/// **Cohort since v53.0.0** (CIRISPersist#963, CC 6.1.5.3 "durability at every
+/// tier"): hold-and-forward among the content's own audience — the owner's
+/// claimed nodes for `self`, the family members' nodes for `family`, each
+/// under its owner's per-node allow list
+/// ([`audience_nodes`](crate::federation::replication_audience::audience_nodes)).
+/// It was SelfOwn, so only the producer advertised and a family's other
+/// devices never held-and-forwarded: no rarest-first and no repair below the
+/// community tier. Nothing leaves the cohort: an outsider is in no audience,
+/// and [`resolve_projection_recipients`] answers this plane from the audience,
+/// not from a roster of person keys. `HardCaseEvent` rows carry `subject_key_id` and the
 /// kinds are adverse (quarantine, de-admission, …): Global gossip of those is
 /// a REPUTATION DIRECTORY, so no live cell ever widens past Cohort — the
 /// infra-role de-admission reach rides the TOMBSTONE ceiling
@@ -474,9 +484,15 @@ pub fn projection_for(
         // FountainContent — the route row's logic at the bytes layer:
         // advertisement ≠ availability; ✱ only on federation so a canonical
         // corpus (trust-root build artifacts) is widely advertised.
+        // v53.0.0 (CIRISPersist#963, CC 6.1.5.3): `self` / `family` are
+        // Cohort — hold-and-forward among the content's own audience, so the
+        // bytes have rarest-first and repair at every tier. The audience is
+        // the claimed nodes under their owners' allow lists, never wider.
         Plane::FountainContent => match cohort_scope {
-            cohort_scope::SELF | cohort_scope::FAMILY => Projection::SelfOwn,
-            cohort_scope::COMMUNITY | cohort_scope::AFFILIATIONS => Projection::Cohort,
+            cohort_scope::SELF
+            | cohort_scope::FAMILY
+            | cohort_scope::COMMUNITY
+            | cohort_scope::AFFILIATIONS => Projection::Cohort,
             cohort_scope::SPECIES | cohort_scope::BIOSPHERE => Projection::Cohort,
             cohort_scope::FEDERATION => {
                 if authority.is_trust_root() {
@@ -1654,6 +1670,40 @@ pub async fn resolve_projection_recipients(
     }
 
     match directory.active_members(cohort, group_key_id).await {
+        // v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — the BYTES plane answers
+        // from the content's audience: the claimed nodes its scope entitles
+        // to hold it, under their owners' per-node allow lists. A holding is
+        // a fact about who holds the bytes, so a denied node is told nothing
+        // ("a cohort peer never sees a denied node", CC 6.1.5.3), and a
+        // member's node is in the set although the roster names the person.
+        // The roster read above stays: it is what tells "cannot judge" from
+        // "judged".
+        Ok(_) if matches!(plane, Plane::FountainContent) => {
+            match crate::federation::replication_audience::audience_nodes(
+                directory,
+                cohort_scope,
+                Some(group_key_id),
+            )
+            .await
+            {
+                Ok(audience) => Ok(RecipientVerdict {
+                    set_resolvable: true,
+                    peer_in_set: audience.contains(peer_key_id),
+                    basis,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        cohort_scope,
+                        group_key_id,
+                        peer_key_id,
+                        error = %e,
+                        "resolve_projection_recipients: audience read failed — WITHHOLDING \
+                         (an advertisement gate never fails open)"
+                    );
+                    Ok(cannot_judge(RecipientBasis::GroupUnresolvable))
+                }
+            }
+        }
         Ok(members) => Ok(RecipientVerdict {
             set_resolvable: true,
             peer_in_set: members.iter().any(|m| m.key_id == peer_key_id),
@@ -1938,14 +1988,22 @@ mod tests {
 
     #[test]
     fn projection_self_and_family_are_publish_own() {
-        // Every plane's self/family cells are SelfOwn — the structurally-
-        // invisible identity tier is publish-own on every plane, and on every
-        // Attestation dimension family including the conservative default.
+        // Every RECORD plane's self/family cells are SelfOwn — the
+        // structurally-invisible identity tier is publish-own on every record
+        // plane, and on every Attestation dimension family including the
+        // conservative default. The one exception is the BYTES plane:
+        // v53.0.0 (CIRISPersist#963, CC 6.1.5.3) makes `FountainContent`
+        // hold-and-forward among the content's own audience at every tier.
         for plane in all_planes() {
             for s in ["self", "family"] {
+                let expected = if matches!(plane, Plane::FountainContent) {
+                    Projection::Cohort
+                } else {
+                    Projection::SelfOwn
+                };
                 assert_eq!(
                     projection_for(plane, s, AuthorityClass::SelfIdentity, false),
-                    Projection::SelfOwn,
+                    expected,
                     "{plane:?}/{s}"
                 );
             }
@@ -2180,13 +2238,12 @@ mod tests {
     #[test]
     fn fountain_content_row_matches_the_decided_table() {
         use AuthorityClass::{AccordCoScrub, ProducerSteward};
-        use Projection::{Cohort, Global, SelfOwn};
+        use Projection::{Cohort, Global};
         const FC: Plane<'static> = Plane::FountainContent;
-        assert_eq!(projection_for(FC, "self", ProducerSteward, false), SelfOwn);
-        assert_eq!(
-            projection_for(FC, "family", ProducerSteward, false),
-            SelfOwn
-        );
+        // v53.0.0 (#963, CC 6.1.5.3) — self / family hold-and-forward among
+        // the content's own audience.
+        assert_eq!(projection_for(FC, "self", ProducerSteward, false), Cohort);
+        assert_eq!(projection_for(FC, "family", ProducerSteward, false), Cohort);
         assert_eq!(
             projection_for(FC, "community", ProducerSteward, false),
             Cohort
@@ -3489,9 +3546,10 @@ mod recipient_set_tests {
 
     /// **Direction 1** — a peer IN the resolved set is eligible.
     ///
-    /// `family` scope on the holdings plane resolves [`Projection::SelfOwn`],
-    /// and `SelfOwn`'s recipient set is the record's own roster. A seated
-    /// member is on it.
+    /// `family` scope on the holdings plane resolves [`Projection::Cohort`]
+    /// since v53.0.0 (#963), and its recipient set is the content's audience:
+    /// the members' claimed nodes, and a member key that is itself a node. A
+    /// seated member node is in it.
     #[tokio::test]
     async fn a_roster_peer_is_an_eligible_recipient_of_a_family_scoped_holding() {
         let backend = holdings_fixture().await;
@@ -3508,8 +3566,9 @@ mod recipient_set_tests {
         .expect("the verb never returns Err today");
         assert_eq!(
             v.basis,
-            RecipientBasis::OwnRoster,
-            "SelfOwn is roster-bounded"
+            RecipientBasis::CohortRoster,
+            "since v53.0.0 (#963) family bytes are Cohort: hold-and-forward among the \
+             content's own audience"
         );
         assert!(
             v.set_resolvable,
@@ -3567,7 +3626,7 @@ mod recipient_set_tests {
         )
         .await
         .expect("no Err");
-        assert_eq!(v.basis, RecipientBasis::OwnRoster);
+        assert_eq!(v.basis, RecipientBasis::CohortRoster);
         assert!(
             v.set_resolvable,
             "the roster resolved — this is a JUDGED refusal, not an unknown"
@@ -3627,7 +3686,7 @@ mod recipient_set_tests {
             not_a_member.set_resolvable,
             "the roster resolved — this refusal is JUDGED"
         );
-        assert_eq!(not_a_member.basis, RecipientBasis::OwnRoster);
+        assert_eq!(not_a_member.basis, RecipientBasis::CohortRoster);
         assert!(!not_a_member.may_advertise(), "fail closed");
 
         assert_ne!(

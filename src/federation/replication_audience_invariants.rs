@@ -57,7 +57,7 @@ pub(crate) mod bodies {
 
     /// `owner` claims `node` as a device of class `class` (a trusted-local
     /// occurrence: the binding this node produced for its own user).
-    async fn claim(d: &dyn FederationDirectory, owner: &str, node: &str, class: &str) {
+    pub(crate) async fn claim(d: &dyn FederationDirectory, owner: &str, node: &str, class: &str) {
         d.put_identity_occurrence_local(IdentityOccurrence {
             identity_key_id: owner.to_owned(),
             occurrence_key_id: node.to_owned(),
