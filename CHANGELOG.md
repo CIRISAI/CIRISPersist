@@ -9,6 +9,57 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### The final-genesis assembler (CIRISPersist#973; CC rc7 T5, T6, 3.4.7, 4.2.6)
+
+**`genesis::ceremony`** (new, production build, Rust only) is the assembler the server's ceremony routes drive. `CeremonyState::plan(inputs)` takes everything once, stamped by the caller at propose. The inputs are the holders as carried, the serve nodes, the T3 successor set and each holder's recovery key (as `CommittedKey`s: key material, not ids), the scope, the community birth's fields and **one `produced_at`**. Every instant in every item derives from that stamp; the assembler reads no clock. The state and each `Partial` are serde, so a ceremony can span HTTP requests and restarts. Item bytes are recomputed from the inputs on every call, never stored.
+
+- **Items, in order:** `record:<node>`, `row:genesis-charter`, `row:genesis-grant:<node>`, `row:genesis-lifecycle`, `family:humanity-accord`, `community:ciris-canonical`, then `authz` (the 32-byte `authorization_digest`).
+- **Every holder signs every item.** That is the founding rule, and it gives each grant the family's quorum as its charter has it (CC 3.4.7).
+- **`add_partial`** verifies Ed25519 over the bytes and ML-DSA-65 over `bytes ‖ ed_sig` against the holder's carried keys when the partial arrives. A bad one is refused by name: `ceremony_item_unknown`, `ceremony_signer_not_a_holder`, `ceremony_signature_invalid` (either half), `ceremony_partial_conflicts`. A refused partial records nothing.
+- **`assemble`** is pure and refuses `ceremony_incomplete`, naming every owed item and holder. **`finish`** is `assemble` followed by `verify_ceremony_outputs`.
+- **The plan refuses** (`ceremony_inputs_invalid`) a holder without exactly one recovery key, a recovery key that is a holder's signing key, one recovery key shared by two holders, a repeated holder, a holder record with no ML-DSA key, no serve node, and an empty successor set.
+- **`mint_test_ceremony`** is now a thin caller of the same path: plan, the software holders sign every item, assemble. `test_ceremony_inputs` and `sign_every_item` are exported for dry runs.
+
+**The bundle carries the genesis heads (CC rc7, T5: the bundle is the only genesis artifact).**
+- `GenesisBundle` gains `roster_records: Vec<GenesisRosterRecord>`, holding the accord family's genesis record and the `ciris-canonical` birth. On the wire they are further elements of `attestations`, after every delegation row, each recognised by its one key (`attestation` / `family` / `community`). A row after a record, or an element with two keys or none, is refused at parse, so a bundle has one spelling.
+- Elements are dispatched by key over `serde_json::Value`, never through an untagged enum. Serde's untagged buffering does not round-trip a row: the embedded seed itself failed to parse that way.
+- `authorization_digest` appends each record's signing envelope (content, not signatures) after the rows. A version-2 bundle has no records and digests exactly as before; the baked seed still verifies.
+- The assembler emits `GENESIS_BUNDLE_VERSION` = 3.
+- **The separate community asset is deleted** (`canonical_community_seed.json` and its pin). `canonical_community_asset()` reads the birth from the pinned bundle, so a community seeded from anything the bundle does not pin has no anchor. The shipped bundle is version 2, so the community leg stays inert until the final ceremony's bundle is baked.
+- `install_test_ceremony_outputs(bundle)` and `install_test_ceremony_outputs_json(bundle_json)` take the bundle alone.
+- `verify_ceremony_outputs(bundle_json)` takes one argument and gains a stage, `ceremony_family_record`: the carried family record must equal the family this build seeds (`accord_family_genesis_record_for`, one construction with `accord_family_genesis_record`), and every holder must have signed it.
+
+**Adopters (Server).** The routes target `plan` → `next_items` → `add_partial` → `finish`; the API shape is posted on #973. `mesh_genesis` re-exports `authorization_digest`, so the preimage change needs no server code. A server that builds a `GenesisBundle` literal adds `roster_records`.
+
+**Witnesses I420–I427** (`tests/test_ceremony_973.rs`):
+- I420: the plan's refusals, and the state round-trips with identical items.
+- I421: partials in any order, with a serialize/parse between each, assemble the minter's bundle exactly.
+- I422: refusals by name.
+- I423: every holder owes every item.
+- I424: `finish` runs the doors.
+- I425: the digest binds record content, not signatures; version-2 is unchanged.
+- I426: the wire spelling.
+- I427: every instant is the stamp.
+
+I350–I355 move to the one-artifact shape. A record whose content is changed after authorization is now refused at the quorum; one whose signatures alone are stripped is refused by its own stage. I351 boots a node from the assembled bundle on memory, sqlite and postgres.
+
+**Mutation round** (on the committed tree `0a616a9a`; lane = `tests/test_ceremony_973.rs`, sqlite): twelve mutants, twelve killed.
+
+| Mutant | Result |
+|---|---|
+| M1 `add_partial` skips verification | killed — I422 |
+| M2 every partial verified against the primary holder's keys | killed — I421/I422 |
+| M3 two of three complete an item | killed — I423 |
+| M4 the digest drops the roster records | killed — I425 |
+| M5 the digest binds the records' signatures | killed — I425 |
+| M6 a row may follow a record | killed — I426 |
+| M7 no family-record stage | killed — I354 |
+| M8 the family record may lack a founder's signature | killed — I354 |
+| M9 no microsecond truncation of the stamp | killed — I427 |
+| M10 the birth is not read from the bundle | killed — I351 |
+| M11 a recovery key may be a holder key | killed — I420 |
+| M12 a recovery key may be shared | killed — I420 |
+
 ### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
 
 A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant` set per chunk, so a 1024-chunk file carried 1024 wraps per recipient and a late device needed 1024 re-grants. CC 5.3.3.1 seals a stream under one DEK per `(stream_id, epoch)` with the STREAM nonce; CC part 5 §5.1 distributes it O(N) per epoch. FSD `BLOB_ENCRYPTION_AT_REST.md` §12.13, `BLOB_REPLICATION.md` §14.1.
