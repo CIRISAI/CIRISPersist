@@ -234,7 +234,7 @@ The `humanity-accord` family row needs nothing: the seats and the protocol are u
 
 Witnesses I345–I349 (memory, sqlite, postgres). Not yet built: the software ceremony minter for a dry run, and a boot test over a baked asset (it reads the compiled file).
 
-### 9.4 Posture after a refused or older bake
+### 9.1 Posture after a refused or older bake
 
 The boot seed and the live posture leg (`verify_delegation_plane_seeded`, read by `genesis_posture` without the seed) must give one answer for one state. They did not: the leg compared the stored row against the RAW compiled-in row, which is not canonical at rest and so classified as legacy, and every verified holder statement that differed from the bake read as its successor. A node whose re-mint was refused at the door kept reporting `Entrenched` on the previous root.
 
