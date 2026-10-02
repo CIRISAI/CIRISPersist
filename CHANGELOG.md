@@ -43,6 +43,39 @@ threat-model citations because this crate's audit story is the point.
 
 I350–I355 move to the one-artifact shape. A record whose content is changed after authorization is now refused at the quorum; one whose signatures alone are stripped is refused by its own stage. I351 boots a node from the assembled bundle on memory, sqlite and postgres.
 
+**The heads name the charter (with rc7 B-1).** The family and community genesis records carry `charter_digest`, the charter row's stored row hash, and an empty `prev_head_digest`. That hash covers the charter's scrubs, so `family:`, `community:` and `authz` (which binds them) wait until every holder has signed the charter.
+- `SignItem.waits_on` names what an item waits on; its `bytes` are empty until then. `next_items` offers only signable items, and `add_partial` on a waiting item is refused `ceremony_item_not_ready`.
+- `accord_family_genesis_record_for` takes the charter digest. The verifier names the charter of the bundle under verification (`bundle_family_charter_digest`), never the compiled bundle's.
+
+**A node upgrading from v52 takes the bundle's accord genesis record (I428, I428b).** A v52 node holds an accord row that names no charter, so under v53 the accord has no charter in force and its root is invalid.
+- CC T6 gives the genesis head an empty `prev_head_digest`. Chaining a version onto the v52 row would leave upgraded and fresh nodes with different head digests for one lineage.
+- So the genesis seeder, the accord id's one entry door, replaces the held row with the genesis record itself, unchanged. The v52 row stays as the superseded prior, labelled `accord_birth_replaces_unrooted` (the label rc7 B-1's prev-head check admits for a birth stored over an un-rooted row).
+- Only a held row that names no charter and no predecessor, with the same seats, founding instant, protocol and entrenchment, is replaced. A row of other seats (#648) or one that already names a charter is left standing.
+- I428 (sqlite, memory, postgres): an upgraded node's accord head is the fresh node's head digest, the bundle's charter is in force, the accord root is valid for an accepting node, and the posture is Entrenched; a second boot changes nothing. I428b: the two left-standing cases.
+
+**An accord holder's recovery (CC 4.2.6; `federation::accord_recovery`, I429).** `draft_accord_recovery` and `recover_accord_holder` rotate a holder's own seat under their pre-committed recovery key, with no quorum.
+- The rotation is a new accord version that swaps exactly one seat, names the held head, keeps the charter and is signed by the new key.
+- Its `supersede_proof.change_envelope` is the recovery statement (`ciris.accord_recovery.v1`): the family, the held head, the next version's content hash, the old and new keys, the recovery key, and the commitment to the new key's own recovery key. That statement is signed by the recovery key.
+- It is admitted iff the commitment recomputed from the recovery key's **stored** record equals the old holder's commitment in force, and the key has not rotated a seat before. The commitment in force is the entry in the charter the head names, or for a recovered holder the commitment their recovery statement named.
+- It enters through the accord's one door (`verify_family_admission`) as the second shape that door admits beside a quorum-proven head version. A recovered seat is the one exception to "an amendment never adds a member". The version chain is the ledger.
+- Refusals are `Error::CharterInvalid` with an `accord_recovery_*` token: `key_mismatch` (a squatted id), `key_spent`, `signature`, `commitment_missing`, `not_a_holder`, `seat_taken`, `statement_unbound`, `changes_more_than_its_seat`, `record_not_signed_by_new_key`, `next_commitment_malformed`, `next_commitment_not_fresh`.
+- I429 (sqlite, memory, postgres): a squatted recovery id is refused and writes nothing; a record not signed by the new key and a statement not signed by the recovery key are refused; the holder's own rotation passes without a quorum and the new key's next commitment is in force; a second recovery chains; a spent key is refused.
+
+**Mutation round 2** (on the committed tree `d845789e`; lane = I428, I428b, I429, sqlite + memory): ten mutants, ten killed.
+
+| Mutant | Result |
+|---|---|
+| R1 the chartless v52 row is not replaced | killed — I428 |
+| R2 the upgrade chains onto the v52 row (prev = its hash) | killed — I428 |
+| R3 a held accord of other seats is replaced too | killed — I428b |
+| R4 a held accord that names a charter is replaced too | killed — I428b |
+| D1 the recovery key's material is not compared | killed — I429 |
+| D2 a spent recovery key rotates again | killed — I429 |
+| D3 the statement signature is not verified | killed — I429 |
+| D4 the recovered seat is not allowed by the adds-no-member check | killed — I429 |
+| D5 the accord door does not admit a recovery | killed — I429 |
+| D8 a recovered holder has no commitment in force | killed — I429 |
+
 **Mutation round** (on the committed tree `0a616a9a`; lane = `tests/test_ceremony_973.rs`, sqlite): twelve mutants, twelve killed.
 
 | Mutant | Result |
