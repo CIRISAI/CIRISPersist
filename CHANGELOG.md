@@ -19,6 +19,27 @@ New module `federation::replication_audience`: the sender's set, the receiver's 
 - **`KindPolicy.audience`** (`ServeAudience::{Cohort, MembershipPlane, Public}`). Pins moved: `REPLICATION_POLICY_HASH` → `1860451c…3869`; `CONSENT_GRAMMAR_HASH` → `4d473eac…e843`.
 - Witnesses I390–I399 (`federation/replication_audience_invariants.rs`; memory, sqlite, postgres; I395 sqlite/postgres). I199's fixture moves its member devices to `laptop` (a server-class device now holds no family content by default).
 
+**Mutation round** (on the committed tree `7e052a52`; lane = `replication_audience_invariants` + `self_collective_invariants`, memory + sqlite): sixteen mutants, sixteen killed.
+
+| Mutant | Result |
+|---|---|
+| M1 the server default lets family through | killed — I394 |
+| M2 `self` reaches every class | killed — I394 |
+| M3 a present list is ignored | killed — I393, I394, I399 |
+| M3b a list admits every group | killed — I393, I394, I396, I399 |
+| M4 live lists do not intersect (the last wins) | killed — I399 |
+| M5 a retired grant's list still counts | killed — I399 |
+| M6 every claimed node is personal | killed — I394 |
+| M7 the room arm skips the owner's list | killed — I393, I394, I396, I398, I399 |
+| M8 the family arm skips the owner's list | killed — I393, I394, I398 |
+| M9 the family send set skips the list | killed — I393 |
+| M10 an owner's grant for another node reaches a sibling | killed — I397 |
+| M11 the accord family is not public | killed — I390 |
+| M12 a declined invitation stays live | killed — I395 |
+| M13 an unsorted list is admitted | killed — I396 |
+| M14 a node's grant for itself may carry a list | killed — I396 |
+| M15 the self arm asks no list | killed — I393, I394, I398 |
+
 **Adopters.** Edge: re-pin both hashes; the serve gate calls `may_receive` per row per peer for `cohort` kinds and `may_receive_group_plane` for `membership_plane` kinds (#760's record gate becomes the latter; the public-group exemption keeps `ciris-canonical`, the accord family, conferring and WA families reaching everyone); CIRISEdge#763 reads `audience_nodes`. Server: the consent UI writes `cohorts` on the owner's grant for a node (with `for_key_id`), and claims a device with its real `device_class` — an `agent` or `server` occurrence no longer receives the owner's self/family content unless listed.
 
 ### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
