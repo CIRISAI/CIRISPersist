@@ -4478,6 +4478,9 @@ pub mod test_support {
             2,
             "({tag}) #556: the stored row proves its own 2-of-n"
         );
+        // v53.0.0 (CC 3.2 T6) — the family version that names it.
+        version_family_naming_charter(directory, &accord, &stored.persist_row_hash, &holders)
+            .await?;
 
         // The conferral, ALSO at 2-of-3: a grant one seat could sign alone would
         // hand that seat the accord's granting pen, which is the asymmetry #557
@@ -5350,11 +5353,13 @@ pub mod test_support {
         let accord_ctl = format!("{tag}-accord-ctl");
         seed_test_family(directory, &accord_ctl, &holders, "quorum:2/3").await?;
         let ctl_charter_id = format!("{tag}-charter-ctl");
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: build_charter(&accord_ctl, &ctl_charter_id)?,
-            })
-            .await?;
+        // v53.0.0 (CC 3.2 T6) — and the family version that names it.
+        charter_family_and_version(
+            directory,
+            build_charter(&accord_ctl, &ctl_charter_id)?,
+            &[&holders[0], &holders[1], &holders[2]],
+        )
+        .await?;
         emit_trust_edge(directory, &user, &accord_ctl, None).await?;
 
         let v = trust_root_valid(directory, &user, &accord_ctl).await?;
@@ -5423,11 +5428,13 @@ pub mod test_support {
 
         // NOW the charter arrives, and the family is chartered exactly as the
         // control is.
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: build_charter(&accord_atk, &atk_charter_id)?,
-            })
-            .await?;
+        // v53.0.0 (CC 3.2 T6) — and the family version that names it.
+        charter_family_and_version(
+            directory,
+            build_charter(&accord_atk, &atk_charter_id)?,
+            &[&holders[0], &holders[1], &holders[2]],
+        )
+        .await?;
         emit_trust_edge(directory, &user, &accord_atk, None).await?;
 
         let after_b = trust_root_valid(directory, &user, &accord_atk).await?;
@@ -5477,23 +5484,25 @@ pub mod test_support {
                 crate::federation::Error::Backend(format!("#561 pre_rotation_commitment: {e}"))
             })?;
         let charter_id = uuid::Uuid::new_v4().to_string();
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: co_signed_trust_attestation(
-                    &charter_id,
-                    &holders[0],
-                    &accord,
-                    attestation_type::DELEGATES_TO,
-                    json!({
-                        "references_attestation_id": charter_id,
-                        "dimension": TRUST_CHARTER_DIMENSION,
-                        "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-                        "pre_rotation_commitment": commitment,
-                    }),
-                    &[&holders[1]],
-                ),
-            })
-            .await?;
+        // v53.0.0 (CC 3.2 T6) — the charter and the family version naming it.
+        charter_family_and_version(
+            directory,
+            co_signed_trust_attestation(
+                &charter_id,
+                &holders[0],
+                &accord,
+                attestation_type::DELEGATES_TO,
+                json!({
+                    "references_attestation_id": charter_id,
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                    "pre_rotation_commitment": commitment,
+                }),
+                &[&holders[1]],
+            ),
+            &[&holders[0], &holders[1], &holders[2]],
+        )
+        .await?;
 
         // Each side names THE ACCORD, not a holder.
         emit_trust_edge(directory, &user, &accord, None).await?;

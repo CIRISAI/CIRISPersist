@@ -23,7 +23,9 @@
 //! - **I445** the attach head moves with the version: an acceptance edge naming
 //!   the replaced head is stale at the author's door; the new head attaches.
 //! - **I446** the accord family's genesis version names the bundle's charter,
-//!   and on a seeded node that is the stored `genesis-charter` row.
+//!   and on a seeded node that is the stored `genesis-charter` row; the
+//!   reserved accord id admits exactly one door record — a version of the
+//!   held accord that moves only its head, whose quorum signed WHICH version.
 //! - **I447** a community's charter is its conferring family's in force.
 //! - **I448** from disk: every backend's `supersede_group_row` runs the prev
 //!   check on both arms.
@@ -440,6 +442,80 @@ pub(crate) mod bodies {
         .unwrap_or_else(|e| panic!("{tag} I445: the new head attaches: {e}"));
     }
 
+    /// **I446 (door)** — the reserved accord id re-versions only its head,
+    /// only under its own quorum, and only the version the quorum bound.
+    pub async fn i446_the_accord_moves_only_its_head(d: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::canonical_community::NEXT_PERSIST_ROW_HASH;
+        ops::register_genesis_accord_roster(d).await.unwrap();
+        crate::federation::genesis::seed_accord_family(d)
+            .await
+            .unwrap();
+        let accord = crate::federation::canonical_community::accord_family_key_id();
+        let held = head(d, accord).await;
+        let ids: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
+        let signers: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let attempt = |next: crate::federation::Family, bind: Option<String>| {
+            let ids = ids.clone();
+            let signers = signers.clone();
+            async move {
+                let mut env = d
+                    .build_membership_change_envelope(
+                        crate::federation::cohort::Cohort::Family,
+                        accord,
+                        &ids,
+                        true,
+                        Some(&next.consensus_protocol),
+                    )
+                    .await
+                    .unwrap();
+                if let Some(h) = bind {
+                    env[NEXT_PERSIST_ROW_HASH] = serde_json::Value::String(h);
+                }
+                let bytes = ciris_verify_core::jcs::canonicalize(&env).unwrap();
+                let sigs = signers
+                    .iter()
+                    .map(|k| ts::threshold_sign(k, &bytes))
+                    .collect();
+                d.supersede_family_with_quorum(ts::sign_family(signers[0], next), env, sigs)
+                    .await
+            }
+        };
+        let hash = |f: &crate::federation::Family| {
+            crate::federation::types::compute_persist_row_hash(f).unwrap()
+        };
+        let mut next = held.clone();
+        next.prev_head_digest = held.persist_row_hash.clone();
+        next.charter_digest = "5e".repeat(32);
+        next.persist_row_hash = String::new();
+        let reserved = |e: &Error| matches!(e, Error::ConstitutionalFamilyReserved { .. });
+        // Unbound: the quorum signed "the same roster", not this version.
+        let e = attempt(next.clone(), None).await.expect_err("unbound");
+        assert!(reserved(&e), "{tag} I446: an unbound envelope: {e:?}");
+        // Bound to another version.
+        let e = attempt(next.clone(), Some("ab".repeat(32)))
+            .await
+            .expect_err("bound elsewhere");
+        assert!(reserved(&e), "{tag} I446: bound to another version: {e:?}");
+        // A roster change is not a head move, however bound.
+        let mut grown = next.clone();
+        grown.members.truncate(2);
+        let bound = hash(&grown);
+        let e = attempt(grown, Some(bound)).await.expect_err("roster");
+        assert!(
+            reserved(&e) || matches!(e, Error::InvalidArgument(_)),
+            "{tag} I446: a roster change through the head door: {e:?}"
+        );
+        assert_eq!(head(d, accord).await, held, "{tag} I446: nothing moved");
+        // The head-only version the quorum bound.
+        let bound = hash(&next);
+        attempt(next, Some(bound))
+            .await
+            .unwrap_or_else(|e| panic!("{tag} I446: the bound head-only version: {e}"));
+        let moved = head(d, accord).await;
+        assert_eq!(moved.charter_digest, "5e".repeat(32), "{tag} I446");
+        assert_eq!(moved.prev_head_digest, held.persist_row_hash, "{tag} I446");
+    }
+
     /// **I447** — a community's charter is its conferring family's.
     pub async fn i447_a_community_reads_its_family_head(d: &dyn FederationDirectory, tag: &str) {
         let (holders, _) = people(d, tag).await;
@@ -615,6 +691,11 @@ mod run {
                 async fn i445() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i445_attach_on_the_replaced_head_is_stale(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i446() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i446_the_accord_moves_only_its_head(&b, &suffix()).await
                 }
                 #[tokio::test]
                 async fn i447() {

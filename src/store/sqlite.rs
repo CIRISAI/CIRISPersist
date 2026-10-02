@@ -53199,7 +53199,12 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
         // SUPERSEDE to a DIFFERENT roster and a DIFFERENT protocol — both
         // inside the signing preimage, so both are re-signed. A contraction:
         // a supersede never adds (#955 Q2).
-        let v2 = ts::sign_family(authority, mk(vec![m1], "unanimous"));
+        // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+        let v2 = ts::family_naming_held(
+            &origin,
+            ts::sign_family(authority, mk(vec![m1], "unanimous")),
+        )
+        .await;
         let version = origin
             .supersede_family(
                 v2,
