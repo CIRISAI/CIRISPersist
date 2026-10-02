@@ -19329,6 +19329,13 @@ mod tests {
         ))
         .await
         .expect("genesis put_family");
+        // v53.0.0 (CC 3.2 T6) — every version below names v1 as its head.
+        let v1_hash = d
+            .lookup_family(&fam)
+            .await
+            .unwrap()
+            .expect("v1")
+            .persist_row_hash;
 
         // Supersede → 3-member quorum:2/3 (a contraction; growth is the
         // widening plane's, #955 Q2).
@@ -19353,7 +19360,7 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
-                        prev_head_digest: String::new(),
+                        prev_head_digest: v1_hash.clone(),
                         charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
@@ -19391,7 +19398,7 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
-                        prev_head_digest: String::new(),
+                        prev_head_digest: v1_hash.clone(),
                         charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
@@ -19578,7 +19585,11 @@ mod tests {
         // 3 of the 5 PRIOR members cosign → meets quorum:3/5.
         let v = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 change.clone(),
                 vec![
                     threshold_sign(&m[0], &bytes),
@@ -19615,7 +19626,11 @@ mod tests {
         // (a) Insufficient quorum: 1 cosignature where M=3 → rejected.
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 change2.clone(),
                 vec![threshold_sign(&m[0], &bytes2)],
             )
@@ -19634,7 +19649,11 @@ mod tests {
         let tbytes = ciris_verify_core::jcs::canonicalize(&tampered).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 tampered,
                 vec![
                     threshold_sign(&m[0], &tbytes),
@@ -19664,7 +19683,11 @@ mod tests {
         let sbytes = ciris_verify_core::jcs::canonicalize(&seat_change).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(seat_roster, "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(seat_roster, "quorum:3/4"),
+                )
+                .await,
                 seat_change,
                 vec![
                     threshold_sign(&m[0], &sbytes),
@@ -19789,7 +19812,11 @@ mod tests {
                 .map(|m| ts::threshold_sign(m, &bytes))
                 .collect();
             d.supersede_community_with_quorum(
-                community(&room, &new_members, founders, cp),
+                crate::federation::tier_ingest::test_support::community_naming_held(
+                    d,
+                    community(&room, &new_members, founders, cp),
+                )
+                .await,
                 change,
                 sigs,
             )
@@ -20042,7 +20069,8 @@ mod tests {
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         refused(
             d.supersede_family_with_quorum(
-                family(&fk),
+                crate::federation::tier_ingest::test_support::family_naming_held(d, family(&fk))
+                    .await,
                 change.clone(),
                 vec![ts::threshold_sign(&fk[1], &bytes)],
             )
@@ -20055,7 +20083,8 @@ mod tests {
         );
         refused_add(
             d.supersede_family_with_quorum(
-                family(&fk),
+                crate::federation::tier_ingest::test_support::family_naming_held(d, family(&fk))
+                    .await,
                 change,
                 vec![ts::threshold_sign(&fk[0], &bytes)],
             )

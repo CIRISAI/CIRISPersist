@@ -428,6 +428,9 @@ impl ConsentSweepReport {
     }
 }
 
+/// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
+#[cfg(test)]
+mod lineage_head_invariants;
 pub mod register;
 /// v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: the
 /// `attestation_type` allowlist, the carrier shape, the report door.

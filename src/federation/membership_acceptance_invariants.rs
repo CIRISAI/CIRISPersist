@@ -874,6 +874,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         let mut c = d.lookup_community(&cid).await.unwrap().unwrap();
+        c.prev_head_digest = c.persist_row_hash.clone();
         c.members.push(CommunityMember {
             key_id: k.clone(),
             joined_at: ms(Utc::now()),

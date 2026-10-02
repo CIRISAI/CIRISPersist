@@ -1818,7 +1818,104 @@ pub struct CharterMembers {
     pub witness_quorum: Option<u32>,
 }
 
-/// Read a root's charter members from the charter row this node holds.
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) —
+/// **which charter rows a root's lineage head puts in force.** The head is the
+/// family record at a version and names the charter in force at that version
+/// (`charter_digest`); a charter row no version names is not in force, so a
+/// charter re-scrub takes effect only through a new version, and the head
+/// moves with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadCharter {
+    /// The root holds no lineage record here (a key root): there is no head to
+    /// name a charter, so every live charter-shaped row stands, as before.
+    KeyRoot,
+    /// The head names this charter (`persist_row_hash` of the
+    /// `trust:charter:v1` row).
+    Named(String),
+    /// The head names no charter: none is in force.
+    Unnamed,
+}
+
+impl HeadCharter {
+    /// Read a head's `charter_digest`.
+    #[must_use]
+    pub fn of(charter_digest: &str) -> Self {
+        if charter_digest.is_empty() {
+            Self::Unnamed
+        } else {
+            Self::Named(charter_digest.to_owned())
+        }
+    }
+
+    /// Does this head put `charter` in force?
+    #[must_use]
+    pub fn admits(&self, charter: &super::Attestation) -> bool {
+        match self {
+            Self::KeyRoot => true,
+            Self::Named(digest) => charter.persist_row_hash == *digest,
+            Self::Unnamed => false,
+        }
+    }
+}
+
+/// v53.0.0 (CC 3.2 T6) — **the digest a version names a charter by, computed
+/// before the row is stored**: the `persist_row_hash` every backend assigns
+/// the row, which is taken over the envelope in its at-rest canonical form
+/// (`canonical_at_rest::canonicalize_in_place`, run at every put door before
+/// the hash). A producer minting a version together with its charter (a
+/// genesis, a ceremony) names the charter by this.
+///
+/// # Errors
+///
+/// An envelope the at-rest canonicalizer refuses, or a row that does not hash.
+pub fn stored_row_hash(charter: &super::Attestation) -> Result<String, Error> {
+    let mut row = charter.clone();
+    super::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+    row.persist_row_hash = String::new();
+    super::types::compute_persist_row_hash(&row)
+}
+
+/// v53.0.0 (CC 3.2 T6) — **the ONE answer to "which charter is in force for
+/// `root`"**: the lineage whose head decides, and what that head names.
+///
+/// - a family root: its own head;
+/// - a community: its conferring family's head — a community's legs are the
+///   family's (CC 4.4: `{community_key_id: ciris-canonical, family:
+///   humanity-accord}`), and every trust-root community is accord-rooted;
+/// - anything else: a key root ([`HeadCharter::KeyRoot`]), whose charter is
+///   its own self-loop.
+///
+/// Returns the key id the charter rows name (`attested_key_id`) with the
+/// verdict. Every reader of a root's charter — the trust-root charter leg,
+/// the charter members (attach window, witness cadence and quorum) — routes
+/// through here, so they cannot disagree about which charter stands.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn charter_in_force<F>(
+    directory: &F,
+    root_key_id: &str,
+) -> Result<(String, HeadCharter), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Some(fam) = directory.lookup_family(root_key_id).await? {
+        return Ok((root_key_id.to_owned(), HeadCharter::of(&fam.charter_digest)));
+    }
+    if directory.lookup_community(root_key_id).await?.is_some() {
+        let family = accord_family_key_id();
+        let head = match directory.lookup_family(family).await? {
+            Some(fam) => HeadCharter::of(&fam.charter_digest),
+            None => HeadCharter::Unnamed,
+        };
+        return Ok((family.to_owned(), head));
+    }
+    Ok((root_key_id.to_owned(), HeadCharter::KeyRoot))
+}
+
+/// Read a root's charter members from the charter in force
+/// ([`charter_in_force`]).
 pub async fn charter_members_for<F>(
     directory: &F,
     root_key_id: &str,
@@ -1827,11 +1924,6 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::envelope::paths;
-    // The charter names the root as its ATTESTED key (a key root charters
-    // itself; the accord's holders charter their family). A community root
-    // has no signing key: its charter is its conferring family's — for a
-    // trust-root-grade community, the accord family's.
-    let mut rows = directory.list_attestations_for(root_key_id).await?;
     let is_charter = |a: &super::Attestation| {
         a.attestation_type == super::types::attestation_type::DELEGATES_TO
             && super::trust_root::job_dimension_admits(
@@ -1839,24 +1931,29 @@ where
                 super::trust_root::TRUST_CHARTER_DIMENSION,
             )
     };
-    // #973 (CC 3.2 T4a) — an unlabelled row is a charter only where its
-    // direction reading stands (held, or a pinned-bundle row).
-    let denied =
-        super::trust_root::direction_denied_ids(directory, rows.iter().filter(|a| is_charter(a)))
-            .await?;
-    rows.retain(|a| !denied.contains(&a.attestation_id));
-    if !rows.iter().any(is_charter) && root_key_id != accord_family_key_id() {
-        rows = directory
-            .list_attestations_for(accord_family_key_id())
-            .await?;
+    // The charter names its lineage as its ATTESTED key (a key root charters
+    // itself; the accord's holders charter their family).
+    let in_force = |owner: String, head: HeadCharter| async move {
+        let mut rows = directory.list_attestations_for(&owner).await?;
+        // #973 (CC 3.2 T4a) — an unlabelled row is a charter only where its
+        // direction reading stands (held, or a pinned-bundle row).
         let denied = super::trust_root::direction_denied_ids(
             directory,
             rows.iter().filter(|a| is_charter(a)),
         )
         .await?;
-        rows.retain(|a| !denied.contains(&a.attestation_id));
+        rows.retain(|a| is_charter(a) && !denied.contains(&a.attestation_id) && head.admits(a));
+        Ok::<_, Error>(rows)
+    };
+    let (owner, head) = charter_in_force(directory, root_key_id).await?;
+    let key_root = head == HeadCharter::KeyRoot;
+    let mut rows = in_force(owner, head).await?;
+    // A key root with no charter of its own reads the accord's, as before.
+    if rows.is_empty() && key_root && root_key_id != accord_family_key_id() {
+        let (owner, head) = charter_in_force(directory, accord_family_key_id()).await?;
+        rows = in_force(owner, head).await?;
     }
-    let charter = rows.iter().find(|a| is_charter(a));
+    let charter = rows.first();
     Ok(charter.map(|a| {
         let e = &a.attestation_envelope;
         CharterMembers {
@@ -2806,6 +2903,13 @@ where
         .is_some())
 }
 
+/// The authorization label of an accord birth stored over an un-rooted row
+/// (a squat) — its value is the replaced row's hash.
+pub(crate) const BIRTH_REPLACES_UNROOTED: &str = "accord_birth_replaces_unrooted";
+/// The authorization label of an accord re-birth stored over a stalled
+/// chain — its value is the replaced row's hash.
+pub(crate) const REBIRTH_REPLACES_STALLED: &str = "accord_rebirth_replaces_stalled";
+
 /// [`apply_trust_root_chain`] reporting what it WROTE (PR #921 review, F3):
 /// `None` — nothing stored, the caller inserts; `Some(0)` — the chain this
 /// node holds is the offered one, nothing written; `Some(n)` — `n` versions
@@ -2838,7 +2942,7 @@ where
                 }
                 Extends::No if is_rebirth_over_stalled(&standing, &chain) => {
                     verify_chain_memo(directory, &chain, &mut memo).await?;
-                    (0, Some(("accord_rebirth_replaces_stalled", held_hash)))
+                    (0, Some((REBIRTH_REPLACES_STALLED, held_hash)))
                 }
                 Extends::No => return Err(does_not_extend(id)),
             }
@@ -2850,7 +2954,7 @@ where
                 .await?
                 .map(|c| c.persist_row_hash)
                 .unwrap_or_default();
-            (0, Some(("accord_birth_replaces_unrooted", stored)))
+            (0, Some((BIRTH_REPLACES_UNROOTED, stored)))
         }
     };
     let mut written = 0;

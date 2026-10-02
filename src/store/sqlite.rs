@@ -7237,6 +7237,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         use crate::federation::cohort::Cohort;
         use crate::federation::Error;
         let now = chrono::Utc::now().to_rfc3339();
+        // v53.0.0 (CC 3.2 T6) — the prev-head check reads it in the closure.
+        let auth_for_prev = authorization.clone();
         let auth_json = match authorization {
             Some(v) => Some(
                 serde_json::to_string(&v)
@@ -7331,6 +7333,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         &new_fam.family_key_id,
                         &new_fam.prev_head_digest,
                         &prior_fam.persist_row_hash,
+                        auth_for_prev.as_ref(),
                     )
                     .map_err(|e| {
                         *stale.lock().expect("stale slot") = Some(e);
@@ -7467,6 +7470,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         &new_comm.community_key_id,
                         &new_comm.prev_head_digest,
                         &prior_comm.persist_row_hash,
+                        auth_for_prev.as_ref(),
                     )
                     .map_err(|e| {
                         *stale.lock().expect("stale slot") = Some(e);

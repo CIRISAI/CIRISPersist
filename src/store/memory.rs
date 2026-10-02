@@ -6231,6 +6231,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         &key,
                         &new_fam.prev_head_digest,
                         &prior.persist_row_hash,
+                        authorization.as_ref(),
                     )?;
                     let cur_ver = *state
                         .federation_group_current_version
@@ -6329,6 +6330,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         &key,
                         &new_comm.prev_head_digest,
                         &prior.persist_row_hash,
+                        authorization.as_ref(),
                     )?;
                     let cur_ver = *state
                         .federation_group_current_version

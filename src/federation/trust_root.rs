@@ -1339,7 +1339,17 @@ where
             // the finding a human acts on ("1 of 2 required distinct
             // holders"), so the best candidate's count is carried out.
             let mut best: Option<CharterQuorum> = None;
-            for candidate in about_root.iter().filter(|a| charter_shaped(a, &about_dead)) {
+            // v53.0.0 (CC 3.2 T6) — only the charter the family's HEAD names
+            // is in force: a re-scrub no version names confers nothing, and
+            // the charter the head names stands until a new version names
+            // another (`canonical_community::charter_in_force`, the one
+            // answer every charter reader shares).
+            let (_, head) =
+                super::canonical_community::charter_in_force(directory, &fam.family_key_id).await?;
+            for candidate in about_root
+                .iter()
+                .filter(|a| charter_shaped(a, &about_dead) && head.admits(a))
+            {
                 let (q, signers) = family_quorum_holders_over(directory, candidate, fam).await?;
                 if q.met() {
                     quorate.push(candidate);

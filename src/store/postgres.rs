@@ -8530,6 +8530,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &new_fam.family_key_id,
                     &new_fam.prev_head_digest,
                     &prior_fam.persist_row_hash,
+                    authorization.as_ref(),
                 )?;
                 let snapshot = serde_json::to_value(&prior_fam)
                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
@@ -8657,6 +8658,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &new_comm.community_key_id,
                     &new_comm.prev_head_digest,
                     &prior_comm.persist_row_hash,
+                    authorization.as_ref(),
                 )?;
                 let snapshot = serde_json::to_value(&prior_comm)
                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
