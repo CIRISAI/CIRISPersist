@@ -9,6 +9,34 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### #973 — a charter silent on witness_quorum, or declaring 0, is in witnessed mode off
+CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quorum = 0`: silence and `0` are one state, witnessed mode off, and "a substrate MUST NOT substitute an internal default". Persist substituted a default of 1 (`DEFAULT_WITNESS_QUORUM`) for a silent charter and read `0` as `1`.
+
+- **No default.** `lineage_witness::declared_witness_quorum` is the one reading of the charter member: absent → `0`. `DEFAULT_WITNESS_QUORUM` is removed. `witnessed()` is false at quorum `0`.
+- **The head.** With the mode off, `witnessed_head` reports "never witnessed" whatever cosigns are held: the head is the founders' latest admitted version, the lineage is live on the founders' quorum, and no equivocation freeze is raised from cosign counts. Cosigns are still admitted and stored as evidence.
+- **Attach.** With the mode off, `check_attach_freshness` admits an edge naming the head this node holds (the out-of-band anchor; the window does not apply), refuses one naming another head, and refuses one naming no head when the charter declares a window. An edge naming no head under a charter with no window is admitted as before (the pre-rc6 shape: the gate re-runs wherever an edge is put, so refusing it would refuse edges already in the field).
+- **Charter admission.** `trust_root::check_charter_witness_quorum`, on both charter doors, refuses `witness_quorum: 1` (`charter_witness_quorum_below_majority`). The full majority check over a witness directory is not built (FSD `TRUST_ROOT_RC6.md` §8, "Not yet built"; CIRISPersist#974).
+- `RootWitnessView` gains `held_head` (additive in the Python JSON); its `quorum` is `0` in off mode.
+
+**In the field.** A lineage with a silent charter and no cosign held, which is every production lineage today, reads the same before and after: never witnessed, judged as before rc6. Two readings change: one cosign under a silent charter no longer engages witnessed mode, and an anchor attach naming the held head under a silent charter is now admitted (it was refused as unwitnessed).
+
+**Witnesses I340–I344** (memory, sqlite, postgres; I340/I341/I342/I344 RED first): a silent charter is off; an explicit `0` is the same state; off mode attaches by anchor only; an explicit quorum of 2 still witnesses; a quorum of 1 is refused at both charter doors. The pre-existing rc6 witnesses (I191, I192, I193, I194, I196, I197) relied on the default of 1; they now run under an explicit quorum of 2 with a twin witness, so one witness act still crosses the quorum.
+
+**Mutation round** (on the committed tree; lane = rc6 + v51 + I190 + the lineage and trust-root unit tests, memory and sqlite): ten mutants, nine killed, one equivalent.
+
+| Mutant | Result |
+|---|---|
+| M1 a silent charter reads as 1 | killed — I340 |
+| M2 quorum 0 counts as 1 in `witnessed()` | killed — the unit test (the fold never asks at 0) |
+| M3 the fold does not short-circuit in off mode | equivalent — `witnessed()` is false at 0, so the search returns the same value |
+| M4 the attach gate ignores off mode | killed — I342 |
+| M5 off mode admits any named head | killed — I342 |
+| M6 off mode admits a headless edge under a window | killed — I342 |
+| M7 a charter quorum of 1 is admitted | killed — I344 |
+| M8 a charter quorum of 2 is refused too | killed — I343 and the rc6 witnesses |
+| M9 the family-charter door skips the check | killed — I344 |
+| M10 the key-charter door skips the check | killed — I344, after a first round in which it survived: nothing drove a key root's charter, and I344 now does |
+
 ### #972 — a seated accord holder founds an infrastructure community
 Operator ruling 2026-10-01 (posted on #926): the three founders of `ciris-canonical` ARE the baked accord holders A1/B1/C1. The founder check asked every founder for a `user` type and an accord-conferred `steward`; the baked holder records are typed `accord_holder`, so they were refused at the door ("is not a human key").
 
