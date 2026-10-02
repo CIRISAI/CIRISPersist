@@ -140,6 +140,10 @@ pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
+/// v53.0.0 (CC 3.2 T2) — I383–I386, a superseded grant hands standing to its
+/// successor; a withdrawn one has none.
+#[cfg(test)]
+pub(crate) mod grant_supersede_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;

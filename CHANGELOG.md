@@ -9,6 +9,38 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### CC 3.2 T2 — a superseded grant hands standing to its successor; a withdrawn one has none
+
+CIRISConstitution v1.0-rc6, CC 3.2 T2 (steward ruling 2026-10-01): *"A grant
+that is superseded … keeps its lineage: a claim made under the superseded
+grant, with `asserted_at` before the successor's, keeps the standing it had
+… A grant that is withdrawn or tombstoned has no successor and no lineage to
+walk: standing under it is gone at once."*
+
+`capability_roots_to_trusted_root_over_roster` folded tombstones through the
+§6.1 precedence, where a `supersedes` is never a retraction. Two results
+followed. A superseded grant stayed a live candidate, so a successor that
+narrowed the scope never narrowed it. And the successor, being a
+`supersedes` row and not a `delegates_to`, conferred nothing. The walk now
+reads the head of the chain (`live_conferrals`). A `supersedes` confers when
+its chain reaches a `delegates_to` signed by the same root at every link. A
+grant its own root has superseded is not a candidate, and a withdrawn
+successor does not revive it. Someone else's `supersedes` neither retires the
+grant nor confers. A `withdraws` still kills at once. The family-quorum arm
+reads the same live set.
+
+The walk answers "does the subject hold this scope now". No read in persist
+answers the T2 question "did a past claim, made before the successor, have
+standing": every caller of the walk resolves at use. The lineage that read
+would follow is kept, because nothing is deleted and each successor names
+what it replaced.
+
+I383–I386 (memory, sqlite, postgres): the successor confers and the head of
+a two-rotation chain confers; a narrowing successor narrows; a withdrawn
+successor confers nothing and revives nothing, and a withdrawn grant is gone;
+a foreign `supersedes` neither retires the grant nor confers. I383–I385 were
+RED before the change. I386 is the control and was green before and after.
+
 ### #965 — the identity re-signing a pair does not demote the occurrence's consent
 
 `federation_identity_occurrences` is keyed `(identity, occurrence)` and
