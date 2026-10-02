@@ -11,8 +11,9 @@
 //!   seat: the version must carry the seat AND its role.
 //! - **I452** (i) only a witnessed lineage is judged: a family whose head names
 //!   no charter takes a version the planes disagree with.
-//! - **I453** the one comparison on the community arm: a widening and a
-//!   revocation of a room name exactly their keys until a record reflects them.
+//! - **I453** the one comparison on the community arm: a revocation of a room
+//!   names exactly its key until a record reflects it, and only while it is
+//!   after the floor (the held head's instant) and effective at the instant.
 //! - **I454** (ii) a row older than one `witness_cadence_secs` that no version
 //!   covers lags the head (`lineage_head_lags_roster`, served on the witness
 //!   view with its keys and instant); a younger row does not; the covering
@@ -294,7 +295,7 @@ pub(crate) mod bodies {
         let held = d.lookup_community(&id).await.unwrap().unwrap();
         let now = chrono::Utc::now();
         assert_eq!(
-            fold_disagreement(d, LineageRecord::Community(&held), now)
+            fold_disagreement(d, LineageRecord::Community(&held), None, now)
                 .await
                 .unwrap(),
             vec![keys[2].clone()],
@@ -303,18 +304,25 @@ pub(crate) mod bodies {
         let mut reflected = held.clone();
         reflected.members.retain(|m| m.key_id != keys[2]);
         assert!(
-            fold_disagreement(d, LineageRecord::Community(&reflected), now)
+            fold_disagreement(d, LineageRecord::Community(&reflected), None, now)
                 .await
                 .unwrap()
                 .is_empty(),
             "{tag} I453: a record reflecting the row"
         );
         assert!(
-            fold_disagreement(d, LineageRecord::Community(&held), at - hours(1))
+            fold_disagreement(d, LineageRecord::Community(&held), None, at - hours(1))
                 .await
                 .unwrap()
                 .is_empty(),
             "{tag} I453: before the row took effect"
+        );
+        assert!(
+            fold_disagreement(d, LineageRecord::Community(&held), Some(at), now)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tag} I453: a row at or before the floor is the held head's, not this one's"
         );
     }
 
@@ -704,7 +712,7 @@ mod pure {
         let cc = code_of("src/federation/canonical_community.rs");
         let b = body(&cc, "pub(crate) async fn apply_trust_root_chain_counted");
         let check = b
-            .find("roster_head::check_version_covers_fold(")
+            .find("roster_head::check_version_covers_fold_since(")
             .expect("I458: the trust-root chain apply runs consequence (i)");
         assert!(
             check < b.find("supersede_group_row(").expect("writes"),

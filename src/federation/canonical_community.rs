@@ -2967,14 +2967,17 @@ where
         }
     };
     // v53.0.0 (CC 3.2 T6, consequence (i)) — the version this apply makes the
-    // head must reflect the roster planes at its own instant. A birth or a
-    // re-birth (it replaces a squat or a stalled chain) is a first version and
-    // is not judged against the replaced lineage's rows.
-    if replaces.is_none() {
-        if let Some(head) = chain.last().filter(|_| start < chain.len()) {
-            super::roster_head::check_version_covers_fold(
+    // head must reflect the roster rows effective after its predecessor in the
+    // chain and up to its own instant (CC 3.2 T8 (iii): a resignation never
+    // reaches behind a link's instant — the predecessor answered for those).
+    // A birth or a re-birth (it replaces a squat or a stalled chain) is a
+    // first version and is not judged against the replaced lineage's rows.
+    if replaces.is_none() && start < chain.len() {
+        if let [.., before, head] = chain.as_slice() {
+            super::roster_head::check_version_covers_fold_since(
                 directory,
                 super::roster_head::LineageRecord::Community(&head.community),
+                Some(head_instant(before)),
                 head_instant(head),
             )
             .await?;

@@ -98,14 +98,19 @@ fn role_of(role: Option<&str>) -> String {
 }
 
 /// **The ONE comparison.** The keys whose seat (present or not) or role the
-/// roster planes move when folded over `record`'s members at `as_of`, sorted.
-/// Empty when the record reflects every roster row effective at `as_of`.
+/// roster planes move when folded over `record`'s members, sorted. Empty when
+/// the record reflects every roster row it answers for.
 ///
-/// A row the record already reflects (a widening of a seated key, a revocation
-/// of an absent one) moves nothing; a row the fold does not apply (no standing
-/// under the record's protocol, or reversed) moves nothing either. A key the
-/// record changed with no plane row about it is the record's own act and is
-/// not judged here.
+/// The rows folded are those effective at or before `as_of` and, when `since`
+/// is given, strictly after it: the rows the record answers for. A row the
+/// record already reflects (a widening of a seated key, a revocation of an
+/// absent one) moves nothing; a row the fold does not apply (no standing under
+/// the record's protocol, or reversed) moves nothing either. A key the record
+/// changed with no plane row about it is the record's own act and is not
+/// judged here. The fold is the ONE authorized replay every roster gate reads
+/// ([`authorized_roster_at`](super::authorized_roster_at)), over the same
+/// stored events ([`community_roster_events`](super::community_roster_events),
+/// [`family_roster_events`](super::family_roster_events)).
 ///
 /// # Errors
 ///
@@ -113,25 +118,40 @@ fn role_of(role: Option<&str>) -> String {
 pub async fn fold_disagreement<F>(
     directory: &F,
     record: LineageRecord<'_>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
     as_of: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<String>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    let answered = |e: &super::RosterEvent| since.is_none_or(|floor| e.effective_at > floor);
     let folded: std::collections::BTreeMap<String, String> = match record {
         LineageRecord::Family(f) => {
-            Box::pin(super::authorized_family_roster_at(directory, f, as_of))
-                .await?
+            let mut events = Box::pin(super::family_roster_events(directory, f)).await?;
+            events.retain(answered);
+            let members: Vec<super::types::CommunityMember> = f
+                .members
+                .iter()
+                .map(super::family_member_as_roster_member)
+                .collect();
+            super::authorized_roster_at(&members, super::RosterRules::of_family(f), &events, as_of)
                 .into_iter()
                 .map(|m| (m.key_id, role_of(m.role.as_deref())))
                 .collect()
         }
         LineageRecord::Community(c) => {
-            Box::pin(super::authorized_community_roster_at(directory, c, as_of))
-                .await?
-                .into_iter()
-                .map(|m| (m.key_id, role_of(m.role.as_deref())))
-                .collect()
+            let nodes = Box::pin(super::community_node_bearing_seats(directory, c)).await?;
+            let mut events = Box::pin(super::community_roster_events(directory, c, &nodes)).await?;
+            events.retain(answered);
+            super::authorized_roster_at(
+                &c.members,
+                super::RosterRules::of_community(c, &nodes),
+                &events,
+                as_of,
+            )
+            .into_iter()
+            .map(|m| (m.key_id, role_of(m.role.as_deref())))
+            .collect()
         }
     };
     let listed = record.seats();
@@ -149,6 +169,33 @@ where
     Ok(moved.into_iter().collect())
 }
 
+/// The instant after which the rows of `lineage_key_id` are the next
+/// version's to answer for: the HELD head's signer-stamped instant on the
+/// community arm (a trust-root link's `amended_at`, a birth's `founded_at`).
+/// Rows effective before it were the held head's to answer — and the
+/// trust-root design lets a later founders' amendment re-seat or re-role a key
+/// a plane row once moved (`check_trust_root_roster_change`), so re-judging an
+/// old row over a newer record would refuse what the chain admits. A family
+/// version carries no signed instant: the family arm answers for every row,
+/// which is CC 3.2 T6's own reading (the fold is the authority on who holds a
+/// seat) — a conferring family moves a seat on the planes, then versions.
+async fn held_floor<F>(
+    directory: &F,
+    record: LineageRecord<'_>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(match record {
+        LineageRecord::Family(_) => None,
+        LineageRecord::Community(c) => {
+            super::canonical_community::lookup_signed_community(directory, &c.community_key_id)
+                .await?
+                .map(|held| super::canonical_community::head_instant(&held))
+        }
+    })
+}
+
 /// **Consequence (i).** Refuse a new version of a witnessed lineage whose
 /// roster disagrees with the fold of the roster rows effective at `as_of`.
 /// Run at every door that stores a version over a held one (the local and
@@ -158,7 +205,9 @@ where
 ///
 /// `as_of` is the version's own signer-stamped instant where the record
 /// carries one (a trust-root link's `amended_at`); a family version carries
-/// none, so its door judges at admission.
+/// none, so its door judges at admission. The rows judged are those after the
+/// held head's instant on the community arm, every row on the family arm
+/// (`held_floor`).
 ///
 /// # Errors
 ///
@@ -180,7 +229,37 @@ where
             return Ok(());
         }
     }
-    let keys = fold_disagreement(directory, record, as_of).await?;
+    let since = held_floor(directory, record).await?;
+    check_version_covers_fold_since(directory, record, since, as_of).await
+}
+
+/// [`check_version_covers_fold`] with the floor given: the instant of the
+/// version the judged one succeeds. The trust-root chain apply passes the
+/// final head's predecessor IN THE OFFERED CHAIN — an intermediate version of
+/// that chain answered for the rows before it (a re-seat after a resignation),
+/// even where this node never held it.
+///
+/// # Errors
+///
+/// As [`check_version_covers_fold`].
+pub async fn check_version_covers_fold_since<F>(
+    directory: &F,
+    record: LineageRecord<'_>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if !record.is_witnessed() {
+        return Ok(());
+    }
+    if let LineageRecord::Family(f) = record {
+        if f.dissolved_at.is_some() {
+            return Ok(());
+        }
+    }
+    let keys = fold_disagreement(directory, record, since, as_of).await?;
     if keys.is_empty() {
         return Ok(());
     }
@@ -219,9 +298,9 @@ pub struct RosterLag {
 /// roster row older than one cadence.
 ///
 /// The cutoff is `at − witness_cadence_secs` (the cadence of the charter in
-/// force). The judgment is [`fold_disagreement`] of the held head at the
-/// cutoff, so a row younger than one cadence never lags and a row the head
-/// reflects never does.
+/// force). The judgment is [`fold_disagreement`] of the held head over the rows
+/// it answers for (`held_floor`) up to the cutoff, so a row younger than one
+/// cadence never lags and a row the head reflects never does.
 ///
 /// # Errors
 ///
@@ -256,16 +335,17 @@ where
         .and_then(chrono::Duration::try_seconds)
         .and_then(|d| at.checked_sub_signed(d))
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-    let uncovered_keys = fold_disagreement(directory, record, cutoff).await?;
+    let since = held_floor(directory, record).await?;
+    let uncovered_keys = fold_disagreement(directory, record, since, cutoff).await?;
     let head_digest = match record {
         LineageRecord::Family(f) => f.persist_row_hash.clone(),
         LineageRecord::Community(c) => c.persist_row_hash.clone(),
     };
-    let mut since: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut first: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut earliest = |t: chrono::DateTime<chrono::Utc>| {
-        since = Some(since.map_or(t, |s| s.min(t)));
+        first = Some(first.map_or(t, |s| s.min(t)));
     };
-    for t in plane_instants(directory, record, &uncovered_keys, cutoff).await? {
+    for t in plane_instants(directory, record, &uncovered_keys, since, cutoff).await? {
         earliest(t);
     }
     let mut uncovered_decisions = Vec::new();
@@ -283,7 +363,7 @@ where
         head_digest,
         uncovered_keys,
         uncovered_decisions,
-        since: since.unwrap_or(cutoff),
+        since: first.unwrap_or(cutoff),
         cadence_secs,
     }))
 }
@@ -294,23 +374,26 @@ async fn plane_instants<F>(
     directory: &F,
     record: LineageRecord<'_>,
     keys: &[String],
+    since: Option<chrono::DateTime<chrono::Utc>>,
     cutoff: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<chrono::DateTime<chrono::Utc>>, Error>
 where
     F: FederationDirectory + ?Sized,
 {
+    let in_window =
+        |t: chrono::DateTime<chrono::Utc>| t <= cutoff && since.is_none_or(|floor| t > floor);
     let named = |k: &str| keys.iter().any(|x| x == k);
     let mut out = Vec::new();
     match record {
         LineageRecord::Family(f) => {
             let id = &f.family_key_id;
             for w in directory.list_family_membership_widenings_for(id).await? {
-                if named(&w.member_key_id) && w.effective_at <= cutoff {
+                if named(&w.member_key_id) && in_window(w.effective_at) {
                     out.push(w.effective_at);
                 }
             }
             for r in directory.list_family_membership_revocations_for(id).await? {
-                if named(&r.removed_identity_key_id) && r.effective_at <= cutoff {
+                if named(&r.removed_identity_key_id) && in_window(r.effective_at) {
                     out.push(r.effective_at);
                 }
             }
@@ -321,7 +404,7 @@ where
                 .list_community_membership_widenings_for(id)
                 .await?
             {
-                if named(&w.member_key_id) && w.effective_at <= cutoff {
+                if named(&w.member_key_id) && in_window(w.effective_at) {
                     out.push(w.effective_at);
                 }
             }
@@ -329,7 +412,7 @@ where
                 .list_community_membership_revocations_for(id)
                 .await?
             {
-                if named(&r.removed_identity_key_id) && r.effective_at <= cutoff {
+                if named(&r.removed_identity_key_id) && in_window(r.effective_at) {
                     out.push(r.effective_at);
                 }
             }
