@@ -454,15 +454,24 @@ pub(crate) mod bodies {
         let held = head(d, accord).await;
         let ids: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
         let signers: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let _ = &ids;
         let attempt = |next: crate::federation::Family, bind: Option<String>| {
-            let ids = ids.clone();
-            let signers = signers.clone();
+            // Signed by the seats the offered roster keeps: a quorum of the
+            // held roster either way, so only the head door can refuse it.
+            let signers: Vec<&str> = signers
+                .iter()
+                .copied()
+                .filter(|k| next.members.iter().any(|m| m.key_id == *k))
+                .collect();
             async move {
+                // The envelope describes the offered roster, so a roster
+                // change reaches the head door rather than the envelope match.
+                let roster: Vec<String> = next.members.iter().map(|m| m.key_id.clone()).collect();
                 let mut env = d
                     .build_membership_change_envelope(
                         crate::federation::cohort::Cohort::Family,
                         accord,
-                        &ids,
+                        &roster,
                         true,
                         Some(&next.consensus_protocol),
                     )
@@ -498,11 +507,11 @@ pub(crate) mod bodies {
         assert!(reserved(&e), "{tag} I446: bound to another version: {e:?}");
         // A roster change is not a head move, however bound.
         let mut grown = next.clone();
-        grown.members.truncate(2);
+        grown.members[2].role = Some("member".to_owned());
         let bound = hash(&grown);
         let e = attempt(grown, Some(bound)).await.expect_err("roster");
         assert!(
-            reserved(&e) || matches!(e, Error::InvalidArgument(_)),
+            reserved(&e),
             "{tag} I446: a roster change through the head door: {e:?}"
         );
         assert_eq!(head(d, accord).await, held, "{tag} I446: nothing moved");
