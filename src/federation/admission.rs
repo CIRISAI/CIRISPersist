@@ -1253,9 +1253,10 @@ impl DimensionAdmissionPolicy {
     ///
     /// * `attn_type` — the wire-shape `attestation_type` token
     ///   (one of `"scores"` / `"delegates_to"` / `"supersedes"` /
-    ///   `"withdraws"` / `"recants"`). Structural primitives are
-    ///   exempt; only `"scores"` passes through the dimension
-    ///   tests.
+    ///   `"withdraws"` / `"recants"`). `"scores"` passes through the
+    ///   dimension tests; a composer does only when it carries a
+    ///   dimension (CC 2.4 ask 3, reported under v53's
+    ///   `row_type::ROW_TYPE_ENFORCEMENT`).
     /// * `dimension` — `attestation_envelope["dimension"]` as a
     ///   string. Pass `None` for structural primitives that have
     ///   no dimension. For `scores`, `None` is treated as an empty
@@ -1270,9 +1271,37 @@ impl DimensionAdmissionPolicy {
         dimension: Option<&str>,
         attesting_identity_type: &str,
     ) -> Result<(), Error> {
-        // Structural primitives exempt — see module docs §"Scope".
         if attn_type != attestation_type::SCORES {
-            return Ok(());
+            // v53.0.0 (CIRISPersist#975, CC 2.4 ask 3) — "the dimension gate
+            // follows the dimension, not the row type". A `dimension` on one of
+            // the four composers (the job label on a `delegates_to`) resolves
+            // exactly as on `scores`; a composer with NO dimension is untouched
+            // (a dimension is optional on them, required only on `scores`).
+            // Other types — a carrier, whose shape refuses a dimension, or an
+            // unregistered type the row-type gate reports — are not asked here.
+            //
+            // Under `row_type::ROW_TYPE_ENFORCEMENT = Report` (v53) a refusal is
+            // counted and logged, never returned: CC asks for a report of what
+            // this newly refuses on a production node before it is enforced.
+            use attestation_type::{DELEGATES_TO, RECANTS, SUPERSEDES, WITHDRAWS};
+            if !matches!(attn_type, DELEGATES_TO | SUPERSEDES | WITHDRAWS | RECANTS) {
+                return Ok(());
+            }
+            let Some(dim) = dimension.map(str::trim).filter(|d| !d.is_empty()) else {
+                return Ok(());
+            };
+            return match self.check_dimension(dim, attesting_identity_type) {
+                Ok(()) => Ok(()),
+                Err(e) => match crate::federation::row_type::enforcement() {
+                    crate::federation::row_type::RowTypeEnforcement::Enforce => Err(e),
+                    crate::federation::row_type::RowTypeEnforcement::Report => {
+                        crate::federation::row_type::record_composer_dimension_would_refuse(
+                            attn_type, dim, &e,
+                        );
+                        Ok(())
+                    }
+                },
+            };
         }
 
         let dim = dimension.unwrap_or("").trim();
@@ -1282,7 +1311,12 @@ impl DimensionAdmissionPolicy {
                 reason: DimensionRejectionReason::EmptyOrMissingDimension.as_str(),
             });
         }
+        self.check_dimension(dim, attesting_identity_type)
+    }
 
+    /// The dimension tests themselves, over a non-empty `dim` — shared by the
+    /// `scores` path and (CC 2.4 ask 3) a composer that carries a dimension.
+    fn check_dimension(&self, dim: &str, attesting_identity_type: &str) -> Result<(), Error> {
         // Layer 1 — the `accord:*` × `accord_holder` constitutional
         // rule. FSD-002 §4.1 + §7.1. Checked first because it
         // produces a distinct error variant downstream consumers
@@ -2059,6 +2093,10 @@ pub fn check_local_tier_eligibility(
              — got '{cohort_scope}'"
         )));
     }
+    // (0b) v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot at
+    // the local doors (all three backends call this). The carrier shape is a
+    // property of the row and is asked at the promotion door.
+    crate::federation::row_type::admit_local_row_type(attestation_type)?;
     // (1) capacity:* — never local (anti-Goodhart §7.5 / AV-62). The rule
     // itself lives in [`check_capacity_never_local`] so that `put_attestation`
     // — the OTHER door onto the local tier — asks the identical predicate
@@ -2598,6 +2636,9 @@ pub async fn check_promotion_admission(
     // Pure function of the row (no directory read, no crypto), and a REFUSAL,
     // so it leads with the other free arms.
     check_row_column_binding(row)?;
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot, beside the
+    // binding. Uncounted: the local door counted this row when it was written.
+    crate::federation::row_type::check_row_type(row)?;
 
     // AV-84 — a TARGETED cohort placement (`family` / `community`) is a
     // producer self-declaration or it is refused. Pure and free, so it leads
@@ -14858,6 +14899,30 @@ pub async fn check_reserved_prefix_admission(
         });
     }
 
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the same two subject-must-not-emit
+    // rules on the DIMENSION. CC registers `age_assurance:*` and
+    // `capacity_assurance:*` as dimension families, so their emitters move to
+    // `scores` + `dimension`, and `age.rs` / `capacity.rs` now read both shapes
+    // (`row_type::claim_token`). The witness-reserved half already rides the
+    // dimension (`DimensionAdmissionPolicy::check` layer 1b); without these two
+    // arms the scores shape would let a subject mint its own graduation.
+    if row.attesting_key_id == row.attested_key_id {
+        if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
+            if dim.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX) {
+                return Err(Error::CapacitySelfEmissionRejected {
+                    key_id: row.attesting_key_id.clone(),
+                    attestation_type: dim.to_owned(),
+                });
+            }
+            if dim.starts_with("age_assurance:") {
+                return Err(Error::AgeAssuranceSelfEmissionRejected {
+                    key_id: row.attesting_key_id.clone(),
+                    attestation_type: dim.to_owned(),
+                });
+            }
+        }
+    }
+
     // CC 3.4.11 (CIRISPersist#307) — the self-declared age rung carries a
     // `{band}`, NEVER a `{level}`; a `{level}` token belongs to the
     // witness `age_assurance:` rung. Age tokens travel as the
@@ -15020,11 +15085,27 @@ pub async fn check_reserved_prefix_admission(
     super::trust_root::check_accord_root_binding(row)?;
 
     // Which (if any) identity-gated reserved prefix does the TYPE carry?
+    //
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — for the two ASSURANCE ladders the
+    // rule follows the claim onto the dimension. Their readers now resolve the
+    // `scores` + `dimension` shape (`row_type::claim_token`), so that shape must
+    // meet the whole rule — the witness role AND the conferred
+    // `infra:attest:assurance` scope — not only the role layer 1b of
+    // `DimensionAdmissionPolicy::check` asks. No emitter in any repo writes the
+    // dimension shape yet, so nothing held is newly refused.
     let is_accord = at.starts_with("accord:");
     let is_hard_case = at.starts_with("hard_case:");
+    let rule_ns = (at == super::types::attestation_type::SCORES)
+        .then(|| envelope_dimension(&row.attestation_envelope))
+        .flatten()
+        .filter(|d| {
+            d.starts_with("age_assurance:")
+                || d.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX)
+        })
+        .unwrap_or(at);
     let matched_rule = default_reserved_prefix_rules()
         .into_iter()
-        .find(|r| at.starts_with(r.pattern_prefix.as_str()));
+        .find(|r| rule_ns.starts_with(r.pattern_prefix.as_str()));
     if !is_accord && !is_hard_case && matched_rule.is_none() {
         return Ok(()); // not a reserved type — no lookup needed.
     }
@@ -15139,7 +15220,7 @@ pub async fn check_reserved_prefix_admission(
         if let Some(scope) = rule.required_delegation_scope.as_deref() {
             let Some(node) = directory.node_key_id() else {
                 return Err(Error::ReservedPrefixEmitterMismatch {
-                    dimension: at.to_owned(),
+                    dimension: rule_ns.to_owned(),
                     prefix: rule.pattern_prefix.clone(),
                     required: vec![format!(
                         "delegated scope {scope} — but this directory has no node identity,                          so conferral cannot be verified. Call set_node_key_id()."
@@ -15156,7 +15237,7 @@ pub async fn check_reserved_prefix_admission(
             .await?;
             if conferred.is_none() {
                 return Err(Error::ReservedPrefixEmitterMismatch {
-                    dimension: at.to_owned(),
+                    dimension: rule_ns.to_owned(),
                     prefix: rule.pattern_prefix.clone(),
                     required: vec![format!(
                         "delegated scope {scope} from a root this node trusts"
@@ -15173,7 +15254,7 @@ pub async fn check_reserved_prefix_admission(
             let mut required = rule.required_identity_types.clone();
             required.sort();
             return Err(Error::ReservedPrefixEmitterMismatch {
-                dimension: at.to_owned(),
+                dimension: rule_ns.to_owned(),
                 prefix: rule.pattern_prefix.clone(),
                 required,
                 got_identity_type: got,

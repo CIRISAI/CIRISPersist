@@ -3221,6 +3221,16 @@ impl FederationDirectory for OpsDirectory {
 
     // ── uncovered REQUIRED methods: no DirectoryOp → Unsupported ────
 
+    // v53.0.0 (CIRISPersist#975) — the row-type census is a local report
+    // door; no DirectoryOp carries it.
+    async fn attestation_type_census(
+        &self,
+    ) -> Result<Vec<crate::federation::row_type::AttestationTypeCount>, Error> {
+        Err(Error::Unsupported {
+            method: "attestation_type_census",
+        })
+    }
+
     async fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>, Error> {
         Err(Error::Unsupported {
             method: "lookup_keys_for_identity",

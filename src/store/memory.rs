@@ -3581,6 +3581,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // and promoting), and backend-symmetric across memory / sqlite /
         // postgres.
         crate::federation::admission::check_row_column_binding(&row)?;
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — THE CLOSED ROW-TYPE SLOT, beside
+        // the binding that makes the type a signed fact. The five + registered
+        // carriers; a carrier of the wrong shape refused; an unregistered type
+        // reported (refused once `row_type::ROW_TYPE_ENFORCEMENT` flips). Pure
+        // ⇒ AV-76 TIER 1, backend-symmetric.
+        crate::federation::row_type::admit_row_type(&row)?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate VALUE validation. Rejects out-of-closed-set values
@@ -4435,6 +4441,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .iter()
                 .filter(|r| {
                     r.tier == crate::federation::types::attestation_tier::FEDERATION
+                        // v53.0.0 (#975) — the replicable set excludes an
+                        // unregistered type under enforcement.
+                        && crate::federation::row_type::served_under_enforcement(r)
                         && subject_key_id
                             .is_none_or(|subj| r.subject_key_ids.iter().any(|s| s == subj))
                 })
@@ -9595,6 +9604,31 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn attestation_type_census(
+        &self,
+    ) -> Result<Vec<crate::federation::row_type::AttestationTypeCount>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut by: std::collections::BTreeMap<
+            String,
+            crate::federation::row_type::AttestationTypeCount,
+        > = std::collections::BTreeMap::new();
+        for a in &state.federation_attestations {
+            let e = by.entry(a.attestation_type.clone()).or_insert_with(|| {
+                crate::federation::row_type::AttestationTypeCount {
+                    attestation_type: a.attestation_type.clone(),
+                    count: 0,
+                    oldest: a.asserted_at,
+                    newest: a.asserted_at,
+                }
+            });
+            e.count += 1;
+            e.oldest = e.oldest.min(a.asserted_at);
+            e.newest = e.newest.max(a.asserted_at);
+        }
+        Ok(by.into_values().collect())
+    }
+
     async fn list_attestations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -9621,6 +9655,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .iter()
             .filter(|a| {
                 a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    // v53.0.0 (#975, CC 2.4) — under enforcement a held row of
+                    // an unregistered type is neither served nor replicated.
+                    && crate::federation::row_type::served_under_enforcement(a)
                     && since.as_ref().is_none_or(|(s_at, s_id)| {
                         (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
                     })

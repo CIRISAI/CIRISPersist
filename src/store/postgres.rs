@@ -5937,6 +5937,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // and promoting), and backend-symmetric across memory / sqlite /
         // postgres.
         crate::federation::admission::check_row_column_binding(&row)?;
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — THE CLOSED ROW-TYPE SLOT, beside
+        // the binding that makes the type a signed fact. The five + registered
+        // carriers; a carrier of the wrong shape refused; an unregistered type
+        // reported (refused once `row_type::ROW_TYPE_ENFORCEMENT` flips). Pure
+        // ⇒ AV-76 TIER 1, backend-symmetric.
+        crate::federation::row_type::admit_row_type(&row)?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
@@ -12967,6 +12973,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    async fn attestation_type_census(
+        &self,
+    ) -> Result<Vec<crate::federation::row_type::AttestationTypeCount>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT attestation_type, COUNT(*)::int8, MIN(asserted_at), MAX(asserted_at) \
+                   FROM cirislens.federation_attestations GROUP BY attestation_type \
+                  ORDER BY attestation_type",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attestation_type_census: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|r| {
+                let count: i64 = r.try_get(1).map_err(|e| {
+                    crate::federation::Error::Backend(format!("attestation_type_census: {e}"))
+                })?;
+                let get =
+                    |i: usize| -> Result<chrono::DateTime<chrono::Utc>, crate::federation::Error> {
+                        r.try_get(i).map_err(|e| {
+                            crate::federation::Error::Backend(format!(
+                                "attestation_type_census: {e}"
+                            ))
+                        })
+                    };
+                Ok(crate::federation::row_type::AttestationTypeCount {
+                    attestation_type: r.try_get(0).map_err(|e| {
+                        crate::federation::Error::Backend(format!("attestation_type_census: {e}"))
+                    })?,
+                    count: u64::try_from(count).unwrap_or(0),
+                    oldest: get(2)?,
+                    newest: get(3)?,
+                })
+            })
+            .collect()
+    }
+
     async fn list_attestations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -12981,19 +13031,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let since_id = since.as_ref().map(|(_, id)| id.clone());
         // E5 invariant: `tier = 'federation'` only — a local-tier row must
         // never reach the advertise/serve wire surface.
+        //
+        // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
+        // unregistered type is neither served nor replicated.
+        let row_type_filter = crate::federation::row_type::serve_filter_sql(
+            "attestation_type",
+            crate::federation::row_type::SqlDialect::Postgres,
+        )
+        .map(|p| format!(" AND {p}"))
+        .unwrap_or_default();
         let rows = client
             .query(
-                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
-                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
-                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
-                    additional_scrubs, admitted_at \
-                 FROM cirislens.federation_attestations \
-                 WHERE ($1::timestamptz IS NULL OR \
-                        (admitted_at, attestation_id::text) > ($1, $2)) \
-                   AND tier = 'federation' \
-                 ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3",
+                &format!(
+                    "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                        attestation_type, \
+                        weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                        promoted_at, additional_scrubs, admitted_at \
+                     FROM cirislens.federation_attestations \
+                     WHERE ($1::timestamptz IS NULL OR \
+                            (admitted_at, attestation_id::text) > ($1, $2)) \
+                       AND tier = 'federation'{row_type_filter} \
+                     ORDER BY admitted_at ASC, attestation_id ASC LIMIT $3"
+                ),
                 &[&since_at, &since_id, &limit],
             )
             .await
@@ -13618,6 +13680,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // federation-tier (the replicable set) only, byte-faithful rows.
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         let mut where_parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
+        // v53.0.0 (#975) — the replicable set excludes an unregistered type
+        // under enforcement.
+        where_parts.extend(crate::federation::row_type::serve_filter_sql(
+            "fa.attestation_type",
+            crate::federation::row_type::SqlDialect::Postgres,
+        ));
         let from = if let Some(subj) = subject_key_id {
             params.push(Box::new(subj.to_string()));
             where_parts.push(format!("s.subject_key_id = ${}", params.len()));

@@ -8546,6 +8546,18 @@ impl Engine {
         crate::federation::age::age_band(&*self.federation_directory(), key_id).await
     }
 
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — what the closed row-type
+    /// slot sees on this node: held rows of an unregistered `attestation_type`
+    /// (by exact type, never deleted), and since process start the unregistered
+    /// admissions and composer dimensions the gate reported rather than
+    /// refused. See [`crate::federation::row_type::row_type_report`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn row_type_report(
+        &self,
+    ) -> Result<crate::federation::row_type::RowTypeReport, crate::federation::Error> {
+        crate::federation::row_type::row_type_report(&*self.federation_directory()).await
+    }
+
     // ── #249 Cut B ── CEG-native graph DX enumerators + community-roster
     //    grow, surfaced as Engine convenience wrappers over the
     //    `federation_directory()` reader + the admission free functions.

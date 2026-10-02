@@ -5,8 +5,9 @@
 //! for `financial` decisions yet `capacitated` for `medical` ones, so every
 //! attestation is qualified by a `{domain}` (CC 3.4.12).
 //!
-//! Tokens travel as the **`attestation_type`** string (like age; NOT the
-//! `scores` envelope `dimension`):
+//! Tokens travel as the `dimension` of a `scores` row (CC 2.4), or — for rows
+//! written before v53.0.0 (CIRISPersist#975) — as the **`attestation_type`**
+//! string itself; both resolve identically ([`super::row_type::claim_token`]):
 //!
 //! - `capacity_assurance:{level}:{domain}:{band}:v1` — the witness verdict.
 //!   `level ∈ {provider, panel, government}` (ascending confidence; `panel`
@@ -347,7 +348,12 @@ pub async fn capacity_state(
                 continue; // lapsed — confers nothing.
             }
         }
-        if let Some(band) = token_is_for_domain(&r.attestation_type, d) {
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — both shapes (`scores` +
+        // `dimension`, and the legacy type slot); see `row_type::claim_token`.
+        let Some(at) = super::row_type::claim_token(&r) else {
+            continue;
+        };
+        if let Some(band) = token_is_for_domain(at, d) {
             return Ok(match band {
                 capacity_band::INCAPACITATED => CapacityState::Incapacitated,
                 _ => CapacityState::Capacitated,
@@ -393,7 +399,10 @@ pub async fn incapacity_facts(
                 continue;
             }
         }
-        let at = r.attestation_type.as_str();
+        // v53.0.0 (CIRISPersist#975) — both shapes; see `row_type::claim_token`.
+        let Some(at) = super::row_type::claim_token(&r) else {
+            continue;
+        };
         if let Some(t) = parse_capacity_token(at) {
             if t.band == capacity_band::INCAPACITATED {
                 facts.incapacitated_domains.insert(t.domain.to_owned());
