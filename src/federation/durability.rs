@@ -22,6 +22,9 @@
 //! - **the target**, [`durability_mode`]: below the §R-policy feasibility
 //!   floor `C₁ = N + K` every audience node holds the full blob; at or above
 //!   it the fountain tuple applies.
+//! - **the deficit**, [`durability_deficit`]: the audience nodes with a live
+//!   `here` custody report (CIRISPersist#942's fold, never re-derived) and the
+//!   rest.
 //!
 //! **Consent is supreme** (CC 6.1.5.3 "What is unchanged"): the audience is
 //! the claimed nodes under their owners' allow lists, so a node a cohort is
@@ -136,6 +139,151 @@ where
             None => Ok(ContentAudience::Unresolvable),
         },
     }
+}
+
+/// The deficit's audience, as far as it can be enumerated.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "nodes")]
+pub enum DeficitAudience {
+    /// Exactly these claimed nodes.
+    Nodes(Vec<String>),
+    /// The commons or a public group: every peer, so no deficit is
+    /// enumerable here (the §R-policy tuple governs).
+    Everyone,
+    /// The row's provenance names no group its scope needs: nothing is a
+    /// target, and nothing is reported missing.
+    Unresolvable,
+}
+
+/// **The durability deficit of one blob** (CC 6.1.5.3): its audience, the
+/// audience nodes with a LIVE `here` custody report, and the rest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DurabilityDeficit {
+    /// Lowercase hex of the at-rest sha256.
+    pub sha256_hex: String,
+    /// The content's audience.
+    pub audience: DeficitAudience,
+    /// Audience nodes whose custody verdict is `here` (S2's fold: a live
+    /// report, 72 h at the reader's clock). Sorted.
+    pub live_here: Vec<String>,
+    /// Audience nodes that are not `here`: `received`, `none`, `unknown`, or a
+    /// lapsed report. Sorted. A node outside the audience is never listed.
+    pub missing: Vec<String>,
+    /// Full-blob or tuple placement for this audience (`None` when the
+    /// audience is not enumerable).
+    pub mode: Option<DurabilityMode>,
+}
+
+/// **The durability deficit of `at_rest_sha256`** for `viewer_key_id`,
+/// authorized exactly as the custody view (a stranger is `NotGranted` and
+/// learns nothing). The audience is [`content_audience`] over the row's own
+/// provenance; each audience node's verdict is S2's per-device fold
+/// ([`custody_view`](super::custody_ack::custody_view) for the devices it
+/// names, [`device_custody_of`](super::custody_ack::device_custody_of) for an
+/// audience node it does not), at `now`. `stream_id` adds that stream's
+/// delivery receipts, which read `received` — still missing: a receipt is not
+/// a copy. Consent is supreme: a `here` from a node outside the audience is
+/// not counted, and no node outside it is ever listed.
+///
+/// **What `here` asserts for a chunk DAG:** a report persist's engine files
+/// for its own node means the manifest AND every chunk are held there
+/// ([`custody_ack_input_for`](super::custody_ack::custody_ack_input_for)). A
+/// report signed by another implementation asserts what that signer checked.
+pub async fn durability_deficit<B>(
+    backend: &B,
+    at_rest_sha256: &[u8; 32],
+    viewer_key_id: &str,
+    stream_id: Option<&str>,
+    n_plus_k: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<DurabilityDeficit, super::BlobError>
+where
+    B: super::BlobStorage + FederationDirectory + Sync,
+{
+    use super::custody_ack::{custody_view, CustodyVerdict};
+    use super::BlobError;
+    let view = custody_view(backend, at_rest_sha256, viewer_key_id, stream_id, now).await?;
+    let prov = backend
+        .blob_provenance(at_rest_sha256)
+        .await?
+        .ok_or_else(|| BlobError::NotHeld {
+            sha256_hex: hex::encode(at_rest_sha256),
+        })?;
+    let audience = content_audience(
+        backend,
+        &prov.cohort_scope,
+        prov.author_key_id.as_deref(),
+        prov.community_key_id.as_deref(),
+    )
+    .await
+    .map_err(|e| BlobError::Backend(format!("durability deficit: audience: {e}")))?;
+    let known: std::collections::BTreeMap<String, CustodyVerdict> = view
+        .devices
+        .iter()
+        .map(|d| (d.device_key_id.clone(), d.state))
+        .collect();
+    deficit_over(backend, &view.sha256_hex, audience, &known, n_plus_k, now)
+        .await
+        .map_err(|e| BlobError::Backend(format!("durability deficit: {e}")))
+}
+
+/// **The deficit over a resolved audience** — the directory-only core of
+/// [`durability_deficit`]. `known` holds verdicts already folded for this blob
+/// (the custody view's, with its receipts); every other audience node is
+/// folded here by [`device_custody_of`](super::custody_ack::device_custody_of)
+/// with no receipt. Only a `here` verdict is a copy.
+pub async fn deficit_over<D>(
+    dir: &D,
+    sha256_hex: &str,
+    audience: ContentAudience,
+    known: &std::collections::BTreeMap<String, super::custody_ack::CustodyVerdict>,
+    n_plus_k: usize,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<DurabilityDeficit, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use super::custody_ack::{device_custody_of, CustodyVerdict};
+    let nodes = match audience {
+        ContentAudience::Everyone | ContentAudience::Unresolvable => {
+            return Ok(DurabilityDeficit {
+                sha256_hex: sha256_hex.to_owned(),
+                audience: if audience == ContentAudience::Everyone {
+                    DeficitAudience::Everyone
+                } else {
+                    DeficitAudience::Unresolvable
+                },
+                live_here: Vec::new(),
+                missing: Vec::new(),
+                mode: None,
+            })
+        }
+        ContentAudience::Nodes(n) => n,
+    };
+    let mut live_here = Vec::new();
+    let mut missing = Vec::new();
+    for node in &nodes {
+        let verdict = match known.get(node) {
+            Some(v) => *v,
+            None => {
+                device_custody_of(dir, node, sha256_hex, None, now)
+                    .await?
+                    .state
+            }
+        };
+        if verdict == CustodyVerdict::Here {
+            live_here.push(node.clone());
+        } else {
+            missing.push(node.clone());
+        }
+    }
+    Ok(DurabilityDeficit {
+        sha256_hex: sha256_hex.to_owned(),
+        mode: Some(durability_mode(nodes.len(), n_plus_k)),
+        audience: DeficitAudience::Nodes(nodes.into_iter().collect()),
+        live_here,
+        missing,
+    })
 }
 
 #[cfg(test)]

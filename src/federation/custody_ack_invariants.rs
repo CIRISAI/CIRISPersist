@@ -43,7 +43,7 @@ pub(crate) mod bodies {
 
     /// A fixed, millisecond-aligned base instant in the recent past, so every
     /// signed instant below is behind the receiving node's clock.
-    fn base() -> DateTime<Utc> {
+    pub(crate) fn base() -> DateTime<Utc> {
         let t = Utc::now() - Duration::days(10);
         DateTime::<Utc>::from_timestamp_millis(t.timestamp_millis()).expect("ms")
     }
@@ -73,7 +73,20 @@ pub(crate) mod bodies {
             .map(|e| e.attestation_id)
     }
 
-    async fn report(
+    /// [`report`], returning the door's answer instead of insisting on it.
+    pub(crate) async fn try_report(
+        d: &dyn FederationDirectory,
+        device: &str,
+        sha: &[u8; 32],
+        state: CustodyState,
+        at: DateTime<Utc>,
+    ) -> Result<String, Error> {
+        let size = (state == CustodyState::Here).then_some(4096);
+        let env = custody_ack_envelope(sha, state, size, cs::SELF, None).expect("envelope");
+        emit(d, device, None, env, cs::SELF, at).await
+    }
+
+    pub(crate) async fn report(
         d: &dyn FederationDirectory,
         device: &str,
         sha: &[u8; 32],
@@ -90,7 +103,38 @@ pub(crate) mod bodies {
     /// A device: the key the test signer for `dev-{tag}` derives, registered
     /// with that signer's pubkeys. `identity_type` is `user` so the device can
     /// sit on a community roster without a steward (the fixture's seat rule).
-    async fn device(d: &dyn FederationDirectory, tag: &str) -> String {
+    pub(crate) async fn device(d: &dyn FederationDirectory, tag: &str) -> String {
+        let k = device_as(d, tag, it::USER).await;
+        // v53.0.0 (#963, CC 6.1.5.3) — a device is a CLAIMED device: since S1
+        // a key no owner has claimed is in no `self` cohort (an unclaimed key
+        // is no one's device), so a report it places at `self` would be
+        // refused `custody_ack_outside_cohort`. The device is its owner's
+        // personal laptop here, which is what these witnesses are about.
+        let owner = format!("{k}-owner");
+        ts::register_hybrid_key_as(d, &owner, &owner, it::USER).await;
+        d.put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
+            identity_key_id: owner.clone(),
+            occurrence_key_id: k.clone(),
+            device_class: crate::federation::types::device_class::LAPTOP.to_owned(),
+            hardware_attestation: None,
+            asserted_at: Utc::now() - Duration::days(30),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("claim {owner} → {k}: {e}"));
+        k
+    }
+
+    /// [`device`], registered as `identity_type` (a claimed NODE, for the
+    /// durability witnesses whose devices sit in an owner's audience).
+    pub(crate) async fn device_as(
+        d: &dyn FederationDirectory,
+        tag: &str,
+        identity_type: &str,
+    ) -> String {
         // The test signer seeds from an id's FIRST 32 BYTES, and the derived id
         // normalizes `_` to `-`: so the alias is already normalized (the
         // derived id then shares its first 32 bytes, and a fixture signing as
@@ -107,7 +151,7 @@ pub(crate) mod bodies {
             &alias.as_bytes()[..32],
             "seed-sharing derived id"
         );
-        ts::register_hybrid_key_as(d, &k, &alias, it::USER).await;
+        ts::register_hybrid_key_as(d, &k, &alias, identity_type).await;
         ALIASES.with(|m| m.borrow_mut().insert(k.clone(), alias));
         k
     }
@@ -339,9 +383,9 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let a = device(d, &format!("{tag}--a")).await;
-        let b = device(d, &format!("{tag}--b")).await;
-        let outsider = device(d, &format!("{tag}--o")).await;
+        let a = device_as(d, &format!("{tag}--a"), it::USER).await;
+        let b = device_as(d, &format!("{tag}--b"), it::USER).await;
+        let outsider = device_as(d, &format!("{tag}--o"), it::USER).await;
         let community = format!("cust-comm-{tag}");
         ts::seed_two_member_community(d, &community, &a, &b).await;
         let sha = blob(tag);
@@ -472,9 +516,9 @@ pub(crate) mod bodies {
         tag: &str,
     ) {
         use crate::federation::replication::hold::is_audience;
-        let a = device(d, &format!("{tag}--a")).await;
-        let b = device(d, &format!("{tag}--b")).await;
-        let outsider = device(d, &format!("{tag}--o")).await;
+        let a = device_as(d, &format!("{tag}--a"), it::USER).await;
+        let b = device_as(d, &format!("{tag}--b"), it::USER).await;
+        let outsider = device_as(d, &format!("{tag}--o"), it::USER).await;
         let community = format!("cust-aud-{tag}");
         ts::seed_two_member_community(d, &community, &a, &b).await;
         let sha = blob(tag);
@@ -503,13 +547,16 @@ pub(crate) mod bodies {
             "I408 the other member is in the audience"
         );
         assert!(!audience(outsider.clone()).await, "I408 an outsider is not");
+        // the self leg: a CLAIMED device (since S1 an unclaimed key is in no
+        // self cohort, so `a` — a bare room member — could not place one)
+        let c = device(d, &format!("{tag}--c")).await;
         let self_env =
             custody_ack_envelope(&sha, CustodyState::None, None, cs::SELF, None).unwrap();
-        emit(d, &a, None, self_env, cs::SELF, base())
+        emit(d, &c, None, self_env, cs::SELF, base())
             .await
             .expect("I408 self admitted");
         assert!(
-            !is_audience(d, cs::SELF, None, &a, |_| false, &outsider)
+            !is_audience(d, cs::SELF, None, &c, |_| false, &outsider)
                 .await
                 .unwrap(),
             "I408 a self report never reaches a node that is not the device's own"

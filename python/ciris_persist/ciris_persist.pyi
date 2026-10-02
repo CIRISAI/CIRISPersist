@@ -2218,6 +2218,9 @@ class Engine:
     def disk_pressure_state(self) -> dict[str, Any]:
         """(derived) epistemic — v6.8.0 (CIRISPersist#149) — live disk-pressure snapshot for monitoring. Re-polls the (injectable) free-bytes source, returns a dict: {free_bytes, t..."""
 
+    def durability_deficit_json(self, at_rest_sha256_hex: str, viewer_key_id: str, stream_id: str | None = None) -> str:
+        """(derived) epistemic — v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — the durability deficit of one blob for viewer_key_id as JSON: {sha256_hex, audience: {kind: nodes|everyone..."""
+
     def get_repository_statistics(self, filter_json: str, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) epistemic — Corpus-shape rollup for a window — distinct trace counts by task_class, QA language / question_num, agent name / version, primary model, deployment..."""
 

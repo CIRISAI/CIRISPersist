@@ -14423,6 +14423,69 @@ impl PyEngine {
         })
     }
 
+    /// v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — **the durability deficit** of
+    /// one blob for `viewer_key_id` as JSON: `{sha256_hex, audience: {kind:
+    /// nodes|everyone|unresolvable, nodes?}, live_here: [node], missing:
+    /// [node], mode: full|tuple|null}`. `missing` is the audience minus the
+    /// nodes with a live `here` report (72 h); a node outside the audience is
+    /// never listed. Authorized like `custody_view_json`.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, stream_id=None))]
+    fn durability_deficit_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        stream_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::durability::{
+                    durability_deficit, DEFAULT_FEASIBILITY_FLOOR,
+                };
+                let now = chrono::Utc::now();
+                let deficit = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            durability_deficit(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                stream_id.as_deref(),
+                                DEFAULT_FEASIBILITY_FLOOR,
+                                now,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            durability_deficit(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                stream_id.as_deref(),
+                                DEFAULT_FEASIBILITY_FLOOR,
+                                now,
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                serde_json::to_string(&deficit)
+                    .map_err(|e| PyRuntimeError::new_err(format!("deficit encode: {e}")))
+            })
+        })
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — **seal a descriptor
     /// under an existing blob's DEK** as `key_id`: `plaintext_b64` (the JCS
     /// `{name, format, codec?}`, ≤ the descriptor cap) → the base64 at-rest

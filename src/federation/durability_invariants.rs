@@ -15,14 +15,22 @@
 //! - **I419** (from disk) the `FountainContent` arm of `projection_for` names
 //!   no `SelfOwn` — the source, comments stripped.
 //!
-//! I415 / I416 (the deficit read) sit on the custody fold and are witnessed
-//! with it.
+//! - **I415** the deficit is the audience without a live `here` (S2's fold):
+//!   a `none` and a silent node are missing; a node outside the audience is
+//!   never listed, its `here` never a copy.
+//! - **I416** a lapsed `here` (72 h + 1 s) is missing; exactly 72 h is a copy;
+//!   a `received` verdict is missing.
+//! - **I415b** (sqlite, postgres; the engine) a node holding a DAG's manifest
+//!   but missing one chunk cannot file `here`, and the deficit lists it; with
+//!   every chunk held it can, and the deficit counts it.
 
 #[cfg(test)]
 pub(crate) mod bodies {
+    use crate::federation::custody_ack::{CustodyState, CustodyVerdict};
+    use crate::federation::custody_ack_invariants::bodies as cust;
     use crate::federation::durability::{
-        content_audience, durability_mode, ContentAudience, DurabilityMode,
-        DEFAULT_FEASIBILITY_FLOOR,
+        content_audience, deficit_over, durability_mode, ContentAudience, DeficitAudience,
+        DurabilityDeficit, DurabilityMode, DEFAULT_FEASIBILITY_FLOOR,
     };
     use crate::federation::namespace::{
         projection_for, resolve_projection_recipients, AuthorityClass, Plane, Projection,
@@ -296,6 +304,155 @@ pub(crate) mod bodies {
         let (judged, may) = advertisable(d, FAMILY, &fam, &owner).await;
         assert!(judged && !may, "I418 a person key is not an audience node");
     }
+
+    /// The deficit of a `self` blob of `owner` at `now`, over S2's fold.
+    async fn deficit(
+        d: &dyn FederationDirectory,
+        owner: &str,
+        sha: &[u8; 32],
+        known: &std::collections::BTreeMap<String, CustodyVerdict>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DurabilityDeficit {
+        let aud = content_audience(d, SELF, Some(owner), None).await.unwrap();
+        deficit_over(
+            d,
+            &hex::encode(sha),
+            aud,
+            known,
+            DEFAULT_FEASIBILITY_FLOOR,
+            now,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// **I415** — the deficit lists exactly the audience nodes with no live
+    /// `here`: a `none`, no report at all, and never a node outside the
+    /// audience (a server-class node's live `here` is not a copy here).
+    pub(crate) async fn i415_the_deficit_is_the_audience_without_a_live_here(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use chrono::Duration;
+        let owner = format!("i415-o-{s}");
+        users(d, &[&owner]).await;
+        let here = cust::device_as(
+            d,
+            &format!("i415-the-deficit-{s}--h"),
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let gone = cust::device_as(
+            d,
+            &format!("i415-the-deficit-{s}--n"),
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let silent = cust::device_as(
+            d,
+            &format!("i415-the-deficit-{s}--u"),
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        let server = cust::device_as(
+            d,
+            &format!("i415-the-deficit-{s}--s"),
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        for k in [&here, &gone, &silent] {
+            claim(d, &owner, k, device_class::LAPTOP).await;
+        }
+        claim(d, &owner, &server, device_class::SERVER).await;
+        let sha = {
+            use sha2::Digest as _;
+            let h: [u8; 32] = sha2::Sha256::digest(format!("i415-blob-{s}")).into();
+            h
+        };
+        let t0 = cust::base();
+        cust::report(d, &here, &sha, CustodyState::Here, t0).await;
+        cust::report(d, &gone, &sha, CustodyState::None, t0).await;
+        // a server-class node is not in its owner's self cohort, so it cannot
+        // even place a self report: the audience and the report door agree
+        let r = cust::try_report(d, &server, &sha, CustodyState::Here, t0).await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_outside_cohort")),
+            "I415 a server-class node's self report is refused: {r:?}"
+        );
+        let now = t0 + Duration::hours(1);
+        let v = deficit(d, &owner, &sha, &Default::default(), now).await;
+        assert_eq!(
+            v.audience,
+            DeficitAudience::Nodes(sorted(vec![here.clone(), gone.clone(), silent.clone()])),
+            "I415 the audience is the owner's personal nodes only"
+        );
+        assert_eq!(v.live_here, vec![here.clone()], "I415 one live copy");
+        assert_eq!(
+            v.missing,
+            sorted(vec![gone.clone(), silent.clone()]),
+            "I415 a `none` and a silent node are missing; the server node is not listed"
+        );
+        assert_eq!(v.mode, Some(DurabilityMode::Full), "I415 3 < N + K");
+    }
+
+    /// **I416** — a lapsed `here` is missing (72 h at the reader's clock, both
+    /// sides of the boundary), and so is a device whose verdict is `received`.
+    pub(crate) async fn i416_an_expired_here_is_missing(d: &dyn FederationDirectory, s: &str) {
+        use chrono::Duration;
+        let owner = format!("i416-o-{s}");
+        users(d, &[&owner]).await;
+        let dev = cust::device_as(
+            d,
+            &format!("i416-the-deficit-{s}--h"),
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        claim(d, &owner, &dev, device_class::PHONE).await;
+        let sha = {
+            use sha2::Digest as _;
+            let h: [u8; 32] = sha2::Sha256::digest(format!("i416-blob-{s}")).into();
+            h
+        };
+        let t0 = cust::base();
+        cust::report(d, &dev, &sha, CustodyState::Here, t0).await;
+        let at_72h = deficit(
+            d,
+            &owner,
+            &sha,
+            &Default::default(),
+            t0 + Duration::hours(72),
+        )
+        .await;
+        assert_eq!(
+            at_72h.live_here,
+            vec![dev.clone()],
+            "I416 exactly 72 h old is still a copy"
+        );
+        let after = deficit(
+            d,
+            &owner,
+            &sha,
+            &Default::default(),
+            t0 + Duration::hours(72) + Duration::seconds(1),
+        )
+        .await;
+        assert!(after.live_here.is_empty(), "I416 lapsed: {after:?}");
+        assert_eq!(after.missing, vec![dev.clone()], "I416 lapsed is missing");
+        // a delivery receipt the custody view folded (`received`) is not a copy
+        let known = std::collections::BTreeMap::from([(dev.clone(), CustodyVerdict::Received)]);
+        let rec = deficit(d, &owner, &sha, &known, t0 + Duration::hours(1)).await;
+        assert_eq!(
+            rec.missing,
+            vec![dev.clone()],
+            "I416 `received` is missing, and the view's verdict is the one used"
+        );
+    }
 }
 
 /// **I419** — from disk: the `FountainContent` arm of `projection_for`
@@ -371,6 +528,8 @@ mod runners {
                 case!(i412_a_denied_node_gets_nothing);
                 case!(i413_i414_small_audience_boundary);
                 case!(i417_i418_holdings_stay_in_the_cohort);
+                case!(i415_the_deficit_is_the_audience_without_a_live_here);
+                case!(i416_an_expired_here_is_missing);
             }
         };
     }
