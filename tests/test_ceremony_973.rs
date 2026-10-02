@@ -526,3 +526,363 @@ async fn i355_refused_community_asset_boots_absent() {
         }
     ));
 }
+
+// ── v53.0.0 — the production assembler (genesis::ceremony), I420–I427 ──
+
+use ciris_persist::federation::genesis::ceremony::{
+    CeremonyError, CeremonyState, Partial, AUTHZ_ITEM_ID,
+};
+
+/// A planned ceremony over the software holders, and the holders to sign with.
+fn planned(
+    produced_at: chrono::DateTime<chrono::Utc>,
+) -> (
+    CeremonyState,
+    Vec<ciris_persist::federation::accord_test_support::Identity>,
+) {
+    let (_, holders, inputs) =
+        test_ceremony_inputs(&SEEDS, &NODE_SEED, produced_at, None).expect("inputs");
+    (CeremonyState::plan(inputs).expect("plan"), holders)
+}
+
+fn partial(
+    h: &ciris_persist::federation::accord_test_support::Identity,
+    item: &str,
+    bytes: &[u8],
+) -> Partial {
+    let (classical, pqc) = h.sign_bytes(bytes);
+    Partial {
+        item: item.to_owned(),
+        holder_key_id: h.key_id.clone(),
+        signature_classical: classical,
+        signature_pqc: pqc,
+    }
+}
+
+/// **I420 — the plan refuses inputs that cannot form a ceremony, and a state
+/// survives serialization with the same items, byte for byte.**
+#[test]
+fn i420_plan_refuses_and_state_round_trips() {
+    let at = at(-5);
+    let (_, _, inputs) = test_ceremony_inputs(&SEEDS, &NODE_SEED, at, None).unwrap();
+    let refused =
+        |mutate: &dyn Fn(&mut ciris_persist::federation::genesis::ceremony::CeremonyInputs)| {
+            let mut i = inputs.clone();
+            mutate(&mut i);
+            match CeremonyState::plan(i) {
+                Err(CeremonyError::InvalidInputs(d)) => d,
+                other => panic!("I420: expected InvalidInputs, got {other:?}"),
+            }
+        };
+    // a holder without a recovery key (CC 4.2.6)
+    let d = refused(&|i| {
+        i.recovery_keys.pop_first();
+    });
+    assert!(d.contains("recovery key"), "{d}");
+    // a recovery key that is a holder signing key
+    let d = refused(&|i| {
+        let h = i.holders[1].record.key_id.clone();
+        let first = i.recovery_keys.keys().next().unwrap().clone();
+        i.recovery_keys.get_mut(&first).unwrap().key_id = h;
+    });
+    assert!(d.contains("held apart"), "{d}");
+    // one recovery key shared by two holders
+    let d = refused(&|i| {
+        let mut keys = i.recovery_keys.values().cloned();
+        let shared = keys.next().unwrap();
+        for v in i.recovery_keys.values_mut() {
+            *v = shared.clone();
+        }
+    });
+    assert!(d.contains("shared"), "{d}");
+    // a holder listed twice, no serve node, no successors
+    assert!(refused(&|i| {
+        let dup = i.holders[0].clone();
+        i.holders.push(dup);
+    })
+    .contains("twice"));
+    assert!(refused(&|i| i.serve_nodes.clear()).contains("serve node"));
+    assert!(refused(&|i| i.successor_keys.clear()).contains("successor"));
+    // a holder record without its ML-DSA half cannot be committed to
+    assert!(refused(&|i| i.holders[2].record.pubkey_ml_dsa_65_base64 = None).contains("ML-DSA"));
+
+    let (state, _) = planned(at);
+    let back = CeremonyState::from_json(&state.to_json().unwrap()).unwrap();
+    assert_eq!(back, state, "I420: the state round-trips");
+    assert_eq!(
+        back.items().unwrap(),
+        state.items().unwrap(),
+        "I420: same bytes"
+    );
+    let mut v: serde_json::Value = serde_json::from_str(&state.to_json().unwrap()).unwrap();
+    v["version"] = serde_json::json!(99);
+    assert!(matches!(
+        CeremonyState::from_json(&v.to_string()),
+        Err(CeremonyError::StateVersion(99))
+    ));
+    // every item, every holder owed, in item order, authorization last
+    let ids: Vec<String> = state.items().unwrap().into_iter().map(|i| i.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            format!("record:{TEST_CEREMONY_NODE_KEY_ID}"),
+            "row:genesis-charter".to_owned(),
+            format!("row:genesis-grant:{TEST_CEREMONY_NODE_KEY_ID}"),
+            "row:genesis-lifecycle".to_owned(),
+            "family:humanity-accord".to_owned(),
+            format!("community:{CANON}"),
+            AUTHZ_ITEM_ID.to_owned(),
+        ],
+        "I420: the items"
+    );
+}
+
+/// **I421 — partials arriving in any order, across serialized states, form
+/// the bundle the minter forms, byte for byte.**
+#[test]
+fn i421_any_order_across_requests_is_byte_identical() {
+    let at = at(-5);
+    let minted = mint_test_ceremony(&SEEDS, &NODE_SEED, at).unwrap();
+    let (mut state, holders) = planned(at);
+    let items = state.items().unwrap();
+    // last holder first, last item first, a serialize/parse between every one
+    for h in holders.iter().rev() {
+        for item in items.iter().rev() {
+            let json = state.to_json().unwrap();
+            state = CeremonyState::from_json(&json).unwrap();
+            state
+                .add_partial(partial(h, &item.id, &item.bytes))
+                .expect("I421: a good partial");
+        }
+    }
+    let bundle = state.assemble().expect("I421: complete");
+    assert_eq!(
+        serde_json::to_value(&bundle).unwrap(),
+        serde_json::to_value(&minted.bundle).unwrap(),
+        "I421: the assembled bundle is the minted one"
+    );
+    // and it parses back to the same bytes (one spelling)
+    let reparsed = parse_genesis_bundle(&serde_json::to_string(&bundle).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_string(&reparsed).unwrap(),
+        serde_json::to_string(&bundle).unwrap()
+    );
+}
+
+/// **I422 — a partial is verified when it arrives and refused by name.**
+#[test]
+fn i422_add_partial_refuses_by_name() {
+    let (mut state, holders) = planned(at(-5));
+    let items = state.items().unwrap();
+    let charter = items
+        .iter()
+        .find(|i| i.id == "row:genesis-charter")
+        .unwrap();
+    let family = items.iter().find(|i| i.id.starts_with("family:")).unwrap();
+    // unknown item
+    let mut p = partial(&holders[0], &charter.id, &charter.bytes);
+    p.item = "row:nonesuch".into();
+    let e = state.add_partial(p).unwrap_err();
+    assert_eq!(e.as_str(), "ceremony_item_unknown", "{e}");
+    // a signer that is not a holder
+    let stranger = ciris_persist::federation::accord_test_support::Identity::new("stranger");
+    let e = state
+        .add_partial(partial(&stranger, &charter.id, &charter.bytes))
+        .unwrap_err();
+    assert_eq!(e.as_str(), "ceremony_signer_not_a_holder", "{e}");
+    // signed over another item's bytes: the classical half fails
+    let e = state
+        .add_partial(partial(&holders[0], &charter.id, &family.bytes))
+        .unwrap_err();
+    assert_eq!(e.as_str(), "ceremony_signature_invalid", "{e}");
+    // a good classical half with the PQC half of another item
+    let good = partial(&holders[0], &charter.id, &charter.bytes);
+    let mut half = good.clone();
+    half.signature_pqc = partial(&holders[0], &family.id, &family.bytes).signature_pqc;
+    let e = state.add_partial(half).unwrap_err();
+    assert_eq!(e.as_str(), "ceremony_signature_invalid", "{e}");
+    // another holder's signature under this holder's name
+    let mut borrowed = partial(&holders[1], &charter.id, &charter.bytes);
+    borrowed.holder_key_id = holders[0].key_id.clone();
+    let e = state.add_partial(borrowed).unwrap_err();
+    assert_eq!(e.as_str(), "ceremony_signature_invalid", "{e}");
+    // nothing refused was recorded
+    assert!(state.partials.is_empty(), "I422: refusals record nothing");
+    // the good one; again is a no-op; a different one conflicts
+    state.add_partial(good.clone()).unwrap();
+    state.add_partial(good.clone()).unwrap();
+    let mut other = good;
+    other.signature_classical = partial(&holders[0], &family.id, &family.bytes).signature_classical;
+    let e = state.add_partial(other).unwrap_err();
+    // (the classical half no longer verifies, so it is refused before the conflict)
+    assert_eq!(e.as_str(), "ceremony_signature_invalid", "{e}");
+}
+
+/// **I423 — nothing assembles while a signature is owed; every holder signs
+/// every item (the founding rule: no 2-of-3 at the mint).**
+#[test]
+fn i423_incomplete_names_what_is_owed() {
+    let (mut state, holders) = planned(at(-5));
+    for item in state.items().unwrap() {
+        // two of three on every item
+        for h in &holders[..2] {
+            state
+                .add_partial(partial(h, &item.id, &item.bytes))
+                .unwrap();
+        }
+    }
+    match state.assemble() {
+        Err(CeremonyError::Incomplete(owed)) => {
+            assert_eq!(owed.len(), 7, "I423: every item still owes one: {owed:?}");
+            assert!(owed.values().all(|o| o == &vec![holders[2].key_id.clone()]));
+        }
+        other => panic!("I423: expected Incomplete, got {other:?}"),
+    }
+    assert_eq!(state.next_items().unwrap().len(), 7);
+    let authz = state
+        .items()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == AUTHZ_ITEM_ID)
+        .unwrap();
+    state
+        .add_partial(partial(&holders[2], &authz.id, &authz.bytes))
+        .unwrap();
+    assert_eq!(state.status().unwrap().len(), 6);
+    assert!(!state.status().unwrap().contains_key(AUTHZ_ITEM_ID));
+}
+
+/// **I424 — `finish` ends in the ordinary doors and passes**; the outputs boot
+/// a node (I351 boots the same path on memory, sqlite and postgres).
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i424_finish_runs_the_doors() {
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    let (mut state, holders) = planned(at(-5));
+    // incomplete: finish refuses before any door
+    assert_eq!(
+        state.finish().await.unwrap_err().as_str(),
+        "ceremony_incomplete"
+    );
+    sign_every_item(&mut state, &holders).unwrap();
+    let done = state.finish().await.expect("I424: the doors admit it");
+    assert_eq!(done.verified.quorum_verified, 3);
+    assert_eq!(
+        (
+            done.verified.community_key_id.as_str(),
+            done.verified.founders
+        ),
+        (CANON, 3)
+    );
+    assert_eq!(
+        parse_genesis_bundle(&done.bundle_json)
+            .unwrap()
+            .roster_records
+            .len(),
+        2
+    );
+}
+
+/// **I425 — the authorization digest binds the roster records' signed
+/// content and nothing about their signatures; a bundle with no records is
+/// digested exactly as before (the baked version-2 seed still verifies).**
+#[test]
+fn i425_digest_binds_record_content_not_signatures() {
+    use ciris_persist::federation::genesis::bundle::authorization_digest;
+    let c = mint(-5);
+    let base = authorization_digest(&c.bundle).unwrap();
+    let mut signatures_only = c.bundle.clone();
+    for r in &mut signatures_only.roster_records {
+        match r {
+            GenesisRosterRecord::Family(f) => f.cosignatures.clear(),
+            GenesisRosterRecord::Community(x) => x.scrub_signature_classical = "x".into(),
+        }
+    }
+    assert_eq!(authorization_digest(&signatures_only).unwrap(), base);
+    for k in 0..2 {
+        let mut content = c.bundle.clone();
+        match &mut content.roster_records[k] {
+            GenesisRosterRecord::Family(f) => f.family.members.pop().map(|_| ()).unwrap(),
+            GenesisRosterRecord::Community(x) => x.community.community_name.push('!'),
+        }
+        assert_ne!(
+            authorization_digest(&content).unwrap(),
+            base,
+            "I425: record {k}"
+        );
+    }
+    let mut dropped = c.bundle.clone();
+    dropped.roster_records.pop();
+    assert_ne!(authorization_digest(&dropped).unwrap(), base);
+    // The baked version-2 seed carries no records and still verifies (its
+    // authorizations were taken over the pre-v53 preimage).
+    let baked = parse_genesis_bundle(include_str!(
+        "../src/federation/genesis/canonical_seed.json"
+    ))
+    .unwrap();
+    assert_eq!((baked.version, baked.roster_records.len()), (2, 0));
+}
+
+/// **I426 — the wire: the records are members of `attestations`, after every
+/// row, each recognised by its one key; any other spelling is refused.**
+#[test]
+fn i426_records_are_members_of_attestations() {
+    let c = mint(-5);
+    let v = serde_json::to_value(&c.bundle).unwrap();
+    let list = v["attestations"].as_array().unwrap();
+    assert!(
+        v.get("roster_records").is_none(),
+        "I426: no field beside attestations"
+    );
+    assert_eq!(list.len(), 5);
+    assert!(list[..3].iter().all(|e| e.get("attestation").is_some()));
+    assert!(list[3].get("family").is_some() && list[4].get("community").is_some());
+    let refused = |v: serde_json::Value| parse_genesis_bundle(&v.to_string()).unwrap_err();
+    let mut two_keys = v.clone();
+    two_keys["attestations"][4]["family"] = list[3]["family"].clone();
+    assert!(refused(two_keys).to_string().contains("exactly one"));
+    let mut neither = v.clone();
+    neither["attestations"][0] = serde_json::json!({"row": 1});
+    assert!(refused(neither).to_string().contains("exactly one"));
+    let mut late_row = v.clone();
+    let row = late_row["attestations"].as_array_mut().unwrap().remove(0);
+    late_row["attestations"].as_array_mut().unwrap().push(row);
+    assert!(refused(late_row)
+        .to_string()
+        .contains("follows a roster record"));
+}
+
+/// **I427 — the assembler reads no clock: every instant derives from the one
+/// `produced_at` the caller stamped, truncated to the microsecond.**
+#[test]
+fn i427_every_instant_is_the_stamp() {
+    let stamp: chrono::DateTime<chrono::Utc> = "2026-10-02T12:00:00.123456789Z".parse().unwrap();
+    let micro: chrono::DateTime<chrono::Utc> = "2026-10-02T12:00:00.123456Z".parse().unwrap();
+    let (state, holders) = planned(stamp);
+    assert_eq!(state.inputs.produced_at, micro, "I427: truncated at plan");
+    let first = state.items().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(
+        state.items().unwrap(),
+        first,
+        "I427: the bytes do not move with the clock"
+    );
+    let mut state = state;
+    sign_every_item(&mut state, &holders).unwrap();
+    let b = state.assemble().unwrap();
+    assert_eq!(b.produced_at, micro.to_rfc3339());
+    assert_eq!(b.serve_nodes[0].record.valid_from, micro);
+    // a row's signed instant is stamped at millisecond precision
+    // (`stamp_signed_instants`), the rows 1 ms apart from the stamp
+    for (k, row) in b.attestations.iter().enumerate() {
+        assert_eq!(
+            row.attestation.asserted_at.timestamp_millis(),
+            micro.timestamp_millis() + i64::try_from(k).unwrap()
+        );
+    }
+    assert_eq!(
+        b.community_record(CANON).unwrap().community.founded_at,
+        micro
+    );
+}
