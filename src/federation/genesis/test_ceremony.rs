@@ -166,6 +166,23 @@ pub fn mint_test_ceremony(
     node_seed: &[u8; 32],
     produced_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<TestCeremonyOutputs, Error> {
+    mint_test_ceremony_scoped(ed_seeds, node_seed, produced_at, None)
+}
+
+/// CIRISPersist#973 — [`mint_test_ceremony`] with one extra scope token on
+/// the charter and the grant, so two ceremonies minted at the SAME instant
+/// carry DIFFERENT signed content (the equal-vintage case the posture leg
+/// has to classify). `None` is `mint_test_ceremony` exactly.
+///
+/// # Errors
+///
+/// As [`mint_test_ceremony`].
+pub fn mint_test_ceremony_scoped(
+    ed_seeds: &[[u8; 32]],
+    node_seed: &[u8; 32],
+    produced_at: chrono::DateTime<chrono::Utc>,
+    extra_scope: Option<&str>,
+) -> Result<TestCeremonyOutputs, Error> {
     if ed_seeds.len() != 3 {
         return Err(Error::InvalidArgument(format!(
             "mint_test_ceremony: the accord roster is three holders (quorum 2 of 3); got {} \
@@ -245,11 +262,13 @@ pub fn mint_test_ceremony(
     let [charter_id, grant_id, lifecycle_id] = test_ceremony_delegation_ids();
     let successors: Vec<String> = holders[1..].iter().map(|h| h.key_id.clone()).collect();
     let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)?;
-    let scope = serde_json::json!([
-        crate::federation::trust_root::INFRA_ATTEST_SCOPE,
-        crate::federation::trust_root::INFRA_SERVE_SCOPE,
-        "infra:store",
-    ]);
+    let mut scope_tokens = vec![
+        crate::federation::trust_root::INFRA_ATTEST_SCOPE.to_owned(),
+        crate::federation::trust_root::INFRA_SERVE_SCOPE.to_owned(),
+        "infra:store".to_owned(),
+    ];
+    scope_tokens.extend(extra_scope.map(str::to_owned));
+    let scope = serde_json::json!(scope_tokens);
     let ms = |n: i64| produced_at + chrono::Duration::milliseconds(n);
     let attestations = vec![
         delegation_row(
