@@ -592,6 +592,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("put_public_key_at_door", ConnClass::Write),
     // v50.0.0 (#928, V157) — the recorded admission depth of a `withdraws`.
     ("withdraws_admission_depth", ConnClass::Read),
+    ("trust_direction_held_among", ConnClass::Read),
     ("put_revocation", ConnClass::Write),
     ("put_scope_blob", ConnClass::Write),
     ("put_signed_transport_destination", ConnClass::Write),

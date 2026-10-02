@@ -276,6 +276,9 @@ pub fn mint_test_ceremony_scoped(
             family,
             crate::federation::types::attestation_type::DELEGATES_TO,
             serde_json::json!({
+                // #973 (CC 3.2 T4a) — a re-minted row names its job; outside
+                // the shipped bundle an unlabelled row is no charter.
+                "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
                 "references_attestation_id": charter_id,
                 "pre_rotation_commitment": commitment,
                 "scope": scope,
@@ -290,6 +293,7 @@ pub fn mint_test_ceremony_scoped(
             TEST_CEREMONY_NODE_KEY_ID,
             crate::federation::types::attestation_type::DELEGATES_TO,
             serde_json::json!({
+                "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
                 "references_attestation_id": grant_id,
                 "scope": scope,
             }),

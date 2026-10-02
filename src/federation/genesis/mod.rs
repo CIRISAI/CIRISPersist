@@ -730,6 +730,37 @@ pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     })
 }
 
+/// CIRISPersist#973 (CC 3.2 T4a, "bundle only") — **is `row` a member of the
+/// pinned GenesisBundle?** "An unlabelled row that is a member of the pinned
+/// GenesisBundle (T5, `bundle_fingerprint`) keeps the reading its direction
+/// gives it, because the three rows baked into the shipped bundle were minted
+/// before the job labels existed and a fresh node could not otherwise seed."
+///
+/// Membership is the baked id AND the baked signed statement: the row's
+/// canonical envelope equals the bundle row's, so a different statement stored
+/// under a baked id is not a member. The bundle is the one this build pins
+/// ([`canonical_genesis_bundle`]: the compiled artifact, or under a live test
+/// anchor the installed software ceremony). A row that cannot be canonicalized
+/// is not a member.
+#[must_use]
+pub fn is_pinned_bundle_row(row: &super::Attestation) -> bool {
+    is_pinned_bundle_statement(&row.attestation_id, &row.attestation_envelope)
+}
+
+/// [`is_pinned_bundle_row`] for a row not yet assembled: the id it will be
+/// stored under and its signed envelope (the write gate's view).
+#[must_use]
+pub fn is_pinned_bundle_statement(attestation_id: &str, envelope: &serde_json::Value) -> bool {
+    let Ok(got) = super::canonical_at_rest::canonical_bytes(envelope) else {
+        return false;
+    };
+    canonical_genesis_bundle().attestations.iter().any(|sa| {
+        sa.attestation.attestation_id == attestation_id
+            && super::canonical_at_rest::canonical_bytes(&sa.attestation.attestation_envelope)
+                .is_ok_and(|want| want == got)
+    })
+}
+
 /// v31.0.0 (CIRISPersist#660) — **the baked delegation-plane ids, as a closed
 /// set**, derived from the artifact rather than re-listed.
 ///

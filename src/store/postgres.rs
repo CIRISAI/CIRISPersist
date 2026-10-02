@@ -4822,6 +4822,38 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .transpose()
     }
 
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        if attestation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("pg pool: {e}")))?;
+        let ids: Vec<&str> = attestation_ids.iter().map(String::as_str).collect();
+        let rows = client
+            .query(
+                "SELECT attestation_id FROM cirislens.federation_trust_direction_held \
+                 WHERE attestation_id = ANY($1) ORDER BY attestation_id",
+                &[&ids],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("trust_direction_held_among: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                r.safe_get_with::<String, _, _, _>(
+                    "attestation_id",
+                    crate::federation::Error::Backend,
+                )
+            })
+            .collect()
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }

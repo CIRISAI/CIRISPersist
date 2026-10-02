@@ -217,11 +217,80 @@ const TRUST_JOB_DIMENSIONS: &[&str] = &[
 ///   than pick a winner.
 /// - carries no job label → yes; direction inference stands, which is what
 ///   keeps this additive for every row written before v23.0.0.
+///
+/// #973 — for the CHARTER and ACCEPTANCE jobs, "infer when silent" is no
+/// longer the whole answer: a silent row is read by direction only when
+/// [`direction_denied_ids`] says so. A caller reading either job pairs
+/// this with [`direction_denied_ids`]. The CONFERRAL job is unchanged.
 pub(crate) fn job_dimension_admits(envelope: &serde_json::Value, expected: &str) -> bool {
     match super::admission::envelope_dimension(envelope) {
         Some(d) if TRUST_JOB_DIMENSIONS.contains(&d) => d == expected,
         _ => true,
     }
+}
+
+/// Does the envelope carry none of the three `trust:{job}` labels? Any other
+/// dimension (the legacy `self:delegates_to*`, an ownership label) claims no
+/// job (CC 3.1.3) and counts as unlabelled here.
+pub(crate) fn names_no_trust_job(envelope: &serde_json::Value) -> bool {
+    !matches!(
+        super::admission::envelope_dimension(envelope),
+        Some(d) if TRUST_JOB_DIMENSIONS.contains(&d)
+    )
+}
+
+/// CIRISPersist#973 (CC 3.2 T4a, steward ruling 2026-10-01, "bundle only") —
+/// **which of `rows` may NOT be read as a charter or an acceptance edge from
+/// their direction?**
+///
+/// "A new row with no `trust:{job}` label gives no acceptance and is no
+/// charter … One exception stands, as a stop-gap until the re-mint: an
+/// unlabelled row that is a member of the pinned GenesisBundle (T5,
+/// `bundle_fingerprint`) keeps the reading its direction gives it … Unlabelled
+/// rows a node already holds keep their reading under T4."
+///
+/// - a row naming a `trust:{job}` label: its label decides
+///   ([`job_dimension_admits`]); it stands;
+/// - an unlabelled member of the pinned bundle
+///   ([`is_pinned_bundle_row`](super::genesis::is_pinned_bundle_row)): it stands;
+/// - an unlabelled row this node held when the rule arrived
+///   ([`FederationDirectory::trust_direction_held_among`], V167): it stands;
+/// - any other unlabelled row: denied. It stays stored and stays a delegation
+///   for every other reader (conferral, duties, ownership); it is no charter
+///   and no acceptance edge.
+///
+/// Returns the ids among `rows` whose direction reading does NOT stand. Only
+/// `delegates_to` rows are asked about, in one directory read.
+pub(crate) async fn direction_denied_ids<'a, F, I>(
+    directory: &F,
+    rows: I,
+) -> Result<std::collections::HashSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+    I: IntoIterator<Item = &'a Attestation>,
+{
+    // Asked of the directory: unlabelled `delegates_to` rows outside the
+    // pinned bundle. One read for the whole set.
+    let mut asked: Vec<String> = rows
+        .into_iter()
+        .filter(|row| {
+            row.attestation_type == attestation_type::DELEGATES_TO
+                && names_no_trust_job(&row.attestation_envelope)
+                && !super::genesis::is_pinned_bundle_row(row)
+        })
+        .map(|row| row.attestation_id.clone())
+        .collect();
+    if asked.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    asked.sort();
+    asked.dedup();
+    let held: std::collections::HashSet<String> = directory
+        .trust_direction_held_among(&asked)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(asked.into_iter().filter(|id| !held.contains(id)).collect())
 }
 
 /// The delegation scope tokens a root self-declaration (its **charter**)
@@ -762,7 +831,7 @@ where
     };
     let refs: Vec<&Attestation> = by_node.iter().collect();
     let dead = tombstoned_ids(&refs);
-    let mut roots: Vec<String> = by_node
+    let candidates: Vec<&Attestation> = by_node
         .iter()
         .filter(|a| {
             a.attestation_type == attestation_type::DELEGATES_TO
@@ -772,6 +841,13 @@ where
                 && counts_in_capability_walk(a)
                 && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
         })
+        .collect();
+    // #973 — an unlabelled edge is an acceptance edge only where its
+    // direction reading stands (held, or a pinned-bundle row).
+    let denied = direction_denied_ids(directory, candidates.iter().copied()).await?;
+    let mut roots: Vec<String> = candidates
+        .into_iter()
+        .filter(|a| !denied.contains(&a.attestation_id))
         .map(|a| a.attested_key_id.clone())
         .collect();
     roots.sort();
@@ -1184,6 +1260,14 @@ where
                 && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
         })
         .collect();
+    // #973 (CC 3.2 T4a) — "a new row with no `trust:{job}` label gives no
+    // acceptance": an unlabelled edge counts only where its direction reading
+    // stands (held when the rule arrived, or a pinned-bundle row).
+    let edge_denied = direction_denied_ids(directory, live_edges.iter().copied()).await?;
+    let live_edges: Vec<&Attestation> = live_edges
+        .into_iter()
+        .filter(|a| !edge_denied.contains(&a.attestation_id))
+        .collect();
     let edge_exists = !live_edges.is_empty();
 
     // 2. Charter.
@@ -1209,6 +1293,16 @@ where
     let about_refs: Vec<&Attestation> = about_root.iter().collect();
     let about_dead = tombstoned_ids(&about_refs);
 
+    // #973 (CC 3.2 T4a) — "… and is no charter": an unlabelled row toward the
+    // root is a charter only where its direction reading stands.
+    let charter_denied = direction_denied_ids(
+        directory,
+        by_root
+            .iter()
+            .chain(about_root.iter())
+            .filter(|a| a.attested_key_id == legs_ref),
+    )
+    .await?;
     let charter_shaped = |a: &&Attestation, dead: &std::collections::HashSet<String>| {
         a.attestation_type == attestation_type::DELEGATES_TO
             && a.attested_key_id == legs_ref
@@ -1216,6 +1310,7 @@ where
             && !is_expired(a, now)
             && counts_in_capability_walk(a)
             && job_dimension_admits(&a.attestation_envelope, TRUST_CHARTER_DIMENSION)
+            && !charter_denied.contains(&a.attestation_id)
             && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
             && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
     };
@@ -1798,6 +1893,10 @@ pub(crate) struct TransitCandidateRoot {
 ///
 /// `pub(crate)` so the parity harness can assert the bound directly rather
 /// than inferring it from timings.
+///
+/// #973 — this is an ENUMERATION: every candidate is then judged by
+/// [`trust_root_valid`], which is where an unlabelled edge whose direction
+/// reading does not stand ([`direction_denied_ids`]) stops counting.
 pub(crate) fn transit_candidate_roots(
     by_user: &[Attestation],
     user_key_id: &str,

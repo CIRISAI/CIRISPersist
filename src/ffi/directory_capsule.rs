@@ -1085,6 +1085,16 @@ pub enum DirectoryOp {
         /// The subject key's `sha256_ed25519_raw` (64 lowercase hex).
         revoked_key_sha256_ed25519_raw: String,
     },
+    /// CIRISPersist#973 (CC 3.2 T4a) —
+    /// [`FederationDirectory::trust_direction_held_among`]: which of these
+    /// unlabelled `delegates_to` rows the node held when the label became
+    /// required, so a capsule consumer reads a held row the way the backend
+    /// does instead of denying it. Result rides `WireHashes` (the
+    /// `Vec<String>` shape). APPEND-ONLY (Growth).
+    TrustDirectionHeldAmong {
+        /// The candidate rows' ids.
+        attestation_ids: Vec<String>,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -2091,6 +2101,12 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::Revocations(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::TrustDirectionHeldAmong { attestation_ids } => {
+            match dir.trust_direction_held_among(&attestation_ids).await {
+                Ok(v) => DirectoryOpResult::WireHashes(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -2710,6 +2726,26 @@ impl FederationDirectory for OpsDirectory {
             DirectoryOpResult::WithdrawsAdmissionDepth(d) => {
                 Ok(d.map(|d| usize::try_from(d).unwrap_or(usize::MAX)))
             }
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// CIRISPersist#973 — the held unlabelled delegations, proxied: the proxy
+    /// never answers "none held" on the backend's behalf.
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, Error> {
+        match self
+            .run_op(&DirectoryOp::TrustDirectionHeldAmong {
+                attestation_ids: attestation_ids.to_vec(),
+            })
+            .await?
+        {
+            DirectoryOpResult::WireHashes(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -4558,6 +4594,26 @@ mod tests {
         }
     }
 
+    /// CIRISPersist#973 — the op forwards the backend's held set: a marked id
+    /// comes back, an unmarked one does not.
+    #[test]
+    fn trust_direction_held_among_op_forwards_the_held_set() {
+        let rt = test_runtime();
+        let backend = Arc::new(MemoryBackend::new());
+        backend.mark_trust_direction_held("held-row");
+        let directory = build_persist_directory(backend as Arc<dyn FederationDirectory>);
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::TrustDirectionHeldAmong {
+                attestation_ids: vec!["held-row".to_owned(), "new-row".to_owned()],
+            },
+        ) {
+            DirectoryOpResult::WireHashes(v) => assert_eq!(v, vec!["held-row".to_owned()]),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// v50.0.0 (CIRISPersist#931) — the capsule carries BOTH community doors:
     /// `PutCommunity` (local) refuses a human-signed legacy `founder_only`
     /// infrastructure record; `ApplyReplicatedCommunity` admits it as data
@@ -5126,7 +5182,7 @@ mod tests {
     fn directory_op_wire_contract_is_pinned_682() {
         assert_eq!(
             structural_digest("DirectoryOp"),
-            "bd3273da1e686a1166e59423cc3a58694a419ccf50ce4ff5f8800d0b04f97a18",
+            "4efe656f9076f4b918efc8e122c6dfb422da3fb2e98fdbf52f4a6f9dbb17bce1",
             "DirectoryOp's wire shape changed. GROWTH (appended a variant, \
              touched nothing existing) → re-pin this digest only. BREAK \
              (changed/renamed/removed/reordered an existing variant) → re-pin \

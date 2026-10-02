@@ -883,10 +883,10 @@ pub(crate) mod bodies {
         )
         .await;
         assert_unnamed(accept_edge(d, "i356-win", None).await, "witnessed, window");
-        // A row with NO job label is not an acceptance edge by name: it
-        // reaches the gate by direction inference only, the same inference
-        // that covers a family charter and the baked `genesis-charter`. It
-        // keeps the pre-#973 reading: refused under a charter with a window …
+        // #973 "bundle only" — a NEW row with NO job label is not an
+        // acceptance edge at all (CC 3.2 T4a): outside the pinned bundle the
+        // gate has nothing to judge, so the row is stored as a plain
+        // delegation under a window and without one, and gives no acceptance.
         ts::register_hybrid_key_as(d, "i356-unl", "i356-unl", identity_type::USER).await;
         let unlabeled = |id: &str| {
             let mut edge = crate::federation::operational::test_support::signed_trust_attestation(
@@ -903,17 +903,28 @@ pub(crate) mod bodies {
             crate::federation::SignedAttestation { attestation: edge }
         };
         let id = uuid::Uuid::new_v4().to_string();
-        let e = d
-            .put_attestation(unlabeled(&id))
+        d.put_attestation(unlabeled(&id))
             .await
-            .expect_err("I356: unlabeled and headless under a window");
-        assert_eq!(e.kind(), "trust_root_head_stale", "I356: {e:?}");
-        // … and admitted under a charter that declares none.
+            .expect("I356: an unlabeled row is no acceptance edge; nothing to gate (window)");
         charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
         let id = uuid::Uuid::new_v4().to_string();
         d.put_attestation(unlabeled(&id))
             .await
-            .expect("I356: an unlabeled row under a charter with no window is not gated");
+            .expect("I356: nor under a charter with no window");
+        assert!(
+            !crate::federation::trust_root::trust_root_valid(d, "i356-unl", CANON)
+                .await
+                .unwrap()
+                .edge_exists,
+            "I356: the stored unlabeled rows give no acceptance"
+        );
+        assert!(
+            crate::federation::trust_root::trusted_roots_of(d, "i356-unl", chrono::Utc::now())
+                .await
+                .unwrap()
+                .is_empty(),
+            "I356: and name no subscribed root"
+        );
         for name in ["i356-off", "i356-on", "i356-win"] {
             assert!(
                 !crate::federation::trust_root::trust_root_valid(d, name, CANON)
@@ -929,6 +940,64 @@ pub(crate) mod bodies {
     /// before the node held the lineage: the pre-enforcement shape) stays
     /// valid, and re-putting the same edge re-runs nothing — in off mode and
     /// after the charter turns witnessing and a window on.
+    /// **I371** (#973) — the envelope a host copies. `acceptance_edge_envelope`
+    /// names the job and the head the attach gate asks for, so an edge built
+    /// from it is admitted and gives acceptance; toward a key root (no lineage
+    /// held) it names the job and no head.
+    pub async fn i371_the_helper_builds_an_admitted_acceptance_edge(d: &dyn FederationDirectory) {
+        use crate::federation::canonical_community::{acceptance_edge_envelope, attach_head_for};
+        use crate::federation::trust_root::{INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION};
+        born(d).await;
+        let now = chrono::Utc::now();
+        let env = acceptance_edge_envelope(d, CANON, &[INFRA_SERVE_SCOPE], now)
+            .await
+            .unwrap();
+        let head = attach_head_for(d, CANON, now)
+            .await
+            .unwrap()
+            .expect("I371: a held lineage has an attachable head");
+        assert_eq!(
+            env,
+            serde_json::json!({
+                "dimension": TRUST_ACCEPTS_DIMENSION,
+                "scope": [INFRA_SERVE_SCOPE],
+                "attached_head_digest": head,
+            }),
+            "I371: the whole shape"
+        );
+        ts::register_hybrid_key_as(d, "i371-node", "i371-node", identity_type::USER).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut edge = crate::federation::operational::test_support::signed_trust_attestation(
+            &id,
+            "i371-node",
+            CANON,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            env,
+        );
+        ts::reseal(&mut edge);
+        d.put_attestation(crate::federation::SignedAttestation { attestation: edge })
+            .await
+            .expect("I371: the helper's envelope passes the attach gate");
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, "i371-node", CANON)
+                .await
+                .unwrap()
+                .edge_exists,
+            "I371: and gives acceptance"
+        );
+        let key_root = acceptance_edge_envelope(d, "i371-some-key-root", &[INFRA_SERVE_SCOPE], now)
+            .await
+            .unwrap();
+        assert_eq!(
+            key_root,
+            serde_json::json!({
+                "dimension": TRUST_ACCEPTS_DIMENSION,
+                "scope": [INFRA_SERVE_SCOPE],
+            }),
+            "I371: a key root has no head to name"
+        );
+    }
+
     pub async fn i357_a_held_headless_edge_stays_valid(d: &dyn FederationDirectory) {
         stand_up(d).await;
         let consumer = "i357-consumer";
@@ -1630,6 +1699,14 @@ mod runners {
                 async fn i356() {
                     let Some(d) = $fresh.await else { return };
                     super::super::bodies::i356_a_new_headless_edge_is_refused_in_every_mode(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i371() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i371_the_helper_builds_an_admitted_acceptance_edge(
                         &d as &dyn FederationDirectory,
                     )
                     .await

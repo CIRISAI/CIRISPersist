@@ -119,6 +119,10 @@ pub mod self_collective;
 pub(crate) mod adopt_batch_invariants;
 /// v47.2.0 (CIRISPersist#853) — CC 2.3 at the bytes plane: the binding fold.
 pub mod blob_tombstone;
+/// CIRISPersist#973 — I366–I370, an unlabelled delegation is no charter and
+/// no acceptance edge ("bundle only").
+#[cfg(test)]
+mod bundle_only_invariants;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bytes_plane_tombstone_invariants;
@@ -2563,6 +2567,23 @@ pub trait FederationDirectory: Send + Sync {
     ) -> Result<Option<usize>, Error> {
         let _ = attestation_id;
         Ok(None)
+    }
+
+    /// CIRISPersist#973 (CC 3.2 T4a, "bundle only"; V167) — was this
+    /// `delegates_to` row, carrying no `trust:{job}` label, already held when
+    /// this node began enforcing the rule that an unlabelled row is no charter
+    /// and no acceptance edge? "Unlabelled rows a node already holds keep
+    /// their reading under T4." The set is recorded once, by the V167
+    /// migration, and never grows afterwards. Returns the subset of
+    /// `attestation_ids` that is held, in one read. The default answers with
+    /// none: a directory that recorded nothing holds nothing under the old
+    /// reading.
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, Error> {
+        let _ = attestation_ids;
+        Ok(Vec::new())
     }
 
     /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated

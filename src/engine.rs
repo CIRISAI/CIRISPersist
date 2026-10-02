@@ -5544,6 +5544,35 @@ impl Engine {
         .await
     }
 
+    /// CIRISPersist#973 (CC 3.2 T3 / T4a) — **the signed envelope of a new
+    /// acceptance edge toward `root_key_id`**: `dimension: trust:accepts:v1`,
+    /// the `scope` this node accepts the root for, and the
+    /// `attached_head_digest` of the lineage head it attaches on (omitted for
+    /// a key root). Emit it as a `delegates_to` with `attested_key_id` = the
+    /// root. A `delegates_to` toward a root without the label gives no
+    /// acceptance; a labelled one without the head is refused
+    /// `trust_root_head_unnamed`. See
+    /// [`acceptance_edge_envelope`](crate::federation::canonical_community::acceptance_edge_envelope).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn trust_acceptance_envelope(
+        &self,
+        root_key_id: &str,
+        scope: &[&str],
+    ) -> Result<serde_json::Value, crate::federation::Error> {
+        use crate::federation::canonical_community::acceptance_edge_envelope;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                acceptance_edge_envelope(arc.as_ref(), root_key_id, scope, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                acceptance_edge_envelope(arc.as_ref(), root_key_id, scope, now).await
+            }
+        }
+    }
+
     /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
     /// `consent:community_trust` grant for `node`**, or `None`: the capture
     /// gate's answer, folded from the rows about the node (latest grant after

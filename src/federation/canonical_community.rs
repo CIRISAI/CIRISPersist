@@ -1839,10 +1839,22 @@ where
                 super::trust_root::TRUST_CHARTER_DIMENSION,
             )
     };
+    // #973 (CC 3.2 T4a) — an unlabelled row is a charter only where its
+    // direction reading stands (held, or a pinned-bundle row).
+    let denied =
+        super::trust_root::direction_denied_ids(directory, rows.iter().filter(|a| is_charter(a)))
+            .await?;
+    rows.retain(|a| !denied.contains(&a.attestation_id));
     if !rows.iter().any(is_charter) && root_key_id != accord_family_key_id() {
         rows = directory
             .list_attestations_for(accord_family_key_id())
             .await?;
+        let denied = super::trust_root::direction_denied_ids(
+            directory,
+            rows.iter().filter(|a| is_charter(a)),
+        )
+        .await?;
+        rows.retain(|a| !denied.contains(&a.attestation_id));
     }
     let charter = rows.iter().find(|a| is_charter(a));
     Ok(charter.map(|a| {
@@ -2083,6 +2095,18 @@ where
             envelope,
             super::trust_root::TRUST_ACCEPTS_DIMENSION,
         )
+    {
+        return Ok(());
+    }
+    // #973 (CC 3.2 T4a, "bundle only") — "a new row with no `trust:{job}`
+    // label gives no acceptance and is no charter". Outside the pinned bundle
+    // an unlabelled row is therefore not an acceptance edge and there is
+    // nothing to gate: it is stored as a delegation and the readers never
+    // count it (`trust_root::direction_denied_ids`). A pinned-bundle row
+    // keeps the reading its direction gives it, gate included.
+    if super::trust_root::names_no_trust_job(envelope)
+        && !attestation_id
+            .is_some_and(|id| super::genesis::is_pinned_bundle_statement(id, envelope))
     {
         return Ok(());
     }
@@ -2337,6 +2361,47 @@ where
         view.held_head
     };
     Ok(head.map(|(digest, _)| digest))
+}
+
+/// #973 (CC 3.2 T3 / T4a) — **the signed envelope of a NEW acceptance edge**
+/// toward `root`, as a host emits it: the job label, the scope the node
+/// accepts the root for, and the head it attaches on.
+///
+/// ```json
+/// { "dimension": "trust:accepts:v1",
+///   "scope": ["infra:attest", "infra:serve"],
+///   "attached_head_digest": "<64 hex>" }
+/// ```
+///
+/// `attached_head_digest` is [`attach_head_for`]'s answer and is omitted for a
+/// key root (no lineage held: the attach gate does not apply). The host adds
+/// its own `references_attestation_id` if it uses one and emits the row as a
+/// `delegates_to` with `attested_key_id = root`. Since #973 a `delegates_to`
+/// toward a root WITHOUT the label gives no acceptance, and a labelled one
+/// without the head is refused `trust_root_head_unnamed`.
+///
+/// # Errors
+///
+/// A directory read failure. `Ok` with no head while a witnessed lineage has
+/// no witnessed head yet: the edge is then refused at the write door, which is
+/// the honest answer (nothing is attachable).
+pub async fn acceptance_edge_envelope<F>(
+    directory: &F,
+    root: &str,
+    scope: &[&str],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<serde_json::Value, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut envelope = serde_json::json!({
+        "dimension": super::trust_root::TRUST_ACCEPTS_DIMENSION,
+        "scope": scope,
+    });
+    if let Some(head) = attach_head_for(directory, root, now).await? {
+        envelope[super::envelope::paths::ATTACHED_HEAD_DIGEST] = serde_json::Value::String(head);
+    }
+    Ok(envelope)
 }
 
 /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held trust-root

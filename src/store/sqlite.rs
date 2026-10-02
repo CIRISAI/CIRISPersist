@@ -3735,6 +3735,33 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("withdraws_admission_depth: {e}")))
     }
 
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        if attestation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(attestation_ids).map_err(|e| {
+            crate::federation::Error::Backend(format!("trust_direction_held_among: {e}"))
+        })?;
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id FROM federation_trust_direction_held \
+                  WHERE attestation_id IN (SELECT value FROM json_each(?1)) \
+                  ORDER BY attestation_id",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![ids], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e: rusqlite::Error| {
+            crate::federation::Error::Backend(format!("trust_direction_held_among: {e}"))
+        })
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }

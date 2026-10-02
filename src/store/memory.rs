@@ -154,6 +154,10 @@ struct State {
     /// v50.0.0 (CIRISPersist#928, V157 mirror) — the delegation depth each
     /// admitted `withdraws` was admitted under.
     federation_withdraws_admission_depths: HashMap<String, usize>,
+    /// #973 (V167) — unlabelled `delegates_to` ids held before the "bundle
+    /// only" rule. A memory backend is born after the rule, so this is empty
+    /// outside tests ([`MemoryBackend::mark_trust_direction_held`]).
+    federation_trust_direction_held: std::collections::HashSet<String>,
     /// v17.4.0 (V106) — the in-memory mirror of the `attestation_subjects`
     /// projection: `subject_key_id → [attestation_id, …]`. Maintained on every
     /// attestation write (put + local upsert/insert). Advisory: reads still
@@ -929,6 +933,7 @@ impl Default for MemoryBackend {
                 federation_keys: HashMap::new(),
                 federation_attestations: Vec::new(),
                 federation_withdraws_admission_depths: HashMap::new(),
+                federation_trust_direction_held: std::collections::HashSet::new(),
                 subject_index: HashMap::new(),
                 announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
@@ -1108,6 +1113,19 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// #973 — record `attestation_id` as an unlabelled `delegates_to` this
+    /// backend held before the "bundle only" rule (what V167 records on the
+    /// SQL backends at upgrade). A memory backend never upgrades, so this is
+    /// the only way its tests reach the held-row arm.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub fn mark_trust_direction_held(&self, attestation_id: &str) {
+        self.state
+            .lock()
+            .expect("memory backend lock")
+            .federation_trust_direction_held
+            .insert(attestation_id.to_owned());
     }
 
     /// v31.0.0 (CIRISPersist#646) — the memory twin of
@@ -2900,6 +2918,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_withdraws_admission_depths
             .get(attestation_id)
             .copied())
+    }
+
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(attestation_ids
+            .iter()
+            .filter(|id| state.federation_trust_direction_held.contains(*id))
+            .cloned()
+            .collect())
     }
 
     fn node_key_id(&self) -> Option<String> {

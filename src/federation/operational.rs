@@ -2432,7 +2432,9 @@ pub mod test_support {
     /// here). Mirrors the sqlite backend's own `android_strongbox_evidence_value`
     /// test fixture — the ONE shape that lets an `accord_holder` register
     /// without real hardware.
-    fn strongbox_evidence(captured_at: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    pub(crate) fn strongbox_evidence(
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
         json!({
             "platform_attestation": {
                 "Android": {
