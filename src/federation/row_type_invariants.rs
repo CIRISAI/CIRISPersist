@@ -34,9 +34,8 @@ mod pure {
     use crate::federation::admission::DimensionAdmissionPolicy;
     use crate::federation::namespace::registry;
     use crate::federation::row_type::{
-        carrier_shape_violation, check_row_type, classify, registered_row_type_sql,
-        with_enforcement, CarrierShapeViolation, RowTypeClass, RowTypeEnforcement,
-        ATTESTATION_TYPE_UNREGISTERED,
+        carrier_shape_violation, check_row_type, classify, with_enforcement, CarrierShapeViolation,
+        RowTypeClass, RowTypeEnforcement, ATTESTATION_TYPE_UNREGISTERED,
     };
     use crate::federation::types::attestation_type::{DELEGATES_TO, SUPERSEDES, WITHDRAWS};
     use crate::federation::Attestation;
@@ -296,6 +295,7 @@ mod pure {
     #[cfg(feature = "sqlite")]
     #[test]
     fn i376_sqlite_predicate_agrees_with_the_classifier() {
+        use crate::federation::row_type::registered_row_type_sql;
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let pred = registered_row_type_sql("t", crate::federation::row_type::SqlDialect::Sqlite);
         let mut probes: Vec<String> = vectors()
@@ -462,7 +462,7 @@ pub(crate) mod bodies {
     use crate::federation::envelope::EnvelopeCore;
     use crate::federation::row_type::{with_enforcement, RowTypeEnforcement};
     use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::identity_type::{USER, WITNESS};
+    use crate::federation::types::identity_type::USER;
     use crate::federation::types::{EmitAttestationInput, SignedAttestation};
     use crate::federation::{Attestation, FederationDirectory};
 
@@ -754,6 +754,7 @@ pub(crate) mod bodies {
     /// **I377** — age and capacity assurance from both shapes. The witness
     /// holds a conferred `infra:attest:assurance` scope (the runner seeds it);
     /// the subject-must-not-emit rule binds the dimension shape too.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn i377_assurance_reads_both_shapes<B: FederationDirectory + Sync>(
         b: &B,
         w: &Who,
@@ -822,7 +823,12 @@ pub(crate) mod bodies {
         // ...and the role alone is not enough: a witness with NO conferred
         // `infra:attest:assurance` scope is refused on the dimension shape as
         // on the type shape (the rule's delegation-scope arm, not layer 1b).
-        let bare = who(b, &format!("i377-bare-witness-{s}"), WITNESS).await;
+        let bare = who(
+            b,
+            &format!("i377-bare-witness-{s}"),
+            crate::federation::types::identity_type::WITNESS,
+        )
+        .await;
         for tok in [age, cap] {
             let mut i = input(
                 "scores",
@@ -843,8 +849,14 @@ pub(crate) mod bodies {
 
     /// The witness for I377, conferred `infra:attest:assurance` by a root
     /// `node` trusts. The runner has set `node` as the directory's node key.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub async fn witness<B: FederationDirectory + Sync>(b: &B, node: &str, s: &str) -> Who {
-        let w = who(b, &format!("i377-witness-{s}"), WITNESS).await;
+        let w = who(
+            b,
+            &format!("i377-witness-{s}"),
+            crate::federation::types::identity_type::WITNESS,
+        )
+        .await;
         crate::federation::admission::r2_test_support::confer_scope_from_trusted_root(
             b.as_dyn_directory(),
             node,
@@ -884,6 +896,9 @@ pub(crate) mod bodies {
                     let Some(b) = $fresh.await else { return };
                     bodies::i375_i376_report_then_withhold(&b, &suffix()).await
                 }
+                // The conferral fixture (`r2_test_support`) needs a SQL backend
+                // feature; the memory runner rides along when one is built.
+                #[cfg(any(feature = "sqlite", feature = "postgres"))]
                 #[tokio::test]
                 async fn i377() {
                     let Some(b) = $fresh.await else { return };
