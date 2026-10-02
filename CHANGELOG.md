@@ -9,6 +9,26 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### #966 — a shared-backend Engine tells the backend its node key
+
+`Engine::from_shared` and `from_shared_with_local` built an Engine over a
+host's live backend and never told that backend its node key, which
+`with_signer` has done at construction since #607. The backend's own receive
+doors (an owner-binding or a device's occurrence arriving over sync, no
+signer in hand) re-wrap "this node's" epochs only under a known node key, so
+a host that opened its own backend and handed it to `from_shared*` re-wrapped
+nothing for a member's late device. Only the Engine's #916 doors healed it,
+lazily. Both shared constructors now derive the key id with one poll of
+`local_derived_key_id` and set it when the backend has none. The id is the one
+`register_self_federation_key` uses. A signer that does not answer on the
+first poll (a hardware round-trip) leaves the key to that lazy path; the
+constructor never guesses an id. The constructors stay synchronous.
+
+I380 (sqlite, postgres; the memory backend has no community-DEK plane):
+both constructors over a freshly opened handle set the node key, and the
+backend's own `apply_replicated_attestation` re-wraps epoch 0 to bob's late
+device. It was RED before the fix (`node_key_id` was `None`).
+
 ### #971 — the evidence rows for CLM-membership-consent (CC 3.1.3.2)
 Evidence only. `evidence/cc_impl.tsv` gains four rows under `CLM-membership-consent`, naming the #955 code that v52 shipped: the growth gate `membership_acceptance.rs#check_growth_accepted`, the founding-signers checks `#check_founding_signers` and `#check_community_founding_signers`, and the supersede refusal `#check_supersede_adds_no_member`. The exact-count pin in `supersets.rs` moves 160 → 164.
 
