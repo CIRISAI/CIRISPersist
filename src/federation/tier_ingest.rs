@@ -332,6 +332,66 @@ where
     Ok(computed_hash)
 }
 
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
+/// one record the reserved `humanity-accord` id admits through a door: a new
+/// version of the HELD accord that moves only its head.**
+///
+/// The accord's head is its family record at a version and names the charter
+/// in force; a charter re-scrub takes effect only through a new version. The
+/// id stays reserved against every founding and every roster, protocol or
+/// entrenchment change (a squat, or a roster change by another rule). What
+/// passes is exactly: this node holds the accord; the offered record equals
+/// it in everything but `prev_head_digest` / `charter_digest`; it carries a
+/// supersede proof naming the held version, whose change envelope binds the
+/// offered record's content hash (`next_persist_row_hash` — the quorum signs
+/// WHICH charter, not only "the same roster"); and that envelope verifies to
+/// the held roster's own protocol. The prev-head check then runs in the
+/// supersede transaction.
+async fn is_accord_head_version<F>(
+    directory: &F,
+    signed: &super::SignedFamily,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let offered = &signed.family;
+    let Some(proof) = signed.supersede_proof.as_ref() else {
+        return Ok(false);
+    };
+    let Some(held) = directory.lookup_family(&offered.family_key_id).await? else {
+        return Ok(false);
+    };
+    let head_only = offered.family_name == held.family_name
+        && offered.members == held.members
+        && offered.founded_at == held.founded_at
+        && offered.consensus_protocol == held.consensus_protocol
+        && offered.consensus_protocol_entrenched == held.consensus_protocol_entrenched
+        && offered.dissolved_at == held.dissolved_at;
+    if !head_only || proof.prior_persist_row_hash != held.persist_row_hash {
+        return Ok(false);
+    }
+    let bound = proof
+        .change_envelope
+        .get(super::canonical_community::NEXT_PERSIST_ROW_HASH)
+        .and_then(|v| v.as_str());
+    if bound != Some(super::types::compute_persist_row_hash(offered)?.as_str()) {
+        return Ok(false);
+    }
+    match directory
+        .verify_membership_quorum(
+            super::cohort::Cohort::Family,
+            &offered.family_key_id,
+            &proof.change_envelope,
+            &proof.quorum_signatures,
+        )
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(Error::Backend(m)) => Err(Error::Backend(m)),
+        Err(_) => Ok(false),
+    }
+}
+
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
 /// [`SignedFamily`](super::SignedFamily): hybrid-Strict verify the scrub
 /// signature against the **claimed authority**'s REGISTERED pubkeys, over
@@ -373,6 +433,7 @@ where
 {
     if signed.family.family_key_id
         == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+        && !is_accord_head_version(directory, signed).await?
     {
         return Err(Error::ConstitutionalFamilyReserved {
             family_key_id: signed.family.family_key_id.clone(),
@@ -1580,6 +1641,38 @@ pub mod test_support {
     pub fn stamp_mirror(row: &mut Attestation) {
         crate::federation::envelope::stamp_signed_instants(row).expect("envelope is an object");
         crate::federation::envelope::RowMirror::stamp_row(row).expect("finite weight");
+    }
+
+    /// v53.0.0 (CC 3.2 T6) — `f` as the version that succeeds the head `d`
+    /// holds: `prev_head_digest` set to the held hash, signed again by the
+    /// same authority (the field is signed).
+    pub async fn family_naming_held<D: crate::federation::FederationDirectory + ?Sized>(
+        d: &D,
+        f: crate::federation::SignedFamily,
+    ) -> crate::federation::SignedFamily {
+        let mut rec = f.family;
+        rec.prev_head_digest = d
+            .lookup_family(&rec.family_key_id)
+            .await
+            .expect("lookup_family")
+            .map(|h| h.persist_row_hash)
+            .unwrap_or_default();
+        sign_family(&f.authority_key_id, rec)
+    }
+
+    /// The community twin of [`family_naming_held`].
+    pub async fn community_naming_held<D: crate::federation::FederationDirectory + ?Sized>(
+        d: &D,
+        c: crate::federation::SignedCommunity,
+    ) -> crate::federation::SignedCommunity {
+        let mut rec = c.community;
+        rec.prev_head_digest = d
+            .lookup_community(&rec.community_key_id)
+            .await
+            .expect("lookup_community")
+            .map(|h| h.persist_row_hash)
+            .unwrap_or_default();
+        sign_community(&c.authority_key_id, rec)
     }
 
     /// v21.0.0 (CIRISPersist#502 E4) — sign a [`Family`](crate::federation::types::Family)
@@ -3198,6 +3291,8 @@ pub mod test_support {
         dir.put_community(sign_community(
             member_a,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: community_key_id.to_owned(),
                 community_name: "chat-pair".to_owned(),
                 members,
@@ -3241,6 +3336,8 @@ pub mod test_support {
         // Both ends DERIVE the same community from the same member pair, so
         // the content is byte-identical; only the signer differs.
         let derived = |name: &str| crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: cid.clone(),
             community_name: name.to_owned(),
             members: vec![

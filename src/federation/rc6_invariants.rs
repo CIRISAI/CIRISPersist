@@ -417,11 +417,9 @@ pub(crate) mod bodies {
             env,
             &["B1", "C1"],
         );
-        d.put_attestation(crate::federation::SignedAttestation {
-            attestation: charter,
-        })
-        .await
-        .map(|_| ())
+        // v53.0.0 (CC 3.2 T6) — a re-scrub takes effect through the family
+        // version that names it.
+        ops::charter_family_and_version(d, charter, &["A1", "B1", "C1"]).await
     }
 
     /// A consumer's `trust:accepts:v1` edge to the root, optionally naming the

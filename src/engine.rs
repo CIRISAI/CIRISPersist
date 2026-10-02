@@ -10814,6 +10814,8 @@ mod tests {
 
         let now: chrono::DateTime<chrono::Utc> = "2026-06-25T00:00:00Z".parse().unwrap();
         let community = crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: kid.clone(),
             community_name: "T".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -11234,6 +11236,8 @@ mod tests {
         // A hostile re-assemble: same family id, the node owner's own sole seat,
         // `founder_only` so the charter threshold would resolve to 1.
         let hostile = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "humanity-accord".into(),
             family_name: "MINE".into(),
             members: vec![crate::federation::types::FamilyMember {
@@ -11295,6 +11299,8 @@ mod tests {
 
         let squat = crate::federation::SignedFamily {
             family: crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: "humanity-accord".into(),
                 family_name: "MINE".into(),
                 members: vec![crate::federation::types::FamilyMember {
@@ -17893,6 +17899,8 @@ mod tests {
             .await
             .expect("seed community key");
         let community = crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_id.into(),
             community_name: "cut-c-community".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -19100,6 +19108,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &founder,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "g1-fam".into(),
                 members: vec![types::FamilyMember {
@@ -19120,6 +19130,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &founder,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "g1-comm".into(),
                     members: vec![types::CommunityMember {
@@ -19432,6 +19444,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "accord".into(),
                 members: mk_members(5),
@@ -19444,6 +19458,13 @@ mod tests {
         ))
         .await
         .expect("genesis put_family");
+        // v53.0.0 (CC 3.2 T6) — every version below names v1 as its head.
+        let v1_hash = d
+            .lookup_family(&fam)
+            .await
+            .unwrap()
+            .expect("v1")
+            .persist_row_hash;
 
         // Supersede → 3-member quorum:2/3 (a contraction; growth is the
         // widening plane's, #955 Q2).
@@ -19468,6 +19489,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: v1_hash.clone(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: {
@@ -19504,6 +19527,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: v1_hash.clone(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: mk_members(3),
@@ -19564,6 +19589,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: format!("g2-ghost-{s}"),
                         family_name: "ghost".into(),
                         members: vec![],
@@ -19642,6 +19669,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "accord".into(),
                     members: members
@@ -19685,7 +19714,11 @@ mod tests {
         // 3 of the 5 PRIOR members cosign → meets quorum:3/5.
         let v = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 change.clone(),
                 vec![
                     threshold_sign(&m[0], &bytes),
@@ -19722,7 +19755,11 @@ mod tests {
         // (a) Insufficient quorum: 1 cosignature where M=3 → rejected.
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 change2.clone(),
                 vec![threshold_sign(&m[0], &bytes2)],
             )
@@ -19741,7 +19778,11 @@ mod tests {
         let tbytes = ciris_verify_core::jcs::canonicalize(&tampered).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 tampered,
                 vec![
                     threshold_sign(&m[0], &tbytes),
@@ -19771,7 +19812,11 @@ mod tests {
         let sbytes = ciris_verify_core::jcs::canonicalize(&seat_change).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(seat_roster, "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(seat_roster, "quorum:3/4"),
+                )
+                .await,
                 seat_change,
                 vec![
                     threshold_sign(&m[0], &sbytes),
@@ -19839,6 +19884,8 @@ mod tests {
             ts::sign_community(
                 &members[0],
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: room.to_owned(),
                     community_name: "protocol room".into(),
                     members: members
@@ -19894,7 +19941,11 @@ mod tests {
                 .map(|m| ts::threshold_sign(m, &bytes))
                 .collect();
             d.supersede_community_with_quorum(
-                community(&room, &new_members, founders, cp),
+                crate::federation::tier_ingest::test_support::community_naming_held(
+                    d,
+                    community(&room, &new_members, founders, cp),
+                )
+                .await,
                 change,
                 sigs,
             )
@@ -20112,6 +20163,8 @@ mod tests {
             ts::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "household".into(),
                     members: members
@@ -20145,7 +20198,8 @@ mod tests {
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         refused(
             d.supersede_family_with_quorum(
-                family(&fk),
+                crate::federation::tier_ingest::test_support::family_naming_held(d, family(&fk))
+                    .await,
                 change.clone(),
                 vec![ts::threshold_sign(&fk[1], &bytes)],
             )
@@ -20158,7 +20212,8 @@ mod tests {
         );
         refused_add(
             d.supersede_family_with_quorum(
-                family(&fk),
+                crate::federation::tier_ingest::test_support::family_naming_held(d, family(&fk))
+                    .await,
                 change,
                 vec![ts::threshold_sign(&fk[0], &bytes)],
             )
@@ -20240,6 +20295,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &comm,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "c".into(),
                     members: cm
@@ -20337,6 +20394,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "f".into(),
                 // v49.0.0 (#910): fmk[0] founds the `founder_only` family, so

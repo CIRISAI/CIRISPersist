@@ -4642,6 +4642,8 @@ mod tests {
         let community = ts::sign_community(
             "capsule-human",
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: "capsule-legacy-root".into(),
                 community_name: "legacy".into(),
                 members: vec![crate::federation::types::CommunityMember {

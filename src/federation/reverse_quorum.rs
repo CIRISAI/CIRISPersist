@@ -3985,6 +3985,8 @@ pub(crate) mod test_support {
     ) {
         let now = Utc::now();
         let community = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_key_id.to_owned(),
             community_name: format!("commons {community_key_id}"),
             members: members
@@ -4078,6 +4080,8 @@ pub(crate) mod test_support {
                 .apply_replicated_community(ts::sign_community(
                     &human,
                     Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: room.clone(),
                         community_name: "legacy infrastructure commons".into(),
                         members,
@@ -4863,6 +4867,8 @@ pub(crate) mod test_support {
             register_user_key(&peer, k).await;
         }
         let peer_community = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community.clone(),
             community_name: format!("commons {community}"),
             members: roster
@@ -5519,6 +5525,8 @@ pub(crate) mod test_support {
             crate::federation::tier_ingest::test_support::sign_community(
                 &founder,
                 Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: community.clone(),
                     community_name: format!("commons {community}"),
                     members: roster

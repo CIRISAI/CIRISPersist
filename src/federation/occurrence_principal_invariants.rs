@@ -68,6 +68,8 @@ pub(crate) mod bodies {
         d.put_community(ts::sign_community(
             comm,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.to_owned(),
                 community_name: "Room".into(),
                 members: members

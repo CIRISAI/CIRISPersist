@@ -488,6 +488,52 @@ pub(crate) fn check_proof_names_prior(
     ))
 }
 
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **a
+/// version names the head it succeeds.** The record at a version IS the
+/// lineage head, and its signed `prev_head_digest` must be the
+/// `persist_row_hash` of the version this node holds: a version that names
+/// another predecessor (or none) is not the successor of this head. Run inside
+/// each backend's supersede transaction, against the row it replaces, so the
+/// check and the write see the same head. The one exception is an accord birth
+/// the trust-root door stores over a squat or a stalled chain: its
+/// `authorization` names the replaced row, and a birth names no predecessor.
+/// An insert under an unoccupied id is
+/// not judged: a node that never held the earlier versions takes the served
+/// version as it finds it, as it always has (a served family carries no
+/// chain), so a non-empty value there is not evidence of anything.
+pub(crate) fn check_prev_head_names_held(
+    kind: &str,
+    group_key_id: &str,
+    offered_prev_head_digest: &str,
+    stored_persist_row_hash: &str,
+    authorization: Option<&serde_json::Value>,
+) -> Result<(), Error> {
+    if offered_prev_head_digest == stored_persist_row_hash {
+        return Ok(());
+    }
+    // An accord BIRTH that the trust-root door stores over a squat or a
+    // stalled chain does not succeed the row it replaces: it is a new
+    // lineage's first version (empty prev), recorded as a replacement of
+    // exactly the held row.
+    let replaces_held = authorization.is_some_and(|a| {
+        [
+            super::canonical_community::BIRTH_REPLACES_UNROOTED,
+            super::canonical_community::REBIRTH_REPLACES_STALLED,
+        ]
+        .iter()
+        .any(|label| a.get(*label).and_then(|v| v.as_str()) == Some(stored_persist_row_hash))
+    });
+    if offered_prev_head_digest.is_empty() && replaces_held {
+        return Ok(());
+    }
+    Err(Error::Conflict(format!(
+        "{kind} {group_key_id}: lineage_prev_head_mismatch — the version names \
+         prev_head_digest {named:?}, but this node holds head {stored_persist_row_hash}; \
+         a version must name the head it succeeds (CC 3.2 T6)",
+        named = offered_prev_head_digest
+    )))
+}
+
 /// The STALE refusal, spelled once for the pre-check and the in-transaction
 /// check.
 fn stale_proof(kind: &str, group_key_id: &str, named: &str, held: &str) -> Error {

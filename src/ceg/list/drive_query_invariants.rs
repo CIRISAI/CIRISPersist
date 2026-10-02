@@ -43,6 +43,8 @@ pub mod bodies {
         let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
         ts::register_identity_key(b, comm, crate::federation::types::identity_type::USER).await;
         let community = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: comm.to_owned(),
             community_name: "Room".into(),
             members: members

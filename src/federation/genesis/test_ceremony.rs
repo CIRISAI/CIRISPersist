@@ -412,6 +412,8 @@ pub fn mint_test_ceremony_scoped(
         role: Some("member".to_owned()),
     });
     let row = Community {
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
         community_key_id: CIRIS_CANONICAL_COMMUNITY_KEY_ID.to_owned(),
         community_name: "CIRIS Canonical Services".to_owned(),
         members,

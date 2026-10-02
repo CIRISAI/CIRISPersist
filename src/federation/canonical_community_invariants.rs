@@ -124,6 +124,8 @@ pub(crate) mod bodies {
             role: Some("member".to_owned()),
         });
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: CANON.to_owned(),
             community_name: "CIRIS Canonical Services".to_owned(),
             members,
@@ -359,11 +361,10 @@ pub(crate) mod bodies {
             }),
             &["B1", "C1"],
         );
-        d.put_attestation(crate::federation::SignedAttestation {
-            attestation: charter,
-        })
-        .await
-        .expect("the accord charters itself 3-of-3");
+        // v53.0.0 (CC 3.2 T6) — and the family version that names it.
+        ops::charter_family_and_version(d, charter, &["A1", "B1", "C1"])
+            .await
+            .expect("the accord charters itself 3-of-3");
     }
 
     /// (d) — CC 3.2 T3 and the community arm of `trust_root_valid`: a consumer
@@ -619,9 +620,15 @@ pub(crate) mod bodies {
     /// version signed by the first of them.
     pub(crate) async fn founders_supersede(
         d: &dyn FederationDirectory,
-        next: Community,
+        mut next: Community,
         founder_signers: &[&str],
     ) -> Result<u32, Error> {
+        // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+        next.prev_head_digest = d
+            .lookup_community(&next.community_key_id)
+            .await?
+            .map(|c| c.persist_row_hash)
+            .unwrap_or_default();
         let change = bound_envelope(d, &next, chrono::Utc::now(), |_| {}).await;
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         let sigs = founder_signers
@@ -661,17 +668,19 @@ pub(crate) mod bodies {
     /// row's chain.
     pub(crate) async fn hand_proof(
         d: &dyn FederationDirectory,
-        next: Community,
+        mut next: Community,
         signers: &[&str],
         authority: &str,
         edit: impl FnOnce(&mut serde_json::Value),
     ) -> SignedCommunity {
-        let change = bound_envelope(d, &next, chrono::Utc::now(), edit).await;
-        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         let held = cc::lookup_signed_community(d, CANON)
             .await
             .unwrap()
             .unwrap();
+        // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+        next.prev_head_digest = held.community.persist_row_hash.clone();
+        let change = bound_envelope(d, &next, chrono::Utc::now(), edit).await;
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         let mut offered = ts::sign_community(authority, next);
         offered.lineage = cc::chain_of(&held);
         offered.supersede_proof = Some(crate::federation::types::GroupSupersedeProof {
@@ -1785,10 +1794,13 @@ pub(crate) mod bodies {
         d: &dyn FederationDirectory,
         prior: &SignedCommunity,
         lineage: Vec<SignedCommunity>,
-        next: Community,
+        mut next: Community,
         signers: &[&str],
         authority: &str,
     ) -> SignedCommunity {
+        // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+        next.prev_head_digest =
+            crate::federation::types::compute_persist_row_hash(&prior.community).unwrap();
         let change = bound_envelope(d, &next, chrono::Utc::now(), |_| {}).await;
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         let mut offered = ts::sign_community(authority, next);
@@ -1865,10 +1877,13 @@ pub(crate) mod bodies {
             FOUNDERS[0],
         )
         .await;
-        assert_eq!(
+        // v53.0.0 (CC 3.2 T6) — the other path no longer reaches the held
+        // content: each version names the head it succeeds, so a path is part
+        // of the content. The v4 over it is refused all the same.
+        assert_ne!(
             crate::federation::types::compute_persist_row_hash(&v3b.community).unwrap(),
             held.community.persist_row_hash,
-            "the other path reaches the content this node holds"
+            "prev_head_digest binds the path: another path is other content"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let v4_body = with_member(v3_body, "ys2-serve-node", "member");
@@ -1998,9 +2013,21 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
+        // v53.0.0 (CC 3.2 T6) — the re-seat restores the birth's roster but
+        // not its content: it names v2 as the head it succeeds.
+        assert_ne!(
             v3.community.persist_row_hash, birth_hash,
-            "the re-seat reproduces the birth's content"
+            "prev_head_digest binds the path: the re-seat is a new version"
+        );
+        assert_eq!(
+            v3.community.members,
+            cc::lookup_signed_community(a, CANON)
+                .await
+                .unwrap()
+                .unwrap()
+                .community
+                .members,
+            "the re-seat reproduces the birth's roster"
         );
         c.put_community(v3).await.expect("c: v3");
         assert_eq!(
