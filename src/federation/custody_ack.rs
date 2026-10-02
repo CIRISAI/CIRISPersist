@@ -554,9 +554,9 @@ where
 }
 
 /// **What this node signs for `blob`** — the input of a custody report,
-/// derived from what the node holds. `here` needs the bytes on this node (a
-/// device does not report a copy it does not have) and takes its size from the
-/// stored row; the cohort is the stored row's, and a caller-named cohort that
+/// derived from what the node holds. `here` needs the blob's row on this node
+/// (a device does not report a copy it does not have) and takes its size from
+/// the stored row; the cohort is the stored row's, and a caller-named cohort that
 /// differs is refused. With no row held, only `none` can be reported, at the
 /// caller-named cohort.
 pub async fn custody_ack_input_for<B>(
@@ -579,17 +579,12 @@ where
                     h.cohort_scope
                 )));
             }
+            // The held row IS this node's copy: `blob_head` reads the same
+            // stored row `has_blob` counts, so there is no row without bytes
+            // to refuse here. (For a chunk DAG the row is the manifest; whether
+            // every chunk is also held is not asked.)
             let size = match state {
-                CustodyState::Here => {
-                    if !backend.has_blob(blob_sha256).await.map_err(blob_err)? {
-                        return Err(Error::InvalidArgument(
-                            "custody_ack_here_not_held: this node does not hold the blob's bytes, \
-                             so it cannot report `here` (CC 3.1.3.3)"
-                                .into(),
-                        ));
-                    }
-                    Some(h.size_bytes)
-                }
+                CustodyState::Here => Some(h.size_bytes),
                 CustodyState::None => None,
             };
             (h.cohort_scope.clone(), size)

@@ -434,11 +434,12 @@ pub(crate) mod bodies {
             "custody_ack_malformed",
             "I407 a commons placement",
         );
-        // The signer's instant may run at most the skew bound ahead of the
-        // receiving node's clock: a future-dated `here` cannot stay live.
-        let future = Utc::now()
-            + crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW
-            + Duration::seconds(60);
+        // The signer's instant may run at most 300 s ahead of the receiving
+        // node's clock (the universal instant gate's bound): a future-dated
+        // `here` cannot stay live.
+        // A literal, not the constant: a witness that computed its instant
+        // from the bound would move with any mutation of the bound.
+        let future = Utc::now() + Duration::seconds(300 + 60);
         let r = emit(
             d,
             &dev,
