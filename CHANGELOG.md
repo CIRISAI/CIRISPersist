@@ -26,7 +26,26 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 
 **Adopters (Edge).** Apply `key_grant:stream:v1` like the other axes; adopt each chunk at the manifest's `epoch`; tolerate zero-length terminator chunks; a v4 DAG has one more chunk per epoch than the producer wrote.
 
-**Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit).
+**Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit). I34b, I144, I202 and I204 moved to the stream shape (a terminator per epoch; one set per epoch; the authorized-but-unkeyed viewer now gets the typed refusal).
+
+**Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): twelve mutants, twelve killed.
+
+| Mutant | Result |
+|---|---|
+| M1 a fresh DEK per chunk (the legacy path always) | killed — I310 and nine more |
+| M2 the floor skips the counter check | killed — I319 |
+| M3 the terminator sealed with `last = false` | killed — I312, I310, I313 and seven more |
+| M4 no terminator at the seal | killed — I312, I202, I144 and seven more |
+| M5 the reader skips the nonce recompute | killed — I319 |
+| M6 counters unchecked | killed — I312 (unit) |
+| M7 an epoch with no `last` passes | killed — I312 (unit) |
+| M8 the seal re-grants per chunk | killed — I310, I34b and ten more |
+| M9 the retroactive walk skips stream epochs | killed — I313 |
+| M10 the stream-axis signer check dropped | killed — I313 |
+| M11 no cap roll | killed — I314 |
+| M12 no removal roll | killed — I314 |
+
+Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #969b). A rolled epoch's terminator is written at the seal, not at the roll (persist cannot take a producer's `seq` mid-stream); the epoch is closed to data at the roll.
 
 ### #973 — a charter silent on witness_quorum, or declaring 0, is in witnessed mode off
 CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quorum = 0`: silence and `0` are one state, witnessed mode off, and "a substrate MUST NOT substitute an internal default". Persist substituted a default of 1 (`DEFAULT_WITNESS_QUORUM`) for a silent charter and read `0` as `1`.
