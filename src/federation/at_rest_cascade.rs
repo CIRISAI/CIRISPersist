@@ -5998,7 +5998,7 @@ pub mod blob_invariants {
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
                 identity_key_id: identity_key_id.to_owned(),
                 occurrence_key_id: occurrence_key_id.to_owned(),
-                device_class: crate::federation::types::device_class::SERVER.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: chrono::Utc::now(),
                 valid_until: None,

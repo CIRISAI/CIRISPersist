@@ -148,7 +148,7 @@ pub mod two_node {
                             crate::federation::types::IdentityOccurrence {
                                 identity_key_id: (*ident).to_owned(),
                                 occurrence_key_id: o.key.clone(),
-                                device_class: crate::federation::types::device_class::SERVER.into(),
+                                device_class: crate::federation::types::device_class::LAPTOP.into(),
                                 hardware_attestation: None,
                                 asserted_at: chrono::Utc::now(),
                                 valid_until: None,
@@ -918,7 +918,7 @@ pub mod two_node {
                     .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
                         identity_key_id: owner.clone(),
                         occurrence_key_id: dev.key.clone(),
-                        device_class: crate::federation::types::device_class::SERVER.into(),
+                        device_class: crate::federation::types::device_class::LAPTOP.into(),
                         hardware_attestation: None,
                         asserted_at: chrono::Utc::now(),
                         valid_until: None,
@@ -3449,7 +3449,7 @@ mod tests {
                 |occ: &str, pk: EncryptionPubkeys| crate::federation::types::IdentityOccurrence {
                     identity_key_id: owner.clone(),
                     occurrence_key_id: occ.to_owned(),
-                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    device_class: crate::federation::types::device_class::LAPTOP.into(),
                     hardware_attestation: None,
                     asserted_at: chrono::Utc::now(),
                     valid_until: None,
