@@ -35333,7 +35333,7 @@ mod tests {
             |occ_key: &str, enc: Option<EncryptionPubkeys>| crate::federation::IdentityOccurrence {
                 identity_key_id: root.clone(),
                 occurrence_key_id: occ_key.into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: now,
                 valid_until: None,
@@ -35464,7 +35464,7 @@ mod tests {
             crate::federation::IdentityOccurrence {
                 identity_key_id: identity.into(),
                 occurrence_key_id: occ_key.into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: now,
                 valid_until: None,
@@ -35479,7 +35479,7 @@ mod tests {
         let bare = |occ_key: &str, identity: &str| crate::federation::IdentityOccurrence {
             identity_key_id: identity.into(),
             occurrence_key_id: occ_key.into(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: now,
             valid_until: None,
@@ -35658,7 +35658,7 @@ mod tests {
             crate::federation::IdentityOccurrence {
                 identity_key_id: identity.into(),
                 occurrence_key_id: occ_key.into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: now,
                 valid_until: None,
@@ -35673,7 +35673,7 @@ mod tests {
         let bare = |occ_key: &str, identity: &str| crate::federation::IdentityOccurrence {
             identity_key_id: identity.into(),
             occurrence_key_id: occ_key.into(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: now,
             valid_until: None,
@@ -36265,7 +36265,7 @@ mod tests {
             crate::federation::IdentityOccurrence {
                 identity_key_id: identity.into(),
                 occurrence_key_id: occ_key.into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: now,
                 valid_until: None,
@@ -48211,7 +48211,7 @@ mod tests {
             .put_identity_occurrence_local(crate::federation::IdentityOccurrence {
                 identity_key_id: root.clone(),
                 occurrence_key_id: occ.clone(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
                 valid_until: None,
@@ -50178,7 +50178,7 @@ mod tests {
             identity_occurrence: crate::federation::IdentityOccurrence {
                 identity_key_id: id_key.clone(),
                 occurrence_key_id: occ_key.clone(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at,
                 valid_until: None,
@@ -50383,7 +50383,7 @@ mod tests {
             .put_identity_occurrence_local(crate::federation::IdentityOccurrence {
                 identity_key_id: id_key.clone(),
                 occurrence_key_id: occ_key.clone(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: chrono::Utc.with_ymd_and_hms(2026, 6, 8, 0, 0, 0).unwrap(),
                 valid_until: None,

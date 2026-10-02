@@ -113,6 +113,40 @@ I350–I355 move to the one-artifact shape. A record whose content is changed af
 | M10 the birth is not read from the bundle | killed — I351 |
 | M11 a recovery key may be a holder key | killed — I420 |
 | M12 a recovery key may be shared | killed — I420 |
+### S1 — one audience resolver; per-node cohorts (#963, CIRISEdge#761; CC 3.3.7, 5.4.6, 6.1.5.3)
+New module `federation::replication_audience`: the sender's set, the receiver's hold decision and edge's serve gate now answer "may this node have this row" through one resolver.
+
+- **The per-node allow list** (operator ruling 2026-10-02) is the optional `cohorts` member of the owner's `consent:replication` grant FOR a node: `[{scope, target}]`, `scope` ∈ `family` | `community` | `affiliations`, sorted by (scope, target) as UTF-8 bytes, deduplicated; `[]` = explicitly none; absent = the node class default. Refused: unsorted, duplicate, unknown scope (`self` is never listed), empty target, unknown entry member; a list on a grant with no `for_key_id`; a list on a node's grant for itself (`consent_cohorts_not_owner_grant`). Several live lists from the owner for one node intersect until one is retired.
+- **Class default**, from the `device_class` of the owner's occurrence of the node (never the key record): personal (`phone` | `laptop`) receives every owner cohort; server class (`server` | `embedded` | `service` | `agent`) receives no `self` and no `family` content but keeps its owner's rooms (CC 3.3.7's text). A node with no live occurrence for the owner is not the owner's device: an owner binding alone no longer makes a node party to its owner's self/family content.
+- **Receiver:** `hold::is_audience` (and so `would_hold`) applies the list on the self, family and room arms; `audience_memberships` takes the cohort scope. **Sender:** `self_collective::send_set_for` keeps only nodes the list lets through (a `family` send unions over the principals' families; the receiver decides per row).
+- **Readers:** `is_public_group`, `audience_nodes(scope, target)`, `may_receive(recipient, row)` (origin, refers-to, an owner's grant FOR another node goes no further, public, cohort), `may_receive_group_plane(recipient, scope, group, named)` for CIRISEdge#761 (public groups to every peer; a private group's records and planes to members' nodes, live invitees' nodes with full history, and the named member's nodes). `membership_acceptance::live_invitees_of`.
+- **`KindPolicy.audience`** (`ServeAudience::{Cohort, MembershipPlane, Public}`). Pins moved: `REPLICATION_POLICY_HASH` → `1860451c…3869`; `CONSENT_GRAMMAR_HASH` → `4d473eac…e843`.
+- Witnesses I390–I399 (`federation/replication_audience_invariants.rs`; memory, sqlite, postgres; I395 sqlite/postgres). I199's fixture moves its member devices to `laptop` (a server-class device now holds no family content by default).
+
+- **Keys follow the same rule** (coordinator ruling): a node that may not receive a cohort's content gets no wrap of its key, or the deny would be cosmetic. The self/family fan-out (`at_rest_cascade::resolve_recipients`), the newcomer re-keys, the community epoch fan-out and the device re-wraps ask `replication_audience::occurrence_may_hold_key` (the body `owner_node_receives` delegates to). A deny added later rolls the key: #969's stream roll already compares held grants against the (now filtered) set, and a room's epoch now rotates when a held recipient leaves its fan-out, as on a removal. A key-grant set reaches only its cohort's audience, never a device it merely names. New refusal `device_rekey_not_in_audience`. Witnesses I392c, I393b, I394b (sqlite, postgres), I314d (#969 pair harness), I397's key-set leg. Wrap mutants W2–W7: six of six killed (keyable admits all — I393b/I394b/I314d; room fan-out unfiltered, room key ignores the list — I392c/I393b; no rotation on a departure — I392c; every device exempt as the singleton — six witnesses; key sets reach by naming — I397).
+
+**Mutation round** (on the committed tree `7e052a52`; lane = `replication_audience_invariants` + `self_collective_invariants`, memory + sqlite): sixteen mutants, sixteen killed.
+
+| Mutant | Result |
+|---|---|
+| M1 the server default lets family through | killed — I394 |
+| M2 `self` reaches every class | killed — I394 |
+| M3 a present list is ignored | killed — I393, I394, I399 |
+| M3b a list admits every group | killed — I393, I394, I396, I399 |
+| M4 live lists do not intersect (the last wins) | killed — I399 |
+| M5 a retired grant's list still counts | killed — I399 |
+| M6 every claimed node is personal | killed — I394 |
+| M7 the room arm skips the owner's list | killed — I393, I394, I396, I398, I399 |
+| M8 the family arm skips the owner's list | killed — I393, I394, I398 |
+| M9 the family send set skips the list | killed — I393 |
+| M10 an owner's grant for another node reaches a sibling | killed — I397 |
+| M11 the accord family is not public | killed — I390 |
+| M12 a declined invitation stays live | killed — I395 |
+| M13 an unsorted list is admitted | killed — I396 |
+| M14 a node's grant for itself may carry a list | killed — I396 |
+| M15 the self arm asks no list | killed — I393, I394, I398 |
+
+**Adopters.** Edge: re-pin both hashes; the serve gate calls `may_receive` per row per peer for `cohort` kinds and `may_receive_group_plane` for `membership_plane` kinds (#760's record gate becomes the latter; the public-group exemption keeps `ciris-canonical`, the accord family, conferring and WA families reaching everyone); CIRISEdge#763 reads `audience_nodes`. Server: the consent UI writes `cohorts` on the owner's grant for a node (with `for_key_id`), and claims a device with its real `device_class` — an `agent` or `server` occurrence no longer receives the owner's self/family content unless listed.
 
 ### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
 

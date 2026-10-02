@@ -37,7 +37,11 @@ pub(crate) mod bodies {
         d.put_identity_occurrence_local(IdentityOccurrence {
             identity_key_id: identity.to_owned(),
             occurrence_key_id: occurrence.to_owned(),
-            device_class: crate::federation::types::device_class::SERVER.to_owned(),
+            // v53.0.0 (#963, CC 3.3.7) — the owner's PERSONAL device: a
+            // server-class occurrence receives none of its owner's `self`
+            // content by default, and these witnesses are about the
+            // self-collective reaching the owner's own devices.
+            device_class: crate::federation::types::device_class::LAPTOP.to_owned(),
             hardware_attestation: None,
             asserted_at: chrono::Utc::now(),
             valid_until: None,
@@ -78,8 +82,11 @@ pub(crate) mod bodies {
         let phone = format!("i137-phone-{s}");
         ts::register_identity_key(d, &phone, USER).await;
         bind(d, &owner, &phone, None).await;
-        // A node the owner OWNS but never bound as a KEM occurrence still
-        // receives the owner's rows: ownership is the endpoint fact.
+        // v53.0.0 (#963, CC 3.3.7) — a node the owner OWNS but never bound as
+        // an occurrence is not one of the owner's devices: it receives none of
+        // the owner's self content (it still SENDS — its principal is its
+        // owner by `owner_of`). Before v53 ownership alone was the endpoint
+        // fact (#884).
         let node_c = format!("i137-node-c-{s}");
         ts::register_identity_key(d, &node_c, crate::federation::types::identity_type::NODE).await;
         ts::put_owner_binding(d, &owner, &node_c).await;
@@ -107,8 +114,8 @@ pub(crate) mod bodies {
             "I137: an occurrence that owns no node is not an endpoint: {self_set:?}"
         );
         assert!(
-            self_set.contains(&node_c),
-            "I137: an owned node that is no KEM occurrence is still an endpoint: {self_set:?}"
+            !self_set.contains(&node_c),
+            "I137: an owned node with no occurrence is not the owner's device (CC 3.3.7): {self_set:?}"
         );
         let c_set =
             crate::federation::self_collective::send_set_for(d, &node_c, cohort_scope::SELF)

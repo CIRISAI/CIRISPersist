@@ -21923,17 +21923,20 @@ mod tests {
         assert_eq!(app_dests[0].transport_kind, "reticulum");
         assert_eq!(app_dests[0].destination, "dest-hash-app");
 
-        // (2) Both occurrences are valid wrap targets → neither
-        // fail-secure-excluded. `self_dek_granted` counts both (0 grants
-        // each since no prior self-blobs existed, but they are in the
-        // cohort). The cascade composes over the v6.2.0 re-key.
+        // (2) Neither occurrence is fail-secure-excluded. v53.0.0 (#963,
+        // CC 3.3.7 and the coordinator ruling): only the APP occurrence (a
+        // personal device) is in the self key cohort — the AGENT occurrence
+        // is server class and receives none of its owner's `self` content,
+        // so no `self` key, unless the owner's grant for it lists the cohort
+        // (and `self` is never listed). The cascade composes over the v6.2.0
+        // re-key.
         assert!(
             outcome.self_dek_excluded.is_empty(),
             "no fail-secure exclusions"
         );
         assert_eq!(
-            outcome.self_dek_granted, 2,
-            "both occurrences in self cohort"
+            outcome.self_dek_granted, 1,
+            "the app occurrence is in the self cohort; the agent is not"
         );
     }
 
@@ -21999,7 +22002,7 @@ mod tests {
                     .put_identity_occurrence_local(types::IdentityOccurrence {
                         identity_key_id: identity_key,
                         occurrence_key_id: occ,
-                        device_class: types::device_class::SERVER.into(),
+                        device_class: types::device_class::LAPTOP.into(),
                         hardware_attestation: None,
                         asserted_at: chrono::Utc::now(),
                         valid_until: None,
@@ -22286,7 +22289,8 @@ mod tests {
 
         assert!(outcome.delegation_promoted);
         assert!(outcome.self_dek_excluded.is_empty());
-        assert_eq!(outcome.self_dek_granted, 2);
+        // v53.0.0 (#963) — the agent occurrence is server class: no self key.
+        assert_eq!(outcome.self_dek_granted, 1);
         assert_eq!(outcome.transport_destinations_registered, 1);
 
         let dir = engine.federation_directory();

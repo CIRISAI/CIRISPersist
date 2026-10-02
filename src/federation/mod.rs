@@ -455,6 +455,11 @@ pub mod renditions;
 // the CC-blocked registry finding + the replication decision.
 pub mod regime;
 pub mod replication;
+// v53.0.0 (CIRISPersist#963 / CIRISEdge#761) — the one audience resolver:
+// per-node cohort allow lists, public groups, `may_receive`.
+pub mod replication_audience;
+#[cfg(test)]
+pub mod replication_audience_invariants;
 pub mod replication_policy;
 pub mod rooting;
 // v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.
@@ -872,6 +877,10 @@ pub const DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE: &str = "device_rekey_member_not_a
 /// `encryption_pubkeys`: there is nothing to wrap to, and there is no
 /// plaintext fallback (§10.1.4).
 pub const DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS: &str = "device_rekey_no_encryption_pubkeys";
+/// v53.0.0 (CIRISPersist#963, CC 3.3.7) — the member's per-node allow list
+/// (or, absent one, the device's class) keeps this room off the device: a
+/// node that may not receive a cohort's content gets no key for it.
+pub const DEVICE_REKEY_RULE_NOT_IN_AUDIENCE: &str = "device_rekey_not_in_audience";
 
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
 /// state a standing question is asked against: each key that has appeared, and

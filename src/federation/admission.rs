@@ -14025,6 +14025,17 @@ pub async fn check_consent_for_key_admission(
         return Ok(());
     };
     if for_key == row.attesting_key_id {
+        // v53.0.0 (#963, CC 3.3.7) — a node naming itself is a node-to-peer
+        // grant, and the cohort allow list rides only an OWNER's grant for
+        // the node (the grammar already refuses it with no `for_key_id`).
+        if env.get("payload").and_then(|p| p.get("cohorts")).is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "consent_cohorts_not_owner_grant: a consent:replication grant by {for_key} for \
+                 itself carries \"cohorts\" — the per-node allow list rides only the owner's \
+                 grant for one of their own nodes, never a node-to-peer grant (CC 3.3.7, \
+                 CIRISPersist#963)"
+            )));
+        }
         return Ok(());
     }
     let Some(rec) = directory.lookup_public_key(&row.attesting_key_id).await? else {
