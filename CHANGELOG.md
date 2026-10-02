@@ -16,7 +16,7 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 - **V168** (both dialects, checksums pinned): `federation_stream_deks` (the epoch's DEK, self-retained; `closed_at`, `terminated_at`, the V146 ledger column) and `federation_stream_dek_grants` (a union, keyed by sealer).
 - **The seal.** `put_blob_chunk_scoped` at self/family mints the epoch's DEK on its first chunk and seals with `stream_nonce(dek, stream_id, epoch, counter, last)` under the unchanged position AAD. `counter` is the V165 count; the chunk floor re-checks it in the insert's transaction (`StreamClaim.stream_key`) and refuses a moved counter (`stream_counter_moved`, nothing stored, the door re-seals). The chunk row's epoch is the DEK's epoch.
 - **One set per epoch.** The epoch's DEK is wrapped at its first chunk and to any recipient who joins later; the stream-axis set (`key_grant:stream:v1`, plane token `"stream"`, appended; registered per the #975 ruling, the existing types unchanged) is emitted then, never per chunk. Admission: the signer must speak for the stream's owner where this node holds the stream; elsewhere the wraps land under the signer as sealer, and a reader takes a wrap only from a sealer speaking for the owner. `RekeyResult.changed_streams` (and the Python `changed_streams`) carries the retroactive walk over stream epochs — O(epochs).
-- **Rolls and terminators.** An epoch closes to data when the next chunk would take the cap's last counter (reserved for the terminator) or when a granted recipient has left the cohort (removal: forward secrecy); the next append mints E+1. The seal appends one empty `last_flag` chunk per unterminated epoch; the floor stamps the epoch terminated in that transaction and refuses anything after it (`stream_epoch_closed`).
+- **Rolls and terminators.** An epoch rolls when the next chunk would take the cap's last counter (reserved for the terminator), when a granted recipient has left the cohort (removal: forward secrecy), or when the producer names a higher epoch. At the roll persist writes the outgoing epoch's terminator — empty, `last_flag = 1`, at the epoch's next counter, under its DEK — at a position persist allocates (`seq = 2^62 + epoch`; a producer's seq below that is required), and the next append mints E+1. The seal terminates any epoch still open. The floor stamps the epoch closed and terminated in the terminator's insert transaction and refuses anything after it (`stream_epoch_closed`).
 - **Manifest v4** = v2 + `"chunk_keys":"stream_epoch"` + each chunk's `epoch`, sealed; v3 children are v4. No member ⇒ legacy per-chunk keys, read as before. A stream that held per-chunk-keyed chunks before v53 stays per-chunk to its seal. `SealedManifestView.chunks[].epoch` tells the puller where to adopt each chunk.
 - **Reads.** A v4 chunk opens under the viewer's stream grant of its epoch; the stored nonce must BE the recomputed STREAM nonce. The whole read and the promote (from the stored nonces, no key — I45) check each epoch's counters 0, 1, 2, … and its single final `last`; a truncated DAG is refused. A live read by position uses a per-chunk grant if held, else the stream grant.
 - **Readiness door.** `Engine::sealed_dag_readiness` / `sealed_dag_readiness_json` → `{sha256_hex, chunk_keys, held, readable, missing, not_held}` from grant rows, no chunk opened: per epoch (`{axis: "stream", stream_id, epoch, seq_from, seq_to}`) for v4, per chunk (`{axis: "content", seq, chunk_sha256}`) for legacy.
@@ -28,7 +28,7 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 
 **Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit). I34b, I144, I202 and I204 moved to the stream shape (a terminator per epoch; one set per epoch; the authorized-but-unkeyed viewer now gets the typed refusal).
 
-**Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): twelve mutants, twelve killed.
+**Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): fourteen mutants, fourteen killed.
 
 | Mutant | Result |
 |---|---|
@@ -44,8 +44,10 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 | M10 the stream-axis signer check dropped | killed — I313 |
 | M11 no cap roll | killed — I314 |
 | M12 no removal roll | killed — I314 |
+| M13 the removal roll closes without a terminator | killed — I314b |
+| M14 the cap roll closes without a terminator | killed — I314 |
 
-Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #969b). A rolled epoch's terminator is written at the seal, not at the roll (persist cannot take a producer's `seq` mid-stream); the epoch is closed to data at the roll.
+Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #969b).
 
 ### CC 1.0-rc6 re-vendored (tag v1.0-rc6)
 The two vendored CC files move from `651140a` to CIRISConstitution tag **`v1.0-rc6`** (commit `3c3e63fdef844f2f849e43081a8242e31cfaf30d`, annotated tag `b9d8cba`). They were first copied at `1f45ebe` ("Cut 1.0-rc6, released as guidance: re-pin 10") before the tag existed; both manifests have the same blob ids at `1f45ebe` and at the tag, so the bytes are unchanged and only the recorded commit moved. **`scripts/check_vendored_cc.sh <cc-tag>`** (new; a ship step, not CI) fetches CC at a tag and compares both files byte for byte, exiting 1 on any difference and 2 on a missing tag or fetch failure; `scripts/check_vendored_cc.sh v1.0-rc6` passes, and fails on a copy altered by one byte. `scripts/release_ship.sh` names the step, and now pushes `refs/tags/v$ver` explicitly (a branch of the same name made the bare push ambiguous at v52.0.1).

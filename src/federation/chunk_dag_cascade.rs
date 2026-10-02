@@ -321,7 +321,7 @@ pub mod orchestrate {
                         },
                         seq,
                         plaintext,
-                        &bound_aad,
+                        aad,
                         state,
                     )
                     .await;
@@ -464,13 +464,15 @@ pub mod orchestrate {
 
     /// v53.0.0 (#969) — the epoch's DEK row: the stream's newest when it is
     /// the target, else minted (a fresh DEK, self-retained under the content
-    /// master) — closing the previous epoch to data first, so a stream has
-    /// ONE open epoch. Two racing first chunks resolve to one row
+    /// master) — TERMINATING the previous epoch first (the producer rolled
+    /// to a higher label), so a stream has ONE open epoch and every epoch it
+    /// leaves carries its `last`. Two racing first chunks resolve to one row
     /// (`stream_dek_insert` returns the stored row).
     async fn ensure_stream_epoch<B>(
         backend: &B,
         w: StreamWrite<'_>,
         latest: Option<crate::federation::StreamDekRecord>,
+        aad: Option<&[u8]>,
     ) -> Result<crate::federation::StreamDekRecord, BlobError>
     where
         B: BlobStorage + Sync,
@@ -480,8 +482,8 @@ pub mod orchestrate {
             if l.epoch == target {
                 return Ok(l);
             }
-            if !l.closed {
-                backend.stream_dek_close(w.stream_id, l.epoch).await?;
+            if !l.terminated {
+                write_terminator(backend, w, l, aad).await?;
             }
         }
         let dek = fresh_dek().map_err(map_at_rest_err)?;
@@ -637,12 +639,23 @@ pub mod orchestrate {
         w: StreamWrite<'_>,
         seq: u64,
         plaintext: &[u8],
-        bound_aad: &[u8],
+        aad: Option<&[u8]>,
         first_state: crate::federation::StreamKeyState,
     ) -> Result<PutChunkScopedResult, BlobError>
     where
         B: BlobStorage + FederationDirectory + Sync,
     {
+        // The terminators' positions are persist's (`terminator_seq`); a
+        // producer's data chunk stays below them.
+        if seq >= TERMINATOR_SEQ_BASE {
+            return Err(BlobError::InvalidArgument(format!(
+                "put_blob_chunk_scoped: seq {seq} is in the range persist reserves for epoch \
+                 terminators (≥ {TERMINATOR_SEQ_BASE}); a producer's seq stays below it \
+                 (CIRISPersist#969)"
+            )));
+        }
+        let bound_aad = chunk_aad(aad, w.stream_id, seq);
+        let bound_aad = bound_aad.as_slice();
         let plaintext_size = plaintext.len() as u64;
         let mut state = Some(first_state);
         for _ in 0..STREAM_SEAL_ATTEMPTS {
@@ -650,11 +663,12 @@ pub mod orchestrate {
                 Some(s) => s.latest,
                 None => backend.stream_key_state(w.stream_id).await?.latest,
             };
-            let rec = ensure_stream_epoch(backend, w, latest).await?;
+            let rec = ensure_stream_epoch(backend, w, latest, aad).await?;
             // The terminator's slot is the cap's last: a data chunk that
-            // would take it rolls the epoch instead (CEG §10.5.3).
+            // would take it rolls the epoch instead (CEG §10.5.3) — the
+            // outgoing epoch's terminator takes that slot now.
             if rec.chunk_count.saturating_add(1) >= crate::federation::blobs::MAX_CHUNKS_PER_EPOCH {
-                backend.stream_dek_close(w.stream_id, rec.epoch).await?;
+                write_terminator(backend, w, rec, aad).await?;
                 continue;
             }
             let (targets, report) =
@@ -674,8 +688,8 @@ pub mod orchestrate {
                 targets.iter().map(|(k, _)| k.as_str()).collect();
             if held.iter().any(|r| !current.contains(r.as_str())) {
                 // A recipient the epoch was granted to is no longer in the
-                // cohort: close it to data and seal under a fresh epoch.
-                backend.stream_dek_close(w.stream_id, rec.epoch).await?;
+                // cohort: terminate it and seal under a fresh epoch.
+                write_terminator(backend, w, rec, aad).await?;
                 continue;
             }
             let dek = stream_epoch_dek(backend, &rec).await?;
@@ -751,104 +765,132 @@ pub mod orchestrate {
         )))
     }
 
-    /// v53.0.0 (#969, CC 5.3.3.1) — **close every epoch with its terminator**:
-    /// for each of the stream's epochs not yet terminated, an empty chunk
-    /// sealed with `last_flag = 0x01` at the epoch's next counter, appended
-    /// at the stream's next `seq`. The floor stamps the epoch terminated in
-    /// the terminator's own transaction, so nothing can follow it. Returns
-    /// how many terminators were written. Idempotent: a terminated epoch is
-    /// skipped.
+    /// v53.0.0 (#969) — the first `seq` persist reserves for epoch
+    /// terminators. A terminator's position is persist's own act — the roll
+    /// is — so it is allocated by persist, not taken from the producer:
+    /// epoch E's terminator sits at `TERMINATOR_SEQ_BASE + E`. It sorts after
+    /// every data chunk (a producer's seq is refused at or above the base),
+    /// so in seq order each epoch's terminator is its final chunk, and a
+    /// manifest's positions stay strictly increasing. `2^62` keeps every
+    /// position inside the index's signed 64-bit column.
+    pub(crate) const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
+
+    /// The position of epoch `epoch`'s terminator.
+    pub(crate) fn terminator_seq(epoch: u64) -> Result<u64, BlobError> {
+        TERMINATOR_SEQ_BASE
+            .checked_add(epoch)
+            .filter(|s| i64::try_from(*s).is_ok())
+            .ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "stream epoch {epoch} is past the terminator range (CIRISPersist#969)"
+                ))
+            })
+    }
+
+    /// v53.0.0 (#969, CC 5.3.3.1) — **terminate one epoch**: an empty chunk
+    /// sealed under the epoch's DEK with `last_flag = 0x01` at the epoch's
+    /// next counter (the V165 count), at `terminator_seq(epoch)`. The floor
+    /// stamps the epoch closed AND terminated in the terminator's own insert
+    /// transaction — that IS the roll's close — so nothing can follow it.
+    /// Called at every roll (cap, removal, a producer's higher label) and at
+    /// the seal. Idempotent: an epoch found terminated is done.
+    async fn write_terminator<B>(
+        backend: &B,
+        w: StreamWrite<'_>,
+        rec: crate::federation::StreamDekRecord,
+        aad: Option<&[u8]>,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        if rec.owner_key_id != w.writer_key_id {
+            return Err(BlobError::InvalidArgument(format!(
+                "stream {} epoch {} was sealed by another writer; a terminator is appended only \
+                 by the stream's single sender (CC 5.3.3.1)",
+                w.stream_id, rec.epoch
+            )));
+        }
+        let seq = terminator_seq(rec.epoch)?;
+        let dek = stream_epoch_dek(backend, &rec).await?;
+        let mut rec = rec;
+        for _ in 0..STREAM_SEAL_ATTEMPTS {
+            if rec.terminated {
+                return Ok(());
+            }
+            let counter = u32::try_from(rec.chunk_count).map_err(|_| {
+                BlobError::Backend(format!(
+                    "stream {} epoch {} past the STREAM counter",
+                    w.stream_id, rec.epoch
+                ))
+            })?;
+            let slot = crate::federation::StreamKeySlot {
+                counter,
+                last: true,
+            };
+            let bound = chunk_aad(aad, w.stream_id, seq);
+            let envelope = seal_stream_chunk(&dek, w.stream_id, rec.epoch, slot, &[], &bound)?;
+            match backend
+                .put_blob_chunk_with_scope(
+                    w.stream_id,
+                    seq,
+                    BlobBody::Inline(envelope.to_bytes()),
+                    rec.epoch,
+                    0,
+                    w.cohort_scope,
+                    StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                    None,
+                    StreamClaim {
+                        community_key_id: w.community_key_id.map(str::to_owned),
+                        owner_key_id: Some(w.writer_key_id.to_owned()),
+                        stream_key: Some(slot),
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(BlobError::InvalidArgument(m))
+                    if m.starts_with(crate::federation::blobs::STREAM_COUNTER_MOVED)
+                        || m.starts_with(crate::federation::blobs::STREAM_EPOCH_CLOSED) =>
+                {
+                    let epoch = rec.epoch;
+                    rec = backend
+                        .stream_dek_list(w.stream_id)
+                        .await?
+                        .into_iter()
+                        .find(|r| r.epoch == epoch)
+                        .ok_or_else(|| {
+                            BlobError::Backend(format!(
+                                "stream {} epoch {epoch} lost its DEK row",
+                                w.stream_id
+                            ))
+                        })?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(BlobError::Backend(format!(
+            "stream {} epoch {} could not settle its terminator",
+            w.stream_id, rec.epoch
+        )))
+    }
+
+    /// v53.0.0 (#969) — **close every epoch with its terminator** at the
+    /// seal ([`write_terminator`] for each epoch not yet terminated). Returns
+    /// how many were written.
     async fn terminate_stream_epochs<B>(
         backend: &B,
         w: StreamWrite<'_>,
-        next_seq: u64,
         aad: Option<&[u8]>,
     ) -> Result<u64, BlobError>
     where
         B: BlobStorage + Sync,
     {
-        let mut seq = next_seq;
         let mut written = 0u64;
         for rec in backend.stream_dek_list(w.stream_id).await? {
             if rec.terminated {
                 continue;
             }
-            if rec.owner_key_id != w.writer_key_id {
-                return Err(BlobError::InvalidArgument(format!(
-                    "seal_stream_scoped: stream {} epoch {} was sealed by another writer; a \
-                     terminator is appended only by the stream's single sender (CC 5.3.3.1)",
-                    w.stream_id, rec.epoch
-                )));
-            }
-            let dek = stream_epoch_dek(backend, &rec).await?;
-            let mut rec = rec;
-            let mut done = false;
-            for _ in 0..STREAM_SEAL_ATTEMPTS {
-                let counter = u32::try_from(rec.chunk_count).map_err(|_| {
-                    BlobError::Backend(format!(
-                        "stream {} epoch {} past the STREAM counter",
-                        w.stream_id, rec.epoch
-                    ))
-                })?;
-                let slot = crate::federation::StreamKeySlot {
-                    counter,
-                    last: true,
-                };
-                let bound = chunk_aad(aad, w.stream_id, seq);
-                let envelope = seal_stream_chunk(&dek, w.stream_id, rec.epoch, slot, &[], &bound)?;
-                match backend
-                    .put_blob_chunk_with_scope(
-                        w.stream_id,
-                        seq,
-                        BlobBody::Inline(envelope.to_bytes()),
-                        rec.epoch,
-                        0,
-                        w.cohort_scope,
-                        StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
-                        None,
-                        StreamClaim {
-                            community_key_id: w.community_key_id.map(str::to_owned),
-                            owner_key_id: Some(w.writer_key_id.to_owned()),
-                            stream_key: Some(slot),
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        done = true;
-                        break;
-                    }
-                    Err(BlobError::InvalidArgument(m))
-                        if m.starts_with(crate::federation::blobs::STREAM_COUNTER_MOVED) =>
-                    {
-                        rec = backend
-                            .stream_dek_list(w.stream_id)
-                            .await?
-                            .into_iter()
-                            .find(|r| r.epoch == rec.epoch)
-                            .ok_or_else(|| {
-                                BlobError::Backend(format!(
-                                    "stream {} epoch {} lost its DEK row",
-                                    w.stream_id, rec.epoch
-                                ))
-                            })?;
-                        if rec.terminated {
-                            done = true;
-                            break;
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            if !done {
-                return Err(BlobError::Backend(format!(
-                    "seal_stream_scoped: stream {} epoch {} could not settle its terminator",
-                    w.stream_id, rec.epoch
-                )));
-            }
-            seq = seq.checked_add(1).ok_or_else(|| {
-                BlobError::InvalidArgument("seal_stream_scoped: seq overflow".into())
-            })?;
+            write_terminator(backend, w, rec, aad).await?;
             written += 1;
         }
         Ok(written)
@@ -981,13 +1023,6 @@ pub mod orchestrate {
                      in the community_key_id argument"
                 ))
             })?;
-            let next_seq = listing
-                .chunks
-                .last()
-                .map_or(Some(0), |c| c.seq.checked_add(1))
-                .ok_or_else(|| {
-                    BlobError::InvalidArgument("seal_stream_scoped: seq overflow".into())
-                })?;
             let w = StreamWrite {
                 cohort_scope,
                 group_key_id: group,
@@ -996,7 +1031,7 @@ pub mod orchestrate {
                 stream_id,
                 epoch: 0,
             };
-            if terminate_stream_epochs(backend, w, next_seq, aad).await? > 0 {
+            if terminate_stream_epochs(backend, w, aad).await? > 0 {
                 listing = backend.stream_chunks(stream_id).await?;
                 check_chunk_rows_match_dag(
                     backend,

@@ -232,7 +232,12 @@ pub(crate) mod bodies {
         assert_eq!(view.chunks.len(), 4);
         assert_eq!(
             view.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3]
+            vec![
+                0,
+                1,
+                2,
+                crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE
+            ]
         );
         assert_eq!(view.chunks[3].size, 0, "the terminator is empty");
         assert_eq!(view.chunks[1].size, 900);
@@ -331,7 +336,7 @@ pub(crate) mod bodies {
         engine_b
             .adopt_sealed_chunk(
                 &v3.stream_id,
-                1,
+                v3.chunks[1].seq,
                 &chunk_env(&v3.chunks[1].sha256_hex).await,
                 0,
                 0,

@@ -19,7 +19,12 @@
 //!   re-grant per epoch, not per chunk. A stranger keeps `NotGranted`.
 //! - **I314** (sqlite, postgres) — an append that would take the epoch's last
 //!   counter (reserved for the terminator) rolls to E+1 under a fresh DEK
-//!   with its own set, counter reset; the seal terminates both epochs.
+//!   with its own set, counter reset; E's terminator is written AT THE ROLL
+//!   in the slot the cap reserved.
+//! - **I314b** (sqlite, postgres) — a REMOVAL roll writes the outgoing
+//!   epoch's terminator at the roll: the epoch, never sealed, carries exactly
+//!   one `last`, its final chunk, at persist's own position
+//!   (`TERMINATOR_SEQ_BASE + epoch`), and reads by position.
 //! - **I315** (sqlite, postgres) — a stream that already holds per-chunk-keyed
 //!   chunks (the v52 shape) stays per-chunk to its seal, seals as v2, and
 //!   reads whole and by range.
@@ -238,8 +243,11 @@ pub(crate) mod bodies {
         let last = listing.chunks.last().unwrap();
         assert_eq!(
             (last.seq, last.plaintext_size),
-            (5, 0),
-            "I312: the terminator"
+            (
+                crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE,
+                0
+            ),
+            "I312: the terminator, at persist's position for epoch 0"
         );
         let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
         let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
@@ -387,7 +395,7 @@ pub(crate) mod bodies {
                 stream_id: stream.clone(),
                 epoch: 0,
                 seq_from: 0,
-                seq_to: 12
+                seq_to: crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE
             }],
             "I313: O(epochs) — one entry"
         );
@@ -571,8 +579,8 @@ pub(crate) mod bodies {
         let deks = p.sa.stream_dek_list(&stream).await.unwrap();
         assert_eq!(deks.len(), 2);
         assert!(
-            deks[0].closed && !deks[0].terminated,
-            "I314: E closed to data"
+            deks[0].closed && deks[0].terminated,
+            "I314: the roll terminated E (its last written at the roll, not at a seal)"
         );
         assert_ne!(
             deks[0].self_retention_wrap, deks[1].self_retention_wrap,
@@ -614,7 +622,13 @@ pub(crate) mod bodies {
         assert!(deks.iter().all(|d| d.terminated), "I314: {deks:?}");
         let listing = p.sa.stream_chunks(&stream).await.unwrap();
         let dek0 = epoch_dek(p.sa.as_ref(), &stream, 0).await;
-        let t0 = listing.chunks.iter().find(|c| c.seq == 4).unwrap();
+        let t0 = listing
+            .chunks
+            .iter()
+            .find(|c| {
+                c.seq == crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE
+            })
+            .unwrap();
         assert_eq!(t0.epoch, 0);
         assert_eq!(
             crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
@@ -688,6 +702,41 @@ pub(crate) mod bodies {
         assert!(
             !after.iter().any(|w| w.recipient_key_id == p.key_b),
             "I314: the removed device holds no wrap of E+1: {after:?}"
+        );
+        // I314b — the epoch the removal closed carries exactly one `last`, as
+        // its final chunk, though the stream was NEVER sealed: the roll
+        // wrote it. Read from the stored nonces (no key), and by position.
+        let rows = p.sa.stream_chunks(&gone).await.unwrap().chunks;
+        let mut slots = Vec::new();
+        for c in rows.iter().filter(|c| c.epoch == 0) {
+            let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+                &inline(p.sa.as_ref(), &c.chunk_sha).await,
+            )
+            .unwrap();
+            let (counter, last) = crate::federation::stream_seal::parse_nonce(&env.nonce).unwrap();
+            slots.push((c.seq, c.epoch, StreamKeySlot { counter, last }));
+        }
+        assert_eq!(
+            slots.iter().filter(|(_, _, s)| s.last).count(),
+            1,
+            "I314b: exactly one last in the removed epoch: {slots:?}"
+        );
+        check_stream_epoch_structure(&[0; 32], &slots)
+            .expect("I314b: the unsealed, rolled epoch is whole");
+        assert_eq!(
+            p.a.read_stream_chunk_as(
+                &gone,
+                crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE,
+                &p.key_a,
+                None
+            )
+            .await
+            .expect("I314b: the terminator reads by position"),
+            Vec::<u8>::new()
+        );
+        assert!(
+            p.sa.stream_dek_list(&gone).await.unwrap()[0].terminated,
+            "I314b: the roll terminated the epoch"
         );
     }
 
