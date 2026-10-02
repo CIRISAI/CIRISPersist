@@ -34,6 +34,8 @@
 
 pub mod accord_carriage;
 pub mod accord_quorum;
+/// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
+pub mod accord_recovery;
 pub mod admission;
 pub mod adopt_cascade;
 pub mod age;

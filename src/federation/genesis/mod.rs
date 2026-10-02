@@ -26,6 +26,8 @@
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
 pub mod bundle;
+/// v53.0.0 (CIRISPersist#973, CC rc7) — the genesis ceremony assembler.
+pub mod ceremony;
 /// CIRISPersist#973 — verify a ceremony's two outputs before they are baked.
 pub mod ceremony_verify;
 pub use ceremony_verify::{
@@ -40,7 +42,8 @@ pub mod test_anchor_block;
 pub mod test_ceremony;
 pub use bundle::{
     bake_assembled_genesis, parse_genesis_bundle, verify_bundle_quorum, BakeItemOutcome,
-    GenesisAuthorization, GenesisBakeReport, GenesisBundle,
+    GenesisAuthorization, GenesisBakeReport, GenesisBundle, GenesisRosterRecord,
+    GENESIS_BUNDLE_VERSION,
 };
 #[cfg(feature = "test-anchor")]
 pub use test_anchor_block::*;
@@ -484,36 +487,57 @@ const ACCORD_FAMILY_FOUNDED_AT: &str = "2026-05-01T00:00:00Z";
 /// `key_id`s from [`accord_holder_genesis_records`], so the family stays
 /// coherent with the seeded holders by construction.
 pub fn accord_family_genesis_record() -> crate::federation::types::Family {
+    // #449 — founder seats follow the EFFECTIVE roster so the family stays
+    // coherent with the seeded holders (test or baked) by construction.
+    // v53.0.0 (CC 3.2 T6) — the genesis version names the charter it was
+    // minted with, or no charter is in force for the accord at all.
+    accord_family_genesis_record_for(
+        ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+        ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+        effective_accord_holder_records()
+            .iter()
+            .map(|sr| sr.record.key_id.as_str()),
+        &genesis_family_charter_digest(),
+    )
+}
+
+/// v53.0.0 (CC 3.2 T6) — the accord family's genesis record over a given
+/// founder set: what [`accord_family_genesis_record`] builds from this build's
+/// roster, and what the ceremony assembler signs as the family's genesis head.
+/// One construction, so the signed head and the seeded row cannot differ.
+/// `charter_digest` is the stored row hash of the charter the genesis version
+/// names ([`bundle_family_charter_digest`]); a genesis version names no
+/// predecessor.
+pub fn accord_family_genesis_record_for<'a>(
+    family_key_id: &str,
+    consensus_protocol: &str,
+    founders: impl IntoIterator<Item = &'a str>,
+    charter_digest: &str,
+) -> crate::federation::types::Family {
     use crate::federation::types::{Family, FamilyMember};
     let founded_at = ACCORD_FAMILY_FOUNDED_AT
         .parse()
         .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
-    // #449 — founder seats follow the EFFECTIVE roster so the family stays
-    // coherent with the seeded holders (test or baked) by construction.
-    let members = effective_accord_holder_records()
-        .iter()
-        .map(|sr| FamilyMember {
-            key_id: sr.record.key_id.clone(),
+    let members = founders
+        .into_iter()
+        .map(|key_id| FamilyMember {
+            key_id: key_id.to_owned(),
             joined_at: founded_at,
             role: Some("founder".to_owned()),
         })
         .collect();
-    let mut family = Family {
+    Family {
         prev_head_digest: String::new(),
-        charter_digest: String::new(),
-        family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+        charter_digest: charter_digest.to_owned(),
+        family_key_id: family_key_id.to_owned(),
         family_name: "HUMANITY_ACCORD".to_owned(),
         members,
         founded_at,
-        consensus_protocol: ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL.to_owned(),
+        consensus_protocol: consensus_protocol.to_owned(),
         consensus_protocol_entrenched: true,
         dissolved_at: None,
         persist_row_hash: String::new(),
-    };
-    // v53.0.0 (CC 3.2 T6) — the genesis version names the charter it was
-    // minted with, or no charter is in force for the accord at all.
-    family.charter_digest = genesis_family_charter_digest();
-    family
+    }
 }
 
 /// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
@@ -526,8 +550,17 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
 /// force carries none.
 #[must_use]
 pub fn genesis_family_charter_digest() -> String {
+    bundle_family_charter_digest(canonical_genesis_bundle())
+}
+
+/// [`genesis_family_charter_digest`] over a given bundle: the stored row hash
+/// of the bundle's charter of the accord family, empty when it carries none.
+/// The ceremony verifier reads the bundle it verifies through this, never the
+/// compiled one.
+#[must_use]
+pub fn bundle_family_charter_digest(bundle: &GenesisBundle) -> String {
     let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    canonical_genesis_bundle()
+    bundle
         .attestations
         .iter()
         .map(|s| &s.attestation)
@@ -566,13 +599,16 @@ where
     // load-bearing rather than an optimisation. A new ceremony ADDS a root
     // (roots co-exist and are addressed per-`root_ref`); nothing here mutates
     // one that already stands.
-    if dir
+    if let Some(held) = dir
         .lookup_family(&family.family_key_id)
         .await
         .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup_family: {e}")))?
-        .is_some()
     {
-        return Ok(()); // already entrenched (reboot) — idempotent no-op.
+        // v53.0.0 (CC 3.2 T6) — the one exception: an accord row that names no
+        // charter (stored before v53 gave the record its head fields) has no
+        // charter in force, so its root is invalid. It is replaced by this
+        // bundle's genesis record; anything else held is left standing.
+        return replace_chartless_accord(dir, &held, family).await;
     }
     // v21.0.0 (CIRISPersist#502 E4) — `put_family` now hybrid-Strict-verifies
     // an authority signature; the baked HUMANITY_ACCORD family is a
@@ -583,6 +619,91 @@ where
         GenesisFault::absent(
             LEG,
             format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"),
+        )
+    })
+}
+
+/// v53.0.0 (CC 3.2 T5/T6) — **a node upgrading from v52 holds an accord row
+/// that names no charter.** Under v53 the charter in force is the one the
+/// head names ([`charter_in_force`](super::canonical_community::charter_in_force)),
+/// so that row leaves the accord with no charter and its root invalid until a
+/// version naming one arrives.
+///
+/// CC T6: the genesis head carries an empty `prev_head_digest`, and the
+/// genesis head is the bundle's. A fresh node seeds exactly that record. If an
+/// upgraded node instead chained a version onto its v52 row, the two nodes
+/// would hold DIFFERENT head digests for one lineage, and every attach naming
+/// a head would split the mesh. So the upgraded node takes the genesis record
+/// itself, unchanged, and the v52 row becomes a superseded prior version
+/// labelled `accord_birth_replaces_unrooted` (the label R2a's prev-head check
+/// admits for a birth stored over an un-rooted row). The write stays inside
+/// this seeder, the door the accord id has always entered by; no peer-reachable
+/// door is opened.
+///
+/// It replaces ONLY a held row that names no charter and no predecessor, and
+/// equals the genesis record in everything a head does not carry (name, seats,
+/// founding instant, protocol, entrenchment, dissolution). A held row naming a
+/// charter or a predecessor is a version chain and is never overwritten, and a
+/// row of other content is a different accord and is left standing (#648).
+/// When the bundle carries the accord's signed genesis record (version 3), its
+/// signatures travel with the stored version.
+async fn replace_chartless_accord<D>(
+    dir: &D,
+    held: &crate::federation::types::Family,
+    genesis: crate::federation::types::Family,
+) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Family;
+    let unrooted = held.charter_digest.is_empty() && held.prev_head_digest.is_empty();
+    let same_roster = held.family_name == genesis.family_name
+        && held.members == genesis.members
+        && held.founded_at == genesis.founded_at
+        && held.consensus_protocol == genesis.consensus_protocol
+        && held.consensus_protocol_entrenched == genesis.consensus_protocol_entrenched
+        && held.dissolved_at == genesis.dissolved_at;
+    if !unrooted || genesis.charter_digest.is_empty() || !genesis.prev_head_digest.is_empty() {
+        return Ok(());
+    }
+    if !same_roster {
+        tracing::warn!(
+            family_key_id = %held.family_key_id,
+            "genesis family seed: the held accord row names no charter but is not this \
+             build's accord (other seats or protocol) — left standing"
+        );
+        return Ok(());
+    }
+    let signed = canonical_genesis_bundle()
+        .family_record(&genesis.family_key_id)
+        .filter(|carried| carried.family == genesis)
+        .cloned()
+        .unwrap_or_else(|| crate::federation::types::SignedFamily {
+            family: genesis.clone(),
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            supersede_proof: None,
+            cosignatures: Vec::new(),
+        });
+    let snapshot = serde_json::to_value(&signed)
+        .map_err(|e| GenesisFault::absent(LEG, format!("accord genesis snapshot: {e}")))?;
+    dir.supersede_group_row(
+        super::cohort::Cohort::Family,
+        snapshot,
+        Some(serde_json::json!({
+            super::canonical_community::BIRTH_REPLACES_UNROOTED: held.persist_row_hash,
+        })),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        GenesisFault::absent(
+            LEG,
+            format!(
+                "replace the chartless accord row {} with the bundle's genesis record: {e}",
+                held.persist_row_hash
+            ),
         )
     })
 }
@@ -678,10 +799,7 @@ const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 /// CIRISPersist#973 — the software ceremony this process boots against, when
 /// one is installed. Test-anchor only.
 #[cfg(feature = "test-anchor")]
-type InstalledTestCeremony = (
-    &'static GenesisBundle,
-    Option<&'static super::SignedCommunity>,
-);
+type InstalledTestCeremony = &'static GenesisBundle;
 
 #[cfg(feature = "test-anchor")]
 static TEST_CEREMONY: std::sync::RwLock<Option<InstalledTestCeremony>> =
@@ -689,24 +807,20 @@ static TEST_CEREMONY: std::sync::RwLock<Option<InstalledTestCeremony>> =
 
 /// CIRISPersist#973 — **install a software ceremony's outputs for this
 /// process**: from now on, while the test anchor is live, every reader of the
-/// compiled bundle and community asset reads these instead, and the boot seed
+/// compiled bundle reads this one instead (v53.0.0: the community birth is a
+/// member of the bundle, CC rc7), and the boot seed
 /// runs its full leg order against them (it otherwise skips everything past
 /// the family under a test anchor). The dry run of a re-mint: mint (or have
-/// the host's ceremony routes produce) the two artifacts, install them, boot.
+/// the host's ceremony routes produce) the bundle, install it, boot.
 ///
 /// A second call replaces the first (a re-mint). The values are leaked: this
 /// is a per-process test fixture, never a production path — the whole seam is
 /// compiled out without the `test-anchor` feature, and inert unless the
 /// runtime test-anchor override is armed.
 #[cfg(feature = "test-anchor")]
-pub fn install_test_ceremony_outputs(
-    bundle: GenesisBundle,
-    community: Option<super::SignedCommunity>,
-) {
+pub fn install_test_ceremony_outputs(bundle: GenesisBundle) {
     let bundle: &'static GenesisBundle = Box::leak(Box::new(bundle));
-    let community: Option<&'static super::SignedCommunity> =
-        community.map(|c| &*Box::leak(Box::new(c)));
-    *TEST_CEREMONY.write().expect("test ceremony lock") = Some((bundle, community));
+    *TEST_CEREMONY.write().expect("test ceremony lock") = Some(bundle);
 }
 
 /// CIRISPersist#973 — remove an installed software ceremony.
@@ -753,7 +867,7 @@ pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     // ceremony's bundle stands in for the compiled one. Compiled out of a
     // production build.
     #[cfg(feature = "test-anchor")]
-    if let Some((bundle, _)) = installed_test_ceremony() {
+    if let Some(bundle) = installed_test_ceremony() {
         return bundle;
     }
     static PARSED: OnceLock<GenesisBundle> = OnceLock::new();
@@ -3235,33 +3349,17 @@ where
     Ok(())
 }
 
-/// CIRISPersist#973 — the baked `ciris-canonical` community birth record, as
-/// the re-mint ceremony outputs it: a [`SignedCommunity`](super::SignedCommunity),
-/// or JSON `null` while no ceremony has baked one. Pinned by SHA-256 in
-/// [`tests::canonical_community_asset_is_pinned`].
-const CANONICAL_COMMUNITY_SEED_JSON: &str = include_str!("canonical_community_seed.json");
-
-/// Parse-once accessor for the baked community birth. `None` until a ceremony
-/// bakes it — every caller treats `None` as "this leg does not exist yet".
-///
-/// # Panics
-///
-/// Panics if the embedded JSON is neither `null` nor a `SignedCommunity`
-/// (build-time-checked by the pin test).
+/// CIRISPersist#973 / v53.0.0 (CC rc7, T5) — the `ciris-canonical` birth
+/// record **the pinned bundle carries**. The bundle is the only genesis
+/// artifact: a community seeded from anything the bundle does not pin has no
+/// anchor, so there is no separate community asset any more. `None` while the
+/// bundle carries no birth (a version-2 bundle) — every caller treats `None` as
+/// "this leg does not exist yet". Under a live test anchor with a software
+/// ceremony installed this reads that ceremony's bundle, through
+/// [`canonical_genesis_bundle`].
 pub fn canonical_community_asset() -> Option<&'static super::SignedCommunity> {
-    use std::sync::OnceLock;
-    // #973 — the test-ceremony seam; see [`canonical_genesis_bundle`].
-    #[cfg(feature = "test-anchor")]
-    if let Some((_, community)) = installed_test_ceremony() {
-        return community;
-    }
-    static PARSED: OnceLock<Option<super::SignedCommunity>> = OnceLock::new();
-    PARSED
-        .get_or_init(|| {
-            serde_json::from_str(CANONICAL_COMMUNITY_SEED_JSON)
-                .expect("embedded canonical_community_seed.json must be null or a SignedCommunity")
-        })
-        .as_ref()
+    canonical_genesis_bundle()
+        .community_record(super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID)
 }
 
 /// CIRISPersist#973 — what the community boot leg did.
@@ -4424,37 +4522,30 @@ mod tests {
         // assembled so this test's own text does not count.
         let call = ["installed_test_", "ceremony()"].concat();
         let fenced: usize = [
-            format!("{cfg}\n    if let Some((bundle, _)) = {call}"),
-            format!("{cfg}\n    if let Some((_, community)) = {call}"),
+            format!("{cfg}\n    if let Some(bundle) = {call}"),
             format!("{cfg}\n    {{\n        {call}.is_some()"),
         ]
         .iter()
         .map(|p| src.matches(p.as_str()).count())
         .sum();
-        assert_eq!(fenced, 3, "the three fenced reads");
+        assert_eq!(fenced, 2, "the two fenced reads");
         assert_eq!(
             src.matches(&call).count(),
             fenced + 1,
-            "a read of the test-ceremony seam outside {cfg} (the definition + 3 reads)"
+            "a read of the test-ceremony seam outside {cfg} (the definition + 2 reads)"
         );
         assert!(include_str!("test_ceremony.rs").contains("`test-anchor` feature"));
     }
 
-    /// CIRISPersist#973 — **the community asset is pinned.** Until a ceremony
-    /// bakes it the file is JSON `null` and the leg is inert; a bake replaces
-    /// the file AND this digest in one commit, so the bytes a node boots on
-    /// are the bytes that were reviewed.
+    /// v53.0.0 (CC rc7, T5) — **the community birth is a member of the pinned
+    /// bundle, never a file beside it.** The separate asset is gone; the
+    /// shipped bundle is version 2 and carries no birth, so the leg is inert
+    /// until the final ceremony's bundle is baked.
     #[test]
-    fn canonical_community_asset_is_pinned() {
-        use sha2::{Digest, Sha256};
-        const PINNED_SHA256: &str =
-            "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed";
-        assert_eq!(
-            hex::encode(Sha256::digest(
-                super::CANONICAL_COMMUNITY_SEED_JSON.as_bytes()
-            )),
-            PINNED_SHA256,
-            "canonical_community_seed.json changed without its pin"
+    fn the_community_birth_lives_in_the_bundle() {
+        assert!(
+            !include_str!("mod.rs").contains(&["canonical_community_seed", ".json\")"].concat()),
+            "a community asset is compiled in beside the bundle"
         );
         // Not baked on this branch: the leg must not exist for a boot.
         assert!(super::canonical_community_asset().is_none());
@@ -4607,6 +4698,7 @@ mod tests {
             serve_nodes: Vec::new(),
             consensus_protocol: "quorum:2/3".to_owned(),
             attestations: vec![crate::federation::SignedAttestation { attestation: row }],
+            roster_records: Vec::new(),
             authorizations: Vec::new(),
             produced_at: "2026-08-12T00:00:00Z".to_owned(),
         };

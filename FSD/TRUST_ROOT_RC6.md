@@ -254,7 +254,7 @@ Invariants I340–I344 (memory, sqlite, postgres): a silent charter is off; an e
 
 ## 9. The community boot leg and the re-bake (CIRISPersist#973)
 
-**Boot leg.** After the delegation plane, boot seeds the baked `ciris-canonical` birth record through the signed `put_community` door (`genesis::seed_canonical_community`). The asset is `genesis/canonical_community_seed.json`: JSON `null` until a ceremony bakes a `SignedCommunity`, pinned by SHA-256 in a unit test.
+**Boot leg.** After the delegation plane, boot seeds the baked `ciris-canonical` birth record through the signed `put_community` door (`genesis::seed_canonical_community`). v53.0.0 (CC rc7, T5): the birth is a member of the pinned bundle's `attestations` (after every delegation row, as `{"community": …}`), never a file beside it; `canonical_community_asset()` reads it from the bundle, and a version-2 bundle carries none, so the leg is inert until the final ceremony's bundle is baked.
 
 | state | what the leg does | reported |
 |---|---|---|
@@ -314,7 +314,7 @@ Wire shape (the `state` tokens are unchanged; `reason` is additive):
 4. Construct the Engine. The boot seed runs anchor → family → serve nodes → delegation plane → community against the installed artifacts; `genesis_posture` reports every leg.
 5. `genesis::verify_ceremony_outputs(bundle_json, community_json)` is the same check the real bake will run on the real files.
 
-**The real bake.** Before the ceremony's two files replace `canonical_seed.json` and `canonical_community_seed.json`, `verify_ceremony_outputs` must return `Ok` on a build whose accord roster is the production one. It applies the files through the ordinary doors on an in-memory directory, so a file the boot path would refuse is refused here, by stage.
+**The real bake.** Before the ceremony's bundle replaces `canonical_seed.json`, `verify_ceremony_outputs` must return `Ok` on a build whose accord roster is the production one. It applies the bundle — its delegation plane, the accord family record and the birth it carries — through the ordinary doors on an in-memory directory, so a file the boot path would refuse is refused here, by stage.
 
 **Not built:** a pyo3 door for the minter (the block minter has none); a postgres run of I352–I355 (the bodies are backend-generic; the boot, I351, runs on all three).
 

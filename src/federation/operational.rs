@@ -4899,7 +4899,7 @@ pub mod test_support {
     /// The un-trust lever and the TTL contributor in one row: this is the edge
     /// a withdrawal tombstones and the edge whose `expires_at` bounds the
     /// cached verdict.
-    pub(crate) async fn emit_trust_edge(
+    pub async fn emit_trust_edge(
         directory: &dyn crate::federation::FederationDirectory,
         from: &str,
         root: &str,
