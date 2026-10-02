@@ -109,6 +109,12 @@ pub enum LineageCosignRefusal {
     Skew,
     /// The object is malformed (not a hex64 digest, not RFC 3339, empty ids).
     Malformed,
+    /// v53.0.0 (CC 3.2 T6, consequence (ii)) — witnessed mode is on and the
+    /// cosigned head is the held head, which lags its roster at the cosign's
+    /// `signed_at`: a roster row older than one cadence no version covers.
+    /// Witnesses do not cosign a lagging head
+    /// ([`crate::federation::roster_head::roster_lag`]).
+    HeadLagsRoster,
 }
 
 impl LineageCosignRefusal {
@@ -124,6 +130,7 @@ impl LineageCosignRefusal {
             Self::PriorNotAncestor => "prior_not_ancestor",
             Self::Skew => "skew",
             Self::Malformed => "malformed",
+            Self::HeadLagsRoster => crate::federation::roster_head::LINEAGE_HEAD_LAGS_ROSTER,
         }
     }
 }
@@ -283,6 +290,33 @@ where
                 // an unknown prior is stored: it may be the other head of an
                 // equivocation this node has not seen (evidence), or a version
                 // not yet received.
+            }
+            // 7b (v53.0.0, CC 3.2 T6 consequence (ii)) — witnesses do not
+            //    cosign a lagging head. Only the HELD head can lag (an older
+            //    version is history), judged at the witness's own instant so
+            //    every node holding the same rows agrees. With witnessed mode
+            //    off the lag is reported and nothing else changes.
+            let is_held_head = held_versions
+                .last()
+                .is_some_and(|(d, _)| d == &cosign.head_digest_sha256_hex);
+            if is_held_head
+                && witnessed_mode_on(declared_witness_quorum(
+                    crate::federation::canonical_community::charter_members_for(
+                        directory,
+                        &cosign.lineage_key_id,
+                    )
+                    .await?
+                    .and_then(|c| c.witness_quorum),
+                ))
+                && crate::federation::roster_head::roster_lag(
+                    directory,
+                    &cosign.lineage_key_id,
+                    signed_at,
+                )
+                .await?
+                .is_some()
+            {
+                return refused(LineageCosignRefusal::HeadLagsRoster);
             }
             LineageCosignOutcome::Inserted
         }

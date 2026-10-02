@@ -2408,6 +2408,12 @@ pub struct RootWitnessView {
     pub community: Option<WitnessedHead>,
     /// The latest instant a counting cosign was signed.
     pub latest_cosign_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// v53.0.0 (CC 3.2 T6, consequence (ii)) — the held head lags its roster:
+    /// a roster row older than one `witness_cadence_secs` that no version
+    /// covers (`lineage_head_lags_roster`). Reported whatever the witness
+    /// quorum; with witnessed mode on, witnesses do not cosign it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roster_lag: Option<super::roster_head::RosterLag>,
 }
 
 /// See [`RootWitnessView`]. `None` when this node holds no lineage for `root`.
@@ -2437,12 +2443,14 @@ where
             None => None,
         };
         let latest = w.latest_cosign_at;
+        let roster_lag = super::roster_head::roster_lag(directory, root, now).await?;
         return Ok(Some(RootWitnessView {
             witnessed_head,
             held_head,
             quorum,
             community: Some(w),
             latest_cosign_at: latest,
+            roster_lag,
         }));
     }
     let Some(fam) = directory.lookup_family(root).await? else {
@@ -2470,6 +2478,7 @@ where
         quorum,
         community: None,
         latest_cosign_at: effective.iter().map(|c| c.signed_at).max(),
+        roster_lag: super::roster_head::roster_lag(directory, root, now).await?,
     }))
 }
 
@@ -2957,6 +2966,20 @@ where
             (0, Some((BIRTH_REPLACES_UNROOTED, stored)))
         }
     };
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — the version this apply makes the
+    // head must reflect the roster planes at its own instant. A birth or a
+    // re-birth (it replaces a squat or a stalled chain) is a first version and
+    // is not judged against the replaced lineage's rows.
+    if replaces.is_none() {
+        if let Some(head) = chain.last().filter(|_| start < chain.len()) {
+            super::roster_head::check_version_covers_fold(
+                directory,
+                super::roster_head::LineageRecord::Community(&head.community),
+                head_instant(head),
+            )
+            .await?;
+        }
+    }
     let mut written = 0;
     for i in start..chain.len() {
         let mut version = chain[i].clone();

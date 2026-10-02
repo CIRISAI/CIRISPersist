@@ -34064,7 +34064,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
         // v50.0.0 (CIRISPersist#925/#927) — a non-conformant infrastructure
         // record and a fused node key are the submitter's to re-mint: 4xx.
-        crate::federation::Error::CommunityConsensusProtocolViolation { .. }
+        // v53.0.0 (CC 3.2 T6) — a version that does not reflect the roster
+        // planes replaces the supersede refusals it sits beside (a typed
+        // Conflict before it), which are ValueError.
+        crate::federation::Error::LineageVersionDisagreesWithFold { .. }
+        | crate::federation::Error::CommunityConsensusProtocolViolation { .. }
         | crate::federation::Error::NodeIdentityNotExclusive { .. }
         | crate::federation::Error::NodeIdentityImmutable { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused

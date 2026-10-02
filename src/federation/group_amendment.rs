@@ -213,6 +213,14 @@ where
     }
     super::check_consensus_protocol_form(&f.consensus_protocol)?;
     super::admission::validate_family_members(dir, f).await?;
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — a family version carries no
+    // signed instant, so it is judged at admission.
+    super::roster_head::check_version_covers_fold(
+        dir,
+        super::roster_head::LineageRecord::Family(f),
+        chrono::Utc::now(),
+    )
+    .await?;
     let snapshot = serde_json::to_value(family)
         .map_err(|e| Error::Backend(format!("family amendment snapshot serialize: {e}")))?;
     dir.supersede_group_row(Cohort::Family, snapshot, Some(authorization(&offer)))
@@ -604,6 +612,15 @@ where
         )
         .await?,
     )?;
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — a version of a witnessed lineage
+    // reflects the roster planes; a family version carries no signed instant,
+    // so it is judged at admission.
+    super::roster_head::check_version_covers_fold(
+        dir,
+        super::roster_head::LineageRecord::Family(&new.family),
+        chrono::Utc::now(),
+    )
+    .await?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
     // the signature that authorizes it travel together, because the way they
     // go stale is by being able to move apart (#651).
@@ -672,6 +689,14 @@ where
     let new =
         super::canonical_community::prepare_trust_root_supersede(dir, new, generic_quorum_skipped)
             .await?;
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — judged at the version's own
+    // signer-stamped instant (a trust-root link's `amended_at`).
+    super::roster_head::check_version_covers_fold(
+        dir,
+        super::roster_head::LineageRecord::Community(&new.community),
+        super::canonical_community::head_instant(&new),
+    )
+    .await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",
