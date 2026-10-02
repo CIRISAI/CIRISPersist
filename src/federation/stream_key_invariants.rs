@@ -596,6 +596,279 @@ pub(crate) mod bodies {
         );
     }
 
+    /// A third device of `p.owner` for the re-class witnesses: its own signer
+    /// and content-KEM keys, registered as a NODE and owner-bound on both
+    /// nodes. It publishes its own occurrence (`publish_signed_content_only_occurrence`,
+    /// the receive door a replicated republish reaches).
+    struct Reclassed {
+        key: String,
+        signer: std::sync::Arc<crate::signing::LocalSigner>,
+        keys: crate::federation::EncryptionPubkeys,
+    }
+
+    async fn reclassed<B>(p: &Pair<B>, run: &str, tag: &str) -> Reclassed
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let alias = format!("{tag}-phone-{run}");
+        let signer = ts::local_signer(&alias);
+        let key = signer.derived_key_id();
+        for n in [p.sa.as_ref(), p.sb.as_ref()] {
+            ts::register_hybrid_key_as(
+                n,
+                &key,
+                &alias,
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            ts::put_owner_binding(n, &p.owner, &key).await;
+        }
+        let (_x_priv, x_pub, _ml_priv, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+        Reclassed {
+            key,
+            signer,
+            keys: crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(&ml_pub),
+            },
+        }
+    }
+
+    /// `dev` republishes its occurrence on `backend` under `class`, signed
+    /// now (millisecond instant; the pause keeps successive ones distinct).
+    async fn publish_as<B>(backend: &B, owner: &str, dev: &Reclassed, class: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        crate::federation::key_grant::publish_signed_content_only_occurrence(
+            backend,
+            &dev.signer,
+            owner,
+            &dev.key,
+            class,
+            None,
+            dev.keys.clone(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{} publishes as {class}: {e}", dev.key));
+    }
+
+    async fn holds_stream<B: BlobStorage + Sync>(
+        b: &B,
+        stream: &str,
+        epoch: u64,
+        owner: &str,
+        dev: &str,
+    ) -> bool {
+        b.stream_dek_grants(stream, epoch, owner)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.recipient_key_id == dev)
+    }
+
+    /// `dev`'s signed occurrence as `b` serves it on its since-read.
+    async fn signed_occurrence_on<B: FederationDirectory + Sync>(
+        b: &B,
+        dev: &str,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        b.list_signed_identity_occurrences_since(None, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == dev)
+            .expect("the device's signed occurrence")
+            .occurrence
+    }
+
+    /// **I397b** (v53.0.0, #963) — a device first published under a server
+    /// class, then republished (same key, same keys, newer instant) as a
+    /// phone, is a newcomer to the self/family keys THIS node holds: the
+    /// receive door wraps it every self stream epoch, the sealed manifest and
+    /// every family stream epoch written while it was server-class, and leaves
+    /// each set dirty for the pending loop.
+    pub(crate) async fn i397b_a_reclass_into_the_audience_is_a_newcomer<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        use crate::federation::types::device_class;
+        let p = pair(dsn_a, dsn_b, run, pick, "i397b").await;
+        let phone = reclassed(&p, run, "i397b").await;
+        publish_as(p.sa.as_ref(), &p.owner, &phone, device_class::SERVER).await;
+        let fam = format!("i397b-fam-{run}");
+        ra::family(p.sa.as_ref() as &dyn FederationDirectory, &fam, &[&p.owner]).await;
+        let (stream, fstream) = (format!("i397b-{run}"), format!("i397b-f-{run}"));
+        write_self(&p.a, &p.owner, &stream, 3).await;
+        let root = seal(&p, &stream).await;
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::FAMILY,
+            Some(&fam),
+            &fstream,
+            0,
+            b"family before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let sa = p.sa.as_ref();
+        assert!(
+            holds_stream(sa, &stream, 0, &p.key_a, &p.key_b).await
+                && holds_stream(sa, &fstream, 0, &p.key_a, &p.key_b).await,
+            "I397b precondition — the laptop holds both epochs"
+        );
+        assert!(
+            !holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await
+                && !holds_stream(sa, &fstream, 0, &p.key_a, &phone.key).await
+                && sa
+                    .get_at_rest_grant(&root, &phone.key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+            "I397b precondition — server-class, the phone holds no self/family key"
+        );
+        p.a.emit_pending_key_grants().await.unwrap();
+
+        publish_as(sa, &p.owner, &phone, device_class::PHONE).await;
+        assert!(
+            holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await,
+            "I397b the re-classed phone holds the self stream's earlier epoch"
+        );
+        assert!(
+            sa.get_at_rest_grant(&root, &phone.key)
+                .await
+                .unwrap()
+                .is_some(),
+            "I397b and the sealed manifest"
+        );
+        assert!(
+            holds_stream(sa, &fstream, 0, &p.key_a, &phone.key).await,
+            "I397b and the family stream's earlier epoch"
+        );
+        let dirty = crate::federation::key_grant::dirty_axes(sa, &p.key_a)
+            .await
+            .unwrap();
+        assert!(
+            dirty.iter().any(|a| matches!(a,
+                crate::federation::key_grant::KeyGrantAxis::Stream { stream_id, epoch: 0, .. }
+                    if *stream_id == stream)),
+            "I397b the widened self epoch's set is pending emission: {dirty:?}"
+        );
+    }
+
+    /// **I397c** (v53.0.0, #963) — the reverse re-class, phone → server: the
+    /// device gets no key for what is written after, and the self stream epoch
+    /// it held rolls at the next chunk (a recipient leaving is a removal).
+    pub(crate) async fn i397c_a_reclass_out_of_the_audience_rolls<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::types::device_class;
+        let p = pair(dsn_a, dsn_b, run, pick, "i397c").await;
+        let phone = reclassed(&p, run, "i397c").await;
+        publish_as(p.sa.as_ref(), &p.owner, &phone, device_class::PHONE).await;
+        let stream = format!("i397c-{run}");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &stream,
+            0,
+            b"before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let sa = p.sa.as_ref();
+        assert!(
+            holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await,
+            "I397c precondition — the phone holds E0"
+        );
+        publish_as(sa, &p.owner, &phone, device_class::SERVER).await;
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &stream,
+            1,
+            b"after",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sa.stream_chunk_at(&stream, 1).await.unwrap().unwrap().epoch,
+            1,
+            "I397c the re-class out of the audience rolled the epoch"
+        );
+        assert!(
+            !holds_stream(sa, &stream, 1, &p.key_a, &phone.key).await
+                && holds_stream(sa, &stream, 1, &p.key_a, &p.key_b).await,
+            "I397c E1's key skips the re-classed server, reaches the laptop"
+        );
+    }
+
+    /// **I397d** (v53.0.0, #963) — a re-class signed EARLIER than the stored
+    /// row (or a replay of the stored row) changes nothing: last-signed-wins
+    /// keeps the server class, and the receive door grants no key.
+    pub(crate) async fn i397d_a_stale_reclass_changes_nothing<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::types::device_class;
+        let p = pair(dsn_a, dsn_b, run, pick, "i397d").await;
+        let phone = reclassed(&p, run, "i397d").await;
+        // The phone-class row is signed FIRST, on B; the server-class row
+        // after it, on A.
+        publish_as(p.sb.as_ref(), &p.owner, &phone, device_class::PHONE).await;
+        publish_as(p.sa.as_ref(), &p.owner, &phone, device_class::SERVER).await;
+        let stream = format!("i397d-{run}");
+        write_self(&p.a, &p.owner, &stream, 2).await;
+        let sa = p.sa.as_ref();
+        let older = signed_occurrence_on(p.sb.as_ref(), &phone.key).await;
+        let current = signed_occurrence_on(sa, &phone.key).await;
+        for (label, row) in [("older", older), ("replayed", current)] {
+            sa.put_identity_occurrence(row)
+                .await
+                .unwrap_or_else(|e| panic!("I397d A admits the {label} row: {e}"));
+            let class = sa
+                .list_identity_occurrences_active(&p.owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|o| o.occurrence_key_id == phone.key)
+                .expect("the phone's row")
+                .device_class;
+            assert_eq!(
+                class,
+                device_class::SERVER,
+                "I397d the {label} row keeps the class"
+            );
+            assert!(
+                !holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await,
+                "I397d the {label} row grants the server-class phone no self key"
+            );
+        }
+    }
+
     pub(crate) async fn i314_the_cap_rolls_the_epoch<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -1445,6 +1718,34 @@ mod runners {
                 async fn i314d() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i314d_a_deny_rolls_the_epoch(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i397b() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i397b_a_reclass_into_the_audience_is_a_newcomer(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i397c() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i397c_a_reclass_out_of_the_audience_rolls(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i397d() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i397d_a_stale_reclass_changes_nothing(&a, &b, &super::suffix(), $pick)
+                        .await
                 }
                 #[tokio::test]
                 async fn i315() {
