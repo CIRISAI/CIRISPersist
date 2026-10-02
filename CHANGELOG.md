@@ -23,6 +23,27 @@ CIRISConstitution rc7 `5e89627` (CC 3.2 T3, 4.2.6, 2.1) and `fe459cf` (CC 4.2.6,
 
 **A keyless family confers as it charters (CC 3.4.7): already held, now witnessed.** The family-quorum plane of the capability walk counts a grant only at the family's own threshold; a grant one holder scrubs confers nothing as the family (I439).
 
+### Mutation round — rc7 accord (on the committed tree `ee61de6f`; witness lane memory+sqlite)
+
+| # | mutant | witness | verdict |
+|---|---|---|---|
+| M1 | the commitment does not sort its elements | I430 | killed |
+| M2 | the commitment hashes the key ids only (the pre-v53 bytes) | I430, I431 | killed |
+| M3 | a repeated key id is not refused | I430 | killed |
+| M4 | a missing/empty ML-DSA-65 key forms an element | I430 | killed |
+| M5 | the T3 door forms each successor's element from the id's test pair, not the stored record (`sqlite,test-anchor`) | I431 | killed |
+| M6 | a standing holder may lack a recovery commitment | I432 | killed |
+| M7 | a stray commitment is not refused | I433 | killed |
+| M8 | two holders may share a recovery key | I434 | killed |
+| M9 | a recovery key may be a holder's signing key | I434 | killed |
+| M10 | the recovery rule applies to every family but the accord | I432, I435 | killed |
+| M11 | `trust_root_valid`'s edge leg ignores rotation | I437 | killed |
+| M12 | `trusted_roots_of` ignores rotation | I438 | killed |
+| M13 | transit candidates ignore a successor edge | I438 | killed |
+| M14 | the family-quorum plane counts a grant below the quorum | I439 | killed |
+
+14 of 14 killed.
+
 ### CC 1.0-rc6 re-vendored (tag v1.0-rc6)
 The two vendored CC files move from `651140a` to CIRISConstitution tag **`v1.0-rc6`** (commit `3c3e63fdef844f2f849e43081a8242e31cfaf30d`, annotated tag `b9d8cba`). They were first copied at `1f45ebe` ("Cut 1.0-rc6, released as guidance: re-pin 10") before the tag existed; both manifests have the same blob ids at `1f45ebe` and at the tag, so the bytes are unchanged and only the recorded commit moved. **`scripts/check_vendored_cc.sh <cc-tag>`** (new; a ship step, not CI) fetches CC at a tag and compares both files byte for byte, exiting 1 on any difference and 2 on a missing tag or fetch failure; `scripts/check_vendored_cc.sh v1.0-rc6` passes, and fails on a copy altered by one byte. `scripts/release_ship.sh` names the step, and now pushes `refs/tags/v$ver` explicitly (a branch of the same name made the bare push ambiguous at v52.0.1).
 
