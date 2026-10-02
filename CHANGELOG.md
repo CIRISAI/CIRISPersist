@@ -9,6 +9,27 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### #965 — the identity re-signing a pair does not demote the occurrence's consent
+
+`federation_identity_occurrences` is keyed `(identity, occurrence)` and
+last-signed-wins. The #932 resolver (`active_identities_for_occurrence`) read
+the occurrence's agreement off that current row. So when `self_at_login`
+named a node's own engine occurrence N as `app`, it published an O-signed
+row. That row replaced the row N had signed itself, and the binding then
+resolved nothing. N stopped being party to its owner's rooms, which surfaced
+far away as `NotPartyTo` at adopt (CIRISEdge#768). The V161 history (#930)
+still held N's agreement, and I271 already said a re-signing does not erase
+it. The resolver now reads agreement from that history through
+`occurrence_agreed_to`, so the two folds agree. An identity's claim the
+occurrence never agreed to still resolves nothing (#932). No door changed and
+no row is refused.
+
+I381 (memory, sqlite, postgres): after the identity re-signs a consented pair,
+the owner is still the principal, and an unagreed claim resolves nothing.
+I382 (sqlite, postgres) follows the issue's shape: provision the engine
+occurrence, run `self_at_login` with `app` = the engine key, and the owner is
+still the node's principal. Both witnesses were RED on the old resolver.
+
 ### #966 — a shared-backend Engine tells the backend its node key
 
 `Engine::from_shared` and `from_shared_with_local` built an Engine over a

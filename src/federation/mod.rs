@@ -164,6 +164,10 @@ pub(crate) mod nested_manifest_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
+/// v53.0.0 (CIRISPersist#965) — I381/I382, an occurrence's consent is never
+/// demoted to the identity's word alone.
+#[cfg(test)]
+pub(crate) mod occurrence_consent_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
@@ -5602,8 +5606,9 @@ pub trait FederationDirectory: Send + Sync {
     /// - it is TRUSTED-LOCAL (no signature columns: `self_at_login`, the HTTP
     ///   self-bind — produced by this node for its own user, never reachable
     ///   from the replication apply), or
-    /// - a stored signed row for the pair was signed by the OCCURRENCE
-    ///   ([`occurrence_agreed_to`]).
+    /// - the OCCURRENCE itself ever signed an admitted assertion of the pair
+    ///   ([`occurrence_agreed_to`], over the V161 history — v53.0.0, #965: a
+    ///   later re-signing by the identity does not erase it).
     async fn active_identities_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -5628,9 +5633,16 @@ pub trait FederationDirectory: Send + Sync {
                 .filter(|s| s.identity_occurrence.occurrence_key_id == occurrence_key_id)
                 .collect();
             let trusted_local = signed_for_pair.is_empty();
-            let agreed = signed_for_pair
-                .iter()
-                .any(|s| s.attesting_key_id == occurrence_key_id);
+            // v53.0.0 (CIRISPersist#965) — agreement is read from the V161
+            // HISTORY (#930), not the current row. The current row is
+            // last-signed-wins over `(identity, occurrence)`, so an identity
+            // re-signing the pair (`self_at_login` naming a node's own engine
+            // occurrence) replaced the occurrence's own row and the binding
+            // resolved nothing: the node stopped being party to its owner's
+            // rooms (CIRISEdge#768). The re-signing never erased agreement
+            // (I271); the resolver now agrees with that fold.
+            let agreed = !trusted_local
+                && occurrence_agreed_to(self, &io.identity_key_id, occurrence_key_id).await?;
             if !(trusted_local || agreed) {
                 continue;
             }
