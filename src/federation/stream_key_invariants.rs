@@ -632,6 +632,63 @@ pub(crate) mod bodies {
             .unwrap(),
             "I314: E's terminator takes the slot the roll reserved"
         );
+
+        // The REMOVAL roll: a recipient granted on the open epoch leaves the
+        // self-collective; the next chunk is sealed under E+1, whose DEK the
+        // removed device never receives (CC 5.1 forward secrecy).
+        let gone = format!("i314-removal-{run}");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &gone,
+            0,
+            b"before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(p
+            .sa
+            .stream_dek_grants(&gone, 0, &p.key_a)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.recipient_key_id == p.key_b));
+        p.sa.put_identity_occurrence_revocation_local(
+            crate::federation::types::IdentityOccurrenceRevocation {
+                identity_key_id: p.owner.clone(),
+                occurrence_key_id: p.key_b.clone(),
+                revoked_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![p.owner.clone()],
+                persist_row_hash: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &gone,
+            1,
+            b"after",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p.sa.stream_chunk_at(&gone, 1).await.unwrap().unwrap().epoch,
+            1,
+            "I314: a removal rolls the epoch"
+        );
+        let after = p.sa.stream_dek_grants(&gone, 1, &p.key_a).await.unwrap();
+        assert!(
+            !after.iter().any(|w| w.recipient_key_id == p.key_b),
+            "I314: the removed device holds no wrap of E+1: {after:?}"
+        );
     }
 
     pub(crate) async fn i315_a_v52_stream_reads_forever<B>(
