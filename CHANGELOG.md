@@ -126,6 +126,28 @@ The delegation rows in I348/I349 are re-minted by SOFTWARE holders on a bare bac
 
 **Mutation round (sqlite lane `remint_invariants`), 9/9 killed:** door refusal mapped to `Divergent` (I346, I346b); seed not inert without an asset (I345); verify not inert without an asset (I345); held record ignored (I345, I347); held comparison inverted (I345, I347); verify calls a held community absent (I345, I347); equal vintage supersedes (I348); supersede skipped on a newer instant (I348, I349); rollback allowed (I348). Not mutated: "the leg writes through a local door" — no trusted-local community door exists to route it through.
 
+### #973 — posture after a refused or older bake
+
+**Fixed: a node whose re-mint did not land reported `Entrenched` on the previous root.** `verify_delegation_plane_seeded` (the live posture leg; `genesis_posture` reads it without the seed) asked whether the stored row supersedes the compiled-in one through `candidate_is_strictly_newer`, which judges its second argument as a STORED row and does not normalize it. The bundle row is not canonical at rest, so passed raw it classified `Legacy` and lost to every conformant stored row. Any verified holder statement that differed from the bake therefore read as its successor: an OLDER one (the boot seed's re-mint refused at the door, e.g. stamped more than 300 s ahead of this node's clock) and a same-vintage twin both gave `Ok`, so the posture said `Entrenched` and nothing told the operator the baked root had not been adopted. The boot seed itself was right (it returns `Absent` and deletes nothing); the two disagreed.
+
+`stored_is_acceptable_successor` now normalizes the baked side itself, so no caller can hand it the raw shape. The leg's answers, by relation of the stored row to the compiled-in one:
+
+| stored | seed at boot | posture leg |
+|---|---|---|
+| identical | `AlreadyCurrent` | `Ok` |
+| bake strictly newer, admitted | `Superseded`, id kept | `Ok` |
+| bake strictly newer, REFUSED at the door | `Absent`, nothing deleted | **`Absent`** ("the compiled-in root was not adopted … OLDER than"); was `Ok` |
+| same vintage, different content | left in place, boots | **`Absent`** ("… of the SAME vintage as, and different from"); was `Ok` |
+| bake OLDER than stored (old binary, newer database) | left, never downgraded | `Ok` (the mesh is ahead of this binary) |
+| absent | installed, or `Absent` when refused | `Ok`, or `Absent` |
+| not a verifiable holder statement | left as substituted | `Divergent` (unchanged) |
+
+A verified holder statement that does not supersede the bake is `Absent`, not `Divergent`: `Divergent` refuses to boot and stays reserved for substitution, so an upgrade can never brick a node over a row its own holders signed. A rollback written beneath persist (a genuine old row put back) is the same state: not entrenched, and the next boot's seed supersedes it. The doc on the leg said a rollback was `Divergent`; it never was (it was `Ok`), and it is now `Absent`.
+
+**Witnesses** (`tests/remint_posture_973.rs`, software ceremony + seam; sqlite and memory, I362 also on postgres): I360 identical; I361 newer admitted; **I362** newer refused (RED: `Entrenched`); **I363** equal vintage (RED: `Entrenched`); I364 bake older; I365 absent. The unit witness `equal_vintage_is_not_a_successor_665` now also drives the RAW bundle row, the caller's shape its fixture had normalized away. `mint_test_ceremony_scoped` mints same-instant ceremonies with different signed content (test-anchor only).
+
+**Mutation round:** MUTATION_TABLE_973H
+
 ### #973 — the software ceremony minter and the outputs verifier
 For CIRISServer's dry run of the 0.5.219 re-mint, and to close the gaps the boot-leg section above listed.
 

@@ -1120,10 +1120,34 @@ where
 /// binary that RUNS the ceremony, and a posture that bricked the node on the
 /// exact state the release ships in would put the ceremony out of reach.
 ///
-/// A row present whose `original_content_hash` is not the baked one is
-/// [`GenesisFault::divergent`] — not a stale artifact but a SUBSTITUTED
-/// conferral row, and the one case here that must not serve. Same split, and
-/// the same reasoning, as the canonical leg's squatting check.
+/// A row present whose `original_content_hash` is not the baked one, and that
+/// is NOT a verifiable statement by a seated accord holder, is
+/// [`GenesisFault::divergent`] — a SUBSTITUTED conferral row, and the one case
+/// here that must not serve. Same split, and the same reasoning, as the
+/// canonical leg's squatting check.
+///
+/// # The (stored, baked) relations (CIRISPersist#973)
+///
+/// | stored vs the compiled-in row | this leg |
+/// |---|---|
+/// | identical | `Ok` |
+/// | a verified holder statement STRICTLY NEWER | `Ok` (the mesh is ahead of this binary) |
+/// | a verified holder statement OLDER | `absent` — the bake was not adopted |
+/// | a verified holder statement of the SAME vintage, different content | `absent` — a tie, not adopted |
+/// | same signed envelope, altered around it | `divergent` |
+/// | not a verifiable holder statement | `divergent` |
+/// | missing, or pre-v31 shaped | `absent` |
+///
+/// The OLDER arm is what an upgrading node holds when the boot seed could not
+/// install the re-mint (refused at the door — a bake stamped ahead of this
+/// node's clock — or the seed has not run). It is not `divergent`: that
+/// refuses to boot, and an upgrade must never brick a node over a row its own
+/// holders signed. It is not `Ok` either: before #973 it was, because the raw
+/// bundle row was compared as a stored row and lost to every conformant one,
+/// so the node reported `Entrenched` on the previous root with nothing to say
+/// the new one had not landed. A rollback written beneath persist (an old
+/// genuine row put back) is the same state and gets the same answer: not
+/// entrenched, and the next boot's seed supersedes it.
 pub async fn verify_delegation_plane_seeded<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
@@ -1162,10 +1186,11 @@ where
         // **This is a narrowing of what counts as sound in every direction
         // except one.** Still `Divergent`, still refusing to serve: an injected
         // squat, a row renamed onto a genesis id, a fabricated row claiming a
-        // holder's `key_id`, a corrupted signature — and now ROLLBACK, a
-        // holder-signed row OLDER than the compiled-in one, which the old
-        // equality check accepted or rejected purely by accident of hashing.
-        // The single thing that stops being called tampering is a newer,
+        // holder's `key_id`, a corrupted signature. A holder-signed row OLDER
+        // than the compiled-in one (a rollback, or an upgrade whose re-mint
+        // did not land) and a same-vintage twin are NOT sound either, but they
+        // are `Absent`, not `Divergent` (#973; see the table on this fn).
+        // The single thing that is served on in place of the bake is a newer,
         // quorum-verified, holder-signed root.
         //
         // ── THE PROPERTY, ASKED FIRST: CAN THIS PLANE CONFER RIGHT NOW? ──
@@ -1286,23 +1311,45 @@ where
             // give identical hashes and the damage arm above owns them. Every row
             // that arrives here is a genuinely different statement.
             let stored_supersedes = stored_is_acceptable_successor(&row, want);
-            if !real || !stored_supersedes {
+            if !real {
                 return Err(GenesisFault::divergent(
                     LEG,
                     format!(
                         "delegation row {id} is present with a content hash that is not the baked \
-                         one (stored {}, baked {}) and is {} — a substituted conferral row",
+                         one (stored {}, baked {}) and is not a verifiable statement by a seated \
+                         accord holder — a substituted conferral row",
+                        row.original_content_hash, want.original_content_hash,
+                    ),
+                ));
+            }
+            if !stored_supersedes {
+                // CIRISPersist#973 — a VERIFIED holder statement that does not
+                // supersede the bake: the previous ceremony's row (the boot
+                // seed could not install its successor — refused at the door,
+                // or not yet run), or a twin of the same vintage. Neither is a
+                // substitution, so neither is `Divergent` (which refuses to
+                // boot, and would brick an upgrading node whose re-mint was
+                // refused for its clock). Neither is `Entrenched` either: this
+                // binary's root was NOT adopted, and the operator must see
+                // that. `Absent` boots, raises the banner, and matches what
+                // the boot seed itself reports for the same state. The next
+                // boot's seed supersedes an older row as soon as the door
+                // admits the bake.
+                return Err(GenesisFault::absent(
+                    LEG,
+                    format!(
+                        "delegation row {id}: the compiled-in root was not adopted — the stored \
+                         row is a verified accord-holder statement (asserted {}, content {}) \
+                         that is {} the baked one (asserted {}, content {})",
+                        row.asserted_at,
                         row.original_content_hash,
-                        want.original_content_hash,
-                        if !real {
-                            "not a verifiable statement by a seated accord holder"
-                        } else if candidate_is_strictly_newer(want, &row) {
-                            "OLDER than the compiled-in artifact (a rollback)"
+                        if candidate_is_strictly_newer(want, &row) {
+                            "OLDER than"
                         } else {
-                            "NEITHER older nor newer than the compiled-in artifact — two \
-                             different statements of the same vintage, which this node cannot \
-                             adjudicate and must not serve on"
+                            "of the SAME vintage as, and different from,"
                         },
+                        want.asserted_at,
+                        want.original_content_hash,
                     ),
                 ));
             }
@@ -4046,8 +4093,24 @@ where
 /// of equal vintage with different content needs holder keys. This predicate is
 /// pure, so `equal_vintage_is_not_a_successor_665` drives the rule itself
 /// rather than a caller that happens to reach it.
+///
+/// # The baked side is normalized HERE (CIRISPersist#973)
+///
+/// [`candidate_is_strictly_newer`] judges its second argument as a STORED row
+/// and does not normalize it. The compiled-in bundle row is not canonical at
+/// rest, so handed raw it classifies `Legacy` and loses to every conformant
+/// stored row: the posture leg passed it raw, and a stored row OLDER than the
+/// bake — or of the same vintage with different content — read as its
+/// successor. `Entrenched` was reported on a root the binary's own bake had
+/// not replaced. The unit witness above this function normalized the baked
+/// row in its fixture, which is why it never saw the caller's shape. A baked
+/// row that cannot be normalized supersedes nothing and is superseded by
+/// nothing: `false`.
 fn stored_is_acceptable_successor(stored: &super::Attestation, baked: &super::Attestation) -> bool {
-    candidate_is_strictly_newer(stored, baked)
+    match baked_row_as_stored(baked) {
+        Ok(baked_as_stored) => candidate_is_strictly_newer(stored, &baked_as_stored),
+        Err(_) => false,
+    }
 }
 
 /// v31.1.0 (CIRISPersist#665 review) — **the deterministic doors
@@ -4326,6 +4389,43 @@ mod tests {
             !super::stored_is_acceptable_successor(baked, &same_age),
             "and the relation is symmetric: neither wins, so neither is a successor"
         );
+        // CIRISPersist#973 — the PRODUCTION shape: the posture leg hands the
+        // predicate the RAW bundle row. Raw, it used to classify Legacy and
+        // lose to every conformant stored row, so a tie (and an OLDER stored
+        // row) read as a successor.
+        let raw = &super::canonical_genesis_bundle().attestations[0].attestation;
+        assert!(
+            !super::stored_is_acceptable_successor(&same_age, raw),
+            "a tie against the RAW baked row is not a successor either"
+        );
+        let mut older = baked.clone();
+        older.asserted_at = baked.asserted_at - chrono::Duration::seconds(60);
+        older.attestation_envelope["asserted_at"] =
+            serde_json::json!(older.asserted_at.to_rfc3339());
+        assert!(
+            super::candidate_is_v31_conformant_as_stored(&older),
+            "the older fixture must stay v31-conformant, or the shape arm answers"
+        );
+        {
+            assert!(
+                !super::stored_is_acceptable_successor(&older, raw),
+                "a stored row OLDER than the RAW baked row is not its successor"
+            );
+        }
+        let mut newer = baked.clone();
+        newer.asserted_at = baked.asserted_at + chrono::Duration::seconds(60);
+        newer.attestation_envelope["asserted_at"] =
+            serde_json::json!(newer.asserted_at.to_rfc3339());
+        assert!(
+            super::candidate_is_v31_conformant_as_stored(&newer),
+            "the newer fixture must stay v31-conformant, or the shape arm answers"
+        );
+        {
+            assert!(
+                super::stored_is_acceptable_successor(&newer, raw),
+                "a stored row strictly NEWER than the RAW baked row is its successor"
+            );
+        }
     }
 
     /// v31.0.0 (CIRISPersist#660) — **the delegation leg's verdict must not
