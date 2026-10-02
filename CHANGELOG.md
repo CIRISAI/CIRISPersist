@@ -254,6 +254,33 @@ CC 3.2 T6 (rc7 `36432c6`, adopting persist's v53 design): every roster-affecting
 | I458 | from disk: every version door judges before it writes; the cosign door; the accord head door |
 | I459 | (ii) an authorized accord roster change anchored on the head, window closed, lags it; another anchor, a refusal, an open window do not |
 
+**A recovery is a covering version** (CC 4.2.6, rc7 `5a4b057`: the ONE accord version not signed by the conferring quorum). It enters through `supersede_family_signed`, so consequence (i) judges it like any version: its roster is the fold's with the one seat's key rotated, and it is admitted without the quorum. I429 (`tests/test_ceremony_973.rs`, memory, sqlite and postgres) now also pins it: an authorized accord roster change anchored on the held head lags it; the holder's recovery moves the head; the lag clears; the fold agrees with the recovered roster.
+
+**Mutation round — R2c** (on the committed tree `bcf41ae0`; lane = I450–I459 + I440–I449 + every `canonical_community_invariants` witness, memory and sqlite): eighteen mutants, eighteen killed.
+
+| Mutant | Result |
+|---|---|
+| M1 the comparison ignores roles | killed — I451 |
+| M2 a widened seat the record lacks is not named | killed — I451, i190 (i) |
+| M3 a revoked seat the record keeps is not named | killed — I450, I453, i190 (o″), (x) |
+| M4 every family is a witnessed lineage | killed — I452 |
+| M5 consequence (i) never refuses | killed — i190 (i), (o″), (x) |
+| M6 the local family door skips (i) | killed — I450, I451 |
+| M7 the lag ignores the cadence | killed — I454 |
+| M8 the cosign refusal ignores witnessed mode | killed — I455 |
+| M9 the cosign door never refuses a lagging head | killed — I455 |
+| M10 an unauthorized accord decision lags | killed — I459 |
+| M11 an open window lags | killed — I459 |
+| M12 the standing majority always holds | killed — I457 |
+| M13 signatures counted, not members | killed — I457 |
+| M14 the accord head door drops the standing-majority count | killed — I458 only (from disk): while the accord is three holders `quorum:2/3` IS the standing majority, so no behaviour separates the leg; I457 witnesses the count |
+| M15 the chain apply skips (i) | killed — i190 (o″), (x) |
+| M16 the lag judges at `at`, not the cutoff | killed — I454 |
+| M17 the chain apply's floor is the held head, not the chain predecessor | killed — i190 (z) |
+| M18 the community arm has no floor | killed — i190 (o), (o″), (o‴), (u), (z) |
+
+Two mutants were malformed on the first pass and re-run corrected (M6 kept its `?`; M8 did not compile); both killed as listed.
+
 ### rc7 B-1: the head moves with the record
 
 CC 3.2 T6 (rc7 `b578b59`, operator ruling B-1 on CIRISConstitution#136): the lineage head is the family or community record at a version; its `prev_head_digest` names the version it succeeds and its `charter_digest` names the charter in force at that version; every roster-affecting row, a charter re-scrub included, MUST produce a new version. Before this, a charter re-scrub wrote only a `trust:charter:v1` row, the record never re-versioned, and the head never moved.
