@@ -536,6 +536,21 @@ pub(crate) mod bodies {
             vec![e.r2.clone()],
             "I438: the subscription set is the successor's root, not the superseded edge's"
         );
+        // The transit candidate set reaches the successor's root (each
+        // candidate is then judged by `trust_root_valid`, I437).
+        let by_user = d.list_attestations_by(&e.user).await.unwrap();
+        let candidates: Vec<String> = crate::federation::trust_root::transit_candidate_roots(
+            &by_user,
+            &e.user,
+            chrono::Utc::now(),
+        )
+        .into_iter()
+        .map(|c| c.root_ref)
+        .collect();
+        assert!(
+            candidates.contains(&e.r2),
+            "I438: transit follows the rotated edge to its root: {candidates:?}"
+        );
     }
 
     // ── I439 ────────────────────────────────────────────────────────────

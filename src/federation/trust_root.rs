@@ -2164,7 +2164,12 @@ pub(crate) fn transit_candidate_roots(
     by_user
         .iter()
         .filter(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
+            // v53.0.0 (CC 3.2 T2) — a user's successor edge (`supersedes`)
+            // names a candidate too. This is a CANDIDATE set: each root is
+            // then judged by `trust_root_valid`, whose edge leg applies the
+            // rotation rule, so a superseded edge's root drops out there.
+            (a.attestation_type == attestation_type::DELEGATES_TO
+                || a.attestation_type == attestation_type::SUPERSEDES)
                 && a.attested_key_id != user_key_id
                 && !dead.contains(&a.attestation_id)
                 && !is_expired(a, now)
