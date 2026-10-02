@@ -234,7 +234,7 @@ The `humanity-accord` family row needs nothing: the seats and the protocol are u
 
 Witnesses I345–I349 (memory, sqlite, postgres). Not yet built: the software ceremony minter for a dry run, and a boot test over a baked asset (it reads the compiled file).
 
-## 9. The dry run: software ceremony, boot seam, outputs verifier (CIRISPersist#973)
+## 10. The dry run: software ceremony, boot seam, outputs verifier (CIRISPersist#973)
 
 **Minter.** `genesis::mint_test_ceremony(ed_seeds[3], node_seed, produced_at)` (feature `test-anchor`) returns the anchor block (unchanged from `mint_test_anchor_block`), the bundle and the `ciris-canonical` birth, signed by the three software holders the block defines. The charter carries `witness_quorum: 0`. A re-mint is the same call with a later `produced_at`: ids kept, instants forward.
 
