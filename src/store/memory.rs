@@ -1576,6 +1576,7 @@ impl MemoryBackend {
         // witnessed lineage head inside the root's attach window.
         crate::federation::canonical_community::check_attach_freshness(
             self,
+            crate::federation::canonical_community::AttachDoor::Author,
             input.attestation_id.as_deref(),
             &input.attesting_key_id,
             &input.attestation_type,
@@ -3914,6 +3915,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // witnessed lineage head inside the root's attach window.
         crate::federation::canonical_community::check_attach_freshness(
             self,
+            crate::federation::canonical_community::AttachDoor::of(&origin),
             Some(&row.attestation_id),
             &row.attesting_key_id,
             &row.attestation_type,

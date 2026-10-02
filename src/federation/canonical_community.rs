@@ -2054,6 +2054,29 @@ where
     }
 }
 
+/// #973 — which door an acceptance edge is arriving through at
+/// [`check_attach_freshness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachDoor {
+    /// This node authored the edge in-process: its own attach, judged in full.
+    Author,
+    /// The edge arrived from elsewhere (a peer, a sync, an import): another
+    /// node's attach, already admitted at its own door.
+    Replicated,
+}
+
+impl AttachDoor {
+    /// The door a stored write's origin names.
+    #[must_use]
+    pub fn of(origin: &super::replication::admission::WriteOrigin) -> Self {
+        match origin {
+            super::replication::admission::WriteOrigin::Authored => Self::Author,
+            super::replication::admission::WriteOrigin::Wire
+            | super::replication::admission::WriteOrigin::Sync { .. } => Self::Replicated,
+        }
+    }
+}
+
 /// **T4a — the acceptance edge is gated on freshness** (CIRISPersist#937, CC
 /// 3.2 T4a rc6; FSD `TRUST_ROOT_RC6.md` §2.2). For a `delegates_to` carrying
 /// `trust:accepts:v1` whose `attested_key_id` is a root this node holds a
@@ -2077,8 +2100,19 @@ where
 /// envelope. A held edge re-offered unchanged passes without re-running
 /// freshness; anything else under a held id is judged as new. A new headless
 /// edge is refused `Error::TrustRootHeadUnnamed`.
+///
+/// #973 (CC 3.2 T4a: "a write-side gate … the gate runs on the edge's first
+/// admission only … once the edge is written, T4 governs without exception")
+/// — **a peer does not re-judge another node's attach.** The head and
+/// freshness comparison belongs to the ATTACHING node's own write
+/// ([`AttachDoor::Author`]). At [`AttachDoor::Replicated`] the edge was
+/// already admitted where it was written: this node's head may be ahead of or
+/// behind the one it names, and its witness view is its own, so only the
+/// SHAPE rule runs there (a new labelled edge names a head).
+#[allow(clippy::too_many_arguments)]
 pub async fn check_attach_freshness<F>(
     directory: &F,
+    door: AttachDoor,
     attestation_id: Option<&str>,
     attesting_key_id: &str,
     attestation_type_str: &str,
@@ -2143,6 +2177,11 @@ where
     let labeled = super::admission::envelope_dimension(envelope)
         == Some(super::trust_root::TRUST_ACCEPTS_DIMENSION);
     let off = !super::lineage_witness::witnessed_mode_on(view.quorum);
+    // Another node's attach: the shape rule only. Which head it named, and
+    // whether that head was fresh and witnessed, was its own door's question.
+    if door == AttachDoor::Replicated && (presented.is_some() || !labeled) {
+        return Ok(());
+    }
     let Some(presented) = presented else {
         if labeled {
             return Err(Error::TrustRootHeadUnnamed {

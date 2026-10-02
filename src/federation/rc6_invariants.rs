@@ -445,7 +445,8 @@ pub(crate) mod bodies {
             env,
         );
         ts::reseal(&mut edge);
-        d.put_attestation(crate::federation::SignedAttestation { attestation: edge })
+        // the consumer's OWN attach: the author's door (#973, I372–I375)
+        d.put_attestation_authored(crate::federation::SignedAttestation { attestation: edge })
             .await?;
         Ok(id)
     }
@@ -1073,6 +1074,7 @@ pub(crate) mod bodies {
         let changed = accept_edge_row(&id, consumer, None, "infra:attest").attestation;
         let e = cc::check_attach_freshness(
             d,
+            cc::AttachDoor::Author,
             Some(&id),
             &changed.attesting_key_id,
             &changed.attestation_type,
@@ -1086,6 +1088,7 @@ pub(crate) mod bodies {
         let same = held.attestation.clone();
         cc::check_attach_freshness(
             d,
+            cc::AttachDoor::Author,
             Some(&id),
             &same.attesting_key_id,
             &same.attestation_type,
@@ -1231,6 +1234,18 @@ pub(crate) mod bodies {
             .await
             .expect("I373: a peer behind the edge's head admits it on replication");
         reads_as_attached(b, consumer, "I373").await;
+        // the authenticated-sync door is a replicated door too
+        let second = "i373-second";
+        for d in [a, b] {
+            ts::register_hybrid_key_as(d, second, second, identity_type::USER).await;
+        }
+        let edge2 = author_edge(a, second, Some(&h2))
+            .await
+            .expect("I373: a second attach");
+        b.put_attestation_synced(edge2, consumer)
+            .await
+            .expect("I373: the sync door admits it too");
+        reads_as_attached(b, second, "I373 (sync)").await;
     }
 
     /// **I374** — the local gate is not weakened, and the shape rule holds on
@@ -1251,6 +1266,34 @@ pub(crate) mod bodies {
                 assert!(detail.contains("not the head this node holds"), "{detail}")
             }
             other => panic!("I374: the author's stale attach must refuse, got {other:?}"),
+        }
+        // the local-tier write is an author's door too
+        let local = a
+            .attestation_insert_local(crate::federation::types::LocalAttestationInput {
+                attestation_id: None,
+                attesting_key_id: consumer.to_owned(),
+                attested_key_id: Some(CANON.to_owned()),
+                attestation_type: crate::federation::types::attestation_type::DELEGATES_TO
+                    .to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                        "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+                        "attached_head_digest": "cd".repeat(32),
+                    }),
+                )
+                .unwrap(),
+                subject_key_ids: vec![],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await;
+        match local {
+            Err(Error::TrustRootHeadStale { .. }) => {}
+            other => panic!("I374 (local tier): a stale local attach must refuse, got {other:?}"),
         }
         let headless = accept_edge_row(
             &uuid::Uuid::new_v4().to_string(),
