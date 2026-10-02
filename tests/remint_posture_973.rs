@@ -88,6 +88,7 @@ fn pre_genesis_delegation(p: &GenesisPosture) -> Option<&str> {
         GenesisPosture::PreGenesis {
             leg: GenesisLeg::Delegation,
             detail,
+            ..
         } => Some(detail.as_str()),
         _ => None,
     }
@@ -166,9 +167,25 @@ async fn i362_refused_newer_bake_is_visibly_not_adopted() {
         let future = mint_at(at(900), None);
         install(&future);
         match seed_family_and_canonical(d).await {
-            Err(GenesisFault::Absent { leg, detail }) => {
+            Err(GenesisFault::Absent {
+                leg,
+                detail,
+                reason,
+            }) => {
                 assert_eq!(leg, GenesisLeg::Delegation, "{tag} I362: {detail}");
                 assert!(detail.contains("nothing deleted"), "{tag} I362: {detail}");
+                // The typed cause: REFUSED at the door, carrying the door's
+                // token, with the previous root still standing.
+                assert_eq!(
+                    reason,
+                    AbsentReason::BakeNotAdopted {
+                        why: BakeNotAdoptedReason::Refused {
+                            refusal: "federation_invalid_argument".to_owned(),
+                        },
+                        held_root_in_force: true,
+                    },
+                    "{tag} I362: the seed names the refusal and the standing root"
+                );
             }
             other => panic!("{tag} I362: the boot seed must report Absent, got {other:?}"),
         }
@@ -188,8 +205,37 @@ async fn i362_refused_newer_bake_is_visibly_not_adopted() {
             detail.contains("not adopted"),
             "{tag} I362: the operator can see WHY: {detail}"
         );
+        // The typed signal a host reads instead of the sentence: the stored
+        // root is OLDER than the bake, the bake is not installed, and the
+        // previous root is in force.
+        let stored_older = AbsentReason::BakeNotAdopted {
+            why: BakeNotAdoptedReason::StoredOlder,
+            held_root_in_force: true,
+        };
+        assert_eq!(posture.absent_reason(), Some(&stored_older), "{tag} I362");
+        assert!(posture.held_root_in_force(), "{tag} I362: {posture:?}");
+        assert!(
+            posture
+                .banner()
+                .is_some_and(|b| b.starts_with("ROOT NOT ADOPTED")),
+            "{tag} I362: the banner must not claim the node holds no root: {:?}",
+            posture.banner()
+        );
+        let json = serde_json::to_value(&posture).unwrap();
+        assert_eq!(
+            json["reason"],
+            serde_json::json!({
+                "kind": "bake_not_adopted",
+                "why": { "cause": "stored_older" },
+                "held_root_in_force": true,
+            }),
+            "{tag} I362: the wire shape a host reads: {json}"
+        );
+        assert_eq!(json["state"], "pre_genesis", "{tag} I362: {json}");
         match verify_delegation_plane_seeded(d).await {
-            Err(GenesisFault::Absent { .. }) => {}
+            Err(f @ GenesisFault::Absent { .. }) => {
+                assert_eq!(f.absent_reason(), Some(&stored_older), "{tag} I362: {f:?}");
+            }
             other => panic!("{tag} I362: the leg itself is Absent, got {other:?}"),
         }
     }
@@ -238,6 +284,15 @@ async fn i363_equal_vintage_different_content_is_not_entrenched() {
             pre_genesis_delegation(&posture).is_some(),
             "{tag} I363: a tie is not Entrenched and not Divergent: {posture:?}"
         );
+        assert_eq!(
+            posture.absent_reason(),
+            Some(&AbsentReason::BakeNotAdopted {
+                why: BakeNotAdoptedReason::EqualVintage,
+                held_root_in_force: true,
+            }),
+            "{tag} I363: a tie is named as a tie, with the held root in force"
+        );
+        assert!(posture.held_root_in_force(), "{tag} I363");
     }
 }
 
@@ -288,8 +343,21 @@ async fn i365_absent_installs_or_stays_absent() {
         match seed_family_and_canonical(d).await {
             Err(GenesisFault::Absent {
                 leg: GenesisLeg::Delegation,
+                reason,
                 ..
-            }) => {}
+            }) => {
+                // Refused with NOTHING held: no root is in force.
+                assert_eq!(
+                    reason,
+                    AbsentReason::BakeNotAdopted {
+                        why: BakeNotAdoptedReason::Refused {
+                            refusal: "federation_invalid_argument".to_owned(),
+                        },
+                        held_root_in_force: false,
+                    },
+                    "{tag} I365"
+                );
+            }
             other => panic!("{tag} I365: Absent on the delegation leg, got {other:?}"),
         }
         assert!(
@@ -301,7 +369,74 @@ async fn i365_absent_installs_or_stays_absent() {
             pre_genesis_delegation(&posture).is_some(),
             "{tag} I365: {posture:?}"
         );
+        // The live posture of an empty plane is the plain pre-ceremony one.
+        assert_eq!(
+            posture.absent_reason(),
+            Some(&AbsentReason::NotSeeded),
+            "{tag} I365: {posture:?}"
+        );
+        assert!(!posture.held_root_in_force(), "{tag} I365");
+        assert!(
+            posture
+                .banner()
+                .is_some_and(|b| b.starts_with("PRE-GENESIS")),
+            "{tag} I365: {:?}",
+            posture.banner()
+        );
     }
+}
+
+/// **I366 — the typed reason on the wire.** `reason` is additive: a posture
+/// serialized before the field existed reads as `not_seeded`, the `state`
+/// tokens are unchanged, and each reason round-trips.
+#[test]
+fn i366_absent_reason_wire_shape_is_additive() {
+    let legacy = serde_json::json!({
+        "state": "pre_genesis",
+        "leg": "delegation",
+        "detail": "delegation row genesis-charter is not installed",
+    });
+    let p: GenesisPosture = serde_json::from_value(legacy).expect("a pre-#973 posture parses");
+    assert_eq!(p.absent_reason(), Some(&AbsentReason::NotSeeded));
+    assert!(!p.held_root_in_force());
+    assert_eq!(
+        serde_json::to_value(&p).unwrap()["reason"],
+        serde_json::json!({ "kind": "not_seeded" })
+    );
+    for (reason, json) in [
+        (
+            AbsentReason::BakeNotAdopted {
+                why: BakeNotAdoptedReason::Refused {
+                    refusal: "federation_invalid_argument".to_owned(),
+                },
+                held_root_in_force: true,
+            },
+            serde_json::json!({
+                "kind": "bake_not_adopted",
+                "why": { "cause": "refused", "refusal": "federation_invalid_argument" },
+                "held_root_in_force": true,
+            }),
+        ),
+        (
+            AbsentReason::BakeNotAdopted {
+                why: BakeNotAdoptedReason::EqualVintage,
+                held_root_in_force: true,
+            },
+            serde_json::json!({
+                "kind": "bake_not_adopted",
+                "why": { "cause": "equal_vintage" },
+                "held_root_in_force": true,
+            }),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&reason).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<AbsentReason>(json).unwrap(),
+            reason
+        );
+    }
+    assert_eq!(GenesisPosture::Entrenched.absent_reason(), None);
+    assert!(!GenesisPosture::Entrenched.held_root_in_force());
 }
 
 /// A database of this test's own, in the cluster `CIRIS_PERSIST_TEST_PG_URL`

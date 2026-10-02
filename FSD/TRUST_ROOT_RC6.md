@@ -276,6 +276,22 @@ The rule, by relation of the stored row to the compiled-in one:
 
 For the re-mint ceremony this means: a bake stamped ahead of a node's clock by more than the skew bound leaves that node on its previous root, visibly pre-genesis on the delegation leg, until its clock passes the instant and it is rebooted. Witnesses I360–I365.
 
+**The typed reason (requested by CIRISServer).** A host must not read the detail sentence to tell these states apart. `GenesisFault::Absent` and `GenesisPosture::PreGenesis` carry `reason: AbsentReason`:
+
+- `NotSeeded`: the leg is not installed (a node awaiting its ceremony). A posture serialized before the field existed reads as this.
+- `BakeNotAdopted { why, held_root_in_force }`: this binary's root was not adopted. `why` is `Refused { refusal }` (the boot seed offered the bake and a door refused it; `refusal` is the error's stable `kind()` token), `StoredOlder` (the live posture: a verified older row is held and the bake is not installed) or `EqualVintage` (a tie). `held_root_in_force` is true when the held row is a verified accord-holder statement, so the previous root still stands.
+
+The boot seed reports `Refused`, because only it sees the refusal. The live posture reports `StoredOlder` or `EqualVintage`, because it sees the rows and not the door. `GenesisPosture::held_root_in_force()` answers the one question a host asks before telling an operator that no trust root is configured, and `banner()` says "ROOT NOT ADOPTED … the previous root stays in force" in that state.
+
+Wire shape (the `state` tokens are unchanged; `reason` is additive):
+
+```json
+{"state":"pre_genesis","leg":"delegation","detail":"…",
+ "reason":{"kind":"bake_not_adopted","why":{"cause":"stored_older"},"held_root_in_force":true}}
+```
+
+`why` is one of `{"cause":"refused","refusal":"<token>"}`, `{"cause":"stored_older"}`, `{"cause":"equal_vintage"}`; a plain pre-ceremony node carries `"reason":{"kind":"not_seeded"}`.
+
 ## 10. The dry run: software ceremony, boot seam, outputs verifier (CIRISPersist#973)
 
 **Minter.** `genesis::mint_test_ceremony(ed_seeds[3], node_seed, produced_at)` (feature `test-anchor`) returns the anchor block (unchanged from `mint_test_anchor_block`), the bundle and the `ciris-canonical` birth, signed by the three software holders the block defines. The charter carries `witness_quorum: 0`. A re-mint is the same call with a later `produced_at`: ids kept, instants forward.
