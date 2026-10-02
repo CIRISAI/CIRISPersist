@@ -217,7 +217,9 @@ pub(crate) mod bodies {
             assert_eq!(page.len() as u64, c.chunk_count);
             seqs.extend(page.iter().map(|x| x.seq));
         }
-        assert_eq!(seqs, (0..61).collect::<Vec<u64>>());
+        let mut want: Vec<u64> = (0..60).collect();
+        want.push(crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE);
+        assert_eq!(seqs, want, "sixty chunks and persist's terminator position");
         // A stranger is refused at the root.
         assert!(matches!(
             p.a.open_sealed_manifest_page_as(&root, 0, &format!("i202-stranger-{run}"), None)

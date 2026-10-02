@@ -2251,20 +2251,27 @@ part 5 §5.1 distributes that key O(N) per epoch. v53 does both.
   any recipient who joins later (the next append or the seal). The stream-axis
   set (`key_grant:stream:v1`, `BLOB_REPLICATION.md` §14.1) is emitted then —
   never per chunk.
-- **Rolls.** The epoch is CLOSED to data (`closed_at`) when the next data chunk
-  would take the cap's last counter (`MAX_CHUNKS_PER_EPOCH − 1`, reserved for
-  the terminator), or when a recipient granted on the epoch has left the
-  cohort (a removal: the next chunk is sealed under a DEK the removed party
-  never held — CC 5.1's forward secrecy for a live family stream). The next
-  append mints E+1 with its own set. The producer's epoch label is honoured
-  when it is higher; a lower one is carried to the open epoch.
-- **The terminator.** The seal appends, for every epoch not yet terminated, an
-  empty chunk sealed with `last_flag = 0x01` at the epoch's next counter, at
-  the stream's next `seq` after the last data chunk. The floor stamps the epoch
-  `terminated_at` in the terminator's own transaction; any later chunk at that
-  epoch is refused (`stream_epoch_closed`) — the append-resistance half of CC
-  5.3.3.1. A rolled epoch's terminator is written at the seal, not at the roll:
-  persist cannot take a `seq` from the producer mid-stream.
+- **Rolls.** An epoch rolls when the next data chunk would take the cap's last
+  counter (`MAX_CHUNKS_PER_EPOCH − 1`, reserved for the terminator), when a
+  recipient granted on the epoch has left the cohort (a removal: the next
+  chunk is sealed under a DEK the removed party never held — CC 5.1's forward
+  secrecy for a live family stream), or when the producer names a higher
+  epoch label (a lower one is carried to the open epoch). Persist writes the
+  outgoing epoch's terminator AT THE ROLL; the next chunk mints E+1 with its
+  own set.
+- **The terminator** is an empty chunk sealed under the epoch's DEK with
+  `last_flag = 0x01` at the epoch's next counter (the V165 count). Its
+  position is persist's to allocate, because the roll is persist's act:
+  `seq = TERMINATOR_SEQ_BASE + epoch` (`2^62 + E`), a range a producer's seq
+  may not enter. It therefore sorts after every data chunk, so in seq order
+  it is its epoch's final chunk and a manifest's positions stay strictly
+  increasing. The floor stamps the epoch closed and `terminated_at` in the
+  terminator's own insert transaction — that insert IS the roll's close — and
+  refuses any later chunk at the epoch (`stream_epoch_closed`), the
+  append-resistance half of CC 5.3.3.1. The seal terminates any epoch still
+  open. An epoch a roll closed carries its `last` whether or not the stream
+  is ever sealed (I314b). The mint of E+1 is a separate write: a crash between
+  the two leaves E terminated and the next append mints E+1.
 - **The manifest** is v4: v2 plus the top-level member `"chunk_keys":
   "stream_epoch"` and each chunk's `epoch`, inside the sealed manifest, so both
   are authoritative. A v3 root's children are v4. A manifest without the member
