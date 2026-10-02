@@ -25,6 +25,11 @@
 //!   epoch's terminator at the roll: the epoch, never sealed, carries exactly
 //!   one `last`, its final chunk, at persist's own position
 //!   (`TERMINATOR_SEQ_BASE + epoch`), and reads by position.
+//! - **I314c** (sqlite, postgres) — the readiness door over a LEGACY (v2,
+//!   per-chunk-keyed) DAG: the granted viewer reads it ready; a viewer
+//!   granted the manifest and every chunk but one is told exactly that
+//!   chunk (`Content{seq, chunk_sha256}`); a stranger is `NotGranted`. So a
+//!   host can ask the door about every DAG, not only v4 ones.
 //! - **I315** (sqlite, postgres) — a stream that already holds per-chunk-keyed
 //!   chunks (the v52 shape) stays per-chunk to its seal, seals as v2, and
 //!   reads whole and by range.
@@ -761,16 +766,14 @@ pub(crate) mod bodies {
         );
     }
 
-    pub(crate) async fn i315_a_v52_stream_reads_forever<B>(
-        dsn_a: &str,
-        dsn_b: &str,
-        run: &str,
-        pick: Pick<B>,
-    ) where
+    /// The v52 shape (a per-chunk-keyed stream, sealed as v2): `n` chunks
+    /// through the v52 chunk door's steps, then the door, which keeps a
+    /// stream that already holds per-chunk-keyed chunks per-chunk. Returns
+    /// the plaintext.
+    async fn write_v52_stream<B>(p: &Pair<B>, stream: &str, n: usize) -> Vec<u8>
+    where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
-        let p = pair(dsn_a, dsn_b, run, pick, "i315").await;
-        let stream = format!("i315-{run}");
         // The v52 chunk door, verbatim: a fresh DEK per chunk, the position
         // AAD, the floor with no stream slot, the per-chunk grants.
         let seg0 = segment(0);
@@ -779,13 +782,13 @@ pub(crate) mod bodies {
             &dek,
             &seg0,
             Some(&crate::federation::chunk_dag_cascade::chunk_aad(
-                None, &stream, 0,
+                None, stream, 0,
             )),
         )
         .unwrap();
         let sha =
             p.sa.put_blob_chunk_with_scope(
-                &stream,
+                stream,
                 0,
                 BlobBody::Inline(env.to_bytes()),
                 0,
@@ -812,12 +815,12 @@ pub(crate) mod bodies {
         .unwrap();
         // The stream continues on the per-chunk path through the door.
         let mut plain = seg0.clone();
-        for i in 1..6 {
+        for i in 1..n {
             let seg = segment(i);
             p.a.put_blob_chunk_scoped(
                 cohort_scope::SELF,
                 Some(&p.owner),
-                &stream,
+                stream,
                 i as u64,
                 &seg,
                 0,
@@ -828,9 +831,23 @@ pub(crate) mod bodies {
             plain.extend_from_slice(&seg);
         }
         assert!(
-            p.sa.stream_dek_list(&stream).await.unwrap().is_empty(),
-            "I315: a v52 stream never gains a stream DEK"
+            p.sa.stream_dek_list(stream).await.unwrap().is_empty(),
+            "a v52 stream never gains a stream DEK"
         );
+        plain
+    }
+
+    pub(crate) async fn i315_a_v52_stream_reads_forever<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i315").await;
+        let stream = format!("i315-{run}");
+        let plain = write_v52_stream(&p, &stream, 6).await;
         let root = seal(&p, &stream).await;
         let view =
             p.a.open_sealed_manifest_as(&root, &p.key_a, None)
@@ -875,6 +892,73 @@ pub(crate) mod bodies {
         assert!(matches!(
             &r.missing[0],
             MissingChunkKey::Content { seq: 0, .. }
+        ));
+    }
+
+    pub(crate) async fn i314c_readiness_over_a_legacy_dag<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i314c").await;
+        let stream = format!("i314c-{run}");
+        write_v52_stream(&p, &stream, 5).await;
+        let root = seal(&p, &stream).await;
+        let view =
+            p.a.open_sealed_manifest_as(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert_eq!(view.version, 2, "I314c: a legacy (v2) DAG");
+        assert_eq!(view.chunks.len(), 5);
+
+        // (a) The granted viewer: readable, nothing missing, every chunk held.
+        let r =
+            p.a.sealed_dag_readiness(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert_eq!(r.chunk_keys, "content", "I314c (a): {r:?}");
+        assert!(r.held && r.readable, "I314c (a): {r:?}");
+        assert!(
+            r.missing.is_empty() && r.not_held.is_empty(),
+            "I314c (a): {r:?}"
+        );
+
+        // (b) A viewer granted the manifest and every chunk but ONE: not
+        // readable, and `missing` names exactly that chunk by seq and sha.
+        let dev = format!("i314c-dev-{run}");
+        let wrap = || crate::federation::GrantWrap {
+            recipient_key_id: dev.clone(),
+            wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+            wrapped_dek: "{}".into(),
+        };
+        p.sa.put_at_rest_grants(&root, cohort_scope::SELF, &[wrap()])
+            .await
+            .unwrap();
+        let lacking = &view.chunks[3];
+        for c in view.chunks.iter().filter(|c| c.seq != lacking.seq) {
+            p.sa.put_at_rest_grants(&hexsha(&c.sha256_hex), cohort_scope::SELF, &[wrap()])
+                .await
+                .unwrap();
+        }
+        let r = p.a.sealed_dag_readiness(&root, &dev, None).await.unwrap();
+        assert!(r.held && !r.readable, "I314c (b): {r:?}");
+        assert_eq!(
+            r.missing,
+            vec![MissingChunkKey::Content {
+                seq: lacking.seq,
+                chunk_sha256: lacking.sha256_hex.clone(),
+            }],
+            "I314c (b): exactly the one chunk"
+        );
+
+        // (c) A stranger (no grant on the manifest) learns nothing.
+        let stranger = format!("i314c-stranger-{run}");
+        assert!(matches!(
+            p.a.sealed_dag_readiness(&root, &stranger, None).await,
+            Err(BlobError::NotGranted { .. })
         ));
     }
 
@@ -1282,6 +1366,11 @@ mod runners {
                 async fn i314() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i314_the_cap_rolls_the_epoch(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i314c() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i314c_readiness_over_a_legacy_dag(&a, &b, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
                 async fn i315() {
