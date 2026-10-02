@@ -748,14 +748,12 @@ pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
 ///   registers it, forcing removal instead of letting a stale excuse outlive
 ///   its reason. It has now done that once, for real.
 pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[
-    // v52.0.0 (CIRISPersist#955) — `membership:` (proposal / acceptance /
-    // decline): the operator ruled on 2026-09-30 that nobody joins a family or
-    // community without their own signed acceptance, and the rows that carry
-    // it ship ahead of the CC text. CIRISConstitution#133 registers them; the
-    // re-vendor deletes this line (the test below fails until it does). NOT a
-    // staged family: a staged family refuses at federation tier, which would
-    // stop the proposal reaching its invitee.
-    "membership:",
+    // EMPTY again as of the rc6 re-vendor. It carried `membership:` (proposal /
+    // acceptance / decline, CIRISPersist#955) from the operator ruling of
+    // 2026-09-30 until CIRISConstitution#133 registered `membership:{stage}`
+    // (CC 4.4.3.2.3); the re-vendor brought the row in,
+    // `tests::declared_exceptions_are_still_unregistered` failed by name, and
+    // the line was deleted. The stem is now governed by the registry reading.
 ];
 
 /// **Staged families** `(stem, tracking ref)` — governed NOW, registered NOT
@@ -14941,7 +14939,16 @@ pub async fn check_reserved_prefix_admission(
     //
     // Pure (no directory lookup), so it stays in the cheap tier alongside the
     // attester==attested arms.
-    check_namespace_family_registered(at)?;
+    //
+    // rc6 re-vendor (CC 2.4, CIRISConstitution#137): a registered CARRIER row
+    // type (`key_grant:{axis}:v1`, `holds_bytes:sha256:{prefix}`) is not a
+    // dimension, and the registry now gates `key_grant:` as a stem no dimension
+    // may sit under. The type half therefore skips a registered carrier — the
+    // dimension matcher would refuse the row type it is told is "never a
+    // dimension". A `dimension` naming a carrier token is still refused below.
+    if !crate::federation::namespace::registry::is_registered_carrier_row_type(at) {
+        check_namespace_family_registered(at)?;
+    }
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
     }
@@ -17853,6 +17860,42 @@ mod tests {
         "trace_summary:",
         "transport:",
         "trust:",
+        // rc6 re-vendor (CIRISConstitution#133) — the rule is per-leaf and
+        // asks who the inviter and the invitee ARE, which no identity type
+        // expresses. The gate is `membership_acceptance::check_membership_row_shape`
+        // + `check_attestation_write_scope` (CIRISPersist#955).
+        "membership:",
+        // rc6 re-vendor (CIRISConstitution#137) — "legacy label on an owner's
+        // own delegates_to row; claims no job, confers nothing; closed". It is
+        // a label on a STRUCTURAL row, outside the `scores` dimension gate; the
+        // reading that it confers nothing is `trust_root`'s (a row whose
+        // dimension is not `trust:{job}` claims no job). Covers both leaves.
+        "self:delegates_to",
+    ];
+
+    /// Manifest-reserved families persist has **no gate for yet** — a different
+    /// statement from the list above, kept apart so it cannot hide there. Every
+    /// one arrived REGISTERED AND RESERVED in the rc6 re-vendor; before it the
+    /// same stems were unregistered open vocabulary, so nothing admits today
+    /// that did not admit yesterday — but CC now names an emitter rule and
+    /// persist does not enforce it. Each entry names the ask that builds the
+    /// gate; the entry is deleted in the cut that lands it.
+    const RESERVED_AND_NOT_YET_GATED: &[(&str, &str)] = &[
+        // CC 3.1.3.3 — holder self-report, within-cohort only.
+        ("custody:", "CIRISPersist#961"),
+        // CC 3.1.3.4 — author-emitted.
+        ("file:", "CIRISPersist#962"),
+        ("collection:", "CIRISPersist#962"),
+        // CC 3.2 T6 — per-leaf: an active founder proposes, the named node's
+        // owner replies. `lineage_witness.rs` gates the COSIGN, not this
+        // ceremony.
+        ("lineage_witness:", "CIRISPersist#974"),
+        // CC 3.1.9.4 — first-person observation; the producer is the
+        // ciris-status node, which does not exist yet.
+        ("observation:reachability", "CIRISPersist#974"),
+        // CC 3.1.1 — owner-signed, self scope only. The server's row
+        // (`self:device_label`, renamed); persist has no emitter.
+        ("device:label", "CIRISConstitution#137"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
@@ -18304,6 +18347,9 @@ mod tests {
                 && !RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE
                     .iter()
                     .any(|s| dim.starts_with(s))
+                && !RESERVED_AND_NOT_YET_GATED
+                    .iter()
+                    .any(|(s, _)| dim.starts_with(s))
             {
                 under_enforced.push(format!(
                     "{} (CC reserves it: {:?}; persist has no gate and no declared reason)",
@@ -18313,6 +18359,18 @@ mod tests {
             }
         }
 
+        for (stem, tracked) in RESERVED_AND_NOT_YET_GATED {
+            assert!(
+                tracked.contains('#'),
+                "{stem:?} is reserved and ungated with no ask that builds its gate"
+            );
+            assert!(
+                registry::entries()
+                    .iter()
+                    .any(|e| e.prefix.starts_with(stem)),
+                "{stem:?} is recorded as reserved-and-ungated but names no manifest family"
+            );
+        }
         assert!(
             over_refused.is_empty(),
             "SPLIT TRUTH — persist OVER-REFUSES (CIRISPersist#590): {over_refused:?}. \

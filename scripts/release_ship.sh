@@ -17,6 +17,9 @@
 # 5. waits for tag CI, then sets the release body from the same section —
 #    polling for the release to EXIST first (tag CI creates it a moment after
 #    its last job; an edit before that fails silently).
+#
+# BEFORE running this for a release that names a CC version: run
+# `scripts/check_vendored_cc.sh <cc-tag>` — the vendored CC files must be the tag's bytes.
 set -uo pipefail
 pr="${1:?pr number}"; ver="${2:?version}"; want="${3:?expected head sha (7)}"; subject="${4:?merge subject}"; bodyf="${5:?merge body file}"
 cd "$(git rev-parse --show-toplevel)"
@@ -61,7 +64,7 @@ for i in $(seq 1 150); do
   mst=$(gh run list --branch main --commit "$merge_sha" --workflow ci.yml --event push --json status,conclusion --jq '.[0] | "\(.status)/\(.conclusion)"' 2>/dev/null || echo none)
   case "$mst" in completed/*|none) break;; esac; echo "main push run on $merge_sha: $mst — waiting before the tag push"; sleep 60
 done
-git push origin "v$ver" || exit 10; echo "tagged v$ver at $merge_sha"
+git push origin "refs/tags/v$ver" || exit 10; echo "tagged v$ver at $merge_sha"
 sleep 90
 st=none
 for i in $(seq 1 120); do

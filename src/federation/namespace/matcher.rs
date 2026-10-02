@@ -17,7 +17,7 @@
 //!
 //! # Drift control
 //!
-//! CC publishes `manifests/namespace_match_vectors.json` — 962 dimensions (released rc5) with
+//! CC publishes `manifests/namespace_match_vectors.json` — 1040 dimensions (rc6) with
 //! the family each resolves to and the refusal each earns — and requires every
 //! consumer to replay them against its own matcher, "so a matcher that drifts
 //! from this one fails a build, not a card". The file is vendored byte-for-byte
@@ -59,17 +59,19 @@ const HEX_PATTERN: &str = "^[0-9a-f]+$";
 /// The reference's version-tail DETECTOR — case-insensitive on the `v` so a
 /// `V1` tail is recognised in order to be refused, never admitted.
 ///
-/// The reference applies its two detectors with Python's `re.match`, whose `$`
-/// also matches before ONE trailing newline; `\n?\z` reproduces that here, so
-/// a detector refuses exactly what the reference's refuses (a detector only
-/// ever adds a refusal). The manifest's own patterns are full-match instead.
-const VERSION_LIKE: &str = "^[vV][0-9]+(?:\\.[0-9]+)*\n?\\z";
+/// Full-match, like every manifest pattern: since CIRISConstitution#128 the
+/// reference applies its two detectors with `re.fullmatch`, so a segment
+/// carrying a trailing newline is neither a version nor a version attempt
+/// (`no_such_family:v1\n:v2` is open vocabulary, not a malformed tail). `\z`
+/// is that reading; before #128 the reference used `re.match`, whose `$`
+/// admitted one trailing newline, and this port reproduced it with `\n?\z`.
+const VERSION_LIKE: &str = "^[vV][0-9]+(?:\\.[0-9]+)*\\z";
 
 /// The reference's `VERSION_ATTEMPT` (rc5 at c60d0a6): a segment that starts
 /// like a version (`v` + digit) but is not one — `v1beta`, `v1.`, `V1x`. In
 /// LAST place it is an attempt at the version tail, so it is malformed. A bare
 /// `vx` is a leaf name (a version begins `v` + digit, R3).
-const VERSION_ATTEMPT: &str = "^[vV][0-9][0-9A-Za-z_.\\-]*\n?\\z";
+const VERSION_ATTEMPT: &str = "^[vV][0-9][0-9A-Za-z_.\\-]*\\z";
 
 /// A refusal the grammar names. Each spells the manifest's own token
 /// (`_meta.case_rule.refusal_tokens`) — never a bespoke string; the mapping is
@@ -252,7 +254,7 @@ fn compile(p: &str) -> Regex {
 }
 
 /// Compile one of the reference's two hard-coded DETECTORS verbatim (they
-/// carry their own anchors and Python-`re.match` newline tolerance).
+/// carry their own anchors; `\z` is full-match, CIRISConstitution#128).
 fn compile_detector(p: &str) -> Regex {
     Regex::new(p).unwrap_or_else(|e| panic!("detector {p:?} does not compile: {e}"))
 }
@@ -986,8 +988,8 @@ mod tests {
         let vs = vectors();
         assert_eq!(
             vs.len(),
-            968,
-            "the rc6 vectors file at 651140a (CIRISConstitution#129, capacity:relay_delivery) carries 968 vectors"
+            1040,
+            "the rc6 vectors file at 1f45ebe carries 1040 dimension vectors"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();
@@ -1057,7 +1059,19 @@ mod tests {
         let tokens = root["_meta"]["case_rule"]["refusal_tokens"]
             .as_object()
             .unwrap();
-        assert_eq!(tokens.len(), Refusal::ALL.len());
+        // The manifest's token table also names the ROW-TYPE refusal (CC 2.4,
+        // `_meta.row_types.refusal`). It refuses an `attestation_type`, never a
+        // dimension, so the dimension matcher has no variant for it: it is
+        // excluded here by reading it from the manifest, not by spelling it.
+        let row_type_refusal = root["_meta"]["row_types"]["refusal"].as_str().unwrap();
+        let dimension_tokens: Vec<&str> = tokens
+            .values()
+            .filter_map(|t| t.as_str())
+            .filter(|t| *t != row_type_refusal)
+            .collect();
+        assert_eq!(dimension_tokens.len() + 1, tokens.len());
+        assert_eq!(dimension_tokens.len(), Refusal::ALL.len());
+        assert_eq!(refusal_from_token(row_type_refusal), None);
         for r in Refusal::ALL {
             assert_eq!(
                 tokens.get(r.manifest_key()).and_then(|t| t.as_str()),
@@ -1162,10 +1176,12 @@ mod tests {
 
     /// Edges no published vector reaches, answered by the released reference
     /// (`tools/cc_namespace_match.py` at c60d0a6, run over the vendored
-    /// registry): a newline-carrying version-like segment (the detectors are
-    /// Python `re.match`, whose `$` tolerates one trailing newline), a closed
+    /// registry): a closed
     /// parameterized parent's unlisted and case-mutated kinds, and a version
-    /// ATTEMPT on a companion row and on open vocabulary.
+    /// ATTEMPT on a companion row and on open vocabulary. (The two
+    /// newline-bearing `no_such_family:v1\n:v2` edges left this table at the
+    /// rc6 re-vendor: CIRISConstitution#128 made the detectors full-match, the
+    /// answer became open vocabulary, and they are published vectors now.)
     #[test]
     fn reference_edges_beyond_the_vectors() {
         /// `(dimension, family, binds, refusal)` as the reference answers.
@@ -1175,9 +1191,7 @@ mod tests {
             &'static [(&'static str, &'static str)],
             Refusal,
         );
-        let cases: [Edge; 8] = [
-            ("no_such_family:v1\n:v2", None, &[], Refusal::CaseMalformed),
-            ("no_such_family:V1\n:v2", None, &[], Refusal::CaseMalformed),
+        let cases: [Edge; 6] = [
             (
                 "consent:made_up:v1",
                 Some("consent:{kind}"),

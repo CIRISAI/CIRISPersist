@@ -1521,7 +1521,7 @@ pub mod bodies {
         register(d, &author, &[it::PRIMITIVE]).await;
         let bind = |id: &str, sha: &[u8; 32]| {
             let env = serde_json::json!({
-                "id": id, "dimension": "file:doc:v1", "cohort_scope": "federation",
+                "id": id, "dimension": "file:v1", "cohort_scope": "federation",
                 "evidence_refs": [hex::encode(sha)]
             });
             let mut row = ts::bare_attestation(id, &author, &author, &env);
@@ -1648,7 +1648,7 @@ pub mod bodies {
             attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
                 serde_json::json!({
                     "id": uuid::Uuid::new_v4().to_string(),
-                    "dimension": "file:doc:v1",
+                    "dimension": "file:v1",
                     "references_attestation_id": format!("absent-{tag}"),
                     "withdrawal_reason": "CC 2.3",
                 }),

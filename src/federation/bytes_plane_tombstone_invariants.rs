@@ -31,12 +31,12 @@ pub mod bodies {
     {
         let env = if by_pointer {
             serde_json::json!({
-                "id": id, "dimension": "file:doc:v1", "cohort_scope": "federation",
+                "id": id, "dimension": "file:v1", "cohort_scope": "federation",
                 "content": {"content_sha256": sha_hex, "community_key_id": "", "tier": "invisible_encrypted"}
             })
         } else {
             serde_json::json!({
-                "id": id, "dimension": "file:doc:v1", "cohort_scope": "federation",
+                "id": id, "dimension": "file:v1", "cohort_scope": "federation",
                 "evidence_refs": [sha_hex]
             })
         };
@@ -391,7 +391,7 @@ pub mod bodies {
         bind_row(b, &e, &a, &[&a], &sha_hex, false).await;
         // Pointer-shaped at these bytes but unreadable (a non-string tier).
         let env = serde_json::json!({
-            "id": bad, "dimension": "file:doc:v1", "cohort_scope": "federation",
+            "id": bad, "dimension": "file:v1", "cohort_scope": "federation",
             "content": {"content_sha256": sha_hex, "community_key_id": "", "tier": 7}
         });
         let mut row = ts::bare_attestation(&bad, &a, &a, &env);

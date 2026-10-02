@@ -42,10 +42,10 @@ pub const VENDORED_CC_VERSION: &str = "1.0-rc6";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "fbb6c32e0ff0a4ef3aa0956c65882e9d0a50123827f9e1eee2c15858f84bd4de";
+    "459d3ef52bc6d021d8bed58af908f75c11fdaf83b5cb841e100040fbe6437ea9";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 149;
+pub const VENDORED_N_FAMILIES: usize = 158;
 
 /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the manifest's
 /// `_meta.registry_sha256`: the hash of the GRAMMAR (families + `_meta` minus
@@ -55,18 +55,35 @@ pub const VENDORED_N_FAMILIES: usize = 149;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (CC 1.0-rc5 as RELEASED from `main` — the `v1.0-rc5` tag's commit),
-/// together with
+/// (the CC 1.0-rc6 cut on branch `rc6`; see that const for why it is a commit
+/// and not yet a tag), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "c22dc0874b4c5ade08d8a691effdee36464eeaa76e3c57de28bdd0d0b2328d3e";
+    "f666f334db6b5e82dd7f75e6cbe82c926d27dcd9bd81d208784527cbce651c37";
 
 /// The CIRISConstitution commit both vendored manifests were copied from:
-/// `c60d0a6` "Cut CC 1.0-rc5, released as guidance (#125)" on `main`, which
-/// the `v1.0-rc5` tag names. (The slice first vendored PR #113's unmerged
-/// head `4b624513`; the released manifests replaced it byte-for-byte.)
-pub const VENDORED_CC_COMMIT: &str = "651140a2a553e2276bf5d80c77a32feaa9968f75";
+/// `1f45ebe` "Cut 1.0-rc6, released as guidance" on branch `rc6`.
+///
+/// **A commit, not a tag — and the release is gated on closing that gap.** The
+/// `v1.0-rc6` tag did not exist when this was vendored (it will sit on a later
+/// finalize commit on `main`, which the steward says touches neither manifest).
+/// The rc5 lesson is that a branch head is not a release, so the two files are
+/// pinned by their own SHA-256 ([`VENDORED_REGISTRY_FILE_SHA256`],
+/// [`VENDORED_VECTORS_FILE_SHA256`]) and `scripts/check_vendored_cc.sh v1.0-rc6`
+/// byte-compares them against the tag before a persist release that names rc6
+/// is tagged (CIRISPersist#975).
+pub const VENDORED_CC_COMMIT: &str = "1f45ebe51a3964fca21c8202f1f148bb9143c2bb";
+
+/// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
+/// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).
+/// What `scripts/check_vendored_cc.sh` compares against the tag.
+pub const VENDORED_REGISTRY_FILE_SHA256: &str =
+    "5f53f9776604713cb84468811983e67804b9771d61882a6723be61000897056d";
+
+/// SHA-256 of the vendored `namespace_match_vectors.json` FILE bytes.
+pub const VENDORED_VECTORS_FILE_SHA256: &str =
+    "c4226dfb769c8939b608398e9b6b4364dde62b8ac40b2cd25363af9bb4622810";
 
 /// v42.0.0 (CC 3.1.7 R3, CIRISPersist#815) — the case class of one dimension
 /// SEGMENT, read from the manifest rather than inferred from `{...}` in prose.
@@ -196,6 +213,11 @@ struct RawMeta {
     /// parse.
     #[serde(default)]
     private_use_prefix: Option<String>,
+    /// CC 2.4 "The row-type slot is closed" (rc6): the five structural row
+    /// types and the registered carriers. `Option` for the same reason as
+    /// `private_use_prefix`: a cut generated before rc6 carries none.
+    #[serde(default)]
+    row_types: Option<RowTypes>,
 }
 
 #[derive(serde::Deserialize)]
@@ -350,6 +372,86 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
 fn registry() -> &'static [NamespaceEntry] {
     static REGISTRY: OnceLock<Vec<NamespaceEntry>> = OnceLock::new();
     REGISTRY.get_or_init(parse_manifest)
+}
+
+/// One registered **carrier** row type (CC 2.4, rc6): a non-`scores` row type
+/// that may occupy the attestation plane. `pattern` is CC's anchored regular
+/// expression, compared byte-exact and whole-string.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct CarrierRowType {
+    /// The envelope `kind` a row of this type carries (`holds_bytes`, `key_grant`).
+    pub kind: String,
+    /// CC's anchored pattern for the whole `attestation_type` string.
+    pub pattern: String,
+    /// A sample value CC publishes for the pattern.
+    pub sample: String,
+    /// The token as CC's text spells it (`key_grant:{axis}:{version}`).
+    pub token: String,
+}
+
+/// The vendored registry's `_meta.row_types` (CC 2.4, rc6): the closed set of
+/// `attestation_type` values. Vendored and parsed here; the admission gate
+/// that enforces it is CIRISPersist#975 and reads this, never constants.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct RowTypes {
+    /// The five structural row types.
+    pub structural: Vec<String>,
+    /// The registered carriers.
+    pub carriers: Vec<CarrierRowType>,
+    /// The refusal token for anything else (`attestation_type_unregistered`).
+    pub refusal: String,
+    /// CC's statement of the comparison rule.
+    pub compare: String,
+    /// The CC clause (`CC 2.4`).
+    pub cc_ref: String,
+}
+
+/// The closed row-type set of the vendored cut, or `None` for a cut generated
+/// before CC published it. Parsed once.
+#[must_use]
+pub fn row_types() -> Option<&'static RowTypes> {
+    static R: OnceLock<Option<RowTypes>> = OnceLock::new();
+    R.get_or_init(|| {
+        let raw: RawManifest =
+            serde_json::from_str(REGISTRY_JSON).expect("vendored namespace_registry.json is valid");
+        raw.meta.row_types
+    })
+    .as_ref()
+}
+
+/// Is `attestation_type` one of the registered CARRIER row types (CC 2.4) —
+/// a whole-string, byte-exact match for a carrier pattern in
+/// `_meta.row_types`?
+///
+/// One caller: the type half of the CC 3.1.7 R2(b) check in
+/// `admission`. A carrier token is a row type and never a dimension, and the
+/// registry says so by gating its stem (`key_grant:` — "carrier row type,
+/// never a dimension"), so the DIMENSION matcher refuses the token by design.
+/// A row's type is not a dimension; this is what keeps the type slot of a
+/// registered carrier out of the dimension matcher. It refuses nothing: the
+/// allowlist over the whole slot is CIRISPersist#975.
+#[must_use]
+pub fn is_registered_carrier_row_type(attestation_type: &str) -> bool {
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    PATTERNS
+        .get_or_init(|| {
+            row_types()
+                .map(|rt| {
+                    rt.carriers
+                        .iter()
+                        .map(|c| {
+                            // Full match whatever the row's own anchors say, and
+                            // `\z` so a trailing newline is never admitted.
+                            let body = c.pattern.trim_start_matches('^').trim_end_matches('$');
+                            regex::Regex::new(&format!("\\A(?:{body})\\z"))
+                                .expect("a vendored carrier pattern compiles")
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|re| re.is_match(attestation_type))
 }
 
 /// The full vendored namespace registry (every CC 3.1 prefix family), sorted
@@ -660,6 +762,15 @@ pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
     "watchlist:{id}",
     "weighted_aggregate:{contribution_id}",
     "witness_diversity:{contribution_id}",
+    "collection:{kind}",
+    "custody:{kind}",
+    "device:label",
+    "file:{version}",
+    "lineage_witness:{stage}",
+    "membership:{stage}",
+    "observation:reachability",
+    "self:delegates_to",
+    "self:delegates_to:agent_occurrence",
 ];
 
 /// Families CC has **deliberately retired** — present in an earlier vendored cut,
@@ -812,6 +923,91 @@ mod tests {
         }
     }
 
+    /// The two vendored files are pinned by their own bytes: this is what
+    /// `scripts/check_vendored_cc.sh <tag>` compares against the CC release tag,
+    /// and what makes a hand edit to either file fail here.
+    #[test]
+    fn the_vendored_files_are_pinned_by_their_bytes() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(REGISTRY_JSON.as_bytes())),
+            VENDORED_REGISTRY_FILE_SHA256,
+            "namespace_registry.json bytes moved without VENDORED_REGISTRY_FILE_SHA256"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(
+                super::super::matcher::VECTORS_JSON.as_bytes()
+            )),
+            VENDORED_VECTORS_FILE_SHA256,
+            "namespace_match_vectors.json bytes moved without VENDORED_VECTORS_FILE_SHA256"
+        );
+        assert_eq!(
+            VENDORED_CC_COMMIT.len(),
+            40,
+            "a full commit id, never a branch name"
+        );
+    }
+
+    /// CC 2.4 (rc6) — the closed row-type set is vendored and parses: the five
+    /// and the two carriers, each carrier's own sample matching its pattern.
+    /// Vendored only; enforcement is CIRISPersist#975.
+    #[test]
+    fn the_row_type_set_is_vendored_and_parses() {
+        let rt = row_types().expect("rc6 carries _meta.row_types");
+        assert_eq!(
+            rt.structural,
+            [
+                "scores",
+                "delegates_to",
+                "supersedes",
+                "withdraws",
+                "recants"
+            ]
+        );
+        assert_eq!(rt.refusal, "attestation_type_unregistered");
+        let patterns: Vec<&str> = rt.carriers.iter().map(|c| c.pattern.as_str()).collect();
+        assert_eq!(
+            patterns,
+            [
+                "^holds_bytes:sha256:[0-9a-f]{8}$",
+                "^key_grant:(content|epoch|stream):v1$"
+            ]
+        );
+        for c in &rt.carriers {
+            let re = regex::Regex::new(&c.pattern).expect("a carrier pattern compiles");
+            assert!(
+                re.is_match(&c.sample),
+                "{} must match {}",
+                c.sample,
+                c.pattern
+            );
+            assert!(c.sample.starts_with(&format!("{}:", c.kind)), "{c:?}");
+        }
+        // The vectors file carries CC's row-type vectors beside the dimension
+        // ones. Present and counted here; REPLAYED by the classifier that
+        // enforces the slot (CIRISPersist#975), which this cut does not add.
+        let vectors: serde_json::Value =
+            serde_json::from_str(super::super::matcher::VECTORS_JSON).unwrap();
+        let rtv = vectors["row_type_vectors"]
+            .as_array()
+            .expect("row_type_vectors");
+        assert_eq!(rtv.len(), 39);
+        // The carrier half of those vectors IS replayed, against the one reader
+        // this cut adds: a vector CC classes `carrier` is a registered carrier,
+        // and nothing else is.
+        for v in rtv {
+            let t = v["attestation_type"].as_str().unwrap();
+            assert_eq!(
+                is_registered_carrier_row_type(t),
+                v["class"] == "carrier",
+                "{t:?}"
+            );
+        }
+        assert!(rtv
+            .iter()
+            .all(|v| v["refusal"].is_null() || v["refusal"] == rt.refusal));
+    }
+
     /// v50.0.0 (CIRISPersist#924, CIRISConstitution#112) — the grammar pin.
     ///
     /// Recomputes `_meta.registry_sha256` over the VENDORED bytes exactly as
@@ -833,7 +1029,7 @@ mod tests {
         let mut grammar_meta = meta.clone();
         grammar_meta.remove("source_sha256");
         grammar_meta.remove("registry_sha256");
-        // v51.0.0 — CC's recipe at 651140a (`tools/build_cc_namespace.py`,
+        // v51.0.0 — CC's recipe since 651140a (`tools/build_cc_namespace.py`,
         // rc6) also excludes `cc_version`: a version bump is not a grammar
         // change. The recipe moves with the bytes it hashes.
         grammar_meta.remove("cc_version");
@@ -1402,6 +1598,11 @@ mod tests {
                 (
                     "private_use_prefix",
                     "RawMeta::private_use_prefix + matcher::parse_rules",
+                ),
+                (
+                    "row_types",
+                    "RawMeta::row_types -> registry::row_types() (CC 2.4: vendored and \
+                     parsed; the allowlist is not enforced here — CIRISPersist#975)",
                 ),
                 (
                     "case_rule",

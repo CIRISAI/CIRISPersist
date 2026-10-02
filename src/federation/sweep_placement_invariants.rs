@@ -44,7 +44,7 @@ pub mod bodies {
     /// room; only the bytes are sealed.
     pub fn file_envelope(id: &str) -> serde_json::Value {
         serde_json::json!({
-            "dimension": "file:doc:v1",
+            "dimension": "file:v1",
             "filename": format!("{id}.txt"),
             "blob_sha256": "ab".repeat(32),
             "size": 42,
