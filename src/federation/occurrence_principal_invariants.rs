@@ -589,9 +589,13 @@ pub(crate) mod bodies {
         bind(d, &node, &node, "2026-06-01T00:00:00Z").await;
         bind(d, &owner, &node, "2026-06-02T00:00:00Z").await;
         room(d, &comm, &[&owner, &other]).await;
-        let memberships = crate::federation::replication::hold::audience_memberships(d, &node)
-            .await
-            .unwrap();
+        let memberships = crate::federation::replication::hold::audience_memberships(
+            d,
+            &node,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        )
+        .await
+        .unwrap();
         assert!(
             memberships.contains(&comm),
             "I122: the node's audience is its owner's rooms: {memberships:?}"
@@ -604,9 +608,13 @@ pub(crate) mod bodies {
         // with no principal involved.
         let own_room = format!("i122-own-{s}");
         room(d, &own_room, &[&node, &other]).await;
-        let memberships = crate::federation::replication::hold::audience_memberships(d, &node)
-            .await
-            .unwrap();
+        let memberships = crate::federation::replication::hold::audience_memberships(
+            d,
+            &node,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        )
+        .await
+        .unwrap();
         assert!(
             memberships.contains(&own_room),
             "I122: the node's own memberships are not lost to the principal walk: {memberships:?}"
@@ -656,9 +664,13 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .is_empty());
-        let memberships = crate::federation::replication::hold::audience_memberships(d, &node)
-            .await
-            .unwrap();
+        let memberships = crate::federation::replication::hold::audience_memberships(
+            d,
+            &node,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        )
+        .await
+        .unwrap();
         assert!(!memberships.contains(&comm), "I123: {memberships:?}");
         let err = holds(d, &node, &comm, &other)
             .await
@@ -700,9 +712,13 @@ pub(crate) mod bodies {
         let (room_a, room_b) = (format!("i124-room-a-{s}"), format!("i124-room-b-{s}"));
         room(d, &room_a, &[&first, &other]).await;
         room(d, &room_b, &[&second, &other]).await;
-        let memberships = crate::federation::replication::hold::audience_memberships(d, &node)
-            .await
-            .unwrap();
+        let memberships = crate::federation::replication::hold::audience_memberships(
+            d,
+            &node,
+            crate::federation::types::cohort_scope::COMMUNITY,
+        )
+        .await
+        .unwrap();
         assert!(
             memberships.contains(&room_a) && memberships.contains(&room_b),
             "I124: party to both humans' rooms: {memberships:?}"

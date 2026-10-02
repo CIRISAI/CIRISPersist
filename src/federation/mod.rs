@@ -450,6 +450,11 @@ pub mod renditions;
 // the CC-blocked registry finding + the replication decision.
 pub mod regime;
 pub mod replication;
+// v53.0.0 (CIRISPersist#963 / CIRISEdge#761) — the one audience resolver:
+// per-node cohort allow lists, public groups, `may_receive`.
+pub mod replication_audience;
+#[cfg(test)]
+pub mod replication_audience_invariants;
 pub mod replication_policy;
 pub mod rooting;
 // v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.

@@ -640,6 +640,55 @@ where
     Ok(out)
 }
 
+/// v53.0.0 (CIRISEdge#761, CC 5.4.6) — **the live invitees of a private
+/// group**: the subjects of held federation-tier proposals for `group` at
+/// `scope` that are unexpired, not withdrawn by their proposer and not
+/// declined by their invitee. A proposal comes from a member (AV-45), so the
+/// proposals are found among the rows `members` (and their active
+/// occurrences) signed. Sorted, deduped.
+pub async fn live_invitees_of<F>(
+    dir: &F,
+    scope: &str,
+    group: &str,
+    members: &[String],
+) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let now = chrono::Utc::now();
+    let mut signers: std::collections::BTreeSet<String> = members.iter().cloned().collect();
+    for m in members {
+        for o in dir.list_identity_occurrences_active(m).await? {
+            signers.insert(o.occurrence_key_id);
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for s in &signers {
+        for row in dir.list_attestations_by(s).await? {
+            if row.tier != attestation_tier::FEDERATION {
+                continue;
+            }
+            let Some(p) = as_proposal(row) else {
+                continue;
+            };
+            if p.row.cohort_scope != scope || p.group != group || p.expires_at <= now {
+                continue;
+            }
+            if proposal_withdrawn(dir, &p).await? {
+                continue;
+            }
+            let replies = replies_of(dir, &p.invitee).await?;
+            let declined = replies_to(&replies, &p.row.attestation_id)
+                .iter()
+                .any(|r| membership_row(r) == Some(MembershipRow::Decline));
+            if !declined {
+                out.insert(p.invitee);
+            }
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
 /// The emit input for a proposal (the inviter signs it through any emit door).
 #[must_use]
 pub fn proposal_input(
