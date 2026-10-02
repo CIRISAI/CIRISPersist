@@ -71,6 +71,10 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+/// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — `custody:ack:v1`: which of
+/// a cohort's own devices hold a blob, folded at read time.
+pub mod custody_ack;
+mod custody_ack_invariants;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — roster rows and the head: a version
@@ -2227,6 +2231,48 @@ pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
         && admission::is_owner_binding_envelope(&row.attestation_envelope)
         && !row.attested_key_id.is_empty())
     .then(|| (row.attesting_key_id.clone(), row.attested_key_id.clone()))
+}
+
+/// v53.0.0 (#963) — `(owner, node)` when `row` changes `owner`'s cohort allow
+/// list for `node`: a `consent:replication` grant `owner` authored FOR `node`,
+/// or `owner`'s `withdraws` / `recants` / `supersedes` of one. The write doors
+/// re-wrap on it ([`rewrap_after_admission`]), so a cohort the owner allows
+/// after the fact reaches the node with its earlier keys; a deny needs no walk
+/// here (the next write rolls the epochs the node held). A lookup that fails
+/// is logged and treated as no change: the row stands, and the pending sweep
+/// is where a missed re-wrap is retried.
+pub(crate) async fn consent_list_change_of<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Option<(String, String)>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let grant_for = |g: &Attestation| -> Option<String> {
+        (admission::envelope_dimension(&g.attestation_envelope)
+            == Some(consent_grammar::GRANT_DIMENSION))
+        .then(|| consent_by_humans::for_key_id_of(&g.attestation_envelope))
+        .flatten()
+        .filter(|node| *node != g.attesting_key_id)
+        .map(str::to_owned)
+    };
+    if let Some(node) = grant_for(row) {
+        return Some((row.attesting_key_id.clone(), node));
+    }
+    if !precedence::is_structural_composer(&row.attestation_type) {
+        return None;
+    }
+    let target = precedence::references_attestation_id_from_envelope(&row.attestation_envelope)?;
+    match directory.get_attestation(target).await {
+        Ok(Some(g)) if g.attesting_key_id == row.attesting_key_id => {
+            grant_for(&g).map(|node| (g.attesting_key_id.clone(), node))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, target = %target, "consent list change: lookup failed (#963)");
+            None
+        }
+    }
 }
 
 /// v50.0.0 (CIRISPersist#916) — run

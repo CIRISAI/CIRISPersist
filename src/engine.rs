@@ -6990,6 +6990,78 @@ impl Engine {
         }
     }
 
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **this node's custody
+    /// report for one blob**: a `custody:ack:v1` `scores` row it signs about
+    /// itself, placed at the blob's own cohort. `Here` needs the bytes on this
+    /// node and takes the stored length as `size`; `None` is "responsive, no
+    /// copy". With no row held only `None` can be reported, at the
+    /// caller-named `cohort_scope`; with a row held a different
+    /// `cohort_scope` is refused. `cohort_target` names the family or
+    /// community (a community blob's is read from its sealing epoch when
+    /// omitted). Re-acknowledge about daily: a report is live for 72 h.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_custody_ack(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        state: crate::federation::custody_ack::CustodyState,
+        cohort_scope: Option<&str>,
+        cohort_target: Option<&str>,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::custody_ack::custody_ack_input_for;
+        let input = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                custody_ack_input_for(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    state,
+                    cohort_scope,
+                    cohort_target,
+                )
+                .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                custody_ack_input_for(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    state,
+                    cohort_scope,
+                    cohort_target,
+                )
+                .await?
+            }
+        };
+        self.emit_attestation_self(input).await
+    }
+
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **the custody view** of
+    /// one blob for `viewer_key_id`: per device, `here` | `received` | `none`
+    /// | `unknown`, folded at this node's clock. `stream_id`, when the caller
+    /// knows the blob's stream, adds its delivery receipts (a receipt with no
+    /// later live report reads `received`). Authorized like
+    /// [`blob_custody`](Self::blob_custody): a stranger is `NotGranted`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn custody_view(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        stream_id: Option<&str>,
+    ) -> Result<crate::federation::custody_ack::CustodyView, crate::federation::BlobError> {
+        use crate::federation::custody_ack::custody_view;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                custody_view(arc.as_ref(), at_rest_sha256, viewer_key_id, stream_id, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                custody_view(arc.as_ref(), at_rest_sha256, viewer_key_id, stream_id, now).await
+            }
+        }
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114; `MEDIA_SOURCE.md`
     /// §9.3) — **seal a small descriptor under an existing blob's DEK.** The
     /// caller is authorized exactly as [`read_blob_as`](Self::read_blob_as)

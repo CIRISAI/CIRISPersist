@@ -1539,7 +1539,7 @@ fn disarmed() {
 async fn baked_sqlite() -> SqliteBackend {
     let b = SqliteBackend::open_in_memory().await.unwrap();
     b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&accord_holder_genesis_records())
+    b.seed_genesis_accord_holders(accord_holder_genesis_records())
         .await
         .expect("seed holders");
     b
@@ -1547,7 +1547,7 @@ async fn baked_sqlite() -> SqliteBackend {
 
 async fn baked_memory() -> MemoryBackend {
     let b = MemoryBackend::new();
-    b.seed_genesis_accord_holders(&accord_holder_genesis_records())
+    b.seed_genesis_accord_holders(accord_holder_genesis_records())
         .await
         .expect("seed holders");
     b
@@ -1862,11 +1862,11 @@ async fn i429b_recovery_replicates_to_a_peer_postgres() {
 async fn i428c_v2_bundle_upgrade_keeps_the_root_postgres() {
     disarmed();
     let roster = accord_holder_genesis_records();
-    let Some((f, base, nf)) = pg_node(&roster).await else {
+    let Some((f, base, nf)) = pg_node(roster).await else {
         eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
         return;
     };
-    let (u, _, nu) = pg_node(&roster).await.unwrap();
+    let (u, _, nu) = pg_node(roster).await.unwrap();
     v2_bundle_keeps_the_root(&f, &u, "postgres").await;
     drop(f);
     drop(u);
