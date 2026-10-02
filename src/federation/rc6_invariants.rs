@@ -999,6 +999,33 @@ pub(crate) mod bodies {
             matches!(e.kind(), "federation_conflict" | "trust_root_head_unnamed"),
             "I358: {e:?}"
         );
+        // The gate itself judges it as new, whatever door order precedes it:
+        // a held id with a different signed envelope is not "already admitted".
+        let changed = accept_edge_row(&id, consumer, None, "infra:attest").attestation;
+        let e = cc::check_attach_freshness(
+            d,
+            Some(&id),
+            &changed.attesting_key_id,
+            &changed.attestation_type,
+            &changed.attested_key_id,
+            &changed.attestation_envelope,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("I358: the gate reads a changed envelope as a new edge");
+        assert_eq!(e.kind(), "trust_root_head_unnamed", "I358: {e:?}");
+        let same = held.attestation.clone();
+        cc::check_attach_freshness(
+            d,
+            Some(&id),
+            &same.attesting_key_id,
+            &same.attestation_type,
+            &same.attested_key_id,
+            &same.attestation_envelope,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("I358: the held edge itself is not re-judged");
         let after = d.get_attestation(&id).await.unwrap().expect("still held");
         assert_eq!(
             after.original_content_hash, held.attestation.original_content_hash,
