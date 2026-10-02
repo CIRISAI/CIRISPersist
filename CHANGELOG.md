@@ -9,6 +9,48 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### S2 — custody:ack:v1 (CIRISPersist#942 part 2; CC 3.1.3.3, CIRISConstitution#130)
+
+A family can now see how many copies of its content exist without weakening encryption or outsider invisibility. Each device reports its own custody of a blob in a `scores` row on `custody:ack:v1`, and persist folds the reports at read time.
+
+**The row.** `attestation_type = scores`; `attesting_key_id == attested_key_id` = the device. Envelope: `custody_state` `here` | `none`; `evidence_refs` = exactly one entry, the blob's at-rest sha256 (64 lowercase hex; the slot `holds_bytes` uses for the full digest); `size` (the stored length) iff `here`; the signer-stamped `asserted_at`; the cohort target (`community_id` / `family_key_id`). `cohort_scope` is the blob's own: `self`, `family` or `community`. It is never a `holds_bytes:*` row. The per-family members ride the envelope's `extra`, as `session:*` and `membership:*` members do, so `ENVELOPE_VOCABULARY_SHA256` does not move.
+
+**The gate** (`custody_ack::check_custody_ack_admission`, at all three put doors and the promotion chokepoint; parity-classified `Gate`). On `custody:ack:v1` it refuses `custody_ack_not_self_report` (another key reporting a device's custody), `custody_ack_malformed` (no or unknown state, `here` without size, `none` with size, a digest that is not one 64-hex blob, a placement outside self/family/community), and `custody_ack_outside_cohort`. A signed instant more than `DEFAULT_MAX_TOUCH_SKEW` (300 s) ahead of the receiving node's clock is refused by the universal instant gate (`check_instant_binding`), which already runs on every row: a future-dated `here` cannot stay live, and there is one skew constant. `custody:` moves from the reserved-and-ungated list to the purpose-gated list.
+
+**The fold** (`custody_ack::fold_device_custody`; never a stored verdict). Per device, the latest non-retired report by signed instant (ties by row hash), live for 72 h judged on the READER's clock (`≤`: exactly 72 h still counts). Then, per CC 3.1.3.3: `here` (a live `here`), `received` (a delivery receipt with no later live report), `none` (a live `none`), `unknown` (no live report, no receipt). `challengeable` marks a live `here` naming its size: the reports a possession challenge (CIRISPersist#976) would test; no challenge exists yet.
+
+**Doors.** `Engine::put_custody_ack(sha, state, cohort_scope?, cohort_target?)` (pyo3 `put_custody_ack`): `here` needs the blob's row on this node (`custody_ack_here_not_held`) and takes its stored length (for a chunk DAG the row is the manifest; whether every chunk is held is not asked); a cohort that differs from the held row's is refused; with no row held only `none` is reportable, at the named cohort; a community blob's target is read from its sealing epoch. `Engine::custody_view(sha, viewer, stream_id?)` (pyo3 `custody_view_json`): authorized like the bytes read; devices are the blob's key recipients, this node, and the stream's receipted subscribers when `stream_id` is given.
+
+**`blob_custody` changes (Server: CIRISServer#704).** It carries `device_custody` (the same fold, without receipts). `copies_known` counts this node's copy, the announced holders and every `here` device, each node once. `copies_observable` is now always `true`: a `self`/`family` device with no live report is `unknown`, never a copy and never `none`. The `why` for self/family says so. I127 moved with it.
+
+**Differences from the design (`daud.md` §S2), CC winning:**
+- No V170 projection table. The fold re-derives from the device's own rows (`list_attestations_by`), so there is nothing to drop and I409 witnesses re-derivation by withdrawal instead. The view names devices from the blob's key recipients, this node and receipt subscribers; a device outside those is not enumerated.
+- `received` is CC's "a receipt with no LATER live report": a receipt newer than a live report outranks it, and an older one does not.
+- The audience check is ONE call site, `custody_ack::device_in_cohort` → `replication::hold::is_audience`. At the put door the AV-45 write-cohort gate already refuses an outsider's family/community placement first (see the mutation table, M9).
+
+**Witnesses I400–I409** (`federation/custody_ack_invariants.rs`; memory, sqlite, postgres) and **I400e** (the Engine door; sqlite, postgres). I127 updated.
+
+**Not built:** the N6 possession challenge (CIRISPersist#976; the `challengeable` flag only). No `evidence/cc_impl.tsv` row for `CLM-custody-receipt`.
+
+**Mutation round** (on the committed tree; lane = I400–I409 memory + sqlite, I400e sqlite, I127 sqlite, the module's unit tests): fourteen mutants, eleven killed, three equivalent.
+
+| Mutant | Result |
+|---|---|
+| M1 the 72 h boundary `<=` → `<` | killed — I401 |
+| M2 liveness ignores the reader's clock | killed — I401 |
+| M3 the self-report equality dropped | killed — I405 |
+| M4 latest-by-instant → earliest | killed — I402, I409, I400e, unit |
+| M5 a receipt newer than the live report never wins | killed — I403, unit |
+| M6 a receipt alone reads unknown | killed — I403 |
+| M7 the future-instant skew bound widened to a year | killed — I407 (after the witness stopped computing its instant from the bound it tests; it survived the first run) |
+| M8 `here` without size admitted | killed — I407 |
+| M9 the cohort audience check always passes | equivalent at the put door — AV-45's write-cohort gate refuses the outsider first (`WriteScopeRefused(NoCommunityMembership)`); the check stays as the one audience call site S1 swaps |
+| M10 withdrawn reports still fold | killed — I409 |
+| M11 another blob's reports answer for this one | killed — I402 |
+| M12 `here` for a row-held blob without bytes | equivalent — `blob_head` and `has_blob` read one stored row; the unreachable branch was removed |
+| M13 a commons placement admitted | killed — I407 |
+| M14 the fold reads rows ABOUT the device instead of BY it | equivalent — a third-party report is refused at admission, so the two sets agree |
+
 ### The final-genesis assembler (CIRISPersist#973; CC rc7 T5, T6, 3.4.7, 4.2.6)
 
 **`genesis::ceremony`** (new, production build, Rust only) is the assembler the server's ceremony routes drive. `CeremonyState::plan(inputs)` takes everything once, stamped by the caller at propose. The inputs are the holders as carried, the serve nodes, the T3 successor set and each holder's recovery key (as `CommittedKey`s: key material, not ids), the scope, the community birth's fields and **one `produced_at`**. Every instant in every item derives from that stamp; the assembler reads no clock. The state and each `Partial` are serde, so a ceremony can span HTTP requests and restarts. Item bytes are recomputed from the inputs on every call, never stored.
