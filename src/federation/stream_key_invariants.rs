@@ -1109,74 +1109,30 @@ pub(crate) mod bodies {
     }
 
     /// The v52 shape (a per-chunk-keyed stream, sealed as v2): `n` chunks
-    /// through the v52 chunk door's steps, then the door, which keeps a
-    /// stream that already holds per-chunk-keyed chunks per-chunk. Returns
-    /// the plaintext.
-    async fn write_v52_stream<B>(p: &Pair<B>, stream: &str, n: usize) -> Vec<u8>
+    /// through the ONE v2 writer, the exported
+    /// [`write_legacy_v2_dag`](crate::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag)
+    /// (the v52 chunk door's steps for chunk 0, the door for the rest, then
+    /// the seal). Returns the plaintext and the DAG's root.
+    async fn write_v52_stream<B>(p: &Pair<B>, stream: &str, n: usize) -> (Vec<u8>, [u8; 32])
     where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
-        // The v52 chunk door, verbatim: a fresh DEK per chunk, the position
-        // AAD, the floor with no stream slot, the per-chunk grants.
-        let seg0 = segment(0);
-        let dek = crate::federation::at_rest_cascade::fresh_dek().unwrap();
-        let env = crate::federation::at_rest_cascade::seal(
-            &dek,
-            &seg0,
-            Some(&crate::federation::chunk_dag_cascade::chunk_aad(
-                None, stream, 0,
-            )),
-        )
-        .unwrap();
-        let sha =
-            p.sa.put_blob_chunk_with_scope(
-                stream,
-                0,
-                BlobBody::Inline(env.to_bytes()),
-                0,
-                seg0.len() as u64,
-                cohort_scope::SELF,
-                crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
-                None,
-                crate::federation::StreamClaim {
-                    community_key_id: Some(p.owner.clone()),
-                    owner_key_id: Some(p.key_a.clone()),
-                    stream_key: None,
-                },
-            )
-            .await
-            .unwrap();
-        crate::federation::at_rest_cascade::orchestrate::grant_dek_to_cohort(
+        let segs: Vec<Vec<u8>> = (0..n).map(segment).collect();
+        let dag = crate::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag(
+            &p.a,
             p.sa.as_ref(),
-            &sha,
             cohort_scope::SELF,
             &p.owner,
-            &dek,
+            stream,
+            &segs,
         )
         .await
-        .unwrap();
-        // The stream continues on the per-chunk path through the door.
-        let mut plain = seg0.clone();
-        for i in 1..n {
-            let seg = segment(i);
-            p.a.put_blob_chunk_scoped(
-                cohort_scope::SELF,
-                Some(&p.owner),
-                stream,
-                i as u64,
-                &seg,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
-            plain.extend_from_slice(&seg);
-        }
+        .unwrap_or_else(|e| panic!("v52 stream {stream}: {e}"));
         assert!(
             p.sa.stream_dek_list(stream).await.unwrap().is_empty(),
             "a v52 stream never gains a stream DEK"
         );
-        plain
+        (dag.plaintext, dag.manifest_sha256)
     }
 
     pub(crate) async fn i315_a_v52_stream_reads_forever<B>(
@@ -1189,8 +1145,7 @@ pub(crate) mod bodies {
     {
         let p = pair(dsn_a, dsn_b, run, pick, "i315").await;
         let stream = format!("i315-{run}");
-        let plain = write_v52_stream(&p, &stream, 6).await;
-        let root = seal(&p, &stream).await;
+        let (plain, root) = write_v52_stream(&p, &stream, 6).await;
         let view =
             p.a.open_sealed_manifest_as(&root, &p.key_a, None)
                 .await
@@ -1247,8 +1202,7 @@ pub(crate) mod bodies {
     {
         let p = pair(dsn_a, dsn_b, run, pick, "i314c").await;
         let stream = format!("i314c-{run}");
-        write_v52_stream(&p, &stream, 5).await;
-        let root = seal(&p, &stream).await;
+        let (_, root) = write_v52_stream(&p, &stream, 5).await;
         let view =
             p.a.open_sealed_manifest_as(&root, &p.key_a, None)
                 .await

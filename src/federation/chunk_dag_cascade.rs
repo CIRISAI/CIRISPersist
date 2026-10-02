@@ -3192,6 +3192,138 @@ pub mod orchestrate {
     }
 }
 
+/// v53.0.0 (CIRISPersist#969) — **test-only: write a legacy (manifest v2,
+/// per-chunk-keyed) sealed DAG the way v52 wrote it**, so a consumer crate can
+/// test the pull of an old-format file END TO END. v53 seals every new
+/// self/family stream under one key per (stream, epoch) (manifest v4); v52's
+/// files stay readable forever, but after v53 no public door writes one. This
+/// is the one v2 writer: persist's own witnesses (I315, I314c) call it too.
+///
+/// Compiled only under `test` or the `test-anchor` feature (never in a
+/// published wheel; Edge's dev-dependency enables `ciris-persist/test-anchor`).
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
+pub mod test_support {
+    use crate::federation::blobs::{BlobBody, BlobError, BlobStorage};
+    use crate::federation::types::cohort_scope::CryptoTier;
+    use crate::federation::{FederationDirectory, StorageFloor, StreamClaim};
+
+    /// What [`write_legacy_v2_dag`] wrote: the identifiers a consumer pulls by.
+    #[derive(Debug, Clone)]
+    pub struct LegacyV2Dag {
+        /// The DAG's content address: the sealed v2 manifest's sha256.
+        pub manifest_sha256: [u8; 32],
+        /// Each chunk's content address (of its ciphertext), in `seq` order.
+        pub chunk_sha256: Vec<[u8; 32]>,
+        /// The file's plaintext: the chunks concatenated.
+        pub plaintext: Vec<u8>,
+    }
+
+    /// Write `chunks` to `stream_id` as a v52 node did, then seal it, on the
+    /// node `engine` runs over `backend` (the same backend, as a consumer holds
+    /// it next to its `Engine`).
+    ///
+    /// - chunk 0 goes through the v52 chunk door's steps verbatim: a fresh DEK,
+    ///   the position AAD, the floor with no stream slot, the per-chunk content
+    ///   grants to `group_key_id`'s cohort (the owner for `self`, the family key
+    ///   for `family`);
+    /// - every later chunk goes through the public chunk door, which keeps a
+    ///   stream that already holds a per-chunk-keyed chunk per-chunk;
+    /// - the public seal door then seals a **v2** manifest (no `chunk_keys`, no
+    ///   epochs, no terminators) and grants it.
+    ///
+    /// The content key-grant sets are left pending, as any write leaves them:
+    /// `engine.emit_pending_key_grants()` emits them for delivery. No clock is
+    /// read here beyond what the public doors read themselves.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for no chunks; otherwise whatever the doors refuse.
+    pub async fn write_legacy_v2_dag<B>(
+        engine: &crate::Engine,
+        backend: &B,
+        cohort_scope: &str,
+        group_key_id: &str,
+        stream_id: &str,
+        chunks: &[Vec<u8>],
+    ) -> Result<LegacyV2Dag, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let Some((first, rest)) = chunks.split_first() else {
+            return Err(BlobError::InvalidArgument(
+                "write_legacy_v2_dag: a DAG has at least one chunk".into(),
+            ));
+        };
+        let node_key = engine
+            .local_derived_key_id()
+            .await
+            .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: node key: {e}")))?;
+        // The v52 chunk door, verbatim.
+        let dek = crate::federation::at_rest_cascade::fresh_dek()
+            .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: dek: {e}")))?;
+        let env = crate::federation::at_rest_cascade::seal(
+            &dek,
+            first,
+            Some(&super::chunk_aad(None, stream_id, 0)),
+        )
+        .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: seal chunk 0: {e}")))?;
+        let sha0 = backend
+            .put_blob_chunk_with_scope(
+                stream_id,
+                0,
+                BlobBody::Inline(env.to_bytes()),
+                0,
+                first.len() as u64,
+                cohort_scope,
+                StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                None,
+                StreamClaim {
+                    community_key_id: Some(group_key_id.to_owned()),
+                    owner_key_id: Some(node_key),
+                    stream_key: None,
+                },
+            )
+            .await?;
+        crate::federation::at_rest_cascade::orchestrate::grant_dek_to_cohort(
+            backend,
+            &sha0,
+            cohort_scope,
+            group_key_id,
+            &dek,
+        )
+        .await?;
+        let mut chunk_sha256 = vec![sha0];
+        let mut plaintext = first.clone();
+        // The stream continues on the per-chunk path through the door.
+        for (i, seg) in rest.iter().enumerate() {
+            let put = engine
+                .put_blob_chunk_scoped(
+                    cohort_scope,
+                    Some(group_key_id),
+                    stream_id,
+                    i as u64 + 1,
+                    seg,
+                    0,
+                    None,
+                )
+                .await?;
+            chunk_sha256.push(put.chunk_sha256);
+            plaintext.extend_from_slice(seg);
+        }
+        let sealed = engine
+            .seal_stream_scoped(cohort_scope, Some(group_key_id), stream_id, None, None)
+            .await?;
+        Ok(LegacyV2Dag {
+            manifest_sha256: sealed.manifest_sha256,
+            chunk_sha256,
+            plaintext,
+        })
+    }
+}
+
 /// §12.7 — the falsifiable invariants, one `exercise_*` body per row,
 /// registered in BOTH `store::sqlite` and `store::postgres` tests.
 #[cfg(any(test, feature = "test-anchor"))]
