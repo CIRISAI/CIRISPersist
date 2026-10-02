@@ -16,6 +16,6 @@ CREATE TABLE IF NOT EXISTS cirislens.federation_trust_direction_held (
 INSERT INTO cirislens.federation_trust_direction_held (attestation_id)
 SELECT attestation_id FROM cirislens.federation_attestations
  WHERE attestation_type = 'delegates_to'
-   AND COALESCE(attestation_envelope ->> 'dimension', '')
+   AND COALESCE(attestation_envelope::jsonb ->> 'dimension', '')
        NOT IN ('trust:charter:v1', 'trust:accepts:v1', 'trust:confers:v1')
 ON CONFLICT (attestation_id) DO NOTHING;

@@ -16677,6 +16677,16 @@ mod tests {
         d
     }
 
+    /// #973 — a node's acceptance edge toward a root, naming its job
+    /// (`trust:accepts:v1`). An unlabelled `delegates_to` gives no acceptance.
+    fn fix_accepts(id: &str, node: &str, root: &str, scope: serde_json::Value) -> Attestation {
+        let mut d = fix_delegates_to(id, node, root, scope);
+        d.attestation_envelope["dimension"] =
+            serde_json::json!(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION);
+        resign_fix(&mut d);
+        d
+    }
+
     /// v18.2.0 (CIRISPersist#481) — the pluggable-trust-root witnesses, all
     /// four asks through the REAL write + walk surfaces:
     /// 1. self-root `attestation(user → user)` ADMITS;
@@ -16736,7 +16746,7 @@ mod tests {
         // The user's trust edge.
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to(
+                attestation: fix_accepts(
                     "tr-edge",
                     "tr-user",
                     "tr-root",
@@ -17036,12 +17046,20 @@ mod tests {
             "(1) correctly-named rows walk: {v:?}"
         );
 
-        // ── (2) UNDIMENSIONED rows still walk. This is the additive
-        //    guarantee for every row written before v23.0.0: no wire break,
-        //    no migration, no re-signing. Asserted deliberately here rather
-        //    than left to whichever fixture happened not to be stamped.
+        // ── (2) UNDIMENSIONED rows. #973 (CC 3.2 T4a): a NEW unlabelled row
+        //    is no charter and gives no acceptance; the rows a node HELD when
+        //    that rule arrived still walk by direction — no wire break and no
+        //    re-signing for every row written before v23.0.0.
+        let unlabelled = |mut a: Attestation| {
+            a.attestation_envelope
+                .as_object_mut()
+                .unwrap()
+                .remove("dimension");
+            resign_fix(&mut a);
+            a
+        };
         for a in [
-            fix_charter("d551-plaincharter", "d551-plain", scope()),
+            unlabelled(fix_charter("d551-plaincharter", "d551-plain", scope())),
             fix_delegates_to("d551-plainedge", "d551-user", "d551-plain", scope()),
             lifecycle("d551-plainlc", "d551-plain"),
         ] {
@@ -17054,8 +17072,18 @@ mod tests {
             .await
             .expect("walk");
         assert!(
+            !plain.edge_exists && !plain.root_self_declares && !plain.valid,
+            "(2) a NEW unlabeled row is neither charter nor acceptance: {plain:?}"
+        );
+        for id in ["d551-plaincharter", "d551-plainedge"] {
+            backend.mark_trust_direction_held(id);
+        }
+        let plain = trust_root_valid(&backend, "d551-user", "d551-plain")
+            .await
+            .expect("walk");
+        assert!(
             plain.edge_exists && plain.root_self_declares && plain.valid,
-            "(2) direction inference still decides an unlabeled row: {plain:?}"
+            "(2) direction inference still decides a HELD unlabeled row: {plain:?}"
         );
 
         // ── (3) CONTRADICTION: same shapes, labels swapped. The charter
@@ -17518,7 +17546,7 @@ mod tests {
             .expect("serve-only self-loop admits (charter-shaped, commitment present)");
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to(
+                attestation: fix_accepts(
                     "rc-edge2",
                     "rc-user",
                     "rc-root2",
@@ -17724,7 +17752,7 @@ mod tests {
             .unwrap();
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to("cr-edge", "cr-user", "cr-root", infra()),
+                attestation: fix_accepts("cr-edge", "cr-user", "cr-root", infra()),
             })
             .await
             .unwrap();
@@ -18302,6 +18330,8 @@ mod tests {
             "references_attestation_id": id,
             "scope": scope,
             "pre_rotation_commitment": commitment,
+            // #973 — a charter names its job; an unlabelled one is no charter.
+            "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
         });
         resign_fix(&mut d);
         d

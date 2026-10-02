@@ -318,4 +318,4 @@ postgres	165	stream_epoch_counts	15192852104165500850
 sqlite	166	family_dissolution	4661524673910244022
 postgres	166	family_dissolution	10124180317187184355
 sqlite	167	trust_direction_held	10551163392193574376
-postgres	167	trust_direction_held	14116599567322671571
+postgres	167	trust_direction_held	5494390082464364779

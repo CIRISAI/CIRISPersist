@@ -47,6 +47,36 @@ CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quo
 
 Mutation round (lane: I194, I195, I342, I356–I359, the re-mint and holdings witnesses; memory and sqlite), six of six killed: the first-admission check dropped (I357); any held id counted as admitted, content ignored (I358, after a first round in which it survived because the id-conflict door answers first — I358 now drives the gate directly); a labeled headless edge admitted (I194, I342, I356); unlabeled rows gated as labeled (the re-mint and holdings witnesses, nine tests); off mode accepting any named head (I342, I359); an unlabeled headless row admitted under a window (I356). Postgres: I356–I359 green.
 
+### #973 — a `delegates_to` with no job label is no charter and no acceptance edge ("bundle only")
+CC 3.2 T4a (rc6 22ea349), steward ruling 2026-10-01: "A new row with no `trust:{job}` label gives no acceptance and is no charter … One exception stands, as a stop-gap until the re-mint: an unlabelled row that is a member of the pinned GenesisBundle (T5, `bundle_fingerprint`) keeps the reading its direction gives it … Unlabelled rows a node already holds keep their reading under T4." This replaces "A row with no job label keeps the earlier reading" in the entry above, and the sixth mutant of that entry's round ("an unlabeled headless row admitted under a window") now describes the built behaviour for a row outside the bundle.
+
+- **The rule.** `trust_root::direction_denied_ids` decides which unlabelled `delegates_to` rows may not be read by direction. A row stands when it names a `trust:{job}` label, when it is a pinned-bundle row (`genesis::is_pinned_bundle_row`: the baked id, signer, subject, type and envelope), or when the node held it at upgrade. Any other unlabelled row is denied. `self:delegates_to:v1` and the ownership dimension are not job labels.
+- **Held is recorded, not inferred.** Migration V167 creates `federation_trust_direction_held` and fills it once with every unlabelled `delegates_to` the node holds. Nothing is added afterwards. `FederationDirectory::trust_direction_held_among(ids)` reads it (sqlite, postgres, memory; capsule op `TrustDirectionHeldAmong` appended, `DirectoryOp` digest re-pinned, ABI stays 7; the directory double delegates it).
+- **Readers changed.** `trusted_roots_of` and `trust_root_valid` (the acceptance edge and the charter, key root and family root), `canonical_community::charter_members_for`. The conferral readers are unchanged: an unlabelled grant still confers.
+- **The attach gate.** A new unlabelled row outside the bundle is not an acceptance edge, so `check_attach_freshness` has nothing to judge: the row is stored as a delegation, under a windowed charter too (it was refused `trust_root_head_stale` there), and gives no acceptance. A labelled edge naming no head is still refused `trust_root_head_unnamed`.
+- **For hosts.** `canonical_community::acceptance_edge_envelope(dir, root, scope, now)` and `Engine::trust_acceptance_envelope(root, scope)` return the envelope of a new acceptance edge: `{"dimension": "trust:accepts:v1", "scope": [...], "attached_head_digest": <attach_head_for's answer>}`, the head omitted for a key root. `attach_head_for` is public.
+- **The test-anchor minter** labels its charter `trust:charter:v1` and its grant `trust:confers:v1`.
+
+**Adopters.** CIRISServer's three acceptance writers and its charter and grant envelopes emit no job label today (inventory on #973). After this change a newly written unlabelled edge gives no acceptance on any node, and an unlabelled charter imported on a fresh node is no charter. A node that upgrades keeps reading the rows it holds, but a fresh peer does not read them when they replicate: a host re-authors its acceptance edge labelled, with a head, even where its held unlabelled edge still reads as valid locally.
+
+**Witnesses I366–I371.** I366 an unlabelled self-directed charter is no charter; I367 an unlabelled or `self:delegates_to:v1` edge gives no acceptance and names no subscribed root; I368 an unlabelled holder → family row, quorum co-signed, is no charter and carries no charter members (I366–I368 on memory, sqlite, postgres); I369 held rows keep their reading (memory by its seam; sqlite and postgres through the real upgrade: rows stored at V166, V167 run, later rows denied); I370 the shipped bundle's unlabelled `genesis-charter` still charters the accord on a fresh sqlite node, and a copy under another id, subject or envelope is not a member; I371 the helper's envelope passes the attach gate and gives acceptance. I356's unlabelled case now asserts the row is stored and gives no acceptance.
+
+**Mutation round** (on the committed tree; lane = I366–I371 + the rc6 witnesses + the capsule op test, memory and sqlite): eleven of eleven killed.
+
+| Mutant | Result |
+|---|---|
+| M1 `trusted_roots_of` ignores the denied set | killed — I367, I369, I356 |
+| M2 `trust_root_valid` counts a denied edge | killed — I367, I369, I356 |
+| M3 `trust_root_valid` reads a denied charter | killed — I366, I368, I369 |
+| M4 `charter_members_for` keeps denied rows | killed — I368 |
+| M5 the bundle exception dropped | killed — I370 |
+| M6 the held lookup ignored (everything denied) | killed — I369 |
+| M7 everything held (the rule off) | killed — I366–I369, I356 |
+| M8 the attach gate still judges an unlabelled row | killed — I356, I369 |
+| M9 bundle membership by id alone | killed — I370 |
+| M10 `self:delegates_to:v1` counts as a job label | killed — I367 |
+| M11 a bundle row does not bind its subject | killed — I370 |
+
 ### #972 — a seated accord holder founds an infrastructure community
 Operator ruling 2026-10-01 (posted on #926): the three founders of `ciris-canonical` ARE the baked accord holders A1/B1/C1. The founder check asked every founder for a `user` type and an accord-conferred `steward`; the baked holder records are typed `accord_holder`, so they were refused at the door ("is not a human key").
 

@@ -210,7 +210,27 @@ The attach gate runs on an edge's FIRST admission. First admission is decided st
 
 A new edge that names itself `trust:accepts:v1` names its head in every mode: the witnessed head while witnessed mode is on, the held (anchored) head while it is off. Without one it is refused `trust_root_head_unnamed`. `attach_head_for(dir, root, now)` returns the head to name.
 
-A row with no job label is not an acceptance edge by name. It reaches the gate by direction inference, which also covers a family charter and the baked `genesis-charter`; it keeps the reading it had before this rule (admitted with no head under a charter that declares no window, refused under one that does). A ceremony that wants its charter rows outside this gate under a windowed charter labels them `trust:charter:v1`.
+A row with no job label is not an acceptance edge. See "An unlabelled row" below, which replaces the earlier reading (admitted with no head under a charter with no window, refused under one that declares a window).
+
+### An unlabelled row is no charter and no acceptance edge (T4a, rc6 22ea349, "bundle only")
+
+CC 3.2 T4a: "A new row with no `trust:{job}` label gives no acceptance and is no charter … One exception stands, as a stop-gap until the re-mint: an unlabelled row that is a member of the pinned GenesisBundle (T5, `bundle_fingerprint`) keeps the reading its direction gives it … Unlabelled rows a node already holds keep their reading under T4."
+
+As built:
+
+- **Three ways a `delegates_to` is read by direction.** It names a `trust:{job}` label (the label decides); it is a row of the pinned bundle (`genesis::is_pinned_bundle_row`: baked id, signer, subject, type and canonical envelope all equal); or the node held it when the rule arrived. Every other unlabelled row is stored and stays a delegation for conferral, duties and ownership, and is never a charter or an acceptance edge. `trust_root::direction_denied_ids` is the one place this is decided.
+- **Held is a recorded fact.** V167 creates `federation_trust_direction_held` and fills it once, at upgrade, with every unlabelled `delegates_to` in `federation_attestations`. No door writes to it afterwards, so a row put, replicated or imported after the upgrade is new. A signer-chosen instant is not consulted. `trust_direction_held_among(ids)` is the read (all backends, capsule op, directory double).
+- **Readers.** `trusted_roots_of`, `trust_root_valid` (edge and charter), `charter_members_for`. `transit_candidate_roots` still enumerates; both of its callers judge each candidate with `trust_root_valid`. Conferral readers are unchanged.
+- **The attach gate** returns early for a new unlabelled row outside the bundle: there is no acceptance edge to gate. Bundle rows keep the earlier unlabelled path.
+- **The envelope a host writes.** `acceptance_edge_envelope(dir, root, scope, now)` (Engine: `trust_acceptance_envelope`) returns `{"dimension": "trust:accepts:v1", "scope": [...], "attached_head_digest": ...}`.
+
+Consequences to plan for:
+
+- A node that upgrades reads its held unlabelled rows as before. A fresh peer receiving those rows by replication does not. Hosts re-author their acceptance edges labelled, with a head.
+- A portable bundle minted before the labels, imported on a fresh node, yields no charter. The shipped bundle is the one exception, by membership.
+- The exception ends with the re-mint: once the baked rows carry labels, `is_pinned_bundle_row` has no unlabelled row to match and can be removed.
+
+Witnesses: I366–I371 (CHANGELOG `[53.0.0]`, with the mutation table).
 
 Witnesses: I356 (a new headless edge refused by name in off mode, in witnessed mode, with and without a window; the unlabeled row's reading), I357 (a held headless edge re-put, re-put under a later windowed charter, and replicated back), I358 (a changed envelope under a held id is new), I359 (a new edge naming the held head attaches in off mode).
 
