@@ -194,20 +194,52 @@ async fn i351_boot_from_ceremony_memory() {
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i351_boot_from_ceremony_postgres() {
-    let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+    let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
         eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
         return;
     };
+    // A database of this test's own: the integration binaries share ONE
+    // database, and a second ceremony seeded into it (other seeds, the same
+    // holder ids) reads as anchor squatting to whichever test runs next.
+    let cut = base.rfind('/').expect("dsn has a database");
+    let name = format!(
+        "ciris_t_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    {
+        let (admin, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+            .await
+            .expect("connect to the base test database");
+        tokio::spawn(conn);
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .expect("create this test's database");
+    }
+    let dsn = format!("{}/{name}", &base[..cut]);
     let c = mint(-5);
     let _armed = Armed::with(&c.block);
-    let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
-        .await
-        .unwrap();
-    b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    boots_fully_seeded(&b, &c, "postgres").await;
+    {
+        let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b.seed_genesis_accord_holders(&effective_accord_holder_records())
+            .await
+            .expect("seed holders");
+        boots_fully_seeded(&b, &c, "postgres").await;
+    }
+    // Best effort: the harness reaps `ciris_t_<pid>_*` of dead processes too.
+    if let Ok((admin, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
+        tokio::spawn(conn);
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await;
+    }
 }
 
 /// **I352 — the upgrade path, end to end**: a node seeded from an OLD
