@@ -5623,6 +5623,52 @@ impl Engine {
         .await
     }
 
+    /// v53.0.0 (CIRISPersist#969) — **the readiness door: can
+    /// `viewer_key_id` read this sealed DAG here now, and what is missing.**
+    /// Answered from the index and grant rows — no chunk is opened: for a
+    /// stream-keyed DAG one check per EPOCH (`missing` names
+    /// `{stream_id, epoch, seq_from, seq_to}`), for a legacy one per chunk
+    /// (`{seq, chunk_sha256}`). The manifest is opened as
+    /// [`open_sealed_manifest_as`](Self::open_sealed_manifest_as) opens it,
+    /// so a stranger is `NotGranted` and learns nothing.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sealed_dag_readiness(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::SealedDagReadiness,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::sealed_dag_readiness_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                sealed_dag_readiness_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                sealed_dag_readiness_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
+    }
+
     /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the chunk
     /// list of a sealed DAG this node holds**, opened for `viewer_key_id`
     /// under the same authorization as [`read_blob_as`](Self::read_blob_as)
@@ -7188,6 +7234,10 @@ impl Engine {
         for axis in &r.chunk_key_grant_emissions {
             self.emit_key_grant(axis).await?;
         }
+        // #969 — and the stream epochs it widened, one set per epoch.
+        for axis in &r.stream_key_grant_emissions {
+            self.emit_key_grant(axis).await?;
+        }
         Ok(r)
     }
 
@@ -7320,6 +7370,16 @@ impl Engine {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: crate::federation::types::cohort_scope::FAMILY.to_owned(),
                 owner_key_id: family_key_id.to_owned(),
+            })
+            .await?;
+        }
+        // #969 — and each stream epoch the walk widened: one set per epoch.
+        for (stream_id, epoch, group) in &r.changed_streams {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Stream {
+                stream_id: stream_id.clone(),
+                epoch: *epoch,
+                cohort_scope: crate::federation::types::cohort_scope::FAMILY.to_owned(),
+                owner_key_id: group.clone(),
             })
             .await?;
         }
@@ -7596,6 +7656,16 @@ impl Engine {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
                 owner_key_id: identity_key_id.to_owned(),
+            })
+            .await?;
+        }
+        // #969 — and each stream epoch the walk widened: one set per epoch.
+        for (stream_id, epoch, group) in &r.changed_streams {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Stream {
+                stream_id: stream_id.clone(),
+                epoch: *epoch,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                owner_key_id: group.clone(),
             })
             .await?;
         }

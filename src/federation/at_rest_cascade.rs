@@ -758,6 +758,24 @@ pub fn open_aad(
     )
 }
 
+/// v53.0.0 (CIRISPersist#969, §12.12) — [`seal_aad`] under a nonce the
+/// CALLER derived: the STREAM nonce of CC 5.3.3.1
+/// ([`stream_nonce`](crate::federation::stream_seal::stream_nonce)), never a
+/// random one. The envelope's byte layout is unchanged (`magic ‖ nonce ‖
+/// ciphertext‖tag`); the nonce is stored and every reader recomputes it and
+/// refuses a mismatch. Crate-private: a deterministic nonce is safe only
+/// where the caller owns the counter (the chunk cascade, single sender).
+pub(crate) fn seal_aad_at_nonce(
+    dek: &[u8; DEK_LEN],
+    nonce: [u8; NONCE_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<AtRestEnvelope, AtRestError> {
+    let ciphertext = ciris_crypto::aes_gcm::encrypt_aad(dek, &nonce, aad, plaintext)
+        .map_err(|e| AtRestError::Crypto(format!("aes-gcm seal under associated data: {e}")))?;
+    Ok(AtRestEnvelope { nonce, ciphertext })
+}
+
 /// v47.2.0 (CIRISPersist#853, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.3) — the ONE
 /// place the read doors ask the tombstone fold. Sits AFTER authorization on
 /// every viewer door (whole-blob, range, and the serve door has no viewer),
@@ -1311,8 +1329,31 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        // persist self-retention: wrap the DEK under the content master so
-        // the read door can recover it in the default tier.
+        self_retain_deks(backend, items, cohort_scope).await?;
+
+        // Recipient cascade — wrap the DEK to each active recipient whose
+        // occurrence carries valid encryption_pubkeys; fail-secure exclude
+        // the rest (no plaintext / v1 fallback). #843: the partition is
+        // decided by roster MEMBER in `partition_roster`, once, for every
+        // cascade.
+        let (targets, report) =
+            resolve_cohort_targets(backend, cohort_scope, owner_or_family_key_id).await?;
+        let changed = grant_deks_to_targets(backend, items, cohort_scope, &targets).await?;
+        Ok((report, changed))
+    }
+
+    /// persist self-retention: wrap each DEK under the content master so the
+    /// read door can recover it in the default tier. The first half of
+    /// [`grant_deks_to_cohort`]; the seal door calls it beside
+    /// [`resolve_cohort_targets`] (v53.0.0, #969).
+    pub(crate) async fn self_retain_deks<B>(
+        backend: &B,
+        items: &[([u8; 32], [u8; DEK_LEN])],
+        cohort_scope: &str,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
         let content_master = backend.load_or_init_content_master().await?;
         for (sha, dek) in items {
             let self_wrap = wrap_dek_for_persist(&content_master, dek).map_err(map_at_rest_err)?;
@@ -1326,19 +1367,43 @@ pub mod orchestrate {
                 )
                 .await?;
         }
+        Ok(())
+    }
 
-        // Recipient cascade — wrap the DEK to each active recipient whose
-        // occurrence carries valid encryption_pubkeys; fail-secure exclude
-        // the rest (no plaintext / v1 fallback). #843: the partition is
-        // decided by roster MEMBER in `partition_roster`, once, for every
-        // cascade.
+    /// v53.0.0 (CIRISPersist#969) — the recipient half of a self/family
+    /// cascade, resolved ONCE: every active recipient occurrence with usable
+    /// keys (the wrap targets) and the report naming who was granted,
+    /// excluded or absent. The seal door resolves it once and wraps the
+    /// manifest's DEK and every stream epoch's DEK to the same set (D9).
+    pub(crate) async fn resolve_cohort_targets<B>(
+        backend: &B,
+        cohort_scope: &str,
+        owner_or_family_key_id: &str,
+    ) -> Result<(Vec<(String, EncryptionPubkeys)>, GrantReport), BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
         let recipients = resolve_recipients(backend, cohort_scope, owner_or_family_key_id).await?;
-        let (targets, report) = partition_roster(recipients);
+        Ok(partition_roster(recipients))
+    }
+
+    /// The wrap half of [`grant_deks_to_cohort`] over targets already
+    /// resolved: a v2 wrap of each blob's DEK to every target that lacks one.
+    /// Returns the blobs on which a NEW grant was written.
+    pub(crate) async fn grant_deks_to_targets<B>(
+        backend: &B,
+        items: &[([u8; 32], [u8; DEK_LEN])],
+        cohort_scope: &str,
+        targets: &[(String, EncryptionPubkeys)],
+    ) -> Result<Vec<[u8; 32]>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
         let v2_algo = WRAP_ALGORITHM_V2;
         let mut changed: Vec<[u8; 32]> = Vec::new();
         for (sha, dek) in items {
             let mut wrote = false;
-            for (occ_key_id, k) in &targets {
+            for (occ_key_id, k) in targets {
                 if items.len() > 1 && backend.get_at_rest_grant(sha, occ_key_id).await?.is_some() {
                     continue;
                 }
@@ -1353,7 +1418,7 @@ pub mod orchestrate {
                 changed.push(*sha);
             }
         }
-        Ok((report, changed))
+        Ok(changed)
     }
 
     /// One newcomer's wrap target for the [`rekey_for_newcomers`] walk:
@@ -1386,6 +1451,12 @@ pub mod orchestrate {
         /// must emit (the full set, re-read), or the newcomer's remote node
         /// never receives the key for historical bytes (CIRISPersist#850).
         pub changed_blobs: Vec<[u8; 32]>,
+        /// v53.0.0 (CIRISPersist#969) — the stream epochs `(stream_id,
+        /// epoch, group_key_id)` this node sealed on which a NEW grant was
+        /// written: each a stream-axis `KeyGrant` set the caller emits. A
+        /// newcomer to a stream-keyed file costs one wrap per epoch, not one
+        /// per chunk.
+        pub changed_streams: Vec<(String, u64, String)>,
     }
 
     /// The **retroactive key-grant ADD re-wrap** (CIRISPersist#161 Ask 2/4,
@@ -1455,13 +1526,24 @@ pub mod orchestrate {
                 .await?
         };
 
+        // v53.0.0 (#969) — the stream epochs this node sealed that the
+        // existing cohort holds wraps on: O(epochs), walked beside the blobs.
+        let streams = if existing_recipients.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .stream_dek_list_for_recipients(existing_recipients, cohort_scope)
+                .await?
+        };
+
         let mut granted: Vec<(String, usize)> = keyed.iter().map(|(k, _)| (k.clone(), 0)).collect();
-        if keyed.is_empty() || blobs.is_empty() {
+        if keyed.is_empty() || (blobs.is_empty() && streams.is_empty()) {
             return Ok(RekeyResult {
                 blobs_scanned: blobs.len(),
                 granted,
                 excluded,
                 changed_blobs: Vec::new(),
+                changed_streams: Vec::new(),
             });
         }
 
@@ -1538,11 +1620,57 @@ pub mod orchestrate {
             }
         }
 
+        // v53.0.0 (#969) — each stream epoch: recover its DEK through the
+        // self-retention wrap on its row, wrap it to every newcomer lacking a
+        // wrap under the stream's owner.
+        let mut changed_streams: Vec<(String, u64, String)> = Vec::new();
+        for rec in &streams {
+            let already: std::collections::HashSet<String> = backend
+                .stream_dek_grants(&rec.stream_id, rec.epoch, &rec.owner_key_id)
+                .await?
+                .into_iter()
+                .map(|w| w.recipient_key_id)
+                .collect();
+            let needs: Vec<usize> = keyed
+                .iter()
+                .enumerate()
+                .filter(|(_, (k, _))| !already.contains(k))
+                .map(|(i, _)| i)
+                .collect();
+            if needs.is_empty() {
+                continue;
+            }
+            let dek = unwrap_dek_for_persist(&content_master, &rec.self_retention_wrap)
+                .map_err(map_at_rest_err)?;
+            let mut wraps = Vec::with_capacity(needs.len());
+            for i in needs {
+                let (occ_key_id, keys) = &keyed[i];
+                wraps.push(crate::federation::GrantWrap {
+                    recipient_key_id: occ_key_id.clone(),
+                    wrap_algorithm: WRAP_ALGORITHM_V2.to_owned(),
+                    wrapped_dek: wrap_dek_v2(&keys.x25519_base64, &keys.ml_kem_768_base64, &dek)
+                        .map_err(map_at_rest_err)?,
+                });
+                granted[i].1 += 1;
+            }
+            backend
+                .stream_dek_put_grants(
+                    &rec.stream_id,
+                    rec.epoch,
+                    &rec.owner_key_id,
+                    cohort_scope,
+                    &wraps,
+                )
+                .await?;
+            changed_streams.push((rec.stream_id.clone(), rec.epoch, rec.group_key_id.clone()));
+        }
+
         Ok(RekeyResult {
             blobs_scanned: blobs.len(),
             granted,
             excluded,
             changed_blobs,
+            changed_streams,
         })
     }
 

@@ -50,11 +50,16 @@
 //!
 //! # Crypto routing (MISSION §1.4)
 //!
-//! AES-256-GCM and HKDF route through the `secrets::crypto` facade — the
-//! sole symmetric-crypto site. This module imports NO `ciris_crypto::*`
-//! directly; it never rolls its own crypto.
+//! AES-256-GCM routes through the `secrets::crypto` facade ([`seal_chunk`] /
+//! [`open_chunk`], `secrets` builds). v53.0.0 (CIRISPersist#969): the nonce
+//! derivation ([`stream_nonce`], [`parse_nonce`]) is what the self/family
+//! chunk cascade seals with in every backend build, so it is compiled
+//! wherever a backend is and calls `ciris_crypto::kdf::hkdf_sha256` — the
+//! same routine the facade wraps. It never rolls its own crypto.
 
+#[cfg(feature = "secrets")]
 use crate::secrets::crypto;
+#[cfg(feature = "secrets")]
 use crate::secrets::SecretsError;
 
 /// Length of the derived nonce prefix, in bytes (CEG §10.5.2).
@@ -78,9 +83,13 @@ const NOT_LAST_FLAG: u8 = 0x00;
 /// Sealing/opening failure.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamSealError {
-    /// Nonce derivation (HKDF) or the AEAD seal/open failed.
+    /// The AEAD seal/open failed.
+    #[cfg(feature = "secrets")]
     #[error("stream seal crypto: {0}")]
     Crypto(#[from] SecretsError),
+    /// The nonce-prefix HKDF failed.
+    #[error("stream nonce hkdf-sha256: {0}")]
+    Kdf(String),
     /// The epoch DEK was not exactly [`DEK_LEN`] bytes.
     #[error("epoch DEK must be {DEK_LEN} bytes (got {0})")]
     BadDekLength(usize),
@@ -116,7 +125,8 @@ pub fn stream_nonce(
     let info = encode_nonce_info(stream_id, epoch);
     // Empty salt → RFC 5869 default; the DEK is the IKM, the domain tag
     // + stream + epoch are the info.
-    let prefix = crypto::hkdf_sha256(epoch_dek, &[], &info, PREFIX_LEN)?;
+    let prefix = ciris_crypto::kdf::hkdf_sha256(epoch_dek, &[], &info, PREFIX_LEN)
+        .map_err(|e| StreamSealError::Kdf(e.to_string()))?;
 
     let mut nonce = [0u8; NONCE_LEN];
     nonce[..PREFIX_LEN].copy_from_slice(&prefix);
@@ -125,10 +135,28 @@ pub fn stream_nonce(
     Ok(nonce)
 }
 
+/// v53.0.0 (CIRISPersist#969) — read `(counter, last)` back out of a stored
+/// STREAM nonce. `None` when the flag byte is neither `0x00` nor `0x01` (no
+/// STREAM nonce has it). The prefix is NOT checked here: the caller
+/// recomputes the whole nonce with [`stream_nonce`] and compares, which is
+/// what binds the prefix to the epoch DEK, the stream and the epoch.
+#[must_use]
+pub fn parse_nonce(nonce: &[u8; NONCE_LEN]) -> Option<(u32, bool)> {
+    let mut counter = [0u8; COUNTER_LEN];
+    counter.copy_from_slice(&nonce[PREFIX_LEN..PREFIX_LEN + COUNTER_LEN]);
+    let last = match nonce[NONCE_LEN - FLAG_LEN] {
+        LAST_FLAG => true,
+        NOT_LAST_FLAG => false,
+        _ => return None,
+    };
+    Some((u32::from_be_bytes(counter), last))
+}
+
 /// Seal one chunk: AES-256-GCM encrypt `plaintext` under `epoch_dek`
 /// with the STREAM nonce for `(stream_id, epoch, counter, last)`. The
 /// returned ciphertext carries the 16-byte GCM tag (the facade packs it
 /// on). The nonce is NOT stored — it is recomputed on open.
+#[cfg(feature = "secrets")]
 pub fn seal_chunk(
     epoch_dek: &[u8; DEK_LEN],
     stream_id: &str,
@@ -146,6 +174,7 @@ pub fn seal_chunk(
 /// counter / flag, or any ciphertext tamper, fails the GCM auth tag and
 /// returns [`StreamSealError::Crypto`] (fail-honest — never a coerced
 /// plaintext).
+#[cfg(feature = "secrets")]
 pub fn open_chunk(
     epoch_dek: &[u8; DEK_LEN],
     stream_id: &str,
@@ -158,7 +187,7 @@ pub fn open_chunk(
     Ok(crypto::decrypt(epoch_dek, &nonce, ciphertext)?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "secrets"))]
 mod tests {
     use super::*;
 
@@ -253,5 +282,44 @@ mod tests {
         let ct = seal_chunk(&DEK_A, "s", 0, 0, true, b"").unwrap();
         assert_eq!(ct.len(), 16, "GCM tag only");
         assert_eq!(open_chunk(&DEK_A, "s", 0, 0, true, &ct).unwrap(), b"");
+    }
+}
+
+/// v53.0.0 (CIRISPersist#969) — the nonce derivation's own witnesses, in
+/// every backend build (the AEAD tests above need `secrets`).
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+
+    const DEK_A: [u8; 32] = [0x11; 32];
+
+    /// #969 — the parse is the inverse of the layout, and a flag byte no
+    /// STREAM nonce carries is refused.
+    #[test]
+    fn parse_nonce_reads_counter_and_flag() {
+        let n = stream_nonce(&DEK_A, "s", 3, 0x0102_0304, true).unwrap();
+        assert_eq!(parse_nonce(&n), Some((0x0102_0304, true)));
+        let n = stream_nonce(&DEK_A, "s", 3, 9, false).unwrap();
+        assert_eq!(parse_nonce(&n), Some((9, false)));
+        let mut bad = n;
+        bad[NONCE_LEN - 1] = 0x02;
+        assert_eq!(parse_nonce(&bad), None);
+    }
+
+    /// I311 (#969) — the CC 5.3.3.1 vector: `info = "ciris-stream-nonce/v1"
+    /// ‖ stream_id_utf8 ‖ epoch_be8`, prefix = HKDF-SHA256(dek; info)[0..7].
+    /// Computed here from the definition with an independent HKDF call, so a
+    /// change to the info encoding (epoch little-endian, a separator, a
+    /// different tag) is a red.
+    #[test]
+    fn i311_the_prefix_is_the_cc_5_3_3_1_derivation() {
+        let mut info = b"ciris-stream-nonce/v1".to_vec();
+        info.extend_from_slice("cam-1".as_bytes());
+        info.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 7]);
+        let prefix = ciris_crypto::kdf::hkdf_sha256(&DEK_A, &[], &info, 7).unwrap();
+        let n = stream_nonce(&DEK_A, "cam-1", 7, 0x0000_0102, false).unwrap();
+        assert_eq!(&n[..7], prefix.as_slice());
+        assert_eq!(&n[7..11], &[0, 0, 1, 2]);
+        assert_eq!(n[11], 0x00);
     }
 }

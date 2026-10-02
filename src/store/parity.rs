@@ -654,6 +654,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // #957 — Gate: refuses an empty batch, more than MAX_CHUNKS_PER_BATCH
     // items, or more than MAX_BATCH_BYTES. A statement about the input.
     ("check_chunk_batch_bounds", Class::Gate),
+    // v53.0.0 (#969) — Gate: refuses a stream-keyed claim on a batch of more
+    // than one item (one STREAM-nonce slot names one chunk).
+    ("check_stream_key_batch", Class::Gate),
     // #957 — Plumbing: a savepoint and a cached statement fail only on the
     // substrate's own terms (the connection, the SQL text), never on input.
     ("savepoint", Class::Plumbing),

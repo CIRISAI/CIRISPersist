@@ -13949,6 +13949,30 @@ fn scope_blob_symbol_from_sqlite_row(
 /// #848 §14 (V146) — the ledger's TEXT instant, byte-compatible with the
 /// grant tables' `created_at` default (`strftime('%Y-%m-%d %H:%M:%f','now')`,
 /// millisecond precision) so `<=` in SQL compares what the watermark read.
+/// v53.0.0 (CIRISPersist#969) — the `federation_stream_deks` projection
+/// every stream-DEK read shares, joined to the epoch's V165 count.
+const SQLITE_STREAM_DEK_SELECT: &str = "SELECT d.stream_id, d.epoch, d.owner_key_id, \
+    d.cohort_scope, d.group_key_id, d.self_retention_wrap, COALESCE(c.chunk_count, 0), \
+    d.closed_at IS NOT NULL, d.terminated_at IS NOT NULL \
+    FROM federation_stream_deks d \
+    LEFT JOIN federation_stream_epoch_counts c ON c.stream_id = d.stream_id AND c.epoch = d.epoch";
+
+fn sqlite_stream_dek_row(
+    r: &rusqlite::Row<'_>,
+) -> Result<crate::federation::StreamDekRecord, rusqlite::Error> {
+    Ok(crate::federation::StreamDekRecord {
+        stream_id: r.get(0)?,
+        epoch: u64::try_from(r.get::<_, i64>(1)?).unwrap_or_default(),
+        owner_key_id: r.get(2)?,
+        cohort_scope: r.get(3)?,
+        group_key_id: r.get(4)?,
+        self_retention_wrap: r.get(5)?,
+        chunk_count: u64::try_from(r.get::<_, i64>(6)?).unwrap_or_default(),
+        closed: r.get(7)?,
+        terminated: r.get(8)?,
+    })
+}
+
 fn format_ledger_instant(t: chrono::DateTime<chrono::Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
@@ -15150,6 +15174,347 @@ impl crate::federation::BlobStorage for SqliteBackend {
                 ))
             })?;
         Ok(out)
+    }
+
+    // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
+
+    async fn stream_key_state(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::federation::StreamKeyState, crate::federation::BlobError> {
+        let sid = stream_id.to_owned();
+        self.read(
+            move |conn| -> Result<crate::federation::StreamKeyState, rusqlite::Error> {
+                let latest = conn
+                    .query_row(
+                        &format!("{SQLITE_STREAM_DEK_SELECT} WHERE d.stream_id = ?1 ORDER BY d.epoch DESC LIMIT 1"),
+                        rusqlite::params![sid],
+                        sqlite_stream_dek_row,
+                    )
+                    .optional()?;
+                let has_chunks: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM federation_stream_chunks WHERE stream_id = ?1)",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )?;
+                let owner_key_id: Option<String> = conn
+                    .query_row(
+                        "SELECT owner_key_id FROM federation_streams WHERE stream_id = ?1",
+                        rusqlite::params![sid],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                Ok(crate::federation::StreamKeyState {
+                    latest,
+                    has_chunks,
+                    owner_key_id,
+                })
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("stream_key_state: {e}")))
+    }
+
+    async fn stream_dek_list(
+        &self,
+        stream_id: &str,
+    ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
+        let sid = stream_id.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::StreamDekRecord>, rusqlite::Error> {
+                let mut st = conn.prepare(&format!(
+                    "{SQLITE_STREAM_DEK_SELECT} WHERE d.stream_id = ?1 ORDER BY d.epoch"
+                ))?;
+                let rows = st.query_map(rusqlite::params![sid], sqlite_stream_dek_row)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_list: {e}")))
+    }
+
+    async fn stream_dek_insert(
+        &self,
+        record: &crate::federation::StreamDekRecord,
+    ) -> Result<crate::federation::StreamDekRecord, crate::federation::BlobError> {
+        let r = record.clone();
+        let ep = i64::try_from(r.epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("stream epoch exceeds i64".into())
+        })?;
+        self.write(
+            move |conn| -> Result<crate::federation::StreamDekRecord, rusqlite::Error> {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO federation_stream_deks \
+                        (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, self_retention_wrap) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT (stream_id, epoch) DO NOTHING",
+                    rusqlite::params![
+                        r.stream_id,
+                        ep,
+                        r.owner_key_id,
+                        r.cohort_scope,
+                        r.group_key_id,
+                        r.self_retention_wrap
+                    ],
+                )?;
+                let stored = tx.query_row(
+                    &format!("{SQLITE_STREAM_DEK_SELECT} WHERE d.stream_id = ?1 AND d.epoch = ?2"),
+                    rusqlite::params![r.stream_id, ep],
+                    sqlite_stream_dek_row,
+                )?;
+                tx.commit()?;
+                Ok(stored)
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_insert: {e}")))
+    }
+
+    async fn stream_dek_close(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sid = stream_id.to_owned();
+        let ep = epoch as i64;
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_stream_deks \
+                    SET closed_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                  WHERE stream_id = ?1 AND epoch = ?2 AND closed_at IS NULL",
+                rusqlite::params![sid, ep],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_close: {e}")))
+    }
+
+    async fn stream_dek_put_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+        cohort_scope: &str,
+        wraps: &[crate::federation::GrantWrap],
+    ) -> Result<usize, crate::federation::BlobError> {
+        let (sid, sealer, scope) = (
+            stream_id.to_owned(),
+            sealer_key_id.to_owned(),
+            cohort_scope.to_owned(),
+        );
+        let ep = epoch as i64;
+        let wraps = wraps.to_vec();
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            // A UNION in one transaction: `DO NOTHING` per row (§13).
+            let tx = conn.transaction()?;
+            let mut inserted = 0usize;
+            for w in &wraps {
+                inserted += tx.execute(
+                    "INSERT INTO federation_stream_dek_grants (\
+                        stream_id, epoch, sealer_key_id, recipient_key_id, wrap_algorithm, \
+                        wrapped_dek, cohort_scope\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT (stream_id, epoch, sealer_key_id, recipient_key_id) DO NOTHING",
+                    rusqlite::params![
+                        sid,
+                        ep,
+                        sealer,
+                        w.recipient_key_id,
+                        w.wrap_algorithm,
+                        w.wrapped_dek,
+                        scope
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_put_grants: {e}")))
+    }
+
+    async fn stream_dek_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+    ) -> Result<Vec<crate::federation::GrantWrap>, crate::federation::BlobError> {
+        let (sid, sealer) = (stream_id.to_owned(), sealer_key_id.to_owned());
+        let ep = epoch as i64;
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::GrantWrap>, rusqlite::Error> {
+                let mut st = conn.prepare(
+                    "SELECT recipient_key_id, wrap_algorithm, wrapped_dek \
+                       FROM federation_stream_dek_grants \
+                      WHERE stream_id = ?1 AND epoch = ?2 AND sealer_key_id = ?3 \
+                      ORDER BY recipient_key_id",
+                )?;
+                let rows = st.query_map(rusqlite::params![sid, ep, sealer], |r| {
+                    Ok(crate::federation::GrantWrap {
+                        recipient_key_id: r.get(0)?,
+                        wrap_algorithm: r.get(1)?,
+                        wrapped_dek: r.get(2)?,
+                    })
+                })?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_grants: {e}")))
+    }
+
+    async fn stream_dek_grants_for_recipient(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> Result<Vec<(String, crate::federation::GrantWrap)>, crate::federation::BlobError> {
+        let (sid, rcpt) = (stream_id.to_owned(), recipient_key_id.to_owned());
+        let ep = epoch as i64;
+        self.read(
+            move |conn| -> Result<Vec<(String, crate::federation::GrantWrap)>, rusqlite::Error> {
+                let mut st = conn.prepare(
+                    "SELECT sealer_key_id, recipient_key_id, wrap_algorithm, wrapped_dek \
+                       FROM federation_stream_dek_grants \
+                      WHERE stream_id = ?1 AND epoch = ?2 AND recipient_key_id = ?3 \
+                      ORDER BY sealer_key_id",
+                )?;
+                let rows = st.query_map(rusqlite::params![sid, ep, rcpt], |r| {
+                    Ok((
+                        r.get(0)?,
+                        crate::federation::GrantWrap {
+                            recipient_key_id: r.get(1)?,
+                            wrap_algorithm: r.get(2)?,
+                            wrapped_dek: r.get(3)?,
+                        },
+                    ))
+                })?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("stream_dek_grants_for_recipient: {e}"))
+        })
+    }
+
+    async fn stream_dek_key_grant_watermark(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let sid = stream_id.to_owned();
+        let ep = epoch as i64;
+        self.read(move |conn| -> Result<Option<String>, rusqlite::Error> {
+            conn.query_row(
+                "SELECT MAX(g.created_at) FROM federation_stream_dek_grants g \
+                   JOIN federation_stream_deks d \
+                     ON d.stream_id = g.stream_id AND d.epoch = g.epoch \
+                    AND d.owner_key_id = g.sealer_key_id \
+                  WHERE g.stream_id = ?1 AND g.epoch = ?2",
+                rusqlite::params![sid, ep],
+                |r| r.get::<_, Option<String>>(0),
+            )
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("stream_dek_key_grant_watermark: {e}"))
+        })
+        .map(|t| t.and_then(|t| parse_ledger_instant(&t)))
+    }
+
+    async fn stream_dek_mark_key_grant_emitted(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sid = stream_id.to_owned();
+        let ep = epoch as i64;
+        let w = format_ledger_instant(watermark);
+        self.write(move |conn| -> Result<(), rusqlite::Error> {
+            conn.execute(
+                "UPDATE federation_stream_deks SET key_grant_emitted_at = ?3 \
+                  WHERE stream_id = ?1 AND epoch = ?2 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < ?3)",
+                rusqlite::params![sid, ep, w],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("stream_dek_mark_key_grant_emitted: {e}"))
+        })
+    }
+
+    async fn stream_dek_list_key_grant_dirty(
+        &self,
+        owner_key_id: &str,
+    ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
+        let owner = owner_key_id.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::StreamDekRecord>, rusqlite::Error> {
+                let mut st = conn.prepare(&format!(
+                    "{SQLITE_STREAM_DEK_SELECT} \
+                      WHERE d.owner_key_id = ?1 \
+                        AND EXISTS(SELECT 1 FROM federation_stream_dek_grants g \
+                                    WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
+                                      AND g.sealer_key_id = d.owner_key_id) \
+                        AND (d.key_grant_emitted_at IS NULL \
+                             OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
+                                 FROM federation_stream_dek_grants g \
+                                WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
+                                  AND g.sealer_key_id = d.owner_key_id)) \
+                      ORDER BY d.stream_id, d.epoch"
+                ))?;
+                let rows = st.query_map(rusqlite::params![owner], sqlite_stream_dek_row)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("stream_dek_list_key_grant_dirty: {e}"))
+        })
+    }
+
+    async fn stream_dek_list_for_recipients(
+        &self,
+        recipients: &[String],
+        cohort_scope: &str,
+    ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
+        if recipients.is_empty() {
+            return Ok(Vec::new());
+        }
+        let recipients = recipients.to_vec();
+        let scope = cohort_scope.to_owned();
+        self.read(
+            move |conn| -> Result<Vec<crate::federation::StreamDekRecord>, rusqlite::Error> {
+                let marks = (0..recipients.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut st = conn.prepare(&format!(
+                    "{SQLITE_STREAM_DEK_SELECT} \
+                      WHERE d.cohort_scope = ?1 \
+                        AND EXISTS(SELECT 1 FROM federation_stream_dek_grants g \
+                                    WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
+                                      AND g.sealer_key_id = d.owner_key_id \
+                                      AND g.recipient_key_id IN ({marks})) \
+                      ORDER BY d.stream_id, d.epoch"
+                ))?;
+                let mut params: Vec<SqlValue> = vec![SqlValue::Text(scope)];
+                params.extend(recipients.into_iter().map(SqlValue::Text));
+                let rows = st.query_map(params_from_iter(params), sqlite_stream_dek_row)?;
+                rows.collect()
+            },
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("stream_dek_list_for_recipients: {e}"))
+        })
     }
 
     async fn community_dek_member_grants_for_epoch(
@@ -16430,6 +16795,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let claim = crate::federation::StreamClaim {
             community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
             owner_key_id: Some(author_key_id.to_owned()),
+            stream_key: None,
         };
         let sha = self
             .put_blob_chunk_floor(
@@ -16463,6 +16829,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
         let claim = crate::federation::StreamClaim {
             community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
             owner_key_id: Some(author_key_id.to_owned()),
+            stream_key: None,
         };
         let items = items
             .into_iter()
@@ -18753,6 +19120,10 @@ enum ItemAppended {
     SeqConflict,
     CapReached,
     EpochMoved,
+    /// #969 — the V165 count is not the counter the chunk was sealed at.
+    StreamCounterMoved,
+    /// #969 — the stream epoch is closed / terminated / has no DEK row.
+    StreamEpochClosed,
 }
 
 /// #957 — the batch's per-item constants.
@@ -18765,6 +19136,8 @@ struct SqliteChunkTx<'a> {
     now_iso: &'a str,
     binding: Option<&'a crate::federation::EpochBinding>,
     bind_as_declared: bool,
+    /// #969 — the STREAM-nonce slot a stream-keyed chunk was sealed at.
+    stream_key: Option<crate::federation::StreamKeySlot>,
 }
 
 /// #957 — one item's append inside its savepoint: the blob row, the nonce
@@ -18822,6 +19195,41 @@ fn sqlite_append_chunk_item(
     };
     if crate::federation::blobs::epoch_chunk_cap_reached(u64::try_from(counted - 1).unwrap_or(0)) {
         return Ok(ItemAppended::CapReached);
+    }
+    // 2b. v53.0.0 (#969, CC 5.3.3.1) — a stream-keyed chunk was sealed at a
+    //     STREAM-nonce counter; it is the epoch's count BEFORE this insert, or
+    //     nothing is stored (the door re-seals). The epoch must hold its DEK
+    //     row, unterminated — and open, for a data chunk; a `last` chunk
+    //     stamps it terminated here, so a write after an epoch's last is
+    //     refused in the same transaction that would store it.
+    if let Some(slot) = c.stream_key {
+        if counted - 1 != i64::from(slot.counter) {
+            return Ok(ItemAppended::StreamCounterMoved);
+        }
+        let open = if slot.last {
+            let mut st = conn.prepare_cached(
+                "UPDATE federation_stream_deks \
+                    SET terminated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                        closed_at = COALESCE(closed_at, strftime('%Y-%m-%d %H:%M:%f', 'now')) \
+                  WHERE stream_id = ?1 AND epoch = ?2 AND terminated_at IS NULL",
+            )?;
+            let n = st.execute(rusqlite::params![c.stream_id, c.epoch_i64])?;
+            *steps += vm_steps(&st);
+            n == 1
+        } else {
+            let mut st = conn.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM federation_stream_deks \
+                                WHERE stream_id = ?1 AND epoch = ?2 \
+                                  AND closed_at IS NULL AND terminated_at IS NULL)",
+            )?;
+            let v: bool =
+                st.query_row(rusqlite::params![c.stream_id, c.epoch_i64], |r| r.get(0))?;
+            *steps += vm_steps(&st);
+            v
+        };
+        if !open {
+            return Ok(ItemAppended::StreamEpochClosed);
+        }
     }
     // 3. The stream-index row. (stream_id, seq) PK = monotonicity.
     //    V142: the chunk's PLAINTEXT size beside its stored size.
@@ -18974,6 +19382,7 @@ impl SqliteBackend {
         floor.check_scope(cohort_scope)?;
         crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
         crate::federation::blobs::check_chunk_batch_bounds(&items)?;
+        crate::federation::blobs::check_stream_key_batch(&claim, items.len())?;
         let cap = self.inline_bytes_cap();
         // u64 → i64 binds (rusqlite has no native u64 path either; keep
         // parity with the PG side's typed-overflow errors).
@@ -19107,6 +19516,7 @@ impl SqliteBackend {
                     now_iso: &now_iso,
                     binding: bind.as_ref(),
                     bind_as_declared,
+                    stream_key: claim_tx.stream_key,
                 };
                 let mut appended = Vec::with_capacity(ready.len());
                 for row in &ready {
@@ -19183,6 +19593,16 @@ impl SqliteBackend {
                         epoch: b.epoch,
                     })
                 }
+                ItemAppended::StreamCounterMoved => {
+                    Err(crate::federation::blobs::stream_counter_moved_refusal(
+                        stream_id,
+                        epoch,
+                        claim.stream_key.map_or(0, |k| k.counter),
+                    ))
+                }
+                ItemAppended::StreamEpochClosed => Err(
+                    crate::federation::blobs::stream_epoch_closed_refusal(stream_id, epoch),
+                ),
             });
         }
         Ok(results
@@ -49179,16 +49599,19 @@ mod tests {
                     sha: s0,
                     size: c0.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
                 crate::federation::ChunkRef {
                     sha: s1,
                     size: c1.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
                 crate::federation::ChunkRef {
                     sha: s2,
                     size: c2.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -49317,11 +49740,13 @@ mod tests {
                     sha: s0,
                     size: 4,
                     seq: None,
+                    epoch: None,
                 },
                 crate::federation::ChunkRef {
                     sha: s_ext,
                     size: 100,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -49475,6 +49900,7 @@ mod tests {
                 sha: sha256_of(b"AAAA"),
                 size: 4,
                 seq: None,
+                epoch: None,
             }],
         };
         let err = backend

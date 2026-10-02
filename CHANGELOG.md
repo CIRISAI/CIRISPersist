@@ -9,6 +9,25 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
+
+A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant` set per chunk, so a 1024-chunk file carried 1024 wraps per recipient and a late device needed 1024 re-grants. CC 5.3.3.1 seals a stream under one DEK per `(stream_id, epoch)` with the STREAM nonce; CC part 5 §5.1 distributes it O(N) per epoch. FSD `BLOB_ENCRYPTION_AT_REST.md` §12.13, `BLOB_REPLICATION.md` §14.1.
+
+- **V168** (both dialects, checksums pinned): `federation_stream_deks` (the epoch's DEK, self-retained; `closed_at`, `terminated_at`, the V146 ledger column) and `federation_stream_dek_grants` (a union, keyed by sealer).
+- **The seal.** `put_blob_chunk_scoped` at self/family mints the epoch's DEK on its first chunk and seals with `stream_nonce(dek, stream_id, epoch, counter, last)` under the unchanged position AAD. `counter` is the V165 count; the chunk floor re-checks it in the insert's transaction (`StreamClaim.stream_key`) and refuses a moved counter (`stream_counter_moved`, nothing stored, the door re-seals). The chunk row's epoch is the DEK's epoch.
+- **One set per epoch.** The epoch's DEK is wrapped at its first chunk and to any recipient who joins later; the stream-axis set (`key_grant:stream:v1`, plane token `"stream"`, appended; registered per the #975 ruling, the existing types unchanged) is emitted then, never per chunk. Admission: the signer must speak for the stream's owner where this node holds the stream; elsewhere the wraps land under the signer as sealer, and a reader takes a wrap only from a sealer speaking for the owner. `RekeyResult.changed_streams` (and the Python `changed_streams`) carries the retroactive walk over stream epochs — O(epochs).
+- **Rolls and terminators.** An epoch closes to data when the next chunk would take the cap's last counter (reserved for the terminator) or when a granted recipient has left the cohort (removal: forward secrecy); the next append mints E+1. The seal appends one empty `last_flag` chunk per unterminated epoch; the floor stamps the epoch terminated in that transaction and refuses anything after it (`stream_epoch_closed`).
+- **Manifest v4** = v2 + `"chunk_keys":"stream_epoch"` + each chunk's `epoch`, sealed; v3 children are v4. No member ⇒ legacy per-chunk keys, read as before. A stream that held per-chunk-keyed chunks before v53 stays per-chunk to its seal. `SealedManifestView.chunks[].epoch` tells the puller where to adopt each chunk.
+- **Reads.** A v4 chunk opens under the viewer's stream grant of its epoch; the stored nonce must BE the recomputed STREAM nonce. The whole read and the promote (from the stored nonces, no key — I45) check each epoch's counters 0, 1, 2, … and its single final `last`; a truncated DAG is refused. A live read by position uses a per-chunk grant if held, else the stream grant.
+- **Readiness door.** `Engine::sealed_dag_readiness` / `sealed_dag_readiness_json` → `{sha256_hex, chunk_keys, held, readable, missing, not_held}` from grant rows, no chunk opened: per epoch (`{axis: "stream", stream_id, epoch, seq_from, seq_to}`) for v4, per chunk (`{axis: "content", seq, chunk_sha256}`) for legacy.
+- **The refusal.** A viewer authorized on the DAG who lacks one chunk's key gets `BlobError::ChunkKeyNotYetGranted` (`blob_chunk_key_not_yet_granted`; Python `ValueError` like the `blob_not_granted` arm it splits from, JSON detail `{sha256, seq, chunk_sha256, key: {axis: content|stream, …}, retryable: true}`). A stranger keeps `blob_not_granted` on the DAG.
+- `SealStreamScopedResult.stream_key_grant_emissions`; the Python seal door now also emits the chunk sets it widened (it emitted only the manifest's).
+- `stream_seal::stream_nonce` / `parse_nonce` compile in every backend build (`postgres` / `sqlite` enable `ciris-crypto/kdf`).
+
+**Adopters (Edge).** Apply `key_grant:stream:v1` like the other axes; adopt each chunk at the manifest's `epoch`; tolerate zero-length terminator chunks; a v4 DAG has one more chunk per epoch than the producer wrote.
+
+**Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit).
+
 ### #973 — a charter silent on witness_quorum, or declaring 0, is in witnessed mode off
 CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quorum = 0`: silence and `0` are one state, witnessed mode off, and "a substrate MUST NOT substitute an internal default". Persist substituted a default of 1 (`DEFAULT_WITNESS_QUORUM`) for a silent charter and read `0` as `1`.
 

@@ -28,7 +28,7 @@ default = []
 test-anchor = ["ciris-verify-core/test-anchor"]
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres", "ciris-crypto/kdf"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available. This is the published-wheel
@@ -68,7 +68,7 @@ extension-module = ["pyo3?/extension-module"]
 # imported by the postgres feature; cargo unifies them when both are
 # on (refinery built with both `tokio-postgres` and `rusqlite`
 # features).
-sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite"]
+sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite", "ciris-crypto/kdf"]
 
 # Phase 2 features (declared now; impls land later — MISSION.md §2 / FSD §4).
 c-abi          = []

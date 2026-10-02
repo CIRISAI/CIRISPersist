@@ -2225,6 +2225,70 @@ unsealed stream: tombstoned, index rows dropped, sealed chunks evicted; the
 key-grant sets already emitted stay (CC 3). The full account is
 `FSD/BLOB_REPLICATION.md` §6.6.
 
+### 12.13 One DEK per (stream, epoch) for self/family streams (#969)
+
+Before v53 a self/family chunk was a whole blob: a fresh DEK per chunk and a
+content-axis `key_grant` set per chunk, so a 1024-chunk file carried 1024
+wraps per recipient and a new device needed 1024 re-grants. CC 5.3.3.1 seals a
+stream under one DEK per `(stream_id, epoch)` with the STREAM nonce, and CC
+part 5 §5.1 distributes that key O(N) per epoch. v53 does both.
+
+- **The DEK** (V168 `federation_stream_deks`, PK `(stream_id, epoch)`): minted
+  on the epoch's first chunk, self-retained under the content master, held only
+  by the node that seals the stream. Only the stream's owner (the #837 claim,
+  I41) seals under it.
+- **The seal.** `nonce = stream_nonce(dek, stream_id, epoch, counter, last)`
+  (`prefix = HKDF-SHA256(dek; "ciris-stream-nonce/v1" ‖ stream_id ‖
+  epoch_be8)[0..7] ‖ counter_be4 ‖ last_flag`). `counter` is the V165 count
+  of the epoch before this chunk; the floor re-reads it in the insert's own
+  transaction and refuses a mismatch (`stream_counter_moved`: nothing stored,
+  the door re-seals), so a `(DEK, nonce)` pair is never reused. The envelope's
+  bytes are unchanged (`magic ‖ nonce ‖ ct‖tag`) and the AAD is still
+  `chunk_aad(caller_aad, stream_id, seq)`. The chunk row's epoch is the stream
+  DEK's epoch.
+- **The grants** (V168 `federation_stream_dek_grants`): the epoch's DEK is
+  wrapped to the stream's one recipient set at the epoch's FIRST chunk, and to
+  any recipient who joins later (the next append or the seal). The stream-axis
+  set (`key_grant:stream:v1`, `BLOB_REPLICATION.md` §14.1) is emitted then —
+  never per chunk.
+- **Rolls.** The epoch is CLOSED to data (`closed_at`) when the next data chunk
+  would take the cap's last counter (`MAX_CHUNKS_PER_EPOCH − 1`, reserved for
+  the terminator), or when a recipient granted on the epoch has left the
+  cohort (a removal: the next chunk is sealed under a DEK the removed party
+  never held — CC 5.1's forward secrecy for a live family stream). The next
+  append mints E+1 with its own set. The producer's epoch label is honoured
+  when it is higher; a lower one is carried to the open epoch.
+- **The terminator.** The seal appends, for every epoch not yet terminated, an
+  empty chunk sealed with `last_flag = 0x01` at the epoch's next counter, at
+  the stream's next `seq` after the last data chunk. The floor stamps the epoch
+  `terminated_at` in the terminator's own transaction; any later chunk at that
+  epoch is refused (`stream_epoch_closed`) — the append-resistance half of CC
+  5.3.3.1. A rolled epoch's terminator is written at the seal, not at the roll:
+  persist cannot take a `seq` from the producer mid-stream.
+- **The manifest** is v4: v2 plus the top-level member `"chunk_keys":
+  "stream_epoch"` and each chunk's `epoch`, inside the sealed manifest, so both
+  are authoritative. A v3 root's children are v4. A manifest without the member
+  is legacy (per-chunk DEKs) and reads as before, forever. A stream that already
+  held per-chunk-keyed chunks when v53 arrived stays per-chunk to its seal (one
+  DAG never mixes the two).
+- **Reads.** The reader opens a v4 chunk under the viewer's stream grant of the
+  chunk's epoch (one recovery per epoch per read), recomputes the nonce from
+  `(counter, last)` and refuses one that is not the STREAM nonce of its DEK,
+  stream and epoch. A whole read, and the promote (from the stored nonces,
+  without a key — I45), check every epoch: counters 0, 1, 2, … in seq order and
+  exactly one `last`, at the end. A truncated DAG is refused. A live read by
+  position takes a per-chunk grant if the viewer holds one, else the stream
+  grant of the index row's epoch.
+- **Readiness and the refusal.** `sealed_dag_readiness(sha, viewer)` answers
+  `{held, readable, missing, not_held}` from grant rows, without opening a
+  chunk: `missing` is per EPOCH for a v4 DAG (`{stream_id, epoch, seq_from,
+  seq_to}`), per chunk for a legacy one. A viewer authorized on the DAG who
+  lacks a chunk's key is refused `blob_chunk_key_not_yet_granted` naming `{seq,
+  chunk_sha, key: content | stream{stream_id, epoch}}` — retryable while sets
+  arrive. A stranger is still `blob_not_granted` on the DAG.
+
+Witnesses I310–I319 (`federation/stream_key_invariants.rs`).
+
 ## 13. Summary
 
 CIRISPersist can encrypt the *content* of every substrate at rest —
