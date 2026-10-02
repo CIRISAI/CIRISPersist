@@ -1249,10 +1249,64 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
         assert!(refusal(e).contains("accord_recovery_signature"), "{tag}");
         assert_eq!(accord_head(d).await, before, "{tag} I429: nothing written");
     }
+    // v53.0.0 (CC 3.2 T6 / CC 4.2.6, rc7 `5a4b057`; R2c) — a recovery is the
+    // one accord version not signed by the conferring quorum, and it is a
+    // COVERING version: an authorized roster change anchored on the held head
+    // lags it until the head moves; the recovery moves it, the lag clears, and
+    // the recovered roster is the fold's (consequence (i) admits it).
+    use ciris_persist::federation::roster_head::{fold_disagreement, roster_lag, LineageRecord};
+    use ciris_verify_core::accord_live_quorum::{AccordAction, AccordDecision, AccordProposal};
+    let far = chrono::Utc::now() + chrono::Duration::days(3650);
+    let nonce = format!("i429-roster-change-{tag}");
+    d.issue_accord_nonce(accord, &nonce).await.unwrap();
+    let proposal = AccordProposal {
+        family_key_id: accord.to_owned(),
+        action: AccordAction::RosterChange,
+        nonce,
+        window_until: (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        prior_family_digest: before.persist_row_hash.clone(),
+        payload_sha256: "cd".repeat(32),
+    };
+    d.put_accord_proposal(proposal.clone(), None).await.unwrap();
+    d.put_accord_decision(AccordDecision {
+        proposal: proposal.clone(),
+        live_set: vec![],
+        yes: 2,
+        no: 0,
+        abstain: 0,
+        authorized: true,
+    })
+    .await
+    .unwrap();
+    let lag = roster_lag(d, accord, far)
+        .await
+        .unwrap()
+        .expect("an authorized roster change anchored on the held head lags it");
+    assert_eq!(
+        lag.uncovered_decisions,
+        vec![proposal.digest()],
+        "{tag} R2c"
+    );
     rotate(d, "test-accord-holder-0", &n0, &r0, "i429-next-0")
         .await
         .unwrap_or_else(|e| panic!("{tag} I429: the holder's own recovery: {e}"));
     let after = accord_head(d).await;
+    assert_ne!(
+        after.persist_row_hash, before.persist_row_hash,
+        "{tag} R2c: the recovery moved the head"
+    );
+    assert_eq!(
+        roster_lag(d, accord, far).await.unwrap(),
+        None,
+        "{tag} R2c: the recovery covers — no lag on the moved head"
+    );
+    assert!(
+        fold_disagreement(d, LineageRecord::Family(&after), None, far)
+            .await
+            .unwrap()
+            .is_empty(),
+        "{tag} R2c: the recovered roster is the fold's"
+    );
     let seats: Vec<&str> = after.members.iter().map(|m| m.key_id.as_str()).collect();
     assert!(
         seats.contains(&n0.key_id.as_str()) && !seats.contains(&"test-accord-holder-0"),

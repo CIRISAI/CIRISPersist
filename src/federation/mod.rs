@@ -73,6 +73,9 @@ pub mod consent_grammar;
 pub mod consent_peer_set;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
+/// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — roster rows and the head: a version
+/// must reflect the fold, an uncovered row lags the head.
+pub mod roster_head;
 // CIRISPersist#857 (`FSD/CONSENT_BY_HUMANS.md`) — consent is by humans: the
 // principal walk in the consent doors, one combine rule.
 pub mod consent_by_humans;
@@ -442,6 +445,9 @@ impl ConsentSweepReport {
 #[cfg(test)]
 mod lineage_head_invariants;
 pub mod register;
+/// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — I450–I459, roster rows and the head.
+#[cfg(test)]
+mod roster_head_invariants;
 /// v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: the
 /// `attestation_type` allowlist, the carrier shape, the report door.
 pub mod row_type;
@@ -10678,6 +10684,23 @@ pub enum Error {
         member_role: &'static str,
     },
 
+    /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`, consequence (i)) — a new version of
+    /// a witnessed lineage whose roster disagrees with the fold of the roster
+    /// rows effective up to it. `keys` are the seats (or roles) the roster
+    /// planes move that the version does not reflect. The conferring quorum
+    /// re-signs a version that covers them; nothing is written
+    /// ([`roster_head::check_version_covers_fold`]).
+    #[error(
+        "lineage_version_disagrees_with_roster_fold: {lineage_key_id}: the version's roster \
+         disagrees with the fold of the roster rows effective up to it at {keys:?} (CC 3.2 T6)"
+    )]
+    LineageVersionDisagreesWithFold {
+        /// The lineage (family or community id).
+        lineage_key_id: String,
+        /// The keys the roster planes move that the version does not reflect.
+        keys: Vec<String>,
+    },
+
     /// v50.0.0 (CIRISPersist#925/#927, CC 3.2 / CC 3.4.2) — an
     /// `infrastructure` community record (or its supersede, or a widening
     /// that promotes a founder) is non-conformant:
@@ -11156,6 +11179,9 @@ impl Error {
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::CommunityConsensusProtocolViolation { .. } => {
                 "federation_community_consensus_protocol_violation"
+            }
+            Error::LineageVersionDisagreesWithFold { .. } => {
+                roster_head::LINEAGE_VERSION_DISAGREES_WITH_FOLD
             }
             Error::NodeIdentityNotExclusive { .. } => "federation_node_identity_not_exclusive",
             Error::NodeIdentityImmutable { .. } => "federation_node_identity_immutable",

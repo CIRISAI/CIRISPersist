@@ -250,6 +250,62 @@ CIRISConstitution rc7 `5e89627` (CC 3.2 T3, 4.2.6, 2.1) and `fe459cf` (CC 4.2.6,
 | M14 | the family-quorum plane counts a grant below the quorum | I439 | killed |
 
 14 of 14 killed.
+### R2c — roster rows and the head
+
+CC 3.2 T6 (rc7 `36432c6`, adopting persist's v53 design): every roster-affecting row of a witnessed lineage — a seat added or removed, a serve-node join, a membership widening or revocation, a resignation, a `revoked_after` bound, an accord decision, a charter re-scrub — MUST be covered by a new version within one cadence of its `effective_at`. Covering is the conferring quorum's duty; persist never synthesises a version. It enforces exactly three consequences (`federation::roster_head`):
+
+- **(i) a version must reflect the fold.** A new version of a witnessed lineage (a family whose head names a charter, the accord, a trust-root-grade community) whose roster disagrees with the fold of the roster rows it answers for is refused: `Error::LineageVersionDisagreesWithFold { lineage_key_id, keys }`, `kind()` `federation_lineage_version_disagrees_with_roster_fold`, Python `ValueError` (the supersede refusals beside it). One comparison, `roster_head::fold_disagreement`: the ONE authorized replay every roster gate reads (`authorized_roster_at` over `community_roster_events` / `family_roster_events`), folded over the version's own members, naming every key whose seat or role a row moves. A key the version changed with no plane row about it is the record's own act and is not judged. Runs before the write at the local family door (`supersede_family_signed`), the replicated family door (`route_occupied_family`), the local community door (`supersede_community_signed`) and the trust-root chain apply. **Which rows a version answers for:** on the community arm, those effective after its predecessor's signed instant and up to its own (`amended_at`) — at a local door the held head, in an offered chain the final head's predecessor IN THE CHAIN (CC 3.2 T8 (iii): a resignation never reaches behind a link's instant, and a later founders' amendment may re-seat or re-role a key an older plane row moved). A family version carries no signed instant, so the family arm answers for every row, judged at admission: a conferring family moves a seat on the planes, then versions.
+- **(ii) an uncovered row lags the head.** `roster_head::roster_lag(root, at)` → `RosterLag { token: "lineage_head_lags_roster", head_digest, uncovered_keys, uncovered_decisions, since, cadence_secs }`: a row older than one `witness_cadence_secs` (the charter in force; `0` when it declares none) that the held head does not reflect, and — for the accord — an authorized `roster_change` decision whose proposal's `prior_family_digest` is the held head and whose window closed before the cutoff (a roster change is carried as a family supersede, so a head that is still the anchor has not been covered). Served on `RootWitnessView.roster_lag` (`Engine::lineage_head`, `lineage_head_json`). With witnessed mode on, `put_lineage_head_cosign` refuses a cosign of the held head while it lags at the cosign's `signed_at`: `LineageCosignRefusal::HeadLagsRoster` (`lineage_head_lags_roster`), so attaching on it goes stale through the T4a freshness gate. With witnessed mode off the lag is reported and nothing else changes.
+- **(iii) the row takes effect at its `effective_at`.** Unchanged: the fold already drops a revoked seat at once, while the head still lists it (I456 pins it).
+
+**The accord's version needs a strict majority of its STANDING roster** (CC 3.2 T6 / CC 4.2.6): the accord head door now also counts distinct standing members (the fold) whose pinned hybrid keys verify the change envelope, ≥ `strict_majority(n)`. `quorum:2/3` is that majority only while the accord is three.
+
+**Witnesses moved to consequence (i).** Four trust-root witnesses asserted the pre-T6 admission of a version that does not cover a held roster row; each now asserts the refusal and keeps its own property on a covering version: i190 (i) (the founders' version lists the plane's serve node), (o″) (a v6 still recording the resigned F2 is refused; F2 + F0 still produce no next version, even one that drops F2), (x) (node `a` refuses H2 alone, stays Stalled on H1, and converges on H3 by walking H2), (y) (F2 resigns after v3; the offered prefix still does not extend, and the covering v4 by F0 + F1 is admitted).
+
+**Adopters.** A host that versions a conferring family, the accord or an infrastructure community MUST build the version from the fold, not from the previous record: every seat a plane row moved since the previous version is listed (or dropped), with its role. A version that disagrees is refused by name, with the keys. Server: the founders' amendment and the final-genesis assembler build the canonical row from the fold. Edge: a cosign the door refuses `lineage_head_lags_roster` is not a fault; the quorum owes a version.
+
+**Not built (BELIEVED, reported):** the accord's own roster change (`AccordAction::RosterChange` carried as a family supersede) still has no door — R2a's accord head door admits only head moves — so an authorized accord roster-change decision can lag the accord head but no version can cover it, and (iii) for it (the decision taking effect) has no fold to land in. A roster row that arrives late with an `effective_at` before the held head's instant (community arm) is outside every window: it neither lags nor refuses (a resignation that far back is already refused `resignation_backdated`; a member revocation is not).
+
+| Witness | What it pins |
+|---|---|
+| I450 | (i) a conferring family's version that keeps a revoked seat is refused, naming it; dropping it admits |
+| I451 | (i) a widened seat, and its role, must be on the version |
+| I452 | (i)/(ii) a family whose head names no charter is no lineage: not judged, never lags |
+| I453 | the community arm of the one comparison, and the floor |
+| I454 | (ii) the lag: older than the cadence, its keys and instant, on the witness view; the covering version clears it |
+| I455 | (ii) witnessed mode on: the cosign of a lagging head is refused `lineage_head_lags_roster`; off: stored, lag reported |
+| I456 | (iii) the removal is effective before any version, and no version is synthesised |
+| I457 | the accord's standing majority: 2 of 5 short, one key's two signatures count once, 3 of 5 enough, an outsider nothing |
+| I458 | from disk: every version door judges before it writes; the cosign door; the accord head door |
+| I459 | (ii) an authorized accord roster change anchored on the head, window closed, lags it; another anchor, a refusal, an open window do not |
+
+**A recovery is a covering version** (CC 4.2.6, rc7 `5a4b057`: the ONE accord version not signed by the conferring quorum). It enters through `supersede_family_signed`, so consequence (i) judges it like any version: its roster is the fold's with the one seat's key rotated, and it is admitted without the quorum. I429 (`tests/test_ceremony_973.rs`, memory, sqlite and postgres) now also pins it: an authorized accord roster change anchored on the held head lags it; the holder's recovery moves the head; the lag clears; the fold agrees with the recovered roster.
+
+**Mutation round — R2c** (on the committed tree `bcf41ae0`; lane = I450–I459 + I440–I449 + every `canonical_community_invariants` witness, memory and sqlite): eighteen mutants, eighteen killed.
+
+| Mutant | Result |
+|---|---|
+| M1 the comparison ignores roles | killed — I451 |
+| M2 a widened seat the record lacks is not named | killed — I451, i190 (i) |
+| M3 a revoked seat the record keeps is not named | killed — I450, I453, i190 (o″), (x) |
+| M4 every family is a witnessed lineage | killed — I452 |
+| M5 consequence (i) never refuses | killed — i190 (i), (o″), (x) |
+| M6 the local family door skips (i) | killed — I450, I451 |
+| M7 the lag ignores the cadence | killed — I454 |
+| M8 the cosign refusal ignores witnessed mode | killed — I455 |
+| M9 the cosign door never refuses a lagging head | killed — I455 |
+| M10 an unauthorized accord decision lags | killed — I459 |
+| M11 an open window lags | killed — I459 |
+| M12 the standing majority always holds | killed — I457 |
+| M13 signatures counted, not members | killed — I457 |
+| M14 the accord head door drops the standing-majority count | killed — I458 only (from disk): while the accord is three holders `quorum:2/3` IS the standing majority, so no behaviour separates the leg; I457 witnesses the count |
+| M15 the chain apply skips (i) | killed — i190 (o″), (x) |
+| M16 the lag judges at `at`, not the cutoff | killed — I454 |
+| M17 the chain apply's floor is the held head, not the chain predecessor | killed — i190 (z) |
+| M18 the community arm has no floor | killed — i190 (o), (o″), (o‴), (u), (z) |
+
+Two mutants were malformed on the first pass and re-run corrected (M6 kept its `?`; M8 did not compile); both killed as listed.
+
 ### rc7 B-1: the head moves with the record
 
 CC 3.2 T6 (rc7 `b578b59`, operator ruling B-1 on CIRISConstitution#136): the lineage head is the family or community record at a version; its `prev_head_digest` names the version it succeeds and its `charter_digest` names the charter in force at that version; every roster-affecting row, a charter re-scrub included, MUST produce a new version. Before this, a charter re-scrub wrote only a `trust:charter:v1` row, the record never re-versioned, and the head never moved.
