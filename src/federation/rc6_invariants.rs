@@ -465,12 +465,12 @@ pub(crate) mod bodies {
         let holders = born(d).await;
         let consumer = "i194-consumer";
         ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
-        // pre-rc6 charter (no window): the old edge shape attaches
+        // #973 (T4a) — a NEW edge names its head under any charter; the
+        // pre-rc6 headless shape stays valid only for an edge already held
+        // (I357).
         let pre = "i194-pre";
         ts::register_hybrid_key_as(d, pre, pre, identity_type::USER).await;
-        accept_edge(d, pre, None)
-            .await
-            .expect("a pre-rc6 charter keeps the pre-rc6 shape");
+        assert_unnamed(accept_edge(d, pre, None).await, "I194 pre-rc6 charter");
         // the accord re-scrubs its charter with a window (ten years: the birth
         // is pinned to 2026-09-20, and a shorter window would decay the witness
         // on a calendar date)
@@ -485,9 +485,9 @@ pub(crate) mod bodies {
             .unwrap()
             .unwrap()
             .persist_row_hash;
-        assert_stale(
+        assert_unnamed(
             accept_edge(d, consumer, None).await,
-            "requires the witnessed lineage head",
+            "I194 windowed charter",
         );
         assert_stale(accept_edge(d, consumer, Some(&head)).await, "not witnessed");
         wit(d, cosign_held_head(d, CANON, "w1", None).await)
@@ -810,7 +810,7 @@ pub(crate) mod bodies {
             ts::register_hybrid_key_as(d, name, name, identity_type::USER).await;
             let _ = i;
         }
-        assert_stale(accept_edge(d, "i342-a", None).await, "out-of-band anchor");
+        assert_unnamed(accept_edge(d, "i342-a", None).await, "I342 off mode");
         assert_stale(
             accept_edge(d, "i342-b", Some(&"ab".repeat(32))).await,
             "not the head this node holds",
@@ -820,6 +820,240 @@ pub(crate) mod bodies {
             .expect("I342: the anchor naming the held head attaches with no cosign");
         assert!(
             crate::federation::trust_root::trust_root_valid(d, "i342-c", CANON)
+                .await
+                .unwrap()
+                .edge_exists
+        );
+    }
+
+    /// A signed acceptance edge for `consumer` → the canonical root, unstored.
+    fn accept_edge_row(
+        id: &str,
+        consumer: &str,
+        head: Option<&str>,
+        scope: &str,
+    ) -> crate::federation::SignedAttestation {
+        let mut env = serde_json::json!({
+            "references_attestation_id": id,
+            "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+            "scope": [scope],
+        });
+        if let Some(h) = head {
+            env["attached_head_digest"] = serde_json::Value::String(h.to_owned());
+        }
+        let mut edge = crate::federation::operational::test_support::signed_trust_attestation(
+            id,
+            consumer,
+            CANON,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            env,
+        );
+        ts::reseal(&mut edge);
+        crate::federation::SignedAttestation { attestation: edge }
+    }
+
+    fn assert_unnamed(r: Result<String, Error>, what: &str) {
+        match r {
+            Err(e) if e.kind() == "trust_root_head_unnamed" => {}
+            other => panic!("{what}: expected trust_root_head_unnamed, got {other:?}"),
+        }
+    }
+
+    /// **I356** (#973; CC 3.2 T4a rc6) — a NEW acceptance edge that names no
+    /// head is refused by name in every mode: witnessed mode off (a silent
+    /// charter with no window, the shape that used to admit) and witnessed
+    /// mode on, with or without a window.
+    pub async fn i356_a_new_headless_edge_is_refused_in_every_mode(d: &dyn FederationDirectory) {
+        born(d).await;
+        for name in ["i356-off", "i356-on", "i356-win"] {
+            ts::register_hybrid_key_as(d, name, name, identity_type::USER).await;
+        }
+        assert_unnamed(
+            accept_edge(d, "i356-off", None).await,
+            "off, silent charter",
+        );
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        assert_unnamed(
+            accept_edge(d, "i356-on", None).await,
+            "witnessed, no window",
+        );
+        charter_the_accord_with(
+            d,
+            serde_json::json!({ "attach_window_secs": LONG_WINDOW, "witness_quorum": 2 }),
+        )
+        .await;
+        assert_unnamed(accept_edge(d, "i356-win", None).await, "witnessed, window");
+        // A row with NO job label is not an acceptance edge by name: it
+        // reaches the gate by direction inference only, the same inference
+        // that covers a family charter and the baked `genesis-charter`. It
+        // keeps the pre-#973 reading: refused under a charter with a window …
+        ts::register_hybrid_key_as(d, "i356-unl", "i356-unl", identity_type::USER).await;
+        let unlabeled = |id: &str| {
+            let mut edge = crate::federation::operational::test_support::signed_trust_attestation(
+                id,
+                "i356-unl",
+                CANON,
+                crate::federation::types::attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "references_attestation_id": id,
+                    "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+                }),
+            );
+            ts::reseal(&mut edge);
+            crate::federation::SignedAttestation { attestation: edge }
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let e = d
+            .put_attestation(unlabeled(&id))
+            .await
+            .expect_err("I356: unlabeled and headless under a window");
+        assert_eq!(e.kind(), "trust_root_head_stale", "I356: {e:?}");
+        // … and admitted under a charter that declares none.
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        d.put_attestation(unlabeled(&id))
+            .await
+            .expect("I356: an unlabeled row under a charter with no window is not gated");
+        for name in ["i356-off", "i356-on", "i356-win"] {
+            assert!(
+                !crate::federation::trust_root::trust_root_valid(d, name, CANON)
+                    .await
+                    .unwrap()
+                    .edge_exists,
+                "I356: a refused edge is not stored ({name})"
+            );
+        }
+    }
+
+    /// **I357** — an edge this node ALREADY holds with no head (admitted
+    /// before the node held the lineage: the pre-enforcement shape) stays
+    /// valid, and re-putting the same edge re-runs nothing — in off mode and
+    /// after the charter turns witnessing and a window on.
+    pub async fn i357_a_held_headless_edge_stays_valid(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        let consumer = "i357-consumer";
+        ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, CANON, CANON, identity_type::USER).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let edge = accept_edge_row(
+            &id,
+            consumer,
+            None,
+            crate::federation::trust_root::INFRA_SERVE_SCOPE,
+        );
+        d.put_attestation(edge.clone())
+            .await
+            .expect("I357: admitted before this node held the lineage");
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .expect("the lineage arrives");
+        d.put_attestation(edge.clone())
+            .await
+            .expect("I357: the same edge re-put in off mode is not re-judged");
+        charter_the_accord_with(
+            d,
+            serde_json::json!({ "attach_window_secs": 1, "witness_quorum": 2 }),
+        )
+        .await;
+        d.put_attestation(edge.clone())
+            .await
+            .expect("I357: nor under a witnessed charter with a lapsed window");
+        d.apply_replicated_attestation(edge)
+            .await
+            .expect("I357: nor when it is replicated back");
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, consumer, CANON)
+                .await
+                .unwrap()
+                .edge_exists,
+            "I357: attached stays attached"
+        );
+    }
+
+    /// **I358** — a held edge's id re-offered with DIFFERENT content and no
+    /// head is a new edge: refused, and the held row is untouched.
+    pub async fn i358_a_changed_edge_under_a_held_id_is_new(d: &dyn FederationDirectory) {
+        stand_up(d).await;
+        let consumer = "i358-consumer";
+        ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        ts::register_hybrid_key_as(d, CANON, CANON, identity_type::USER).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let held = accept_edge_row(
+            &id,
+            consumer,
+            None,
+            crate::federation::trust_root::INFRA_SERVE_SCOPE,
+        );
+        d.put_attestation(held.clone()).await.expect("held");
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .expect("the lineage arrives");
+        let changed = accept_edge_row(&id, consumer, None, "infra:attest");
+        let e = d
+            .put_attestation(changed)
+            .await
+            .expect_err("I358: a different edge under the held id");
+        // The id-conflict door answers before the attach gate on every
+        // backend; either refusal leaves the held edge as it was.
+        assert!(
+            matches!(e.kind(), "federation_conflict" | "trust_root_head_unnamed"),
+            "I358: {e:?}"
+        );
+        // The gate itself judges it as new, whatever door order precedes it:
+        // a held id with a different signed envelope is not "already admitted".
+        let changed = accept_edge_row(&id, consumer, None, "infra:attest").attestation;
+        let e = cc::check_attach_freshness(
+            d,
+            Some(&id),
+            &changed.attesting_key_id,
+            &changed.attestation_type,
+            &changed.attested_key_id,
+            &changed.attestation_envelope,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("I358: the gate reads a changed envelope as a new edge");
+        assert_eq!(e.kind(), "trust_root_head_unnamed", "I358: {e:?}");
+        let same = held.attestation.clone();
+        cc::check_attach_freshness(
+            d,
+            Some(&id),
+            &same.attesting_key_id,
+            &same.attestation_type,
+            &same.attested_key_id,
+            &same.attestation_envelope,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("I358: the held edge itself is not re-judged");
+        let after = d.get_attestation(&id).await.unwrap().expect("still held");
+        assert_eq!(
+            after.original_content_hash, held.attestation.original_content_hash,
+            "I358: the held edge is untouched"
+        );
+    }
+
+    /// **I359** — a new edge naming the head this node holds attaches in off
+    /// mode under a silent charter with no window: the anchor is enough.
+    pub async fn i359_a_new_edge_naming_the_held_head_attaches_off(d: &dyn FederationDirectory) {
+        born(d).await;
+        let consumer = "i359-consumer";
+        ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        let head = d
+            .lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        assert_stale(
+            accept_edge(d, consumer, Some(&"cd".repeat(32))).await,
+            "not the head this node holds",
+        );
+        accept_edge(d, consumer, Some(&head))
+            .await
+            .expect("I359: the anchored head attaches");
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, consumer, CANON)
                 .await
                 .unwrap()
                 .edge_exists
@@ -916,10 +1150,19 @@ pub(crate) mod bodies {
         let holders = born(d).await;
         let r = cc::resolve_community(d, CANON).await.unwrap().unwrap();
         assert!(r.live, "3 founders at quorum:2/3: live (M + 1)");
-        // a consumer attached before the stall (pre-rc6 charter: no head named)
+        // a consumer attached before the stall, naming the head it holds
+        // (#973: a new edge names its head; witnessed mode is off here)
         let consumer = "i195-consumer";
         ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
-        accept_edge(d, consumer, None).await.expect("attaches");
+        let head = d
+            .lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        accept_edge(d, consumer, Some(&head))
+            .await
+            .expect("attaches");
         ts::register_hybrid_key_as(d, "stall-node", "stall-node", identity_type::NODE).await;
         assert_eq!(count(d, kind::COMMUNITY_LIVENESS_STALLED).await, 0);
         // a resignation: stalled, declared once
@@ -1380,6 +1623,38 @@ mod runners {
                     super::super::bodies::i197_a_deferred_cosign_is_rechecked_on_arrival(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i356() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i356_a_new_headless_edge_is_refused_in_every_mode(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i357() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i357_a_held_headless_edge_stays_valid(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i358() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i358_a_changed_edge_under_a_held_id_is_new(
+                        &d as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i359() {
+                    let Some(d) = $fresh.await else { return };
+                    super::super::bodies::i359_a_new_edge_naming_the_held_head_attaches_off(
+                        &d as &dyn FederationDirectory,
                     )
                     .await
                 }

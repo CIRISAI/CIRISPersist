@@ -2053,8 +2053,22 @@ where
 /// no window admits only an edge naming the head (the T5 anchor). Refusals are
 /// `Error::TrustRootHeadStale`. A root with no lineage here (a KEY root) is
 /// not this gate's business; nothing on the ATTACHED side reads this.
+///
+/// #973 (CC 3.2 T4a, rc6 5cceadb) — **only a NEW edge is gated.** "An edge
+/// admitted before a substrate enforced this rule carries no
+/// `attached_head_digest` and stays valid … on every later put, replication
+/// or restore of that same edge; it is read as naming the head the node held
+/// when it was admitted. Only a new edge is gated: a new edge that names no
+/// head is refused in every mode, witnessed mode off included, where the head
+/// it must name is the anchored one." NEW is structural: `attestation_id`
+/// names no row this node holds with the same attester, root and signed
+/// envelope. A held edge re-offered unchanged passes without re-running
+/// freshness; anything else under a held id is judged as new. A new headless
+/// edge is refused `Error::TrustRootHeadUnnamed`.
 pub async fn check_attach_freshness<F>(
     directory: &F,
+    attestation_id: Option<&str>,
+    attesting_key_id: &str,
     attestation_type_str: &str,
     attested_key_id: &str,
     envelope: &serde_json::Value,
@@ -2086,51 +2100,67 @@ where
     let Some(view) = root_witness_view(directory, root, now).await? else {
         return Ok(());
     };
+    // T4a: "the gate runs on the edge's first admission only".
+    if edge_already_admitted(directory, attestation_id, attesting_key_id, root, envelope).await? {
+        return Ok(());
+    }
     let charter = charter_members_for(directory, root)
         .await?
         .unwrap_or_default();
     let presented = envelope
         .get(paths::ATTACHED_HEAD_DIGEST)
         .and_then(|v| v.as_str());
-    // The gate is ARMED by the charter: a charter that declares no
-    // `attach_window_secs` is a pre-rc6 charter, and an edge that names no head
-    // under it is the pre-rc6 shape (admitted, stated — CHANGELOG 51.0.0). Once
-    // the conferring roster re-scrubs its charter with a window (the shipped
-    // default for ciris-canonical / humanity-accord is 7 days), every attach
-    // needs the witnessed head; an edge that names a head is judged under any
-    // charter (the T5 anchor).
-    // #973 (CC 3.2 T6, witnessed mode off) — no head is fresh by cosignature,
-    // so none is attachable by cosignature: an attach is by an out-of-band
-    // anchor to the head this node holds (T5), and the window does not apply.
+    // A new edge that NAMES itself `trust:accepts:v1` names the head it
+    // attaches on, in every mode. A row with no job label reaches this gate
+    // by direction inference only, and the same inference covers a family's
+    // charter and the baked genesis plane (the unlabeled `genesis-charter`),
+    // which are not acceptance edges and carry no head: for those the
+    // pre-#973 reading is kept exactly — armed by the charter's window.
+    let labeled = super::admission::envelope_dimension(envelope)
+        == Some(super::trust_root::TRUST_ACCEPTS_DIMENSION);
     let off = !super::lineage_witness::witnessed_mode_on(view.quorum);
-    if off {
-        return match (presented, view.held_head.as_ref()) {
-            // The pre-rc6 edge shape under a pre-rc6 charter (no window, no
-            // head named) is unchanged: edges already in the field re-admit.
-            (None, _) if charter.attach_window_secs.is_none() => Ok(()),
-            (None, _) => refuse(format!(
+    let Some(presented) = presented else {
+        if labeled {
+            return Err(Error::TrustRootHeadUnnamed {
+                root_key_id: root.to_owned(),
+                detail: format!(
+                    "a new acceptance edge must name the lineage head it attaches on (`{}`): the \
+                     witnessed head, or the anchored head this node holds while witnessed mode is \
+                     off (CC 3.2 T4a)",
+                    paths::ATTACHED_HEAD_DIGEST
+                ),
+            });
+        }
+        if charter.attach_window_secs.is_none() {
+            return Ok(());
+        }
+        return if off {
+            refuse(format!(
                 "the lineage of {root} is in witnessed mode off: attaching requires an \
                  out-of-band anchor naming the head (`{}`), never a cosignature (CC 3.2 T6)",
                 paths::ATTACHED_HEAD_DIGEST
-            )),
-            (Some(p), Some((held, _))) if p == held => Ok(()),
-            (Some(p), _) => refuse(format!(
-                "the presented head {p} is not the head this node holds for {root}: in \
+            ))
+        } else {
+            refuse(format!(
+                "the root's charter declares an attach window of {}s: attaching requires the \
+                 witnessed lineage head (`{}`) inside it — never attach on a stale or absent one",
+                charter.attach_window_secs.unwrap_or_default(),
+                paths::ATTACHED_HEAD_DIGEST
+            ))
+        };
+    };
+    // #973 (CC 3.2 T6, witnessed mode off) — no head is fresh by cosignature,
+    // so none is attachable by cosignature: an attach is by an out-of-band
+    // anchor to the head this node holds (T5), and the window does not apply.
+    if off {
+        return match view.held_head.as_ref() {
+            Some((held, _)) if presented == held => Ok(()),
+            _ => refuse(format!(
+                "the presented head {presented} is not the head this node holds for {root}: in \
                  witnessed mode off an attach names the current head as its anchor"
             )),
         };
     }
-    let Some(presented) = presented else {
-        if charter.attach_window_secs.is_none() {
-            return Ok(());
-        }
-        return refuse(format!(
-            "the root's charter declares an attach window of {}s: attaching requires the \
-             witnessed lineage head (`{}`) inside it — never attach on a stale or absent one",
-            charter.attach_window_secs.unwrap_or_default(),
-            paths::ATTACHED_HEAD_DIGEST
-        ));
-    };
     let Some((head_digest, head_at)) = view.witnessed_head.clone() else {
         return refuse(format!(
             "the lineage of {root} is not witnessed ({} independent witness cosign(s) required, \
@@ -2165,6 +2195,39 @@ where
             }
         }
     }
+}
+
+/// T4a's "first admission only", decided structurally: this node already holds
+/// a row under `attestation_id` with the same attester, the same root and the
+/// same signed envelope. A directory that cannot answer the lookup, or a held
+/// row that differs in any of the three, is "new".
+async fn edge_already_admitted<F>(
+    directory: &F,
+    attestation_id: Option<&str>,
+    attesting_key_id: &str,
+    root: &str,
+    envelope: &serde_json::Value,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(id) = attestation_id else {
+        return Ok(false);
+    };
+    let held = match directory.get_attestation(id).await {
+        Ok(Some(h)) => h,
+        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if held.attesting_key_id != attesting_key_id || held.attested_key_id != root {
+        return Ok(false);
+    }
+    let canonical = |v: &serde_json::Value| -> Result<serde_json::Value, Error> {
+        let mut v = v.clone();
+        super::canonical_at_rest::canonicalize_in_place(&mut v)?;
+        Ok(v)
+    };
+    Ok(canonical(&held.attestation_envelope)? == canonical(envelope)?)
 }
 
 /// The witness plane's view of a ROOT this node holds a lineage for — a
@@ -2248,6 +2311,32 @@ where
         community: None,
         latest_cosign_at: effective.iter().map(|c| c.signed_at).max(),
     }))
+}
+
+/// #973 (CC 3.2 T4a) — **the head a NEW acceptance edge must name** for
+/// `root`, as this node sees it now: the witnessed head while witnessed mode
+/// is on (`None` while the held head is not yet witnessed — nothing is
+/// attachable), the held head as the out-of-band anchor while it is off.
+/// `None` also when this node holds no lineage for `root` (a key root: the
+/// gate does not apply and no head is named). A host building an acceptance
+/// edge writes the returned digest as `attached_head_digest`.
+pub async fn attach_head_for<F>(
+    directory: &F,
+    root: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(view) = root_witness_view(directory, root, now).await? else {
+        return Ok(None);
+    };
+    let head = if super::lineage_witness::witnessed_mode_on(view.quorum) {
+        view.witnessed_head
+    } else {
+        view.held_head
+    };
+    Ok(head.map(|(digest, _)| digest))
 }
 
 /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held trust-root

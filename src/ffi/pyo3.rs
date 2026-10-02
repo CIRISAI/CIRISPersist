@@ -34010,6 +34010,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v19.0.0 — caller-fixable: add the pre-rotation commitment / fix binding.
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
         crate::federation::Error::TrustRootHeadStale { .. } => PyValueError::new_err(kind),
+        crate::federation::Error::TrustRootHeadUnnamed { .. } => PyValueError::new_err(kind),
         // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
         crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
         // v31.0.0 (CIRISPersist#648) — NOT caller-fixable by fixing the
