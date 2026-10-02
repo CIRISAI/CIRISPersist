@@ -795,6 +795,33 @@ fn env_u64(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// v52.0.2 (CIRISServer#705) — the pool every [`PostgresBackend::connect`]
+/// builds: deadpool's connector wrapped in
+/// [`PersistRuntimeConnect`](super::postgres_runtime_connect::PersistRuntimeConnect),
+/// so a connection created from a thread with no persist runtime is made on
+/// persist's own. Both TLS arms build through this one function.
+fn persist_runtime_pool<T>(cfg: &Config, tls: T) -> Result<Pool, String>
+where
+    T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Clone + Sync + Send + 'static,
+    T::Stream: Sync + Send,
+    T::TlsConnect: Sync + Send,
+    <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
+{
+    let pg_config = cfg.get_pg_config().map_err(|e| e.to_string())?;
+    let manager = deadpool_postgres::Manager::from_connect(
+        pg_config,
+        super::postgres_runtime_connect::PersistRuntimeConnect::new(
+            deadpool_postgres::ConfigConnectImpl { tls },
+        ),
+        cfg.get_manager_config(),
+    );
+    Pool::builder(manager)
+        .config(cfg.get_pool_config())
+        .runtime(Runtime::Tokio1)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// Postgres-backed [`Backend`] impl.
 pub struct PostgresBackend {
     pool: Pool,
@@ -1451,12 +1478,11 @@ impl PostgresBackend {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
             let connector = MakeRustlsConnect::new(tls_config);
-            cfg.create_pool(Some(Runtime::Tokio1), connector)
+            persist_runtime_pool(&cfg, connector)
                 .map_err(|e| Error::Backend(format!("pool create (tls): {e}")))?
         };
         #[cfg(not(feature = "tls"))]
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
+        let pool = persist_runtime_pool(&cfg, NoTls)
             .map_err(|e| Error::Backend(format!("pool create: {e}")))?;
 
         Ok(Self {

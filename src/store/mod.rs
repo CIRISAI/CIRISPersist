@@ -37,6 +37,11 @@ pub mod migration_timing;
 mod parity;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+/// v52.0.2 (CIRISServer#705, CIRISPersist#354) — the pool connector that
+/// runs a new connection on persist's own runtime when the polling thread has
+/// none of persist's (a foreign tokio copy's thread).
+#[cfg(feature = "postgres")]
+pub(crate) mod postgres_runtime_connect;
 mod schema_parity;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod scope_bind;
