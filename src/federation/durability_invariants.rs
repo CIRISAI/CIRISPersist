@@ -161,6 +161,13 @@ pub(crate) mod bodies {
             RecipientBasis::CohortRoster,
             "I411 family bytes are hold-and-forward, not publish-own"
         );
+        // a family row that names no family has no audience to resolve: it
+        // is never everyone, and nothing is reported as a target
+        assert_eq!(
+            content_audience(d, FAMILY, Some(&a), None).await.unwrap(),
+            ContentAudience::Unresolvable,
+            "I411 a family row with no group key is unresolvable, never everyone"
+        );
     }
 
     /// **I412** — consent is supreme: an allow list that keeps the family off
