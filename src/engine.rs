@@ -22230,7 +22230,8 @@ mod tests {
 
         assert!(outcome.delegation_promoted);
         assert!(outcome.self_dek_excluded.is_empty());
-        assert_eq!(outcome.self_dek_granted, 2);
+        // v53.0.0 (#963) — the agent occurrence is server class: no self key.
+        assert_eq!(outcome.self_dek_granted, 1);
         assert_eq!(outcome.transport_destinations_registered, 1);
 
         let dir = engine.federation_directory();
