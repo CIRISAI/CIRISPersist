@@ -158,16 +158,34 @@ pub async fn send_set_for(
         .await?
         .into_iter()
         .collect();
-    if matches!(cohort_scope, cohort_scope::SELF | cohort_scope::FAMILY) {
-        let principals = principals_of(dir, k).await?;
-        for p in &principals {
-            set.extend(nodes_of(dir, p).await?);
+    // v53.0.0 (CIRISPersist#963, CC 3.3.7) — a node is in the set only when
+    // its owner's allow list (or, absent one, its class) lets the content
+    // reach it: the sender withholds what the receiver's hold decision
+    // refuses, through the same resolver. A `family` send unions over the
+    // principals' families (the row's own family is not an argument here),
+    // so it can name a node that receives another of those families; the
+    // receiver's `is_audience` decides per row.
+    use super::replication_audience::{owner_node_receives, OwnerCohort};
+    if cohort_scope == cohort_scope::SELF {
+        for p in &principals_of(dir, k).await? {
+            for n in nodes_of(dir, p).await? {
+                if owner_node_receives(dir, p, &n, OwnerCohort::SelfContent).await? {
+                    set.insert(n);
+                }
+            }
         }
-        if cohort_scope == cohort_scope::FAMILY {
-            for p in &principals {
-                for fam in dir.list_families_for_member_active(p).await? {
-                    for m in dir.active_family_members(&fam.family_key_id).await? {
-                        set.extend(nodes_of(dir, &m.key_id).await?);
+    } else if cohort_scope == cohort_scope::FAMILY {
+        for p in &principals_of(dir, k).await? {
+            for fam in dir.list_families_for_member_active(p).await? {
+                let cohort = OwnerCohort::Group {
+                    scope: cohort_scope::FAMILY,
+                    target: &fam.family_key_id,
+                };
+                for m in dir.active_family_members(&fam.family_key_id).await? {
+                    for n in nodes_of(dir, &m.key_id).await? {
+                        if owner_node_receives(dir, &m.key_id, &n, cohort).await? {
+                            set.insert(n);
+                        }
                     }
                 }
             }

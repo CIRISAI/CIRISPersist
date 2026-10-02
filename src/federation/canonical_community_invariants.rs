@@ -447,6 +447,7 @@ pub(crate) mod bodies {
             serve_nodes: Vec::new(),
             consensus_protocol: "quorum:2/3".to_owned(),
             attestations: Vec::new(),
+            roster_records: Vec::new(),
             authorizations: Vec::new(),
             produced_at: "2026-09-27T00:00:00Z".to_owned(),
         };

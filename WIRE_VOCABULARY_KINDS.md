@@ -238,6 +238,19 @@ after `FamilyMembershipWidening` — never inserts, the order is hashed:
 
 `FSD/ROOM_ROSTER_AUTHORITY.md` §11 is the design.
 
+### v53.0.0 — who a kind is served to (CIRISEdge#761, CIRISPersist#963)
+
+- Every `KindPolicy` gains `audience` (`ServeAudience`): `cohort` (Attestation,
+  KeyGrant — per row, per peer, `replication_audience::may_receive`),
+  `membership_plane` (Family, Community and the five membership planes —
+  `may_receive_group_plane`: public groups to every peer, a private group's to
+  members' nodes, live invitees' nodes and the named member's nodes) and
+  `public` (every other kind). No kind is added or reordered.
+- **Pins moved:** `REPLICATION_POLICY_HASH`
+  `5501d6b9…714a` → `1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869`;
+  `CONSENT_GRAMMAR_HASH` (the `cohorts` payload member)
+  `82305891…82ac` → `4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`.
+
 ---
 
 ## Why persist exposes no `send_trace_batch` wrapper

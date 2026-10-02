@@ -33847,7 +33847,7 @@ mod tests {
         let occ = |k: &str, enc: Option<EncryptionPubkeys>| crate::federation::IdentityOccurrence {
             identity_key_id: "root".into(),
             occurrence_key_id: k.into(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
             valid_until: None,
@@ -33961,7 +33961,7 @@ mod tests {
         let occ = |k: &str, enc: Option<EncryptionPubkeys>| crate::federation::IdentityOccurrence {
             identity_key_id: "root".into(),
             occurrence_key_id: k.into(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
             valid_until: None,
@@ -34103,7 +34103,7 @@ mod tests {
             crate::federation::IdentityOccurrence {
                 identity_key_id: identity.into(),
                 occurrence_key_id: occ_key.into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
                 valid_until: None,
@@ -35810,7 +35810,7 @@ mod tests {
         crate::federation::IdentityOccurrence {
             identity_key_id: identity.into(),
             occurrence_key_id: occ_key.into(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
             valid_until: None,
@@ -35913,7 +35913,7 @@ mod tests {
         let typed = |enc_x: &[u8]| crate::federation::IdentityOccurrence {
             identity_key_id: "alice".into(),
             occurrence_key_id: "alice-phone".into(),
-            device_class: crate::federation::types::device_class::AGENT.into(),
+            device_class: crate::federation::types::device_class::LAPTOP.into(),
             hardware_attestation: None,
             asserted_at: "2026-06-14T00:00:00Z".parse().unwrap(),
             valid_until: None,
@@ -36440,7 +36440,7 @@ mod tests {
             identity_occurrence: crate::federation::IdentityOccurrence {
                 identity_key_id: "alice".into(),
                 occurrence_key_id: "alice-phone".into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: "2026-06-14T00:00:00Z".parse().unwrap(),
                 valid_until: None,
@@ -38658,7 +38658,7 @@ mod tests {
             identity_occurrence: crate::federation::IdentityOccurrence {
                 identity_key_id: "io507-id".into(),
                 occurrence_key_id: "io507-occ".into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
                 valid_until: None,
@@ -39037,7 +39037,7 @@ mod tests {
                 crate::federation::IdentityOccurrence {
                     identity_key_id: "ap515".into(),
                     occurrence_key_id: "ap515".into(),
-                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    device_class: crate::federation::types::device_class::LAPTOP.into(),
                     hardware_attestation: None,
                     asserted_at: format!("{asserted}Z").parse().unwrap(),
                     valid_until: None,
@@ -39200,7 +39200,7 @@ mod tests {
             .put_identity_occurrence_local(crate::federation::IdentityOccurrence {
                 identity_key_id: "ior507-id".into(),
                 occurrence_key_id: "ior507-occ".into(),
-                device_class: crate::federation::types::device_class::AGENT.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: "2026-06-08T00:00:00Z".parse().unwrap(),
                 valid_until: None,

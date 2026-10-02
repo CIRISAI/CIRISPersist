@@ -265,34 +265,56 @@ pub fn is_proxy_content(
     }
 }
 
-/// #846 (§4) — the communities `our_key_id` is party to: those its
-/// ACTIVE principal identity (or the key itself) is an active member of.
-/// One directory walk per decision; the sweep reuses one set per cycle.
+/// #846 (§4) — the rooms `our_key_id` is party to at `cohort_scope`
+/// (`community` or `affiliations`): those its own key is an active member of,
+/// and those an ACTIVE principal identity is an active member of AND that
+/// principal's allow list for this node lets through
+/// ([`owner_node_receives`](crate::federation::replication_audience::owner_node_receives);
+/// v53.0.0, #963 — a denied node is simply not party). One directory walk per
+/// decision; the sweep reuses one set per cycle.
 pub async fn audience_memberships<D>(
     directory: &D,
     our_key_id: &str,
+    cohort_scope: &str,
 ) -> Result<HashSet<String>, Error>
 where
     D: FederationDirectory + ?Sized,
 {
+    use crate::federation::replication_audience::{owner_node_receives, OwnerCohort};
     // v45.0.1 (CIRISPersist#873, `FSD/OCCURRENCE_PRINCIPAL.md` §3) — EVERY
     // principal, plus the node's own key: a shared device is party to both
     // humans' rooms, and the node's own memberships were always its own.
-    let mut keys = directory
+    let principals = directory
         .active_identities_for_occurrence(our_key_id)
         .await?;
-    keys.push(our_key_id.to_owned());
     let mut out = HashSet::new();
-    for key in keys {
-        for c in directory.list_communities_for_member_active(&key).await? {
-            out.insert(c.community_key_id);
+    for c in directory
+        .list_communities_for_member_active(our_key_id)
+        .await?
+    {
+        out.insert(c.community_key_id);
+    }
+    for p in &principals {
+        for c in directory.list_communities_for_member_active(p).await? {
+            if out.contains(&c.community_key_id) {
+                continue;
+            }
+            let cohort = OwnerCohort::Group {
+                scope: cohort_scope,
+                target: &c.community_key_id,
+            };
+            if owner_node_receives(directory, p, our_key_id, cohort).await? {
+                out.insert(c.community_key_id);
+            }
         }
     }
     Ok(out)
 }
 
-/// v52.0.0 (#960) — is any principal of this node (its own key, or a human
-/// it is an active occurrence of) an active member of `family_key_id`?
+/// v52.0.0 (#960) — is this node party to `family_key_id`'s content? Its own
+/// key is an active member, or a human it is an active occurrence of is an
+/// active member whose allow list lets the family through to this node
+/// (v53.0.0, #963).
 pub async fn family_audience<D>(
     directory: &D,
     our_key_id: &str,
@@ -301,17 +323,36 @@ pub async fn family_audience<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let mut principals: HashSet<String> = directory
-        .active_identities_for_occurrence(our_key_id)
-        .await?
-        .into_iter()
-        .collect();
-    principals.insert(our_key_id.to_owned());
-    Ok(directory
+    use crate::federation::replication_audience::{owner_node_receives, OwnerCohort};
+    let members: HashSet<String> = directory
         .active_family_members(family_key_id)
         .await?
-        .iter()
-        .any(|m| principals.contains(&m.key_id)))
+        .into_iter()
+        .map(|m| m.key_id)
+        .collect();
+    if members.contains(our_key_id) {
+        return Ok(true);
+    }
+    for p in directory
+        .active_identities_for_occurrence(our_key_id)
+        .await?
+    {
+        if members.contains(&p)
+            && owner_node_receives(
+                directory,
+                &p,
+                our_key_id,
+                OwnerCohort::Group {
+                    scope: cs::FAMILY,
+                    target: family_key_id,
+                },
+            )
+            .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// #846 (§4) — the pure core of [`is_audience`]: is a node whose active
@@ -362,30 +403,49 @@ pub async fn is_audience<D>(
 where
     D: FederationDirectory + ?Sized,
 {
+    use crate::federation::replication_audience::{owner_node_receives, OwnerCohort};
     let mut author_local = is_local_or_family(author_key_id);
+    let placement = cs::Scope::parse(cohort_scope).map(cs::Scope::placement);
     // v46.3.0 (CIRISPersist#884, `FSD/SELF_COLLECTIVE_TRANSFER.md` §4.1) —
     // the self/family arm by PRINCIPAL, not by key: a row authored by the
-    // human (or their actor occurrence) is this node's own content when
-    // the same human owns this node. #873 lifted only the community
-    // memberships; `self` still compared the author to the node's key, so
-    // a person-authored self row was `NotPartyTo` on the person's own
-    // second device. The operator's family predicate is kept as-is.
+    // human (or their actor occurrence) is this node's own content when the
+    // same human owns this node.
+    // v53.0.0 (CIRISPersist#963, CC 3.3.7) — and only when that human's allow
+    // list lets it reach THIS node: `self` follows the node's class (a server
+    // or agent occurrence holds none of its owner's `self` content), a family
+    // row follows the owner's list for that family. The principal must hold a
+    // live occurrence of this node (the claimed-nodes rule); an owner binding
+    // alone makes no device.
     if !author_local
         && matches!(
-            cs::Scope::parse(cohort_scope).map(cs::Scope::placement),
+            placement,
             Some(cs::Placement::SelfCollective | cs::Placement::Targeted(cs::TargetPlane::Family))
         )
     {
-        author_local =
-            crate::federation::self_collective::speaks_for(directory, our_key_id, author_key_id)
-                .await?;
+        let cohort = match (placement, community_key_id) {
+            (Some(cs::Placement::Targeted(cs::TargetPlane::Family)), Some(fam)) => {
+                Some(OwnerCohort::Group {
+                    scope: cs::FAMILY,
+                    target: fam,
+                })
+            }
+            (Some(cs::Placement::Targeted(cs::TargetPlane::Family)), None) => None,
+            _ => Some(OwnerCohort::SelfContent),
+        };
+        if let Some(cohort) = cohort {
+            for p in
+                crate::federation::self_collective::principals_of(directory, author_key_id).await?
+            {
+                if owner_node_receives(directory, &p, our_key_id, cohort).await? {
+                    author_local = true;
+                    break;
+                }
+            }
+        }
     }
     // v52.0.0 (CIRISPersist#960) — the FAMILY arm by the family's own
-    // roster. The operator predicate is test-only in practice (production
-    // never installs one), so a family member's node was never party to the
-    // family's content: this node is party when any of its principals — the
-    // humans it is an occurrence of, and its own key — is an active member
-    // of the named family. The room arm's rule, on the family plane.
+    // roster: this node is party when its own key, or a principal whose allow
+    // list lets the family through, is an active member of the named family.
     if !author_local && cs::target_plane(cohort_scope) == Some(cs::TargetPlane::Family) {
         if let Some(fam) = community_key_id {
             author_local = family_audience(directory, our_key_id, fam).await?;
@@ -393,7 +453,7 @@ where
     }
     // Only the community arms need the walk; do not pay for it otherwise.
     let members = if cs::target_plane(cohort_scope) == Some(cs::TargetPlane::Room) {
-        audience_memberships(directory, our_key_id).await?
+        audience_memberships(directory, our_key_id, cohort_scope).await?
     } else {
         HashSet::new()
     };

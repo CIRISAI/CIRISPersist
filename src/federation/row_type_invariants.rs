@@ -419,10 +419,6 @@ mod pure {
                 include_str!("genesis/prior_ceremony_delegation_rows.json"),
             ),
             (
-                "canonical_community_seed",
-                include_str!("genesis/canonical_community_seed.json"),
-            ),
-            (
                 "accord_holder_seed",
                 include_str!("genesis/accord_holder_seed.json"),
             ),

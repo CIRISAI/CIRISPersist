@@ -2,39 +2,31 @@
 //! trust-root re-mint, signed by SOFTWARE holders, so a host can dry-run the
 //! ceremony end to end before the real one.
 //!
-//! [`mint_test_ceremony`] produces, for a three-holder test anchor, exactly
-//! the two artifacts the real ceremony outputs, in the JSON shapes the boot
-//! path reads:
-//!
-//! - the **bundle** (`canonical_seed.json`'s shape, a [`GenesisBundle`]): the
-//!   holder roster as carried, one accord-scrubbed canonical serve node, the
-//!   three delegation rows (`genesis-charter` with `witness_quorum: 0`,
-//!   `genesis-grant:<node>`, `genesis-lifecycle`) each scrubbed by all three
-//!   holders, and all three holders' authorizations;
-//! - the **community asset** (`canonical_community_seed.json`'s shape, a
-//!   [`SignedCommunity`]): the `ciris-canonical` birth, founders = the three
-//!   holders, all three signing, the node listed as `member` and never
-//!   signing.
+//! [`mint_test_ceremony`] produces, for a three-holder test anchor, the
+//! artifact the real ceremony outputs, through the same assembler
+//! ([`super::ceremony`]): the **bundle** (`canonical_seed.json`'s shape, a
+//! [`GenesisBundle`]) — the holder roster as carried, one accord-scrubbed
+//! canonical serve node, the three delegation rows (`genesis-charter` with
+//! `witness_quorum: 0` and every holder's recovery commitment,
+//! `genesis-grant:<node>`, `genesis-lifecycle`) each scrubbed by all three
+//! holders, and, as further members of `attestations` (v53.0.0, CC rc7), the
+//! accord family's genesis record and the `ciris-canonical` birth (founders =
+//! the three holders, all three signing, the node listed as `member` and never
+//! signing), with all three holders' authorizations over the whole.
 //!
 //! The anchor block ([`mint_test_anchor_block`](super::mint_test_anchor_block))
-//! is unchanged and returned beside them. Everything here is behind the
+//! is unchanged and returned beside it. Everything here is behind the
 //! `test-anchor` feature: no production build contains it.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_crypto::{ClassicalSigner as _, Ed25519Signer, MlDsa65Signer, PqcSigner as _};
 
-use super::bundle::authorization_digest;
-use super::{
-    mint_test_anchor_block, test_anchor_mldsa_seed, GenesisAuthorization, GenesisBundle,
-    TestAnchorBlock,
-};
+use super::{mint_test_anchor_block, test_anchor_mldsa_seed, GenesisBundle, TestAnchorBlock};
 use crate::federation::accord_test_support::Identity;
 use crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID;
-use crate::federation::types::{
-    Community, CommunityMember, RosterCosignature, ScrubSig, SignedCommunity,
-};
-use crate::federation::{Attestation, Error, SignedAttestation, SignedKeyRecord};
+use crate::federation::types::SignedCommunity;
+use crate::federation::{Error, SignedKeyRecord};
 
 /// The key id of the one canonical serve node a minted ceremony seats.
 pub const TEST_CEREMONY_NODE_KEY_ID: &str = "test-canonical-node-0";
@@ -49,16 +41,16 @@ pub fn test_ceremony_delegation_ids() -> [String; 3] {
     ]
 }
 
-/// What [`mint_test_ceremony`] returns: the anchor block and the two
-/// artifacts of the ceremony.
+/// What [`mint_test_ceremony`] returns: the anchor block and the bundle.
 #[derive(Debug, Clone)]
 pub struct TestCeremonyOutputs {
     /// The `CIRIS_TEST_TRUST_ROOT*` block for the three holders — arm it
-    /// before booting against the artifacts below.
+    /// before booting against the bundle below.
     pub block: TestAnchorBlock,
-    /// The bundle (`canonical_seed.json`'s shape).
+    /// The bundle (`canonical_seed.json`'s shape) — the only artifact.
     pub bundle: GenesisBundle,
-    /// The `ciris-canonical` birth (`canonical_community_seed.json`'s shape).
+    /// The `ciris-canonical` birth the bundle carries, cloned out for
+    /// convenience (never a second artifact).
     pub community: SignedCommunity,
 }
 
@@ -71,16 +63,6 @@ impl TestCeremonyOutputs {
     pub fn bundle_json(&self) -> Result<String, Error> {
         serde_json::to_string_pretty(&self.bundle)
             .map_err(|e| Error::Backend(format!("serialize bundle: {e}")))
-    }
-
-    /// The community asset as the JSON the boot path parses.
-    ///
-    /// # Errors
-    ///
-    /// Serialization failure.
-    pub fn community_json(&self) -> Result<String, Error> {
-        serde_json::to_string_pretty(&self.community)
-            .map_err(|e| Error::Backend(format!("serialize community: {e}")))
     }
 }
 
@@ -125,65 +107,6 @@ fn bad(what: &str, e: impl std::fmt::Display) -> Error {
     Error::InvalidArgument(format!("mint_test_ceremony: {what}: {e}"))
 }
 
-/// One delegation row: sealed (signed instants + the typed-column mirror),
-/// scrubbed by `holders[0]` and co-scrubbed by the rest over the SAME
-/// envelope.
-fn delegation_row(
-    id: &str,
-    attested: &str,
-    attestation_type: &str,
-    envelope: serde_json::Value,
-    at: chrono::DateTime<chrono::Utc>,
-    holders: &[Identity],
-) -> Result<SignedAttestation, Error> {
-    let mut row = Attestation {
-        attestation_id: id.to_owned(),
-        attesting_key_id: holders[0].key_id.clone(),
-        attested_key_id: attested.to_owned(),
-        attestation_type: attestation_type.to_owned(),
-        weight: Some(1.0),
-        asserted_at: at,
-        expires_at: None,
-        attestation_envelope: envelope,
-        original_content_hash: String::new(),
-        scrub_signature_classical: String::new(),
-        scrub_signature_pqc: None,
-        scrub_key_id: holders[0].key_id.clone(),
-        scrub_timestamp: at,
-        pqc_completed_at: Some(at),
-        persist_row_hash: String::new(),
-        subject_key_ids: Vec::new(),
-        withdraws_admission_rule: None,
-        cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
-        tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
-        promoted_at: None,
-        additional_scrubs: Vec::new(),
-    };
-    crate::federation::envelope::stamp_signed_instants(&mut row)
-        .map_err(|e| bad("stamp instants", e))?;
-    let mirror =
-        crate::federation::envelope::RowMirror::of(&row).map_err(|e| bad("row mirror", e))?;
-    row.attestation_envelope[crate::federation::envelope::paths::ROW] =
-        serde_json::to_value(&mirror).map_err(|e| bad("row mirror serialize", e))?;
-    let (och, classical, pqc) = holders[0].sign_envelope(&row.attestation_envelope);
-    row.original_content_hash = och;
-    row.scrub_signature_classical = classical;
-    row.scrub_signature_pqc = pqc;
-    row.additional_scrubs = holders[1..]
-        .iter()
-        .map(|h| {
-            let (_, classical, pqc) = h.sign_envelope(&row.attestation_envelope);
-            ScrubSig {
-                cosigned_at: None,
-                scrub_key_id: h.key_id.clone(),
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-            }
-        })
-        .collect();
-    Ok(SignedAttestation { attestation: row })
-}
-
 /// **Mint the software ceremony** for three test-anchor holders
 /// (`test-accord-holder-{0,1,2}`, seeds in that order) and one canonical node
 /// ([`TEST_CEREMONY_NODE_KEY_ID`], from `node_seed`), every instant stamped
@@ -191,6 +114,11 @@ fn delegation_row(
 /// order). A re-mint is the same call with a later `produced_at`: the ids are
 /// kept and the instants move forward, which is what the #665 supersede path
 /// requires.
+///
+/// v53.0.0 — a thin caller of the production assembler
+/// ([`CeremonyState`](super::ceremony::CeremonyState)): plan, have each
+/// software holder sign every item, assemble. One code path, so the dry run
+/// proves the production one.
 ///
 /// Pure: no directory, no clock, no environment.
 ///
@@ -220,6 +148,74 @@ pub fn mint_test_ceremony_scoped(
     produced_at: chrono::DateTime<chrono::Utc>,
     extra_scope: Option<&str>,
 ) -> Result<TestCeremonyOutputs, Error> {
+    let (block, holders, inputs) =
+        test_ceremony_inputs(ed_seeds, node_seed, produced_at, extra_scope)?;
+    let mut state = super::ceremony::CeremonyState::plan(inputs).map_err(|e| bad("plan", e))?;
+    sign_every_item(&mut state, &holders)?;
+    let bundle = state.assemble().map_err(|e| bad("assemble", e))?;
+    let community = bundle
+        .community_record(CIRIS_CANONICAL_COMMUNITY_KEY_ID)
+        .cloned()
+        .ok_or_else(|| bad("assemble", "no community birth"))?;
+    Ok(TestCeremonyOutputs {
+        block,
+        bundle,
+        community,
+    })
+}
+
+/// v53.0.0 — have every software holder sign every item a ceremony still owes,
+/// round by round (the heads and the authorization become signable once the
+/// charter is complete).
+///
+/// # Errors
+///
+/// A partial the assembler refuses.
+pub fn sign_every_item(
+    state: &mut super::ceremony::CeremonyState,
+    holders: &[Identity],
+) -> Result<(), Error> {
+    loop {
+        let items = state.next_items().map_err(|e| bad("items", e))?;
+        if items.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            for h in holders.iter().filter(|h| item.owed.contains(&h.key_id)) {
+                let (classical, pqc) = h.sign_bytes(&item.bytes);
+                state
+                    .add_partial(super::ceremony::Partial {
+                        item: item.id.clone(),
+                        holder_key_id: h.key_id.clone(),
+                        signature_classical: classical,
+                        signature_pqc: pqc,
+                    })
+                    .map_err(|e| bad("add partial", e))?;
+            }
+        }
+    }
+}
+
+/// v53.0.0 — the software ceremony's inputs: the anchor block, the three
+/// software holders (to sign with), and the [`CeremonyInputs`](super::ceremony::CeremonyInputs)
+/// a host would stamp at propose.
+///
+/// # Errors
+///
+/// As [`mint_test_ceremony`].
+pub fn test_ceremony_inputs(
+    ed_seeds: &[[u8; 32]],
+    node_seed: &[u8; 32],
+    produced_at: chrono::DateTime<chrono::Utc>,
+    extra_scope: Option<&str>,
+) -> Result<
+    (
+        TestAnchorBlock,
+        Vec<Identity>,
+        super::ceremony::CeremonyInputs,
+    ),
+    Error,
+> {
     if ed_seeds.len() != 3 {
         return Err(Error::InvalidArgument(format!(
             "mint_test_ceremony: the accord roster is three holders (quorum 2 of 3); got {} \
@@ -227,10 +223,6 @@ pub fn mint_test_ceremony_scoped(
             ed_seeds.len()
         )));
     }
-    // Truncated to microseconds: every backend stores an instant at that
-    // precision, and a row minted finer would not round-trip byte-equal.
-    let produced_at = chrono::DateTime::from_timestamp_micros(produced_at.timestamp_micros())
-        .ok_or_else(|| bad("produced_at", "out of range"))?;
     let block = mint_test_anchor_block(ed_seeds)?;
     let holders: Vec<Identity> = ed_seeds
         .iter()
@@ -257,229 +249,94 @@ pub fn mint_test_ceremony_scoped(
         })
         .collect::<Result<_, Error>>()?;
 
-    // The canonical serve node: its own software pair, its record scrubbed by
-    // all three holders (the accord's m-of-n over the registration envelope).
+    // The canonical serve node: its own software pair.
     let node_ed = Ed25519Signer::from_seed(node_seed).map_err(|e| bad("node ed25519 seed", e))?;
     let node_mldsa = MlDsa65Signer::from_seed(&test_anchor_mldsa_seed(node_seed))
         .map_err(|e| bad("node ml-dsa-65 seed", e))?;
-    let node_ed_pub = B64.encode(node_ed.public_key().map_err(|e| bad("node ed pubkey", e))?);
-    let node_pqc_pub = B64.encode(
-        node_mldsa
-            .public_key()
-            .map_err(|e| bad("node ml-dsa pubkey", e))?,
-    );
     let node_roles = vec![
         crate::federation::trust_root::INFRA_SERVE_SCOPE.to_owned(),
         crate::federation::trust_root::INFRA_ATTEST_SCOPE.to_owned(),
         "infra:store".to_owned(),
     ];
-    let scrubbers: Vec<&Identity> = holders.iter().collect();
-    let mut node_record =
-        crate::federation::accord_test_support::signed_canonical_record_with_roles(
-            TEST_CEREMONY_NODE_KEY_ID,
-            "canonical,node",
-            &node_ed_pub,
-            Some(&node_pqc_pub),
-            node_roles.clone(),
-            serde_json::json!({
-                "purpose": "federation-peering",
-                "roles": node_roles,
-                "test_anchor": true,
-            }),
-            &scrubbers,
-        );
-    node_record.valid_from = produced_at;
-    node_record.scrub_timestamp = produced_at;
-    node_record.pqc_completed_at = Some(produced_at);
-    node_record.attestation_evidence = None;
+    let serve_node = super::ceremony::ServeNodeInput {
+        key_id: TEST_CEREMONY_NODE_KEY_ID.to_owned(),
+        identity_type: "canonical,node".to_owned(),
+        pubkey_ed25519_base64: B64
+            .encode(node_ed.public_key().map_err(|e| bad("node ed pubkey", e))?),
+        pubkey_ml_dsa_65_base64: B64.encode(
+            node_mldsa
+                .public_key()
+                .map_err(|e| bad("node ml-dsa pubkey", e))?,
+        ),
+        capability_roles: node_roles.clone(),
+        registration_envelope: serde_json::json!({
+            "purpose": "federation-peering",
+            "roles": node_roles,
+            "test_anchor": true,
+        }),
+        attestation_evidence: None,
+    };
 
-    // The delegation plane, in the baked bundle's order and shape; the
-    // charter carries the rc6 witness member at 0 (witnessed mode off).
-    let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
-    let [charter_id, grant_id, lifecycle_id] = test_ceremony_delegation_ids();
-    let successors: Vec<String> = holders[1..].iter().map(|h| h.key_id.clone()).collect();
-    // v53.0.0 (CC 3.2 T3, rc7) — the commitment binds the successors' public
-    // keys as their records carry them, not their ids.
+    // v53.0.0 (CC 3.2 T3, rc7) — the successors as their records carry them.
     let successor_keys: Vec<crate::federation::trust_root::CommittedKey> = holder_records[1..]
         .iter()
         .map(|r| crate::federation::trust_root::CommittedKey::from_record(&r.record))
         .collect::<Result<_, _>>()?;
-    let commitment = crate::federation::trust_root::pre_rotation_commitment(&successor_keys)?;
-    // v53.0.0 (CC 4.2.6, rc7) — every holder's pre-committed recovery key: a
-    // software pair derived from the holder's seed, held apart from its
-    // signing pair.
-    let recovery_commitments: std::collections::BTreeMap<String, String> = holders
+    // v53.0.0 (CC 4.2.6, rc7) — every holder's pre-committed recovery key.
+    let recovery_keys = holders
         .iter()
         .zip(ed_seeds)
         .map(|(h, seed)| {
-            let key = test_ceremony_recovery_key(&h.key_id, seed)?;
             Ok((
                 h.key_id.clone(),
-                crate::federation::trust_root::recovery_commitment(&key)?,
+                test_ceremony_recovery_key(&h.key_id, seed)?,
             ))
         })
         .collect::<Result<_, Error>>()?;
-    let mut scope_tokens = vec![
+    let mut scope = vec![
         crate::federation::trust_root::INFRA_ATTEST_SCOPE.to_owned(),
         crate::federation::trust_root::INFRA_SERVE_SCOPE.to_owned(),
         "infra:store".to_owned(),
     ];
-    scope_tokens.extend(extra_scope.map(str::to_owned));
-    let scope = serde_json::json!(scope_tokens);
-    let ms = |n: i64| produced_at + chrono::Duration::milliseconds(n);
-    let attestations = vec![
-        delegation_row(
-            &charter_id,
-            family,
-            crate::federation::types::attestation_type::DELEGATES_TO,
-            serde_json::json!({
-                // #973 (CC 3.2 T4a) — a re-minted row names its job; outside
-                // the shipped bundle an unlabelled row is no charter.
-                "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
-                "references_attestation_id": charter_id,
-                "pre_rotation_commitment": commitment,
-                "scope": scope,
-                "successor_key_ids": successors,
-                crate::federation::envelope::paths::WITNESS_QUORUM: 0,
-                crate::federation::envelope::paths::RECOVERY_COMMITMENTS: recovery_commitments,
-            }),
-            ms(0),
-            &holders,
-        )?,
-        delegation_row(
-            &grant_id,
-            TEST_CEREMONY_NODE_KEY_ID,
-            crate::federation::types::attestation_type::DELEGATES_TO,
-            serde_json::json!({
-                "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
-                "references_attestation_id": grant_id,
-                "scope": scope,
-            }),
-            ms(1),
-            &holders,
-        )?,
-        delegation_row(
-            &lifecycle_id,
-            family,
-            crate::federation::types::attestation_type::SCORES,
-            serde_json::json!({
-                "references_attestation_id": lifecycle_id,
-                "dimension": "accord:lifecycle:v1",
-            }),
-            ms(2),
-            &holders,
-        )?,
-    ];
-
-    let mut bundle = GenesisBundle {
-        version: 2,
-        family_key_id: family.to_owned(),
-        holders: holder_records,
-        serve_nodes: vec![SignedKeyRecord {
-            record: node_record,
-        }],
+    scope.extend(extra_scope.map(str::to_owned));
+    let inputs = super::ceremony::CeremonyInputs {
+        family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
         consensus_protocol: ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL.to_owned(),
-        attestations,
-        authorizations: Vec::new(),
-        produced_at: produced_at.to_rfc3339(),
+        holders: holder_records,
+        serve_nodes: vec![serve_node],
+        successor_keys,
+        recovery_keys,
+        scope,
+        community: super::ceremony::CommunityInput {
+            community_key_id: CIRIS_CANONICAL_COMMUNITY_KEY_ID.to_owned(),
+            community_name: "CIRIS Canonical Services".to_owned(),
+            consensus_protocol: "quorum:2/3".to_owned(),
+            policy_blob: serde_json::json!({
+                "cohort_subkind": "infrastructure",
+                "cohort_subkind_payload": {
+                    "infrastructure_constraint": {
+                        "service_class": "canonical",
+                        "admission_quorum_basis": "founders",
+                    }
+                },
+                "consensus_protocol_entrenched": true,
+            }),
+        },
+        produced_at,
     };
-    let digest = authorization_digest(&bundle)?;
-    bundle.authorizations = holders
-        .iter()
-        .map(|h| {
-            let (classical, pqc) = h.sign_bytes(&digest);
-            GenesisAuthorization {
-                holder_key_id: h.key_id.clone(),
-                signature_classical: classical,
-                signature_pqc: pqc,
-            }
-        })
-        .collect();
-
-    // The community birth: founders = the holders, all three signing; the
-    // node is a member and signs nothing.
-    let mut members: Vec<CommunityMember> = holders
-        .iter()
-        .map(|h| CommunityMember {
-            key_id: h.key_id.clone(),
-            joined_at: produced_at,
-            role: Some("founder".to_owned()),
-        })
-        .collect();
-    members.push(CommunityMember {
-        key_id: TEST_CEREMONY_NODE_KEY_ID.to_owned(),
-        joined_at: produced_at,
-        role: Some("member".to_owned()),
-    });
-    let row = Community {
-        prev_head_digest: String::new(),
-        charter_digest: String::new(),
-        community_key_id: CIRIS_CANONICAL_COMMUNITY_KEY_ID.to_owned(),
-        community_name: "CIRIS Canonical Services".to_owned(),
-        members,
-        founded_at: produced_at,
-        consensus_protocol: "quorum:2/3".to_owned(),
-        policy_blob: Some(serde_json::json!({
-            "cohort_subkind": "infrastructure",
-            "cohort_subkind_payload": {
-                "infrastructure_constraint": {
-                    "service_class": "canonical",
-                    "admission_quorum_basis": "founders",
-                }
-            },
-            "consensus_protocol_entrenched": true,
-        })),
-        persist_row_hash: String::new(),
-    };
-    let envelope = row.signing_envelope();
-    let (_, classical, pqc) = holders[0].sign_envelope(&envelope);
-    let cosignatures = holders[1..]
-        .iter()
-        .map(|h| {
-            let (_, classical, pqc) = h.sign_envelope(&envelope);
-            RosterCosignature {
-                authority_key_id: h.key_id.clone(),
-                scrub_signature_classical: classical,
-                scrub_signature_pqc: pqc,
-            }
-        })
-        .collect();
-    let community = SignedCommunity {
-        community: row,
-        authority_key_id: holders[0].key_id.clone(),
-        scrub_signature_classical: classical,
-        scrub_signature_pqc: pqc,
-        supersede_proof: None,
-        cosignatures,
-        lineage: Vec::new(),
-    };
-    Ok(TestCeremonyOutputs {
-        block,
-        bundle,
-        community,
-    })
+    Ok((block, holders, inputs))
 }
 
 /// CIRISPersist#973 — [`install_test_ceremony_outputs`](super::install_test_ceremony_outputs)
-/// from the two JSON artifacts, as a host that received them from its own
-/// ceremony routes (or from [`mint_test_ceremony`]) holds them. Call it
+/// from the bundle JSON, as a host that received it from its own ceremony
+/// routes (or from [`mint_test_ceremony`]) holds it. Call it
 /// BEFORE constructing the Engine: the boot seed then runs every leg against
 /// these artifacts.
 ///
 /// # Errors
 ///
 /// A file that does not parse as its shape.
-pub fn install_test_ceremony_outputs_json(
-    bundle_json: &str,
-    community_json: Option<&str>,
-) -> Result<(), Error> {
-    let bundle = super::parse_genesis_bundle(bundle_json)?;
-    let community = community_json
-        .map(|c| {
-            serde_json::from_str::<SignedCommunity>(c)
-                .map_err(|e| Error::InvalidArgument(format!("community asset: {e}")))
-        })
-        .transpose()?;
-    super::install_test_ceremony_outputs(bundle, community);
+pub fn install_test_ceremony_outputs_json(bundle_json: &str) -> Result<(), Error> {
+    super::install_test_ceremony_outputs(super::parse_genesis_bundle(bundle_json)?);
     Ok(())
 }

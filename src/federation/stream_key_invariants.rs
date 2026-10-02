@@ -527,6 +527,75 @@ pub(crate) mod bodies {
         );
     }
 
+    /// **I314d** (v53.0.0, #963 — coordinator ruling) — a DENY added later
+    /// is a recipient leaving the audience: the next family chunk rolls the
+    /// epoch, and the new epoch's key never reaches the denied device.
+    pub(crate) async fn i314d_a_deny_rolls_the_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        let p = pair(dsn_a, dsn_b, run, pick, "i314d").await;
+        let d = p.sa.as_ref() as &dyn FederationDirectory;
+        let fam = format!("i314d-fam-{run}");
+        ra::family(d, &fam, &[&p.owner]).await;
+        let stream = format!("i314d-{run}");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::FAMILY,
+            Some(&fam),
+            &stream,
+            0,
+            b"before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            p.sa.stream_dek_grants(&stream, 0, &p.key_a)
+                .await
+                .unwrap()
+                .iter()
+                .any(|w| w.recipient_key_id == p.key_b),
+            "I314d precondition — the second device holds E0's wrap"
+        );
+        ra::put(
+            d,
+            &ra::grant(&p.owner, Some(&p.key_b), Some(serde_json::json!([]))),
+        )
+        .await
+        .expect("I314d the owner denies every cohort on the second device");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::FAMILY,
+            Some(&fam),
+            &stream,
+            1,
+            b"after",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p.sa.stream_chunk_at(&stream, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1,
+            "I314d the deny rolled the epoch"
+        );
+        let after = p.sa.stream_dek_grants(&stream, 1, &p.key_a).await.unwrap();
+        assert!(
+            !after.iter().any(|w| w.recipient_key_id == p.key_b),
+            "I314d the denied device holds no wrap of E1: {after:?}"
+        );
+    }
+
     pub(crate) async fn i314_the_cap_rolls_the_epoch<B>(
         dsn_a: &str,
         dsn_b: &str,
@@ -1371,6 +1440,11 @@ mod runners {
                 async fn i314c() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i314c_readiness_over_a_legacy_dag(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i314d() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i314d_a_deny_rolls_the_epoch(&a, &b, &super::suffix(), $pick).await
                 }
                 #[tokio::test]
                 async fn i315() {

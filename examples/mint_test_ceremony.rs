@@ -1,14 +1,14 @@
 //! CIRISPersist#973 — mint the SOFTWARE re-mint ceremony for a dry run: the
-//! anchor block (stdout, compose lines) and the two artifacts the real
-//! ceremony outputs (written to `out_dir`).
+//! anchor block (stdout, compose lines) and the bundle the real ceremony
+//! outputs (written to `out_dir`).
 //!
 //! ```text
 //! cargo run --example mint_test_ceremony --features test-anchor -- \
 //!     <out_dir> <holder_seed_b64> <holder_seed_b64> <holder_seed_b64> <node_seed_b64>
 //! ```
 //!
-//! Writes `<out_dir>/canonical_seed.json` (the bundle) and
-//! `<out_dir>/canonical_community_seed.json` (the `ciris-canonical` birth).
+//! Writes `<out_dir>/canonical_seed.json`: the bundle, the only genesis
+//! artifact (v53.0.0, CC rc7 — the `ciris-canonical` birth is a member of it).
 
 fn main() {
     use ciris_persist::federation::genesis::{decode_seed_b64, mint_test_ceremony};
@@ -41,6 +41,5 @@ fn main() {
         });
     };
     write("canonical_seed.json", outputs.bundle_json());
-    write("canonical_community_seed.json", outputs.community_json());
     print!("{}", outputs.block.compose_lines());
 }

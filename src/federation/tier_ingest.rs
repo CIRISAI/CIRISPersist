@@ -488,6 +488,13 @@ where
     if signed.family.family_key_id
         == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
         && !is_accord_head_version(directory, signed).await?
+        // v53.0.0 (CC 4.2.6) — the door's second admitted shape: a holder's
+        // own seat rotated under their pre-committed recovery key. A version
+        // shaped as a recovery that fails a check is refused by that check's
+        // name (`accord_recovery_*`), here and on every peer.
+        && super::accord_recovery::verify_accord_recovery(directory, signed)
+            .await?
+            .is_none()
     {
         return Err(Error::ConstitutionalFamilyReserved {
             family_key_id: signed.family.family_key_id.clone(),
