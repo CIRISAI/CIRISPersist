@@ -437,6 +437,47 @@ pub(crate) mod bodies {
             plain[50..=140].to_vec(),
             "I313: and by range"
         );
+        // The stream's single sender grants its keys. B is the same person's
+        // other node and speaks for A (#884); a party that shares no
+        // principal with the stream's owner does not, and its set is refused
+        // before the attestation plane is asked.
+        let forged = crate::federation::key_grant::KeyGrantSet {
+            axis: crate::federation::key_grant::KeyGrantAxis::Stream {
+                stream_id: stream.clone(),
+                epoch: 0,
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                owner_key_id: p.owner.clone(),
+            },
+            wraps: p
+                .sa
+                .stream_dek_grants(&stream, 0, &p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .take(1)
+                .map(|mut w| {
+                    w.recipient_key_id = format!("i313-evil-{run}");
+                    w
+                })
+                .collect(),
+        };
+        let id =
+            p.b.emit_attestation_self(forged.emit_input())
+                .await
+                .unwrap();
+        let mut row = p.sb.get_attestation(&id).await.unwrap().expect("B's row");
+        let outsider = format!("i313-outsider-{run}");
+        row.attesting_key_id = outsider.clone();
+        row.scrub_key_id = outsider;
+        let e =
+            p.a.apply_replicated_key_grant(SignedKeyGrantSet { attestation: row })
+                .await
+                .expect_err("I313: a set signed by a party that does not speak for the owner");
+        assert!(
+            matches!(&e, crate::federation::Error::KeyGrantRefused { reason, .. }
+                if *reason == "signer_not_stream_owner"),
+            "I313: {e:?}"
+        );
         // A late device: one re-grant per EPOCH (and the manifest), not per chunk.
         let late = format!("i313-late-{run}");
         crate::federation::tier_ingest::test_support::register_hybrid_key_as(
@@ -936,6 +977,47 @@ pub(crate) mod bodies {
             2,
             "I319: the refused append stepped nothing"
         );
+        // A chunk at the right slot sealed under the right DEK, with the
+        // right counter and flag, whose nonce PREFIX is not the stream's: the
+        // DEK opens it, so only the reader's recompute refuses it.
+        let mut nonce =
+            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 2, false).unwrap();
+        nonce[0] ^= 0xff;
+        let random = crate::federation::at_rest_cascade::seal_aad_at_nonce(
+            &dek,
+            nonce,
+            &crate::federation::chunk_dag_cascade::chunk_aad(None, &stream, 7),
+            b"random",
+        )
+        .unwrap();
+        p.sa.put_blob_chunk_with_scope(
+            &stream,
+            7,
+            BlobBody::Inline(random.to_bytes()),
+            0,
+            6,
+            cohort_scope::SELF,
+            crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+            None,
+            crate::federation::StreamClaim {
+                community_key_id: Some(p.owner.clone()),
+                owner_key_id: Some(p.key_a.clone()),
+                stream_key: Some(StreamKeySlot {
+                    counter: 2,
+                    last: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let e =
+            p.a.read_stream_chunk_as(&stream, 7, &p.key_a, None)
+                .await
+                .expect_err("I319: a nonce that is not the STREAM nonce");
+        assert!(
+            matches!(&e, BlobError::Backend(m) if m.contains("not the STREAM nonce")),
+            "I319: {e:?}"
+        );
         // A foreign writer is refused by the stream's floor (I41).
         let foreign =
             p.sa.put_blob_chunk_with_scope(
@@ -951,7 +1033,7 @@ pub(crate) mod bodies {
                     community_key_id: Some(p.owner.clone()),
                     owner_key_id: Some(p.key_b.clone()),
                     stream_key: Some(StreamKeySlot {
-                        counter: 2,
+                        counter: 3,
                         last: false,
                     }),
                 },
