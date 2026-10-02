@@ -55,25 +55,23 @@ pub const VENDORED_N_FAMILIES: usize = 158;
 /// vendored bytes the way `tools/build_cc_namespace.py` does.
 ///
 /// Vendored byte-for-byte from CIRISConstitution commit [`VENDORED_CC_COMMIT`]
-/// (the CC 1.0-rc6 cut on branch `rc6`; see that const for why it is a commit
-/// and not yet a tag), together with
+/// (CC 1.0-rc6, the `v1.0-rc6` tag's commit), together with
 /// `namespace_match_vectors.json` from the same commit. JSON carries no
 /// comments, so this doc is the vendored files' header.
 pub const VENDORED_REGISTRY_SHA256: &str =
     "f666f334db6b5e82dd7f75e6cbe82c926d27dcd9bd81d208784527cbce651c37";
 
-/// The CIRISConstitution commit both vendored manifests were copied from:
-/// `1f45ebe` "Cut 1.0-rc6, released as guidance" on branch `rc6`.
+/// The CIRISConstitution commit both vendored manifests were copied from: the
+/// commit the `v1.0-rc6` tag names (`3c3e63f`, annotated tag `b9d8cba`).
 ///
-/// **A commit, not a tag — and the release is gated on closing that gap.** The
-/// `v1.0-rc6` tag did not exist when this was vendored (it will sit on a later
-/// finalize commit on `main`, which the steward says touches neither manifest).
-/// The rc5 lesson is that a branch head is not a release, so the two files are
-/// pinned by their own SHA-256 ([`VENDORED_REGISTRY_FILE_SHA256`],
-/// [`VENDORED_VECTORS_FILE_SHA256`]) and `scripts/check_vendored_cc.sh v1.0-rc6`
-/// byte-compares them against the tag before a persist release that names rc6
-/// is tagged (CIRISPersist#975).
-pub const VENDORED_CC_COMMIT: &str = "1f45ebe51a3964fca21c8202f1f148bb9143c2bb";
+/// The files were first copied at `1f45ebe` "Cut 1.0-rc6, released as guidance"
+/// on branch `rc6`, before the tag existed; both manifests carry the same blob
+/// ids at `1f45ebe` and at the tag, so the bytes are unchanged and only this
+/// record moved. The files are also pinned by their own SHA-256
+/// ([`VENDORED_REGISTRY_FILE_SHA256`], [`VENDORED_VECTORS_FILE_SHA256`]), and
+/// `scripts/check_vendored_cc.sh v1.0-rc6` byte-compares them against the tag
+/// before a persist release that names rc6 is tagged.
+pub const VENDORED_CC_COMMIT: &str = "3c3e63fdef844f2f849e43081a8242e31cfaf30d";
 
 /// SHA-256 of the vendored `namespace_registry.json` FILE bytes (the whole file,
 /// unlike [`VENDORED_REGISTRY_SHA256`], which is CC's hash of the grammar).

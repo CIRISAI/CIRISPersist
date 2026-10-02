@@ -989,7 +989,7 @@ mod tests {
         assert_eq!(
             vs.len(),
             1040,
-            "the rc6 vectors file at 1f45ebe carries 1040 dimension vectors"
+            "the rc6 vectors file (v1.0-rc6) carries 1040 dimension vectors"
         );
         let oracle: serde_json::Value = serde_json::from_str(BINDS_JSON).unwrap();
         let oracle = oracle["binds"].as_array().unwrap();

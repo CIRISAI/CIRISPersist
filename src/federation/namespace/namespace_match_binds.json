@@ -1,6 +1,6 @@
 {
  "_meta": {
-  "cc_commit": "1f45ebe51a3964fca21c8202f1f148bb9143c2bb",
+  "cc_commit": "3c3e63fdef844f2f849e43081a8242e31cfaf30d",
   "generator": "scripts/gen_namespace_match_binds.py",
   "reference": "tools/cc_namespace_match.py",
   "vectors_sha256": "c4226dfb769c8939b608398e9b6b4364dde62b8ac40b2cd25363af9bb4622810"
