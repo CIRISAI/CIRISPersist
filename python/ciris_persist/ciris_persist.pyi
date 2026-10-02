@@ -945,7 +945,7 @@ class Engine:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
     def put_accord_decision_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision>, "steward_signatures": <obj|null> }. Immutable (M2)."""
+        """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision> }. Immutable (M2). v53.0.0 (CC 4.2.6 rc7): a non-null s..."""
 
     def put_accord_participation_json(self, payload_json: str) -> None:
         """(derived) deontic — #302 — admit an accord_participation. payload_json = { "participation": <AccordParticipation>, "standing_roster": [<ThresholdMember>...] }. Verify-..."""

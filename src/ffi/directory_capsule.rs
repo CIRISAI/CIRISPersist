@@ -4481,8 +4481,8 @@ impl FederationDirectory for OpsDirectory {
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), Error> {
+        let _ = decision;
         Err(Error::Unsupported {
             method: "put_accord_decision",
         })

@@ -11898,8 +11898,9 @@ impl PyEngine {
     }
 
     /// #302 — record the server's frozen-L decision. `payload_json` =
-    /// `{ "decision": <AccordDecision>, "steward_signatures": <obj|null> }`.
-    /// Immutable (M2).
+    /// `{ "decision": <AccordDecision> }`. Immutable (M2). v53.0.0 (CC 4.2.6
+    /// rc7): a non-null `steward_signatures` is refused — the steward backstop
+    /// it carried is removed, and dropping it silently would hide that.
     fn put_accord_decision_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -11913,16 +11914,19 @@ impl PyEngine {
                         .unwrap_or(serde_json::Value::Null),
                 )
                 .map_err(|e| PyValueError::new_err(format!("decision decode: {e}")))?;
-            let steward_signatures = v
-                .get("steward_signatures")
-                .cloned()
-                .filter(|x| !x.is_null());
+            if v.get("steward_signatures").is_some_and(|x| !x.is_null()) {
+                return Err(PyValueError::new_err(
+                    "steward_signatures: the regional-steward backstop is removed (CC 4.2.6 \
+                     rc7, CIRISConstitution#139); a roster change is counted against the \
+                     standing roster and an accord decision carries no steward signatures",
+                ));
+            }
             py.detach(move || {
                 accord_dispatch!(
                     self,
                     runtime,
                     b,
-                    b.put_accord_decision(decision, steward_signatures)
+                    b.put_accord_decision(decision)
                         .await
                         .map_err(federation_err_to_py)
                 )

@@ -9338,14 +9338,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        let prep = crate::federation::accord_quorum::prepare_decision(
-            &decision,
-            steward_signatures,
-            chrono::Utc::now(),
-        )?;
+        let prep =
+            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
         let client = self
             .get_client()
             .await
@@ -9373,9 +9369,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.accord_decision (\
                     proposal_digest, family_key_id, authorized, yes, no, abstain, \
-                    live_set, window_until, steward_signatures, decision_json, \
+                    live_set, window_until, decision_json, \
                     persist_row_hash, decided_at\
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                 &[
                     &prep.proposal_digest,
                     &prep.family_key_id,
@@ -9385,7 +9381,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &prep.abstain,
                     &prep.live_set,
                     &prep.window_until,
-                    &prep.steward_signatures,
                     &prep.decision_json,
                     &prep.persist_row_hash,
                     &prep.decided_at,
@@ -9407,7 +9402,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let row_opt = client
             .query_opt(
-                "SELECT decision_json, steward_signatures, persist_row_hash, decided_at \
+                "SELECT decision_json, persist_row_hash, decided_at \
                  FROM cirislens.accord_decision WHERE proposal_digest = $1",
                 &[&proposal_digest],
             )
@@ -22423,7 +22418,6 @@ fn pg_row_to_stored_decision(
         .map_err(|e| crate::federation::Error::Backend(format!("decision deserialize: {e}")))?;
     Ok(crate::federation::accord_quorum::StoredDecision {
         decision,
-        steward_signatures: row.safe_get_with("steward_signatures", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
         decided_at: row.safe_get_with("decided_at", mk_err)?,
     })

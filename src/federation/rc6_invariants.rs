@@ -388,18 +388,21 @@ pub(crate) mod bodies {
         members: serde_json::Value,
     ) -> Result<(), Error> {
         use crate::federation::trust_root::{
-            pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION,
+            test_pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
+            TRUST_CHARTER_DIMENSION,
         };
         let family = cc::accord_family_key_id();
         let id = uuid::Uuid::new_v4().to_string();
         let commitment =
-            pre_rotation_commitment(&["accord-succ-a".to_owned(), "accord-succ-b".to_owned()])
+            test_pre_rotation_commitment(&["accord-succ-a".to_owned(), "accord-succ-b".to_owned()])
                 .unwrap();
         let mut env = serde_json::json!({
             "references_attestation_id": id,
             "dimension": TRUST_CHARTER_DIMENSION,
             "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
             "pre_rotation_commitment": commitment,
+                "recovery_commitments":
+                    crate::federation::trust_root::test_accord_recovery_commitments_held(d).await,
         });
         if let (Some(e), Some(m)) = (env.as_object_mut(), members.as_object()) {
             for (k, v) in m {
@@ -1418,7 +1421,7 @@ pub(crate) mod bodies {
         ts::register_hybrid_key_as(d, root, root, identity_type::USER).await;
         let key_charter = |quorum: u64| {
             let id = uuid::Uuid::new_v4().to_string();
-            let commitment = crate::federation::trust_root::pre_rotation_commitment(&[
+            let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
                 "i344-succ-a".to_owned(),
                 "i344-succ-b".to_owned(),
             ])
