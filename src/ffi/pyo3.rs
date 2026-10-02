@@ -37281,6 +37281,7 @@ mod tests {
     /// it has provably started — see
     /// [`runtime_with_blocking_task_in_flight`] for why the handshake
     /// is what makes these tests deterministic.
+    #[cfg(feature = "sqlite")]
     #[cfg(test)]
     fn arm_blocking_task(runtime: &SharedRuntime) {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
