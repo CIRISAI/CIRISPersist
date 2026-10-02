@@ -790,8 +790,8 @@ pub(crate) mod owner_withdraw {
 /// **I127 (CIRISPersist#942)** — the custody view, on sqlite and postgres over
 /// the two-node community ladder (#876's fixture): a community blob lists the
 /// members of its sealing epoch and counts this node's copy; a self blob lists
-/// the owner's grant recipients and says its copies elsewhere are NOT
-/// observable (never "1 copy"); a commons blob lists no access and is
+/// the owner's grant recipients and (v53.0.0) counts copies from custody
+/// reports, every unreported device `unknown`; a commons blob lists no access and is
 /// observable; a stranger is `NotGranted` and learns nothing.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod custody {
@@ -834,14 +834,28 @@ mod custody {
         let v = e.blob_custody(&s.at_rest_sha256, &l.node_a).await.unwrap();
         assert_eq!(v.tier, "invisible_encrypted");
         assert!(v.held_here);
+        // v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — self/family copies
+        // are counted from custody reports now. With none filed yet, every
+        // device is `unknown` (never a copy, never `none`), and the only copy
+        // counted is this node's own.
         assert!(
-            !v.copies_observable,
-            "self/family copies are never countable today: {v:?}"
+            v.copies_observable,
+            "self/family copies are observable through custody reports: {v:?}"
+        );
+        assert_eq!(
+            v.copies_known, 1,
+            "only this node's own copy, before any report: {v:?}"
+        );
+        assert!(
+            v.device_custody
+                .iter()
+                .all(|d| d.state == crate::federation::custody_ack::CustodyVerdict::Unknown),
+            "no report filed: every device is unknown: {v:?}"
         );
         assert!(
             v.why
                 .as_deref()
-                .is_some_and(|w| w.contains("never announced")),
+                .is_some_and(|w| w.contains("never announced") && w.contains("unknown, not none")),
             "{v:?}"
         );
         assert!(

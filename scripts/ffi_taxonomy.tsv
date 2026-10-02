@@ -552,6 +552,8 @@ Engine	lineage_head_json	epistemic
 Engine	seal_descriptor_for_blob	deontic	
 Engine	open_descriptor_for_blob	deontic	
 Engine	blob_custody_json	epistemic	
+Engine	custody_view_json	epistemic	
+Engine	put_custody_ack	testimonial	self_audit
 Engine	read_stream_chunk_as	deontic	
 Engine	rebind_key_record	deontic	
 Engine	rebind_self_federation_key	deontic	

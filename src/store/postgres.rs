@@ -6520,6 +6520,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             self, &row,
         )
         .await?;
+        // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
+        // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
+        crate::federation::custody_ack::check_custody_ack_admission(self, &row).await?;
         // CC 3.1 — a lowercase family stem, or the row evades every family gate
         // (v42.0.0, CIRISPersist#814).
         crate::federation::admission::check_dimension_case_rule(&row)?;

@@ -71,6 +71,10 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+/// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — `custody:ack:v1`: which of
+/// a cohort's own devices hold a blob, folded at read time.
+pub mod custody_ack;
+mod custody_ack_invariants;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
 /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — roster rows and the head: a version
