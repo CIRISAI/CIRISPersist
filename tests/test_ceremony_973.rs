@@ -273,7 +273,7 @@ async fn i353_future_dated_remint_is_absent_never_divergent() {
     let future = mint(900);
     install_test_ceremony_outputs(future.bundle.clone(), Some(future.community.clone()));
     match seed_family_and_canonical(&b).await {
-        Err(GenesisFault::Absent { leg, detail }) => {
+        Err(GenesisFault::Absent { leg, detail, .. }) => {
             assert_eq!(leg, GenesisLeg::Delegation, "I353: {detail}");
             assert!(
                 detail.contains("ahead of now") && detail.contains("nothing deleted"),

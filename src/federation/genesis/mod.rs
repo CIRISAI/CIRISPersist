@@ -49,8 +49,8 @@ pub use test_ceremony::*;
 
 pub mod posture;
 pub use posture::{
-    constitutional_seat, genesis_posture, require_constitutional_root, GenesisFault, GenesisLeg,
-    GenesisPosture, ROOT_REQUIRING_GATES,
+    constitutional_seat, genesis_posture, require_constitutional_root, AbsentReason,
+    BakeNotAdoptedReason, GenesisFault, GenesisLeg, GenesisPosture, ROOT_REQUIRING_GATES,
 };
 
 use super::SignedKeyRecord;
@@ -1335,7 +1335,12 @@ where
                 // the boot seed itself reports for the same state. The next
                 // boot's seed supersedes an older row as soon as the door
                 // admits the bake.
-                return Err(GenesisFault::absent(
+                // CIRISPersist#973 — the cause, typed. The read path sees a
+                // verified older (or same-vintage) row and a bake that is
+                // not installed; WHY the seed did not install it is the
+                // seed's fault to carry (`Refused`), not this leg's to guess.
+                let stored_older = candidate_is_strictly_newer(want, &row);
+                return Err(GenesisFault::bake_not_adopted(
                     LEG,
                     format!(
                         "delegation row {id}: the compiled-in root was not adopted — the stored \
@@ -1343,7 +1348,7 @@ where
                          that is {} the baked one (asserted {}, content {})",
                         row.asserted_at,
                         row.original_content_hash,
-                        if candidate_is_strictly_newer(want, &row) {
+                        if stored_older {
                             "OLDER than"
                         } else {
                             "of the SAME vintage as, and different from,"
@@ -1351,6 +1356,14 @@ where
                         want.asserted_at,
                         want.original_content_hash,
                     ),
+                    if stored_older {
+                        BakeNotAdoptedReason::StoredOlder
+                    } else {
+                        BakeNotAdoptedReason::EqualVintage
+                    },
+                    // `real` held above: the stored row is a verified
+                    // accord-holder statement, so the previous root stands.
+                    true,
                 ));
             }
             // A verified holder statement at least as new as ours. The mesh's
@@ -3739,9 +3752,15 @@ where
         // place — see `Error::is_duplicate_key`, which also records why it is a
         // string test and what would have to change to make it a typed one.
         Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
-        Err(e) => Err(GenesisFault::absent(
+        // CIRISPersist#973 — the bake was offered and refused, and no row is
+        // held under this id: nothing is in force on this row.
+        Err(e) => Err(GenesisFault::bake_not_adopted(
             LEG,
             format!("delegation row {id} could not be installed: {e}"),
+            BakeNotAdoptedReason::Refused {
+                refusal: e.kind().to_owned(),
+            },
+            false,
         )),
     }
 }
@@ -3867,13 +3886,22 @@ where
     // deliberately not pre-flighted; it is neither pure nor deterministic, and
     // a door that could refuse for a transient reason is exactly the one whose
     // retry the next boot fixes.
+    // CIRISPersist#973 — on the SUPERSEDE arm the row being replaced is a
+    // verified holder statement of an earlier ceremony: while it is still
+    // present, the previous root is in force. (The repair arm replaces this
+    // ceremony's own damaged row; nothing older stands behind it.)
+    let predecessor_stands = outcome == DelegationRowOutcome::Superseded;
     if let Err(e) = preflight_replacement_admission(&sa.attestation) {
-        return Err(GenesisFault::absent(
+        return Err(GenesisFault::bake_not_adopted(
             LEG,
             format!(
                 "refusing to remove the installed delegation row {id}: the replacement would be \
                  refused at the write door anyway ({e}) — nothing deleted"
             ),
+            BakeNotAdoptedReason::Refused {
+                refusal: e.kind().to_owned(),
+            },
+            predecessor_stands,
         ));
     }
 
@@ -3899,18 +3927,26 @@ where
         // `verify_delegation_plane_seeded`, so such a node comes up awaiting its
         // ceremony rather than bricked by a fault it cannot clear.
         Err(e @ super::Error::Unsupported { .. }) => {
-            return Err(GenesisFault::absent(
+            return Err(GenesisFault::bake_not_adopted(
                 LEG,
                 format!(
                     "delegation row {id} needs replacing and this directory has no re-bake \
                      replacement door: {e}"
                 ),
+                BakeNotAdoptedReason::Refused {
+                    refusal: e.kind().to_owned(),
+                },
+                predecessor_stands,
             ))
         }
         Err(e) => {
-            return Err(GenesisFault::absent(
+            return Err(GenesisFault::bake_not_adopted(
                 LEG,
                 format!("delegation row {id} could not be removed for replacement: {e}"),
+                BakeNotAdoptedReason::Refused {
+                    refusal: e.kind().to_owned(),
+                },
+                predecessor_stands,
             ))
         }
     }
@@ -3922,9 +3958,15 @@ where
         // Somebody else completed the same replacement first. The plane holds
         // the baked row either way, which is what this was for.
         Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
-        Err(e) => Err(GenesisFault::absent(
+        // The predecessor was removed above and the bake was then refused:
+        // nothing stands under this id.
+        Err(e) => Err(GenesisFault::bake_not_adopted(
             LEG,
             format!("baked delegation row {id} could not be installed over its predecessor: {e}"),
+            BakeNotAdoptedReason::Refused {
+                refusal: e.kind().to_owned(),
+            },
+            false,
         )),
     }
 }
