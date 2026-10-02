@@ -48,7 +48,7 @@ fn mint_at(t: chrono::DateTime<chrono::Utc>, extra: Option<&str>) -> TestCeremon
 }
 
 fn install(c: &TestCeremonyOutputs) {
-    install_test_ceremony_outputs(c.bundle.clone(), Some(c.community.clone()));
+    install_test_ceremony_outputs(c.bundle.clone());
 }
 
 async fn backends() -> Vec<(&'static str, Box<dyn FederationDirectory>)> {

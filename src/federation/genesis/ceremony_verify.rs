@@ -1,24 +1,27 @@
-//! CIRISPersist#973 — **verify a ceremony's two outputs offline, before they
-//! are baked.**
+//! CIRISPersist#973 — **verify a ceremony's output offline, before it is
+//! baked.**
 //!
-//! A re-mint ceremony hands persist two files: the bundle
-//! (`canonical_seed.json`'s shape) and the community birth
-//! (`canonical_community_seed.json`'s shape). Baking them is a compile-in, so
-//! a file that the boot path would refuse must be caught BEFORE the bake —
-//! afterwards every node of the release simply reports the leg absent.
+//! A re-mint ceremony hands persist one file: the bundle
+//! (`canonical_seed.json`'s shape). v53.0.0 (CC rc7, T5): the bundle is the
+//! only genesis artifact; the accord family's genesis record and the
+//! `ciris-canonical` birth are members of it, pinned by its fingerprint.
+//! Baking it is a compile-in, so a file that the boot path would refuse must
+//! be caught BEFORE the bake — afterwards every node of the release simply
+//! reports the leg absent.
 //!
 //! [`verify_ceremony_outputs`] does not re-implement a single rule. It stands
 //! up a throwaway in-memory directory holding only what a fresh node holds
 //! (this build's accord holders and the accord family), and applies the two
-//! files through the ORDINARY doors: [`bake_assembled_genesis`](super::bake_assembled_genesis)
+//! bundle through the ORDINARY doors: [`bake_assembled_genesis`](super::bake_assembled_genesis)
 //! for the bundle (holder quorum, serve-node conferral, every delegation-row
-//! gate) and the signed `put_community` door for the birth (signature,
-//! trust-root shape, founder eligibility, accord quorum, the founding rule
-//! and the node seat). A refusal is reported by the stage it came from, with
-//! the door's own words.
+//! gate) and the signed `put_community` door for the birth it carries
+//! (signature, trust-root shape, founder eligibility, accord quorum, the
+//! founding rule and the node seat). The accord family's record is checked
+//! against the family this build seeds and against every holder's signature.
+//! A refusal is reported by the stage it came from, with the door's own words.
 
 use super::{BakeItemOutcome, GenesisBundle};
-use crate::federation::{FederationDirectory as _, SignedCommunity};
+use crate::federation::FederationDirectory as _;
 
 /// Which stage refused. The wire token is [`Self::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +38,9 @@ pub enum CeremonyOutputsRefusal {
     ServeNode,
     /// A delegation row was not installed.
     DelegationRow,
+    /// v53.0.0 — the bundle carries no accord family record, one that is not
+    /// the family this build seeds, or one a holder did not sign.
+    FamilyRecord,
     /// The signed community door refused the birth (signature, shape,
     /// founder eligibility, quorum, founding rule or node seat — the detail
     /// carries the door's rule).
@@ -54,6 +60,7 @@ impl CeremonyOutputsRefusal {
             Self::BundleBake => "ceremony_bundle_bake",
             Self::ServeNode => "ceremony_serve_node",
             Self::DelegationRow => "ceremony_delegation_row",
+            Self::FamilyRecord => "ceremony_family_record",
             Self::CommunityBirth => "ceremony_community_birth",
             Self::CommunityNotLive => "ceremony_community_not_live",
         }
@@ -102,22 +109,30 @@ pub struct CeremonyOutputsVerified {
     pub founders: usize,
 }
 
-/// **Verify a ceremony's bundle and community birth** against this build's
-/// accord roster, through the ordinary doors, on a throwaway in-memory
-/// directory. Nothing outside that directory is read or written.
+/// **Verify a ceremony's bundle** — its delegation plane, the accord family
+/// record and the community birth it carries — against this build's accord
+/// roster, through the ordinary doors, on a throwaway in-memory directory.
+/// Nothing outside that directory is read or written.
 ///
 /// # Errors
 ///
 /// [`CeremonyOutputsRefused`] naming the stage; see the module doc.
 pub async fn verify_ceremony_outputs(
     bundle_json: &str,
-    community_json: &str,
 ) -> Result<CeremonyOutputsVerified, CeremonyOutputsRefused> {
     use CeremonyOutputsRefusal as R;
     let bundle: GenesisBundle = super::parse_genesis_bundle(bundle_json)
         .map_err(|e| refused(R::Malformed, format!("bundle: {e}")))?;
-    let community: SignedCommunity = serde_json::from_str(community_json)
-        .map_err(|e| refused(R::Malformed, format!("community: {e}")))?;
+    let community = bundle
+        .community_record(crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID)
+        .cloned()
+        .ok_or_else(|| {
+            refused(
+                R::CommunityBirth,
+                "the bundle carries no ciris-canonical birth record (CC rc7: the birth is a \
+                 member of bundle.attestations)",
+            )
+        })?;
 
     // The carried holders must be this build's roster: same ids, same keys.
     let roster = super::effective_accord_holder_records();
@@ -140,6 +155,8 @@ pub async fn verify_ceremony_outputs(
             ),
         ));
     }
+
+    check_family_record(&bundle, &roster).map_err(|d| refused(R::FamilyRecord, d))?;
 
     // A fresh node: the holders and the accord family, nothing else.
     let dir = crate::store::memory::MemoryBackend::new();
@@ -194,4 +211,75 @@ pub async fn verify_ceremony_outputs(
         community_key_id: id,
         founders: resolved.founders.len(),
     })
+}
+
+/// v53.0.0 (CC 3.2 T6) — the accord family's genesis record the bundle
+/// carries is the family this build seeds ([`accord_family_genesis_record`](super::accord_family_genesis_record):
+/// same founders, protocol, entrenchment and instant), signed over its signing
+/// envelope by EVERY holder of this build's roster (the founding rule).
+fn check_family_record(
+    bundle: &GenesisBundle,
+    roster: &[crate::federation::SignedKeyRecord],
+) -> Result<(), String> {
+    let expected = super::accord_family_genesis_record();
+    let carried = bundle
+        .family_record(&expected.family_key_id)
+        .ok_or_else(|| {
+            format!(
+                "the bundle carries no {} family record (CC rc7: the family's genesis head is a \
+                 member of bundle.attestations)",
+                expected.family_key_id
+            )
+        })?;
+    if carried.family.signing_envelope() != expected.signing_envelope() {
+        return Err(format!(
+            "the carried {} record is not the family this build seeds",
+            expected.family_key_id
+        ));
+    }
+    let bytes =
+        crate::verify::canonical::ceg_produce_canonicalize(&carried.family.signing_envelope())
+            .map_err(|e| format!("canonicalize the family record: {e}"))?;
+    let mut signed = std::collections::BTreeSet::new();
+    let sigs = std::iter::once((
+        carried.authority_key_id.as_str(),
+        carried.scrub_signature_classical.as_str(),
+        carried.scrub_signature_pqc.as_deref(),
+    ))
+    .chain(carried.cosignatures.iter().map(|c| {
+        (
+            c.authority_key_id.as_str(),
+            c.scrub_signature_classical.as_str(),
+            c.scrub_signature_pqc.as_deref(),
+        )
+    }));
+    for (who, classical, pqc) in sigs {
+        let holder = roster
+            .iter()
+            .find(|r| r.record.key_id == who)
+            .ok_or_else(|| format!("{who} signed the family record and is not a holder"))?;
+        crate::verify::hybrid::verify_hybrid(
+            &bytes,
+            classical,
+            pqc,
+            &holder.record.pubkey_ed25519_base64,
+            holder.record.pubkey_ml_dsa_65_base64.as_deref(),
+            crate::verify::hybrid::HybridPolicy::Strict,
+            None,
+        )
+        .map_err(|e| format!("{who}'s signature over the family record: {e}"))?;
+        signed.insert(who);
+    }
+    let missing: Vec<&str> = roster
+        .iter()
+        .map(|r| r.record.key_id.as_str())
+        .filter(|k| !signed.contains(k))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the family record lacks the founding signature of {missing:?} (every holder signs \
+             the genesis head)"
+        ));
+    }
+    Ok(())
 }

@@ -45,6 +45,40 @@ fn at(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() + chrono::Duration::seconds(offset_secs)
 }
 
+/// The bundle with its carried `ciris-canonical` birth changed by `f`.
+fn with_birth(
+    bundle: &GenesisBundle,
+    f: impl FnOnce(&mut ciris_persist::federation::SignedCommunity),
+) -> GenesisBundle {
+    let mut b = bundle.clone();
+    for r in &mut b.roster_records {
+        if let GenesisRosterRecord::Community(c) = r {
+            f(c);
+            return b;
+        }
+    }
+    panic!("the bundle carries a birth");
+}
+
+/// The bundle with its carried accord family record changed by `f`.
+fn with_family(
+    bundle: &GenesisBundle,
+    f: impl FnOnce(&mut ciris_persist::federation::SignedFamily),
+) -> GenesisBundle {
+    let mut b = bundle.clone();
+    for r in &mut b.roster_records {
+        if let GenesisRosterRecord::Family(x) = r {
+            f(x);
+            return b;
+        }
+    }
+    panic!("the bundle carries a family record");
+}
+
+fn json(b: &GenesisBundle) -> String {
+    serde_json::to_string(b).unwrap()
+}
+
 fn mint(offset_secs: i64) -> TestCeremonyOutputs {
     mint_test_ceremony(&SEEDS, &NODE_SEED, at(offset_secs)).expect("mint")
 }
@@ -78,7 +112,7 @@ async fn stored_instant(d: &dyn FederationDirectory, id: &str) -> chrono::DateTi
 /// installed ceremony seeds every leg and reports Entrenched, community leg
 /// included.
 async fn boots_fully_seeded(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &str) {
-    install_test_ceremony_outputs(c.bundle.clone(), Some(c.community.clone()));
+    install_test_ceremony_outputs(c.bundle.clone());
     seed_family_and_canonical(d)
         .await
         .unwrap_or_else(|e| panic!("{tag} I351: the boot seed against the ceremony: {e:?}"));
@@ -135,7 +169,7 @@ async fn i350_minted_outputs_verify_offline() {
         "I350: the block is the #805 block, untouched"
     );
     let _armed = Armed::with(&c.block);
-    let v = verify_ceremony_outputs(&c.bundle_json().unwrap(), &c.community_json().unwrap())
+    let v = verify_ceremony_outputs(&c.bundle_json().unwrap())
         .await
         .unwrap_or_else(|e| panic!("I350: the minted outputs verify: {e}"));
     assert_eq!(v.quorum_verified, 3, "I350: all three holders authorize");
@@ -264,7 +298,7 @@ async fn i352_remint_supersedes_on_upgrade() {
         boots_fully_seeded(d, &old, tag).await;
         let before = stored_instant(d, "genesis-charter").await;
         let new = mint(-5);
-        install_test_ceremony_outputs(new.bundle.clone(), Some(new.community.clone()));
+        install_test_ceremony_outputs(new.bundle.clone());
         seed_family_and_canonical(d)
             .await
             .unwrap_or_else(|e| panic!("{tag} I352: boot against the re-mint: {e:?}"));
@@ -303,7 +337,7 @@ async fn i353_future_dated_remint_is_absent_never_divergent() {
     boots_fully_seeded(&b, &old, "sqlite").await;
     let before = stored_instant(&b, "genesis-charter").await;
     let future = mint(900);
-    install_test_ceremony_outputs(future.bundle.clone(), Some(future.community.clone()));
+    install_test_ceremony_outputs(future.bundle.clone());
     match seed_family_and_canonical(&b).await {
         Err(GenesisFault::Absent { leg, detail, .. }) => {
             assert_eq!(leg, GenesisLeg::Delegation, "I353: {detail}");
@@ -327,79 +361,109 @@ async fn i353_future_dated_remint_is_absent_never_divergent() {
     );
 }
 
-/// **I354 — the verifier refuses by name.**
+/// **I354 — the verifier refuses by name.** v53.0.0: the bundle is the one
+/// artifact, so the birth and the family record are tampered INSIDE it. A
+/// change to a record's signed content moves the authorization digest and is
+/// refused at the quorum; a change to its signatures alone is refused by the
+/// record's own stage.
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i354_verifier_refuses_by_name() {
     use CeremonyOutputsRefusal as R;
     let c = mint(-5);
     let _armed = Armed::with(&c.block);
-    let (bj, cj) = (c.bundle_json().unwrap(), c.community_json().unwrap());
     let reason =
         |r: Result<CeremonyOutputsVerified, CeremonyOutputsRefused>| r.expect_err("must refuse");
 
     // malformed
     assert_eq!(
-        reason(verify_ceremony_outputs("{", &cj).await).reason,
+        reason(verify_ceremony_outputs("{").await).reason,
         R::Malformed
     );
-    assert_eq!(
-        reason(verify_ceremony_outputs(&bj, "null").await).reason,
-        R::Malformed
-    );
+    // one spelling: a delegation row after a roster record
+    let mut v = serde_json::to_value(&c.bundle).unwrap();
+    let list = v["attestations"].as_array_mut().unwrap();
+    let row = list.remove(0);
+    list.push(row);
+    let e = reason(verify_ceremony_outputs(&v.to_string()).await);
+    assert_eq!(e.reason, R::Malformed, "{e}");
 
     // one authorization: below the quorum
     let mut b1 = c.bundle.clone();
     b1.authorizations.truncate(1);
-    let e = reason(verify_ceremony_outputs(&serde_json::to_string(&b1).unwrap(), &cj).await);
+    let e = reason(verify_ceremony_outputs(&json(&b1)).await);
     assert_eq!(e.reason, R::BundleQuorum, "{e}");
 
     // a carried holder that is not this build's roster
     let mut b2 = c.bundle.clone();
     b2.holders[0].record.key_id = "someone-else".into();
-    let e = reason(verify_ceremony_outputs(&serde_json::to_string(&b2).unwrap(), &cj).await);
+    let e = reason(verify_ceremony_outputs(&json(&b2)).await);
     assert_eq!(e.reason, R::HolderRosterMismatch, "{e}");
 
-    // a founder who did not sign the birth
-    let mut c1 = c.community.clone();
-    c1.cosignatures.pop();
-    let e = reason(verify_ceremony_outputs(&bj, &serde_json::to_string(&c1).unwrap()).await);
+    // no birth in the bundle
+    let mut b0 = c.bundle.clone();
+    b0.roster_records
+        .retain(|r| !matches!(r, GenesisRosterRecord::Community(_)));
+    let e = reason(verify_ceremony_outputs(&json(&b0)).await);
     assert_eq!(e.reason, R::CommunityBirth, "{e}");
 
-    // a node member the bundle does not anchor (no accord-scrubbed record)
-    let mut c2 = c.community.clone();
-    for m in &mut c2.community.members {
-        if m.key_id == TEST_CEREMONY_NODE_KEY_ID {
-            m.key_id = "unanchored-node".into();
-        }
+    // a founder who did not sign the birth (signatures are not content)
+    let e = reason(
+        verify_ceremony_outputs(&json(&with_birth(&c.bundle, |b| {
+            b.cosignatures.pop();
+        })))
+        .await,
+    );
+    assert_eq!(e.reason, R::CommunityBirth, "{e}");
+
+    // the birth's content changed after the holders authorized the bundle:
+    // a node member the bundle does not anchor, or a renamed community
+    for tampered in [
+        with_birth(&c.bundle, |b| {
+            for m in &mut b.community.members {
+                if m.key_id == TEST_CEREMONY_NODE_KEY_ID {
+                    m.key_id = "unanchored-node".into();
+                }
+            }
+        }),
+        with_birth(&c.bundle, |b| {
+            b.community.community_name = "Somebody Else's Services".into();
+        }),
+    ] {
+        let e = reason(verify_ceremony_outputs(&json(&tampered)).await);
+        assert_eq!(e.reason, R::BundleQuorum, "{e}");
     }
-    let e = reason(verify_ceremony_outputs(&bj, &serde_json::to_string(&c2).unwrap()).await);
-    assert_eq!(e.reason, R::CommunityBirth, "{e}");
 
-    // a tampered birth (a signed member changed after signing)
-    let mut c3 = c.community.clone();
-    c3.community.community_name = "Somebody Else's Services".into();
-    let e = reason(verify_ceremony_outputs(&bj, &serde_json::to_string(&c3).unwrap()).await);
-    assert_eq!(e.reason, R::CommunityBirth, "{e}");
+    // the accord family record: a holder's signature missing, or absent
+    let e = reason(
+        verify_ceremony_outputs(&json(&with_family(&c.bundle, |f| {
+            f.cosignatures.pop();
+        })))
+        .await,
+    );
+    assert_eq!(e.reason, R::FamilyRecord, "{e}");
+    let mut bf = c.bundle.clone();
+    bf.roster_records
+        .retain(|r| !matches!(r, GenesisRosterRecord::Family(_)));
+    let e = reason(verify_ceremony_outputs(&json(&bf)).await);
+    assert_eq!(e.reason, R::FamilyRecord, "{e}");
 
     // a delegation row or a serve node altered after the holders authorized
     // the bundle: the authorization digest binds both, so the quorum fails
     let mut b3 = c.bundle.clone();
     b3.attestations[1].attestation.attestation_envelope["scope"] =
         serde_json::json!(["infra:serve"]);
-    let e = reason(verify_ceremony_outputs(&serde_json::to_string(&b3).unwrap(), &cj).await);
+    let e = reason(verify_ceremony_outputs(&json(&b3)).await);
     assert_eq!(e.reason, R::BundleQuorum, "{e}");
     let mut b4 = c.bundle.clone();
     b4.serve_nodes[0].record.identity_type = "canonical,node,steward".into();
-    let e = reason(verify_ceremony_outputs(&serde_json::to_string(&b4).unwrap(), &cj).await);
+    let e = reason(verify_ceremony_outputs(&json(&b4)).await);
     assert_eq!(e.reason, R::BundleQuorum, "{e}");
 
     // a correctly authorized bundle whose rows the write door refuses (stamped
     // 15 minutes ahead): caught at the bake stage, by the door's own rule
     let f = mint(900);
-    let e = reason(
-        verify_ceremony_outputs(&f.bundle_json().unwrap(), &f.community_json().unwrap()).await,
-    );
+    let e = reason(verify_ceremony_outputs(&f.bundle_json().unwrap()).await);
     assert_eq!(e.reason, R::DelegationRow, "{e}");
     assert!(e.detail.contains("ahead of now"), "{e}");
 }
@@ -414,7 +478,7 @@ async fn i355b_seam_is_inert_without_the_override() {
     let baked_holder = accord_holder_genesis_records()[0].record.key_id.clone();
     {
         let _armed = Armed::with(&c.block);
-        install_test_ceremony_outputs(c.bundle.clone(), Some(c.community.clone()));
+        install_test_ceremony_outputs(c.bundle.clone());
         assert_eq!(
             canonical_genesis_bundle().holders[0].record.key_id,
             "test-accord-holder-0"
@@ -431,22 +495,21 @@ async fn i355b_seam_is_inert_without_the_override() {
         );
         assert!(
             canonical_community_asset().is_none(),
-            "I355b: disarmed, the compiled (unbaked) community asset"
+            "I355b: disarmed, the compiled bundle (version 2) carries no birth"
         );
     }
 }
 
-/// **I355 — a tampered community asset never stops the boot**: the leg is
-/// Absent, the rest is seeded.
+/// **I355 — a refused birth never stops the boot**: the leg is Absent, the
+/// rest is seeded. (The birth's signatures are stripped inside the bundle:
+/// evidence, not content, so the bundle's own quorum still verifies.)
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i355_refused_community_asset_boots_absent() {
     let c = mint(-5);
     let _armed = Armed::with(&c.block);
     let b = sqlite().await;
-    let mut bad = c.community.clone();
-    bad.cosignatures.clear();
-    install_test_ceremony_outputs(c.bundle.clone(), Some(bad));
+    install_test_ceremony_outputs(with_birth(&c.bundle, |b| b.cosignatures.clear()));
     match seed_family_and_canonical(&b).await {
         Err(GenesisFault::Absent { leg, .. }) => assert_eq!(leg, GenesisLeg::Community),
         other => panic!("I355: expected Absent(community), got {other:?}"),
