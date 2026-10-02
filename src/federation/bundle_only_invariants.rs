@@ -422,6 +422,12 @@ mod run {
         let mut copy = charter.clone();
         copy.attestation_id = "genesis-charter-copy".to_owned();
         assert!(!genesis::is_pinned_bundle_row(&copy), "I370: id binds");
+        let mut moved = charter.clone();
+        moved.attested_key_id = "some-other-root".to_owned();
+        assert!(
+            !genesis::is_pinned_bundle_row(&moved),
+            "I370: subject binds"
+        );
         let mut altered = charter.clone();
         altered.attestation_envelope["scope"] = serde_json::json!(["infra:serve"]);
         assert!(

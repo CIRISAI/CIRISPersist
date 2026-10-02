@@ -745,6 +745,12 @@ pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
 #[must_use]
 pub fn is_pinned_bundle_row(row: &super::Attestation) -> bool {
     is_pinned_bundle_statement(&row.attestation_id, &row.attestation_envelope)
+        && canonical_genesis_bundle().attestations.iter().any(|sa| {
+            sa.attestation.attestation_id == row.attestation_id
+                && sa.attestation.attesting_key_id == row.attesting_key_id
+                && sa.attestation.attested_key_id == row.attested_key_id
+                && sa.attestation.attestation_type == row.attestation_type
+        })
 }
 
 /// [`is_pinned_bundle_row`] for a row not yet assembled: the id it will be
