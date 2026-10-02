@@ -210,11 +210,79 @@ pub async fn owner_node_receives<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let Some(class) = owner_node_class(dir, owner, node).await? else {
+    // The occurrence must resolve to the owner (#932: its consent or this
+    // node's own trust); then the newest active row decides, through the
+    // same body the key fan-outs ask.
+    if owner == node
+        || !dir
+            .active_identities_for_occurrence(node)
+            .await?
+            .iter()
+            .any(|p| p == owner)
+    {
+        return Ok(false);
+    }
+    let Some(occ) = dir
+        .list_identity_occurrences_active(owner)
+        .await?
+        .into_iter()
+        .filter(|o| o.occurrence_key_id == node)
+        .max_by_key(|o| o.asserted_at)
+    else {
         return Ok(false);
     };
-    let list = owner_allow_list(dir, owner, node).await?;
+    occurrence_may_hold_key(dir, owner, &occ, cohort).await
+}
+
+/// **The key half of the same rule (coordinator ruling on #963):** may
+/// `member`'s occurrence `occ` (a row of the member's ACTIVE occurrence fold,
+/// the set every wrap fan-out already walks) be WRAPPED a content key of
+/// `cohort`? The same [`class_allows`] over the same [`owner_allow_list`] as
+/// [`owner_node_receives`]: a node that may not receive a cohort's content
+/// gets no key for it either, so a deny is not cosmetic (a node holding the
+/// key could fetch the bytes from anyone). The member's own key (the
+/// singleton occurrence) is the member, not a device: it keeps its wrap.
+pub async fn occurrence_may_hold_key<D>(
+    dir: &D,
+    member: &str,
+    occ: &super::types::IdentityOccurrence,
+    cohort: OwnerCohort<'_>,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    if occ.occurrence_key_id == member {
+        return Ok(true);
+    }
+    let Some(class) = NodeClass::of_device_class(&occ.device_class) else {
+        return Ok(false);
+    };
+    let list = owner_allow_list(dir, member, &occ.occurrence_key_id).await?;
     Ok(class_allows(class, list.as_ref(), cohort))
+}
+
+/// [`occurrence_may_hold_key`] for a ROOM's epoch key: one community DEK
+/// serves both room scopes, so a list admitting the room under either
+/// `community` or `affiliations` admits the key.
+pub async fn occurrence_may_hold_room_key<D>(
+    dir: &D,
+    member: &str,
+    occ: &super::types::IdentityOccurrence,
+    community_key_id: &str,
+) -> Result<bool, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    for scope in [cs::COMMUNITY, cs::AFFILIATIONS] {
+        let cohort = OwnerCohort::Group {
+            scope,
+            target: community_key_id,
+        };
+        if occurrence_may_hold_key(dir, member, occ, cohort).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The nodes of `owner` that `cohort` reaches: the owner's ACTIVE occurrences
@@ -433,9 +501,17 @@ where
     if row.attesting_key_id == recipient {
         return Ok(Verdict::Yes(Reason::Origin));
     }
-    if row.attested_key_id == recipient
-        || row.subject_key_ids.iter().any(|s| s == recipient)
-        || super::consent_by_humans::for_key_id_of(&row.attestation_envelope) == Some(recipient)
+    // A key-grant set carries KEYS for a cohort's content: naming a device
+    // is not a reason to send it there. It reaches only the cohort's audience
+    // (coordinator ruling on #963 — a deny is not cosmetic).
+    let key_set = row
+        .attestation_type
+        .starts_with(super::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX);
+    if !key_set
+        && (row.attested_key_id == recipient
+            || row.subject_key_ids.iter().any(|s| s == recipient)
+            || super::consent_by_humans::for_key_id_of(&row.attestation_envelope)
+                == Some(recipient))
     {
         return Ok(Verdict::Yes(Reason::RefersTo));
     }

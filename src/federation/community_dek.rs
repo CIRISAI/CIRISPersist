@@ -380,10 +380,26 @@ pub mod orchestrate {
 
         let mut out = Vec::new();
         for member in &roster {
-            let occ = backend
+            let all = backend
                 .list_identity_occurrences_active(&member.key_id)
                 .await
                 .map_err(map_dir_err)?;
+            // v53.0.0 (CIRISPersist#963, coordinator ruling) — a device the
+            // member's allow list keeps this room off gets no epoch key.
+            let mut occ = Vec::with_capacity(all.len());
+            for o in all {
+                if crate::federation::replication_audience::occurrence_may_hold_room_key(
+                    backend,
+                    &member.key_id,
+                    &o,
+                    &community.community_key_id,
+                )
+                .await
+                .map_err(map_dir_err)?
+                {
+                    occ.push(o);
+                }
+            }
             out.push((
                 member.key_id.clone(),
                 occ.into_iter()
@@ -561,6 +577,33 @@ pub mod orchestrate {
                     )
                     .await?;
                 }
+            }
+        }
+
+        // v53.0.0 (CIRISPersist#963, coordinator ruling) — a recipient that
+        // LEFT the fan-out (its owner's allow list now keeps the room off the
+        // device, or it lost its keys) rotates the epoch, as a removal does:
+        // it holds this epoch's key, so new content must not join it.
+        let held = backend
+            .community_dek_member_grant_recipients(community_key_id, minter_key_id, epoch)
+            .await?;
+        if !held.is_empty() {
+            let (current, _) = partition_roster(members.clone());
+            let current: std::collections::HashSet<String> =
+                current.into_iter().map(|(k, _)| k).collect();
+            if held.iter().any(|r| !current.contains(r)) {
+                let next = backend
+                    .community_dek_bump_epoch(community_key_id, minter_key_id)
+                    .await?;
+                set_key_state(
+                    backend,
+                    community_key_id,
+                    minter_key_id,
+                    epoch,
+                    DekKeyState::Disabled,
+                )
+                .await?;
+                epoch = next;
             }
         }
 

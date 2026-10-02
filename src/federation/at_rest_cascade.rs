@@ -1130,6 +1130,33 @@ pub mod orchestrate {
             .filter(|k| !k.x25519_base64.is_empty() && !k.ml_kem_768_base64.is_empty())
     }
 
+    /// v53.0.0 (CIRISPersist#963, coordinator ruling) — the occurrences of
+    /// `member` that may hold `cohort`'s content key: the ONE audience rule
+    /// ([`occurrence_may_hold_key`](crate::federation::replication_audience::occurrence_may_hold_key)),
+    /// so a node denied a cohort's content is denied its key too.
+    async fn keyable<B>(
+        backend: &B,
+        member: &str,
+        occ: Vec<crate::federation::types::IdentityOccurrence>,
+        cohort: crate::federation::replication_audience::OwnerCohort<'_>,
+    ) -> Result<Vec<crate::federation::types::IdentityOccurrence>, BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
+        let mut out = Vec::with_capacity(occ.len());
+        for o in occ {
+            if crate::federation::replication_audience::occurrence_may_hold_key(
+                backend, member, &o, cohort,
+            )
+            .await
+            .map_err(map_dir_err)?
+            {
+                out.push(o);
+            }
+        }
+        Ok(out)
+    }
+
     /// Resolve the active recipients for a self/family write, BY MEMBER:
     /// each roster identity with its `(occurrence_key_id,
     /// encryption_pubkeys?)` pairs (#843 — a member with none is still
@@ -1153,6 +1180,15 @@ pub mod orchestrate {
                     .list_identity_occurrences_active(owner_or_family_key_id)
                     .await
                     .map_err(map_dir_err)?;
+                // v53.0.0 (#963) — only the occurrences the owner's allow list
+                // (or class) lets `self` content reach get its key.
+                let occ = keyable(
+                    backend,
+                    owner_or_family_key_id,
+                    occ,
+                    crate::federation::replication_audience::OwnerCohort::SelfContent,
+                )
+                .await?;
                 Ok(vec![(
                     owner_or_family_key_id.to_owned(),
                     occ.into_iter()
@@ -1189,6 +1225,17 @@ pub mod orchestrate {
                         .list_identity_occurrences_active(&member.key_id)
                         .await
                         .map_err(map_dir_err)?;
+                    // v53.0.0 (#963) — the member's allow list for each device.
+                    let occ = keyable(
+                        backend,
+                        &member.key_id,
+                        occ,
+                        crate::federation::replication_audience::OwnerCohort::Group {
+                            scope: FAMILY,
+                            target: owner_or_family_key_id,
+                        },
+                    )
+                    .await?;
                     out.push((
                         member.key_id.clone(),
                         occ.into_iter()
@@ -1848,16 +1895,25 @@ pub mod orchestrate {
         }
 
         // Newcomers = the new member identity's active occurrences.
-        let newcomers: Vec<Newcomer> = backend
-            .list_identity_occurrences_active(new_member_identity_key_id)
-            .await
-            .map_err(map_dir_err)?
-            .into_iter()
-            .map(|o| Newcomer {
-                occurrence_key_id: o.occurrence_key_id,
-                encryption_pubkeys: o.encryption_pubkeys,
-            })
-            .collect();
+        let newcomers: Vec<Newcomer> = keyable(
+            backend,
+            new_member_identity_key_id,
+            backend
+                .list_identity_occurrences_active(new_member_identity_key_id)
+                .await
+                .map_err(map_dir_err)?,
+            crate::federation::replication_audience::OwnerCohort::Group {
+                scope: FAMILY,
+                target: family_key_id,
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|o| Newcomer {
+            occurrence_key_id: o.occurrence_key_id,
+            encryption_pubkeys: o.encryption_pubkeys,
+        })
+        .collect();
 
         // Existing cohort = every OTHER current member's active occurrences —
         // the authorized fold (v49.0.0, #910.3), not the raw record.
@@ -1905,6 +1961,19 @@ pub mod orchestrate {
         let mut existing: Vec<String> = Vec::new();
         for o in active {
             if newset.contains(o.occurrence_key_id.as_str()) {
+                // v53.0.0 (#963) — a device `self` content may not reach is no
+                // newcomer to its keys.
+                if !crate::federation::replication_audience::occurrence_may_hold_key(
+                    backend,
+                    identity_key_id,
+                    &o,
+                    crate::federation::replication_audience::OwnerCohort::SelfContent,
+                )
+                .await
+                .map_err(map_dir_err)?
+                {
+                    continue;
+                }
                 newcomers.push(Newcomer {
                     occurrence_key_id: o.occurrence_key_id,
                     encryption_pubkeys: o.encryption_pubkeys,
@@ -2156,6 +2225,36 @@ pub mod orchestrate {
     /// member owns but does not speak through (infrastructure the member
     /// operates for others) is not a device of theirs and receives none of
     /// their history.
+    /// v53.0.0 (CIRISPersist#963, coordinator ruling) — may `device` (an
+    /// occurrence of `member`) hold `community_key_id`'s epoch keys? The ONE
+    /// audience rule over the member's newest active row for the device.
+    async fn device_may_hold_room_key<B>(
+        backend: &B,
+        member_key_id: &str,
+        device: &str,
+        community_key_id: &str,
+    ) -> Result<bool, crate::federation::Error>
+    where
+        B: FederationDirectory + Sync,
+    {
+        let Some(occ) = backend
+            .list_identity_occurrences_active(member_key_id)
+            .await?
+            .into_iter()
+            .filter(|o| o.occurrence_key_id == device)
+            .max_by_key(|o| o.asserted_at)
+        else {
+            return Ok(false);
+        };
+        crate::federation::replication_audience::occurrence_may_hold_room_key(
+            backend,
+            member_key_id,
+            &occ,
+            community_key_id,
+        )
+        .await
+    }
+
     async fn is_member_device<B>(
         backend: &B,
         member_key_id: &str,
@@ -2397,6 +2496,18 @@ pub mod orchestrate {
                 crate::federation::DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE,
             ));
         }
+        // 4b — v53.0.0 (#963) — the member's allow list (or the device's
+        // class) lets this room reach the device: a denied device gets no key.
+        if !device_may_hold_room_key(
+            backend,
+            member_key_id,
+            new_occurrence_key_id,
+            community_key_id,
+        )
+        .await?
+        {
+            return Err(refuse(crate::federation::DEVICE_REKEY_RULE_NOT_IN_AUDIENCE));
+        }
 
         // 5 — the device's content-KEM keys, revocation- and validity-aware.
         let keys = backend
@@ -2558,6 +2669,13 @@ pub mod orchestrate {
                 }
                 let holders = &holders_of[member];
                 for device in devices {
+                    // v53.0.0 (#963) — a device the member's list denies this
+                    // room gets none of its epochs.
+                    if !device_may_hold_room_key(backend, member, &device, &community_key_id)
+                        .await?
+                    {
+                        continue;
+                    }
                     let keys = backend.resolve_encryption_keys(&device).await?;
                     let Some(keys) = usable_keys(&keys).cloned() else {
                         report

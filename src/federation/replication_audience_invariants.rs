@@ -43,13 +43,13 @@ pub(crate) mod bodies {
         ms(Utc::now() - Duration::days(days))
     }
 
-    async fn users(d: &dyn FederationDirectory, keys: &[&str]) {
+    pub(crate) async fn users(d: &dyn FederationDirectory, keys: &[&str]) {
         for k in keys {
             ts::register_hybrid_key_as(d, k, k, USER).await;
         }
     }
 
-    async fn nodes(d: &dyn FederationDirectory, keys: &[&str]) {
+    pub(crate) async fn nodes(d: &dyn FederationDirectory, keys: &[&str]) {
         for k in keys {
             ts::register_hybrid_key_as(d, k, k, NODE).await;
         }
@@ -106,7 +106,7 @@ pub(crate) mod bodies {
         }
     }
 
-    async fn room(d: &dyn FederationDirectory, cid: &str, founders: &[&str]) {
+    pub(crate) async fn room(d: &dyn FederationDirectory, cid: &str, founders: &[&str]) {
         ts::register_identity_key(d, cid, USER).await;
         let c = Community {
             community_key_id: cid.to_owned(),
@@ -132,7 +132,7 @@ pub(crate) mod bodies {
             .unwrap_or_else(|e| panic!("room {cid}: {e}"));
     }
 
-    async fn family(d: &dyn FederationDirectory, fid: &str, founders: &[&str]) {
+    pub(crate) async fn family(d: &dyn FederationDirectory, fid: &str, founders: &[&str]) {
         let f = Family {
             family_key_id: fid.to_owned(),
             family_name: "household".into(),
@@ -160,7 +160,7 @@ pub(crate) mod bodies {
 
     /// `author`'s `consent:replication` grant FOR `for_key`, with `cohorts`
     /// (raw JSON, so the malformed shapes can be offered too).
-    fn grant(
+    pub(crate) fn grant(
         author: &str,
         for_key: Option<&str>,
         cohorts: Option<serde_json::Value>,
@@ -187,7 +187,7 @@ pub(crate) mod bodies {
         r
     }
 
-    async fn put(d: &dyn FederationDirectory, a: &Attestation) -> Result<(), Error> {
+    pub(crate) async fn put(d: &dyn FederationDirectory, a: &Attestation) -> Result<(), Error> {
         d.put_attestation(SignedAttestation {
             attestation: a.clone(),
         })
@@ -205,7 +205,7 @@ pub(crate) mod bodies {
         put(d, &r).await.expect("withdraws admitted");
     }
 
-    fn entries(pairs: &[(&str, &str)]) -> serde_json::Value {
+    pub(crate) fn entries(pairs: &[(&str, &str)]) -> serde_json::Value {
         let mut v: Vec<(String, String)> = pairs
             .iter()
             .map(|(s, t)| ((*s).to_owned(), (*t).to_owned()))
@@ -728,6 +728,218 @@ pub(crate) mod bodies {
     }
 }
 
+/// The KEY half (coordinator ruling on #963): a node denied a cohort's
+/// content gets no key for it. SQL backends (the cascades need blob storage).
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod key_bodies {
+    use super::bodies::{entries, family, grant, nodes, put, room, users};
+    use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+    use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::cohort_scope::{COMMUNITY, FAMILY, SELF};
+    use crate::federation::types::{device_class, IdentityOccurrence};
+    use crate::federation::{BlobStorage, FederationDirectory, SignedAttestation};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    /// `owner` claims `node` (class `class`) with real content-KEM keys, and
+    /// binds it as its owner.
+    async fn keyed_claim<B>(b: &B, owner: &str, node: &str, class: &str)
+    where
+        B: FederationDirectory + Sync,
+    {
+        let (_xp, x_pub, _mp, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().expect("kem");
+        b.put_identity_occurrence_local(IdentityOccurrence {
+            identity_key_id: owner.to_owned(),
+            occurrence_key_id: node.to_owned(),
+            device_class: class.to_owned(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now() - chrono::Duration::days(2),
+            valid_until: None,
+            encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(&ml_pub),
+            }),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("keyed claim {owner} → {node}: {e}"));
+        b.put_attestation(SignedAttestation {
+            attestation: ts::owner_binding_attestation(
+                &uuid::Uuid::new_v4().to_string(),
+                owner,
+                node,
+            ),
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn minter<B: FederationDirectory + Sync>(b: &B, s: &str) -> String {
+        crate::federation::at_rest_cascade::blob_invariants::node_signer(b, &format!("mint-{s}"))
+            .await
+            .derived_key_id()
+    }
+
+    async fn self_family_granted<B>(b: &B, scope: &str, group: &str) -> Vec<String>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        encrypt_and_cascade(b, scope, group, b"i39x content", None, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("seal at {scope}: {e}"))
+            .granted
+    }
+
+    /// The room epoch a seal used, and that epoch's wrap recipients.
+    async fn room_epoch<B>(b: &B, cid: &str, minter: &str) -> (u64, Vec<String>)
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let r = encrypt_and_cascade_community(b, cid, b"i39x room", None, Some(minter))
+            .await
+            .unwrap_or_else(|e| panic!("seal in {cid}: {e}"));
+        let rec = b
+            .community_dek_member_grant_recipients(cid, &r.minter_key_id, r.epoch)
+            .await
+            .unwrap();
+        (r.epoch, rec)
+    }
+
+    /// **I393b** — the denied laptop gets no key for the room or the family it
+    /// is denied; the phone with no list gets both; self still reaches it.
+    pub(crate) async fn i393b_a_denied_node_gets_no_key<B>(b: &B, s: &str)
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let d = b as &dyn FederationDirectory;
+        let (owner, laptop, phone, adult, work, fam) = (
+            format!("i393b-o-{s}"),
+            format!("i393b-l-{s}"),
+            format!("i393b-p-{s}"),
+            format!("i393b-adulthub-{s}"),
+            format!("i393b-work-{s}"),
+            format!("i393b-f-{s}"),
+        );
+        users(d, &[&owner]).await;
+        nodes(d, &[&laptop, &phone]).await;
+        keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
+        keyed_claim(b, &owner, &phone, device_class::PHONE).await;
+        room(d, &adult, &[&owner]).await;
+        room(d, &work, &[&owner]).await;
+        family(d, &fam, &[&owner]).await;
+        put(
+            d,
+            &grant(&owner, Some(&laptop), Some(entries(&[(COMMUNITY, &work)]))),
+        )
+        .await
+        .unwrap();
+        let fg = self_family_granted(b, FAMILY, &fam).await;
+        assert!(
+            fg.contains(&phone) && !fg.contains(&laptop),
+            "I393b family wraps: {fg:?}"
+        );
+        let sg = self_family_granted(b, SELF, &owner).await;
+        assert!(
+            sg.contains(&phone) && sg.contains(&laptop),
+            "I393b self follows the class: {sg:?}"
+        );
+        let m = minter(b, s).await;
+        let (_, ar) = room_epoch(b, &adult, &m).await;
+        assert!(
+            ar.contains(&phone) && !ar.contains(&laptop),
+            "I393b adulthub's epoch key: {ar:?}"
+        );
+        let (_, wr) = room_epoch(b, &work, &m).await;
+        assert!(
+            wr.contains(&laptop),
+            "I393b the listed room's key reaches the laptop: {wr:?}"
+        );
+    }
+
+    /// **I394b** — a server-class agent and server get no self or family key,
+    /// but do get their owner's room key (CC 3.3.7).
+    pub(crate) async fn i394b_server_class_keys<B>(b: &B, s: &str)
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let d = b as &dyn FederationDirectory;
+        let (owner, agent, server, laptop, cid, fam) = (
+            format!("i394b-o-{s}"),
+            format!("i394b-a-{s}"),
+            format!("i394b-s-{s}"),
+            format!("i394b-l-{s}"),
+            format!("i394b-c-{s}"),
+            format!("i394b-f-{s}"),
+        );
+        users(d, &[&owner]).await;
+        nodes(d, &[&agent, &server, &laptop]).await;
+        keyed_claim(b, &owner, &agent, device_class::AGENT).await;
+        keyed_claim(b, &owner, &server, device_class::SERVER).await;
+        keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
+        room(d, &cid, &[&owner]).await;
+        family(d, &fam, &[&owner]).await;
+        for (scope, group) in [(SELF, owner.as_str()), (FAMILY, fam.as_str())] {
+            let g = self_family_granted(b, scope, group).await;
+            assert!(
+                g.contains(&laptop) && !g.contains(&agent) && !g.contains(&server),
+                "I394b {scope}: no key for the server class: {g:?}"
+            );
+        }
+        let (_, r) = room_epoch(b, &cid, &minter(b, s).await).await;
+        assert!(
+            r.contains(&agent) && r.contains(&server) && r.contains(&laptop),
+            "I394b the room key reaches every class: {r:?}"
+        );
+    }
+
+    /// **I392c** — a deny added later: the next seal rotates the room's
+    /// epoch, and the new epoch's key does not reach the denied laptop.
+    pub(crate) async fn i392c_a_later_deny_rotates_the_room_epoch<B>(b: &B, s: &str)
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let d = b as &dyn FederationDirectory;
+        let (owner, laptop, phone, cid) = (
+            format!("i392c-o-{s}"),
+            format!("i392c-l-{s}"),
+            format!("i392c-p-{s}"),
+            format!("i392c-c-{s}"),
+        );
+        users(d, &[&owner]).await;
+        nodes(d, &[&laptop, &phone]).await;
+        keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
+        keyed_claim(b, &owner, &phone, device_class::PHONE).await;
+        room(d, &cid, &[&owner]).await;
+        let m = minter(b, s).await;
+        let (e0, r0) = room_epoch(b, &cid, &m).await;
+        assert!(
+            r0.contains(&laptop),
+            "I392c precondition — the laptop holds e{e0}"
+        );
+        put(
+            d,
+            &grant(&owner, Some(&laptop), Some(serde_json::json!([]))),
+        )
+        .await
+        .unwrap();
+        let (e1, r1) = room_epoch(b, &cid, &m).await;
+        assert!(e1 > e0, "I392c the deny rotated the epoch: e{e0} → e{e1}");
+        assert!(
+            !r1.contains(&laptop) && r1.contains(&phone),
+            "I392c the new epoch's key skips the denied laptop: {r1:?}"
+        );
+        let again = encrypt_and_cascade_community(b, &cid, b"i392c steady", None, Some(&m))
+            .await
+            .unwrap();
+        assert_eq!(
+            again.epoch, e1,
+            "I392c no further rotation once the set is steady"
+        );
+    }
+}
+
 #[cfg(test)]
 mod runners {
     fn suffix() -> String {
@@ -796,4 +1008,56 @@ mod runners {
         },
         [i395_live_invitee_receives_the_planes]
     );
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod key_runners {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
+    }
+
+    macro_rules! key_runners {
+        ($modname:ident, $fresh:expr) => {
+            mod $modname {
+                use super::suffix;
+                macro_rules! case {
+                    ($name:ident) => {
+                        #[tokio::test]
+                        async fn $name() {
+                            let Some(b) = $fresh.await else { return };
+                            crate::federation::replication_audience_invariants::key_bodies::$name(
+                                &b,
+                                &suffix(),
+                            )
+                            .await
+                        }
+                    };
+                }
+                case!(i393b_a_denied_node_gets_no_key);
+                case!(i394b_server_class_keys);
+                case!(i392c_a_later_deny_rotates_the_room_epoch);
+            }
+        };
+    }
+
+    #[cfg(feature = "sqlite")]
+    key_runners!(sqlite, async {
+        use crate::store::Backend as _;
+        let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
+
+    #[cfg(feature = "postgres")]
+    key_runners!(postgres, async {
+        use crate::store::Backend as _;
+        let dsn = crate::test_pg::empty_dsn()?;
+        let b = crate::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        Some(b)
+    });
 }
