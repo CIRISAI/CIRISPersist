@@ -635,6 +635,23 @@ pub(crate) mod bodies {
             !ra::may_receive(d, &sibling, &g).await.unwrap().allowed(),
             "I397 a sibling node does not"
         );
+        // A key-grant set naming the server-class laptop at a family it may
+        // not receive does not reach it by naming it (coordinator ruling).
+        let fam = format!("i397-f-{s}");
+        family(d, &fam, &[&owner]).await;
+        let mut set = ts::bare_attestation(
+            "i397-set",
+            &sibling,
+            &sibling,
+            &serde_json::json!({ "family_key_id": fam }),
+        );
+        set.attestation_type = "key_grant:content:v1".into();
+        set.cohort_scope = FAMILY.into();
+        set.subject_key_ids = vec![laptop.clone()];
+        assert!(
+            !ra::may_receive(d, &laptop, &set).await.unwrap().allowed(),
+            "I397 a key set naming a device outside the cohort's audience does not reach it"
+        );
         let mut own = ts::bare_attestation("i397-own", &laptop, &laptop, &serde_json::json!({}));
         own.cohort_scope = SELF.into();
         assert_eq!(
