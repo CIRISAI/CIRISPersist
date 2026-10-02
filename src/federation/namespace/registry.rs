@@ -417,20 +417,17 @@ pub fn row_types() -> Option<&'static RowTypes> {
     .as_ref()
 }
 
-/// Is `attestation_type` one of the registered CARRIER row types (CC 2.4) —
-/// a whole-string, byte-exact match for a carrier pattern in
-/// `_meta.row_types`?
+/// The registered CARRIER row type (CC 2.4) `attestation_type` is a
+/// whole-string, byte-exact match for, or `None`.
 ///
-/// One caller: the type half of the CC 3.1.7 R2(b) check in
-/// `admission`. A carrier token is a row type and never a dimension, and the
-/// registry says so by gating its stem (`key_grant:` — "carrier row type,
-/// never a dimension"), so the DIMENSION matcher refuses the token by design.
-/// A row's type is not a dimension; this is what keeps the type slot of a
-/// registered carrier out of the dimension matcher. It refuses nothing: the
-/// allowlist over the whole slot is CIRISPersist#975.
+/// Each carrier's pattern is compiled once from `_meta.row_types`, re-anchored
+/// `\A(?:…)\z` whatever anchors the row spells, so a trailing newline is never
+/// admitted. The row-type gate (CIRISPersist#975,
+/// [`crate::federation::row_type`]) reads this for the carrier's envelope
+/// `kind`; no type constant in the tree decides admission.
 #[must_use]
-pub fn is_registered_carrier_row_type(attestation_type: &str) -> bool {
-    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+pub fn carrier_row_type(attestation_type: &str) -> Option<&'static CarrierRowType> {
+    static PATTERNS: OnceLock<Vec<(regex::Regex, &'static CarrierRowType)>> = OnceLock::new();
     PATTERNS
         .get_or_init(|| {
             row_types()
@@ -438,18 +435,34 @@ pub fn is_registered_carrier_row_type(attestation_type: &str) -> bool {
                     rt.carriers
                         .iter()
                         .map(|c| {
-                            // Full match whatever the row's own anchors say, and
-                            // `\z` so a trailing newline is never admitted.
                             let body = c.pattern.trim_start_matches('^').trim_end_matches('$');
-                            regex::Regex::new(&format!("\\A(?:{body})\\z"))
-                                .expect("a vendored carrier pattern compiles")
+                            let re = regex::Regex::new(&format!("\\A(?:{body})\\z"))
+                                .expect("a vendored carrier pattern compiles");
+                            (re, c)
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         })
         .iter()
-        .any(|re| re.is_match(attestation_type))
+        .find(|(re, _)| re.is_match(attestation_type))
+        .map(|(_, c)| *c)
+}
+
+/// Is `attestation_type` one of the registered CARRIER row types (CC 2.4) —
+/// a whole-string, byte-exact match for a carrier pattern in
+/// `_meta.row_types`?
+///
+/// Read by the type half of the CC 3.1.7 R2(b) check in `admission`. A
+/// carrier token is a row type and never a dimension, and the registry says so
+/// by gating its stem (`key_grant:` — "carrier row type, never a dimension"),
+/// so the DIMENSION matcher refuses the token by design. A row's type is not a
+/// dimension; this is what keeps the type slot of a registered carrier out of
+/// the dimension matcher. The allowlist over the whole slot is
+/// [`crate::federation::row_type`] (CIRISPersist#975).
+#[must_use]
+pub fn is_registered_carrier_row_type(attestation_type: &str) -> bool {
+    carrier_row_type(attestation_type).is_some()
 }
 
 /// The full vendored namespace registry (every CC 3.1 prefix family), sorted

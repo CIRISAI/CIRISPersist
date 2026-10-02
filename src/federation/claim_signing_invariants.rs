@@ -752,6 +752,9 @@ mod tests {
         );
         carrier.attestation_type =
             crate::federation::key_grant::KEY_GRANT_EPOCH_ATTESTATION_TYPE.to_owned();
+        // v53.0.0 (#975, CC 2.4) — a carrier carries no weight; the fixture's
+        // default one would be refused `carrier_carries_weight`.
+        carrier.weight = None;
         let carrier = ts::seal_row(&minter, carrier);
         backend
             .apply_replicated_attestation(crate::federation::SignedAttestation {

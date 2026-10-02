@@ -12756,6 +12756,46 @@ impl PyEngine {
         })
     }
 
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — the closed row-type slot's
+    /// report: `{enforcement, held_unregistered: [{attestation_type, type_stem,
+    /// count, oldest, newest}], admitted_unregistered: [{label, count}],
+    /// composer_dimension_would_refuse: [{label, count}]}`. Wraps
+    /// [`row_type_report`](crate::federation::row_type::row_type_report).
+    fn row_type_report_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let report = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::row_type::row_type_report(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::row_type::row_type_report(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&report)
+                    .map_err(|e| PyValueError::new_err(format!("row_type_report serialize: {e}")))
+            })
+        })
+    }
+
     /// v11.5.0 (CIRISPersist#306, CC 3.3.12 / CC 1.15.6) — the **I1 age band**
     /// of `key_id`, resolved from its incoming age attestations (witness
     /// `age_assurance:*` OUTRANKS self-declared `age_self_declared:*`; a
@@ -33722,6 +33762,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // rather than as a substrate error the caller cannot act on.
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
         | crate::federation::Error::NamespaceFamilyUnregistered { .. }
+        // v53.0.0 (#975, CC 2.4) — the closed row-type slot and the carrier
+        // shape: the producer chose the type and the shape, so both are its
+        // fault, beside the R2(b) refusal they sit with.
+        | crate::federation::Error::AttestationTypeUnregistered { .. }
+        | crate::federation::Error::CarrierRowMalformed { .. }
         // (#571, CC 3.1.7 R2 Private Use) — offering an `x_private:*` row at
         // federation tier is the same shape: the producer chose a range the
         // Constitution keeps local, and only the producer can act on it.

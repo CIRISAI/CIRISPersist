@@ -429,6 +429,12 @@ impl ConsentSweepReport {
 }
 
 pub mod register;
+/// v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: the
+/// `attestation_type` allowlist, the carrier shape, the report door.
+pub mod row_type;
+/// CIRISPersist#975 — I370–I379, the closed row-type slot.
+#[cfg(test)]
+mod row_type_invariants;
 // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4–§5) — the rendition
 // index (V149 `blob_renditions`) and the sized holder claim, the pure half.
 pub mod renditions;
@@ -5228,6 +5234,13 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error>;
 
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — every stored
+    /// `attestation_type` with its row count and `asserted_at` span, every
+    /// tier. The inventory [`row_type::row_type_report`] filters to the types
+    /// the closed slot does not register. Bounded by the number of DISTINCT
+    /// types, not rows.
+    async fn attestation_type_census(&self) -> Result<Vec<row_type::AttestationTypeCount>, Error>;
+
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`SignedIdentityOccurrenceRevocation`] wrappers since a cursor — the
     /// bulk-read mirror of
@@ -9648,6 +9661,44 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// v53.0.0 (CIRISPersist#975, **CC 2.4** "The row-type slot is closed").
+    /// The row's `attestation_type` is neither one of the five structural
+    /// types nor a whole-string, byte-exact match for a registered carrier in
+    /// the vendored registry's `_meta.row_types`.
+    ///
+    /// Raised only under [`row_type::RowTypeEnforcement::Enforce`]. v53 ships
+    /// [`row_type::ROW_TYPE_ENFORCEMENT`] = `Report`: the row is admitted and
+    /// counted, because CIRISServer's legacy `consent` rows (CIRISServer#713)
+    /// must be re-authored as `scores` fleet-wide before a release refuses them.
+    #[error(
+        "attestation type unregistered (CC 2.4): {attestation_type:?} is not one of the five row          types (scores, delegates_to, supersedes, withdraws, recants) nor a registered carrier —          the row-type slot is closed; a claim rides `scores` with its family in `dimension`"
+    )]
+    AttestationTypeUnregistered {
+        /// The refused `attestation_type`, verbatim.
+        attestation_type: String,
+        /// CC's refusal token, read from `_meta.row_types.refusal`
+        /// (`attestation_type_unregistered`).
+        reason: &'static str,
+    },
+
+    /// v53.0.0 (CIRISPersist#975, **CC 2.4** carrier shape). A row of a
+    /// registered CARRIER type (`holds_bytes:sha256:{prefix}`,
+    /// `key_grant:{axis}:v1`) whose shape is not a carrier's: not a
+    /// self-attestation, an envelope `kind` other than the carrier's, or a
+    /// `dimension` / `score` / `confidence` / `weight` / non-empty
+    /// `subject_key_ids` — the members that would make it a claim. Enforced in
+    /// v53 at every admission door (no emitter anywhere writes another shape).
+    #[error(
+        "carrier row malformed (CC 2.4): {attestation_type:?} is a registered carrier row type,          and a carrier is a self-attestation whose envelope `kind` is the carrier's and which          carries no claim members — refused: {reason}"
+    )]
+    CarrierRowMalformed {
+        /// The carrier `attestation_type`.
+        attestation_type: String,
+        /// Which part of the carrier shape the row broke
+        /// ([`row_type::CarrierShapeViolation::as_str`]).
+        reason: &'static str,
+    },
+
     /// v10.3.0 (CIRISPersist#288, CC 3.4.5). A `capacity:*` attestation
     /// was self-emitted (`attesting_key_id == attested_key_id`). The
     /// Constitution's "Critical enforcement" rule: a `capacity:*` score
@@ -11019,6 +11070,8 @@ impl Error {
             Error::NamespacePrivateUseNotFederatable { .. } => {
                 "federation_namespace_private_use_not_federatable"
             }
+            Error::AttestationTypeUnregistered { .. } => "federation_attestation_type_unregistered",
+            Error::CarrierRowMalformed { .. } => "federation_carrier_row_malformed",
             Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
             Error::AccordHolderRequiresAttestationEvidence { .. } => {
                 "federation_accord_holder_requires_attestation_evidence"
