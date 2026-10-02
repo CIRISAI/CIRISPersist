@@ -467,9 +467,8 @@ pub mod wire_index;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
 // nonce. Gated on `secrets`: routes through that feature's
 // `secrets::crypto` facade (MISSION §1.4 sole symmetric-crypto site).
-// v53.0.0 (CIRISPersist#969) — also every backend build: the self/family
-// chunk cascade seals under the STREAM nonce.
-#[cfg(any(feature = "secrets", feature = "postgres", feature = "sqlite"))]
+// v53.0.0 (CIRISPersist#969) — compiled in every build: the self/family chunk
+// cascade seals under the STREAM nonce (its AEAD helpers stay `secrets`-gated).
 pub mod stream_seal;
 // v4.1 (CIRISPersist#142 Cut C4) — delivery-receipt canonical bytes +
 // subscriber-signature verify. Backend-agnostic; the JOIN-against-STH

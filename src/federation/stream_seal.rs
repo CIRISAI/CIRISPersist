@@ -54,7 +54,7 @@
 //! [`open_chunk`], `secrets` builds). v53.0.0 (CIRISPersist#969): the nonce
 //! derivation ([`stream_nonce`], [`parse_nonce`]) is what the self/family
 //! chunk cascade seals with in every backend build, so it is compiled
-//! wherever a backend is and calls `ciris_crypto::kdf::hkdf_sha256` — the
+//! in every build and calls `ciris_crypto::kdf::hkdf_sha256` — the
 //! same routine the facade wraps. It never rolls its own crypto.
 
 #[cfg(feature = "secrets")]

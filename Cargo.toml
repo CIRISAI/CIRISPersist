@@ -28,7 +28,7 @@ default = []
 test-anchor = ["ciris-verify-core/test-anchor"]
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres", "ciris-crypto/kdf"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available. This is the published-wheel
@@ -68,7 +68,7 @@ extension-module = ["pyo3?/extension-module"]
 # imported by the postgres feature; cargo unifies them when both are
 # on (refinery built with both `tokio-postgres` and `rusqlite`
 # features).
-sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite", "ciris-crypto/kdf"]
+sqlite         = ["dep:rusqlite", "dep:refinery", "refinery/rusqlite"]
 
 # Phase 2 features (declared now; impls land later — MISSION.md §2 / FSD §4).
 c-abi          = []
@@ -574,7 +574,7 @@ ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v19
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v19.0.0", version = "19", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v19.0.0", version = "19", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,

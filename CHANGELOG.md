@@ -22,7 +22,7 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 - **Readiness door.** `Engine::sealed_dag_readiness` / `sealed_dag_readiness_json` → `{sha256_hex, chunk_keys, held, readable, missing, not_held}` from grant rows, no chunk opened: per epoch (`{axis: "stream", stream_id, epoch, seq_from, seq_to}`) for v4, per chunk (`{axis: "content", seq, chunk_sha256}`) for legacy.
 - **The refusal.** A viewer authorized on the DAG who lacks one chunk's key gets `BlobError::ChunkKeyNotYetGranted` (`blob_chunk_key_not_yet_granted`; Python `ValueError` like the `blob_not_granted` arm it splits from, JSON detail `{sha256, seq, chunk_sha256, key: {axis: content|stream, …}, retryable: true}`). A stranger keeps `blob_not_granted` on the DAG.
 - `SealStreamScopedResult.stream_key_grant_emissions`; the Python seal door now also emits the chunk sets it widened (it emitted only the manifest's).
-- `stream_seal::stream_nonce` / `parse_nonce` compile in every backend build (`postgres` / `sqlite` enable `ciris-crypto/kdf`).
+- `stream_seal::stream_nonce` / `parse_nonce` compile in every build (`ciris-crypto` gains its `kdf` feature unconditionally); `seal_chunk` / `open_chunk` stay `secrets`-gated.
 
 **Adopters (Edge).** Apply `key_grant:stream:v1` like the other axes; adopt each chunk at the manifest's `epoch`; tolerate zero-length terminator chunks; a v4 DAG has one more chunk per epoch than the producer wrote.
 
