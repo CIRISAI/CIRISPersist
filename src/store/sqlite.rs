@@ -30554,6 +30554,8 @@ mod tests {
             t.asserted_at,
             1,
         );
+        // v53.0.0 (#975, CC 2.4) — a carrier carries no weight.
+        t.weight = None;
         resign_fed(&mut t); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: t })

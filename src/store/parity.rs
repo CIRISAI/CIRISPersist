@@ -339,6 +339,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // idempotent no-op and only a genuine disagreement refuses, which is a
     // policy question about the caller's input rather than a substrate one.
     ("attestation_reput_verdict", Class::Gate),
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: a fact
+    // about the caller's row (its type, a carrier's shape), immediately after
+    // the binding on all three backends.
+    ("admit_row_type", Class::Gate),
     ("check_single_node_owner_admission", Class::Gate),
     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
     // refused at `cohort_scope: federation`.
