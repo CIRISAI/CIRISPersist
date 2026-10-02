@@ -4314,7 +4314,7 @@ pub mod test_support {
         let accord = format!("{tag}-accord");
         let user = format!("{tag}-user");
         let subject = format!("{tag}-subject");
-        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..3).map(|i| format!("h{i}-{tag}")).collect();
 
         // The cast, registered with their deterministic `sign_envelope` pubkeys
         // so every signature below resolves at the ingest gate on EVERY backend.
@@ -5300,7 +5300,7 @@ pub mod test_support {
 
         let user = format!("{tag}-user");
         let foreign = format!("{tag}-foreign");
-        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..3).map(|i| format!("h{i}-{tag}")).collect();
 
         for who in &holders {
             register_typed_key(directory, who, identity_type::NODE).await?;
@@ -5468,7 +5468,7 @@ pub mod test_support {
         let accord = format!("{tag}-accord");
         let user = format!("{tag}-user");
         let peer = format!("{tag}-peer");
-        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..3).map(|i| format!("h{i}-{tag}")).collect();
 
         for who in &holders {
             register_typed_key(directory, who, identity_type::NODE).await?;
