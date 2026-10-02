@@ -39,6 +39,96 @@ The two vendored CC files move from `651140a` to CIRISConstitution tag **`v1.0-r
 
 **Reserved by CC, not yet gated here.** Six of the nine rows carry an emitter rule persist does not enforce: `custody:` (CIRISPersist#961), `file:` and `collection:` (CIRISPersist#962), `lineage_witness:` and `observation:reachability` (CIRISPersist#974), `device:label` (CIRISConstitution#137; persist has no emitter). They were unregistered open vocabulary before this vendor, so no emitter is admitted that was not admitted before; they are recorded in `RESERVED_AND_NOT_YET_GATED`, each with the ask that builds its gate, apart from the families persist gates by purpose-built checks (`membership:`, and the `self:delegates_to` labels, which confer nothing).
 
+### Mutation round — #966, #965, CC 3.2 T2 (on the committed tree; sqlite lane)
+
+| # | mutant | witness | verdict |
+|---|---|---|---|
+| M1 | `from_shared` does not tell the backend its key | I380 | killed |
+| M2 | `from_shared_with_local` does not tell it | I380 | killed |
+| M3 | the "already known" guard inverted | I380 | killed |
+| M4 | the resolver's history agreement forced `false` | I381/I382 | killed |
+| M5 | the resolver's history agreement forced `true` | I381 control | killed |
+| M6 | a superseded grant stays a candidate | I383/I384/I385 | killed |
+| M7 | a rotation link may be signed by anyone | I386 (second trusted root) | killed (after I386 gained that leg; it survived the first run, because a foreign signer that is not a trusted root already fails `trust_root_valid`) |
+| M8 | a `supersedes` is not conferral-shaped | I383/I384 | killed |
+| M9 | anyone's `supersedes` retires the grant | I386 | killed |
+
+### CC 3.2 T2 — a superseded grant hands standing to its successor; a withdrawn one has none
+
+CIRISConstitution v1.0-rc6, CC 3.2 T2 (steward ruling 2026-10-01): *"A grant
+that is superseded … keeps its lineage: a claim made under the superseded
+grant, with `asserted_at` before the successor's, keeps the standing it had
+… A grant that is withdrawn or tombstoned has no successor and no lineage to
+walk: standing under it is gone at once."*
+
+`capability_roots_to_trusted_root_over_roster` folded tombstones through the
+§6.1 precedence, where a `supersedes` is never a retraction. Two results
+followed. A superseded grant stayed a live candidate, so a successor that
+narrowed the scope never narrowed it. And the successor, being a
+`supersedes` row and not a `delegates_to`, conferred nothing. The walk now
+reads the head of the chain (`live_conferrals`). A `supersedes` confers when
+its chain reaches a `delegates_to` signed by the same root at every link. A
+grant its own root has superseded is not a candidate, and a withdrawn
+successor does not revive it. Someone else's `supersedes` neither retires the
+grant nor confers. A `withdraws` still kills at once. The family-quorum arm
+reads the same live set.
+
+The walk answers "does the subject hold this scope now". No read in persist
+answers the T2 question "did a past claim, made before the successor, have
+standing": every caller of the walk resolves at use. The lineage that read
+would follow is kept, because nothing is deleted and each successor names
+what it replaced.
+
+I383–I386 (memory, sqlite, postgres): the successor confers and the head of
+a two-rotation chain confers; a narrowing successor narrows; a withdrawn
+successor confers nothing and revives nothing, and a withdrawn grant is gone;
+a foreign `supersedes` neither retires the grant nor confers. I383–I385 were
+RED before the change. I386 is the control and was green before and after.
+
+### #965 — the identity re-signing a pair does not demote the occurrence's consent
+
+`federation_identity_occurrences` is keyed `(identity, occurrence)` and
+last-signed-wins. The #932 resolver (`active_identities_for_occurrence`) read
+the occurrence's agreement off that current row. So when `self_at_login`
+named a node's own engine occurrence N as `app`, it published an O-signed
+row. That row replaced the row N had signed itself, and the binding then
+resolved nothing. N stopped being party to its owner's rooms, which surfaced
+far away as `NotPartyTo` at adopt (CIRISEdge#768). The V161 history (#930)
+still held N's agreement, and I271 already said a re-signing does not erase
+it. The resolver now reads agreement from that history through
+`occurrence_agreed_to`, so the two folds agree. An identity's claim the
+occurrence never agreed to still resolves nothing (#932). No door changed and
+no row is refused.
+
+I381 (memory, sqlite, postgres): after the identity re-signs a consented pair,
+the owner is still the principal, and an unagreed claim resolves nothing.
+I382 (sqlite, postgres) follows the issue's shape: provision the engine
+occurrence, run `self_at_login` with `app` = the engine key, and the owner is
+still the node's principal. Both witnesses were RED on the old resolver.
+
+### #966 — a shared-backend Engine tells the backend its node key
+
+`Engine::from_shared` and `from_shared_with_local` built an Engine over a
+host's live backend and never told that backend its node key, which
+`with_signer` has done at construction since #607. The backend's own receive
+doors (an owner-binding or a device's occurrence arriving over sync, no
+signer in hand) re-wrap "this node's" epochs only under a known node key, so
+a host that opened its own backend and handed it to `from_shared*` re-wrapped
+nothing for a member's late device. Only the Engine's #916 doors healed it,
+lazily. Both shared constructors now derive the key id with one poll of
+`local_derived_key_id` and set it when the backend has none. The id is the one
+`register_self_federation_key` uses. A signer that does not answer on the
+first poll (a hardware round-trip) leaves the key to that lazy path; the
+constructor never guesses an id. The constructors stay synchronous.
+
+I380 (sqlite, postgres; the memory backend has no community-DEK plane):
+both constructors over a freshly opened handle set the node key, and the
+backend's own `apply_replicated_attestation` re-wraps epoch 0 to bob's late
+device. It was RED before the fix (`node_key_id` was `None`).
+
+### #971 — the evidence rows for CLM-membership-consent (CC 3.1.3.2)
+Evidence only. `evidence/cc_impl.tsv` gains four rows under `CLM-membership-consent`, naming the #955 code that v52 shipped: the growth gate `membership_acceptance.rs#check_growth_accepted`, the founding-signers checks `#check_founding_signers` and `#check_community_founding_signers`, and the supersede refusal `#check_supersede_adds_no_member`. The exact-count pin in `supersets.rs` moves 160 → 164.
+
 ### #973 — a charter silent on witness_quorum, or declaring 0, is in witnessed mode off
 CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quorum = 0`: silence and `0` are one state, witnessed mode off, and "a substrate MUST NOT substitute an internal default". Persist substituted a default of 1 (`DEFAULT_WITNESS_QUORUM`) for a silent charter and read `0` as `1`.
 

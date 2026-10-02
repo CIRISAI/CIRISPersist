@@ -1627,6 +1627,104 @@ where
     .await
 }
 
+/// v53.0.0 (CC 3.2 T2) — how far a `supersedes` chain is followed back to the
+/// `delegates_to` it rotates. A chain longer than this is not walked to its
+/// root and so confers nothing (fail-closed): a root rotates a grant a handful
+/// of times, not this many.
+const MAX_GRANT_ROTATIONS: usize = 64;
+
+/// v53.0.0 (CC 3.2 T2, steward ruling 2026-10-01) — **the conferral-shaped
+/// rows that confer NOW**: rotation is a `supersedes`, compromise is a
+/// `withdraws`.
+///
+/// > A grant that is **superseded** — the root issues the successor grant, to
+/// > a rotated key or with a changed scope, as a `supersedes` on the old one —
+/// > keeps its lineage: a claim made under the superseded grant, with
+/// > `asserted_at` before the successor's, keeps the standing it had, and a
+/// > reader walks the `supersedes` chain to find it. A grant that is
+/// > **withdrawn** or tombstoned has no successor and no lineage to walk:
+/// > standing under it is gone at once, for every claim ever made under it.
+///
+/// - A `supersedes` confers only as a **successor**: its chain, followed
+///   through `references_attestation_id`, reaches a `delegates_to` and every
+///   link is signed by the same root. Anyone else's `supersedes` over the
+///   root's grant is not a rotation of it.
+/// - A grant (or successor) the SAME root has superseded is not a candidate:
+///   its successor is. That holds whether or not the successor still confers,
+///   so withdrawing a successor does not revive what it replaced.
+///
+/// Before v53 a `supersedes` (never a retraction in the §6.1 fold) left the
+/// superseded grant live, so a narrowed scope never narrowed, and the
+/// successor, not a `delegates_to`, conferred nothing.
+///
+/// What this does NOT answer: the standing of a PAST claim made under a
+/// superseded grant. That is an as-of read (`asserted_at` before the
+/// successor's), and no caller of this walk asks it: every caller resolves
+/// standing at use, now. The lineage it would walk is kept (the superseded
+/// row is never deleted and its successor names it).
+async fn live_conferrals<'a, F>(
+    directory: &F,
+    shaped: Vec<&'a Attestation>,
+) -> Result<Vec<&'a Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut live = Vec::with_capacity(shaped.len());
+    for row in shaped {
+        if row.attestation_type == attestation_type::SUPERSEDES
+            && !rotates_own_grant(directory, row).await?
+        {
+            continue;
+        }
+        let superseded = directory
+            .list_attestations_referencing(&row.attestation_id)
+            .await?
+            .iter()
+            .any(|r| {
+                r.attestation_type == attestation_type::SUPERSEDES
+                    && r.attesting_key_id == row.attesting_key_id
+                    && r.attestation_id != row.attestation_id
+            });
+        if !superseded {
+            live.push(row);
+        }
+    }
+    Ok(live)
+}
+
+/// Does the `supersedes` `succ` rotate a grant its own signer made — its chain
+/// reaching a `delegates_to`, every link by the same key?
+async fn rotates_own_grant<F>(directory: &F, succ: &Attestation) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut cur_target =
+        super::precedence::references_attestation_id_from_envelope(&succ.attestation_envelope)
+            .map(str::to_owned);
+    for _ in 0..MAX_GRANT_ROTATIONS {
+        let Some(target_id) = cur_target.take() else {
+            return Ok(false);
+        };
+        let Some(target) = directory.get_attestation(&target_id).await? else {
+            return Ok(false);
+        };
+        if target.attesting_key_id != succ.attesting_key_id {
+            return Ok(false);
+        }
+        if target.attestation_type == attestation_type::DELEGATES_TO {
+            return Ok(true);
+        }
+        if target.attestation_type != attestation_type::SUPERSEDES {
+            return Ok(false);
+        }
+        cur_target = super::precedence::references_attestation_id_from_envelope(
+            &target.attestation_envelope,
+        )
+        .map(str::to_owned);
+    }
+    Ok(false)
+}
+
 /// v22.1.0 (CIRISPersist#548) — the roster-parameterized core of
 /// [`capability_roots_to_trusted_root`], mirroring the
 /// [`has_accord_conferred_role`](super::admission::has_accord_conferred_role) /
@@ -1666,8 +1764,12 @@ where
     // non-expired — #488 delta 3) scoped delegates_to edge to the subject
     // (excluding a self-grant). Dedup so a root that granted twice is
     // walked once.
+    // v53.0.0 (CC 3.2 T2) — a successor grant is a `supersedes` carrying the
+    // conferral body; it is conferral-shaped too, and `live_conferrals` below
+    // admits it only when it rotates its own root's grant.
     let conferral_shaped = |a: &&Attestation| {
-        a.attestation_type == attestation_type::DELEGATES_TO
+        (a.attestation_type == attestation_type::DELEGATES_TO
+            || a.attestation_type == attestation_type::SUPERSEDES)
             && a.attested_key_id == subject_key_id
             && a.attesting_key_id != subject_key_id
             && !dead.contains(&a.attestation_id)
@@ -1680,10 +1782,19 @@ where
             && scope_contains(&a.attestation_envelope, scope)
     };
 
+    // v53.0.0 (CC 3.2 T2, steward ruling 2026-10-01) — rotation is a
+    // `supersedes`, compromise is a `withdraws`. This walk answers "does the
+    // subject hold `scope` NOW", so the head of a grant's `supersedes` chain
+    // is the live candidate and every grant it superseded is not; a withdrawn
+    // link (`dead`) confers nothing and revives nothing. See
+    // [`live_conferrals`].
+    let shaped: Vec<&Attestation> = about_subject.iter().filter(conferral_shaped).collect();
+    let live = live_conferrals(directory, shaped).await?;
+
     let mut seen = std::collections::HashSet::new();
-    let candidates: Vec<(&str, &str)> = about_subject
+    let candidates: Vec<(&str, &str)> = live
         .iter()
-        .filter(conferral_shaped)
+        .copied()
         .filter(|a| seen.insert(a.attesting_key_id.clone()))
         .map(|a| (a.attesting_key_id.as_str(), a.attestation_id.as_str()))
         .collect();
@@ -1713,7 +1824,7 @@ where
     // crypto) and BEFORE the ceremony arm, matching the cheapest-first ordering
     // this walk has always used.
     let mut family_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for grant in about_subject.iter().filter(conferral_shaped) {
+    for grant in live.iter().copied() {
         let families = match directory
             .list_families_for_member(&grant.attesting_key_id)
             .await
