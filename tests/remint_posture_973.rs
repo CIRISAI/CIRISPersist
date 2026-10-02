@@ -304,34 +304,72 @@ async fn i365_absent_installs_or_stays_absent() {
     }
 }
 
-/// I362 on postgres, when a test database is provided.
+/// A database of this test's own, in the cluster `CIRIS_PERSIST_TEST_PG_URL`
+/// points at. The integration binaries all receive ONE database from
+/// `scripts/pg_test_db.sh`; a second ceremony seeded into it (other seeds,
+/// the same holder ids) reads as anchor squatting to whichever test runs
+/// next. Named `ciris_t_<pid>_<nanos>`, the prefix the harness reaps by PID.
+#[cfg(feature = "postgres")]
+async fn own_pg_database(base: &str) -> (String, String, String) {
+    let cut = base.rfind('/').expect("dsn has a database");
+    let name = format!(
+        "ciris_t_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let (admin, conn) = tokio_postgres::connect(base, tokio_postgres::NoTls)
+        .await
+        .expect("connect to the base test database");
+    tokio::spawn(conn);
+    admin
+        .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+        .await
+        .expect("create this test's database");
+    (format!("{}/{name}", &base[..cut]), base.to_owned(), name)
+}
+
+/// I362 on postgres, when a test database is provided
+/// (`scripts/pg_test_db.sh -- …`).
 #[cfg(feature = "postgres")]
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i362_refused_newer_bake_postgres() {
-    let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+    let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
         eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
         return;
     };
+    let (dsn, base, name) = own_pg_database(&base).await;
     let old = mint_at(at(-3600), None);
     let _armed = Armed::with(&old.block);
-    let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
-        .await
-        .unwrap();
-    b.run_migrations().await.unwrap();
-    b.seed_genesis_accord_holders(&effective_accord_holder_records())
-        .await
-        .expect("seed holders");
-    boot_seeded(&b, &old, "postgres").await;
-    let future = mint_at(at(900), None);
-    install(&future);
-    assert!(matches!(
-        seed_family_and_canonical(&b).await,
-        Err(GenesisFault::Absent { .. })
-    ));
-    let posture = genesis_posture(&b).await;
-    assert!(
-        pre_genesis_delegation(&posture).is_some(),
-        "postgres I362: {posture:?}"
-    );
+    {
+        let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b.seed_genesis_accord_holders(&effective_accord_holder_records())
+            .await
+            .expect("seed holders");
+        boot_seeded(&b, &old, "postgres").await;
+        let future = mint_at(at(900), None);
+        install(&future);
+        assert!(matches!(
+            seed_family_and_canonical(&b).await,
+            Err(GenesisFault::Absent { .. })
+        ));
+        let posture = genesis_posture(&b).await;
+        assert!(
+            pre_genesis_delegation(&posture).is_some(),
+            "postgres I362: {posture:?}"
+        );
+    }
+    // Best effort: the harness reaps `ciris_t_<pid>_*` of dead processes too.
+    if let Ok((admin, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
+        tokio::spawn(conn);
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await;
+    }
 }

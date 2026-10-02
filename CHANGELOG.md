@@ -146,7 +146,19 @@ A verified holder statement that does not supersede the bake is `Absent`, not `D
 
 **Witnesses** (`tests/remint_posture_973.rs`, software ceremony + seam; sqlite and memory, I362 also on postgres): I360 identical; I361 newer admitted; **I362** newer refused (RED: `Entrenched`); **I363** equal vintage (RED: `Entrenched`); I364 bake older; I365 absent. The unit witness `equal_vintage_is_not_a_successor_665` now also drives the RAW bundle row, the caller's shape its fixture had normalized away. `mint_test_ceremony_scoped` mints same-instant ceremonies with different signed content (test-anchor only).
 
-**Mutation round:** MUTATION_TABLE_973H
+**Mutation round** (on the committed tree; lane = the two ceremony binaries + the genesis unit tests under `sqlite test-anchor`; M7 on the store-level squat witnesses): 6 killed, 1 equivalent.
+
+| Mutant | Result |
+|---|---|
+| M1 the predicate compares the RAW baked row (the defect) | killed: I362, I363, the unit witness |
+| M2 a non-superseding holder statement is accepted (arm removed) | killed: I362, I363 |
+| M3 a non-superseding holder statement is `Divergent` (bricks the boot) | killed: I353, I362, I363 |
+| M4 a successor may tie (`>=`) | killed: I363, the unit witness |
+| M5 an unnormalizable bake reads as superseded | equivalent: the leg returns `Unreadable` from `baked_row_matches_stored` on the same failure before the predicate is asked |
+| M6 a newer stored row is not accepted | killed: I364, the unit witness |
+| M7 an unverifiable stored row is tolerated (substitution arm removed) | killed: `injected_genesis_squat_is_divergent_{memory,sqlite}_660` |
+
+Postgres: the witnesses' lane with the `_665` / `_660` store suites, 82/82; the postgres I362 runs in a database of its own, because the integration binaries share one and a second ceremony there reads as anchor squatting.
 
 ### #973 — the software ceremony minter and the outputs verifier
 For CIRISServer's dry run of the 0.5.219 re-mint, and to close the gaps the boot-leg section above listed.
