@@ -81,9 +81,9 @@ pub(crate) mod bodies {
         holders: &[String],
         extra: serde_json::Value,
     ) -> crate::federation::Attestation {
-        let commitment = crate::federation::trust_root::pre_rotation_commitment(&[
-            crate::federation::trust_root::test_committed_key(&format!("{family}-succ-a")),
-            crate::federation::trust_root::test_committed_key(&format!("{family}-succ-b")),
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&[
+            format!("{family}-succ-a"),
+            format!("{family}-succ-b"),
         ])
         .unwrap();
         let mut env = serde_json::json!({
@@ -587,8 +587,8 @@ pub(crate) mod bodies {
                 "dimension": TRUST_CHARTER_DIMENSION,
                 "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
                 "attach_window_secs": 4242,
-                "pre_rotation_commitment": crate::federation::trust_root::pre_rotation_commitment(
-                    &[crate::federation::trust_root::test_committed_key(&format!("{root}-succ"))]
+                "pre_rotation_commitment": crate::federation::trust_root::test_pre_rotation_commitment(
+                    &[format!("{root}-succ")]
                 ).unwrap(),
             }),
             &[],
