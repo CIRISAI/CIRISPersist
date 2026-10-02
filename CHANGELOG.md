@@ -213,7 +213,24 @@ CC 6.1.5.3 ("durability at every tier"): the target-replication machinery runs b
 | M5 the self audience from the author, not its principals | killed — I410 |
 | M6 a group scope with no group resolves to everyone | killed — I411 (after a leg was added; it survived the first run) |
 
-**Adopters.** Edge (#763): call `resolve_projection_recipients` with `Plane::FountainContent` for self/family holdings exactly as for community ones, passing the content's group (`self`: the owner's key; `family`: the family key) and the peer's NODE key, both to decide who is told and whose holding claim is admitted; size the target with `durability_mode`. Server (#704): nothing new to call yet.
+- **The deficit** (`durability::durability_deficit`, `Engine::durability_deficit`, Python `durability_deficit_json`): `{sha256_hex, audience: {kind: nodes|everyone|unresolvable, nodes?}, live_here, missing, mode}` — the blob's audience minus the audience nodes whose custody verdict is a live `here` (S2's fold, 72 h at the reader's clock, never re-derived); `received`, `none`, `unknown` and a lapsed `here` are missing; a node outside the audience is never listed and its `here` is never a copy. Authorized like the custody view (a stranger is `NotGranted`). `deficit_over` is the directory-only core.
+- **A DAG is `here` only with every chunk.** `custody_ack_input_for` (the engine's own report) asks `chunk_dag_cascade::orchestrate::held_dag_completeness` as this node: a manifest held with a chunk missing is refused `custody_ack_here_dag_incomplete` (naming the seqs), a `chunk_dag` row whose manifest this node cannot open `custody_ack_here_dag_unverifiable`. An adopted manifest not yet promoted (`inline`) is recognized by opening it. Residual: an inline manifest this node cannot open is reported by its row. `none` is always reportable.
+- **S1 × S2 seam (fixtures):** since S1 a key no owner has claimed is in no `self` cohort, so S2's fixture devices that place `self` reports are now claimed laptops of an owner; the room-roster devices of I406/I408 stay unclaimed, and I408's self leg uses a claimed device. No production change: the engine's own node (I400e) was always a claimed device.
+- Witnesses I415, I416 (memory, sqlite, postgres), I415b (sqlite, postgres; the engine: the origin's complete DAG is `here` and counted, an evicted chunk refuses `here` and the deficit lists the node, an adopted unpromoted manifest with no chunks refuses `here`, a stranger is refused the deficit).
+
+**Mutation round 2** (on `da7cc066`; lane = durability + custody witnesses, sqlite): seven mutants, seven killed.
+
+| Mutant | Result |
+|---|---|
+| M7 any report is a copy (live-here vs any-ack) | killed — I415, I416 |
+| M8 a lapsed `here` counted live (the fold's clock dropped) | killed — I416 |
+| M9 the custody view's verdicts ignored | killed — I416 |
+| M10 the node's own `here` skips the DAG check | killed — I415b |
+| M11 an incomplete DAG reads complete | killed — I415b |
+| M12 an `inline` row is never a DAG | killed — I415b (the adopted leg) |
+| M13 a node outside the audience is listed | killed — I415, I416 |
+
+**Adopters.** Edge (#763): call `resolve_projection_recipients` with `Plane::FountainContent` for self/family holdings exactly as for community ones, passing the content's group (`self`: the owner's key; `family`: the family key) and the peer's NODE key, both to decide who is told and whose holding claim is admitted; size the target with `durability_mode`; run rarest-first and repair over `durability_deficit`'s `missing`. A custody `here` filed through persist's door asserts the WHOLE DAG (manifest and every chunk) is held; refile `here` after repairing a chunk. Server (#704): show `durability_deficit_json` (`missing` = devices the owner's content does not yet live on; `received` and stale reports count as missing); report `here` only through `put_custody_ack`, which refuses a partial DAG by name.
 
 ### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
 
