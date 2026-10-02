@@ -1360,13 +1360,15 @@ pub(crate) mod bodies {
     }
 
     /// (o″) — the counting rule (round 9 ruling) and the lapse trace. F2
-    /// resigns at t1, after the birth. The other founders' v6 that still
-    /// RECORDS F2 is admitted on the replicated chain door: F2 counts as
-    /// nothing, so the row reads Stalled, naming F2. v6 → v7: F2's resignation
-    /// lies in (seated_since(F2) = the birth, t7], so F2 with F0 produces no v7
-    /// on either door — the resignation did not lapse although v6's instant is
-    /// after it. F0 + F1 amend F2 out (Rooted), then RE-SEAT F2, so
-    /// seated_since(F2) = t8 > t1: F2 counts again and co-signs a later link.
+    /// resigns at t1, after the birth: the held birth reads Stalled, naming
+    /// F2. v53.0.0 (CC 3.2 T6, rc7 `36432c6`, consequence (i)) — the other
+    /// founders' v6 that still RECORDS F2 is refused on the replicated chain
+    /// door: the resignation is a roster row the version must cover (before
+    /// T6 it was admitted, Stalled). Birth → v7: F2's resignation lies in
+    /// (seated_since(F2) = the birth, t7], so F2 with F0 produces no v7 on
+    /// either door, even a v7 that drops F2. F0 + F1 amend F2 out (Rooted),
+    /// then RE-SEAT F2, so seated_since(F2) = t8 > t1: F2 counts again and
+    /// co-signs a later link.
     pub async fn o3_a_resignation_does_not_lapse(d: &dyn FederationDirectory) {
         let holders = stand_up(d).await;
         put_conferred(d, &holders, "rr-steward", "user,steward").await;
@@ -1389,14 +1391,20 @@ pub(crate) mod bodies {
             |_| {},
         )
         .await;
-        d.put_community(offered)
+        let e = d
+            .put_community(offered)
             .await
-            .expect("a later version MAY still record the resigned founder");
+            .expect_err("a later version still recording the resigned founder is refused");
+        assert!(
+            matches!(&e, Error::LineageVersionDisagreesWithFold { keys, .. }
+                if keys == &[FOUNDERS[2].to_owned()]),
+            "{e:?}"
+        );
         match cc::stored_standing(d, CANON).await.unwrap() {
             cc::StoredStanding::Stalled { reason, .. } => {
                 assert!(reason.contains(FOUNDERS[2]), "{reason}")
             }
-            other => panic!("a version recording a resigned founder is Stalled: {other:?}"),
+            other => panic!("the birth with a resigned founder is Stalled: {other:?}"),
         }
         // v51.0.0 (CC 3.2 T7, PR #943 review): stalled is valid but
         // non-admitting — still served, not live.
@@ -1408,10 +1416,15 @@ pub(crate) mod bodies {
                 .live
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        // The lapse: v6's instant is after F2's resignation, but F2 was seated
-        // at the birth, so the resignation still un-counts F2 on v6 → v7.
+        // The lapse: F2 was seated at the birth, so the resignation un-counts
+        // F2 on birth → v7. Each v7 drops F2 (it covers the resignation), so
+        // the refusal is the counting rule's, never consequence (i)'s.
         for v7 in [
-            with_member(v6.clone(), "rr2-serve-node", "member"),
+            with_member(
+                swapped(v6.clone(), FOUNDERS[2], "rr-steward"),
+                "rr2-serve-node",
+                "member",
+            ),
             swapped(v6.clone(), FOUNDERS[2], "rr-steward"),
         ] {
             assert!(
@@ -1705,9 +1718,12 @@ pub(crate) mod bodies {
     /// Node `b` holds H2 (t2), signed by F0 + F1 and still recording F2. F2
     /// resigns at t_r, t1 < t_r ≤ t2, having NOT signed H2: `a` admits the
     /// resignation (after its head) and `b` refuses it (`resignation_backdated`).
-    /// `a` then ADMITS H2, F2 counting as nothing: `a` Stalled, `b` Rooted.
-    /// H3 amends F2 out on `b`; `a` admits it; both read Rooted on H3. No
-    /// re-birth.
+    /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`, consequence (i)) — `a` then REFUSES
+    /// H2 alone: on `a` the resignation is a row H2 does not cover (before T6
+    /// it was admitted, F2 counting as nothing). `a` stays Stalled on H1, `b`
+    /// Rooted on H2. H3 amends F2 out on `b`; `a` admits the chain H1 → H2 → H3
+    /// (H3 answers for the rows after H2, which covered nothing it missed);
+    /// both read Rooted on H3. No re-birth.
     pub async fn x_a_resignation_split_converges(
         a: &dyn FederationDirectory,
         b: &dyn FederationDirectory,
@@ -1749,14 +1765,20 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .unwrap();
-        a.put_community(h2)
+        let e = a
+            .put_community(h2)
             .await
-            .expect("a admits H2: F2 counts as nothing, F0 and F1 are the quorum");
+            .expect_err("a refuses H2 alone: it does not cover a's resignation row");
+        assert!(
+            matches!(&e, Error::LineageVersionDisagreesWithFold { keys, .. }
+                if keys == &[FOUNDERS[2].to_owned()]),
+            "{e:?}"
+        );
         match cc::stored_standing(a, CANON).await.unwrap() {
             cc::StoredStanding::Stalled { reason, .. } => {
                 assert!(reason.contains(FOUNDERS[2]), "{reason}")
             }
-            other => panic!("a holds H2 with a resigned founder recorded: {other:?}"),
+            other => panic!("a holds H1 with a resigned founder: {other:?}"),
         }
         assert!(matches!(
             cc::stored_standing(b, CANON).await.unwrap(),
@@ -1776,7 +1798,7 @@ pub(crate) mod bodies {
             .unwrap();
         a.put_community(h3.clone())
             .await
-            .expect("a admits H3 from its stalled H2");
+            .expect("a admits H3 over its stalled H1, walking H2");
         for d in [a, b] {
             match cc::stored_standing(d, CANON).await.unwrap() {
                 cc::StoredStanding::Rooted(held) => assert_eq!(
@@ -1821,8 +1843,9 @@ pub(crate) mod bodies {
     }
 
     /// (y) — rounds 9 and 10: an offered lineage cannot re-date a founder's
-    /// seat. `a` holds v1 → v3 (v3 still records F2, who resigned after v1:
-    /// Stalled). The founders also signed another path to the SAME content:
+    /// seat. `a` holds v1 → v3 (v3 records F2, who resigns after v3: Stalled —
+    /// v53.0.0, CC 3.2 T6: a v3 signed after the resignation would have to
+    /// cover it, so the resignation now follows v3). The founders also signed another path to the SAME content:
     /// v1 → v2b (F2 out) → v3′ (F2 back, content equal to v3), which would
     /// date F2's seat after the resignation. A v4 over that path does not
     /// extend the version `a` holds (the held version is matched by position
@@ -1842,18 +1865,18 @@ pub(crate) mod bodies {
             .await
             .unwrap()
             .unwrap();
-        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
-            .await
-            .expect("F2 resigns after the birth");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let v3_body = with_member(canonical_row(&FOUNDERS), "ys-serve-node", "member");
         founders_supersede(d, v3_body.clone(), &[FOUNDERS[0], FOUNDERS[1]])
             .await
-            .expect("v3 still records F2");
+            .expect("v3 records F2");
         let held = cc::lookup_signed_community(d, CANON)
             .await
             .unwrap()
             .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        d.put_community_membership_revocation(founder_revocation(&[FOUNDERS[2]], FOUNDERS[2]))
+            .await
+            .expect("F2 resigns after v3");
         assert!(matches!(
             cc::stored_standing(d, CANON).await.unwrap(),
             cc::StoredStanding::Stalled { .. }
@@ -1905,6 +1928,10 @@ pub(crate) mod bodies {
                 .expect_err("another path to the held content does not extend the held version");
             assert_violation(&e, "does not extend");
         }
+        // v53.0.0 (CC 3.2 T6) — over the held chain the v4 covers the
+        // resignation (drops F2), so consequence (i) passes and the refusal
+        // below is the counting rule's.
+        let v4_body = swapped(v4_body, FOUNDERS[2], "ys-steward");
         let by_f2 = link_by_hand(
             d,
             &held,
@@ -2744,9 +2771,28 @@ pub(crate) mod bodies {
         // Seats move through the record instead.
         ts::register_hybrid_key_as(d, "cc9-serve-node", "cc9-serve-node", identity_type::NODE)
             .await;
-        founders_supersede(
+        // v53.0.0 (CC 3.2 T6, rc7 `36432c6`, consequence (i)) — the serve
+        // node's join is a roster row the version must cover: a version built
+        // from the base row without it disagrees with the fold.
+        let e = founders_supersede(
             d,
             swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "x4-steward"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect_err("a version that drops the plane's serve node is refused");
+        assert!(
+            matches!(&e, Error::LineageVersionDisagreesWithFold { keys, .. }
+                if keys == &["cc3-serve-node".to_owned()]),
+            "{e:?}"
+        );
+        founders_supersede(
+            d,
+            with_member(
+                swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "x4-steward"),
+                "cc3-serve-node",
+                "member",
+            ),
             &[FOUNDERS[0], FOUNDERS[1]],
         )
         .await

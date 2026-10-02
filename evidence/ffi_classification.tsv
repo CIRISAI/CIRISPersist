@@ -22,7 +22,7 @@
 # CC asked for this file because 53 testimonial rows living only in a gated TSV
 # is itself a testimonial-class state: the class should not exemplify its own wrong.
 #
-# Counts at this revision: empirical=197 deontic=174 testimonial=41 structural=40 procedural=39 ontological=34 epistemic=32 axiotic=19 nomological=16 pragmatic=6 axiomatic=3
+# Counts at this revision: empirical=197 deontic=174 testimonial=42 structural=40 procedural=39 ontological=34 epistemic=33 axiotic=19 nomological=16 pragmatic=6 axiomatic=3
 #
 class	binding	class_count	owner	symbol	frame
 axiomatic	binding	3	MODULE	namespace_manifest_version	
@@ -418,38 +418,39 @@ empirical	descriptive	197	Engine	wa_cert_get_by_kid
 empirical	descriptive	197	Engine	wa_cert_get_by_oauth	
 empirical	descriptive	197	Engine	wa_cert_list_by_role	
 empirical	descriptive	197	Engine	wa_cert_update_last_login	
-epistemic	descriptive	32	Engine	age_band_fine_json	
-epistemic	descriptive	32	Engine	age_band_json	
-epistemic	descriptive	32	Engine	blob_custody_json	
-epistemic	descriptive	32	Engine	cache_budget_bytes	
-epistemic	descriptive	32	Engine	cache_usage_bytes	
-epistemic	descriptive	32	Engine	capacity_state_json	
-epistemic	descriptive	32	Engine	corpus_shape	
-epistemic	descriptive	32	Engine	cross_agent_divergence	
-epistemic	descriptive	32	Engine	describe_crossing	
-epistemic	descriptive	32	Engine	disk_pressure_state	
-epistemic	descriptive	32	Engine	get_repository_statistics	
-epistemic	descriptive	32	Engine	lineage_head_json	
-epistemic	descriptive	32	Engine	list_signed_accord_quorum_evidence_since	
-epistemic	descriptive	32	Engine	list_signed_communities_since	
-epistemic	descriptive	32	Engine	list_signed_community_membership_revocations_since	
-epistemic	descriptive	32	Engine	list_signed_families_since	
-epistemic	descriptive	32	Engine	list_signed_family_membership_revocations_since	
-epistemic	descriptive	32	Engine	list_signed_identity_occurrence_revocations_since	
-epistemic	descriptive	32	Engine	list_signed_identity_occurrences_for_json	
-epistemic	descriptive	32	Engine	list_signed_identity_occurrences_since	
-epistemic	descriptive	32	Engine	list_signed_key_records_since	
-epistemic	descriptive	32	Engine	list_signed_location_proofs_since	
-epistemic	descriptive	32	Engine	list_signed_partner_records_since	
-epistemic	descriptive	32	Engine	list_signed_revocations_since	
-epistemic	descriptive	32	Engine	list_signed_transport_destinations_since	
-epistemic	descriptive	32	Engine	node_state_json	
-epistemic	descriptive	32	Engine	peer_quota_observation_json	
-epistemic	descriptive	32	Engine	secrets_is_healthy	
-epistemic	descriptive	32	Engine	secrets_test_encryption	
-epistemic	descriptive	32	Engine	temporal_drift	
-epistemic	descriptive	32	Engine	verify_trace	
-epistemic	descriptive	32	ScoringFactorStream	summary	
+epistemic	descriptive	33	Engine	age_band_fine_json	
+epistemic	descriptive	33	Engine	age_band_json	
+epistemic	descriptive	33	Engine	blob_custody_json	
+epistemic	descriptive	33	Engine	cache_budget_bytes	
+epistemic	descriptive	33	Engine	cache_usage_bytes	
+epistemic	descriptive	33	Engine	capacity_state_json	
+epistemic	descriptive	33	Engine	corpus_shape	
+epistemic	descriptive	33	Engine	cross_agent_divergence	
+epistemic	descriptive	33	Engine	custody_view_json	
+epistemic	descriptive	33	Engine	describe_crossing	
+epistemic	descriptive	33	Engine	disk_pressure_state	
+epistemic	descriptive	33	Engine	get_repository_statistics	
+epistemic	descriptive	33	Engine	lineage_head_json	
+epistemic	descriptive	33	Engine	list_signed_accord_quorum_evidence_since	
+epistemic	descriptive	33	Engine	list_signed_communities_since	
+epistemic	descriptive	33	Engine	list_signed_community_membership_revocations_since	
+epistemic	descriptive	33	Engine	list_signed_families_since	
+epistemic	descriptive	33	Engine	list_signed_family_membership_revocations_since	
+epistemic	descriptive	33	Engine	list_signed_identity_occurrence_revocations_since	
+epistemic	descriptive	33	Engine	list_signed_identity_occurrences_for_json	
+epistemic	descriptive	33	Engine	list_signed_identity_occurrences_since	
+epistemic	descriptive	33	Engine	list_signed_key_records_since	
+epistemic	descriptive	33	Engine	list_signed_location_proofs_since	
+epistemic	descriptive	33	Engine	list_signed_partner_records_since	
+epistemic	descriptive	33	Engine	list_signed_revocations_since	
+epistemic	descriptive	33	Engine	list_signed_transport_destinations_since	
+epistemic	descriptive	33	Engine	node_state_json	
+epistemic	descriptive	33	Engine	peer_quota_observation_json	
+epistemic	descriptive	33	Engine	secrets_is_healthy	
+epistemic	descriptive	33	Engine	secrets_test_encryption	
+epistemic	descriptive	33	Engine	temporal_drift	
+epistemic	descriptive	33	Engine	verify_trace	
+epistemic	descriptive	33	ScoringFactorStream	summary	
 nomological	descriptive	16	Engine	audit_canonicalize_for_hash	
 nomological	descriptive	16	Engine	audit_canonicalize_for_signing	
 nomological	descriptive	16	Engine	canonicalize_envelope	
@@ -585,44 +586,45 @@ structural	binding	40	ScoringFactorStream	__anext__
 structural	binding	40	ScoringFactorStream	__iter__	
 structural	binding	40	ScoringFactorStream	__len__	
 structural	binding	40	ScoringFactorStream	__next__	
-testimonial	binding	41	Engine	audit_chain_proof	self_audit
-testimonial	binding	41	Engine	audit_list_entries	self_audit
-testimonial	binding	41	Engine	audit_next_chain_position	self_audit
-testimonial	binding	41	Engine	audit_record_entry	self_audit
-testimonial	binding	41	Engine	audit_verify_all_chains	self_audit
-testimonial	binding	41	Engine	audit_verify_chain	self_audit
-testimonial	binding	41	Engine	cirisnode_put_delivery_attestation	delivery_event
-testimonial	binding	41	Engine	compare_wholeness_witnesses_json	equivocation_evidence
-testimonial	binding	41	Engine	current_sth	log_commitment
-testimonial	binding	41	Engine	delete_traces_for_agent	erasure_effect
-testimonial	binding	41	Engine	delete_traces_for_agent_id_hash	erasure_effect
-testimonial	binding	41	Engine	descend_aggregated_sources	erasure_effect
-testimonial	binding	41	Engine	evict_fountain_content_hard_delete	erasure_effect
-testimonial	binding	41	Engine	hash_chain_gaps	self_audit
-testimonial	binding	41	Engine	latest_stream_sth	log_commitment
-testimonial	binding	41	Engine	ledger_list_fork_evidence	equivocation_evidence
-testimonial	binding	41	Engine	ledger_put_checkpoint	log_commitment
-testimonial	binding	41	Engine	ledger_record_fork_evidence	equivocation_evidence
-testimonial	binding	41	Engine	list_delivery_receipts_for	delivery_event
-testimonial	binding	41	Engine	list_witness_equivocations_json	equivocation_evidence
-testimonial	binding	41	Engine	lookup_signed_record_by_content_hash	upstream_attestation
-testimonial	binding	41	Engine	maintenance_archive_expired	erasure_effect
-testimonial	binding	41	Engine	maintenance_prune_audit_chain	self_audit
-testimonial	binding	41	Engine	next_sequence	self_audit
-testimonial	binding	41	Engine	peek_sequence	self_audit
-testimonial	binding	41	Engine	provenance_chain	self_audit
-testimonial	binding	41	Engine	put_delivery_receipt	delivery_event
-testimonial	binding	41	Engine	put_stream_sth	log_commitment
-testimonial	binding	41	Engine	put_wholeness_witness_json	equivocation_evidence
-testimonial	binding	41	Engine	rebuild_signed_wire_index	upstream_attestation
-testimonial	binding	41	Engine	receive_and_persist	upstream_attestation
-testimonial	binding	41	Engine	run_retention	erasure_effect
-testimonial	binding	41	Engine	seal_stream	log_commitment
-testimonial	binding	41	Engine	stream_chunks_json	log_commitment
-testimonial	binding	41	Engine	stream_consistency_proof	log_commitment
-testimonial	binding	41	Engine	stream_inclusion_proof	log_commitment
-testimonial	binding	41	Engine	sweep_ttl_expired	erasure_effect
-testimonial	binding	41	Engine	trust_grant_consistency_proof	log_commitment
-testimonial	binding	41	Engine	trust_grant_inclusion_proof	log_commitment
-testimonial	binding	41	Engine	tsdb_prune_summaries	erasure_effect
-testimonial	binding	41	Engine	verify_locale_inclusion_json	log_commitment
+testimonial	binding	42	Engine	audit_chain_proof	self_audit
+testimonial	binding	42	Engine	audit_list_entries	self_audit
+testimonial	binding	42	Engine	audit_next_chain_position	self_audit
+testimonial	binding	42	Engine	audit_record_entry	self_audit
+testimonial	binding	42	Engine	audit_verify_all_chains	self_audit
+testimonial	binding	42	Engine	audit_verify_chain	self_audit
+testimonial	binding	42	Engine	cirisnode_put_delivery_attestation	delivery_event
+testimonial	binding	42	Engine	compare_wholeness_witnesses_json	equivocation_evidence
+testimonial	binding	42	Engine	current_sth	log_commitment
+testimonial	binding	42	Engine	delete_traces_for_agent	erasure_effect
+testimonial	binding	42	Engine	delete_traces_for_agent_id_hash	erasure_effect
+testimonial	binding	42	Engine	descend_aggregated_sources	erasure_effect
+testimonial	binding	42	Engine	evict_fountain_content_hard_delete	erasure_effect
+testimonial	binding	42	Engine	hash_chain_gaps	self_audit
+testimonial	binding	42	Engine	latest_stream_sth	log_commitment
+testimonial	binding	42	Engine	ledger_list_fork_evidence	equivocation_evidence
+testimonial	binding	42	Engine	ledger_put_checkpoint	log_commitment
+testimonial	binding	42	Engine	ledger_record_fork_evidence	equivocation_evidence
+testimonial	binding	42	Engine	list_delivery_receipts_for	delivery_event
+testimonial	binding	42	Engine	list_witness_equivocations_json	equivocation_evidence
+testimonial	binding	42	Engine	lookup_signed_record_by_content_hash	upstream_attestation
+testimonial	binding	42	Engine	maintenance_archive_expired	erasure_effect
+testimonial	binding	42	Engine	maintenance_prune_audit_chain	self_audit
+testimonial	binding	42	Engine	next_sequence	self_audit
+testimonial	binding	42	Engine	peek_sequence	self_audit
+testimonial	binding	42	Engine	provenance_chain	self_audit
+testimonial	binding	42	Engine	put_custody_ack	self_audit
+testimonial	binding	42	Engine	put_delivery_receipt	delivery_event
+testimonial	binding	42	Engine	put_stream_sth	log_commitment
+testimonial	binding	42	Engine	put_wholeness_witness_json	equivocation_evidence
+testimonial	binding	42	Engine	rebuild_signed_wire_index	upstream_attestation
+testimonial	binding	42	Engine	receive_and_persist	upstream_attestation
+testimonial	binding	42	Engine	run_retention	erasure_effect
+testimonial	binding	42	Engine	seal_stream	log_commitment
+testimonial	binding	42	Engine	stream_chunks_json	log_commitment
+testimonial	binding	42	Engine	stream_consistency_proof	log_commitment
+testimonial	binding	42	Engine	stream_inclusion_proof	log_commitment
+testimonial	binding	42	Engine	sweep_ttl_expired	erasure_effect
+testimonial	binding	42	Engine	trust_grant_consistency_proof	log_commitment
+testimonial	binding	42	Engine	trust_grant_inclusion_proof	log_commitment
+testimonial	binding	42	Engine	tsdb_prune_summaries	erasure_effect
+testimonial	binding	42	Engine	verify_locale_inclusion_json	log_commitment

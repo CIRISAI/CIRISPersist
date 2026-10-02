@@ -11714,7 +11714,10 @@ impl PyEngine {
     /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this
     /// node holds a lineage for (a trust-root community or a conferring
     /// family) as JSON (`witnessed_head`, `quorum`, `community` detail,
-    /// `latest_cosign_at`), or `null` when no lineage is held.
+    /// `latest_cosign_at`), or `null` when no lineage is held. v53.0.0 (CC 3.2
+    /// T6): `roster_lag` (`lineage_head_lags_roster`, the uncovered keys and
+    /// accord decisions, `since`, `cadence_secs`) when the held head lags its
+    /// roster.
     fn lineage_head_json(&self, py: Python<'_>, community_key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -14311,6 +14314,105 @@ impl PyEngine {
                         let backend = sq.clone();
                         runtime.block_on(async move {
                             blob_custody(backend.as_ref(), &sha, &viewer).await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                serde_json::to_string(&view)
+                    .map_err(|e| PyRuntimeError::new_err(format!("custody encode: {e}")))
+            })
+        })
+    }
+
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **this node's custody
+    /// report** for one blob: `state` is `"here"` or `"none"`. `here` needs the
+    /// bytes on this node (refused `custody_ack_here_not_held` otherwise) and
+    /// takes the stored length as its size. `cohort_scope` is needed only when
+    /// no row is held (`none` for a dropped blob); `cohort_target` names the
+    /// family or community. Returns the new `attestation_id`. Re-acknowledge
+    /// about daily: a report is live for 72 hours.
+    #[pyo3(signature = (at_rest_sha256_hex, state, cohort_scope=None, cohort_target=None))]
+    fn put_custody_ack(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        state: &str,
+        cohort_scope: Option<String>,
+        cohort_target: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let state =
+                crate::federation::custody_ack::CustodyState::parse(state).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "custody_ack_malformed: state {state:?} is not \"here\" | \"none\""
+                    ))
+                })?;
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .put_custody_ack(
+                            &sha,
+                            state,
+                            cohort_scope.as_deref(),
+                            cohort_target.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **the custody view** of
+    /// one blob as JSON: `{sha256_hex, devices: [{device_key_id, state,
+    /// reported_at?, received_at?, size?, challengeable}], copies_here,
+    /// receipts_consulted}`, `state` ∈ `here` | `received` | `none` |
+    /// `unknown`. `stream_id` adds that stream's delivery receipts. Authorized
+    /// like `read_blob_as` (`blob_not_granted` for a stranger). Never render
+    /// `unknown` as `none`, nor a lapsed `here` as a copy.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, stream_id=None))]
+    fn custody_view_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        stream_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::custody_ack::custody_view;
+                let now = chrono::Utc::now();
+                let view = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            custody_view(backend.as_ref(), &sha, &viewer, stream_id.as_deref(), now)
+                                .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            custody_view(backend.as_ref(), &sha, &viewer, stream_id.as_deref(), now)
+                                .await
                         })
                     }
                 }
@@ -34064,7 +34166,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
         // v50.0.0 (CIRISPersist#925/#927) — a non-conformant infrastructure
         // record and a fused node key are the submitter's to re-mint: 4xx.
-        crate::federation::Error::CommunityConsensusProtocolViolation { .. }
+        // v53.0.0 (CC 3.2 T6) — a version that does not reflect the roster
+        // planes replaces the supersede refusals it sits beside (a typed
+        // Conflict before it), which are ValueError.
+        crate::federation::Error::LineageVersionDisagreesWithFold { .. }
+        | crate::federation::Error::CommunityConsensusProtocolViolation { .. }
         | crate::federation::Error::NodeIdentityNotExclusive { .. }
         | crate::federation::Error::NodeIdentityImmutable { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused

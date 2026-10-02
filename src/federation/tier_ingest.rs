@@ -386,10 +386,64 @@ where
         )
         .await
     {
-        Ok(()) => Ok(true),
-        Err(Error::Backend(m)) => Err(Error::Backend(m)),
-        Err(_) => Ok(false),
+        Ok(()) => {}
+        Err(Error::Backend(m)) => return Err(Error::Backend(m)),
+        Err(_) => return Ok(false),
     }
+    // v53.0.0 (CC 3.2 T6 / CC 4.2.6, rc7 `36432c6`) — the accord's version
+    // needs yes-votes from a strict majority of its STANDING roster, whatever
+    // its `consensus_protocol` reads (`quorum:2/3` is that majority only while
+    // the roster is three).
+    accord_standing_majority_signed(directory, &offered.family_key_id, proof).await
+}
+
+/// v53.0.0 (CC 3.2 T6 / CC 4.2.6) — do distinct members of `family`'s standing
+/// roster (the one fold, [`FederationDirectory::active_family_members`]) that
+/// make a strict majority of it sign `proof.change_envelope`? Each signature
+/// is verified against the member's REGISTERED pinned hybrid key, one member
+/// at a time, so a key counts once however many signatures name it.
+pub(crate) async fn accord_standing_majority_signed<F>(
+    directory: &F,
+    family_key_id: &str,
+    proof: &super::types::GroupSupersedeProof,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::accord_genesis as ag;
+    let standing = directory.active_family_members(family_key_id).await?;
+    let Ok(bytes) = ag::accord_family_signing_bytes(&proof.change_envelope) else {
+        return Ok(false);
+    };
+    let mut signed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for m in &standing {
+        let Some(rec) = directory.lookup_public_key(&m.key_id).await? else {
+            continue;
+        };
+        let member = ciris_verify_core::threshold::ThresholdMember {
+            member_id: rec.key_id,
+            ed25519_public_key_base64: rec.pubkey_ed25519_base64,
+            mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
+            role: None,
+        };
+        let verified = proof
+            .quorum_signatures
+            .iter()
+            .filter(|sig| sig.member_id == member.member_id)
+            .any(|sig| {
+                ciris_verify_core::threshold::verify_threshold_signatures(
+                    &bytes,
+                    std::slice::from_ref(&member),
+                    std::slice::from_ref(sig),
+                    1,
+                )
+                .is_ok()
+            });
+        if verified {
+            signed.insert(member.member_id);
+        }
+    }
+    Ok(signed.len() >= ag::strict_majority(standing.len()))
 }
 
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated

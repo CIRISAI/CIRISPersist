@@ -183,6 +183,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
     // row whose grant shape or granter is not admissible. A statement about the input.
     ("check_community_trust_grant_admission", Class::Gate),
+    // v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — Gate: refuses a `custody:ack:v1`
+    // row that is not a holder self-report, is malformed, or sits outside the
+    // device's cohort. A statement about the input.
+    ("check_custody_ack_admission", Class::Gate),
     // v52.0.0 (CIRISPersist#672) — Plumbing: the held-record settle. Its `?`
     // propagates only a serialization failure (the substrate's own terms); a
     // lookup error falls through to the full apply, and a settle returns early

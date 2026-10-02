@@ -1833,6 +1833,9 @@ class Engine:
     def provenance_chain(self, key_id: str) -> str:
         """(derived) testimonial — Verify-consumable provenance read (CIRISVerify WS-4)."""
 
+    def put_custody_ack(self, at_rest_sha256_hex: str, state: str, cohort_scope: str | None = None, cohort_target: str | None = None) -> str:
+        """(derived) testimonial — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — this node's custody report for one blob: state is "here" or "none". here needs the bytes on this no..."""
+
     def put_delivery_receipt(self, receipt_json: str) -> None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber delivery receipt (receipt_json is a serialized DeliveryReceipt). Runs the JOIN-ag..."""
 
@@ -2205,6 +2208,9 @@ class Engine:
 
     def cross_agent_divergence(self, deployment_domain: str, window_json: str, metric: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) epistemic — Cross-agent divergence z-scores. metric is one of "csdma_plausibility", "dsdma_domain_alignment", "idma_k_eff", "idma_correlation_risk", "conscienc..."""
+
+    def custody_view_json(self, at_rest_sha256_hex: str, viewer_key_id: str, stream_id: str | None = None) -> str:
+        """(derived) epistemic — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — the custody view of one blob as JSON: {sha256_hex, devices: [{device_key_id, state, reported_at?, r..."""
 
     def describe_crossing(self, attestation_id: str, scope: str, cohort_target: str | None, basis: str) -> str:
         """(derived) epistemic — v39.0.0 — the nine-axis description a truthful caller would state for attestation_id at scope, as JSON: the starting point for enter_mesh / widen_a..."""

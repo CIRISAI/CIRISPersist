@@ -9,6 +9,48 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### S2 — custody:ack:v1 (CIRISPersist#942 part 2; CC 3.1.3.3, CIRISConstitution#130)
+
+A family can now see how many copies of its content exist without weakening encryption or outsider invisibility. Each device reports its own custody of a blob in a `scores` row on `custody:ack:v1`, and persist folds the reports at read time.
+
+**The row.** `attestation_type = scores`; `attesting_key_id == attested_key_id` = the device. Envelope: `custody_state` `here` | `none`; `evidence_refs` = exactly one entry, the blob's at-rest sha256 (64 lowercase hex; the slot `holds_bytes` uses for the full digest); `size` (the stored length) iff `here`; the signer-stamped `asserted_at`; the cohort target (`community_id` / `family_key_id`). `cohort_scope` is the blob's own: `self`, `family` or `community`. It is never a `holds_bytes:*` row. The per-family members ride the envelope's `extra`, as `session:*` and `membership:*` members do, so `ENVELOPE_VOCABULARY_SHA256` does not move.
+
+**The gate** (`custody_ack::check_custody_ack_admission`, at all three put doors and the promotion chokepoint; parity-classified `Gate`). On `custody:ack:v1` it refuses `custody_ack_not_self_report` (another key reporting a device's custody), `custody_ack_malformed` (no or unknown state, `here` without size, `none` with size, a digest that is not one 64-hex blob, a placement outside self/family/community), and `custody_ack_outside_cohort`. A signed instant more than `DEFAULT_MAX_TOUCH_SKEW` (300 s) ahead of the receiving node's clock is refused by the universal instant gate (`check_instant_binding`), which already runs on every row: a future-dated `here` cannot stay live, and there is one skew constant. `custody:` moves from the reserved-and-ungated list to the purpose-gated list.
+
+**The fold** (`custody_ack::fold_device_custody`; never a stored verdict). Per device, the latest non-retired report by signed instant (ties by row hash), live for 72 h judged on the READER's clock (`≤`: exactly 72 h still counts). Then, per CC 3.1.3.3: `here` (a live `here`), `received` (a delivery receipt with no later live report), `none` (a live `none`), `unknown` (no live report, no receipt). `challengeable` marks a live `here` naming its size: the reports a possession challenge (CIRISPersist#976) would test; no challenge exists yet.
+
+**Doors.** `Engine::put_custody_ack(sha, state, cohort_scope?, cohort_target?)` (pyo3 `put_custody_ack`): `here` needs the blob's row on this node (`custody_ack_here_not_held`) and takes its stored length (for a chunk DAG the row is the manifest; whether every chunk is held is not asked); a cohort that differs from the held row's is refused; with no row held only `none` is reportable, at the named cohort; a community blob's target is read from its sealing epoch. `Engine::custody_view(sha, viewer, stream_id?)` (pyo3 `custody_view_json`): authorized like the bytes read; devices are the blob's key recipients, this node, and the stream's receipted subscribers when `stream_id` is given.
+
+**`blob_custody` changes (Server: CIRISServer#704).** It carries `device_custody` (the same fold, without receipts). `copies_known` counts this node's copy, the announced holders and every `here` device, each node once. `copies_observable` is now always `true`: a `self`/`family` device with no live report is `unknown`, never a copy and never `none`. The `why` for self/family says so. I127 moved with it.
+
+**Differences from the design (`daud.md` §S2), CC winning:**
+- No V170 projection table. The fold re-derives from the device's own rows (`list_attestations_by`), so there is nothing to drop and I409 witnesses re-derivation by withdrawal instead. The view names devices from the blob's key recipients, this node and receipt subscribers; a device outside those is not enumerated.
+- `received` is CC's "a receipt with no LATER live report": a receipt newer than a live report outranks it, and an older one does not.
+- The audience check is ONE call site, `custody_ack::device_in_cohort` → `replication::hold::is_audience`. At the put door the AV-45 write-cohort gate already refuses an outsider's family/community placement first (see the mutation table, M9).
+
+**Witnesses I400–I409** (`federation/custody_ack_invariants.rs`; memory, sqlite, postgres) and **I400e** (the Engine door; sqlite, postgres). I127 updated.
+
+**Not built:** the N6 possession challenge (CIRISPersist#976; the `challengeable` flag only). No `evidence/cc_impl.tsv` row for `CLM-custody-receipt`.
+
+**Mutation round** (on the committed tree; lane = I400–I409 memory + sqlite, I400e sqlite, I127 sqlite, the module's unit tests): fourteen mutants, eleven killed, three equivalent.
+
+| Mutant | Result |
+|---|---|
+| M1 the 72 h boundary `<=` → `<` | killed — I401 |
+| M2 liveness ignores the reader's clock | killed — I401 |
+| M3 the self-report equality dropped | killed — I405 |
+| M4 latest-by-instant → earliest | killed — I402, I409, I400e, unit |
+| M5 a receipt newer than the live report never wins | killed — I403, unit |
+| M6 a receipt alone reads unknown | killed — I403 |
+| M7 the future-instant skew bound widened to a year | killed — I407 (after the witness stopped computing its instant from the bound it tests; it survived the first run) |
+| M8 `here` without size admitted | killed — I407 |
+| M9 the cohort audience check always passes | equivalent at the put door — AV-45's write-cohort gate refuses the outsider first (`WriteScopeRefused(NoCommunityMembership)`); the check stays as the one audience call site S1 swaps |
+| M10 withdrawn reports still fold | killed — I409 |
+| M11 another blob's reports answer for this one | killed — I402 |
+| M12 `here` for a row-held blob without bytes | equivalent — `blob_head` and `has_blob` read one stored row; the unreachable branch was removed |
+| M13 a commons placement admitted | killed — I407 |
+| M14 the fold reads rows ABOUT the device instead of BY it | equivalent — a third-party report is refused at admission, so the two sets agree |
+
 ### The final-genesis assembler (CIRISPersist#973; CC rc7 T5, T6, 3.4.7, 4.2.6)
 
 **`genesis::ceremony`** (new, production build, Rust only) is the assembler the server's ceremony routes drive. `CeremonyState::plan(inputs)` takes everything once, stamped by the caller at propose. The inputs are the holders as carried, the serve nodes, the T3 successor set and each holder's recovery key (as `CommittedKey`s: key material, not ids), the scope, the community birth's fields and **one `produced_at`**. Every instant in every item derives from that stamp; the assembler reads no clock. The state and each `Partial` are serde, so a ceremony can span HTTP requests and restarts. Item bytes are recomputed from the inputs on every call, never stored.
@@ -149,6 +191,29 @@ New module `federation::replication_audience`: the sender's set, the receiver's 
 **Adopters.** Edge: re-pin both hashes; the serve gate calls `may_receive` per row per peer for `cohort` kinds and `may_receive_group_plane` for `membership_plane` kinds (#760's record gate becomes the latter; the public-group exemption keeps `ciris-canonical`, the accord family, conferring and WA families reaching everyone); CIRISEdge#763 reads `audience_nodes`. Server: the consent UI writes `cohorts` on the owner's grant for a node (with `for_key_id`), and claims a device with its real `device_class` — an `agent` or `server` occurrence no longer receives the owner's self/family content unless listed.
 
 **Re-class into the audience (I397b–I397d).** Server 0.5.218/0.5.219 published every owned node's occurrence as `server`; 0.5.220 republishes each under its real class (same key, newer `asserted_at`). A device that comes into its owner's self/family audience that way is a newcomer to the self/family keys the receiving node holds: the signed-occurrence and owner-binding receive doors now run `at_rest_cascade::orchestrate::rekey_self_family_for_device` beside the #916 epoch re-wrap, wrapping every self/family blob and stream epoch the rest of the cohort holds there (sets left dirty for the pending loop). Before this, only community epochs followed a device. The reverse re-class rolls the self stream epoch at the next chunk; a stale or replayed row changes nothing. Mutation: 4/4 killed (the door skipping the walk, the family arm, the missing-key check, the self audience check).
+### S3 — every-tier durability (#963)
+CC 6.1.5.3 ("durability at every tier"): the target-replication machinery runs below the community tier, bounded to the content's own audience. Built on S1's resolver; no second audience predicate.
+
+- **`projection_for(FountainContent, self | family)` is `Cohort`** (was `SelfOwn`): self/family bytes hold-and-forward among their audience, so they get rarest-first and repair. Every record plane's self/family cell stays `SelfOwn`; the commons cells are unchanged.
+- **The holdings recipient verb answers the bytes plane from the audience.** `resolve_projection_recipients(Plane::FountainContent, …)` reads `audience_nodes(scope, group)` — the claimed nodes under their owners' allow lists — after the roster read that tells "cannot judge" from "judged". A denied node is never told of a holding; a person key is not an audience node. The same verb answers both halves of a within-cohort holding claim: who a holding may be advertised to, and whose claim a node admits. Other planes keep the roster answer.
+- **New `federation::durability`:** `content_audience(scope, author, group)` over a stored blob's own provenance (`self` = the union over the author's principals; a group scope with no group key is `Unresolvable`, never everyone; commons = everyone); `durability_mode(audience_size, n_plus_k)` — below `N + K` (`DEFAULT_FEASIBILITY_FLOOR` = 20 + 6) every audience node holds the full blob, at or above it the tuple applies; a producer's declared tuple moves the floor.
+- **Consent is supreme:** the audience never includes a node outside its owner's grant, so no target, deficit or advertisement reaches one.
+- Witnesses I410–I414, I417–I419 (`federation/durability_invariants.rs`; memory, sqlite, postgres; I419 from disk with comments stripped). The three #744 recipient witnesses move their family basis to `CohortRoster`; `projection_self_and_family_are_publish_own` exempts the bytes plane.
+
+**Where this differs from the design (CC wins):** persist holds no `FountainHoldingClaim` plane (it is edge's holdings plane, CIRISEdge#499), so "claim admission" is the recipient verb above, not a new door and not a migration (no V171). `fountain::retention::holding_claim_counts` is unchanged: CC says N6 applies within the cohort exactly as outside, and possession challenges are #976. No projection hash exists to re-pin; I419 pins the cell from disk.
+
+**Mutation round** (on the committed tree `af2b95e6`; lane = durability + recipient-set + projection witnesses, memory): six mutants, six killed.
+
+| Mutant | Result |
+|---|---|
+| M1 `<` becomes `<=` at `N + K` | killed — unit, I413/I414 |
+| M2 self/family bytes back to `SelfOwn` | killed — I419, I410, I411, #744 direction 1 |
+| M3 the bytes plane answered from the person roster | killed — I410, I411, I417/I418 |
+| M4 every peer in the audience | killed — I410, I412, I417/I418, #744 direction 2 |
+| M5 the self audience from the author, not its principals | killed — I410 |
+| M6 a group scope with no group resolves to everyone | killed — I411 (after a leg was added; it survived the first run) |
+
+**Adopters.** Edge (#763): call `resolve_projection_recipients` with `Plane::FountainContent` for self/family holdings exactly as for community ones, passing the content's group (`self`: the owner's key; `family`: the family key) and the peer's NODE key, both to decide who is told and whose holding claim is admitted; size the target with `durability_mode`. Server (#704): nothing new to call yet.
 
 **A cohort allowed or denied after the fact (I397e, I397f).** The sqlite/postgres attestation write door reads, before the row moves, whether it changes an owner's cohort allow list for one of its nodes (`consent:replication` FOR the node, or the owner's `withdraws` / `recants` / `supersedes` of one; `federation::consent_list_change_of`), and on insert runs the same `rewrap_own_epochs_for_device` walk: a newly allowed node receives the family blobs and room epochs sealed while it was denied. A deny needs no walk; the next write rolls what the node held and skips it. Mutation: 3/3 killed (the door not hooking, a retraction not counted, the grant match inverted).
 
@@ -229,6 +294,62 @@ CIRISConstitution rc7 `5e89627` (CC 3.2 T3, 4.2.6, 2.1) and `fe459cf` (CC 4.2.6,
 | M14 | the family-quorum plane counts a grant below the quorum | I439 | killed |
 
 14 of 14 killed.
+### R2c — roster rows and the head
+
+CC 3.2 T6 (rc7 `36432c6`, adopting persist's v53 design): every roster-affecting row of a witnessed lineage — a seat added or removed, a serve-node join, a membership widening or revocation, a resignation, a `revoked_after` bound, an accord decision, a charter re-scrub — MUST be covered by a new version within one cadence of its `effective_at`. Covering is the conferring quorum's duty; persist never synthesises a version. It enforces exactly three consequences (`federation::roster_head`):
+
+- **(i) a version must reflect the fold.** A new version of a witnessed lineage (a family whose head names a charter, the accord, a trust-root-grade community) whose roster disagrees with the fold of the roster rows it answers for is refused: `Error::LineageVersionDisagreesWithFold { lineage_key_id, keys }`, `kind()` `federation_lineage_version_disagrees_with_roster_fold`, Python `ValueError` (the supersede refusals beside it). One comparison, `roster_head::fold_disagreement`: the ONE authorized replay every roster gate reads (`authorized_roster_at` over `community_roster_events` / `family_roster_events`), folded over the version's own members, naming every key whose seat or role a row moves. A key the version changed with no plane row about it is the record's own act and is not judged. Runs before the write at the local family door (`supersede_family_signed`), the replicated family door (`route_occupied_family`), the local community door (`supersede_community_signed`) and the trust-root chain apply. **Which rows a version answers for:** on the community arm, those effective after its predecessor's signed instant and up to its own (`amended_at`) — at a local door the held head, in an offered chain the final head's predecessor IN THE CHAIN (CC 3.2 T8 (iii): a resignation never reaches behind a link's instant, and a later founders' amendment may re-seat or re-role a key an older plane row moved). A family version carries no signed instant, so the family arm answers for every row, judged at admission: a conferring family moves a seat on the planes, then versions.
+- **(ii) an uncovered row lags the head.** `roster_head::roster_lag(root, at)` → `RosterLag { token: "lineage_head_lags_roster", head_digest, uncovered_keys, uncovered_decisions, since, cadence_secs }`: a row older than one `witness_cadence_secs` (the charter in force; `0` when it declares none) that the held head does not reflect, and — for the accord — an authorized `roster_change` decision whose proposal's `prior_family_digest` is the held head and whose window closed before the cutoff (a roster change is carried as a family supersede, so a head that is still the anchor has not been covered). Served on `RootWitnessView.roster_lag` (`Engine::lineage_head`, `lineage_head_json`). With witnessed mode on, `put_lineage_head_cosign` refuses a cosign of the held head while it lags at the cosign's `signed_at`: `LineageCosignRefusal::HeadLagsRoster` (`lineage_head_lags_roster`), so attaching on it goes stale through the T4a freshness gate. With witnessed mode off the lag is reported and nothing else changes.
+- **(iii) the row takes effect at its `effective_at`.** Unchanged: the fold already drops a revoked seat at once, while the head still lists it (I456 pins it).
+
+**The accord's version needs a strict majority of its STANDING roster** (CC 3.2 T6 / CC 4.2.6): the accord head door now also counts distinct standing members (the fold) whose pinned hybrid keys verify the change envelope, ≥ `strict_majority(n)`. `quorum:2/3` is that majority only while the accord is three.
+
+**Witnesses moved to consequence (i).** Four trust-root witnesses asserted the pre-T6 admission of a version that does not cover a held roster row; each now asserts the refusal and keeps its own property on a covering version: i190 (i) (the founders' version lists the plane's serve node), (o″) (a v6 still recording the resigned F2 is refused; F2 + F0 still produce no next version, even one that drops F2), (x) (node `a` refuses H2 alone, stays Stalled on H1, and converges on H3 by walking H2), (y) (F2 resigns after v3; the offered prefix still does not extend, and the covering v4 by F0 + F1 is admitted).
+
+**Adopters.** A host that versions a conferring family, the accord or an infrastructure community MUST build the version from the fold, not from the previous record: every seat a plane row moved since the previous version is listed (or dropped), with its role. A version that disagrees is refused by name, with the keys. Server: the founders' amendment and the final-genesis assembler build the canonical row from the fold. Edge: a cosign the door refuses `lineage_head_lags_roster` is not a fault; the quorum owes a version.
+
+**Not built (BELIEVED, reported):** the accord's own roster change (`AccordAction::RosterChange` carried as a family supersede) still has no door — R2a's accord head door admits only head moves — so an authorized accord roster-change decision can lag the accord head but no version can cover it, and (iii) for it (the decision taking effect) has no fold to land in. A roster row that arrives late with an `effective_at` before the held head's instant (community arm) is outside every window: it neither lags nor refuses (a resignation that far back is already refused `resignation_backdated`; a member revocation is not).
+
+| Witness | What it pins |
+|---|---|
+| I450 | (i) a conferring family's version that keeps a revoked seat is refused, naming it; dropping it admits |
+| I451 | (i) a widened seat, and its role, must be on the version |
+| I452 | (i)/(ii) a family whose head names no charter is no lineage: not judged, never lags |
+| I453 | the community arm of the one comparison, and the floor |
+| I454 | (ii) the lag: older than the cadence, its keys and instant, on the witness view; the covering version clears it |
+| I455 | (ii) witnessed mode on: the cosign of a lagging head is refused `lineage_head_lags_roster`; off: stored, lag reported |
+| I456 | (iii) the removal is effective before any version, and no version is synthesised |
+| I457 | the accord's standing majority: 2 of 5 short, one key's two signatures count once, 3 of 5 enough, an outsider nothing |
+| I458 | from disk: every version door judges before it writes; the cosign door; the accord head door |
+| I459 | (ii) an authorized accord roster change anchored on the head, window closed, lags it; another anchor, a refusal, an open window do not |
+
+**A recovery is a covering version** (CC 4.2.6, rc7 `5a4b057`: the ONE accord version not signed by the conferring quorum). It enters through `supersede_family_signed`, so consequence (i) judges it like any version: its roster is the fold's with the one seat's key rotated, and it is admitted without the quorum. I429 (`tests/test_ceremony_973.rs`, memory, sqlite and postgres) now also pins it: an authorized accord roster change anchored on the held head lags it; the holder's recovery moves the head; the lag clears; the fold agrees with the recovered roster.
+
+**Mutation round — R2c** (on the committed tree `bcf41ae0`; lane = I450–I459 + I440–I449 + every `canonical_community_invariants` witness, memory and sqlite): eighteen mutants, eighteen killed.
+
+| Mutant | Result |
+|---|---|
+| M1 the comparison ignores roles | killed — I451 |
+| M2 a widened seat the record lacks is not named | killed — I451, i190 (i) |
+| M3 a revoked seat the record keeps is not named | killed — I450, I453, i190 (o″), (x) |
+| M4 every family is a witnessed lineage | killed — I452 |
+| M5 consequence (i) never refuses | killed — i190 (i), (o″), (x) |
+| M6 the local family door skips (i) | killed — I450, I451 |
+| M7 the lag ignores the cadence | killed — I454 |
+| M8 the cosign refusal ignores witnessed mode | killed — I455 |
+| M9 the cosign door never refuses a lagging head | killed — I455 |
+| M10 an unauthorized accord decision lags | killed — I459 |
+| M11 an open window lags | killed — I459 |
+| M12 the standing majority always holds | killed — I457 |
+| M13 signatures counted, not members | killed — I457 |
+| M14 the accord head door drops the standing-majority count | killed — I458 only (from disk): while the accord is three holders `quorum:2/3` IS the standing majority, so no behaviour separates the leg; I457 witnesses the count |
+| M15 the chain apply skips (i) | killed — i190 (o″), (x) |
+| M16 the lag judges at `at`, not the cutoff | killed — I454 |
+| M17 the chain apply's floor is the held head, not the chain predecessor | killed — i190 (z) |
+| M18 the community arm has no floor | killed — i190 (o), (o″), (o‴), (u), (z) |
+
+Two mutants were malformed on the first pass and re-run corrected (M6 kept its `?`; M8 did not compile); both killed as listed.
+
 ### rc7 B-1: the head moves with the record
 
 CC 3.2 T6 (rc7 `b578b59`, operator ruling B-1 on CIRISConstitution#136): the lineage head is the family or community record at a version; its `prev_head_digest` names the version it succeeds and its `charter_digest` names the charter in force at that version; every roster-affecting row, a charter re-scrub included, MUST produce a new version. Before this, a charter re-scrub wrote only a `trust:charter:v1` row, the record never re-versioned, and the head never moved.

@@ -2709,6 +2709,9 @@ pub async fn check_promotion_admission(
     // CC 3.3.1 — a `consent:community_trust` grant is the node's own and lists
     // its owner at the grant's instant (v52.0.0, CIRISPersist#946).
     super::community_trust_consent::check_community_trust_grant_admission(directory, row).await?;
+    // CC 3.1.3.3 — a custody report is a holder self-report within the blob's
+    // own cohort (v53.0.0, CIRISPersist#942 part 2).
+    super::custody_ack::check_custody_ack_admission(directory, row).await?;
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
     // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
@@ -17963,6 +17966,12 @@ mod tests {
         // reading that it confers nothing is `trust_root`'s (a row whose
         // dimension is not `trust:{job}` claims no job). Covers both leaves.
         "self:delegates_to",
+        // v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — a holder self-report
+        // placed within the blob's own cohort: the rule asks whether the
+        // attester IS the attested device and is in the row's cohort, which no
+        // identity type expresses. The gate is
+        // `custody_ack::check_custody_ack_admission`.
+        "custody:",
     ];
 
     /// Manifest-reserved families persist has **no gate for yet** — a different
@@ -17973,8 +17982,6 @@ mod tests {
     /// persist does not enforce it. Each entry names the ask that builds the
     /// gate; the entry is deleted in the cut that lands it.
     const RESERVED_AND_NOT_YET_GATED: &[(&str, &str)] = &[
-        // CC 3.1.3.3 — holder self-report, within-cohort only.
-        ("custody:", "CIRISPersist#961"),
         // CC 3.1.3.4 — author-emitted.
         ("file:", "CIRISPersist#962"),
         ("collection:", "CIRISPersist#962"),
