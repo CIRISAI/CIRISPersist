@@ -28,7 +28,7 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 
 **Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit). I34b, I144, I202 and I204 moved to the stream shape (a terminator per epoch; one set per epoch; the authorized-but-unkeyed viewer now gets the typed refusal).
 
-**Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): fourteen mutants, fourteen killed.
+**Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): sixteen mutants, fourteen killed, two equivalent.
 
 | Mutant | Result |
 |---|---|
@@ -44,8 +44,10 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 | M10 the stream-axis signer check dropped | killed — I313 |
 | M11 no cap roll | killed — I314 |
 | M12 no removal roll | killed — I314 |
-| M13 the removal roll closes without a terminator | killed — I314b |
-| M14 the cap roll closes without a terminator | killed — I314 |
+| M13 every roll (cap, removal, producer label) closes without a terminator | killed — I314 / I314b |
+| M14 the producer-label roll closes without a terminator | killed — I314b |
+| M15 the cap roll alone closes without a terminator | equivalent — the next pass's `ensure_stream_epoch` terminates the closed epoch in the same append |
+| M16 the removal roll alone closes without a terminator | equivalent — as M15 |
 
 Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #969b).
 

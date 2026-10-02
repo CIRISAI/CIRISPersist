@@ -738,6 +738,27 @@ pub(crate) mod bodies {
             p.sa.stream_dek_list(&gone).await.unwrap()[0].terminated,
             "I314b: the roll terminated the epoch"
         );
+        // The producer's own roll (a higher epoch label) terminates the
+        // outgoing epoch too.
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &gone,
+            2,
+            b"later",
+            5,
+            None,
+        )
+        .await
+        .unwrap();
+        let deks = p.sa.stream_dek_list(&gone).await.unwrap();
+        assert_eq!(
+            deks.iter()
+                .map(|d| (d.epoch, d.terminated))
+                .collect::<Vec<_>>(),
+            vec![(0, true), (1, true), (5, false)],
+            "I314b: the producer's roll terminated E+1"
+        );
     }
 
     pub(crate) async fn i315_a_v52_stream_reads_forever<B>(
