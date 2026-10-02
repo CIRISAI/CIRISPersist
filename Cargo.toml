@@ -870,6 +870,12 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v18.0.0
 name = "mint_test_anchor"
 required-features = ["test-anchor"]
 
+# CIRISPersist#973 — the software ceremony minter (dry run), test-anchor-gated:
+# `cargo run --example mint_test_ceremony --features test-anchor -- <out_dir> <seed>×3 <node_seed>`.
+[[example]]
+name = "mint_test_ceremony"
+required-features = ["test-anchor"]
+
 [dev-dependencies]
 # v21.4.0 (CIRISPersist#513 / CIRISVerify#219) — the custody-attestation
 # MOCK fabrication surface (`MockYubicoCa`), test builds only: mint

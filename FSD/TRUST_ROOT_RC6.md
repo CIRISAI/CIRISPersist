@@ -243,3 +243,31 @@ The leg's fault is only ever `Absent` (the door refused: a node awaiting its cer
 The `humanity-accord` family row needs nothing: the seats and the protocol are unchanged.
 
 Witnesses I345–I349 (memory, sqlite, postgres). Not yet built: the software ceremony minter for a dry run, and a boot test over a baked asset (it reads the compiled file).
+
+### 9.1 Posture after a refused or older bake
+
+The boot seed and the live posture leg (`verify_delegation_plane_seeded`, read by `genesis_posture` without the seed) must give one answer for one state. They did not: the leg compared the stored row against the RAW compiled-in row, which is not canonical at rest and so classified as legacy, and every verified holder statement that differed from the bake read as its successor. A node whose re-mint was refused at the door kept reporting `Entrenched` on the previous root.
+
+The rule, by relation of the stored row to the compiled-in one:
+
+- identical, or a verified holder statement strictly newer: sound.
+- a verified holder statement that is older, or of the same vintage with different content: **Absent**. The node boots, the banner is raised, and the detail says the compiled-in root was not adopted. Not `Divergent`: that refuses to boot and is reserved for a row that is not a verifiable holder statement.
+- an old binary on a newer database (the bake older than stored): the stored rows are never downgraded and the posture is sound.
+
+For the re-mint ceremony this means: a bake stamped ahead of a node's clock by more than the skew bound leaves that node on its previous root, visibly pre-genesis on the delegation leg, until its clock passes the instant and it is rebooted. Witnesses I360–I365.
+
+## 10. The dry run: software ceremony, boot seam, outputs verifier (CIRISPersist#973)
+
+**Minter.** `genesis::mint_test_ceremony(ed_seeds[3], node_seed, produced_at)` (feature `test-anchor`) returns the anchor block (unchanged from `mint_test_anchor_block`), the bundle and the `ciris-canonical` birth, signed by the three software holders the block defines. The charter carries `witness_quorum: 0`. A re-mint is the same call with a later `produced_at`: ids kept, instants forward.
+
+**Dry-run order for a host.**
+1. Mint (or have the host's own ceremony routes produce the two files with the software holders' seeds).
+2. Arm the block (`CIRIS_TEST_TRUST_ROOT*`, `CIRIS_TESTING_MODE=true`).
+3. `genesis::install_test_ceremony_outputs_json(bundle_json, Some(community_json))`.
+4. Construct the Engine. The boot seed runs anchor → family → serve nodes → delegation plane → community against the installed artifacts; `genesis_posture` reports every leg.
+5. `genesis::verify_ceremony_outputs(bundle_json, community_json)` is the same check the real bake will run on the real files.
+
+**The real bake.** Before the ceremony's two files replace `canonical_seed.json` and `canonical_community_seed.json`, `verify_ceremony_outputs` must return `Ok` on a build whose accord roster is the production one. It applies the files through the ordinary doors on an in-memory directory, so a file the boot path would refuse is refused here, by stage.
+
+**Not built:** a pyo3 door for the minter (the block minter has none); a postgres run of I352–I355 (the bodies are backend-generic; the boot, I351, runs on all three).
+
