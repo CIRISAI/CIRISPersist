@@ -204,6 +204,16 @@ As built:
 
 **In the field.** A lineage whose charter is silent and for which no cosign is held (every lineage in production today) reads the same before and after: it was "never witnessed, judged as before rc6", and it still is. The reading changes only where a silent charter met a held cosign: one cosign used to engage witnessed mode (the default of 1) and no longer does. An anchor attach naming the held head used to be refused as unwitnessed under a silent charter and is now admitted.
 
+### Only a new acceptance edge is gated (T4a, rc6 5cceadb)
+
+The attach gate runs on an edge's FIRST admission. First admission is decided structurally: the edge's id names no row this node holds with the same attester, root and signed envelope. A held edge re-put or replicated back is not re-judged, with or without `attached_head_digest`; it is read as naming the head the node held when it was admitted. A held id offered with a different envelope is a new edge.
+
+A new edge that names itself `trust:accepts:v1` names its head in every mode: the witnessed head while witnessed mode is on, the held (anchored) head while it is off. Without one it is refused `trust_root_head_unnamed`. `attach_head_for(dir, root, now)` returns the head to name.
+
+A row with no job label is not an acceptance edge by name. It reaches the gate by direction inference, which also covers a family charter and the baked `genesis-charter`; it keeps the reading it had before this rule (admitted with no head under a charter that declares no window, refused under one that does). A ceremony that wants its charter rows outside this gate under a windowed charter labels them `trust:charter:v1`.
+
+Witnesses: I356 (a new headless edge refused by name in off mode, in witnessed mode, with and without a window; the unlabeled row's reading), I357 (a held headless edge re-put, re-put under a later windowed charter, and replicated back), I358 (a changed envelope under a held id is new), I359 (a new edge naming the held head attaches in off mode).
+
 ### Not yet built
 
 - The witness directory: `witnesses[]` inside the charter, a head's cosignatures judged against its PARENT's directory, and the majority check `witness_quorum = ⌊n/2⌋ + 1` over that directory's size. Until it exists a non-zero quorum counts any registered key typed `witness` that is not a founder's person (§3.2), and only the value `1` is refused at admission. Tracked on CIRISPersist#974.
