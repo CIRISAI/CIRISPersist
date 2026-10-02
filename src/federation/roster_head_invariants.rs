@@ -404,8 +404,16 @@ pub(crate) mod bodies {
             roster_lag(d, &fam, now).await.unwrap().is_none(),
             "{tag} I454: younger than the cadence"
         );
-        // One cadence later it does.
-        let later = now + hours(1);
+        // One cadence after THIS node admitted it, it does.
+        let admitted = chrono::Utc::now();
+        assert!(
+            roster_lag(d, &fam, admitted + chrono::Duration::minutes(59))
+                .await
+                .unwrap()
+                .is_none(),
+            "{tag} I454: the cadence runs from admission, not the row's instant"
+        );
+        let later = admitted + hours(1) + chrono::Duration::minutes(1);
         let lag = roster_lag(d, &fam, later)
             .await
             .unwrap()
@@ -419,11 +427,8 @@ pub(crate) mod bodies {
             "{tag} I454: the head that lags"
         );
         assert!(
-            (lag.since - (now - chrono::Duration::minutes(10)))
-                .num_seconds()
-                .abs()
-                <= 1,
-            "{tag} I454: since the row's effective instant: {lag:?}"
+            lag.since >= now && lag.since <= admitted,
+            "{tag} I454: since this node admitted the row: {lag:?}"
         );
         let view = root_witness_view(d, &fam, later).await.unwrap().unwrap();
         assert_eq!(
@@ -663,6 +668,125 @@ pub(crate) mod bodies {
 }
 
 #[cfg(test)]
+pub(crate) mod backdated {
+    use crate::federation::canonical_community::{
+        self as cc, CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON,
+    };
+    use crate::federation::canonical_community_invariants::bodies::{
+        canonical_row, founder_revocation_at, founders_supersede, signed, stand_up, widening_by,
+        with_member, FOUNDERS,
+    };
+    use crate::federation::membership_acceptance::test_support::ConsentedWidening as _;
+    use crate::federation::roster_head::roster_lag;
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::identity_type;
+    use crate::federation::{Error, FederationDirectory};
+
+    const NODE: &str = "bd-serve-node";
+
+    /// The canonical row born, a serve node widened in on the plane and
+    /// covered by v2, then a revocation of the node signed with an instant
+    /// BEFORE v2 and admitted after it. Returns the revocation's instant.
+    async fn backdated_revocation(d: &dyn FederationDirectory) -> chrono::DateTime<chrono::Utc> {
+        stand_up(d).await;
+        ts::register_hybrid_key_as(d, NODE, NODE, identity_type::NODE).await;
+        d.put_community(signed(canonical_row(&FOUNDERS), &["A1", "B1"]))
+            .await
+            .unwrap();
+        d.put_community_membership_widening_consented(widening_by(
+            &[FOUNDERS[0], FOUNDERS[1]],
+            NODE,
+            Some("member"),
+        ))
+        .await
+        .expect("the serve node joins");
+        let backdated = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        founders_supersede(
+            d,
+            with_member(canonical_row(&FOUNDERS), NODE, "member"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect("v2 covers the join");
+        let v2 = cc::lookup_signed_community(d, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cc::head_instant(&v2) > backdated, "the row predates v2");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        d.put_community_membership_revocation(founder_revocation_at(
+            &[FOUNDERS[0], FOUNDERS[1]],
+            NODE,
+            backdated,
+        ))
+        .await
+        .expect("a revocation of the node dated before v2, admitted after it");
+        backdated
+    }
+
+    /// **I450b** — (ii) a backdated revocation does not escape the lag: the
+    /// held head is judged against the fold now, over the rows this node
+    /// admitted after it, whatever instant they were signed with.
+    pub async fn i450b_a_backdated_row_lags(d: &dyn FederationDirectory) {
+        backdated_revocation(d).await;
+        let lag = roster_lag(d, CANON, chrono::Utc::now())
+            .await
+            .unwrap()
+            .expect("the backdated revocation lags the head");
+        assert_eq!(lag.uncovered_keys, vec![NODE.to_owned()], "I450b");
+    }
+
+    /// **I450c** — (i), which way it goes: a version that leaves the backdated
+    /// revocation uncovered DISAGREES with the fold at its own instant and is
+    /// refused; the version that drops the node is admitted and clears the lag.
+    pub async fn i450c_a_version_must_cover_a_backdated_row(d: &dyn FederationDirectory) {
+        backdated_revocation(d).await;
+        let e = founders_supersede(
+            d,
+            with_member(canonical_row(&FOUNDERS), NODE, "member"),
+            &[FOUNDERS[0], FOUNDERS[1]],
+        )
+        .await
+        .expect_err("a v3 still listing the revoked node is refused");
+        assert!(
+            matches!(&e, Error::LineageVersionDisagreesWithFold { keys, .. }
+                if keys == &[NODE.to_owned()]),
+            "I450c: {e:?}"
+        );
+        founders_supersede(d, canonical_row(&FOUNDERS), &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("v3 drops the node");
+        assert!(
+            roster_lag(d, CANON, chrono::Utc::now())
+                .await
+                .unwrap()
+                .is_none(),
+            "I450c: covered"
+        );
+    }
+
+    /// **I450d** — (ii) the cadence and `since` are timed from THIS node's
+    /// admission, never from the row's signer-chosen instant: the lag names
+    /// the admission instant, after the backdated one.
+    pub async fn i450d_the_lag_is_timed_from_admission(d: &dyn FederationDirectory) {
+        let backdated = backdated_revocation(d).await;
+        let lag = roster_lag(d, CANON, chrono::Utc::now())
+            .await
+            .unwrap()
+            .expect("lags");
+        let v2 = cc::lookup_signed_community(d, CANON)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            lag.since > backdated && lag.since > cc::head_instant(&v2),
+            "I450d: since is when this node admitted the row: {lag:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod pure {
     fn code_of(file: &str) -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
@@ -792,6 +916,21 @@ mod run {
                 async fn i457() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i457_a_standing_majority(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i450b() {
+                    let Some(b) = $fresh.await else { return };
+                    super::super::backdated::i450b_a_backdated_row_lags(&b).await
+                }
+                #[tokio::test]
+                async fn i450c() {
+                    let Some(b) = $fresh.await else { return };
+                    super::super::backdated::i450c_a_version_must_cover_a_backdated_row(&b).await
+                }
+                #[tokio::test]
+                async fn i450d() {
+                    let Some(b) = $fresh.await else { return };
+                    super::super::backdated::i450d_the_lag_is_timed_from_admission(&b).await
                 }
                 #[tokio::test]
                 async fn i459() {
