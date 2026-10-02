@@ -819,6 +819,26 @@ pub(crate) mod bodies {
             .await
             .expect_err("only a conferred witness emits assurance");
         assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        // ...and the role alone is not enough: a witness with NO conferred
+        // `infra:attest:assurance` scope is refused on the dimension shape as
+        // on the type shape (the rule's delegation-scope arm, not layer 1b).
+        let bare = who(b, &format!("i377-bare-witness-{s}"), WITNESS).await;
+        for tok in [age, cap] {
+            let mut i = input(
+                "scores",
+                serde_json::json!({"dimension": tok, "score": 1, "confidence": 1}),
+            );
+            i.attested_key_id = Some(modern.key.clone());
+            let e = emit_with_local_signer(b, &bare.signer, i)
+                .await
+                .expect_err("the witness role without the conferred scope does not emit assurance");
+            assert_eq!(
+                e.kind(),
+                "federation_reserved_prefix_emitter_mismatch",
+                "{tok}"
+            );
+            assert!(e.to_string().contains("delegated scope"), "{tok}: {e}");
+        }
     }
 
     /// The witness for I377, conferred `infra:attest:assurance` by a root
