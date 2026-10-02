@@ -599,13 +599,16 @@ where
     // load-bearing rather than an optimisation. A new ceremony ADDS a root
     // (roots co-exist and are addressed per-`root_ref`); nothing here mutates
     // one that already stands.
-    if dir
+    if let Some(held) = dir
         .lookup_family(&family.family_key_id)
         .await
         .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup_family: {e}")))?
-        .is_some()
     {
-        return Ok(()); // already entrenched (reboot) — idempotent no-op.
+        // v53.0.0 (CC 3.2 T6) — the one exception: an accord row that names no
+        // charter (stored before v53 gave the record its head fields) has no
+        // charter in force, so its root is invalid. It is replaced by this
+        // bundle's genesis record; anything else held is left standing.
+        return replace_chartless_accord(dir, &held, family).await;
     }
     // v21.0.0 (CIRISPersist#502 E4) — `put_family` now hybrid-Strict-verifies
     // an authority signature; the baked HUMANITY_ACCORD family is a
@@ -616,6 +619,91 @@ where
         GenesisFault::absent(
             LEG,
             format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"),
+        )
+    })
+}
+
+/// v53.0.0 (CC 3.2 T5/T6) — **a node upgrading from v52 holds an accord row
+/// that names no charter.** Under v53 the charter in force is the one the
+/// head names ([`charter_in_force`](super::canonical_community::charter_in_force)),
+/// so that row leaves the accord with no charter and its root invalid until a
+/// version naming one arrives.
+///
+/// CC T6: the genesis head carries an empty `prev_head_digest`, and the
+/// genesis head is the bundle's. A fresh node seeds exactly that record. If an
+/// upgraded node instead chained a version onto its v52 row, the two nodes
+/// would hold DIFFERENT head digests for one lineage, and every attach naming
+/// a head would split the mesh. So the upgraded node takes the genesis record
+/// itself, unchanged, and the v52 row becomes a superseded prior version
+/// labelled `accord_birth_replaces_unrooted` (the label R2a's prev-head check
+/// admits for a birth stored over an un-rooted row). The write stays inside
+/// this seeder, the door the accord id has always entered by; no peer-reachable
+/// door is opened.
+///
+/// It replaces ONLY a held row that names no charter and no predecessor, and
+/// equals the genesis record in everything a head does not carry (name, seats,
+/// founding instant, protocol, entrenchment, dissolution). A held row naming a
+/// charter or a predecessor is a version chain and is never overwritten, and a
+/// row of other content is a different accord and is left standing (#648).
+/// When the bundle carries the accord's signed genesis record (version 3), its
+/// signatures travel with the stored version.
+async fn replace_chartless_accord<D>(
+    dir: &D,
+    held: &crate::federation::types::Family,
+    genesis: crate::federation::types::Family,
+) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Family;
+    let unrooted = held.charter_digest.is_empty() && held.prev_head_digest.is_empty();
+    let same_roster = held.family_name == genesis.family_name
+        && held.members == genesis.members
+        && held.founded_at == genesis.founded_at
+        && held.consensus_protocol == genesis.consensus_protocol
+        && held.consensus_protocol_entrenched == genesis.consensus_protocol_entrenched
+        && held.dissolved_at == genesis.dissolved_at;
+    if !unrooted || genesis.charter_digest.is_empty() || !genesis.prev_head_digest.is_empty() {
+        return Ok(());
+    }
+    if !same_roster {
+        tracing::warn!(
+            family_key_id = %held.family_key_id,
+            "genesis family seed: the held accord row names no charter but is not this \
+             build's accord (other seats or protocol) — left standing"
+        );
+        return Ok(());
+    }
+    let signed = canonical_genesis_bundle()
+        .family_record(&genesis.family_key_id)
+        .filter(|carried| carried.family == genesis)
+        .cloned()
+        .unwrap_or_else(|| crate::federation::types::SignedFamily {
+            family: genesis.clone(),
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            supersede_proof: None,
+            cosignatures: Vec::new(),
+        });
+    let snapshot = serde_json::to_value(&signed)
+        .map_err(|e| GenesisFault::absent(LEG, format!("accord genesis snapshot: {e}")))?;
+    dir.supersede_group_row(
+        super::cohort::Cohort::Family,
+        snapshot,
+        Some(serde_json::json!({
+            super::canonical_community::BIRTH_REPLACES_UNROOTED: held.persist_row_hash,
+        })),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        GenesisFault::absent(
+            LEG,
+            format!(
+                "replace the chartless accord row {} with the bundle's genesis record: {e}",
+                held.persist_row_hash
+            ),
         )
     })
 }

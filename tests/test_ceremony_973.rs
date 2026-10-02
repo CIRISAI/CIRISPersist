@@ -918,3 +918,208 @@ fn i427_every_instant_is_the_stamp() {
         micro
     );
 }
+
+/// The upgrade body shared by the backends: a node that ran v52 holds the
+/// accord row v52 seeded — no charter named, no predecessor — so under v53 the
+/// accord has no charter in force. Booting against the final bundle replaces
+/// it with the bundle's genesis record itself.
+async fn upgrades_from_v52(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &str) {
+    use ciris_persist::federation::canonical_community::{charter_in_force, HeadCharter};
+    use ciris_persist::federation::types::compute_persist_row_hash;
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let roster: Vec<String> = effective_accord_holder_records()
+        .iter()
+        .map(|r| r.record.key_id.clone())
+        .collect();
+    let v52 = accord_family_genesis_record_for(
+        accord,
+        ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+        roster.iter().map(String::as_str),
+        "",
+    );
+    d.put_family_local(v52).await.expect("the v52 accord row");
+    let held_v52 = d.lookup_family(accord).await.unwrap().unwrap();
+    assert_eq!(
+        charter_in_force(d, accord).await.unwrap(),
+        (accord.to_owned(), HeadCharter::Unnamed),
+        "{tag} I428: control — the v52 row names no charter"
+    );
+
+    install_test_ceremony_outputs(c.bundle.clone());
+    seed_family_and_canonical(d)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I428: the upgraded boot: {e:?}"));
+
+    let carried = c
+        .bundle
+        .family_record(accord)
+        .expect("the bundle's accord record");
+    let digest = bundle_family_charter_digest(&c.bundle);
+    assert!(!digest.is_empty());
+    let held = d.lookup_family(accord).await.unwrap().unwrap();
+    assert_eq!(
+        (held.charter_digest.as_str(), held.prev_head_digest.as_str()),
+        (digest.as_str(), ""),
+        "{tag} I428: the head is the genesis record (CC T6: empty prev at genesis)"
+    );
+    assert_eq!(
+        held.persist_row_hash,
+        compute_persist_row_hash(&carried.family).unwrap(),
+        "{tag} I428: the same head digest a fresh node holds"
+    );
+    let versions = d
+        .list_group_versions(ciris_persist::federation::cohort::Cohort::Family, accord)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 2, "{tag} I428: {versions:?}");
+    assert_eq!(
+        versions[0].authorization.as_ref().unwrap()["accord_birth_replaces_unrooted"],
+        serde_json::json!(held_v52.persist_row_hash),
+        "{tag} I428: the v52 row is the superseded prior, labelled"
+    );
+    assert_eq!(
+        charter_in_force(d, accord).await.unwrap(),
+        (accord.to_owned(), HeadCharter::Named(digest)),
+        "{tag} I428: the bundle's charter is in force"
+    );
+    // The accord root is valid for a node that accepts it.
+    let user = format!("i428-user-{tag}");
+    ciris_persist::federation::accord_test_support::register_typed_key(
+        d,
+        &user,
+        ciris_persist::federation::types::identity_type::USER,
+    )
+    .await
+    .unwrap();
+    ciris_persist::federation::accord_test_support::emit_trust_edge(d, &user, accord, None)
+        .await
+        .unwrap();
+    let verdict = ciris_persist::federation::trust_root::trust_root_valid(d, &user, accord)
+        .await
+        .unwrap();
+    assert!(
+        verdict.valid && verdict.root_self_declares,
+        "{tag} I428: the accord root is valid with its charter in force: {verdict:?}"
+    );
+    assert!(
+        matches!(genesis_posture(d).await, GenesisPosture::Entrenched),
+        "{tag} I428: entrenched"
+    );
+    // A second boot changes nothing: the held head names a charter now.
+    seed_family_and_canonical(d).await.unwrap();
+    assert_eq!(
+        d.lookup_family(accord)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash,
+        held.persist_row_hash
+    );
+}
+
+/// **I428 — a node upgrading from v52 takes the bundle's accord genesis
+/// record** over the chartless row v52 seeded, and the accord root is valid
+/// with the bundle's charter in force (sqlite, memory).
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i428_v52_accord_row_takes_the_genesis_head() {
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    upgrades_from_v52(&sqlite().await, &c, "sqlite").await;
+    upgrades_from_v52(&memory().await, &c, "memory").await;
+}
+
+/// **I428b — only a chartless row of this build's accord is replaced**: a held
+/// accord of other seats is left standing (#648), and so is one that already
+/// names a charter (a version chain).
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i428b_other_accord_rows_are_left_standing() {
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let roster: Vec<String> = effective_accord_holder_records()
+        .iter()
+        .map(|r| r.record.key_id.clone())
+        .collect();
+    for (tag, row) in [
+        (
+            "other seats",
+            accord_family_genesis_record_for(
+                accord,
+                ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+                roster[..2].iter().map(String::as_str),
+                "",
+            ),
+        ),
+        (
+            "names a charter",
+            accord_family_genesis_record_for(
+                accord,
+                ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+                roster.iter().map(String::as_str),
+                &"ab".repeat(32),
+            ),
+        ),
+    ] {
+        let d = memory().await;
+        d.put_family_local(row).await.unwrap();
+        let before = d.lookup_family(accord).await.unwrap().unwrap();
+        install_test_ceremony_outputs(c.bundle.clone());
+        let _ = seed_family_and_canonical(&d).await;
+        assert_eq!(
+            d.lookup_family(accord).await.unwrap().unwrap(),
+            before,
+            "I428b ({tag}): left standing"
+        );
+    }
+}
+
+/// I428 on postgres, when a test database is provided.
+#[cfg(feature = "postgres")]
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i428_v52_accord_row_takes_the_genesis_head_postgres() {
+    let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let cut = base.rfind('/').expect("dsn has a database");
+    let name = format!(
+        "ciris_t_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    {
+        let (admin, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+            .await
+            .expect("connect to the base test database");
+        tokio::spawn(conn);
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .expect("create this test's database");
+    }
+    let dsn = format!("{}/{name}", &base[..cut]);
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    {
+        let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b.seed_genesis_accord_holders(&effective_accord_holder_records())
+            .await
+            .expect("seed holders");
+        upgrades_from_v52(&b, &c, "postgres").await;
+    }
+    if let Ok((admin, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
+        tokio::spawn(conn);
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await;
+    }
+}
