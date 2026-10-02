@@ -149,6 +149,29 @@ New module `federation::replication_audience`: the sender's set, the receiver's 
 **Adopters.** Edge: re-pin both hashes; the serve gate calls `may_receive` per row per peer for `cohort` kinds and `may_receive_group_plane` for `membership_plane` kinds (#760's record gate becomes the latter; the public-group exemption keeps `ciris-canonical`, the accord family, conferring and WA families reaching everyone); CIRISEdge#763 reads `audience_nodes`. Server: the consent UI writes `cohorts` on the owner's grant for a node (with `for_key_id`), and claims a device with its real `device_class` — an `agent` or `server` occurrence no longer receives the owner's self/family content unless listed.
 
 **Re-class into the audience (I397b–I397d).** Server 0.5.218/0.5.219 published every owned node's occurrence as `server`; 0.5.220 republishes each under its real class (same key, newer `asserted_at`). A device that comes into its owner's self/family audience that way is a newcomer to the self/family keys the receiving node holds: the signed-occurrence and owner-binding receive doors now run `at_rest_cascade::orchestrate::rekey_self_family_for_device` beside the #916 epoch re-wrap, wrapping every self/family blob and stream epoch the rest of the cohort holds there (sets left dirty for the pending loop). Before this, only community epochs followed a device. The reverse re-class rolls the self stream epoch at the next chunk; a stale or replayed row changes nothing. Mutation: 4/4 killed (the door skipping the walk, the family arm, the missing-key check, the self audience check).
+### S3 — every-tier durability (#963)
+CC 6.1.5.3 ("durability at every tier"): the target-replication machinery runs below the community tier, bounded to the content's own audience. Built on S1's resolver; no second audience predicate.
+
+- **`projection_for(FountainContent, self | family)` is `Cohort`** (was `SelfOwn`): self/family bytes hold-and-forward among their audience, so they get rarest-first and repair. Every record plane's self/family cell stays `SelfOwn`; the commons cells are unchanged.
+- **The holdings recipient verb answers the bytes plane from the audience.** `resolve_projection_recipients(Plane::FountainContent, …)` reads `audience_nodes(scope, group)` — the claimed nodes under their owners' allow lists — after the roster read that tells "cannot judge" from "judged". A denied node is never told of a holding; a person key is not an audience node. The same verb answers both halves of a within-cohort holding claim: who a holding may be advertised to, and whose claim a node admits. Other planes keep the roster answer.
+- **New `federation::durability`:** `content_audience(scope, author, group)` over a stored blob's own provenance (`self` = the union over the author's principals; a group scope with no group key is `Unresolvable`, never everyone; commons = everyone); `durability_mode(audience_size, n_plus_k)` — below `N + K` (`DEFAULT_FEASIBILITY_FLOOR` = 20 + 6) every audience node holds the full blob, at or above it the tuple applies; a producer's declared tuple moves the floor.
+- **Consent is supreme:** the audience never includes a node outside its owner's grant, so no target, deficit or advertisement reaches one.
+- Witnesses I410–I414, I417–I419 (`federation/durability_invariants.rs`; memory, sqlite, postgres; I419 from disk with comments stripped). The three #744 recipient witnesses move their family basis to `CohortRoster`; `projection_self_and_family_are_publish_own` exempts the bytes plane.
+
+**Where this differs from the design (CC wins):** persist holds no `FountainHoldingClaim` plane (it is edge's holdings plane, CIRISEdge#499), so "claim admission" is the recipient verb above, not a new door and not a migration (no V171). `fountain::retention::holding_claim_counts` is unchanged: CC says N6 applies within the cohort exactly as outside, and possession challenges are #976. No projection hash exists to re-pin; I419 pins the cell from disk.
+
+**Mutation round** (on the committed tree `af2b95e6`; lane = durability + recipient-set + projection witnesses, memory): six mutants, six killed.
+
+| Mutant | Result |
+|---|---|
+| M1 `<` becomes `<=` at `N + K` | killed — unit, I413/I414 |
+| M2 self/family bytes back to `SelfOwn` | killed — I419, I410, I411, #744 direction 1 |
+| M3 the bytes plane answered from the person roster | killed — I410, I411, I417/I418 |
+| M4 every peer in the audience | killed — I410, I412, I417/I418, #744 direction 2 |
+| M5 the self audience from the author, not its principals | killed — I410 |
+| M6 a group scope with no group resolves to everyone | killed — I411 (after a leg was added; it survived the first run) |
+
+**Adopters.** Edge (#763): call `resolve_projection_recipients` with `Plane::FountainContent` for self/family holdings exactly as for community ones, passing the content's group (`self`: the owner's key; `family`: the family key) and the peer's NODE key, both to decide who is told and whose holding claim is admitted; size the target with `durability_mode`. Server (#704): nothing new to call yet.
 
 ### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
 

@@ -452,6 +452,12 @@ mod row_type_invariants;
 // index (V149 `blob_renditions`) and the sized holder claim, the pure half.
 pub mod renditions;
 // CIRISPersist#571 — `regime:*` experimental-regime research artifacts:
+// v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — durability at every tier: the
+// content audience of a stored blob, the small-audience target rule, the
+// deficit read.
+pub mod durability;
+#[cfg(test)]
+pub mod durability_invariants;
 // the CC-blocked registry finding + the replication decision.
 pub mod regime;
 pub mod replication;
