@@ -234,6 +234,17 @@ Witnesses: I366–I371 (CHANGELOG `[53.0.0]`, with the mutation table).
 
 Witnesses: I356 (a new headless edge refused by name in off mode, in witnessed mode, with and without a window; the unlabeled row's reading), I357 (a held headless edge re-put, re-put under a later windowed charter, and replicated back), I358 (a changed envelope under a held id is new), I359 (a new edge naming the held head attaches in off mode).
 
+### A peer does not re-judge another node's attach (T4a)
+
+T4a is "a write-side gate" that "runs on the edge's first admission only"; "once the edge is written, T4 governs without exception". The attaching node's own write is that first admission. `AttachDoor` carries which door an edge arrives through:
+
+| door | origins | what runs |
+|---|---|---|
+| `Author` | `WriteOrigin::Authored`, the local-tier write | the full gate: the named head is the held (off) or witnessed (on) head, inside the window |
+| `Replicated` | `WriteOrigin::Wire`, `WriteOrigin::Sync` | the shape rule only: a new labelled edge names a head |
+
+A peer whose head is ahead of or behind the head an edge names, or that has not witnessed it, admits the replicated edge and reads its author as attached. A node therefore never re-authors its edge because the head advanced. A host writes its own edge through the authored door. Witnesses I372–I375.
+
 ### Not yet built
 
 - The witness directory: `witnesses[]` inside the charter, a head's cosignatures judged against its PARENT's directory, and the majority check `witness_quorum = ⌊n/2⌋ + 1` over that directory's size. Until it exists a non-zero quorum counts any registered key typed `witness` that is not a founder's person (§3.2), and only the value `1` is refused at admission. Tracked on CIRISPersist#974.

@@ -77,6 +77,23 @@ CC 3.2 T4a (rc6 22ea349), steward ruling 2026-10-01: "A new row with no `trust:{
 | M10 `self:delegates_to:v1` counts as a job label | killed — I367 |
 | M11 a bundle row does not bind its subject | killed — I370 |
 
+### #973 — a peer does not re-judge another node's attach
+The attach gate (`check_attach_freshness`) ran inside the one stored-write door for every origin. So a peer that first received another node's acceptance edge by replication judged it against its OWN held or witnessed head. It refused the edge `trust_root_head_stale`, and did not store it, whenever its head was ahead of or behind the head the edge named. A node that had attached correctly then read as not rooted on that peer (`trusted_roots_of(peer)`), until it re-authored its edge on every head change. CC 3.2 T4a calls this "a write-side gate" that "runs on the edge's first admission only".
+
+- **`canonical_community::AttachDoor`** names the door. `Author` is an authored put (`put_attestation_authored`, the emit recipe) and the local-tier write: the full gate, unchanged. `Replicated` is `WriteOrigin::Wire` and `WriteOrigin::Sync`: the head, window and witness comparisons do not run.
+- **Kept on both doors:** the shape rule (a new edge labelled `trust:accepts:v1` names a head, else `trust_root_head_unnamed`) and the bundle-only rule.
+- **Breaking for Rust callers:** `check_attach_freshness` takes the door as its second argument.
+- **For hosts:** a node writes its OWN acceptance edge through the authored door (`Engine::emit_attestation_self` does). A host that put its own edge through plain `put_attestation` would now skip the freshness comparison.
+- A node does not re-author its edge when the lineage head advances.
+
+Witnesses, two nodes, on memory, sqlite and postgres; I372, I373 and I375 were RED first:
+- **I372** — the receiver is ahead of the edge's head: admitted on the wire door and the apply door, and the sender reads as rooted.
+- **I373** — the receiver is behind: admitted on apply and on the authenticated-sync door.
+- **I374** — the author's own write naming a head it does not hold is still refused, on the authored door and the local-tier door; a labelled edge with no head is refused on every door.
+- **I375** — a receiver in witnessed mode that has not witnessed the head admits the replicated edge, and still refuses its own attach on that head.
+
+Mutation round, 10 of 10 killed: the replicated door runs the full gate; the replicated door skips the shape rule; the authored origin mapped to `Replicated`; the sync origin mapped to `Author`; each backend's put door fixed to `Author` (memory, sqlite, postgres); each backend's local-tier door set to `Replicated` (memory, sqlite, postgres).
+
 ### #972 — a seated accord holder founds an infrastructure community
 Operator ruling 2026-10-01 (posted on #926): the three founders of `ciris-canonical` ARE the baked accord holders A1/B1/C1. The founder check asked every founder for a `user` type and an accord-conferred `steward`; the baked holder records are typed `accord_holder`, so they were refused at the door ("is not a human key").
 
