@@ -49,6 +49,8 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 | M15 the cap roll alone closes without a terminator | equivalent — the next pass's `ensure_stream_epoch` terminates the closed epoch in the same append |
 | M16 the removal roll alone closes without a terminator | equivalent — as M15 |
 
+**I314c** (sqlite, postgres) — the readiness door answers for a legacy (v2, per-chunk-keyed) DAG too: the granted viewer is ready; a viewer granted the manifest and every chunk but one is told exactly that chunk (`Content{seq, chunk_sha256}`); a stranger is `NotGranted`. A host can ask `sealed_dag_readiness` about every DAG instead of probing `get_at_rest_grant` per chunk. Mutants on the legacy branch: grant check inverted, legacy check skipped, the wrong sha named — three killed (the third by I314c alone).
+
 Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #977).
 
 ### CC 1.0-rc6 re-vendored (tag v1.0-rc6)
