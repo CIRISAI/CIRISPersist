@@ -1392,3 +1392,414 @@ async fn i429_recovery_rotates_one_seat_without_quorum_postgres() {
             .await;
     }
 }
+
+// ── v53.0.0 — the v52 upgrade on the SHIPPED version-2 bundle (no test anchor) ──
+
+/// The body: a fresh node and a node holding the v52 accord row both boot on
+/// the baked version-2 bundle, and both end with the baked charter in force,
+/// one head digest, and a valid accord root for an accepting node.
+async fn v2_bundle_keeps_the_root(
+    fresh: &dyn FederationDirectory,
+    upgraded: &dyn FederationDirectory,
+    tag: &str,
+) {
+    use ciris_persist::federation::canonical_community::{charter_in_force, HeadCharter};
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    assert_eq!(canonical_genesis_bundle().version, 2, "the shipped bundle");
+    let digest = genesis_family_charter_digest();
+    assert!(
+        !digest.is_empty(),
+        "{tag}: the baked charter is the family's"
+    );
+    let roster: Vec<String> = accord_holder_genesis_records()
+        .iter()
+        .map(|r| r.record.key_id.clone())
+        .collect();
+    let v52 = accord_family_genesis_record_for(
+        accord,
+        ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+        roster.iter().map(String::as_str),
+        "",
+    );
+    upgraded
+        .put_family_local(v52)
+        .await
+        .expect("the v52 accord row");
+    assert_eq!(
+        charter_in_force(upgraded, accord).await.unwrap(),
+        (accord.to_owned(), HeadCharter::Unnamed),
+        "{tag}: control — the v52 row names no charter"
+    );
+    for (d, who) in [(fresh, "fresh"), (upgraded, "upgraded")] {
+        seed_family_and_canonical(d)
+            .await
+            .unwrap_or_else(|e| panic!("{tag} {who}: boot on the v2 bundle: {e:?}"));
+        assert_eq!(
+            charter_in_force(d, accord).await.unwrap(),
+            (accord.to_owned(), HeadCharter::Named(digest.clone())),
+            "{tag} {who}: the baked charter is in force"
+        );
+        let user = format!("v2-user-{tag}-{who}");
+        ciris_persist::federation::accord_test_support::register_typed_key(
+            d,
+            &user,
+            ciris_persist::federation::types::identity_type::USER,
+        )
+        .await
+        .unwrap();
+        ciris_persist::federation::accord_test_support::emit_trust_edge(d, &user, accord, None)
+            .await
+            .unwrap();
+        let v = ciris_persist::federation::trust_root::trust_root_valid(d, &user, accord)
+            .await
+            .unwrap();
+        assert!(
+            v.valid && v.root_self_declares,
+            "{tag} {who}: the accord root is valid on the v2 bundle: {v:?}"
+        );
+    }
+    assert_eq!(
+        fresh
+            .lookup_family(accord)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash,
+        upgraded
+            .lookup_family(accord)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash,
+        "{tag}: one head digest for fresh and upgraded nodes"
+    );
+}
+
+fn disarmed() {
+    clear_test_ceremony_outputs();
+    for k in TEST_ANCHOR_ENV_VARS {
+        std::env::remove_var(k);
+    }
+}
+
+async fn baked_sqlite() -> SqliteBackend {
+    let b = SqliteBackend::open_in_memory().await.unwrap();
+    b.run_migrations().await.unwrap();
+    b.seed_genesis_accord_holders(&accord_holder_genesis_records())
+        .await
+        .expect("seed holders");
+    b
+}
+
+async fn baked_memory() -> MemoryBackend {
+    let b = MemoryBackend::new();
+    b.seed_genesis_accord_holders(&accord_holder_genesis_records())
+        .await
+        .expect("seed holders");
+    b
+}
+
+/// **I428c — a node upgrading from v52 while the build still ships the
+/// version-2 bundle keeps a valid accord root** (sqlite, memory).
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i428c_v2_bundle_upgrade_keeps_the_root() {
+    disarmed();
+    v2_bundle_keeps_the_root(&baked_sqlite().await, &baked_sqlite().await, "sqlite").await;
+    v2_bundle_keeps_the_root(&baked_memory().await, &baked_memory().await, "memory").await;
+}
+
+// ── v53.0.0 — a recovery replicated to a peer (two nodes), I429b ──
+
+/// Deliver A's accord record to B through the real planes: A's signed
+/// since-read, B's replicated `put_family` door.
+async fn deliver_accord(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+) -> Result<(), ciris_persist::federation::Error> {
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let served = a
+        .list_signed_families_since(None, u32::MAX)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.family.family.family_key_id == accord)
+        .expect("A serves its signed accord version");
+    b.put_family(served.family).await
+}
+
+/// A crafted recovery version, as a peer would offer it.
+async fn crafted(
+    on: &dyn FederationDirectory,
+    old: &str,
+    new: &Identity,
+    recovery: &Identity,
+    next: &str,
+) -> ciris_persist::federation::SignedFamily {
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let draft = draft_accord_recovery(
+        on,
+        &AccordRecoveryRequest {
+            family_key_id: accord.to_owned(),
+            old_holder_key_id: old.to_owned(),
+            new_holder_key_id: new.key_id.clone(),
+            recovery_key_id: recovery.key_id.clone(),
+            next_recovery_commitment: ciris_persist::federation::trust_root::recovery_commitment(
+                &ciris_persist::federation::trust_root::test_committed_key(next),
+            )
+            .unwrap(),
+            joined_at: "2026-10-02T14:00:00Z".parse().unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    ciris_persist::federation::accord_recovery::recovery_version(
+        &accord_head(on).await.persist_row_hash,
+        &draft,
+        recovery.sign_bytes(&draft.statement_bytes),
+        new.sign_bytes(&draft.record_bytes),
+    )
+}
+
+/// Does the accord's held roster on `d` reach its quorum with `signers`?
+async fn quorum_with(d: &dyn FederationDirectory, signers: &[&Identity]) -> bool {
+    use ciris_persist::federation::cohort::Cohort;
+    let held = accord_head(d).await;
+    let ids: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
+    let env = d
+        .build_membership_change_envelope(
+            Cohort::Family,
+            &held.family_key_id,
+            &ids,
+            held.consensus_protocol_entrenched,
+            Some(&held.consensus_protocol),
+        )
+        .await
+        .unwrap();
+    let bytes = ciris_verify_core::jcs::canonicalize(&env).unwrap();
+    let sigs: Vec<_> = signers.iter().map(|s| s.threshold_sig(&bytes)).collect();
+    d.verify_membership_quorum(Cohort::Family, &held.family_key_id, &env, &sigs)
+        .await
+        .is_ok()
+}
+
+/// The two-node body.
+async fn recovery_replicates(
+    a: &dyn FederationDirectory,
+    b: &dyn FederationDirectory,
+    c: &TestCeremonyOutputs,
+    tag: &str,
+) {
+    boots_fully_seeded(a, c, &format!("{tag}-A")).await;
+    boots_fully_seeded(b, c, &format!("{tag}-B")).await;
+    let (_, holders, _) = test_ceremony_inputs(&SEEDS, &NODE_SEED, at(-5), None).unwrap();
+    assert_eq!(
+        accord_head(a).await,
+        accord_head(b).await,
+        "{tag}: one genesis head"
+    );
+    let r0 = recovery_identity(0);
+    let n0 = Identity::new(&format!("i429b-new-0-{tag}"));
+    let next0 = Identity::new("i429-next-0");
+    let m = Identity::new(&format!("i429b-m-{tag}"));
+    for d in [a, b] {
+        for k in [&r0, &n0, &next0, &m] {
+            register(d, k).await;
+        }
+    }
+    // A rotates holder 0 under its recovery key; B learns it by replication.
+    rotate(a, "test-accord-holder-0", &n0, &r0, "i429-next-0")
+        .await
+        .unwrap_or_else(|e| panic!("{tag} A: the recovery: {e}"));
+    let before_b = accord_head(b).await;
+    deliver_accord(a, b)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I429b: B admits A's recovery version: {e}"));
+    let after_b = accord_head(b).await;
+    assert_eq!(
+        after_b.persist_row_hash,
+        accord_head(a).await.persist_row_hash,
+        "{tag} I429b: B's head is A's"
+    );
+    assert_eq!(
+        after_b.prev_head_digest, before_b.persist_row_hash,
+        "{tag}: B's head moved"
+    );
+    // On B the new key counts in the quorum and the lost key does not.
+    assert!(
+        quorum_with(b, &[&n0, &holders[1]]).await,
+        "{tag} I429b: the new holder counts in B's quorum"
+    );
+    assert!(
+        !quorum_with(b, &[&holders[0], &holders[1]]).await,
+        "{tag} I429b: the lost key no longer counts on B"
+    );
+    // B also learns the new holder's own recovery commitment.
+    assert_eq!(
+        recovery_commitment_in_force(b, after_b.family_key_id.as_str(), &n0.key_id)
+            .await
+            .unwrap(),
+        recovery_commitment_in_force(a, after_b.family_key_id.as_str(), &n0.key_id)
+            .await
+            .unwrap()
+    );
+
+    // A squatted recovery id, offered to B: refused by name, nothing written.
+    let mut posing = Identity::new("i429-squatter");
+    posing.key_id = recovery_identity(1).key_id.clone();
+    register(b, &posing).await;
+    let n1 = Identity::new(&format!("i429b-new-1-{tag}"));
+    register(b, &n1).await;
+    let squat = crafted(b, "test-accord-holder-1", &n1, &posing, "i429b-next-x").await;
+    let e = b.put_family(squat).await.unwrap_err();
+    assert!(
+        e.to_string().contains("accord_recovery_key_mismatch"),
+        "{tag} I429b: B refuses a squatted recovery key: {e}"
+    );
+    assert_eq!(accord_head(b).await, after_b, "{tag}: nothing written on B");
+
+    // A second recovery on A (n0 -> m under next0, naming r0's own material
+    // as m's recovery key), replicated; then a recovery of m under the SPENT
+    // r0 offered to B is refused.
+    let r0_commitment = ciris_persist::federation::trust_root::recovery_commitment(
+        &ciris_persist::federation::trust_root::CommittedKey::from_record(
+            &a.lookup_public_key(&r0.key_id).await.unwrap().unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let draft = draft_accord_recovery(
+        a,
+        &AccordRecoveryRequest {
+            family_key_id: after_b.family_key_id.clone(),
+            old_holder_key_id: n0.key_id.clone(),
+            new_holder_key_id: m.key_id.clone(),
+            recovery_key_id: next0.key_id.clone(),
+            next_recovery_commitment: r0_commitment,
+            joined_at: "2026-10-02T13:00:00Z".parse().unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let (rs, ns) = (
+        next0.sign_bytes(&draft.statement_bytes),
+        m.sign_bytes(&draft.record_bytes),
+    );
+    recover_accord_holder(a, draft, rs, ns).await.unwrap();
+    deliver_accord(a, b)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I429b: B admits the second recovery: {e}"));
+    let x = Identity::new(&format!("i429b-x-{tag}"));
+    register(b, &x).await;
+    let spent = crafted(b, &m.key_id, &x, &r0, "i429b-next-y").await;
+    let held = accord_head(b).await;
+    let e = b.put_family(spent).await.unwrap_err();
+    assert!(
+        e.to_string().contains("accord_recovery_key_spent"),
+        "{tag} I429b: B refuses a spent recovery key: {e}"
+    );
+    assert_eq!(accord_head(b).await, held, "{tag}: nothing written on B");
+}
+
+/// **I429b — a recovery replicates**: node A rotates a holder's seat, node B
+/// learns the version only through replication and admits it through the
+/// same accord door; B's head moves and the new holder counts in B's quorum;
+/// a squatted or spent recovery key offered to B is refused (sqlite, memory).
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i429b_recovery_replicates_to_a_peer() {
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    recovery_replicates(&sqlite().await, &sqlite().await, &c, "sqlite").await;
+    recovery_replicates(&memory().await, &memory().await, &c, "memory").await;
+}
+
+/// A fresh postgres database of this test's own (migrated), with the given
+/// holders seeded, and its name for the drop. `None` without a DSN.
+#[cfg(feature = "postgres")]
+async fn pg_node(
+    holders: &[ciris_persist::federation::SignedKeyRecord],
+) -> Option<(
+    ciris_persist::store::postgres::PostgresBackend,
+    String,
+    String,
+)> {
+    let base = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok()?;
+    let cut = base.rfind('/').expect("dsn has a database");
+    let name = format!(
+        "ciris_t_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let (admin, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+        .await
+        .expect("connect to the base test database");
+    tokio::spawn(conn);
+    admin
+        .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+        .await
+        .expect("create this test's database");
+    let b = ciris_persist::store::postgres::PostgresBackend::connect(&format!(
+        "{}/{name}",
+        &base[..cut]
+    ))
+    .await
+    .unwrap();
+    b.run_migrations().await.unwrap();
+    b.seed_genesis_accord_holders(holders)
+        .await
+        .expect("seed holders");
+    Some((b, base, name))
+}
+
+#[cfg(feature = "postgres")]
+async fn drop_pg(base: &str, name: &str) {
+    if let Ok((admin, conn)) = tokio_postgres::connect(base, tokio_postgres::NoTls).await {
+        tokio::spawn(conn);
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await;
+    }
+}
+
+/// I429b on postgres: two databases, two nodes.
+#[cfg(feature = "postgres")]
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i429b_recovery_replicates_to_a_peer_postgres() {
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    let roster = effective_accord_holder_records();
+    let Some((a, base, na)) = pg_node(&roster).await else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let (b, _, nb) = pg_node(&roster).await.unwrap();
+    recovery_replicates(&a, &b, &c, "postgres").await;
+    drop(a);
+    drop(b);
+    drop_pg(&base, &na).await;
+    drop_pg(&base, &nb).await;
+}
+
+/// I428c on postgres.
+#[cfg(feature = "postgres")]
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i428c_v2_bundle_upgrade_keeps_the_root_postgres() {
+    disarmed();
+    let roster = accord_holder_genesis_records();
+    let Some((f, base, nf)) = pg_node(&roster).await else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let (u, _, nu) = pg_node(&roster).await.unwrap();
+    v2_bundle_keeps_the_root(&f, &u, "postgres").await;
+    drop(f);
+    drop(u);
+    drop_pg(&base, &nf).await;
+    drop_pg(&base, &nu).await;
+}
