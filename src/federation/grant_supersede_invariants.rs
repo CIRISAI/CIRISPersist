@@ -255,6 +255,29 @@ pub(crate) mod bodies {
             None,
             "I386 a foreign supersedes confers nothing"
         );
+        // The same from a SECOND root the user trusts: its `supersedes` over
+        // the first root's grant is not a grant of its own (only a root
+        // rotates its own grants), so it confers nothing either.
+        let other_subject = format!("gs-osubj-{tag}");
+        let root2 = format!("gs-root2-{tag}");
+        ts::register_hybrid_key_as(d, &other_subject, &other_subject, it::NODE).await;
+        establish_trust_root(d, &fx.user, &root2, &other_subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("I386 a second trusted root");
+        let _ = supersede(
+            d,
+            &format!("gs-r2succ-{tag}"),
+            &root2,
+            &fx.subject,
+            &fx.grant,
+            INFRA_ATTEST_SCOPE,
+        )
+        .await;
+        assert_eq!(
+            walk(d, &fx, INFRA_ATTEST_SCOPE).await,
+            None,
+            "I386 another trusted root's supersedes over this root's grant is no rotation"
+        );
     }
 }
 

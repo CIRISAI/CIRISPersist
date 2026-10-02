@@ -9,6 +9,20 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### Mutation round — #966, #965, CC 3.2 T2 (on the committed tree; sqlite lane)
+
+| # | mutant | witness | verdict |
+|---|---|---|---|
+| M1 | `from_shared` does not tell the backend its key | I380 | killed |
+| M2 | `from_shared_with_local` does not tell it | I380 | killed |
+| M3 | the "already known" guard inverted | I380 | killed |
+| M4 | the resolver's history agreement forced `false` | I381/I382 | killed |
+| M5 | the resolver's history agreement forced `true` | I381 control | killed |
+| M6 | a superseded grant stays a candidate | I383/I384/I385 | killed |
+| M7 | a rotation link may be signed by anyone | I386 (second trusted root) | killed (after I386 gained that leg; it survived the first run, because a foreign signer that is not a trusted root already fails `trust_root_valid`) |
+| M8 | a `supersedes` is not conferral-shaped | I383/I384 | killed |
+| M9 | anyone's `supersedes` retires the grant | I386 | killed |
+
 ### CC 3.2 T2 — a superseded grant hands standing to its successor; a withdrawn one has none
 
 CIRISConstitution v1.0-rc6, CC 3.2 T2 (steward ruling 2026-10-01): *"A grant
