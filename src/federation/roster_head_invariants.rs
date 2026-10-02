@@ -725,11 +725,18 @@ mod pure {
                 && b.contains("LineageCosignRefusal::HeadLagsRoster"),
             "I458: the cosign door refuses a lagging head"
         );
+        // The door RETURNS the count's verdict (its tail expression), so a
+        // call whose result is dropped does not pass. While the accord is three
+        // holders `quorum:2/3` IS the standing majority, so no behaviour can tell
+        // the leg apart; I457 witnesses the count itself.
         let ti = code_of("src/federation/tier_ingest.rs");
         let b = body(&ti, "async fn is_accord_head_version");
+        let flat: String = b.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            b.contains("accord_standing_majority_signed("),
-            "I458: the accord head door counts the standing majority"
+            flat.contains(
+                "accord_standing_majority_signed(directory, &offered.family_key_id, proof).await }"
+            ),
+            "I458: the accord head door returns the standing-majority count"
         );
     }
 }
