@@ -234,6 +234,8 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 
 **Adopters (Edge).** Apply `key_grant:stream:v1` like the other axes; adopt each chunk at the manifest's `epoch`; tolerate zero-length terminator chunks; a v4 DAG has one more chunk per epoch than the producer wrote.
 
+**A consumer can pull an old-format file end to end (test-anchor only).** `chunk_dag_cascade::test_support::write_legacy_v2_dag(engine, backend, cohort_scope, group_key_id, stream_id, chunks) -> LegacyV2Dag { manifest_sha256, chunk_sha256, plaintext }` writes a per-chunk-keyed stream and seals a v2 manifest exactly as v52 did. It is the one v2 writer (I315 and I314c call it). `tests/legacy_v2_dag_writer.rs` drives it from outside the crate: A writes, B pulls through the replicated key-grant sets, the sealed manifest, each sealed chunk and the promote, then reads; a writer that emits v4, or skips chunk 0's grant, fails it. `tier_ingest::test_support::put_owner_binding` is now `pub`. Never in a published wheel.
+
 **Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit). I34b, I144, I202 and I204 moved to the stream shape (a terminator per epoch; one set per epoch; the authorized-but-unkeyed viewer now gets the typed refusal).
 
 **Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): sixteen mutants, fourteen killed, two equivalent.
