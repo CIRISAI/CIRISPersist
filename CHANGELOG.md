@@ -61,6 +61,27 @@ I350–I355 move to the one-artifact shape. A record whose content is changed af
 - Refusals are `Error::CharterInvalid` with an `accord_recovery_*` token: `key_mismatch` (a squatted id), `key_spent`, `signature`, `commitment_missing`, `not_a_holder`, `seat_taken`, `statement_unbound`, `changes_more_than_its_seat`, `record_not_signed_by_new_key`, `next_commitment_malformed`, `next_commitment_not_fresh`.
 - I429 (sqlite, memory, postgres): a squatted recovery id is refused and writes nothing; a record not signed by the new key and a statement not signed by the recovery key are refused; the holder's own rotation passes without a quorum and the new key's next commitment is in force; a second recovery chains; a spent key is refused.
 
+**A recovery replicates (I429b) — and it did not before.** The replicated door (`put_family` → `route_occupied_family` → `admit_amendment`) refused a recovery version: it required a membership-change envelope, the adds-no-member rule and a quorum.
+- The occupied-id route now marks an offer that `verify_accord_recovery` verifies, and `admit_amendment` admits it on that proof alone. The prior head is still bound by the recovery check.
+- The accord door names a failing recovery's check (`accord_recovery_*`) instead of the generic reserved-id refusal, on every node. `recovery_version` is the one builder of the signed version.
+- I429b (two nodes: sqlite, memory, postgres): B learns A's recovery only through A's signed since-read and B's replicated door. B's head moves; the new holder counts in B's quorum and the lost key does not; B learns the new holder's commitment.
+- On B, a squatted recovery key and a spent one are refused by name and write nothing, and a node holding no accord refuses a recovery-shaped version (`accord_recovery_no_held_accord`).
+
+**The shipped version-2 bundle keeps the accord root (I428c).** Until the final ceremony's bundle is baked, v53 ships the version-2 bundle. Its charter is unlabelled and a pinned-bundle member, so it is the family's charter and `genesis_family_charter_digest` names it.
+- A fresh node seeds the accord naming it.
+- A node holding the v52 row takes the same genesis record through the seeder replacement above.
+- Both end with the baked charter in force, one head digest, and a valid accord root for an accepting node. That is witnessed on sqlite, memory and postgres against the real baked asset with no test anchor armed, with a control that the v52 row named no charter.
+
+**Mutation round 3** (lane = I428–I429b, sqlite + memory): five mutants, four killed, one equivalent.
+
+| Mutant | Result |
+|---|---|
+| W1 the peer amendment door ignores a recovery | killed — I429b |
+| W2 the offer never marks a recovery | killed — I429b |
+| W3 the accord door admits any recovery-shaped version | killed — I429b (the no-accord node; survived until that leg was added) |
+| W4 a recovery skips the prior-head check | equivalent — `verify_accord_recovery` binds the proof's prior to the held head |
+| V1 the chartless v52 row is not replaced | killed — I428, I428c |
+
 **Mutation round 2** (on the committed tree `d845789e`; lane = I428, I428b, I429, sqlite + memory): ten mutants, ten killed.
 
 | Mutant | Result |

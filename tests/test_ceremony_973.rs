@@ -1693,12 +1693,28 @@ async fn recovery_replicates(
     register(b, &x).await;
     let spent = crafted(b, &m.key_id, &x, &r0, "i429b-next-y").await;
     let held = accord_head(b).await;
-    let e = b.put_family(spent).await.unwrap_err();
+    let e = b.put_family(spent.clone()).await.unwrap_err();
     assert!(
         e.to_string().contains("accord_recovery_key_spent"),
         "{tag} I429b: B refuses a spent recovery key: {e}"
     );
     assert_eq!(accord_head(b).await, held, "{tag}: nothing written on B");
+    // A node holding no accord at all is offered a recovery-shaped version:
+    // the reserved id refuses it at the door, by the recovery's own name.
+    let none = MemoryBackend::new();
+    none.seed_genesis_accord_holders(&effective_accord_holder_records())
+        .await
+        .unwrap();
+    let e = none.put_family(spent).await.unwrap_err();
+    assert!(
+        e.to_string().contains("accord_recovery_no_held_accord"),
+        "{tag} I429b: no held accord, no recovery: {e}"
+    );
+    assert!(none
+        .lookup_family(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// **I429b — a recovery replicates**: node A rotates a holder's seat, node B
