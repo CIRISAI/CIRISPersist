@@ -84,6 +84,43 @@ impl TestCeremonyOutputs {
     }
 }
 
+/// v53.0.0 (CC 4.2.6) — the recovery seed of a holder seed: domain-separated,
+/// so the recovery pair is never the signing pair.
+#[must_use]
+pub fn test_ceremony_recovery_seed(holder_seed: &[u8; 32]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ciris-test-ceremony-recovery-v1\0");
+    h.update(holder_seed);
+    h.finalize().into()
+}
+
+/// v53.0.0 (CC 4.2.6) — the software recovery key a minted ceremony commits for
+/// `holder_key_id`: `<holder>-recovery`, its pair derived from
+/// [`test_ceremony_recovery_seed`].
+///
+/// # Errors
+///
+/// A seed a signer rejects.
+pub fn test_ceremony_recovery_key(
+    holder_key_id: &str,
+    holder_seed: &[u8; 32],
+) -> Result<crate::federation::trust_root::CommittedKey, Error> {
+    let seed = test_ceremony_recovery_seed(holder_seed);
+    let ed = Ed25519Signer::from_seed(&seed).map_err(|e| bad("recovery ed25519 seed", e))?;
+    let mldsa = MlDsa65Signer::from_seed(&test_anchor_mldsa_seed(&seed))
+        .map_err(|e| bad("recovery ml-dsa-65 seed", e))?;
+    Ok(crate::federation::trust_root::CommittedKey {
+        key_id: format!("{holder_key_id}-recovery"),
+        pubkey_ed25519_base64: B64.encode(ed.public_key().map_err(|e| bad("recovery ed pk", e))?),
+        pubkey_ml_dsa_65_base64: B64.encode(
+            mldsa
+                .public_key()
+                .map_err(|e| bad("recovery ml-dsa pk", e))?,
+        ),
+    })
+}
+
 fn bad(what: &str, e: impl std::fmt::Display) -> Error {
     Error::InvalidArgument(format!("mint_test_ceremony: {what}: {e}"))
 }
@@ -261,7 +298,27 @@ pub fn mint_test_ceremony_scoped(
     let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
     let [charter_id, grant_id, lifecycle_id] = test_ceremony_delegation_ids();
     let successors: Vec<String> = holders[1..].iter().map(|h| h.key_id.clone()).collect();
-    let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)?;
+    // v53.0.0 (CC 3.2 T3, rc7) — the commitment binds the successors' public
+    // keys as their records carry them, not their ids.
+    let successor_keys: Vec<crate::federation::trust_root::CommittedKey> = holder_records[1..]
+        .iter()
+        .map(|r| crate::federation::trust_root::CommittedKey::from_record(&r.record))
+        .collect::<Result<_, _>>()?;
+    let commitment = crate::federation::trust_root::pre_rotation_commitment(&successor_keys)?;
+    // v53.0.0 (CC 4.2.6, rc7) — every holder's pre-committed recovery key: a
+    // software pair derived from the holder's seed, held apart from its
+    // signing pair.
+    let recovery_commitments: std::collections::BTreeMap<String, String> = holders
+        .iter()
+        .zip(ed_seeds)
+        .map(|(h, seed)| {
+            let key = test_ceremony_recovery_key(&h.key_id, seed)?;
+            Ok((
+                h.key_id.clone(),
+                crate::federation::trust_root::recovery_commitment(&key)?,
+            ))
+        })
+        .collect::<Result<_, Error>>()?;
     let mut scope_tokens = vec![
         crate::federation::trust_root::INFRA_ATTEST_SCOPE.to_owned(),
         crate::federation::trust_root::INFRA_SERVE_SCOPE.to_owned(),
@@ -284,6 +341,7 @@ pub fn mint_test_ceremony_scoped(
                 "scope": scope,
                 "successor_key_ids": successors,
                 crate::federation::envelope::paths::WITNESS_QUORUM: 0,
+                crate::federation::envelope::paths::RECOVERY_COMMITMENTS: recovery_commitments,
             }),
             ms(0),
             &holders,

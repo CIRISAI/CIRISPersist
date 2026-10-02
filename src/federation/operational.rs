@@ -2338,10 +2338,10 @@ pub mod test_support {
             format!("{root_key_id}-succ-a"),
             format!("{root_key_id}-succ-b"),
         ];
-        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
             .map_err(|e| {
-                crate::federation::Error::Backend(format!("pre_rotation_commitment: {e}"))
-            })?;
+            crate::federation::Error::Backend(format!("pre_rotation_commitment: {e}"))
+        })?;
         // EVERY seated holder scrubs the charter (holders[0] signs, the rest
         // co-scrub): the charter's verified scrub set — which is what the
         // v47.3.0 holder-hardware leg judges — is then the whole seat set.
@@ -2960,8 +2960,10 @@ pub mod test_support {
         // — the canonical's own charter (it holds its key at boot)...
         let charter_id = uuid::Uuid::new_v4().to_string();
         let successors = vec![format!("{canonical}-succ-a"), format!("{canonical}-succ-b")];
-        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
-            .map_err(|e| crate::federation::Error::Backend(format!("#548 pre_rotation: {e}")))?;
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
+            .map_err(|e| {
+            crate::federation::Error::Backend(format!("#548 pre_rotation: {e}"))
+        })?;
         directory
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: signed_trust_attestation(
@@ -3336,12 +3338,12 @@ pub mod test_support {
             format!("{root_key_id}-succ-a"),
             format!("{root_key_id}-succ-b"),
         ];
-        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
             .map_err(|e| {
-                crate::federation::Error::Backend(format!(
-                    "establish_trust_root pre_rotation_commitment: {e}"
-                ))
-            })?;
+            crate::federation::Error::Backend(format!(
+                "establish_trust_root pre_rotation_commitment: {e}"
+            ))
+        })?;
         let charter = signed_trust_attestation(
             &charter_id,
             root_key_id,
@@ -4198,10 +4200,10 @@ pub mod test_support {
         seed_test_family(directory, &accord, &holders, "quorum:2/3").await?;
 
         let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
-        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
             .map_err(|e| {
-                crate::federation::Error::Backend(format!("#557 pre_rotation_commitment: {e}"))
-            })?;
+            crate::federation::Error::Backend(format!("#557 pre_rotation_commitment: {e}"))
+        })?;
         let charter_envelope = |id: &str| {
             json!({
                 "references_attestation_id": id,
@@ -5182,31 +5184,32 @@ pub mod test_support {
         // is malformed — only unentitled.
         register_typed_key(directory, &foreign, identity_type::NODE).await?;
 
-        let build_charter = |accord: &str,
-                             charter_id: &str|
-         -> Result<
-            crate::federation::Attestation,
-            crate::federation::Error,
-        > {
-            let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
-            let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("#686 pre_rotation_commitment: {e}"))
-                })?;
-            Ok(co_signed_trust_attestation(
-                charter_id,
-                &holders[0],
-                accord,
-                attestation_type::DELEGATES_TO,
-                json!({
-                    "references_attestation_id": charter_id,
-                    "dimension": TRUST_CHARTER_DIMENSION,
-                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-                    "pre_rotation_commitment": commitment,
-                }),
-                &[&holders[1]],
-            ))
-        };
+        let build_charter =
+            |accord: &str,
+             charter_id: &str|
+             -> Result<crate::federation::Attestation, crate::federation::Error> {
+                let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
+                let commitment =
+                    crate::federation::trust_root::test_pre_rotation_commitment(&successors)
+                        .map_err(|e| {
+                            crate::federation::Error::Backend(format!(
+                                "#686 pre_rotation_commitment: {e}"
+                            ))
+                        })?;
+                Ok(co_signed_trust_attestation(
+                    charter_id,
+                    &holders[0],
+                    accord,
+                    attestation_type::DELEGATES_TO,
+                    json!({
+                        "references_attestation_id": charter_id,
+                        "dimension": TRUST_CHARTER_DIMENSION,
+                        "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                        "pre_rotation_commitment": commitment,
+                    }),
+                    &[&holders[1]],
+                ))
+            };
         let foreign_withdraws = |id: &str, target_id: &str, accord: &str| {
             signed_trust_attestation(
                 id,
@@ -5346,10 +5349,10 @@ pub mod test_support {
 
         // The accord charters ITSELF at 2-of-3 — no seat can do it alone.
         let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
-        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+        let commitment = crate::federation::trust_root::test_pre_rotation_commitment(&successors)
             .map_err(|e| {
-                crate::federation::Error::Backend(format!("#561 pre_rotation_commitment: {e}"))
-            })?;
+            crate::federation::Error::Backend(format!("#561 pre_rotation_commitment: {e}"))
+        })?;
         let charter_id = uuid::Uuid::new_v4().to_string();
         directory
             .put_attestation(crate::federation::SignedAttestation {

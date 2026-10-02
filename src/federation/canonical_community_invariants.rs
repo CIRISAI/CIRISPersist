@@ -336,12 +336,13 @@ pub(crate) mod bodies {
     /// (the family's 2-of-3 and more), with a recovery pre-commitment.
     pub(crate) async fn charter_the_accord(d: &dyn FederationDirectory) {
         use crate::federation::trust_root::{
-            pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION,
+            test_pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
+            TRUST_CHARTER_DIMENSION,
         };
         let family = cc::accord_family_key_id();
         let id = uuid::Uuid::new_v4().to_string();
         let commitment =
-            pre_rotation_commitment(&["accord-succ-a".to_owned(), "accord-succ-b".to_owned()])
+            test_pre_rotation_commitment(&["accord-succ-a".to_owned(), "accord-succ-b".to_owned()])
                 .unwrap();
         let charter = ops::co_signed_trust_attestation(
             &id,
@@ -353,6 +354,8 @@ pub(crate) mod bodies {
                 "dimension": TRUST_CHARTER_DIMENSION,
                 "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
                 "pre_rotation_commitment": commitment,
+                "recovery_commitments":
+                    crate::federation::trust_root::test_accord_recovery_commitments_held(d).await,
             }),
             &["B1", "C1"],
         );

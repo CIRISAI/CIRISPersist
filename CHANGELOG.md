@@ -50,6 +50,40 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 | M16 the removal roll alone closes without a terminator | equivalent — as M15 |
 
 Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #977).
+### rc7 accord: key-binding commitments, recovery commitments, no backstop
+
+CIRISConstitution rc7 `5e89627` (CC 3.2 T3, 4.2.6, 2.1) and `fe459cf` (CC 4.2.6, CIRISConstitution#139). Witnesses I430–I439 on memory, sqlite and postgres; I430 is a pure test.
+
+**Commitments bind key material (CC 3.2 T3). Breaking.** `pre_rotation_commitment` hashed the sorted successor key ids. `put_public_key` does not tie a key id to its public keys, so whoever registered a record under a committed id first, with their own keys, satisfied the commitment. It now takes `&[CommittedKey]` and hashes, as CC spells it, the lowercase-hex SHA-256 of the JCS array of `{key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64}` elements sorted by `key_id` (UTF-8 bytes), each member exactly as the key record stores it. `CommittedKey::from_record` refuses a record with no (or an empty) ML-DSA-65 key; the member is never null. An empty set or a repeated key id is refused. `recovery_commitment(&CommittedKey)` is the one-element form. The T3 recovery door (`check_trust_charter_admission`) recomputes every successor's element from the record this node stores under its id: an unregistered successor is refused ("holds no key record"), and a record under a committed id with other keys reproduces another digest and is refused ("the public keys these successor records carry"). Id membership is no longer the check. No alias for the old signature. A commitment stored by an earlier release is an opaque digest and stays well-formed; a recovery against it now has to reproduce it from key material, which an id-only digest will never match — re-commit before relying on a T3 recovery.
+
+**The accord's charter commits a recovery key per holder (CC 4.2.6).** New envelope member `recovery_commitments: {holder_key_id: commitment}` (`envelope::paths::RECOVERY_COMMITMENTS`; `ENVELOPE_VOCABULARY_SHA256` re-pinned to `8064aafe…95b1`). A `trust:charter:v1` naming `humanity-accord` is refused (`federation_charter_invalid`, the token leads the detail) when: the member is absent, not an object, or holds a value that is not 64 lowercase hex, or a standing holder (this node's revocation-folded roster) has no entry — `accord_recovery_commitment_missing`; an entry names a key holding no seat — `accord_recovery_commitment_stray`; an entry commits to a standing holder's own signing key (recomputed from the stored record), or two holders commit to one key — `accord_recovery_key_not_apart`. The last is persist's reading of "held offline and apart from the signing key": a shared recovery key would let one holder rotate another's seat. Other families' charters are unchanged (I435). The shipped baked bundle's charter is unlabelled and is not judged by this door. What is NOT built here: the recovery `supersedes` door itself (a holder rotating under its recovery key with no quorum) — it rides the record versioning of CC 3.2 T6 and is the next slice. The software ceremony minter commits a recovery key per holder: `<holder>-recovery`, its pair derived from `test_ceremony_recovery_seed` (domain-separated from the signing seed).
+
+**The steward backstop is removed (CC 4.2.6). Breaking.** `FederationDirectory::put_accord_decision(decision)` loses its `steward_signatures` argument, `StoredDecision` loses the field, and V172 drops `accord_decision.steward_signatures` on both dialects. `put_accord_decision_json` refuses a non-null `steward_signatures` (`ValueError`) rather than dropping it silently. Persist holds no contest or restore domain labels. A roster change counted against the standing roster is already the floor of `family_charter_threshold` (`strict_majority(N)`).
+
+**Acceptance edges rotate the way grants do (CC 3.2 T2).** The v53 grant rule (a same-signer `supersedes` is the live candidate; what it superseded is not) reached the capability walk's grants only. `trust_root_valid`'s edge leg and `trusted_roots_of` read the user's acceptance edges through the same `live_conferrals`, so a user who supersedes their edge to R1 with one naming R2 is subscribed to R2 and not R1 on both reads (I437, I438). Not applied to charters: a family charter's authority is its quorum, not its signer, and a same-signer rule there would let one holder retire the family's charter; charter versions follow the head record (CC 3.2 T6), the next slice. `transit_candidate_roots` takes a user's successor edge as a candidate too (each candidate is then judged by `trust_root_valid`), so transit eligibility follows a rotated edge to its new root.
+
+**A keyless family confers as it charters (CC 3.4.7): already held, now witnessed.** The family-quorum plane of the capability walk counts a grant only at the family's own threshold; a grant one holder scrubs confers nothing as the family (I439).
+
+### Mutation round — rc7 accord (on the committed tree `ee61de6f`; witness lane memory+sqlite)
+
+| # | mutant | witness | verdict |
+|---|---|---|---|
+| M1 | the commitment does not sort its elements | I430 | killed |
+| M2 | the commitment hashes the key ids only (the pre-v53 bytes) | I430, I431 | killed |
+| M3 | a repeated key id is not refused | I430 | killed |
+| M4 | a missing/empty ML-DSA-65 key forms an element | I430 | killed |
+| M5 | the T3 door forms each successor's element from the id's test pair, not the stored record (`sqlite,test-anchor`) | I431 | killed |
+| M6 | a standing holder may lack a recovery commitment | I432 | killed |
+| M7 | a stray commitment is not refused | I433 | killed |
+| M8 | two holders may share a recovery key | I434 | killed |
+| M9 | a recovery key may be a holder's signing key | I434 | killed |
+| M10 | the recovery rule applies to every family but the accord | I432, I435 | killed |
+| M11 | `trust_root_valid`'s edge leg ignores rotation | I437 | killed |
+| M12 | `trusted_roots_of` ignores rotation | I438 | killed |
+| M13 | transit candidates ignore a successor edge | I438 | killed |
+| M14 | the family-quorum plane counts a grant below the quorum | I439 | killed |
+
+14 of 14 killed.
 
 ### CC 1.0-rc6 re-vendored (tag v1.0-rc6)
 The two vendored CC files move from `651140a` to CIRISConstitution tag **`v1.0-rc6`** (commit `3c3e63fdef844f2f849e43081a8242e31cfaf30d`, annotated tag `b9d8cba`). They were first copied at `1f45ebe` ("Cut 1.0-rc6, released as guidance: re-pin 10") before the tag existed; both manifests have the same blob ids at `1f45ebe` and at the tag, so the bytes are unchanged and only the recorded commit moved. **`scripts/check_vendored_cc.sh <cc-tag>`** (new; a ship step, not CI) fetches CC at a tag and compares both files byte for byte, exiting 1 on any difference and 2 on a missing tag or fetch failure; `scripts/check_vendored_cc.sh v1.0-rc6` passes, and fails on a copy altered by one byte. `scripts/release_ship.sh` names the step, and now pushes `refs/tags/v$ver` explicitly (a branch of the same name made the bare push ambiguous at v52.0.1).

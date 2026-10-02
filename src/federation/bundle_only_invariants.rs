@@ -23,7 +23,7 @@
 pub(crate) mod bodies {
     use crate::federation::operational::test_support as ops;
     use crate::federation::trust_root::{
-        pre_rotation_commitment, trust_root_valid, trusted_roots_of, INFRA_ATTEST_SCOPE,
+        test_pre_rotation_commitment, trust_root_valid, trusted_roots_of, INFRA_ATTEST_SCOPE,
         INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
     };
     use crate::federation::types::{attestation_type, identity_type};
@@ -35,7 +35,7 @@ pub(crate) mod bodies {
 
     fn charter_envelope(id: &str, root: &str, label: Option<&str>) -> serde_json::Value {
         let commitment =
-            pre_rotation_commitment(&[format!("{root}-succ-a"), format!("{root}-succ-b")])
+            test_pre_rotation_commitment(&[format!("{root}-succ-a"), format!("{root}-succ-b")])
                 .expect("commitment");
         let mut env = serde_json::json!({
             "references_attestation_id": id,

@@ -6810,19 +6810,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        let prep = crate::federation::accord_quorum::prepare_decision(
-            &decision,
-            steward_signatures,
-            chrono::Utc::now(),
-        )?;
+        let prep =
+            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
         let crate::federation::accord_quorum::PreparedDecision {
             proposal_digest,
             persist_row_hash,
             decided_at,
-            steward_signatures,
             ..
         } = prep;
         let mut state = self.state.lock().expect("memory backend lock");
@@ -6839,7 +6834,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             proposal_digest,
             crate::federation::accord_quorum::StoredDecision {
                 decision,
-                steward_signatures,
                 persist_row_hash,
                 decided_at,
             },
@@ -17535,7 +17529,7 @@ mod tests {
     /// dead to the walk as a tombstoned one.
     #[tokio::test]
     async fn rc3_charter_deltas_488() {
-        use crate::federation::trust_root::{pre_rotation_commitment, trust_root_valid};
+        use crate::federation::trust_root::{test_pre_rotation_commitment, trust_root_valid};
         let backend = MemoryBackend::new();
         for (k, it) in [
             ("rc-user", "user"),
@@ -17630,7 +17624,7 @@ mod tests {
         // successor set; the bound successor charter ADMITS; a non-binding
         // one REFUSES; a non-member attester REFUSES.
         let successors = vec!["rc-root2".to_owned(), "rc-user".to_owned()];
-        let commitment = pre_rotation_commitment(&successors).unwrap();
+        let commitment = test_pre_rotation_commitment(&successors).unwrap();
         let mut pred = fix_delegates_to(
             "rc-pred",
             "rc-root",
@@ -17658,7 +17652,7 @@ mod tests {
             "references_attestation_id": "rc-succ",
             "scope": ["infra:serve", "infra:attest"],
             "pre_rotation_commitment":
-                pre_rotation_commitment(&["rc-next-a".to_owned()]).unwrap(),
+                test_pre_rotation_commitment(&["rc-next-a".to_owned()]).unwrap(),
             "recovers": "rc-root",
             "successor_keys": successors,
         });
@@ -18361,7 +18355,7 @@ mod tests {
     fn fix_charter(id: &str, root: &str, scope: serde_json::Value) -> Attestation {
         let successors = vec![format!("{root}-succ-a"), format!("{root}-succ-b")];
         let commitment =
-            crate::federation::trust_root::pre_rotation_commitment(&successors).unwrap();
+            crate::federation::trust_root::test_pre_rotation_commitment(&successors).unwrap();
         let mut d = fix_attestation(id, root, root, root);
         d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
         crate::federation::tier_ingest::test_support::reseal(&mut d);
@@ -23767,9 +23761,9 @@ mod tests {
             };
             if id == "n607-charter" {
                 envelope["pre_rotation_commitment"] =
-                    serde_json::json!(crate::federation::trust_root::pre_rotation_commitment(&[
-                        "n607-root-successor".to_owned()
-                    ])
+                    serde_json::json!(crate::federation::trust_root::test_pre_rotation_commitment(
+                        &["n607-root-successor".to_owned()]
+                    )
                     .expect("commitment"));
             }
             let envelope = envelope;

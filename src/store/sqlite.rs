@@ -8145,25 +8145,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        let prep = crate::federation::accord_quorum::prepare_decision(
-            &decision,
-            steward_signatures,
-            chrono::Utc::now(),
-        )?;
+        let prep =
+            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
         let live_set = serde_json::to_string(&prep.live_set)
             .map_err(|e| Error::Backend(format!("live_set encode: {e}")))?;
         let decision_json = serde_json::to_string(&prep.decision_json)
             .map_err(|e| Error::Backend(format!("decision_json encode: {e}")))?;
-        let steward = match &prep.steward_signatures {
-            Some(v) => Some(
-                serde_json::to_string(v)
-                    .map_err(|e| Error::Backend(format!("steward_signatures encode: {e}")))?,
-            ),
-            None => None,
-        };
         let digest_for_err = prep.proposal_digest.clone();
         let outcome = self
             .write(move |conn| -> Result<&'static str, rusqlite::Error> {
@@ -8186,9 +8175,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 conn.execute(
                     "INSERT INTO accord_decision (\
                     proposal_digest, family_key_id, authorized, yes, no, abstain, \
-                    live_set, window_until, steward_signatures, decision_json, \
+                    live_set, window_until, decision_json, \
                     persist_row_hash, decided_at\
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     rusqlite::params![
                         prep.proposal_digest,
                         prep.family_key_id,
@@ -8198,7 +8187,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         prep.abstain,
                         live_set,
                         prep.window_until.to_rfc3339(),
-                        steward,
                         decision_json,
                         prep.persist_row_hash,
                         prep.decided_at.to_rfc3339(),
@@ -8228,7 +8216,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 rusqlite::Error,
             > {
                 conn.query_row(
-                    "SELECT decision_json, steward_signatures, persist_row_hash, decided_at \
+                    "SELECT decision_json, persist_row_hash, decided_at \
                  FROM accord_decision WHERE proposal_digest = ?1",
                     [&key],
                     sqlite_row_to_stored_decision,
@@ -22285,15 +22273,9 @@ fn sqlite_row_to_stored_decision(
 ) -> rusqlite::Result<crate::federation::accord_quorum::StoredDecision> {
     let decision_json: String = row.get("decision_json")?;
     let decision = serde_json::from_str(&decision_json).map_err(accord_json_err)?;
-    let steward_text: Option<String> = row.get("steward_signatures")?;
-    let steward_signatures = match steward_text {
-        Some(t) => Some(serde_json::from_str(&t).map_err(accord_json_err)?),
-        None => None,
-    };
     let decided_at: String = row.get("decided_at")?;
     Ok(crate::federation::accord_quorum::StoredDecision {
         decision,
-        steward_signatures,
         persist_row_hash: row.get("persist_row_hash")?,
         decided_at: parse_rfc3339(&decided_at),
     })

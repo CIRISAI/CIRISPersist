@@ -182,6 +182,11 @@ pub mod rc5_adopts_invariants;
 /// v51.0.0 — the rc6 trust-root security set (I191–I196).
 #[cfg(test)]
 pub(crate) mod rc6_invariants;
+/// v53.0.0 (CC rc7, CIRISConstitution#139) — I430–I439: commitments bind key
+/// material, the accord commits a recovery key per holder, no steward backstop,
+/// acceptance edges rotate as grants do, a keyless family confers at its quorum.
+#[cfg(test)]
+pub(crate) mod rc7_accord_invariants;
 /// CIRISPersist#973 — I345–I349, the community boot leg and the re-bake path.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod remint_invariants;
@@ -8887,12 +8892,13 @@ pub trait FederationDirectory: Send + Sync {
 
     /// #302 — record the server's frozen-L decision (M2). IMMUTABLE: a
     /// differing re-PUT for the same proposal is [`Error::Conflict`]; an
-    /// identical one is an idempotent no-op. `steward_signatures` carries the
-    /// |L|<L_FLOOR backstop (H6) when present.
+    /// identical one is an idempotent no-op.
+    ///
+    /// v53.0.0 (CC 4.2.6 rc7, CIRISConstitution#139) — the steward-signature
+    /// argument is gone with the regional-steward backstop (H6) it carried.
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), Error>;
 
     /// #302 — the stored decision for `proposal_digest`, or `None`.

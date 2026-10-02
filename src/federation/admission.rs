@@ -22593,7 +22593,7 @@ pub(crate) mod r2_test_support {
         scope: &str,
     ) {
         use crate::federation::trust_root::{
-            pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
+            test_pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
             TRUST_CONFERS_DIMENSION,
         };
         // The FK on attesting_key_id is real: every signer of the three rows must
@@ -22627,7 +22627,7 @@ pub(crate) mod r2_test_support {
                     "dimension": TRUST_CHARTER_DIMENSION,
                     "scope": ["infra:serve", "infra:attest"],
                     "pre_rotation_commitment":
-                        pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
+                        test_pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
                 }),
             ),
             (
@@ -26061,7 +26061,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         suffix: &str,
     ) {
         use crate::federation::trust_root::{
-            capability_roots_to_trusted_root, pre_rotation_commitment, trust_root_valid,
+            capability_roots_to_trusted_root, test_pre_rotation_commitment, trust_root_valid,
             TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
         };
         let node = format!("reh-node-{suffix}");
@@ -26090,7 +26090,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                     "dimension": TRUST_CHARTER_DIMENSION,
                     "scope": charter_scope,
                     "pre_rotation_commitment":
-                        pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
+                        test_pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
                 }),
             ),
             (

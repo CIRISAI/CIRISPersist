@@ -174,7 +174,6 @@ pub(crate) struct PreparedDecision {
     pub abstain: i64,
     pub live_set: serde_json::Value,
     pub window_until: DateTime<Utc>,
-    pub steward_signatures: Option<serde_json::Value>,
     pub decision_json: serde_json::Value,
     pub persist_row_hash: String,
     pub decided_at: DateTime<Utc>,
@@ -183,11 +182,13 @@ pub(crate) struct PreparedDecision {
 /// Derive the `accord_decision` columns from the verify-core
 /// [`AccordDecision`]. The decision is IMMUTABLE once written (M2): backends
 /// reject a differing re-PUT and no-op an identical one (keyed on the
-/// `persist_row_hash`). `steward_signatures` carries the |L|<L_FLOOR backstop
-/// sigs (H6) when present.
+/// `persist_row_hash`).
+///
+/// v53.0.0 (CC 4.2.6 rc7, CIRISConstitution#139) — no steward signatures: the
+/// regional-steward backstop (H6) and its restore (H7) and contest are removed,
+/// and a roster change is counted against the standing roster instead.
 pub(crate) fn prepare_decision(
     decision: &AccordDecision,
-    steward_signatures: Option<serde_json::Value>,
     decided_at: DateTime<Utc>,
 ) -> Result<PreparedDecision, Error> {
     let window_until = parse_rfc3339(
@@ -207,7 +208,6 @@ pub(crate) fn prepare_decision(
         abstain: decision.abstain as i64,
         live_set,
         window_until,
-        steward_signatures,
         persist_row_hash: compute_persist_row_hash(decision)?,
         decision_json,
         decided_at,
@@ -254,9 +254,6 @@ pub struct StoredParticipation {
 pub struct StoredDecision {
     /// The verbatim verify-core frozen-L decision snapshot (M2, immutable).
     pub decision: AccordDecision,
-    /// The |L|<L_FLOOR steward-backstop signatures (H6), if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub steward_signatures: Option<serde_json::Value>,
     /// Substrate row hash (canonical SHA-256 of the stored decision).
     pub persist_row_hash: String,
     /// When persist admitted the decision.
@@ -422,15 +419,15 @@ pub(crate) mod test_fixtures {
             abstain: 0,
         };
         backend
-            .put_accord_decision(AccordDecision::new(prop.clone(), &tally, true), None)
+            .put_accord_decision(AccordDecision::new(prop.clone(), &tally, true))
             .await
             .unwrap();
         backend
-            .put_accord_decision(AccordDecision::new(prop.clone(), &tally, true), None)
+            .put_accord_decision(AccordDecision::new(prop.clone(), &tally, true))
             .await
             .unwrap(); // idempotent
         let err = backend
-            .put_accord_decision(AccordDecision::new(prop.clone(), &tally, false), None)
+            .put_accord_decision(AccordDecision::new(prop.clone(), &tally, false))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Conflict(_)), "M2: {err:?}");

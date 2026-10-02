@@ -231,6 +231,11 @@ pub mod paths {
     /// v51.0.0 (CIRISPersist#937) — on a `trust:accepts:v1` acceptance edge:
     /// the lineage head (its `persist_row_hash`) the consumer attaches under.
     pub const ATTACHED_HEAD_DIGEST: &str = "attached_head_digest";
+    /// v53.0.0 (CC 4.2.6, rc7 `5e89627`) — a member of the ACCORD's charter:
+    /// `{holder_key_id: commitment}`, each holder's pre-committed recovery key
+    /// ([`crate::federation::trust_root::recovery_commitment`]). Required on
+    /// the accord's charter; one per standing holder.
+    pub const RECOVERY_COMMITMENTS: &str = "recovery_commitments";
 }
 
 /// v31.0.0 (CIRISPersist#643) — the member names INSIDE [`paths::ROW`]. One
@@ -517,6 +522,9 @@ pub struct EnvelopeCore {
     /// [`paths::ATTACHED_HEAD_DIGEST`] — v51.0.0 (#937).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_head_digest: Option<String>,
+    /// [`paths::RECOVERY_COMMITMENTS`] — v53.0.0 (CC 4.2.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_commitments: Option<std::collections::BTreeMap<String, String>>,
     /// Every dimension-specific key, untyped and preserved. Covered by
     /// the envelope vocabulary hash, not by the compiler.
     #[serde(flatten)]
@@ -953,6 +961,10 @@ fn fully_populated_core() -> EnvelopeCore {
         witness_cadence_secs: Some(86_400),
         witness_quorum: Some(1),
         attached_head_digest: Some("cd".repeat(32)),
+        recovery_commitments: Some(std::collections::BTreeMap::from([(
+            "A1".to_owned(),
+            "ef".repeat(32),
+        )])),
         // Deliberately EMPTY: `extra` is the open half, and the typed
         // key set is exactly what this value serializes to only while
         // nothing untyped rides along.
@@ -993,6 +1005,7 @@ mod tests {
             (paths::WITNESS_CADENCE_SECS, true),
             (paths::WITNESS_QUORUM, true),
             (paths::ATTACHED_HEAD_DIGEST, true),
+            (paths::RECOVERY_COMMITMENTS, true),
         ] {
             assert_eq!(
                 v.get(path).is_some(),
@@ -1194,6 +1207,10 @@ pub fn envelope_vocabulary_json() -> serde_json::Value {
             paths::WITNESS_CADENCE_SECS,
             paths::WITNESS_QUORUM,
             paths::ATTACHED_HEAD_DIGEST,
+            // v53.0.0 (CC 4.2.6, rc7) — RE-PINNED: each accord holder's
+            // pre-committed recovery key is a scrub-signed charter member, and
+            // it decides who may rotate a holder's seat without a quorum.
+            paths::RECOVERY_COMMITMENTS,
         ],
         // v31.0.0 (CIRISPersist#643) — the CLOSED member set of `row`. Served
         // alongside the universal paths so a consumer can validate the mirror
@@ -1301,8 +1318,12 @@ pub fn envelope_vocabulary_sha256() -> String {
 /// and the acceptance edge's `attached_head_digest` joined `universal_paths`:
 /// they decide whether a consumer ATTACHES a root. Previous pin:
 /// `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a`.
+/// v53.0.0 (CC 4.2.6 rc7, CIRISConstitution#139) — RE-PINNED: the accord
+/// charter's `recovery_commitments` joined `universal_paths` (it decides who
+/// may rotate a holder's seat without a quorum). Previous pin:
+/// `c9558c98bf871e97c2e73c428894e2dc642fcffec4de92da06ab5a9fa69ddca2`.
 pub const ENVELOPE_VOCABULARY_SHA256: &str =
-    "c9558c98bf871e97c2e73c428894e2dc642fcffec4de92da06ab5a9fa69ddca2";
+    "8064aafe07646acefad93f51fbf7e79cb8ac421bd49318c5aad50ded142295b1";
 
 #[cfg(test)]
 mod vocab_tests {
