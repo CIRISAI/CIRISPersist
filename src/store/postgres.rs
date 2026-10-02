@@ -6306,6 +6306,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // witnessed lineage head inside the root's attach window.
         crate::federation::canonical_community::check_attach_freshness(
             self,
+            Some(&row.attestation_id),
+            &row.attesting_key_id,
             &row.attestation_type,
             &row.attested_key_id,
             &row.attestation_envelope,
@@ -21516,6 +21518,8 @@ impl PostgresBackend {
         // witnessed lineage head inside the root's attach window.
         crate::federation::canonical_community::check_attach_freshness(
             self,
+            input.attestation_id.as_deref(),
+            &input.attesting_key_id,
             &input.attestation_type,
             input
                 .attested_key_id

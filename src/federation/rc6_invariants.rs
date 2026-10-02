@@ -465,12 +465,12 @@ pub(crate) mod bodies {
         let holders = born(d).await;
         let consumer = "i194-consumer";
         ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
-        // pre-rc6 charter (no window): the old edge shape attaches
+        // #973 (T4a) — a NEW edge names its head under any charter; the
+        // pre-rc6 headless shape stays valid only for an edge already held
+        // (I357).
         let pre = "i194-pre";
         ts::register_hybrid_key_as(d, pre, pre, identity_type::USER).await;
-        accept_edge(d, pre, None)
-            .await
-            .expect("a pre-rc6 charter keeps the pre-rc6 shape");
+        assert_unnamed(accept_edge(d, pre, None).await, "I194 pre-rc6 charter");
         // the accord re-scrubs its charter with a window (ten years: the birth
         // is pinned to 2026-09-20, and a shorter window would decay the witness
         // on a calendar date)
@@ -485,9 +485,9 @@ pub(crate) mod bodies {
             .unwrap()
             .unwrap()
             .persist_row_hash;
-        assert_stale(
+        assert_unnamed(
             accept_edge(d, consumer, None).await,
-            "requires the witnessed lineage head",
+            "I194 windowed charter",
         );
         assert_stale(accept_edge(d, consumer, Some(&head)).await, "not witnessed");
         wit(d, cosign_held_head(d, CANON, "w1", None).await)
@@ -810,7 +810,7 @@ pub(crate) mod bodies {
             ts::register_hybrid_key_as(d, name, name, identity_type::USER).await;
             let _ = i;
         }
-        assert_stale(accept_edge(d, "i342-a", None).await, "out-of-band anchor");
+        assert_unnamed(accept_edge(d, "i342-a", None).await, "I342 off mode");
         assert_stale(
             accept_edge(d, "i342-b", Some(&"ab".repeat(32))).await,
             "not the head this node holds",
@@ -883,6 +883,37 @@ pub(crate) mod bodies {
         )
         .await;
         assert_unnamed(accept_edge(d, "i356-win", None).await, "witnessed, window");
+        // A row with NO job label is not an acceptance edge by name: it
+        // reaches the gate by direction inference only, the same inference
+        // that covers a family charter and the baked `genesis-charter`. It
+        // keeps the pre-#973 reading: refused under a charter with a window …
+        ts::register_hybrid_key_as(d, "i356-unl", "i356-unl", identity_type::USER).await;
+        let unlabeled = |id: &str| {
+            let mut edge = crate::federation::operational::test_support::signed_trust_attestation(
+                id,
+                "i356-unl",
+                CANON,
+                crate::federation::types::attestation_type::DELEGATES_TO,
+                serde_json::json!({
+                    "references_attestation_id": id,
+                    "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+                }),
+            );
+            ts::reseal(&mut edge);
+            crate::federation::SignedAttestation { attestation: edge }
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let e = d
+            .put_attestation(unlabeled(&id))
+            .await
+            .expect_err("I356: unlabeled and headless under a window");
+        assert_eq!(e.kind(), "trust_root_head_stale", "I356: {e:?}");
+        // … and admitted under a charter that declares none.
+        charter_the_accord_with(d, serde_json::json!({ "witness_quorum": 2 })).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        d.put_attestation(unlabeled(&id))
+            .await
+            .expect("I356: an unlabeled row under a charter with no window is not gated");
         for name in ["i356-off", "i356-on", "i356-win"] {
             assert!(
                 !crate::federation::trust_root::trust_root_valid(d, name, CANON)
@@ -1092,10 +1123,19 @@ pub(crate) mod bodies {
         let holders = born(d).await;
         let r = cc::resolve_community(d, CANON).await.unwrap().unwrap();
         assert!(r.live, "3 founders at quorum:2/3: live (M + 1)");
-        // a consumer attached before the stall (pre-rc6 charter: no head named)
+        // a consumer attached before the stall, naming the head it holds
+        // (#973: a new edge names its head; witnessed mode is off here)
         let consumer = "i195-consumer";
         ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
-        accept_edge(d, consumer, None).await.expect("attaches");
+        let head = d
+            .lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
+        accept_edge(d, consumer, Some(&head))
+            .await
+            .expect("attaches");
         ts::register_hybrid_key_as(d, "stall-node", "stall-node", identity_type::NODE).await;
         assert_eq!(count(d, kind::COMMUNITY_LIVENESS_STALLED).await, 0);
         // a resignation: stalled, declared once

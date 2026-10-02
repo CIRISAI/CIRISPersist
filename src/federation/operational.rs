@@ -2977,13 +2977,18 @@ pub mod test_support {
                     &user,
                     &canonical,
                     attestation_type::DELEGATES_TO,
-                    json!({
-                        "id": edge_id,
-                        // v23.0.0 (CIRISPersist#551 item 2) — the deletable
-                        // un-trust lever, named so an operator can find it.
-                        "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                        "scope": [INFRA_SERVE_SCOPE],
-                    }),
+                    naming_the_attach_head(
+                        directory,
+                        &canonical,
+                        json!({
+                            "id": edge_id,
+                            // v23.0.0 (CIRISPersist#551 item 2) — the deletable
+                            // un-trust lever, named so an operator can find it.
+                            "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                            "scope": [INFRA_SERVE_SCOPE],
+                        }),
+                    )
+                    .await,
                 ),
             })
             .await?;
@@ -3374,6 +3379,27 @@ pub mod test_support {
     /// (`FederationTierUnverified` — the derived key ≠ the node's real signing
     /// key). Best-effort by design: on that failure it logs and returns, and
     /// the real user's own signer is expected to emit the honest edge.
+    /// #973 (CC 3.2 T4a) — a NEW acceptance edge names the head it attaches
+    /// on. Adds `attached_head_digest` to `envelope` when this node holds a
+    /// lineage for `root` (a key root has none and the edge stays as built).
+    pub(crate) async fn naming_the_attach_head(
+        directory: &dyn crate::federation::FederationDirectory,
+        root: &str,
+        mut envelope: serde_json::Value,
+    ) -> serde_json::Value {
+        if let Ok(Some(head)) = crate::federation::canonical_community::attach_head_for(
+            directory,
+            root,
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            envelope[crate::federation::envelope::paths::ATTACHED_HEAD_DIGEST] =
+                serde_json::Value::String(head);
+        }
+        envelope
+    }
+
     async fn try_emit_synthetic_trust_edge(
         directory: &dyn crate::federation::FederationDirectory,
         user_key_id: &str,
@@ -3387,13 +3413,18 @@ pub mod test_support {
             user_key_id,
             root_key_id,
             attestation_type::DELEGATES_TO,
-            json!({
-                "references_attestation_id": edge_id,
-                // v23.0.0 (CIRISPersist#551 item 2) — node → R: the trust
-                // edge, named.
-                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-            }),
+            naming_the_attach_head(
+                directory,
+                root_key_id,
+                json!({
+                    "references_attestation_id": edge_id,
+                    // v23.0.0 (CIRISPersist#551 item 2) — node → R: the trust
+                    // edge, named.
+                    "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                }),
+            )
+            .await,
         );
         if let Err(e) = directory
             .put_attestation(crate::federation::SignedAttestation { attestation: edge })
@@ -4312,11 +4343,16 @@ pub mod test_support {
                     &user,
                     &accord,
                     attestation_type::DELEGATES_TO,
-                    json!({
-                        "references_attestation_id": edge_id,
-                        "dimension": TRUST_ACCEPTS_DIMENSION,
-                        "scope": [INFRA_SERVE_SCOPE],
-                    }),
+                    naming_the_attach_head(
+                        directory,
+                        &accord,
+                        json!({
+                            "references_attestation_id": edge_id,
+                            "dimension": TRUST_ACCEPTS_DIMENSION,
+                            "scope": [INFRA_SERVE_SCOPE],
+                        }),
+                    )
+                    .await,
                 ),
             })
             .await?;
@@ -4624,12 +4660,17 @@ pub mod test_support {
             &user,
             &root_b,
             attestation_type::DELEGATES_TO,
-            json!({
-                "references_attestation_id": edge_id,
-                // v23.0.0 (CIRISPersist#551 item 2) — node → R.
-                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-            }),
+            naming_the_attach_head(
+                directory,
+                &root_b,
+                json!({
+                    "references_attestation_id": edge_id,
+                    // v23.0.0 (CIRISPersist#551 item 2) — node → R.
+                    "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                }),
+            )
+            .await,
             &user_real_key,
         );
         directory
@@ -4697,11 +4738,16 @@ pub mod test_support {
             from,
             root,
             crate::federation::types::attestation_type::DELEGATES_TO,
-            json!({
-                "references_attestation_id": id,
-                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
-                "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
-            }),
+            naming_the_attach_head(
+                directory,
+                root,
+                json!({
+                    "references_attestation_id": id,
+                    "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                    "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+                }),
+            )
+            .await,
         );
         edge.expires_at = expires_at;
         // v31.0.0 (CIRISPersist#598) — `expires_at` is bound in BOTH

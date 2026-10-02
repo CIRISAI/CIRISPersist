@@ -9079,6 +9079,17 @@ pub enum Error {
         /// The rule that refused, in words.
         detail: String,
     },
+    /// CIRISPersist#973 (CC 3.2 T4a, rc6) — a NEW acceptance edge
+    /// (`trust:accepts:v1`) named no lineage head. A new edge names the head
+    /// it attaches on in every mode; an edge this node already holds is not
+    /// re-judged.
+    #[error("trust root head unnamed: attaching {root_key_id} refused — {detail}")]
+    TrustRootHeadUnnamed {
+        /// The root being attached.
+        root_key_id: String,
+        /// The rule that refused, in words.
+        detail: String,
+    },
     /// v19.0.0 (CIRISPersist#488, CRITICAL — the KERI lesson) — a root
     /// charter (`delegates_to(root → root, infra:*)`) failed the recovery
     /// admission gate: missing/malformed pre-rotation commitment, or a
@@ -10934,6 +10945,7 @@ impl Error {
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
             Error::TrustRootHeadStale { .. } => "trust_root_head_stale",
+            Error::TrustRootHeadUnnamed { .. } => "trust_root_head_unnamed",
             Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
             Error::NoConstitutionalRootYet { .. } => "federation_no_constitutional_root_yet",
             Error::ConstitutionalFamilyReserved { .. } => {
