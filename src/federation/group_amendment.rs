@@ -589,7 +589,18 @@ where
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
         .await?;
-    // v52.0.0 (#955, Q2) — an amendment never adds a member.
+    // v52.0.0 (#955, Q2) — an amendment never adds a member. v53.0.0 (CC
+    // 4.2.6): the one exception is an accord holder's recovery, whose new key
+    // takes the holder's own seat and signed the version that seats it.
+    let mut allowed = super::membership_acceptance::supersede_allowed_members(
+        dir,
+        Cohort::Family,
+        &new.family.family_key_id,
+    )
+    .await?;
+    if let Some(recovered) = super::accord_recovery::verify_accord_recovery(dir, &new).await? {
+        allowed.insert(recovered);
+    }
     super::membership_acceptance::check_supersede_adds_no_member(
         &new.family.family_key_id,
         &new.family
@@ -597,12 +608,7 @@ where
             .iter()
             .map(|m| m.key_id.as_str())
             .collect::<Vec<_>>(),
-        &super::membership_acceptance::supersede_allowed_members(
-            dir,
-            Cohort::Family,
-            &new.family.family_key_id,
-        )
-        .await?,
+        &allowed,
     )?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
     // the signature that authorizes it travel together, because the way they

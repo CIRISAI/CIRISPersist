@@ -1123,3 +1123,272 @@ async fn i428_v52_accord_row_takes_the_genesis_head_postgres() {
             .await;
     }
 }
+
+// ── v53.0.0 — an accord holder's recovery (CC 4.2.6), I429 ──
+
+use ciris_persist::federation::accord_recovery::{
+    draft_accord_recovery, recover_accord_holder, recovery_commitment_in_force,
+    AccordRecoveryRequest,
+};
+use ciris_persist::federation::accord_test_support::Identity;
+
+/// A software key registered under its own id.
+async fn register(d: &dyn FederationDirectory, who: &Identity) {
+    d.put_public_key(ciris_persist::federation::SignedKeyRecord {
+        record: who.steward_key_record(),
+    })
+    .await
+    .unwrap_or_else(|e| panic!("register {}: {e}", who.key_id));
+}
+
+/// Holder `k`'s committed recovery key as a signer.
+fn recovery_identity(k: usize) -> Identity {
+    let seed = test_ceremony_recovery_seed(&SEEDS[k]);
+    Identity::from_seeds(
+        &format!("test-accord-holder-{k}-recovery"),
+        &seed,
+        &test_anchor_mldsa_seed(&seed),
+    )
+    .unwrap()
+}
+
+fn refusal(e: ciris_persist::federation::Error) -> String {
+    e.to_string()
+}
+
+/// One rotation: `old` → `new` under `recovery`, naming `next` (a key id whose
+/// test pair becomes the new key's committed recovery key).
+async fn rotate(
+    d: &dyn FederationDirectory,
+    old: &str,
+    new: &Identity,
+    recovery: &Identity,
+    next: &str,
+) -> Result<u32, ciris_persist::federation::Error> {
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let next_commitment = ciris_persist::federation::trust_root::recovery_commitment(
+        &ciris_persist::federation::trust_root::test_committed_key(next),
+    )
+    .unwrap();
+    let draft = draft_accord_recovery(
+        d,
+        &AccordRecoveryRequest {
+            family_key_id: accord.to_owned(),
+            old_holder_key_id: old.to_owned(),
+            new_holder_key_id: new.key_id.clone(),
+            recovery_key_id: recovery.key_id.clone(),
+            next_recovery_commitment: next_commitment,
+            joined_at: "2026-10-02T12:00:00Z".parse().unwrap(),
+        },
+    )
+    .await?;
+    let r = recovery.sign_bytes(&draft.statement_bytes);
+    let n = new.sign_bytes(&draft.record_bytes);
+    recover_accord_holder(d, draft, r, n).await
+}
+
+async fn accord_head(d: &dyn FederationDirectory) -> ciris_persist::federation::types::Family {
+    d.lookup_family(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// The recovery body shared by the backends.
+async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &str) {
+    boots_fully_seeded(d, c, tag).await;
+    let accord = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    let before = accord_head(d).await;
+
+    // A squatter registers holder 1's committed recovery id with its own keys.
+    let mut posing = Identity::new("i429-squatter");
+    posing.key_id = recovery_identity(1).key_id.clone();
+    register(d, &posing).await;
+    let n1 = Identity::new(&format!("i429-new-1-{tag}"));
+    register(d, &n1).await;
+    let e = rotate(d, "test-accord-holder-1", &n1, &posing, "i429-next-x")
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("accord_recovery_key_mismatch"),
+        "{tag} I429: a squatted recovery id is refused: {e}"
+    );
+    assert_eq!(accord_head(d).await, before, "{tag} I429: nothing written");
+
+    // The real recovery of holder 0: no quorum, one seat swapped.
+    let r0 = recovery_identity(0);
+    register(d, &r0).await;
+    let n0 = Identity::new(&format!("i429-new-0-{tag}"));
+    register(d, &n0).await;
+    // the record signed by a key other than the one taking the seat: refused
+    let wrong = Identity::new("i429-wrong");
+    {
+        let accord_req = AccordRecoveryRequest {
+            family_key_id: accord.to_owned(),
+            old_holder_key_id: "test-accord-holder-0".into(),
+            new_holder_key_id: n0.key_id.clone(),
+            recovery_key_id: r0.key_id.clone(),
+            next_recovery_commitment: ciris_persist::federation::trust_root::recovery_commitment(
+                &ciris_persist::federation::trust_root::test_committed_key("i429-next-0"),
+            )
+            .unwrap(),
+            joined_at: "2026-10-02T12:00:00Z".parse().unwrap(),
+        };
+        let draft = draft_accord_recovery(d, &accord_req).await.unwrap();
+        let r = r0.sign_bytes(&draft.statement_bytes);
+        let n = wrong.sign_bytes(&draft.record_bytes);
+        assert!(recover_accord_holder(d, draft.clone(), r.clone(), n)
+            .await
+            .is_err());
+        // a statement signed by the new key instead of the recovery key: refused
+        let n_ok = n0.sign_bytes(&draft.record_bytes);
+        let not_r = n0.sign_bytes(&draft.statement_bytes);
+        let e = recover_accord_holder(d, draft, not_r, n_ok)
+            .await
+            .unwrap_err();
+        assert!(refusal(e).contains("accord_recovery_signature"), "{tag}");
+        assert_eq!(accord_head(d).await, before, "{tag} I429: nothing written");
+    }
+    rotate(d, "test-accord-holder-0", &n0, &r0, "i429-next-0")
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I429: the holder's own recovery: {e}"));
+    let after = accord_head(d).await;
+    let seats: Vec<&str> = after.members.iter().map(|m| m.key_id.as_str()).collect();
+    assert!(
+        seats.contains(&n0.key_id.as_str()) && !seats.contains(&"test-accord-holder-0"),
+        "{tag} I429: the seat moved: {seats:?}"
+    );
+    assert_eq!(after.members.len(), before.members.len());
+    assert_eq!(
+        after.prev_head_digest, before.persist_row_hash,
+        "{tag} I429: a new version"
+    );
+    assert_eq!(
+        after.charter_digest, before.charter_digest,
+        "{tag} I429: the charter stays"
+    );
+    assert_eq!(
+        (after.consensus_protocol.as_str(), after.founded_at),
+        (before.consensus_protocol.as_str(), before.founded_at)
+    );
+    let next0 = ciris_persist::federation::trust_root::recovery_commitment(
+        &ciris_persist::federation::trust_root::test_committed_key("i429-next-0"),
+    )
+    .unwrap();
+    assert_eq!(
+        recovery_commitment_in_force(d, accord, &n0.key_id)
+            .await
+            .unwrap(),
+        Some(next0),
+        "{tag} I429: the new key's own recovery commitment is in force"
+    );
+
+    // The new holder recovers in turn under "i429-next-0", naming holder 0's
+    // spent key as its successor's recovery key; that successor's recovery
+    // under the spent key is refused.
+    let r_next0 = Identity::new("i429-next-0");
+    register(d, &r_next0).await;
+    let m = Identity::new(&format!("i429-m-{tag}"));
+    register(d, &m).await;
+    let r0_as_id = r0.key_id.clone();
+    // the next commitment names r0's own material
+    let r0_commitment = ciris_persist::federation::trust_root::recovery_commitment(
+        &ciris_persist::federation::trust_root::CommittedKey::from_record(
+            &d.lookup_public_key(&r0_as_id).await.unwrap().unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let draft = draft_accord_recovery(
+        d,
+        &AccordRecoveryRequest {
+            family_key_id: accord.to_owned(),
+            old_holder_key_id: n0.key_id.clone(),
+            new_holder_key_id: m.key_id.clone(),
+            recovery_key_id: "i429-next-0".into(),
+            next_recovery_commitment: r0_commitment,
+            joined_at: "2026-10-02T13:00:00Z".parse().unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let (r, n) = (
+        r_next0.sign_bytes(&draft.statement_bytes),
+        m.sign_bytes(&draft.record_bytes),
+    );
+    recover_accord_holder(d, draft, r, n)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I429: the second recovery: {e}"));
+    let x = Identity::new(&format!("i429-x-{tag}"));
+    register(d, &x).await;
+    let e = rotate(d, &m.key_id, &x, &r0, "i429-next-x")
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("accord_recovery_key_spent"),
+        "{tag} I429: a recovery key rotates one seat once: {e}"
+    );
+}
+
+/// **I429 — a holder rotates their own seat under their pre-committed
+/// recovery key (CC 4.2.6)**: no quorum, one seat, a new version naming the
+/// held head; a squatted recovery id, a statement not signed by the recovery
+/// key and a record not signed by the new key are refused; a recovery key is
+/// spent after one rotation (sqlite, memory).
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i429_recovery_rotates_one_seat_without_quorum() {
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    recovers(&sqlite().await, &c, "sqlite").await;
+    recovers(&memory().await, &c, "memory").await;
+}
+
+/// I429 on postgres, when a test database is provided.
+#[cfg(feature = "postgres")]
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i429_recovery_rotates_one_seat_without_quorum_postgres() {
+    let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+        eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let cut = base.rfind('/').expect("dsn has a database");
+    let name = format!(
+        "ciris_t_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    {
+        let (admin, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+            .await
+            .expect("connect to the base test database");
+        tokio::spawn(conn);
+        admin
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .expect("create this test's database");
+    }
+    let dsn = format!("{}/{name}", &base[..cut]);
+    let c = mint(-5);
+    let _armed = Armed::with(&c.block);
+    {
+        let b = ciris_persist::store::postgres::PostgresBackend::connect(&dsn)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        b.seed_genesis_accord_holders(&effective_accord_holder_records())
+            .await
+            .expect("seed holders");
+        recovers(&b, &c, "postgres").await;
+    }
+    if let Ok((admin, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
+        tokio::spawn(conn);
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .await;
+    }
+}
