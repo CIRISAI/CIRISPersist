@@ -90,6 +90,8 @@ pub mod bodies {
                 Kind::Family => Signed::Family(ts::sign_family(
                     &members[0],
                     Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: id.to_owned(),
                         family_name: c.name.to_owned(),
                         members: members
@@ -110,6 +112,8 @@ pub mod bodies {
                 Kind::Community => Signed::Community(ts::sign_community(
                     &members[0],
                     Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: id.to_owned(),
                         community_name: c.name.to_owned(),
                         members: members

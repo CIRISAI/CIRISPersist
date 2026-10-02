@@ -3783,6 +3783,8 @@ mod charter_threshold_tests {
 
     fn family(cp: &str) -> Family {
         Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "fam".into(),
             family_name: "fam".into(),
             members: vec![],

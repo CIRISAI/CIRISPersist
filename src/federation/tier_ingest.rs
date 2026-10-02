@@ -3198,6 +3198,8 @@ pub mod test_support {
         dir.put_community(sign_community(
             member_a,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: community_key_id.to_owned(),
                 community_name: "chat-pair".to_owned(),
                 members,
@@ -3241,6 +3243,8 @@ pub mod test_support {
         // Both ends DERIVE the same community from the same member pair, so
         // the content is byte-identical; only the signer differs.
         let derived = |name: &str| crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: cid.clone(),
             community_name: name.to_owned(),
             members: vec![

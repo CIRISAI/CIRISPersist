@@ -46,6 +46,8 @@ pub mod bodies {
 
     fn infra_room(room: &str, protocol: &str, members: Vec<CommunityMember>) -> Community {
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: room.to_owned(),
             community_name: "trust root".into(),
             members,

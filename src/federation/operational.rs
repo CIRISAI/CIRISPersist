@@ -3689,6 +3689,8 @@ pub mod test_support {
             .parse()
             .expect("pinned family founding instant is valid RFC-3339");
         let family = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: family_key_id.to_owned(),
             family_name: family_key_id.to_owned(),
             members: holders

@@ -1584,6 +1584,8 @@ pub(crate) mod test_support {
         // own consensus_protocol IS the threshold. `majority` floors at a
         // strict majority of 3 ⇒ 2.
         dir.put_family_local(Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: wa_body.clone(),
             family_name: format!("wise authorities {suffix}"),
             members: wa
@@ -1834,6 +1836,8 @@ pub(crate) mod test_support {
         register(dir, &uncarded, &[identity_type::USER]).await;
         let body2 = format!("r-wa-body2-{suffix}");
         dir.put_family_local(Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: body2.clone(),
             family_name: format!("half-legible authorities {suffix}"),
             members: [&wa[0], &wa[1], &uncarded]

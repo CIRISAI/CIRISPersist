@@ -963,6 +963,8 @@ pub(crate) async fn exercise_seedless_gate_refusals(dir: &dyn FederationDirector
     //    created: sole seat + `founder_only` ⇒ a 1-of-1 charter threshold.
     let squat = crate::federation::SignedFamily {
         family: crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "humanity-accord".to_owned(),
             family_name: "MINE".to_owned(),
             members: vec![crate::federation::types::FamilyMember {

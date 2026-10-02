@@ -520,6 +520,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // transaction: a proof over a version this node does not hold is refused
     // as stale. Gate.
     ("check_proof_names_prior", Class::Gate),
+    // v53.0.0 (CC 3.2 T6) — inside every backend's supersede transaction: a
+    // version whose signed `prev_head_digest` is not the head this node holds
+    // is refused. Gate.
+    ("check_prev_head_names_held", Class::Gate),
     // v39.0.0 — the whole crossing decision: custody verification, every
     // inherited co-scrub, `check_promotion_admission`, and the nine
     // contextual-integrity axes. Delegates, not Gate: it is the door's helper

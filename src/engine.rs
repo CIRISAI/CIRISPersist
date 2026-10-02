@@ -10685,6 +10685,8 @@ mod tests {
 
         let now: chrono::DateTime<chrono::Utc> = "2026-06-25T00:00:00Z".parse().unwrap();
         let community = crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: kid.clone(),
             community_name: "T".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -11105,6 +11107,8 @@ mod tests {
         // A hostile re-assemble: same family id, the node owner's own sole seat,
         // `founder_only` so the charter threshold would resolve to 1.
         let hostile = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "humanity-accord".into(),
             family_name: "MINE".into(),
             members: vec![crate::federation::types::FamilyMember {
@@ -11166,6 +11170,8 @@ mod tests {
 
         let squat = crate::federation::SignedFamily {
             family: crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: "humanity-accord".into(),
                 family_name: "MINE".into(),
                 members: vec![crate::federation::types::FamilyMember {
@@ -17764,6 +17770,8 @@ mod tests {
             .await
             .expect("seed community key");
         let community = crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_id.into(),
             community_name: "cut-c-community".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -18971,6 +18979,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &founder,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "g1-fam".into(),
                 members: vec![types::FamilyMember {
@@ -18991,6 +19001,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &founder,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "g1-comm".into(),
                     members: vec![types::CommunityMember {
@@ -19303,6 +19315,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "accord".into(),
                 members: mk_members(5),
@@ -19339,6 +19353,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: {
@@ -19375,6 +19391,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: mk_members(3),
@@ -19435,6 +19453,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: format!("g2-ghost-{s}"),
                         family_name: "ghost".into(),
                         members: vec![],
@@ -19513,6 +19533,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "accord".into(),
                     members: members
@@ -19710,6 +19732,8 @@ mod tests {
             ts::sign_community(
                 &members[0],
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: room.to_owned(),
                     community_name: "protocol room".into(),
                     members: members
@@ -19983,6 +20007,8 @@ mod tests {
             ts::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "household".into(),
                     members: members
@@ -20111,6 +20137,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &comm,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "c".into(),
                     members: cm
@@ -20208,6 +20236,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "f".into(),
                 // v49.0.0 (#910): fmk[0] founds the `founder_only` family, so

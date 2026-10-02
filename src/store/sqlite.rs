@@ -7188,8 +7188,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "INSERT INTO federation_families (\
                     family_key_id, family_name, members, founded_at, \
                     consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at, dissolved_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.family_key_id,
                     row.family_name,
@@ -7200,6 +7200,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                     admitted_at.to_rfc3339(),
                     row.dissolved_at.map(|t| t.to_rfc3339()),
+                    row.prev_head_digest,
+                    row.charter_digest,
                 ],
             )?;
             Ok(())
@@ -7295,7 +7297,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         .query_row(
                             "SELECT version, family_key_id, family_name, members, founded_at, \
                                     consensus_protocol, consensus_protocol_entrenched, \
-                                    dissolved_at, persist_row_hash \
+                                    dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                              FROM federation_families WHERE family_key_id = ?1",
                             [&new_fam.family_key_id],
                             |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
@@ -7322,6 +7324,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             rusqlite::Error::QueryReturnedNoRows
                         })?;
                     }
+                    // v53.0.0 (CC 3.2 T6) — the version names the head it
+                    // succeeds, judged inside the transaction that replaces it.
+                    crate::federation::group_amendment::check_prev_head_names_held(
+                        cohort_str,
+                        &new_fam.family_key_id,
+                        &new_fam.prev_head_digest,
+                        &prior_fam.persist_row_hash,
+                    )
+                    .map_err(|e| {
+                        *stale.lock().expect("stale slot") = Some(e);
+                        rusqlite::Error::QueryReturnedNoRows
+                    })?;
                     let snapshot = serde_json::to_string(&prior_fam)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     tx.execute(
@@ -7351,7 +7365,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
                             scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15 \
+                            supersede_proof = ?13, cosignatures = ?14, dissolved_at = ?15, \
+                            prev_head_digest = ?16, charter_digest = ?17 \
                          WHERE family_key_id = ?1",
                         rusqlite::params![
                             new_fam.family_key_id,
@@ -7373,6 +7388,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             proof_json,
                             cosignatures_json,
                             new_fam.dissolved_at.map(|t| t.to_rfc3339()),
+                            new_fam.prev_head_digest,
+                            new_fam.charter_digest,
                         ],
                     )?;
                     tx.commit()?;
@@ -7418,7 +7435,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     let prior = tx
                         .query_row(
                             "SELECT version, community_key_id, community_name, members, \
-                                    founded_at, consensus_protocol, policy_blob, persist_row_hash \
+                                    founded_at, consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                              FROM federation_communities WHERE community_key_id = ?1",
                             [&new_comm.community_key_id],
                             |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_community(r)?)),
@@ -7444,6 +7461,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             rusqlite::Error::QueryReturnedNoRows
                         })?;
                     }
+                    // v53.0.0 (CC 3.2 T6) — see the family arm.
+                    crate::federation::group_amendment::check_prev_head_names_held(
+                        cohort_str,
+                        &new_comm.community_key_id,
+                        &new_comm.prev_head_digest,
+                        &prior_comm.persist_row_hash,
+                    )
+                    .map_err(|e| {
+                        *stale.lock().expect("stale slot") = Some(e);
+                        rusqlite::Error::QueryReturnedNoRows
+                    })?;
                     let snapshot = serde_json::to_string(&prior_comm)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     tx.execute(
@@ -7473,7 +7501,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             persist_row_hash = ?7, version = ?8, \
                             authority_key_id = ?9, scrub_signature_classical = ?10, \
                             scrub_signature_pqc = ?11, admitted_at = ?12, \
-                            supersede_proof = ?13, cosignatures = ?14, lineage = ?15 \
+                            supersede_proof = ?13, cosignatures = ?14, lineage = ?15, \
+                            prev_head_digest = ?16, charter_digest = ?17 \
                          WHERE community_key_id = ?1",
                         rusqlite::params![
                             new_comm.community_key_id,
@@ -7492,6 +7521,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             proof_json,
                             cosignatures_json,
                             lineage_json,
+                            new_comm.prev_head_digest,
+                            new_comm.charter_digest,
                         ],
                     )?;
                     tx.commit()?;
@@ -7579,7 +7610,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let live: Option<(u32, serde_json::Value)> = if cohort == Cohort::Family {
                 conn.query_row(
                     "SELECT version, family_key_id, family_name, members, founded_at, \
-                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_families WHERE family_key_id = ?1",
                     [&key],
                     |r| {
@@ -7595,7 +7626,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             } else {
                 conn.query_row(
                     "SELECT version, community_key_id, community_name, members, founded_at, \
-                            consensus_protocol, policy_blob, persist_row_hash \
+                            consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_communities WHERE community_key_id = ?1",
                     [&key],
                     |r| {
@@ -7636,7 +7667,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move |conn| -> Result<Option<crate::federation::Family>, rusqlite::Error> {
                 conn.query_row(
                     "SELECT family_key_id, family_name, members, founded_at, \
-                        consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                        consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_families WHERE family_key_id = ?1",
                     [&key],
                     sqlite_row_to_family,
@@ -7663,7 +7694,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move |conn| -> Result<Vec<crate::federation::Family>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT family_key_id, family_name, members, founded_at, \
-                        consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                        consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_families \
                      WHERE EXISTS ( \
                          SELECT 1 FROM json_each(federation_families.members) \
@@ -7805,7 +7836,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move |conn| -> Result<Option<crate::federation::Community>, rusqlite::Error> {
                 conn.query_row(
                     "SELECT community_key_id, community_name, members, founded_at, \
-                        consensus_protocol, policy_blob, persist_row_hash \
+                        consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_communities WHERE community_key_id = ?1",
                     [&key],
                     sqlite_row_to_community,
@@ -7829,7 +7860,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             move |conn| -> Result<Vec<crate::federation::Community>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT community_key_id, community_name, members, founded_at, \
-                        consensus_protocol, policy_blob, persist_row_hash \
+                        consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_communities \
                      WHERE EXISTS ( \
                          SELECT 1 FROM json_each(federation_communities.members) \
@@ -10566,7 +10597,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
                 let mut stmt = conn.prepare(
                     "SELECT community_key_id, community_name, members, founded_at, \
-                        consensus_protocol, policy_blob, persist_row_hash \
+                        consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                      FROM federation_communities \
                      WHERE json_extract(policy_blob, '$.cohort_subkind') = 'geographic' \
                      ORDER BY community_key_id ASC",
@@ -21802,6 +21833,8 @@ fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fede
         })
         .transpose()?;
     Ok(crate::federation::Family {
+        prev_head_digest: row.get("prev_head_digest")?,
+        charter_digest: row.get("charter_digest")?,
         family_key_id: row.get("family_key_id")?,
         family_name: row.get("family_name")?,
         members,
@@ -21916,6 +21949,8 @@ fn sqlite_row_to_community(
     };
     let founded_at: String = row.get("founded_at")?;
     Ok(crate::federation::Community {
+        prev_head_digest: row.get("prev_head_digest")?,
+        charter_digest: row.get("charter_digest")?,
         community_key_id: row.get("community_key_id")?,
         community_name: row.get("community_name")?,
         members,
@@ -27233,8 +27268,9 @@ impl SqliteBackend {
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, supersede_proof, cosignatures, lineage\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    admitted_at, supersede_proof, cosignatures, lineage, \
+                    prev_head_digest, charter_digest\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     rusqlite::params![
                         community_key_id,
                         row.community_name,
@@ -27252,6 +27288,8 @@ impl SqliteBackend {
                         supersede_proof_json,
                         cosignatures_json,
                         lineage_json,
+                        row.prev_head_digest,
+                        row.charter_digest,
                     ],
                 )?;
                 if inserted == 1 {
@@ -30625,6 +30663,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 crate::federation::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "Household".into(),
                     members: vec![crate::federation::types::FamilyMember {
@@ -32932,6 +32972,8 @@ mod tests {
         consensus_protocol: &str,
     ) -> crate::federation::Family {
         crate::federation::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: family_key_id.into(),
             family_name: family_name.into(),
             members: members
@@ -33168,6 +33210,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 "geo-comm",
                 Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: "geo-comm".into(),
                     community_name: "Geo".into(),
                     members: members
@@ -37501,6 +37545,8 @@ mod tests {
         policy_blob: Option<serde_json::Value>,
     ) -> crate::federation::Community {
         crate::federation::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_key_id.into(),
             community_name: community_name.into(),
             members: crate::federation::tier_ingest::test_support::fixture_members(
@@ -37852,6 +37898,8 @@ mod tests {
         }
         backend
             .put_family_local(crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: "fmr504-fam".to_owned(),
                 family_name: "fixture family".into(),
                 members: vec![],
@@ -37946,6 +37994,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "cmr504-comm",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "cmr504-comm".to_owned(),
                         community_name: "fixture room".into(),
                         members: vec![],
@@ -47000,6 +47050,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 cid,
                 crate::federation::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: cid.into(),
                     community_name: "nm-test".into(),
                     members: vec![crate::federation::CommunityMember {
@@ -53114,6 +53166,8 @@ INSERT INTO transport_destinations (occurrence_key_id, transport_kind, destinati
 
         let joined = "2026-05-01T00:00:00Z".parse().unwrap();
         let mk = |members: Vec<&str>, protocol: &str| Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: fam_key.to_owned(),
             family_name: "acme".into(),
             members: members

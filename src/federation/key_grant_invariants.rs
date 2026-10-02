@@ -173,6 +173,8 @@ pub mod two_node {
                 .put_community(ts::sign_community(
                     comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.to_owned(),
                         community_name: "Two-node Co-op".into(),
                         members: roster,
@@ -1204,6 +1206,8 @@ pub mod two_node {
                 .put_family(ts::sign_family(
                     &fam,
                     crate::federation::types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "I199 Household".into(),
                         members,
@@ -1450,6 +1454,8 @@ pub mod two_node {
                 .put_community(ts::sign_community(
                     &comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.clone(),
                         community_name: "Principal Co-op".into(),
                         members: [&alice, &bob]
@@ -1601,6 +1607,8 @@ pub mod two_node {
             c.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob]
@@ -1724,6 +1732,8 @@ pub mod two_node {
             d.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob]
@@ -1823,6 +1833,8 @@ pub mod two_node {
             e.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob, &carol]
@@ -1949,6 +1961,8 @@ pub mod two_node {
             f.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob]
@@ -3694,6 +3708,8 @@ mod tests {
             let community = ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Delivered Co-op".into(),
                     members: [&alice, &bob]
@@ -4514,6 +4530,8 @@ mod tests {
             sq.put_community(ts::sign_community(
                 &comm2,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm2.clone(),
                     community_name: "Second Co-op".into(),
                     members: roster,

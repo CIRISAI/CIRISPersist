@@ -1473,6 +1473,8 @@ mod tests {
 
     fn community(policy: Option<serde_json::Value>) -> Community {
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: "comm-1".into(),
             community_name: "Test Co-op".into(),
             members: vec![CommunityMember {
@@ -1606,6 +1608,8 @@ pub mod lifecycle_support {
             .put_community(ts::sign_community(
                 community_key_id,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: community_key_id.to_owned(),
                     community_name: "Lifecycle Co-op".into(),
                     members: crate::federation::tier_ingest::test_support::fixture_members(
@@ -1718,6 +1722,8 @@ pub mod lifecycle_support {
             .put_community(ts::sign_community(
                 community_key_id,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: community_key_id.to_owned(),
                     community_name: "Shaped Co-op".into(),
                     members: roster,
@@ -1766,6 +1772,8 @@ pub mod lifecycle_support {
             .put_family(ts::sign_family(
                 family_key_id,
                 crate::federation::types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: family_key_id.to_owned(),
                     family_name: "Shaped Household".into(),
                     members: roster,

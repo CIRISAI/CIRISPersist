@@ -527,6 +527,8 @@ mod run {
         dir.put_family(ts::sign_family(
             &owner,
             Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "household".into(),
                 members: [&owner, &node]

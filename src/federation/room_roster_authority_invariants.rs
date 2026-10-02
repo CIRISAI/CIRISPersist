@@ -84,6 +84,8 @@ pub mod bodies {
         d.put_community(ts::sign_community(
             &signer,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: room.clone(),
                 community_name: "authority room".into(),
                 members: keys

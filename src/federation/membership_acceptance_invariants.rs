@@ -69,6 +69,8 @@ pub(crate) mod bodies {
             })
             .collect();
         let c = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: cid.to_owned(),
             community_name: "I21x co-op".into(),
             members,
@@ -101,6 +103,8 @@ pub(crate) mod bodies {
             })
             .collect();
         let f = Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: fid.to_owned(),
             family_name: "I21x household".into(),
             members,
@@ -813,6 +817,8 @@ pub(crate) mod bodies {
         // a forged co-signature is refused, never counted as consent
         {
             let f = Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: f2.clone(),
                 family_name: "forged".into(),
                 members: [&founder, &cofounder]

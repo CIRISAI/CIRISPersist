@@ -196,6 +196,8 @@ pub(crate) mod bodies {
         b.put_community(ts::sign_community(
             &comm,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: "second device".into(),
                 members: [(&alice, true), (&bob, false), (&carol, false)]

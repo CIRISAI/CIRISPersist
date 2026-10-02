@@ -41,6 +41,8 @@ pub mod bodies {
     fn family(w: &World, members: &[&String], name: &str) -> Family {
         let joined = at("2026-01-01T00:00:00Z");
         Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: w.id.clone(),
             family_name: name.to_owned(),
             members: members

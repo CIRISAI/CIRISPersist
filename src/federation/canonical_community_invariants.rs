@@ -124,6 +124,8 @@ pub(crate) mod bodies {
             role: Some("member".to_owned()),
         });
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: CANON.to_owned(),
             community_name: "CIRIS Canonical Services".to_owned(),
             members,

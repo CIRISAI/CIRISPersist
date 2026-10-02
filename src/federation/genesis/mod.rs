@@ -499,6 +499,8 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
         })
         .collect();
     Family {
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
         family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
         family_name: "HUMANITY_ACCORD".to_owned(),
         members,
@@ -5273,6 +5275,8 @@ mod tests {
         )
         .await;
         let bad = Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "test-fam".into(),
             family_name: "T".into(),
             members: vec![FamilyMember {

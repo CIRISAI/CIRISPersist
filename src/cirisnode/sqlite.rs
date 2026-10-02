@@ -4669,6 +4669,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     founder,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: community_id.into(),
                         community_name: "tc".into(),
                         members: vec![crate::federation::types::CommunityMember {

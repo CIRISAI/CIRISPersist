@@ -77,6 +77,8 @@ pub mod bodies {
         dir.put_community(sign_community(
             founder,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: room.to_owned(),
                 community_name: format!("as-of room {room}"),
                 members: vec![CommunityMember {
@@ -410,6 +412,8 @@ pub mod bodies {
         dir.put_community(sign_community(
             &alice,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: here.clone(),
                 community_name: format!("epoch room {here}"),
                 members: vec![seat(&alice, true), seat(&bob, true), seat(&carol, false)],
