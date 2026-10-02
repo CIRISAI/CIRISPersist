@@ -1988,6 +1988,148 @@ pub mod orchestrate {
         Ok(result)
     }
 
+    /// v53.0.0 (#963) — **a device that comes INTO its owner's self or family
+    /// audience is a newcomer to the keys this node holds.** The case is a
+    /// re-class: an occurrence the owner first published under a server class
+    /// (no self/family key, CC 3.3.7) is republished, same key, newer
+    /// `asserted_at`, under a personal class. Nothing about the device is new,
+    /// so no host calls [`rekey_self_occurrence_add`]; the receive doors run
+    /// this beside the #916 epoch re-wrap
+    /// ([`FederationDirectory::rewrap_own_epochs_for_device`](crate::federation::FederationDirectory::rewrap_own_epochs_for_device)).
+    ///
+    /// For `self` and for every family the owner is an active member of, when
+    /// the device may now hold that cohort's key (the one audience rule) and
+    /// lacks a blob or stream epoch the rest of the cohort holds here, the
+    /// [`rekey_for_newcomers`] walk wraps it. The cohort here is every OTHER
+    /// active occurrence, the owner's own included: a re-classed device was
+    /// beside them all along. Grants only; each leaves its set dirty for the
+    /// pending-`KeyGrant` loop. A device that already holds everything costs
+    /// four index reads, so the idempotent re-deliveries stay cheap.
+    pub async fn rekey_self_family_for_device<B>(
+        backend: &B,
+        owner: &str,
+        device: &str,
+    ) -> Result<Vec<(&'static str, String, RekeyResult)>, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::replication_audience::{occurrence_may_hold_key, OwnerCohort};
+        let mut out = Vec::new();
+        if owner == device {
+            return Ok(out);
+        }
+        let mine = backend
+            .list_identity_occurrences_active(owner)
+            .await
+            .map_err(map_dir_err)?;
+        let Some(occ) = mine.iter().find(|o| o.occurrence_key_id == device).cloned() else {
+            return Ok(out);
+        };
+        let newcomer = [Newcomer {
+            occurrence_key_id: occ.occurrence_key_id.clone(),
+            encryption_pubkeys: occ.encryption_pubkeys.clone(),
+        }];
+
+        let mut cohorts: Vec<(&'static str, String, Vec<String>)> = Vec::new();
+        if occurrence_may_hold_key(backend, owner, &occ, OwnerCohort::SelfContent)
+            .await
+            .map_err(map_dir_err)?
+        {
+            let others = mine
+                .iter()
+                .map(|o| o.occurrence_key_id.clone())
+                .filter(|k| k != device)
+                .collect();
+            cohorts.push((SELF, owner.to_owned(), others));
+        }
+        for fam in backend
+            .list_families_for_member_active(owner)
+            .await
+            .map_err(map_dir_err)?
+        {
+            let cohort = OwnerCohort::Group {
+                scope: FAMILY,
+                target: &fam.family_key_id,
+            };
+            if !occurrence_may_hold_key(backend, owner, &occ, cohort)
+                .await
+                .map_err(map_dir_err)?
+            {
+                continue;
+            }
+            let mut others = Vec::new();
+            for m in backend
+                .active_family_members(&fam.family_key_id)
+                .await
+                .map_err(map_dir_err)?
+            {
+                for o in backend
+                    .list_identity_occurrences_active(&m.key_id)
+                    .await
+                    .map_err(map_dir_err)?
+                {
+                    if o.occurrence_key_id != device {
+                        others.push(o.occurrence_key_id);
+                    }
+                }
+            }
+            cohorts.push((FAMILY, fam.family_key_id.clone(), others));
+        }
+
+        for (scope, group, others) in cohorts {
+            if !device_lacks_cohort_keys(backend, scope, &others, device).await? {
+                continue;
+            }
+            let r = rekey_for_newcomers(backend, scope, &others, &newcomer).await?;
+            out.push((scope, group, r));
+        }
+        Ok(out)
+    }
+
+    /// Does `device` lack a blob or stream epoch wrap that `others` hold in
+    /// `scope` on this node? Index reads only.
+    async fn device_lacks_cohort_keys<B>(
+        backend: &B,
+        scope: &str,
+        others: &[String],
+        device: &str,
+    ) -> Result<bool, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        if others.is_empty() {
+            return Ok(false);
+        }
+        let me = [device.to_owned()];
+        let held: std::collections::HashSet<[u8; 32]> = backend
+            .list_at_rest_blobs_for_recipients(&me, scope)
+            .await?
+            .into_iter()
+            .collect();
+        if backend
+            .list_at_rest_blobs_for_recipients(others, scope)
+            .await?
+            .iter()
+            .any(|sha| !held.contains(sha))
+        {
+            return Ok(true);
+        }
+        let key = |r: &crate::federation::StreamDekRecord| {
+            (r.stream_id.clone(), r.epoch, r.owner_key_id.clone())
+        };
+        let held: std::collections::HashSet<_> = backend
+            .stream_dek_list_for_recipients(&me, scope)
+            .await?
+            .iter()
+            .map(key)
+            .collect();
+        Ok(backend
+            .stream_dek_list_for_recipients(others, scope)
+            .await?
+            .iter()
+            .any(|r| !held.contains(&key(r))))
+    }
+
     /// #249 Cut G4 (§7) — forward-secrecy re-key on **community** member
     /// REMOVAL: the symmetric of [`rekey_family_member_add`]. Records the
     /// community membership revocation (forward-only; the active fold drops the

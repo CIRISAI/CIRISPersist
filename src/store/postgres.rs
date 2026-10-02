@@ -5807,6 +5807,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         owner: &str,
         device: &str,
     ) -> Result<(), crate::federation::Error> {
+        // v53.0.0 (#963) — a device that came into its owner's self/family
+        // audience (a re-class to a personal class) is a newcomer to the
+        // self/family keys this node holds. Needs no node key: the walk reads
+        // this node's own self-retention rows.
+        let self_family =
+            crate::federation::at_rest_cascade::orchestrate::rekey_self_family_for_device(
+                self, owner, device,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("self/family re-key to {device}: {e}"))
+            });
         let Some(me) = crate::federation::FederationDirectory::node_key_id(self) else {
             // Not silent (#916 review, N1): with no node key this backend
             // cannot know which epochs are its own, so it re-wraps none; the
@@ -5817,7 +5830,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "no node key set on this backend: the member-device re-wrap is skipped \
                  (set it through an Engine / PyEngine constructor) (#916)"
             );
-            return Ok(());
+            return self_family;
         };
         crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices(
             self,
@@ -5827,6 +5840,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         )
         .await
         .map(|_| ())
+        .and(self_family)
     }
 
     async fn put_attestation_with_origin(

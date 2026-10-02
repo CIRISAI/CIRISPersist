@@ -3007,6 +3007,10 @@ pub trait FederationDirectory: Send + Sync {
     /// epochs to re-wrap. The sqlite and postgres backends run
     /// [`at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices`](crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices)
     /// under their node key (none set: nothing is theirs to re-wrap).
+    /// v53.0.0 (#963) — and, first, the self/family walk
+    /// ([`at_rest_cascade::orchestrate::rekey_self_family_for_device`](crate::federation::at_rest_cascade::orchestrate::rekey_self_family_for_device)):
+    /// a device re-classed into its owner's self/family audience gets the
+    /// self/family keys this node holds.
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         let _ = (owner, device);
         Ok(())
