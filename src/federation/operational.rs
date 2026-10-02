@@ -2332,7 +2332,6 @@ pub mod test_support {
         user_key_id: &str,
         overrides: &[(&str, ScrubSigner<'_>)],
     ) -> Result<(), crate::federation::Error> {
-        seed_test_family(directory, root_key_id, holders, "quorum:2/3").await?;
         let charter_id = format!("{root_key_id}-charter");
         let successors = vec![
             format!("{root_key_id}-succ-a"),
@@ -2376,11 +2375,16 @@ pub mod test_support {
                 }
             })
             .collect();
+        // v53.0.0 (CC 3.2 T6) — the family's founding version names this
+        // charter, or it is not in force.
+        let digest = charter_digest_of(&charter);
+        seed_test_family_naming(directory, root_key_id, holders, "quorum:2/3", &digest).await?;
         directory
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: charter,
             })
             .await?;
+        assert_charter_digest_held(directory, root_key_id, &charter_id, &digest).await;
         try_emit_synthetic_trust_edge(directory, user_key_id, root_key_id).await;
         Ok(())
     }
@@ -3687,10 +3691,25 @@ pub mod test_support {
         holders: &[String],
         consensus_protocol: &str,
     ) -> Result<(), crate::federation::Error> {
+        seed_test_family_naming(directory, family_key_id, holders, consensus_protocol, "").await
+    }
+
+    /// v53.0.0 (CC 3.2 T6) — [`seed_test_family`] whose founding version
+    /// names `charter_digest` as the charter in force (the head names its
+    /// charter; one no version names is not in force).
+    pub async fn seed_test_family_naming(
+        directory: &dyn crate::federation::FederationDirectory,
+        family_key_id: &str,
+        holders: &[String],
+        consensus_protocol: &str,
+        charter_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
         let founded_at: chrono::DateTime<chrono::Utc> = "2020-01-01T00:00:00Z"
             .parse()
             .expect("pinned family founding instant is valid RFC-3339");
-        let family = crate::federation::types::Family {
+        let mut family = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: family_key_id.to_owned(),
             family_name: family_key_id.to_owned(),
             members: holders
@@ -3707,7 +3726,114 @@ pub mod test_support {
             dissolved_at: None,
             persist_row_hash: String::new(),
         };
+        family.charter_digest = charter_digest.to_owned();
         directory.put_family_local(family).await
+    }
+
+    /// v53.0.0 (CC 3.2 T6) — the digest a version names a charter by: the
+    /// row hash the store computes for it. Fixtures compute it before the row
+    /// is written (the founding version must name it, and a family must exist
+    /// before its charter is admitted); [`assert_charter_digest_held`] checks
+    /// the store agreed.
+    pub fn charter_digest_of(charter: &crate::federation::Attestation) -> String {
+        crate::federation::canonical_community::stored_row_hash(charter)
+            .expect("a charter row always hashes")
+    }
+
+    /// The stored row of `attestation_id` carries `digest` — the fixture's
+    /// precomputed digest is the one the store holds.
+    pub async fn assert_charter_digest_held(
+        directory: &dyn crate::federation::FederationDirectory,
+        attested_key_id: &str,
+        attestation_id: &str,
+        digest: &str,
+    ) {
+        let held = directory
+            .list_attestations_for(attested_key_id)
+            .await
+            .expect("list charters")
+            .into_iter()
+            .find(|a| a.attestation_id == attestation_id)
+            .expect("the charter was stored");
+        assert_eq!(
+            held.persist_row_hash, digest,
+            "the store's row hash of {attestation_id} is the digest the version names"
+        );
+    }
+
+    /// v53.0.0 (CC 3.2 T6) — **admit a family's charter and the version that
+    /// puts it in force**: the charter row, then a new version of the family
+    /// it names (`attested_key_id`) whose `charter_digest` is the stored row's
+    /// hash, authorized by `signers`. The shape every re-scrub takes now.
+    pub async fn charter_family_and_version(
+        directory: &dyn crate::federation::FederationDirectory,
+        charter: crate::federation::Attestation,
+        signers: &[&str],
+    ) -> Result<(), crate::federation::Error> {
+        let family = charter.attested_key_id.clone();
+        let id = charter.attestation_id.clone();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: charter,
+            })
+            .await?;
+        let held = directory
+            .list_attestations_for(&family)
+            .await?
+            .into_iter()
+            .find(|a| a.attestation_id == id)
+            .ok_or_else(|| crate::federation::Error::Backend(format!("charter {id} not stored")))?;
+        let signers: Vec<String> = signers.iter().map(|s| (*s).to_owned()).collect();
+        version_family_naming_charter(directory, &family, &held.persist_row_hash, &signers)
+            .await
+            .map(|_| ())
+    }
+
+    /// v53.0.0 (CC 3.2 T6) — **a new version of `family_key_id` naming
+    /// `charter_digest`**: same roster, protocol and entrenchment, the held
+    /// head as `prev_head_digest`, authored by `signers[0]` and authorized by
+    /// every signer's threshold signature over the change envelope — the
+    /// shape a charter re-scrub takes now that the charter in force is the
+    /// one the head names.
+    pub async fn version_family_naming_charter(
+        directory: &dyn crate::federation::FederationDirectory,
+        family_key_id: &str,
+        charter_digest: &str,
+        signers: &[String],
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::tier_ingest::test_support as ts;
+        let held = directory
+            .lookup_family(family_key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!("no family {family_key_id}"))
+            })?;
+        let mut next = held.clone();
+        next.prev_head_digest = held.persist_row_hash.clone();
+        next.charter_digest = charter_digest.to_owned();
+        next.persist_row_hash = String::new();
+        let ids: Vec<String> = held.members.iter().map(|m| m.key_id.clone()).collect();
+        let mut env = directory
+            .build_membership_change_envelope(
+                crate::federation::cohort::Cohort::Family,
+                family_key_id,
+                &ids,
+                held.consensus_protocol_entrenched,
+                Some(&held.consensus_protocol),
+            )
+            .await?;
+        // The quorum signs WHICH version (the accord's door requires it).
+        env[crate::federation::canonical_community::NEXT_PERSIST_ROW_HASH] =
+            serde_json::Value::String(crate::federation::types::compute_persist_row_hash(&next)?);
+        let bytes = ciris_verify_core::jcs::canonicalize(&env)
+            .map_err(|e| crate::federation::Error::Backend(format!("jcs: {e}")))?;
+        let sigs = signers
+            .iter()
+            .map(|k| ts::threshold_sign(k, &bytes))
+            .collect();
+        directory
+            .supersede_family_with_quorum(ts::sign_family(&signers[0], next), env, sigs)
+            .await
     }
 
     /// v36.2.0 (CIRISPersist#713) — **relay eligibility for an `accord:*`
@@ -4190,7 +4316,7 @@ pub mod test_support {
         let accord = format!("{tag}-accord");
         let user = format!("{tag}-user");
         let subject = format!("{tag}-subject");
-        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..3).map(|i| format!("h{i}-{tag}")).collect();
 
         // The cast, registered with their deterministic `sign_envelope` pubkeys
         // so every signature below resolves at the ingest gate on EVERY backend.
@@ -4354,6 +4480,9 @@ pub mod test_support {
             2,
             "({tag}) #556: the stored row proves its own 2-of-n"
         );
+        // v53.0.0 (CC 3.2 T6) — the family version that names it.
+        version_family_naming_charter(directory, &accord, &stored.persist_row_hash, &holders)
+            .await?;
 
         // The conferral, ALSO at 2-of-3: a grant one seat could sign alone would
         // hand that seat the accord's granting pen, which is the asymmetry #557
@@ -5173,7 +5302,7 @@ pub mod test_support {
 
         let user = format!("{tag}-user");
         let foreign = format!("{tag}-foreign");
-        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..3).map(|i| format!("h{i}-{tag}")).collect();
 
         for who in &holders {
             register_typed_key(directory, who, identity_type::NODE).await?;
@@ -5227,11 +5356,13 @@ pub mod test_support {
         let accord_ctl = format!("{tag}-accord-ctl");
         seed_test_family(directory, &accord_ctl, &holders, "quorum:2/3").await?;
         let ctl_charter_id = format!("{tag}-charter-ctl");
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: build_charter(&accord_ctl, &ctl_charter_id)?,
-            })
-            .await?;
+        // v53.0.0 (CC 3.2 T6) — and the family version that names it.
+        charter_family_and_version(
+            directory,
+            build_charter(&accord_ctl, &ctl_charter_id)?,
+            &[&holders[0], &holders[1], &holders[2]],
+        )
+        .await?;
         emit_trust_edge(directory, &user, &accord_ctl, None).await?;
 
         let v = trust_root_valid(directory, &user, &accord_ctl).await?;
@@ -5300,11 +5431,13 @@ pub mod test_support {
 
         // NOW the charter arrives, and the family is chartered exactly as the
         // control is.
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: build_charter(&accord_atk, &atk_charter_id)?,
-            })
-            .await?;
+        // v53.0.0 (CC 3.2 T6) — and the family version that names it.
+        charter_family_and_version(
+            directory,
+            build_charter(&accord_atk, &atk_charter_id)?,
+            &[&holders[0], &holders[1], &holders[2]],
+        )
+        .await?;
         emit_trust_edge(directory, &user, &accord_atk, None).await?;
 
         let after_b = trust_root_valid(directory, &user, &accord_atk).await?;
@@ -5338,7 +5471,7 @@ pub mod test_support {
         let accord = format!("{tag}-accord");
         let user = format!("{tag}-user");
         let peer = format!("{tag}-peer");
-        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+        let holders: Vec<String> = (0..3).map(|i| format!("h{i}-{tag}")).collect();
 
         for who in &holders {
             register_typed_key(directory, who, identity_type::NODE).await?;
@@ -5354,23 +5487,25 @@ pub mod test_support {
             crate::federation::Error::Backend(format!("#561 pre_rotation_commitment: {e}"))
         })?;
         let charter_id = uuid::Uuid::new_v4().to_string();
-        directory
-            .put_attestation(crate::federation::SignedAttestation {
-                attestation: co_signed_trust_attestation(
-                    &charter_id,
-                    &holders[0],
-                    &accord,
-                    attestation_type::DELEGATES_TO,
-                    json!({
-                        "references_attestation_id": charter_id,
-                        "dimension": TRUST_CHARTER_DIMENSION,
-                        "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-                        "pre_rotation_commitment": commitment,
-                    }),
-                    &[&holders[1]],
-                ),
-            })
-            .await?;
+        // v53.0.0 (CC 3.2 T6) — the charter and the family version naming it.
+        charter_family_and_version(
+            directory,
+            co_signed_trust_attestation(
+                &charter_id,
+                &holders[0],
+                &accord,
+                attestation_type::DELEGATES_TO,
+                json!({
+                    "references_attestation_id": charter_id,
+                    "dimension": TRUST_CHARTER_DIMENSION,
+                    "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                    "pre_rotation_commitment": commitment,
+                }),
+                &[&holders[1]],
+            ),
+            &[&holders[0], &holders[1], &holders[2]],
+        )
+        .await?;
 
         // Each side names THE ACCORD, not a holder.
         emit_trust_edge(directory, &user, &accord, None).await?;

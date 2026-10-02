@@ -434,8 +434,9 @@ impl PostgresBackend {
                     community_key_id, community_name, members, founded_at, \
                     consensus_protocol, policy_blob, persist_row_hash, \
                     authority_key_id, scrub_signature_classical, scrub_signature_pqc, \
-                    admitted_at, supersede_proof, cosignatures, lineage\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                    admitted_at, supersede_proof, cosignatures, lineage, \
+                    prev_head_digest, charter_digest\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
                  ON CONFLICT DO NOTHING",
                 &[
                     &row.community_key_id,
@@ -454,6 +455,8 @@ impl PostgresBackend {
                     &supersede_proof_value,
                     &cosignatures_value,
                     &lineage_value,
+                    &row.prev_head_digest,
+                    &row.charter_digest,
                 ],
             )
             .await
@@ -8464,8 +8467,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "INSERT INTO cirislens.federation_families (\
                     family_key_id, family_name, members, founded_at, \
                     consensus_protocol, consensus_protocol_entrenched, persist_row_hash, \
-                    admitted_at, dissolved_at\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    admitted_at, dissolved_at, prev_head_digest, charter_digest\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &row.family_key_id,
                     &row.family_name,
@@ -8476,6 +8479,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.persist_row_hash,
                     &admitted_at,
                     &row.dissolved_at,
+                    &row.prev_head_digest,
+                    &row.charter_digest,
                 ],
             )
             .await
@@ -8559,7 +8564,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let prior = tx
                     .query_opt(
                         "SELECT version, family_key_id, family_name, members, founded_at, \
-                                consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                                consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                          FROM cirislens.federation_families WHERE family_key_id = $1 \
                          FOR UPDATE",
                         &[&new_fam.family_key_id],
@@ -8586,6 +8591,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &prior_fam.persist_row_hash,
                     )?;
                 }
+                // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds,
+                // judged against the row read FOR UPDATE.
+                crate::federation::group_amendment::check_prev_head_names_held(
+                    cohort_discriminator,
+                    &new_fam.family_key_id,
+                    &new_fam.prev_head_digest,
+                    &prior_fam.persist_row_hash,
+                    authorization.as_ref(),
+                )?;
                 let snapshot = serde_json::to_value(&prior_fam)
                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
                 tx.execute(
@@ -8616,7 +8630,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
                         scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13, cosignatures = $14, dissolved_at = $15 \
+                        supersede_proof = $13, cosignatures = $14, dissolved_at = $15, \
+                        prev_head_digest = $16, charter_digest = $17 \
                      WHERE family_key_id = $1",
                     &[
                         &new_fam.family_key_id,
@@ -8638,6 +8653,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &proof_value,
                         &cosignatures_value,
                         &new_fam.dissolved_at,
+                        &new_fam.prev_head_digest,
+                        &new_fam.charter_digest,
                     ],
                 )
                 .await
@@ -8679,7 +8696,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 let prior = tx
                     .query_opt(
                         "SELECT version, community_key_id, community_name, members, founded_at, \
-                                consensus_protocol, policy_blob, persist_row_hash \
+                                consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                          FROM cirislens.federation_communities WHERE community_key_id = $1 \
                          FOR UPDATE",
                         &[&new_comm.community_key_id],
@@ -8703,6 +8720,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &prior_comm.persist_row_hash,
                     )?;
                 }
+                // v53.0.0 (CC 3.2 T6) — see the family arm.
+                crate::federation::group_amendment::check_prev_head_names_held(
+                    cohort_discriminator,
+                    &new_comm.community_key_id,
+                    &new_comm.prev_head_digest,
+                    &prior_comm.persist_row_hash,
+                    authorization.as_ref(),
+                )?;
                 let snapshot = serde_json::to_value(&prior_comm)
                     .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
                 tx.execute(
@@ -8734,7 +8759,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         persist_row_hash = $7, version = $8, \
                         authority_key_id = $9, scrub_signature_classical = $10, \
                         scrub_signature_pqc = $11, admitted_at = $12, \
-                        supersede_proof = $13, cosignatures = $14, lineage = $15 \
+                        supersede_proof = $13, cosignatures = $14, lineage = $15, \
+                        prev_head_digest = $16, charter_digest = $17 \
                      WHERE community_key_id = $1",
                     &[
                         &new_comm.community_key_id,
@@ -8753,6 +8779,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &proof_value,
                         &cosignatures_value,
                         &lineage_value,
+                        &new_comm.prev_head_digest,
+                        &new_comm.charter_digest,
                     ],
                 )
                 .await
@@ -8829,7 +8857,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             client
                 .query_opt(
                     "SELECT version, family_key_id, family_name, members, founded_at, \
-                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                            consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                      FROM cirislens.federation_families WHERE family_key_id = $1",
                     &[&group_key_id],
                 )
@@ -8847,7 +8875,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             client
                 .query_opt(
                     "SELECT version, community_key_id, community_name, members, founded_at, \
-                            consensus_protocol, policy_blob, persist_row_hash \
+                            consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                      FROM cirislens.federation_communities WHERE community_key_id = $1",
                     &[&group_key_id],
                 )
@@ -8888,7 +8916,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let row_opt = client
             .query_opt(
                 "SELECT family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                  FROM cirislens.federation_families WHERE family_key_id = $1",
                 &[&family_key_id],
             )
@@ -8913,7 +8941,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT family_key_id, family_name, members, founded_at, \
-                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, persist_row_hash \
+                    consensus_protocol, consensus_protocol_entrenched, dissolved_at, prev_head_digest, charter_digest, persist_row_hash \
                  FROM cirislens.federation_families \
                  WHERE members @> $1 \
                     OR family_key_id IN ( \
@@ -9071,7 +9099,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let row_opt = client
             .query_opt(
                 "SELECT community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash \
+                    consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                  FROM cirislens.federation_communities WHERE community_key_id = $1",
                 &[&community_key_id],
             )
@@ -9096,7 +9124,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash \
+                    consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                  FROM cirislens.federation_communities \
                  WHERE members @> $1 \
                     OR community_key_id IN ( \
@@ -11853,7 +11881,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash \
+                    consensus_protocol, policy_blob, prev_head_digest, charter_digest, persist_row_hash \
                  FROM cirislens.federation_communities \
                  WHERE policy_blob->>'cohort_subkind' = 'geographic' \
                  ORDER BY community_key_id ASC",
@@ -22898,6 +22926,8 @@ fn pg_row_to_family(
     let members: Vec<crate::federation::FamilyMember> = serde_json::from_value(members_value)
         .map_err(|e| crate::federation::Error::Backend(format!("members deserialize: {e}")))?;
     Ok(crate::federation::Family {
+        prev_head_digest: row.safe_get_with("prev_head_digest", mk_err)?,
+        charter_digest: row.safe_get_with("charter_digest", mk_err)?,
         family_key_id: row.safe_get_with("family_key_id", mk_err)?,
         family_name: row.safe_get_with("family_name", mk_err)?,
         members,
@@ -22979,6 +23009,8 @@ fn pg_row_to_community(
         .map_err(|e| crate::federation::Error::Backend(format!("members deserialize: {e}")))?;
     let policy_blob: Option<serde_json::Value> = row.safe_get_with("policy_blob", mk_err)?;
     Ok(crate::federation::Community {
+        prev_head_digest: row.safe_get_with("prev_head_digest", mk_err)?,
+        charter_digest: row.safe_get_with("charter_digest", mk_err)?,
         community_key_id: row.safe_get_with("community_key_id", mk_err)?,
         community_name: row.safe_get_with("community_name", mk_err)?,
         members,
@@ -35185,6 +35217,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &coop,
                     crate::federation::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: coop.clone(),
                         community_name: "Acme Co-op".into(),
                         members: [&alice, &bob, &carol]
@@ -35437,6 +35471,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 crate::federation::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "Household".into(),
                     members: members
@@ -35636,6 +35672,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 key,
                 crate::federation::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: key.into(),
                     community_name: "Co-op".into(),
                     members: crate::federation::tier_ingest::test_support::fixture_members(
@@ -35848,6 +35886,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.to_owned(),
                         community_name: "fixture room".into(),
                         members: vec![],
@@ -35946,6 +35986,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &coop,
                     crate::federation::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: coop.clone(),
                         community_name: "Affiliations Co-op".into(),
                         members: vec![crate::federation::CommunityMember {
@@ -36080,6 +36122,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.to_owned(),
                         community_name: "fixture room".into(),
                         members: vec![],
@@ -36216,6 +36260,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 crate::federation::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "Household".into(),
                     members: vec![crate::federation::FamilyMember {
@@ -39456,6 +39502,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 cid,
                 crate::federation::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: cid.to_owned(),
                     community_name: "nm-test".into(),
                     members: vec![crate::federation::CommunityMember {
@@ -39878,6 +39926,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 cid,
                 crate::federation::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: cid.to_owned(),
                     community_name: "ob-test".into(),
                     members: crate::federation::tier_ingest::test_support::fixture_members(
@@ -40230,6 +40280,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &comm,
                     crate::federation::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.clone(),
                         community_name: "tc".into(),
                         members: vec![crate::federation::CommunityMember {
@@ -40992,6 +41044,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 crate::federation::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "PG Household".into(),
                     members: vec![crate::federation::types::FamilyMember {
@@ -48063,6 +48117,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &comm,
                 Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Geo".into(),
                     members: members
@@ -48794,6 +48850,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &comm,
                     crate::federation::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.clone(),
                         community_name: "cb".into(),
                         // v49.0.0 (#908): u0 founds the room, so its signature is the
@@ -48902,6 +48960,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &mod_comm,
                     crate::federation::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: mod_comm.clone(),
                         community_name: "mods".into(),
                         members: vec![member(&founder, Some(MEMBER_ROLE_FOUNDER))],
@@ -49370,6 +49430,8 @@ mod tests {
         // below (`serde_json::to_vec` renders full sub-second precision).
         let now = chrono::Utc.with_ymd_and_hms(2026, 6, 4, 0, 0, 0).unwrap();
         let family_row = |key: &str| crate::federation::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: key.into(),
             family_name: "504 PG Household".into(),
             members: vec![crate::federation::FamilyMember {
@@ -49452,6 +49514,8 @@ mod tests {
         let signed = crate::federation::tier_ingest::test_support::sign_community(
             &auth,
             crate::federation::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: "504 PG Co-op".into(),
                 members: vec![crate::federation::CommunityMember {
@@ -49654,6 +49718,8 @@ mod tests {
         }
         backend
             .put_family_local(crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.to_owned(),
                 family_name: "fixture family".into(),
                 members: vec![],
@@ -49763,6 +49829,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     &comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.to_owned(),
                         community_name: "fixture room".into(),
                         members: vec![],
@@ -50399,6 +50467,8 @@ mod tests {
         }
         let now = chrono::Utc.with_ymd_and_hms(2026, 6, 4, 0, 0, 0).unwrap();
         let family_row = crate::federation::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: fam.clone(),
             family_name: "507 PG Household".into(),
             members: vec![crate::federation::FamilyMember {

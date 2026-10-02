@@ -1947,6 +1947,8 @@ impl MemoryBackend {
             })
             .collect();
         let community = crate::federation::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_key_id.to_owned(),
             community_name: format!("test-community:{community_key_id}"),
             members,
@@ -6222,6 +6224,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             &prior.persist_row_hash,
                         )?;
                     }
+                    // v53.0.0 (CC 3.2 T6) — the version names the head it
+                    // succeeds; checked under the same lock that replaces it.
+                    crate::federation::group_amendment::check_prev_head_names_held(
+                        &cohort_str,
+                        &key,
+                        &new_fam.prev_head_digest,
+                        &prior.persist_row_hash,
+                        authorization.as_ref(),
+                    )?;
                     let cur_ver = *state
                         .federation_group_current_version
                         .get(&(cohort_str.clone(), key.clone()))
@@ -6312,6 +6323,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             &prior.persist_row_hash,
                         )?;
                     }
+                    // v53.0.0 (CC 3.2 T6) — the version names the head it
+                    // succeeds; checked under the same lock that replaces it.
+                    crate::federation::group_amendment::check_prev_head_names_held(
+                        &cohort_str,
+                        &key,
+                        &new_comm.prev_head_digest,
+                        &prior.persist_row_hash,
+                        authorization.as_ref(),
+                    )?;
                     let cur_ver = *state
                         .federation_group_current_version
                         .get(&(cohort_str.clone(), key.clone()))
@@ -18510,6 +18530,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: community_id.into(),
                         community_name: "test-community".into(),
                         members: vec![crate::federation::types::CommunityMember {
@@ -19185,6 +19207,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: community_id.into(),
                         community_name: "ob-test".into(),
                         members: crate::federation::tier_ingest::test_support::fixture_members(
@@ -19582,6 +19606,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "ob-owner",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "ob-owner".into(),
                         community_name: "fixture room".into(),
                         members: vec![],
@@ -20256,6 +20282,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 family_key,
                 Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: family_key.into(),
                     family_name: "Test Household".into(),
                     members: vec![FamilyMember {
@@ -21062,6 +21090,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "mod-comm",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "mod-comm".into(),
                         community_name: "mods".into(),
                         members: vec![crate::federation::types::CommunityMember {
@@ -21171,6 +21201,8 @@ mod tests {
             let policy_blob =
                 infra.then(|| serde_json::json!({ "cohort_subkind": "infrastructure" }));
             let community = crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: cid.into(),
                 community_name: "dt".into(),
                 members: vec![crate::federation::types::CommunityMember {
@@ -21312,6 +21344,8 @@ mod tests {
                     crate::federation::tier_ingest::test_support::sign_community(
                         cid,
                         crate::federation::types::Community {
+                            prev_head_digest: String::new(),
+                            charter_digest: String::new(),
                             community_key_id: cid.into(),
                             community_name: "bk".into(),
                             members: vec![crate::federation::types::CommunityMember {
@@ -23097,6 +23131,8 @@ mod tests {
         b.put_family(ts::sign_family(
             fam,
             crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.into(),
                 family_name: "861".into(),
                 members: [alice, bob]
@@ -24967,6 +25003,8 @@ mod tests {
                 .unwrap();
         }
         let fam = |key_id: &str| crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: key_id.into(),
             family_name: "E4 Household".into(),
             members: vec![crate::federation::types::FamilyMember {
@@ -25034,6 +25072,8 @@ mod tests {
                 .unwrap();
         }
         let comm = |key_id: &str| crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: key_id.into(),
             community_name: "E4 Co-op".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -25101,6 +25141,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 "e4-fmr-fam",
                 crate::federation::types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: "e4-fmr-fam".into(),
                     family_name: "E4 FMR Household".into(),
                     members: vec![
@@ -25206,6 +25248,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "e4-cmr-authority",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "e4-cmr-comm".into(),
                         community_name: "E4 CMR Co-op".into(),
                         members: vec![crate::federation::types::CommunityMember {
@@ -25412,6 +25456,8 @@ mod tests {
                 .unwrap();
         }
         let fam = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "e4sig-family".into(),
             family_name: "E4 Signature Household".into(),
             members: vec![crate::federation::types::FamilyMember {

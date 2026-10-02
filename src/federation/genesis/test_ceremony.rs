@@ -164,7 +164,9 @@ pub fn mint_test_ceremony_scoped(
     })
 }
 
-/// v53.0.0 — have every software holder sign every item a ceremony still owes.
+/// v53.0.0 — have every software holder sign every item a ceremony still owes,
+/// round by round (the heads and the authorization become signable once the
+/// charter is complete).
 ///
 /// # Errors
 ///
@@ -173,20 +175,25 @@ pub fn sign_every_item(
     state: &mut super::ceremony::CeremonyState,
     holders: &[Identity],
 ) -> Result<(), Error> {
-    for item in state.next_items().map_err(|e| bad("items", e))? {
-        for h in holders.iter().filter(|h| item.owed.contains(&h.key_id)) {
-            let (classical, pqc) = h.sign_bytes(&item.bytes);
-            state
-                .add_partial(super::ceremony::Partial {
-                    item: item.id.clone(),
-                    holder_key_id: h.key_id.clone(),
-                    signature_classical: classical,
-                    signature_pqc: pqc,
-                })
-                .map_err(|e| bad("add partial", e))?;
+    loop {
+        let items = state.next_items().map_err(|e| bad("items", e))?;
+        if items.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            for h in holders.iter().filter(|h| item.owed.contains(&h.key_id)) {
+                let (classical, pqc) = h.sign_bytes(&item.bytes);
+                state
+                    .add_partial(super::ceremony::Partial {
+                        item: item.id.clone(),
+                        holder_key_id: h.key_id.clone(),
+                        signature_classical: classical,
+                        signature_pqc: pqc,
+                    })
+                    .map_err(|e| bad("add partial", e))?;
+            }
         }
     }
-    Ok(())
 }
 
 /// v53.0.0 — the software ceremony's inputs: the anchor block, the three

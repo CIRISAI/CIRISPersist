@@ -489,12 +489,15 @@ const ACCORD_FAMILY_FOUNDED_AT: &str = "2026-05-01T00:00:00Z";
 pub fn accord_family_genesis_record() -> crate::federation::types::Family {
     // #449 — founder seats follow the EFFECTIVE roster so the family stays
     // coherent with the seeded holders (test or baked) by construction.
+    // v53.0.0 (CC 3.2 T6) — the genesis version names the charter it was
+    // minted with, or no charter is in force for the accord at all.
     accord_family_genesis_record_for(
         ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
         ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
         effective_accord_holder_records()
             .iter()
             .map(|sr| sr.record.key_id.as_str()),
+        &genesis_family_charter_digest(),
     )
 }
 
@@ -502,10 +505,14 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
 /// founder set: what [`accord_family_genesis_record`] builds from this build's
 /// roster, and what the ceremony assembler signs as the family's genesis head.
 /// One construction, so the signed head and the seeded row cannot differ.
+/// `charter_digest` is the stored row hash of the charter the genesis version
+/// names ([`bundle_family_charter_digest`]); a genesis version names no
+/// predecessor.
 pub fn accord_family_genesis_record_for<'a>(
     family_key_id: &str,
     consensus_protocol: &str,
     founders: impl IntoIterator<Item = &'a str>,
+    charter_digest: &str,
 ) -> crate::federation::types::Family {
     use crate::federation::types::{Family, FamilyMember};
     let founded_at = ACCORD_FAMILY_FOUNDED_AT
@@ -520,6 +527,8 @@ pub fn accord_family_genesis_record_for<'a>(
         })
         .collect();
     Family {
+        prev_head_digest: String::new(),
+        charter_digest: charter_digest.to_owned(),
         family_key_id: family_key_id.to_owned(),
         family_name: "HUMANITY_ACCORD".to_owned(),
         members,
@@ -529,6 +538,42 @@ pub fn accord_family_genesis_record_for<'a>(
         dissolved_at: None,
         persist_row_hash: String::new(),
     }
+}
+
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
+/// charter the accord family's genesis version names**: the `persist_row_hash`
+/// of the bundle's charter of the family (`delegates_to` toward
+/// `humanity-accord` carrying the charter reading — `genesis-charter`). The
+/// head names the charter in force, and a charter no version names is not in
+/// force ([`charter_in_force`](crate::federation::canonical_community::charter_in_force)),
+/// so the genesis version must name the bundle's. Empty when the bundle in
+/// force carries none.
+#[must_use]
+pub fn genesis_family_charter_digest() -> String {
+    bundle_family_charter_digest(canonical_genesis_bundle())
+}
+
+/// [`genesis_family_charter_digest`] over a given bundle: the stored row hash
+/// of the bundle's charter of the accord family, empty when it carries none.
+/// The ceremony verifier reads the bundle it verifies through this, never the
+/// compiled one.
+#[must_use]
+pub fn bundle_family_charter_digest(bundle: &GenesisBundle) -> String {
+    let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    bundle
+        .attestations
+        .iter()
+        .map(|s| &s.attestation)
+        .find(|a| {
+            a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+                && a.attested_key_id == family
+                && crate::federation::trust_root::job_dimension_admits(
+                    &a.attestation_envelope,
+                    crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+                )
+        })
+        .and_then(|a| crate::federation::canonical_community::stored_row_hash(a).ok())
+        .unwrap_or_default()
 }
 
 /// First-boot-seed the baked HUMANITY_ACCORD **family row** (CIRISPersist#386).
@@ -1704,6 +1749,27 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
                 );
             }
         }
+    }
+    // v53.0.0 (CC 3.2 T6) — I446: the seeded family's genesis version names
+    // the charter the bundle installs, by the hash THIS backend stored for it,
+    // so the charter in force on a freshly seeded node is `genesis-charter`.
+    if row_bound.is_ok() {
+        let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+        let stored = dir
+            .get_attestation("genesis-charter")
+            .await
+            .expect("read back")
+            .expect("genesis-charter installed");
+        let (owner, head) = crate::federation::canonical_community::charter_in_force(dir, family)
+            .await
+            .expect("charter in force");
+        assert_eq!(owner, family, "I446");
+        assert!(
+            head.admits(&stored),
+            "I446: the seeded accord family's head names the stored genesis-charter \
+             ({head:?} vs stored {})",
+            stored.persist_row_hash
+        );
     }
 }
 
@@ -5265,6 +5331,8 @@ mod tests {
         )
         .await;
         let bad = Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "test-fam".into(),
             family_name: "T".into(),
             members: vec![FamilyMember {

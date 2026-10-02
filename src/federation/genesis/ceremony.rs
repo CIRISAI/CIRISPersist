@@ -16,6 +16,12 @@
 //! at the mint), which also gives each grant the family's quorum as its
 //! charter has it (CC 3.4.7).
 //!
+//! The heads name the charter in force by its stored row hash (CC 3.2 T6,
+//! `charter_digest`), which covers the charter's scrubs; so `family:`,
+//! `community:` and `authz` (which binds them) wait until every holder has
+//! signed the charter. [`CeremonyState::next_items`] offers only what can be
+//! signed now.
+//!
 //! [`CeremonyState`] holds only the caller's inputs and the partials received.
 //! The bytes of every item are **recomputed from the inputs on every call**,
 //! never stored, and every instant in them is derived from the ONE
@@ -148,6 +154,10 @@ pub struct SignItem {
     pub bytes: Vec<u8>,
     /// The holders that have not yet signed it.
     pub owed: Vec<String>,
+    /// The items it waits on (empty when it can be signed now). The heads and
+    /// the authorization wait on the charter: they name its stored row hash,
+    /// which covers its scrubs. While it waits, `bytes` is empty.
+    pub waits_on: Vec<String>,
 }
 
 /// Why the assembler refused. The wire token is [`CeremonyError::as_str`].
@@ -159,6 +169,13 @@ pub enum CeremonyError {
     StateVersion(u32),
     /// A partial names an item this ceremony does not have.
     UnknownItem(String),
+    /// A partial names an item that waits on another item's signatures.
+    NotReady {
+        /// The item.
+        item: String,
+        /// What it waits on.
+        waits_on: Vec<String>,
+    },
     /// A partial is signed by a key that is not a holder of this ceremony.
     NotAHolder(String),
     /// A partial's signature does not verify over the item's bytes.
@@ -191,6 +208,7 @@ impl CeremonyError {
             Self::InvalidInputs(_) => "ceremony_inputs_invalid",
             Self::StateVersion(_) => "ceremony_state_version",
             Self::UnknownItem(_) => "ceremony_item_unknown",
+            Self::NotReady { .. } => "ceremony_item_not_ready",
             Self::NotAHolder(_) => "ceremony_signer_not_a_holder",
             Self::BadSignature { .. } => "ceremony_signature_invalid",
             Self::ConflictingPartial { .. } => "ceremony_partial_conflicts",
@@ -210,6 +228,9 @@ impl std::fmt::Display for CeremonyError {
                 "{token}: state version {v}, this build reads {CEREMONY_STATE_VERSION}"
             ),
             Self::UnknownItem(i) => write!(f, "{token}: no item {i:?}"),
+            Self::NotReady { item, waits_on } => {
+                write!(f, "{token}: {item} waits on {waits_on:?}")
+            }
             Self::NotAHolder(h) => write!(f, "{token}: {h} is not a holder of this ceremony"),
             Self::BadSignature {
                 item,
@@ -250,14 +271,30 @@ pub struct CeremonyFinished {
     pub verified: super::CeremonyOutputsVerified,
 }
 
-/// The unsigned objects of a ceremony and the bytes of each item, in item
-/// order. Recomputed from the inputs; never stored.
+/// The unsigned objects of a ceremony and its items, in item order.
+/// Recomputed from the inputs (and, for the heads, the charter's signatures);
+/// never stored.
 struct Draft {
     node_records: Vec<KeyRecord>,
     rows: Vec<Attestation>,
-    family: crate::federation::types::Family,
-    community: Community,
-    items: Vec<(String, Vec<u8>)>,
+    heads: Option<(crate::federation::types::Family, Community)>,
+    items: Vec<DraftItem>,
+}
+
+/// One item of a draft: its bytes, or (while it waits) the items it waits on.
+struct DraftItem {
+    id: String,
+    bytes: Option<Vec<u8>>,
+    waits_on: Vec<String>,
+}
+
+fn scrub_sig(p: &Partial) -> ScrubSig {
+    ScrubSig {
+        cosigned_at: None,
+        scrub_key_id: p.holder_key_id.clone(),
+        scrub_signature_classical: p.signature_classical.clone(),
+        scrub_signature_pqc: Some(p.signature_pqc.clone()),
+    }
 }
 
 fn canonical(value: &serde_json::Value, what: &str) -> Result<Vec<u8>, CeremonyError> {
@@ -439,11 +476,49 @@ impl CeremonyState {
         Ok(row)
     }
 
+    /// `row` with the signatures the ceremony holds for it: the first holder in
+    /// roster order is the primary scrub, the rest co-scrub. Only for a
+    /// complete item.
+    fn signed_row(&self, row: &Attestation) -> Result<Attestation, CeremonyError> {
+        let id = format!("row:{}", row.attestation_id);
+        let mut signed = self.signed(&id).into_iter();
+        let p = signed
+            .next()
+            .ok_or_else(|| CeremonyError::Incomplete(self.owed_of(&id)))?;
+        let mut row = row.clone();
+        let bytes = canonical(&row.attestation_envelope, "row envelope")?;
+        row.original_content_hash = sha256_hex(&bytes);
+        row.scrub_signature_classical = p.signature_classical.clone();
+        row.scrub_signature_pqc = Some(p.signature_pqc.clone());
+        row.scrub_key_id = p.holder_key_id.clone();
+        row.additional_scrubs = signed.map(scrub_sig).collect();
+        Ok(row)
+    }
+
+    fn owed_of(&self, item: &str) -> BTreeMap<String, Vec<String>> {
+        let slot = self.partials.get(item);
+        let owed: Vec<String> = self
+            .holder_ids()
+            .into_iter()
+            .filter(|h| slot.is_none_or(|s| !s.contains_key(h)))
+            .collect();
+        BTreeMap::from([(item.to_owned(), owed)])
+    }
+
+    fn complete(&self, item: &str) -> bool {
+        self.owed_of(item).values().all(Vec::is_empty)
+    }
+
     fn draft(&self) -> Result<Draft, CeremonyError> {
         let i = &self.inputs;
         let at = i.produced_at;
         let primary = i.holders[0].record.key_id.clone();
         let mut items = Vec::new();
+        let ready = |id: String, bytes: Vec<u8>| DraftItem {
+            id,
+            bytes: Some(bytes),
+            waits_on: Vec::new(),
+        };
 
         // Serve nodes: the subject bound into the envelope before the bytes
         // are formed (#659), the scrub over the full envelope.
@@ -482,7 +557,7 @@ impl CeremonyState {
                 consent_role: None,
                 additional_scrubs: Vec::new(),
             });
-            items.push((format!("record:{}", n.key_id), bytes));
+            items.push(ready(format!("record:{}", n.key_id), bytes));
         }
 
         // The delegation plane, 1 ms apart in bundle order.
@@ -523,64 +598,85 @@ impl CeremonyState {
             ms(offset),
         )?);
         for r in &rows {
-            items.push((
+            items.push(ready(
                 format!("row:{}", r.attestation_id),
                 canonical(&r.attestation_envelope, "row envelope")?,
             ));
         }
 
         // The genesis heads (CC 3.2 T6): the accord family record and the
-        // community birth, each its own signed record at its first version.
-        let family = super::accord_family_genesis_record_for(
-            &i.family_key_id,
-            &i.consensus_protocol,
-            i.holders.iter().map(|h| h.record.key_id.as_str()),
-        );
-        items.push((
-            format!("family:{}", family.family_key_id),
-            canonical(&family.signing_envelope(), "family record")?,
-        ));
-        let mut members: Vec<CommunityMember> = i
-            .holders
-            .iter()
-            .map(|h| CommunityMember {
-                key_id: h.record.key_id.clone(),
+        // community birth, each its own signed record at its first version,
+        // naming the charter in force by its stored row hash. That hash covers
+        // the charter's scrubs, so the heads — and the authorization, which
+        // binds them — wait until every holder has signed the charter.
+        let family_id = format!("family:{}", i.family_key_id);
+        let community_id = format!("community:{}", i.community.community_key_id);
+        let charter_item = format!("row:{GENESIS_CHARTER_ID}");
+        let heads = if self.complete(&charter_item) {
+            let charter = self.signed_row(&rows[0])?;
+            let charter_digest = crate::federation::canonical_community::stored_row_hash(&charter)
+                .map_err(|e| CeremonyError::InvalidInputs(format!("charter digest: {e}")))?;
+            let family = super::accord_family_genesis_record_for(
+                &i.family_key_id,
+                &i.consensus_protocol,
+                i.holders.iter().map(|h| h.record.key_id.as_str()),
+                &charter_digest,
+            );
+            let mut members: Vec<CommunityMember> = i
+                .holders
+                .iter()
+                .map(|h| CommunityMember {
+                    key_id: h.record.key_id.clone(),
+                    joined_at: at,
+                    role: Some("founder".to_owned()),
+                })
+                .collect();
+            members.extend(i.serve_nodes.iter().map(|n| CommunityMember {
+                key_id: n.key_id.clone(),
                 joined_at: at,
-                role: Some("founder".to_owned()),
-            })
-            .collect();
-        members.extend(i.serve_nodes.iter().map(|n| CommunityMember {
-            key_id: n.key_id.clone(),
-            joined_at: at,
-            role: Some("member".to_owned()),
-        }));
-        let community = Community {
-            community_key_id: i.community.community_key_id.clone(),
-            community_name: i.community.community_name.clone(),
-            members,
-            founded_at: at,
-            consensus_protocol: i.community.consensus_protocol.clone(),
-            policy_blob: Some(i.community.policy_blob.clone()),
-            persist_row_hash: String::new(),
+                role: Some("member".to_owned()),
+            }));
+            let community = Community {
+                prev_head_digest: String::new(),
+                charter_digest,
+                community_key_id: i.community.community_key_id.clone(),
+                community_name: i.community.community_name.clone(),
+                members,
+                founded_at: at,
+                consensus_protocol: i.community.consensus_protocol.clone(),
+                policy_blob: Some(i.community.policy_blob.clone()),
+                persist_row_hash: String::new(),
+            };
+            items.push(ready(
+                family_id,
+                canonical(&family.signing_envelope(), "family record")?,
+            ));
+            items.push(ready(
+                community_id,
+                canonical(&community.signing_envelope(), "community record")?,
+            ));
+            // Last: the holders' authorization over the whole bundle. The
+            // digest binds content, not the scrubs the other items accumulate.
+            let unsigned = self.bundle_from(&node_records, &rows, &family, &community, Vec::new());
+            let digest = authorization_digest(&unsigned)
+                .map_err(|e| CeremonyError::InvalidInputs(format!("authorization digest: {e}")))?;
+            items.push(ready(AUTHZ_ITEM_ID.to_owned(), digest));
+            Some((family, community))
+        } else {
+            for id in [family_id, community_id, AUTHZ_ITEM_ID.to_owned()] {
+                items.push(DraftItem {
+                    id,
+                    bytes: None,
+                    waits_on: vec![charter_item.clone()],
+                });
+            }
+            None
         };
-        items.push((
-            format!("community:{}", community.community_key_id),
-            canonical(&community.signing_envelope(), "community record")?,
-        ));
-
-        // Last: the holders' authorization over the whole bundle. The digest
-        // binds content, not the scrubs the items above accumulate, so it is
-        // signable at once.
-        let unsigned = self.bundle_from(&node_records, &rows, &family, &community, Vec::new());
-        let digest = authorization_digest(&unsigned)
-            .map_err(|e| CeremonyError::InvalidInputs(format!("authorization digest: {e}")))?;
-        items.push((AUTHZ_ITEM_ID.to_owned(), digest));
 
         Ok(Draft {
             node_records,
             rows,
-            family,
-            community,
+            heads,
             items,
         })
     }
@@ -633,31 +729,32 @@ impl CeremonyState {
         }
     }
 
-    /// Every item, with its bytes and the holders still owed — complete items
-    /// included (their `owed` is empty), in item order.
+    /// Every item in item order, complete ones included (their `owed` is
+    /// empty). An item that waits on another (the heads and the
+    /// authorization wait on the charter) has empty `bytes` and names what it
+    /// waits on.
     ///
     /// # Errors
     ///
     /// The inputs no longer form a ceremony (a state edited by hand).
     pub fn items(&self) -> Result<Vec<SignItem>, CeremonyError> {
-        let holders = self.holder_ids();
         Ok(self
             .draft()?
             .items
             .into_iter()
-            .map(|(id, bytes)| {
-                let signed = self.partials.get(&id);
-                let owed = holders
-                    .iter()
-                    .filter(|h| signed.is_none_or(|s| !s.contains_key(*h)))
-                    .cloned()
-                    .collect();
-                SignItem { id, bytes, owed }
+            .map(|d| {
+                let owed = self.owed_of(&d.id).into_values().next().unwrap_or_default();
+                SignItem {
+                    id: d.id,
+                    bytes: d.bytes.unwrap_or_default(),
+                    owed,
+                    waits_on: d.waits_on,
+                }
             })
             .collect())
     }
 
-    /// The items still owed signatures, with their bytes.
+    /// The items a holder can sign now: owed, and waiting on nothing.
     ///
     /// # Errors
     ///
@@ -666,19 +763,21 @@ impl CeremonyState {
         Ok(self
             .items()?
             .into_iter()
-            .filter(|i| !i.owed.is_empty())
+            .filter(|i| !i.owed.is_empty() && i.waits_on.is_empty())
             .collect())
     }
 
-    /// Item id → the holders still owed, for the items not yet complete.
+    /// Item id → the holders still owed, for every item not yet complete
+    /// (waiting ones included).
     ///
     /// # Errors
     ///
     /// As [`Self::items`].
     pub fn status(&self) -> Result<BTreeMap<String, Vec<String>>, CeremonyError> {
         Ok(self
-            .next_items()?
+            .items()?
             .into_iter()
+            .filter(|i| !i.owed.is_empty())
             .map(|i| (i.id, i.owed))
             .collect())
     }
@@ -688,13 +787,19 @@ impl CeremonyState {
     ///
     /// # Errors
     ///
-    /// [`CeremonyError::UnknownItem`], [`CeremonyError::NotAHolder`],
-    /// [`CeremonyError::BadSignature`] (either half),
-    /// [`CeremonyError::ConflictingPartial`].
+    /// [`CeremonyError::UnknownItem`], [`CeremonyError::NotReady`],
+    /// [`CeremonyError::NotAHolder`], [`CeremonyError::BadSignature`] (either
+    /// half), [`CeremonyError::ConflictingPartial`].
     pub fn add_partial(&mut self, partial: Partial) -> Result<(), CeremonyError> {
         let draft = self.draft()?;
-        let Some((_, bytes)) = draft.items.iter().find(|(id, _)| *id == partial.item) else {
+        let Some(item) = draft.items.iter().find(|d| d.id == partial.item) else {
             return Err(CeremonyError::UnknownItem(partial.item));
+        };
+        let Some(bytes) = item.bytes.as_deref() else {
+            return Err(CeremonyError::NotReady {
+                item: partial.item,
+                waits_on: item.waits_on.clone(),
+            });
         };
         let Some(holder) = self
             .inputs
@@ -754,23 +859,15 @@ impl CeremonyState {
             return Err(CeremonyError::Incomplete(owed));
         }
         let draft = self.draft()?;
-        let scrubs = |item: &str| -> Vec<ScrubSig> {
-            self.signed(item)
-                .iter()
-                .skip(1)
-                .map(|p| ScrubSig {
-                    cosigned_at: None,
-                    scrub_key_id: p.holder_key_id.clone(),
-                    scrub_signature_classical: p.signature_classical.clone(),
-                    scrub_signature_pqc: Some(p.signature_pqc.clone()),
-                })
-                .collect()
-        };
-        let first = |item: &str| -> Partial {
+        let (family, community) = draft
+            .heads
+            .as_ref()
+            .ok_or_else(|| CeremonyError::Incomplete(self.owed_of(AUTHZ_ITEM_ID)))?;
+        let primary_of = |item: &str| -> Result<Partial, CeremonyError> {
             self.signed(item)
                 .first()
                 .map(|p| (*p).clone())
-                .expect("a complete item has its primary")
+                .ok_or_else(|| CeremonyError::Incomplete(self.owed_of(item)))
         };
         let cosigs = |item: &str| -> Vec<RosterCosignature> {
             self.signed(item)
@@ -789,31 +886,25 @@ impl CeremonyState {
             .iter()
             .map(|r| {
                 let id = format!("record:{}", r.key_id);
-                let p = first(&id);
+                let p = primary_of(&id)?;
                 let mut r = r.clone();
                 r.scrub_signature_classical = p.signature_classical;
                 r.scrub_signature_pqc = Some(p.signature_pqc);
                 r.scrub_key_id = p.holder_key_id;
-                r.additional_scrubs = scrubs(&id);
-                r
+                r.additional_scrubs = self
+                    .signed(&id)
+                    .into_iter()
+                    .skip(1)
+                    .map(scrub_sig)
+                    .collect();
+                Ok(r)
             })
-            .collect();
+            .collect::<Result<_, CeremonyError>>()?;
         let rows: Vec<Attestation> = draft
             .rows
             .iter()
-            .map(|row| {
-                let id = format!("row:{}", row.attestation_id);
-                let p = first(&id);
-                let mut row = row.clone();
-                let bytes = canonical(&row.attestation_envelope, "row envelope")?;
-                row.original_content_hash = sha256_hex(&bytes);
-                row.scrub_signature_classical = p.signature_classical;
-                row.scrub_signature_pqc = Some(p.signature_pqc);
-                row.scrub_key_id = p.holder_key_id;
-                row.additional_scrubs = scrubs(&id);
-                Ok(row)
-            })
-            .collect::<Result<_, CeremonyError>>()?;
+            .map(|row| self.signed_row(row))
+            .collect::<Result<_, _>>()?;
         let authorizations = self
             .signed(AUTHZ_ITEM_ID)
             .iter()
@@ -823,18 +914,12 @@ impl CeremonyState {
                 signature_pqc: p.signature_pqc.clone(),
             })
             .collect();
-        let mut bundle = self.bundle_from(
-            &nodes,
-            &rows,
-            &draft.family,
-            &draft.community,
-            authorizations,
-        );
+        let mut bundle = self.bundle_from(&nodes, &rows, family, community, authorizations);
         for record in &mut bundle.roster_records {
             match record {
                 GenesisRosterRecord::Family(f) => {
                     let id = format!("family:{}", f.family.family_key_id);
-                    let p = first(&id);
+                    let p = primary_of(&id)?;
                     f.authority_key_id = p.holder_key_id;
                     f.scrub_signature_classical = p.signature_classical;
                     f.scrub_signature_pqc = Some(p.signature_pqc);
@@ -842,7 +927,7 @@ impl CeremonyState {
                 }
                 GenesisRosterRecord::Community(c) => {
                     let id = format!("community:{}", c.community.community_key_id);
-                    let p = first(&id);
+                    let p = primary_of(&id)?;
                     c.authority_key_id = p.holder_key_id;
                     c.scrub_signature_classical = p.signature_classical;
                     c.scrub_signature_pqc = Some(p.signature_pqc);

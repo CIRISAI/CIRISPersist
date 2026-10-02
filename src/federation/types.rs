@@ -3133,6 +3133,24 @@ pub struct Family {
     /// before v52.0.0 keeps its bytes, signature and `persist_row_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dissolved_at: Option<DateTime<Utc>>,
+    /// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) —
+    /// **the version this record succeeds**: the `persist_row_hash` of the
+    /// family record it replaces, so the lineage head (this record at a version)
+    /// names its predecessor inside what its signers signed. Empty on a
+    /// founding version. A supersede whose value is not the held head's hash
+    /// is refused (`group_amendment::check_prev_head_names_held`). Absent on
+    /// the wire when empty, so a founding record keeps its bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prev_head_digest: String,
+    /// v53.0.0 (CC 3.2 T6) — **the charter in force at this version**: the
+    /// `persist_row_hash` of the `trust:charter:v1` row this version adopts.
+    /// A charter row no version names is not in force
+    /// ([`charter_in_force`](super::canonical_community::charter_in_force)),
+    /// so a charter re-scrub takes effect only by a new version, and the head
+    /// moves with it. Empty when the version adopts no charter. Absent on the
+    /// wire when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub charter_digest: String,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
@@ -3280,6 +3298,24 @@ pub struct Community {
     /// nullable JSONB (postgres) / JSON TEXT (sqlite).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_blob: Option<serde_json::Value>,
+    /// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) —
+    /// **the version this record succeeds**: the `persist_row_hash` of the
+    /// community record it replaces, so the lineage head (this record at a version)
+    /// names its predecessor inside what its signers signed. Empty on a
+    /// founding version. A supersede whose value is not the held head's hash
+    /// is refused (`group_amendment::check_prev_head_names_held`). Absent on
+    /// the wire when empty, so a founding record keeps its bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prev_head_digest: String,
+    /// v53.0.0 (CC 3.2 T6) — **the charter this version was minted under**:
+    /// the `persist_row_hash` of a `trust:charter:v1` row. Signed and
+    /// persisted, so the head carries it; NOT what decides the charter in
+    /// force for a trust-root community — its legs are its conferring
+    /// family's (CC 4.4), so that is the charter the FAMILY's head names
+    /// ([`charter_in_force`](super::canonical_community::charter_in_force)).
+    /// Empty when the version names none. Absent on the wire when empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub charter_digest: String,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
@@ -5276,6 +5312,8 @@ mod persist_row_hash_v1_pin_tests {
     #[test]
     fn a_real_typed_row_with_non_ascii_hashes_under_v1() {
         let fam = Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "fam-nonascii".to_owned(),
             family_name: "家族 ⚠️ Ünïcode".to_owned(),
             members: Vec::new(),
@@ -5483,6 +5521,8 @@ mod signing_preimage_pin_tests {
     /// `skip_serializing_if` on it would red this gate).
     fn full_family() -> Family {
         Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "fam-key".to_owned(),
             family_name: "Acme Household".to_owned(),
             members: vec![full_family_member()],
@@ -5496,6 +5536,8 @@ mod signing_preimage_pin_tests {
 
     fn full_community() -> Community {
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: "comm-key".to_owned(),
             community_name: "Acme Co-op".to_owned(),
             members: vec![full_community_member()],
@@ -5611,6 +5653,8 @@ mod signing_preimage_pin_tests {
 
     fn minimal_family() -> Family {
         Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "fam-key".to_owned(),
             family_name: "Acme Household".to_owned(),
             members: Vec::new(),
@@ -5624,6 +5668,8 @@ mod signing_preimage_pin_tests {
 
     fn minimal_community() -> Community {
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: "comm-key".to_owned(),
             community_name: "Acme Co-op".to_owned(),
             members: Vec::new(),

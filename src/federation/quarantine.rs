@@ -1259,6 +1259,8 @@ pub(crate) mod test_support {
             crate::federation::tier_ingest::test_support::sign_community(
                 &founder,
                 Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: community.clone(),
                     community_name: format!("commons {community}"),
                     members: vec![

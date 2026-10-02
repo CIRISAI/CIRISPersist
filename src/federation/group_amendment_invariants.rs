@@ -90,6 +90,8 @@ pub mod bodies {
                 Kind::Family => Signed::Family(ts::sign_family(
                     &members[0],
                     Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: id.to_owned(),
                         family_name: c.name.to_owned(),
                         members: members
@@ -110,6 +112,8 @@ pub mod bodies {
                 Kind::Community => Signed::Community(ts::sign_community(
                     &members[0],
                     Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: id.to_owned(),
                         community_name: c.name.to_owned(),
                         members: members
@@ -144,9 +148,29 @@ pub mod bodies {
             change: serde_json::Value,
             sigs: Vec<ciris_verify_core::threshold::ThresholdSignature>,
         ) -> Result<u32, Error> {
+            // v53.0.0 (CC 3.2 T6) — the version names the head `d` holds,
+            // signed again by the same authority.
             match s {
-                Signed::Family(f) => d.supersede_family_with_quorum(f, change, sigs).await,
-                Signed::Community(c) => d.supersede_community_with_quorum(c, change, sigs).await,
+                Signed::Family(f) => {
+                    let mut rec = f.family;
+                    rec.prev_head_digest = d
+                        .lookup_family(&rec.family_key_id)
+                        .await?
+                        .map(|h| h.persist_row_hash)
+                        .unwrap_or_default();
+                    let f = ts::sign_family(&f.authority_key_id, rec);
+                    d.supersede_family_with_quorum(f, change, sigs).await
+                }
+                Signed::Community(c) => {
+                    let mut rec = c.community;
+                    rec.prev_head_digest = d
+                        .lookup_community(&rec.community_key_id)
+                        .await?
+                        .map(|h| h.persist_row_hash)
+                        .unwrap_or_default();
+                    let c = ts::sign_community(&c.authority_key_id, rec);
+                    d.supersede_community_with_quorum(c, change, sigs).await
+                }
             }
         }
 

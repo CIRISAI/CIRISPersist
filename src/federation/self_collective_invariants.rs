@@ -155,6 +155,8 @@ pub(crate) mod bodies {
         d.put_family(ts::sign_family(
             &fam,
             crate::federation::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "Fam".into(),
                 members: vec![

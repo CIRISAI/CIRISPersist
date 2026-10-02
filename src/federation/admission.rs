@@ -23800,6 +23800,8 @@ pub(crate) mod r2_test_support {
         dir.put_family(ts::sign_family(
             &author,
             crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: format!("nskinds-family-{tag}"),
                 members: vec![crate::federation::types::FamilyMember {
@@ -23821,6 +23823,8 @@ pub(crate) mod r2_test_support {
         dir.put_community(ts::sign_community(
             &author,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: format!("nskinds-community-{tag}"),
                 members: vec![crate::federation::types::CommunityMember {
@@ -24875,6 +24879,8 @@ pub(crate) mod steward_liveness_test_support {
             crate::federation::tier_ingest::test_support::sign_community(
                 &n1,
                 Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: community.clone(),
                     community_name: format!("node commons {suffix}"),
                     members: [&n1, &n2]
@@ -25110,6 +25116,8 @@ pub(crate) mod moderation_walk_liveness_test_support {
         dir.put_community(sign_community(
             founder,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: community.to_owned(),
                 community_name: format!("moderation commons {suffix}"),
                 members: vec![CommunityMember {

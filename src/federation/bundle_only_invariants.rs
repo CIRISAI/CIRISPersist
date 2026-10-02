@@ -343,12 +343,36 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(166).await.unwrap();
+        // v53.0.0 — this build reads V174's lineage-head columns on every
+        // family/community lookup, so the pre-V167 write needs them; they are
+        // added for the write and dropped before the upgrade, which then adds
+        // them as a node upgrading from v52 would. The rows under test are
+        // attestations, untouched by either step.
+        b.write(|conn| conn.execute_batch(V174_TEMP_ADD_SQLITE))
+            .await
+            .unwrap();
         let h = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
+        b.write(|conn| conn.execute_batch(V174_TEMP_DROP_SQLITE))
+            .await
+            .unwrap();
         b.run_migrations().await.unwrap();
         bodies::i369_assert(&b, &h, true).await;
         let late = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
         bodies::i369_assert(&b, &late, false).await;
     }
+
+    #[cfg(feature = "sqlite")]
+    const V174_TEMP_ADD_SQLITE: &str = "\
+        ALTER TABLE federation_families ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '';\
+        ALTER TABLE federation_families ADD COLUMN charter_digest TEXT NOT NULL DEFAULT '';\
+        ALTER TABLE federation_communities ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '';\
+        ALTER TABLE federation_communities ADD COLUMN charter_digest TEXT NOT NULL DEFAULT '';";
+    #[cfg(feature = "sqlite")]
+    const V174_TEMP_DROP_SQLITE: &str = "\
+        ALTER TABLE federation_families DROP COLUMN prev_head_digest;\
+        ALTER TABLE federation_families DROP COLUMN charter_digest;\
+        ALTER TABLE federation_communities DROP COLUMN prev_head_digest;\
+        ALTER TABLE federation_communities DROP COLUMN charter_digest;";
 
     #[cfg(feature = "postgres")]
     #[tokio::test]
@@ -361,7 +385,31 @@ mod run {
             .await
             .unwrap();
         b.run_migrations_through(166).await.unwrap();
+        // v53.0.0 — see the sqlite leg: V174's columns for the write only.
+        let pg = |sql: &'static str| {
+            let b = &b;
+            async move {
+                b.get_client()
+                    .await
+                    .unwrap()
+                    .batch_execute(sql)
+                    .await
+                    .unwrap()
+            }
+        };
+        pg("ALTER TABLE cirislens.federation_families \
+                ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '', \
+                ADD COLUMN charter_digest TEXT NOT NULL DEFAULT ''; \
+            ALTER TABLE cirislens.federation_communities \
+                ADD COLUMN prev_head_digest TEXT NOT NULL DEFAULT '', \
+                ADD COLUMN charter_digest TEXT NOT NULL DEFAULT '';")
+        .await;
         let h = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;
+        pg("ALTER TABLE cirislens.federation_families \
+                DROP COLUMN prev_head_digest, DROP COLUMN charter_digest; \
+            ALTER TABLE cirislens.federation_communities \
+                DROP COLUMN prev_head_digest, DROP COLUMN charter_digest;")
+        .await;
         b.run_migrations().await.unwrap();
         bodies::i369_assert(&b, &h, true).await;
         let late = bodies::i369_put_unlabelled(&b as &dyn FederationDirectory).await;

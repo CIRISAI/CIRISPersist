@@ -214,14 +214,22 @@ pub async fn verify_ceremony_outputs(
 }
 
 /// v53.0.0 (CC 3.2 T6) — the accord family's genesis record the bundle
-/// carries is the family this build seeds ([`accord_family_genesis_record`](super::accord_family_genesis_record):
-/// same founders, protocol, entrenchment and instant), signed over its signing
+/// carries is the family this build seeds ([`accord_family_genesis_record_for`](super::accord_family_genesis_record_for):
+/// same founders, protocol, entrenchment and instant, naming the bundle's own
+/// charter), signed over its signing
 /// envelope by EVERY holder of this build's roster (the founding rule).
 fn check_family_record(
     bundle: &GenesisBundle,
     roster: &[crate::federation::SignedKeyRecord],
 ) -> Result<(), String> {
-    let expected = super::accord_family_genesis_record();
+    // The family this build seeds, naming THIS bundle's charter (never the
+    // compiled bundle's: the bundle under verification is not yet baked).
+    let expected = super::accord_family_genesis_record_for(
+        ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+        ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+        roster.iter().map(|r| r.record.key_id.as_str()),
+        &super::bundle_family_charter_digest(bundle),
+    );
     let carried = bundle
         .family_record(&expected.family_key_id)
         .ok_or_else(|| {

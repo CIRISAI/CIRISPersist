@@ -644,15 +644,21 @@ fn i421_any_order_across_requests_is_byte_identical() {
     let at = at(-5);
     let minted = mint_test_ceremony(&SEEDS, &NODE_SEED, at).unwrap();
     let (mut state, holders) = planned(at);
-    let items = state.items().unwrap();
-    // last holder first, last item first, a serialize/parse between every one
-    for h in holders.iter().rev() {
-        for item in items.iter().rev() {
-            let json = state.to_json().unwrap();
-            state = CeremonyState::from_json(&json).unwrap();
-            state
-                .add_partial(partial(h, &item.id, &item.bytes))
-                .expect("I421: a good partial");
+    // round by round: last holder first, last item first, a serialize/parse
+    // between every partial
+    loop {
+        let items = state.next_items().unwrap();
+        if items.is_empty() {
+            break;
+        }
+        for h in holders.iter().rev() {
+            for item in items.iter().rev() {
+                let json = state.to_json().unwrap();
+                state = CeremonyState::from_json(&json).unwrap();
+                state
+                    .add_partial(partial(h, &item.id, &item.bytes))
+                    .expect("I421: a good partial");
+            }
         }
     }
     let bundle = state.assemble().expect("I421: complete");
@@ -678,7 +684,17 @@ fn i422_add_partial_refuses_by_name() {
         .iter()
         .find(|i| i.id == "row:genesis-charter")
         .unwrap();
-    let family = items.iter().find(|i| i.id.starts_with("family:")).unwrap();
+    let family = items
+        .iter()
+        .find(|i| i.id == "row:genesis-lifecycle")
+        .unwrap();
+    // an item that waits on the charter is not signable yet
+    let heads = items.iter().find(|i| i.id.starts_with("family:")).unwrap();
+    assert!(heads.bytes.is_empty() && heads.waits_on == vec![charter.id.clone()]);
+    let e = state
+        .add_partial(partial(&holders[0], &heads.id, &charter.bytes))
+        .unwrap_err();
+    assert_eq!(e.as_str(), "ceremony_item_not_ready", "{e}");
     // unknown item
     let mut p = partial(&holders[0], &charter.id, &charter.bytes);
     p.item = "row:nonesuch".into();
@@ -723,8 +739,8 @@ fn i422_add_partial_refuses_by_name() {
 #[test]
 fn i423_incomplete_names_what_is_owed() {
     let (mut state, holders) = planned(at(-5));
-    for item in state.items().unwrap() {
-        // two of three on every item
+    // two of three on every item signable now
+    for item in state.next_items().unwrap() {
         for h in &holders[..2] {
             state
                 .add_partial(partial(h, &item.id, &item.bytes))
@@ -733,23 +749,39 @@ fn i423_incomplete_names_what_is_owed() {
     }
     match state.assemble() {
         Err(CeremonyError::Incomplete(owed)) => {
-            assert_eq!(owed.len(), 7, "I423: every item still owes one: {owed:?}");
-            assert!(owed.values().all(|o| o == &vec![holders[2].key_id.clone()]));
+            assert_eq!(owed.len(), 7, "I423: every item still owes: {owed:?}");
+            // the four signable items owe the third holder; the heads and the
+            // authorization, still waiting on the charter, owe all three
+            let third = vec![holders[2].key_id.clone()];
+            assert_eq!(owed.values().filter(|o| **o == third).count(), 4);
+            assert_eq!(owed.values().filter(|o| o.len() == 3).count(), 3);
         }
         other => panic!("I423: expected Incomplete, got {other:?}"),
     }
-    assert_eq!(state.next_items().unwrap().len(), 7);
-    let authz = state
+    assert_eq!(
+        state.next_items().unwrap().len(),
+        4,
+        "I423: the waiting three are not offered"
+    );
+    // the third holder signs the charter: the heads and the authorization open
+    let charter = state
         .items()
         .unwrap()
         .into_iter()
-        .find(|i| i.id == AUTHZ_ITEM_ID)
+        .find(|i| i.id == "row:genesis-charter")
         .unwrap();
     state
-        .add_partial(partial(&holders[2], &authz.id, &authz.bytes))
+        .add_partial(partial(&holders[2], &charter.id, &charter.bytes))
         .unwrap();
-    assert_eq!(state.status().unwrap().len(), 6);
-    assert!(!state.status().unwrap().contains_key(AUTHZ_ITEM_ID));
+    let next: Vec<String> = state
+        .next_items()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(next.len(), 6, "I423: {next:?}");
+    assert!(next.contains(&AUTHZ_ITEM_ID.to_owned()));
+    assert!(state.items().unwrap().iter().all(|i| i.waits_on.is_empty()));
 }
 
 /// **I424 — `finish` ends in the ordinary doors and passes**; the outputs boot

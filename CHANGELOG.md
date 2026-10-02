@@ -137,6 +137,32 @@ CIRISConstitution rc7 `5e89627` (CC 3.2 T3, 4.2.6, 2.1) and `fe459cf` (CC 4.2.6,
 | M14 | the family-quorum plane counts a grant below the quorum | I439 | killed |
 
 14 of 14 killed.
+### rc7 B-1: the head moves with the record
+
+CC 3.2 T6 (rc7 `b578b59`, operator ruling B-1 on CIRISConstitution#136): the lineage head is the family or community record at a version; its `prev_head_digest` names the version it succeeds and its `charter_digest` names the charter in force at that version; every roster-affecting row, a charter re-scrub included, MUST produce a new version. Before this, a charter re-scrub wrote only a `trust:charter:v1` row, the record never re-versioned, and the head never moved.
+
+- **Two signed members on `Family` and `Community`** (`prev_head_digest`, `charter_digest`). Both are in `signing_envelope()` and the row hash; absent on the wire when empty, so a founding record that names no charter keeps its bytes. Persisted by **V174** (`lineage_head_links`, both dialects; `TEXT NOT NULL DEFAULT ''`).
+- **A version names the head it succeeds.** Every backend's `supersede_group_row` refuses, inside the transaction that replaces the row, a version whose `prev_head_digest` is not the held row's hash: `Conflict` carrying `lineage_prev_head_mismatch`. The one exception is an accord birth the trust-root door stores over a squat or a stalled chain (its authorization names the replaced row; a birth names no predecessor). An insert under an unoccupied id is not judged (a fresh node takes the served version as it finds it; a served family carries no chain).
+- **The charter in force is the one the head names.** `canonical_community::charter_in_force(root)` is the one answer every charter reader shares: a family root reads its own head, a community reads its conferring family's (CC 4.4), anything else is a key root whose self-charter stands as before (`HeadCharter::{KeyRoot, Named, Unnamed}`). The trust-root family charter leg and `charter_members_for` (attach window, witness cadence and quorum) both route through it; `charter_members_for` no longer takes whichever charter row a listing returned first. A charter row no version names confers nothing.
+- **The accord re-versions its head under its own quorum.** The reserved `humanity-accord` id admits exactly one door record: a version of the HELD accord that changes only `prev_head_digest` / `charter_digest`, carrying a supersede proof that names the held version and whose change envelope binds the offered record's content hash (`next_persist_row_hash`), verified to the held roster's own protocol. Founding, roster, protocol and entrenchment changes stay reserved. Without this, no charter re-scrub of the accord could ever take effect.
+- **Genesis.** The baked accord family's genesis version names the bundle's charter of the family (`genesis-charter`) by the hash every backend stores for it (`canonical_community::stored_row_hash`: the envelope in its at-rest canonical form). A node that already holds an accord family keeps it (the seed is a no-op on a held row), so a node upgrading from v52 holds an accord head that names no charter until a version names one — see the adopter notes.
+
+**Adopters.** A host that supersedes a family or community MUST set `prev_head_digest` to the `persist_row_hash` it holds, before signing; a version naming no predecessor is refused. A host minting a charter for a family root MUST also mint the family version naming it (`charter_digest`), or the charter is not in force. The accord's version takes `supersede_family_with_quorum` with the change envelope's `next_persist_row_hash` set to the new version's hash.
+
+**Not versioned (READ, reported, not built here).** Roster-plane rows still change a lineage's roster without a record version: family and community membership revocations and widenings, including a trust-root community's member (serve-node) joins and a founder's resignation (`check_trust_root_roster_change` admits it as a roster-plane revocation). CC 3.2 T6 requires each to produce a new version; that is a door redesign for a later slice.
+
+| Witness | What it pins |
+|---|---|
+| I440 | both members signed, persisted, served; the row hash covers them |
+| I441 | a supersede naming another head (or none) is refused on the family and community arm |
+| I442 | a quorate charter the head does not name confers nothing; the version naming it does, and chains |
+| I443 | a re-scrub with no version confers nothing |
+| I444 | the charter members are the named charter's and follow the head |
+| I445 | the attach head moves; an edge naming the replaced head is stale |
+| I446 | genesis names the bundle charter (pure + seeded on every backend); the accord's head door |
+| I447 | a community reads its conferring family's head |
+| I448 | from disk: the prev check on both arms of every backend's supersede |
+| I449 | a key root keeps its self-charter |
 
 ### CC 1.0-rc6 re-vendored (tag v1.0-rc6)
 The two vendored CC files move from `651140a` to CIRISConstitution tag **`v1.0-rc6`** (commit `3c3e63fdef844f2f849e43081a8242e31cfaf30d`, annotated tag `b9d8cba`). They were first copied at `1f45ebe` ("Cut 1.0-rc6, released as guidance: re-pin 10") before the tag existed; both manifests have the same blob ids at `1f45ebe` and at the tag, so the bytes are unchanged and only the recorded commit moved. **`scripts/check_vendored_cc.sh <cc-tag>`** (new; a ship step, not CI) fetches CC at a tag and compares both files byte for byte, exiting 1 on any difference and 2 on a missing tag or fetch failure; `scripts/check_vendored_cc.sh v1.0-rc6` passes, and fails on a copy altered by one byte. `scripts/release_ship.sh` names the step, and now pushes `refs/tags/v$ver` explicitly (a branch of the same name made the bare push ambiguous at v52.0.1).
