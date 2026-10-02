@@ -140,6 +140,10 @@ pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
+/// v53.0.0 (CC 3.2 T2) — I383–I386, a superseded grant hands standing to its
+/// successor; a withdrawn one has none.
+#[cfg(test)]
+pub(crate) mod grant_supersede_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
@@ -165,6 +169,10 @@ pub(crate) mod nested_manifest_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
+/// v53.0.0 (CIRISPersist#965) — I381/I382, an occurrence's consent is never
+/// demoted to the identity's word alone.
+#[cfg(test)]
+pub(crate) mod occurrence_consent_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
@@ -424,6 +432,12 @@ impl ConsentSweepReport {
 }
 
 pub mod register;
+/// v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: the
+/// `attestation_type` allowlist, the carrier shape, the report door.
+pub mod row_type;
+/// CIRISPersist#975 — I370–I379, the closed row-type slot.
+#[cfg(test)]
+mod row_type_invariants;
 // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4–§5) — the rendition
 // index (V149 `blob_renditions`) and the sized holder claim, the pure half.
 pub mod renditions;
@@ -5225,6 +5239,13 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error>;
 
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — every stored
+    /// `attestation_type` with its row count and `asserted_at` span, every
+    /// tier. The inventory [`row_type::row_type_report`] filters to the types
+    /// the closed slot does not register. Bounded by the number of DISTINCT
+    /// types, not rows.
+    async fn attestation_type_census(&self) -> Result<Vec<row_type::AttestationTypeCount>, Error>;
+
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`SignedIdentityOccurrenceRevocation`] wrappers since a cursor — the
     /// bulk-read mirror of
@@ -5607,8 +5628,9 @@ pub trait FederationDirectory: Send + Sync {
     /// - it is TRUSTED-LOCAL (no signature columns: `self_at_login`, the HTTP
     ///   self-bind — produced by this node for its own user, never reachable
     ///   from the replication apply), or
-    /// - a stored signed row for the pair was signed by the OCCURRENCE
-    ///   ([`occurrence_agreed_to`]).
+    /// - the OCCURRENCE itself ever signed an admitted assertion of the pair
+    ///   ([`occurrence_agreed_to`], over the V161 history — v53.0.0, #965: a
+    ///   later re-signing by the identity does not erase it).
     async fn active_identities_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -5633,9 +5655,16 @@ pub trait FederationDirectory: Send + Sync {
                 .filter(|s| s.identity_occurrence.occurrence_key_id == occurrence_key_id)
                 .collect();
             let trusted_local = signed_for_pair.is_empty();
-            let agreed = signed_for_pair
-                .iter()
-                .any(|s| s.attesting_key_id == occurrence_key_id);
+            // v53.0.0 (CIRISPersist#965) — agreement is read from the V161
+            // HISTORY (#930), not the current row. The current row is
+            // last-signed-wins over `(identity, occurrence)`, so an identity
+            // re-signing the pair (`self_at_login` naming a node's own engine
+            // occurrence) replaced the occurrence's own row and the binding
+            // resolved nothing: the node stopped being party to its owner's
+            // rooms (CIRISEdge#768). The re-signing never erased agreement
+            // (I271); the resolver now agrees with that fold.
+            let agreed = !trusted_local
+                && occurrence_agreed_to(self, &io.identity_key_id, occurrence_key_id).await?;
             if !(trusted_local || agreed) {
                 continue;
             }
@@ -9637,6 +9666,44 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// v53.0.0 (CIRISPersist#975, **CC 2.4** "The row-type slot is closed").
+    /// The row's `attestation_type` is neither one of the five structural
+    /// types nor a whole-string, byte-exact match for a registered carrier in
+    /// the vendored registry's `_meta.row_types`.
+    ///
+    /// Raised only under [`row_type::RowTypeEnforcement::Enforce`]. v53 ships
+    /// [`row_type::ROW_TYPE_ENFORCEMENT`] = `Report`: the row is admitted and
+    /// counted, because CIRISServer's legacy `consent` rows (CIRISServer#713)
+    /// must be re-authored as `scores` fleet-wide before a release refuses them.
+    #[error(
+        "attestation type unregistered (CC 2.4): {attestation_type:?} is not one of the five row          types (scores, delegates_to, supersedes, withdraws, recants) nor a registered carrier —          the row-type slot is closed; a claim rides `scores` with its family in `dimension`"
+    )]
+    AttestationTypeUnregistered {
+        /// The refused `attestation_type`, verbatim.
+        attestation_type: String,
+        /// CC's refusal token, read from `_meta.row_types.refusal`
+        /// (`attestation_type_unregistered`).
+        reason: &'static str,
+    },
+
+    /// v53.0.0 (CIRISPersist#975, **CC 2.4** carrier shape). A row of a
+    /// registered CARRIER type (`holds_bytes:sha256:{prefix}`,
+    /// `key_grant:{axis}:v1`) whose shape is not a carrier's: not a
+    /// self-attestation, an envelope `kind` other than the carrier's, or a
+    /// `dimension` / `score` / `confidence` / `weight` / non-empty
+    /// `subject_key_ids` — the members that would make it a claim. Enforced in
+    /// v53 at every admission door (no emitter anywhere writes another shape).
+    #[error(
+        "carrier row malformed (CC 2.4): {attestation_type:?} is a registered carrier row type,          and a carrier is a self-attestation whose envelope `kind` is the carrier's and which          carries no claim members — refused: {reason}"
+    )]
+    CarrierRowMalformed {
+        /// The carrier `attestation_type`.
+        attestation_type: String,
+        /// Which part of the carrier shape the row broke
+        /// ([`row_type::CarrierShapeViolation::as_str`]).
+        reason: &'static str,
+    },
+
     /// v10.3.0 (CIRISPersist#288, CC 3.4.5). A `capacity:*` attestation
     /// was self-emitted (`attesting_key_id == attested_key_id`). The
     /// Constitution's "Critical enforcement" rule: a `capacity:*` score
@@ -11008,6 +11075,8 @@ impl Error {
             Error::NamespacePrivateUseNotFederatable { .. } => {
                 "federation_namespace_private_use_not_federatable"
             }
+            Error::AttestationTypeUnregistered { .. } => "federation_attestation_type_unregistered",
+            Error::CarrierRowMalformed { .. } => "federation_carrier_row_malformed",
             Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
             Error::AccordHolderRequiresAttestationEvidence { .. } => {
                 "federation_accord_holder_requires_attestation_evidence"

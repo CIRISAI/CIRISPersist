@@ -1536,15 +1536,12 @@ pub fn absence_falsifier(
 /// Kept rather than deleted because the mechanism is the point: a fourth
 /// exception cannot be slipped into the R2 gate as a bare stem without stating
 /// its provenance and its ask here.
-pub const PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES: &[(&str, &str, &str, &str)] = &[(
-    "membership:",
-    "CC 4.4.3.2.3 admit predicate as amended by the maintainer ruling of 2026-09-30 \
-     (CIRISConstitution#133); persist's FSD/MEMBERSHIP_ACCEPTANCE.md",
-    "nobody joins a family or community without their own signed acceptance: the \
-     proposal / acceptance / decline rows are the consent every roster growth now \
-     requires, shipped ahead of the CC row",
-    "CIRISConstitution#133",
-)];
+pub const PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES: &[(&str, &str, &str, &str)] = &[
+    // EMPTY again as of the rc6 re-vendor: `membership:` (CIRISPersist#955) was
+    // the one entry, CIRISConstitution#133 registered `membership:{stage}`, and
+    // `tests::gated_uncatalogued_families_are_still_gated_and_still_uncatalogued`
+    // failed by name until the line was deleted.
+];
 
 /// The family stems persist gates that CC has never catalogued, with their
 /// provenance and tracking ask — see
@@ -1746,7 +1743,7 @@ mod tests {
         // visible one-line diff, which is the same discipline the FFI taxonomy
         // and the CC 3.1.9.2 prose-rule count are held to.
         // One number, stated once: the message reads it, so it cannot go stale.
-        const EXPECTED: usize = 160;
+        const EXPECTED: usize = 164;
         assert_eq!(
             checked, EXPECTED,
             "checked {checked} version-pinned persist src/ rows, expected {EXPECTED}. \

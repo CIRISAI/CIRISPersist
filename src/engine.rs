@@ -1307,7 +1307,7 @@ impl Engine {
     /// re-wrapping the singleton's own `BackendDispatch` by cloning the
     /// inner `Arc<…Backend>`) shares the same connection pool.
     pub fn from_shared(backend: BackendDispatch, signer: Arc<dyn HardwareSigner>) -> Engine {
-        Engine {
+        let engine = Engine {
             backend,
             signer,
             // v2.12.0 (#112) — `from_shared` only takes the hybrid
@@ -1323,7 +1323,9 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
-        }
+        };
+        engine.tell_shared_backend_its_node_key();
+        engine
     }
 
     /// v2.12.0 (CIRISPersist#112) — variant of [`Engine::from_shared`]
@@ -1340,7 +1342,7 @@ impl Engine {
         signer: Arc<dyn HardwareSigner>,
         local_signer: Option<Arc<LocalSigner>>,
     ) -> Engine {
-        Engine {
+        let engine = Engine {
             backend,
             signer,
             local_signer,
@@ -1349,6 +1351,61 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+        };
+        engine.tell_shared_backend_its_node_key();
+        engine
+    }
+
+    /// v53.0.0 (CIRISPersist#966) — a shared constructor tells the backend
+    /// its node key, as [`Engine::with_signer`] does (#607): the backend's
+    /// receive doors (an owner-binding or a device's occurrence landing over
+    /// sync, no signer in hand) re-wrap "this node's" epochs only under a
+    /// known node key, and a host that hands persist a backend it opened
+    /// itself never calls a door that would tell it.
+    ///
+    /// The constructors stay synchronous (Edge and the pyo3 singleton call
+    /// them outside a runtime), so the key id is derived by polling
+    /// [`local_derived_key_id`](Self::local_derived_key_id) ONCE: a software
+    /// signer answers on the first poll. A signer that does not (a hardware
+    /// round-trip) leaves the key to the lazy path the #916 doors already
+    /// run (`ensure_backend_node_key`) — never a guessed id. A key the
+    /// backend already knows is kept: it was told by the Engine that opened
+    /// it, which is the same id.
+    fn tell_shared_backend_its_node_key(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            let known = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+                }
+            };
+            if known {
+                return;
+            }
+            let fut = std::pin::pin!(self.local_derived_key_id());
+            // `Waker::noop` is 1.85 (the MSRV is 1.83) and the crate denies
+            // `unsafe`: a `Wake` impl that does nothing. One poll never wakes.
+            struct NoWake;
+            impl std::task::Wake for NoWake {
+                fn wake(self: Arc<Self>) {}
+            }
+            let waker = std::task::Waker::from(Arc::new(NoWake));
+            let mut cx = std::task::Context::from_waker(&waker);
+            match std::future::Future::poll(fut, &mut cx) {
+                std::task::Poll::Ready(Ok(k)) => self.set_backend_node_key_id(&k),
+                std::task::Poll::Ready(Err(e)) => tracing::warn!(
+                    error = %e,
+                    "from_shared: no node key for the shared backend; the #916 doors derive it lazily"
+                ),
+                std::task::Poll::Pending => tracing::debug!(
+                    "from_shared: the signer answers asynchronously; the #916 doors derive the node key lazily"
+                ),
+            }
         }
     }
 
@@ -8614,6 +8671,18 @@ impl Engine {
         key_id: &str,
     ) -> Result<crate::federation::age::AgeBand, crate::federation::Error> {
         crate::federation::age::age_band(&*self.federation_directory(), key_id).await
+    }
+
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — what the closed row-type
+    /// slot sees on this node: held rows of an unregistered `attestation_type`
+    /// (by exact type, never deleted), and since process start the unregistered
+    /// admissions and composer dimensions the gate reported rather than
+    /// refused. See [`crate::federation::row_type::row_type_report`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn row_type_report(
+        &self,
+    ) -> Result<crate::federation::row_type::RowTypeReport, crate::federation::Error> {
+        crate::federation::row_type::row_type_report(&*self.federation_directory()).await
     }
 
     // ── #249 Cut B ── CEG-native graph DX enumerators + community-roster

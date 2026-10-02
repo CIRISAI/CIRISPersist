@@ -191,3 +191,7 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 3.1.1	CLM-duty	CIRISPersist	src/federation/admission.rs#check_duty_admission	ciris-persist@52.0.1
 3.3.1	CLM-consent-community-trust	CIRISPersist	src/federation/community_trust_consent.rs#check_community_trust_grant_admission	ciris-persist@52.0.1
 3.3.1	CLM-consent-community-trust	CIRISPersist	src/federation/community_trust_consent.rs#fold_community_trust	ciris-persist@52.0.1
+3.1.3.2	CLM-membership-consent	CIRISPersist	src/federation/membership_acceptance.rs#check_growth_accepted	ciris-persist@52.0.1
+3.1.3.2	CLM-membership-consent	CIRISPersist	src/federation/membership_acceptance.rs#check_founding_signers	ciris-persist@52.0.1
+3.1.3.2	CLM-membership-consent	CIRISPersist	src/federation/membership_acceptance.rs#check_community_founding_signers	ciris-persist@52.0.1
+3.1.3.2	CLM-membership-consent	CIRISPersist	src/federation/membership_acceptance.rs#check_supersede_adds_no_member	ciris-persist@52.0.1

@@ -579,6 +579,7 @@ Engine	revocations_for	empirical
 Engine	revoke_delegation	deontic	
 Engine	revoke_trust_grant	deontic	
 Engine	root_binding	ontological	
+Engine	row_type_report_json	empirical	
 Engine	run_consent_expiry_sweep_json	procedural	
 Engine	run_deletion_window_watch_json	procedural	
 Engine	run_legacy_graph_migration	procedural	

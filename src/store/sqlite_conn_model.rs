@@ -255,6 +255,8 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("attach_attestation_pqc_signature", ConnClass::Write),
     ("attach_key_pqc_signature", ConnClass::Write),
     ("attach_revocation_pqc_signature", ConnClass::Write),
+    // v53.0.0 (#975) — the row-type census: one GROUP BY, read-only.
+    ("attestation_type_census", ConnClass::Read),
     ("attestations_binding_content", ConnClass::Read),
     ("backfill_trace_dedup_shard_keys", ConnClass::Write),
     ("backfill_revocation_subject_digests", ConnClass::Write),

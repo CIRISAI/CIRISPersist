@@ -1785,8 +1785,13 @@ mod tests {
 
     /// **The measurement behind `RetainedCell::open_contradictions`'s doc.**
     ///
-    /// Retaining the contradiction count pins 137 of the registry's 149
-    /// families; withholding it pins 8 (136 of 148 at the rc5 tag; v51.0.0's
+    /// Retaining the contradiction count pins 138 of the registry's 158
+    /// families; withholding it pins 8. (137 of 149 until the v53.0.0 rc6 @
+    /// `v1.0-rc6` re-vendor, whose nine new families put one on the retained
+    /// side — `observation:reachability`, signed — while the eight
+    /// `positive-only` leaves (`collection:`, `custody:`, `device:label`,
+    /// `file:`, `lineage_witness:`, `membership:`, both `self:delegates_to`
+    /// labels) pin on neither; 136 of 148 at the rc5 tag; v51.0.0's
     /// rc6 @ 651140a re-vendor adds `capacity:relay_delivery`, signed, to the
     /// retained side). (107 of 114 before the v42.0.0 rc3 →
     /// rc5 re-vendor; 109 of 116 / 3 until the v50.0.0 rc5 @ 4b624513
@@ -1803,11 +1808,11 @@ mod tests {
         let withheld = pinned_families(false).len();
         assert_eq!(
             (retained, withheld),
-            (137, 8),
+            (138, 8),
             "the contradiction-count contrast moved (retained={retained}, \
              withheld={withheld})"
         );
-        assert_eq!(vendored_family_polarities().len(), 149);
+        assert_eq!(vendored_family_polarities().len(), 158);
     }
 
     /// **The signed fold's escape hatch is a zero-confidence row — and that is

@@ -4755,6 +4755,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // and promoting), and backend-symmetric across memory / sqlite /
         // postgres.
         crate::federation::admission::check_row_column_binding(&row)?;
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — THE CLOSED ROW-TYPE SLOT, beside
+        // the binding that makes the type a signed fact. The five + registered
+        // carriers; a carrier of the wrong shape refused; an unregistered type
+        // reported (refused once `row_type::ROW_TYPE_ENFORCEMENT` flips). Pure
+        // ⇒ AV-76 TIER 1, backend-symmetric.
+        crate::federation::row_type::admit_row_type(&row)?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
@@ -11652,6 +11658,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    async fn attestation_type_census(
+        &self,
+    ) -> Result<Vec<crate::federation::row_type::AttestationTypeCount>, crate::federation::Error>
+    {
+        self.read(|conn| -> Result<Vec<_>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT attestation_type, COUNT(*), MIN(asserted_at), MAX(asserted_at) \
+                   FROM federation_attestations GROUP BY attestation_type \
+                  ORDER BY attestation_type",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let oldest: String = r.get(2)?;
+                let newest: String = r.get(3)?;
+                Ok(crate::federation::row_type::AttestationTypeCount {
+                    attestation_type: r.get(0)?,
+                    count: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+                    oldest: parse_rfc3339(&oldest),
+                    newest: parse_rfc3339(&newest),
+                })
+            })?;
+            rows.collect()
+        })
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("attestation_type_census: {e}")))
+    }
+
     async fn list_attestations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -11659,6 +11691,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<Vec<crate::federation::ServedAttestation>, crate::federation::Error> {
         let since_at = since.as_ref().map(|(t, _)| t.to_rfc3339());
         let since_id = since.as_ref().map(|(_, id)| id.clone());
+        // v53.0.0 (#975, CC 2.4) — under enforcement a held row of an
+        // unregistered type is neither served nor replicated. Read on the
+        // calling task, before the closure moves to the pool.
+        let row_type_filter = crate::federation::row_type::serve_filter_sql(
+            "attestation_type",
+            crate::federation::row_type::SqlDialect::Sqlite,
+        )
+        .map(|p| format!(" AND {p}"))
+        .unwrap_or_default();
         self.read(move |conn| -> Result<Vec<_>, rusqlite::Error> {
             // E5 invariant: `tier = 'federation'` only — a local-tier row
             // must never reach the advertise/serve wire surface.
@@ -11671,7 +11712,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     additional_scrubs, {pos} AS _pos \
                  FROM federation_attestations \
                  WHERE (?1 IS NULL OR {pos} > ?1 OR ({pos} = ?1 AND attestation_id > ?2)) \
-                   AND tier = 'federation' \
+                   AND tier = 'federation'{row_type_filter} \
                  ORDER BY {pos} ASC, attestation_id ASC LIMIT ?3",
                 pos = POS_ATTESTATION,
             ))?;
@@ -12214,6 +12255,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // log walk reads the base table directly.
         let mut binds: Vec<SqlValue> = Vec::new();
         let mut parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
+        // v53.0.0 (#975) — the replicable set excludes an unregistered type
+        // under enforcement.
+        parts.extend(crate::federation::row_type::serve_filter_sql(
+            "fa.attestation_type",
+            crate::federation::row_type::SqlDialect::Sqlite,
+        ));
         let from = if let Some(subj) = subject_key_id {
             binds.push(SqlValue::Text(subj.to_string()));
             parts.push(format!("s.subject_key_id = ?{}", binds.len()));
@@ -30927,6 +30974,8 @@ mod tests {
             t.asserted_at,
             1,
         );
+        // v53.0.0 (#975, CC 2.4) — a carrier carries no weight.
+        t.weight = None;
         resign_fed(&mut t); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: t })
