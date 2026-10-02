@@ -1129,6 +1129,206 @@ pub(crate) mod bodies {
         );
     }
 
+    /// Advance `d`'s canonical head by a founders' amendment; returns the new head.
+    async fn advance_head(d: &dyn FederationDirectory, holders: &[ops::Identity]) -> String {
+        put_conferred(d, holders, "new-steward", "user,steward").await;
+        let v2 = swapped(canonical_row(&FOUNDERS), FOUNDERS[2], "new-steward");
+        founders_supersede(d, v2, &[FOUNDERS[0], FOUNDERS[1]])
+            .await
+            .expect("the founders amend");
+        held_head(d).await
+    }
+
+    async fn held_head(d: &dyn FederationDirectory) -> String {
+        d.lookup_community(CANON)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash
+    }
+
+    /// The author's own write of its acceptance edge (the attaching node's door).
+    async fn author_edge(
+        d: &dyn FederationDirectory,
+        consumer: &str,
+        head: Option<&str>,
+    ) -> Result<crate::federation::SignedAttestation, Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let edge = accept_edge_row(
+            &id,
+            consumer,
+            head,
+            crate::federation::trust_root::INFRA_SERVE_SCOPE,
+        );
+        d.put_attestation_authored(edge.clone()).await?;
+        Ok(edge)
+    }
+
+    async fn reads_as_attached(d: &dyn FederationDirectory, consumer: &str, what: &str) {
+        assert!(
+            crate::federation::trust_root::trust_root_valid(d, consumer, CANON)
+                .await
+                .unwrap()
+                .edge_exists,
+            "{what}: the receiver holds the sender's acceptance edge"
+        );
+        assert!(
+            crate::federation::trust_root::trusted_roots_of(d, consumer, chrono::Utc::now())
+                .await
+                .unwrap()
+                .contains(&CANON.to_owned()),
+            "{what}: the receiver reads the sender as rooted (`trusted_roots_of`)"
+        );
+    }
+
+    /// **I372** (#973; CC 3.2 T4a "a write-side gate … first admission only")
+    /// — a peer does not re-judge another node's attach. The receiver's head
+    /// has ADVANCED past the head the edge names: the replicated edge is
+    /// admitted and the sender reads as rooted there.
+    pub async fn i372_a_receiver_ahead_admits_the_replicated_edge(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+    ) {
+        born(a).await;
+        let holders_b = born(b).await;
+        let consumer = "i372-consumer";
+        for d in [a, b] {
+            ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        }
+        let h1 = held_head(a).await;
+        let edge = author_edge(a, consumer, Some(&h1))
+            .await
+            .expect("I372: the author attaches on the head it holds");
+        let h2 = advance_head(b, &holders_b).await;
+        assert_ne!(h1, h2, "I372: the receiver's head moved");
+        b.put_attestation(edge.clone())
+            .await
+            .expect("I372: a peer ahead of the edge's head admits it on replication");
+        reads_as_attached(b, consumer, "I372").await;
+        // and through the replication apply door, idempotently
+        b.apply_replicated_attestation(edge)
+            .await
+            .expect("I372: the apply door");
+    }
+
+    /// **I373** — the receiver is BEHIND the head the edge names: admitted too.
+    pub async fn i373_a_receiver_behind_admits_the_replicated_edge(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+    ) {
+        let holders_a = born(a).await;
+        born(b).await;
+        let consumer = "i373-consumer";
+        for d in [a, b] {
+            ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        }
+        let h2 = advance_head(a, &holders_a).await;
+        assert_ne!(h2, held_head(b).await, "I373: the receiver is behind");
+        let edge = author_edge(a, consumer, Some(&h2))
+            .await
+            .expect("I373: the author attaches on its newer head");
+        b.apply_replicated_attestation(edge)
+            .await
+            .expect("I373: a peer behind the edge's head admits it on replication");
+        reads_as_attached(b, consumer, "I373").await;
+    }
+
+    /// **I374** — the local gate is not weakened, and the shape rule holds on
+    /// both doors: the author's own write naming a head it does not hold is
+    /// refused; a labelled edge naming no head is refused on apply too.
+    pub async fn i374_the_authors_gate_and_the_shape_rule_stand(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+    ) {
+        born(a).await;
+        born(b).await;
+        let consumer = "i374-consumer";
+        for d in [a, b] {
+            ts::register_hybrid_key_as(d, consumer, consumer, identity_type::USER).await;
+        }
+        match author_edge(a, consumer, Some(&"cd".repeat(32))).await {
+            Err(Error::TrustRootHeadStale { detail, .. }) => {
+                assert!(detail.contains("not the head this node holds"), "{detail}")
+            }
+            other => panic!("I374: the author's stale attach must refuse, got {other:?}"),
+        }
+        let headless = accept_edge_row(
+            &uuid::Uuid::new_v4().to_string(),
+            consumer,
+            None,
+            crate::federation::trust_root::INFRA_SERVE_SCOPE,
+        );
+        let id = headless.attestation.attestation_id.clone();
+        for (door, r) in [
+            (
+                "wire",
+                b.put_attestation(headless.clone()).await.map(|_| ()),
+            ),
+            (
+                "apply",
+                b.apply_replicated_attestation(headless.clone())
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "authored",
+                a.put_attestation_authored(headless.clone())
+                    .await
+                    .map(|_| ()),
+            ),
+        ] {
+            match r {
+                Err(e) if e.kind() == "trust_root_head_unnamed" => {}
+                other => {
+                    panic!("I374 ({door}): a headless labelled edge must refuse, got {other:?}")
+                }
+            }
+        }
+        assert!(b.get_attestation(&id).await.unwrap().is_none());
+    }
+
+    /// **I375** — witnessed mode ON at the receiver (explicit quorum 2), the
+    /// receiver has NOT witnessed the head: the replicated edge is admitted
+    /// (the witness quorum is the attaching node's question), while the
+    /// receiver's own attach on that unwitnessed head is still refused.
+    pub async fn i375_a_witnessed_receiver_admits_an_edge_it_did_not_witness(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+    ) {
+        born_witnessed(a).await;
+        born_witnessed(b).await;
+        let (consumer, local) = ("i375-consumer", "i375-local");
+        for d in [a, b] {
+            for k in [consumer, local] {
+                ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
+            }
+        }
+        for w in ["w1", "w2"] {
+            a.put_lineage_head_cosign(cosign_held_head(a, CANON, w, None).await)
+                .await
+                .unwrap();
+        }
+        let head = held_head(a).await;
+        let edge = author_edge(a, consumer, Some(&head))
+            .await
+            .expect("I375: the author attaches on its witnessed head");
+        assert_eq!(
+            d_view(b).await.judged,
+            None,
+            "I375: b has witnessed nothing"
+        );
+        b.put_attestation(edge)
+            .await
+            .expect("I375: a replicated edge is not judged against the receiver's witness view");
+        reads_as_attached(b, consumer, "I375").await;
+        assert_stale(
+            author_edge(b, local, Some(&head))
+                .await
+                .map(|e| e.attestation.attestation_id),
+            "not witnessed",
+        );
+    }
+
     /// **I343** — an explicit, valid quorum keeps working as before: under
     /// `witness_quorum: 2` one cosign engages nothing and two witness the head.
     pub async fn i343_an_explicit_quorum_still_witnesses(d: &dyn FederationDirectory) {
@@ -1641,6 +1841,50 @@ mod runners {
                         return;
                     };
                     super::super::bodies::i193_equivocation_freezes_at_the_fork(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i372() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::i372_a_receiver_ahead_admits_the_replicated_edge(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i373() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::i373_a_receiver_behind_admits_the_replicated_edge(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i374() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::i374_the_authors_gate_and_the_shape_rule_stand(
+                        &a as &dyn FederationDirectory,
+                        &b as &dyn FederationDirectory,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i375() {
+                    let (Some(a), Some(b)) = ($fresh.await, $fresh.await) else {
+                        return;
+                    };
+                    super::super::bodies::i375_a_witnessed_receiver_admits_an_edge_it_did_not_witness(
                         &a as &dyn FederationDirectory,
                         &b as &dyn FederationDirectory,
                     )
