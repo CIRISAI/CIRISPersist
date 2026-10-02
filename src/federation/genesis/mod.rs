@@ -4347,10 +4347,21 @@ mod tests {
         let node = "dryrun-fresh-node";
         crate::federation::tier_ingest::test_support::register_hybrid_key(&sq, node).await;
         let edge_id = uuid::Uuid::new_v4().to_string();
+        // #973 (CC 3.2 T4a) — a new acceptance edge names the head it
+        // attaches on: the family head this node holds (witnessed mode off).
+        let head = crate::federation::canonical_community::attach_head_for(
+            &sq,
+            FAMILY,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("attach head")
+        .expect("the family lineage is held");
         let envelope = serde_json::json!({
             "id": edge_id,
             "dimension": TRUST_ACCEPTS_DIMENSION,
             "scope": ["infra:serve", "infra:attest", "infra:store", "infra:transport"],
+            "attached_head_digest": head,
         });
         // v31.2.0 — build the row, then SEAL it through the substrate's own
         // helper rather than hand-rolling the signature. `seal_row_in_place`
