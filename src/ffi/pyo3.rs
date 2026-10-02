@@ -6563,7 +6563,9 @@ impl PyEngine {
     /// re-seeding a late device, carries the FULL set again (idempotent on
     /// every receiver, §13). `axis_json` is a `KeyGrantAxis`:
     /// `{"axis":"epoch","community_key_id":…,"minter_key_id":…,"epoch":N}` or
-    /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`.
+    /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`
+    /// or (v53.0.0, #969)
+    /// `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
     /// Returns the emitted row's `attestation_id`, or `null` when this node
     /// holds no wrap for the axis. Needs the LocalSigner (hybrid).
     fn emit_key_grant(&self, py: Python<'_>, axis_json: &str) -> PyResult<Option<String>> {
@@ -14845,6 +14847,43 @@ impl PyEngine {
         })
     }
 
+    /// v53.0.0 (CIRISPersist#969) — **the readiness door**: can
+    /// `viewer_key_id` read this sealed DAG on this node now. Returns JSON
+    /// `{"sha256_hex", "chunk_keys": "stream_epoch" | "content", "held",
+    /// "readable", "missing": [{"axis": "stream", "stream_id", "epoch",
+    /// "seq_from", "seq_to"} | {"axis": "content", "seq", "chunk_sha256"} |
+    /// {"axis": "child", "index", "child_sha256"}, …], "not_held": [seq, …]}`,
+    /// from grant rows only (no chunk is opened; O(epochs) for a stream-keyed
+    /// DAG). A stranger raises `ValueError` (`blob_not_granted`), as at
+    /// `open_sealed_manifest_json`.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, caller_aad_b64=None))]
+    fn sealed_dag_readiness_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let r = runtime
+                    .block_on(async move {
+                        engine
+                            .sealed_dag_readiness(&sha, &viewer, aad.as_deref())
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&r).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
     /// v52.0.0 (CIRISPersist#954) — **one page of a v3 manifest**: the chunks
     /// child `child_index` lists, opened as `viewer_key_id` (authorized on the
     /// root as `read_blob_as`, then on the child row). For a file above the
@@ -15279,6 +15318,15 @@ impl PyEngine {
                 // replicates. An engine that cannot sign it says so rather than
                 // leaving members with bytes and no key.
                 if let Some(axis) = r.key_grant_emission.as_ref() {
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
+                }
+                // #923 (D9) / #969 — the chunk and stream-epoch sets the seal
+                // widened ride beside the manifest's, as at the Engine door.
+                for axis in r
+                    .chunk_key_grant_emissions
+                    .iter()
+                    .chain(r.stream_key_grant_emissions.iter())
+                {
                     runtime.block_on(self.emit_key_grant_axis_async(axis))?;
                 }
                 let readable_by_nobody = r.readable_by_nobody();
@@ -25219,6 +25267,10 @@ impl PyEngine {
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
+                    // #969 — the stream epochs the walk widened.
+                    "changed_streams": r.changed_streams.iter().map(|(sid, epoch, _)| {
+                        serde_json::json!({"stream_id": sid, "epoch": epoch})
+                    }).collect::<Vec<_>>(),
                 }))
                 .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
             })
@@ -25252,6 +25304,10 @@ impl PyEngine {
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
+                    // #969 — the stream epochs the walk widened.
+                    "changed_streams": r.changed_streams.iter().map(|(sid, epoch, _)| {
+                        serde_json::json!({"stream_id": sid, "epoch": epoch})
+                    }).collect::<Vec<_>>(),
                 }))
                 .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
             })
@@ -34291,6 +34347,27 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // Python callers branch on it.
         crate::federation::BlobError::NotGranted { .. }
         | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
+        // v53.0.0 (CIRISPersist#969) — an AUTHORIZED viewer lacking one
+        // chunk's key: its own token, and the type of the arm it splits from
+        // (`blob_not_granted` was a ValueError). The detail rides as JSON after
+        // the token — `{dag, seq, chunk_sha, key: {axis: content|stream, …}}` —
+        // so a host knows which set to wait for; it is retryable.
+        crate::federation::BlobError::ChunkKeyNotYetGranted {
+            ref sha256_hex,
+            seq,
+            ref chunk_sha_hex,
+            ref key,
+            ..
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({
+                "sha256": sha256_hex,
+                "seq": seq,
+                "chunk_sha256": chunk_sha_hex,
+                "key": key,
+                "retryable": true,
+            })
+        )),
         // v47.1.0 (CIRISPersist#842) — its OWN kind token, so a host tells "did
         // not open" (look at the row: the associated data) from "may not read"
         // (`blob_not_granted`: get a grant) without reading prose. The sha rides
@@ -34643,6 +34720,7 @@ fn parse_put_blob_chunks_payload(
             sha,
             size: c.size,
             seq: None,
+            epoch: None,
         });
     }
     let manifest = crate::federation::ChunkManifest {

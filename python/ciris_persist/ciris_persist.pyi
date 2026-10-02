@@ -3185,6 +3185,9 @@ class Engine:
     def row_type_report_json(self) -> str:
         """(derived) empirical — v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — the closed row-type slot's report: {enforcement, held_unregistered: [{attestation_type, type_stem, count..."""
 
+    def sealed_dag_readiness_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+        """(derived) empirical — v53.0.0 (CIRISPersist#969) — the readiness door: can viewer_key_id read this sealed DAG on this node now. Returns JSON {"sha256_hex", "chunk_keys":..."""
+
     def secrets_get_access_logs(self, secret_uuid: str | None, limit: int) -> str:
         """(derived) empirical — v0.6.1 — Audit-log query. secret_uuid=None returns the global tail. Returns JSON array of AccessLogEntry. [build-conditional: #[cfg(feature = "secrets")]]"""
 

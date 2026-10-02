@@ -618,6 +618,44 @@ adopt doors reconcile (I72). The retroactive-ADD walk sees only blobs this
 node self-retains — a peer-authored blob adopted here is skipped, never an
 abort (I65).
 
+### 14.1 The stream axis (v53.0.0, CIRISPersist#969)
+
+**Erratum to the content axis.** §14's content axis is a per-BLOB rule, written
+for whole blobs. A chunk DAG inherited it chunk by chunk; that was an
+implementation choice, not a ruling, and it is non-conformant to CC 5.3.3.1 for
+a stream. From v53 the content axis covers whole blobs and sealed manifests;
+the chunks of a self/family stream ride a third axis (#975 ruling: the carrier
+type `key_grant:{axis}:v1` is kept, and one more type is registered).
+
+| axis | identity | `wraps[]` | who signs |
+|---|---|---|---|
+| stream (self / family chunk streams) | `(stream_id, epoch)`, with `cohort_scope` and `owner_key_id` (the self identity or family) | every recipient occurrence of the stream's one access set | the stream's OWNER (the single sender) |
+
+- **Wire.** `attestation_type = "key_grant:stream:v1"`, envelope `axis:
+  "stream"`, `stream_id`, `epoch`, `cohort_scope`, `owner_key_id`, and on a
+  family set `family_key_id` (#953). The plane token `"stream"` is APPENDED;
+  the projection is decided by the emission scope (`SelfOwn` at self/family),
+  so no pinned vocabulary moved. A pre-v53 peer refuses the type `malformed`.
+- **Admission.** Where the admitting node holds the stream (an adopt wrote its
+  row naming the author), the signer must speak for that owner, else
+  `signer_not_stream_owner`. Where it does not yet, the wraps are projected
+  under the signer as SEALER (`federation_stream_dek_grants.sealer_key_id`) and
+  the reader takes a wrap only from a sealer that speaks for the stream's owner
+  once it is known: a set for another owner's stream id grants nothing, in
+  either order. Wraps are a union (§13).
+- **Emission.** At an epoch's first chunk, when the recipient set grows (the
+  next append, the seal), and from the retroactive-ADD walk, which now walks
+  the stream epochs this node seals (`RekeyResult.changed_streams`) — O(epochs),
+  not O(chunks). The V146 ledger is `key_grant_emitted_at` on the epoch's
+  `federation_stream_deks` row; `emit_pending_key_grants` sweeps dirty epochs.
+- **Adopt and promote.** Unchanged (I45): bytes are stored unopened at `(stream_id,
+  seq)` with the epoch the v4 manifest names (`SealedManifestView.chunks[].epoch`);
+  the promote additionally refuses a chunk adopted at another epoch and checks
+  each epoch's counters and terminator from the stored nonces.
+- **Adopters (Edge).** Replicate and apply `key_grant:stream:v1` like the other
+  axes; adopt each chunk at the manifest's `epoch`; tolerate zero-length
+  terminator chunks in the walk; `sealed_dag_readiness` answers per epoch.
+
 ## 15. Rotation on admitted removal — every minter, its own counter
 
 CIRISEdge's fact 1 is a present-day forward-secrecy hole across nodes: after

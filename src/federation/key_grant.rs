@@ -22,6 +22,7 @@
 //! |---|---|---|---|
 //! | epoch (community / affiliations) | `(community_key_id, minter_key_id, epoch)` | every recipient occurrence the minter could wrap to at emission | the MINTER's occurrence key |
 //! | content (self / family) | `(at_rest_sha256, cohort_scope, owner_key_id)` | every recipient occurrence of the self-collective / family | the blob's AUTHOR |
+//! | stream (self / family chunk streams, v53.0.0 #969) | `(stream_id, epoch, cohort_scope, owner_key_id)` | every recipient occurrence of the stream's one access set | the stream's OWNER (single sender) |
 //!
 //! The set rides the attestation plane as a row whose `attestation_type` is
 //! [`KEY_GRANT_EPOCH_ATTESTATION_TYPE`] / [`KEY_GRANT_CONTENT_ATTESTATION_TYPE`]
@@ -93,6 +94,11 @@ pub const KEY_GRANT_ATTESTATION_TYPE_PREFIX: &str = "key_grant:";
 pub const KEY_GRANT_EPOCH_ATTESTATION_TYPE: &str = "key_grant:epoch:v1";
 /// The content-axis row type: `(at_rest_sha256, cohort_scope, owner)`.
 pub const KEY_GRANT_CONTENT_ATTESTATION_TYPE: &str = "key_grant:content:v1";
+/// v53.0.0 (CIRISPersist#969, #975 ruling) — the stream-axis row type:
+/// `(stream_id, epoch)` of a self/family chunk stream, signed by the
+/// stream's owner. CC 5.1's epoch-addressed `(stream_id, epoch[, recipient])`
+/// axis, for the streams CC 5.3.3.1 seals under one DEK per epoch.
+pub const KEY_GRANT_STREAM_ATTESTATION_TYPE: &str = "key_grant:stream:v1";
 /// The envelope `kind` token.
 pub const KEY_GRANT_ENVELOPE_KIND: &str = "key_grant";
 
@@ -118,6 +124,20 @@ pub enum KeyGrantAxis {
         /// The owner (self) or family key the blob was sealed for.
         owner_key_id: String,
     },
+    /// v53.0.0 (CIRISPersist#969) — stream-epoch-addressed: one self/family
+    /// chunk stream's `(stream_id, epoch)` DEK. Signed by the stream's owner
+    /// (the single sender, CC 5.3.3.1); one set per recipient per epoch,
+    /// where the content axis carried one per CHUNK.
+    Stream {
+        /// The stream.
+        stream_id: String,
+        /// The stream epoch the DEK seals.
+        epoch: u64,
+        /// `self` or `family`.
+        cohort_scope: String,
+        /// The owner (self) or family key the stream is sealed for.
+        owner_key_id: String,
+    },
 }
 
 impl KeyGrantAxis {
@@ -127,6 +147,7 @@ impl KeyGrantAxis {
         match self {
             KeyGrantAxis::Epoch { .. } => KEY_GRANT_EPOCH_ATTESTATION_TYPE,
             KeyGrantAxis::Content { .. } => KEY_GRANT_CONTENT_ATTESTATION_TYPE,
+            KeyGrantAxis::Stream { .. } => KEY_GRANT_STREAM_ATTESTATION_TYPE,
         }
     }
 
@@ -137,16 +158,20 @@ impl KeyGrantAxis {
     pub fn emission_cohort_scope(&self) -> &str {
         match self {
             KeyGrantAxis::Epoch { .. } => cohort_scope::COMMUNITY,
-            KeyGrantAxis::Content { cohort_scope, .. } => cohort_scope.as_str(),
+            KeyGrantAxis::Content { cohort_scope, .. }
+            | KeyGrantAxis::Stream { cohort_scope, .. } => cohort_scope.as_str(),
         }
     }
 
-    /// The stable axis token (`epoch` / `content`) for the plane registry.
+    /// The stable axis token (`epoch` / `content` / `stream`) for the plane
+    /// registry. `stream` is APPENDED (v53.0.0, #969): the projection is
+    /// decided by the emission scope, never by this token.
     #[must_use]
     pub fn token(&self) -> &'static str {
         match self {
             KeyGrantAxis::Epoch { .. } => "epoch",
             KeyGrantAxis::Content { .. } => "content",
+            KeyGrantAxis::Stream { .. } => "stream",
         }
     }
 }
@@ -198,6 +223,9 @@ pub enum KeyGrantRefusalReason {
     /// The attestation plane refused the row (a conflicting row under the
     /// same id, or a lost store race); nothing was projected.
     AttestationRefused,
+    /// v53.0.0 (#969) — stream axis: this node holds the stream under an
+    /// owner the signer does not speak for.
+    SignerNotStreamOwner,
 }
 
 impl KeyGrantRefusalReason {
@@ -212,6 +240,7 @@ impl KeyGrantRefusalReason {
             KeyGrantRefusalReason::SignerNotActiveMember => "signer_not_active_member",
             KeyGrantRefusalReason::SignerNotAuthor => "signer_not_author",
             KeyGrantRefusalReason::AttestationRefused => "attestation_refused",
+            KeyGrantRefusalReason::SignerNotStreamOwner => "signer_not_stream_owner",
         }
     }
 }
@@ -278,6 +307,22 @@ impl KeyGrantSet {
                 // envelope's target fields, never from `owner_key_id`. A
                 // family set that named its family only as the owner was
                 // refused `scope_no_family_membership` at its author's door.
+                if cohort_scope == crate::federation::types::cohort_scope::FAMILY {
+                    m.insert("family_key_id".into(), owner_key_id.as_str().into());
+                }
+            }
+            KeyGrantAxis::Stream {
+                stream_id,
+                epoch,
+                cohort_scope,
+                owner_key_id,
+            } => {
+                m.insert("axis".into(), "stream".into());
+                m.insert("stream_id".into(), stream_id.as_str().into());
+                m.insert("epoch".into(), (*epoch).into());
+                m.insert("cohort_scope".into(), cohort_scope.as_str().into());
+                m.insert("owner_key_id".into(), owner_key_id.as_str().into());
+                // #953 — the cohort target rides the envelope on a family set.
                 if cohort_scope == crate::federation::types::cohort_scope::FAMILY {
                     m.insert("family_key_id".into(), owner_key_id.as_str().into());
                 }
@@ -371,6 +416,52 @@ impl KeyGrantSet {
                 }
                 KeyGrantAxis::Content {
                     at_rest_sha256,
+                    cohort_scope: scope,
+                    owner_key_id,
+                }
+            }
+            (KEY_GRANT_STREAM_ATTESTATION_TYPE, "stream") => {
+                let stream_id = field("stream_id")?;
+                if stream_id.is_empty() {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        "stream-axis key_grant names an empty stream_id",
+                    ));
+                }
+                let epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        "key_grant envelope lacks an unsigned `epoch`",
+                    )
+                })?;
+                let scope = field("cohort_scope")?;
+                if scope != cohort_scope::SELF && scope != cohort_scope::FAMILY {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        format!("stream-axis key_grant at cohort_scope {scope:?}; only self / family streams are stream-keyed"),
+                    ));
+                }
+                let owner_key_id = field("owner_key_id")?;
+                // #953 — as on the content axis.
+                let named_family = env.get("family_key_id");
+                let agrees = if scope == cohort_scope::FAMILY {
+                    named_family.and_then(|v| v.as_str()) == Some(owner_key_id.as_str())
+                } else {
+                    named_family.is_none()
+                };
+                if !agrees {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::Malformed,
+                        format!(
+                            "stream-axis key_grant at cohort_scope {scope:?}: `family_key_id` \
+                             {named_family:?} must equal `owner_key_id` {owner_key_id:?} on a \
+                             family set and be absent on a self set"
+                        ),
+                    ));
+                }
+                KeyGrantAxis::Stream {
+                    stream_id,
+                    epoch,
                     cohort_scope: scope,
                     owner_key_id,
                 }
@@ -509,6 +600,38 @@ where
     Ok(Some(KeyGrantSet {
         axis: KeyGrantAxis::Content {
             at_rest_sha256: hex::encode(at_rest_sha256),
+            cohort_scope: scope.to_owned(),
+            owner_key_id: owner_key_id.to_owned(),
+        },
+        wraps,
+    }))
+}
+
+/// v53.0.0 (CIRISPersist#969) — the FULL stream-axis set for one
+/// `(stream_id, epoch)` this node sealed: every recipient wrap under the
+/// stream's owner, or `None` if there is nothing a peer could use (or this
+/// node holds the stream under no owner).
+pub async fn build_stream_set<B>(
+    backend: &B,
+    stream_id: &str,
+    epoch: u64,
+    scope: &str,
+    owner_key_id: &str,
+) -> Result<Option<KeyGrantSet>, BlobError>
+where
+    B: BlobStorage + Sync,
+{
+    let Some(sealer) = backend.stream_key_state(stream_id).await?.owner_key_id else {
+        return Ok(None);
+    };
+    let wraps = backend.stream_dek_grants(stream_id, epoch, &sealer).await?;
+    if wraps.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(KeyGrantSet {
+        axis: KeyGrantAxis::Stream {
+            stream_id: stream_id.to_owned(),
+            epoch,
             cohort_scope: scope.to_owned(),
             owner_key_id: owner_key_id.to_owned(),
         },
@@ -758,6 +881,12 @@ where
                 .await
                 .map_err(map_blob_err)
         }
+        KeyGrantAxis::Stream {
+            stream_id, epoch, ..
+        } => backend
+            .stream_dek_mark_key_grant_emitted(stream_id, *epoch, watermark)
+            .await
+            .map_err(map_blob_err),
     }
 }
 
@@ -792,6 +921,12 @@ where
                 .await
                 .map_err(map_blob_err)
         }
+        KeyGrantAxis::Stream {
+            stream_id, epoch, ..
+        } => backend
+            .stream_dek_key_grant_watermark(stream_id, *epoch)
+            .await
+            .map_err(map_blob_err),
     }
 }
 
@@ -831,6 +966,19 @@ where
             owner_key_id: prov.community_key_id.unwrap_or_else(|| me.to_owned()),
         });
     }
+    // v53.0.0 (#969) — each stream epoch `me` sealed whose set is dirty.
+    for d in backend
+        .stream_dek_list_key_grant_dirty(me)
+        .await
+        .map_err(map_blob_err)?
+    {
+        out.push(KeyGrantAxis::Stream {
+            stream_id: d.stream_id,
+            epoch: d.epoch,
+            cohort_scope: d.cohort_scope,
+            owner_key_id: d.group_key_id,
+        });
+    }
     Ok(out)
 }
 
@@ -865,6 +1013,12 @@ where
                 })?;
             build_content_set(backend, &sha, cohort_scope, owner_key_id).await
         }
+        KeyGrantAxis::Stream {
+            stream_id,
+            epoch,
+            cohort_scope,
+            owner_key_id,
+        } => build_stream_set(backend, stream_id, *epoch, cohort_scope, owner_key_id).await,
     }
 }
 
@@ -1137,6 +1291,32 @@ where
                 None => pending = true,
             }
         }
+        // v53.0.0 (#969) — the stream's single sender signs its epochs'
+        // sets. Where this node holds the stream (an adopted chunk wrote its
+        // row naming the author), the signer must speak for that owner. Where
+        // it does not yet, the wraps are projected UNDER THE SIGNER as
+        // sealer, and the reader takes a wrap only from a sealer that speaks
+        // for the stream's owner once it is known — so a set for someone
+        // else's stream id grants nothing, in either order.
+        KeyGrantAxis::Stream { stream_id, .. } => {
+            if let Some(owner) = backend
+                .stream_key_state(stream_id)
+                .await
+                .map_err(map_blob_err)?
+                .owner_key_id
+            {
+                if !speaks_for(backend, signer, &owner).await? {
+                    return Err(refuse(
+                        KeyGrantRefusalReason::SignerNotStreamOwner,
+                        format!(
+                            "signer {signer:?} does not speak for the owner of stream {stream_id:?} \
+                             on this node; a stream's keys are granted by its single sender \
+                             (CC 5.3.3.1)"
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     // The carrier row, through the attestation plane's own admission.
@@ -1286,6 +1466,15 @@ where
                 .await
                 .map_err(map_blob_err)?
         }
+        KeyGrantAxis::Stream {
+            stream_id,
+            epoch,
+            cohort_scope,
+            ..
+        } => backend
+            .stream_dek_put_grants(stream_id, *epoch, signer, cohort_scope, &parsed.wraps)
+            .await
+            .map_err(map_blob_err)?,
     };
     if let Some((sha, scope)) = retire_after_projection {
         backend

@@ -165,6 +165,7 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+// v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
@@ -196,6 +197,8 @@ pub mod scope_classifier_invariants;
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod stream_key_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
@@ -478,7 +481,8 @@ pub mod wire_index;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
 // nonce. Gated on `secrets`: routes through that feature's
 // `secrets::crypto` facade (MISSION §1.4 sole symmetric-crypto site).
-#[cfg(feature = "secrets")]
+// v53.0.0 (CIRISPersist#969) — compiled in every build: the self/family chunk
+// cascade seals under the STREAM nonce (its AEAD helpers stay `secrets`-gated).
 pub mod stream_seal;
 // v4.1 (CIRISPersist#142 Cut C4) — delivery-receipt canonical bytes +
 // subscriber-signature verify. Backend-agnostic; the JOIN-against-STH
@@ -552,13 +556,14 @@ pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
     AbandonFloorReport, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow,
-    BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding,
-    EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestChildRef,
-    ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest, ParsedManifest,
-    PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
-    StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION,
-    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
-    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    BlobRange, BlobStorage, ChunkKeyRef, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
+    EpochBinding, EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef,
+    ManifestChildRef, ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest,
+    ParsedManifest, PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition,
+    ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord,
+    StreamHead, StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
+    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, CHUNK_MANIFEST_VERSION_STREAM,
+    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;

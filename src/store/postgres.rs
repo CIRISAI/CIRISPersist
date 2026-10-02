@@ -944,12 +944,45 @@ fn pg_prepare_chunk_item(
     })
 }
 
+/// v53.0.0 (CIRISPersist#969) — the `federation_stream_deks` projection
+/// every stream-DEK read shares, joined to the epoch's V165 count.
+const PG_STREAM_DEK_SELECT: &str = "SELECT d.stream_id, d.epoch, d.owner_key_id, \
+    d.cohort_scope, d.group_key_id, d.self_retention_wrap, \
+    COALESCE(c.chunk_count, 0)::BIGINT AS chunk_count, \
+    (d.closed_at IS NOT NULL) AS closed, (d.terminated_at IS NOT NULL) AS terminated \
+    FROM cirislens.federation_stream_deks d \
+    LEFT JOIN cirislens.federation_stream_epoch_counts c \
+      ON c.stream_id = d.stream_id AND c.epoch = d.epoch";
+
+fn pg_stream_dek_row(
+    r: &tokio_postgres::Row,
+) -> Result<crate::federation::StreamDekRecord, crate::federation::BlobError> {
+    use crate::federation::BlobError::Backend as B;
+    let epoch: i64 = r.safe_get_with("epoch", B)?;
+    let count: i64 = r.safe_get_with("chunk_count", B)?;
+    Ok(crate::federation::StreamDekRecord {
+        stream_id: r.safe_get_with("stream_id", B)?,
+        epoch: u64::try_from(epoch).unwrap_or_default(),
+        owner_key_id: r.safe_get_with("owner_key_id", B)?,
+        cohort_scope: r.safe_get_with("cohort_scope", B)?,
+        group_key_id: r.safe_get_with("group_key_id", B)?,
+        self_retention_wrap: r.safe_get_with("self_retention_wrap", B)?,
+        chunk_count: u64::try_from(count).unwrap_or_default(),
+        closed: r.safe_get_with("closed", B)?,
+        terminated: r.safe_get_with("terminated", B)?,
+    })
+}
+
 /// #957 — what one item's savepoint did.
 enum PgItemAppended {
     Ok,
     SeqConflict,
     CapReached,
     EpochMoved,
+    /// #969 — the V165 count is not the counter the chunk was sealed at.
+    StreamCounterMoved,
+    /// #969 — the stream epoch is closed / terminated / has no DEK row.
+    StreamEpochClosed,
 }
 
 /// #957 — the batch's per-item constants.
@@ -961,6 +994,8 @@ struct PgChunkTx<'a> {
     owner_key_id: Option<&'a str>,
     binding: Option<&'a crate::federation::EpochBinding>,
     bind_as_declared: bool,
+    /// #969 — the STREAM-nonce slot a stream-keyed chunk was sealed at.
+    stream_key: Option<crate::federation::StreamKeySlot>,
 }
 
 /// #957 — one item's append inside its savepoint: the blob row, the nonce
@@ -1022,6 +1057,39 @@ async fn pg_append_chunk_item(
         .safe_get_with(0usize, crate::federation::BlobError::Backend)?;
     if crate::federation::blobs::epoch_chunk_cap_reached(u64::try_from(counted - 1).unwrap_or(0)) {
         return Ok(PgItemAppended::CapReached);
+    }
+    // 2b. v53.0.0 (#969, CC 5.3.3.1) — the stream-keyed slot: the counter is
+    //     the count BEFORE this insert (the counter row is locked until
+    //     commit), the epoch's DEK row is unterminated (and open, for a data
+    //     chunk), and a `last` chunk stamps it terminated in this transaction.
+    if let Some(slot) = c.stream_key {
+        if counted - 1 != i64::from(slot.counter) {
+            return Ok(PgItemAppended::StreamCounterMoved);
+        }
+        let open = if slot.last {
+            tx.execute(
+                "UPDATE cirislens.federation_stream_deks \
+                    SET terminated_at = NOW(), closed_at = COALESCE(closed_at, NOW()) \
+                  WHERE stream_id = $1 AND epoch = $2 AND terminated_at IS NULL",
+                &[&c.stream_id, &c.epoch_i64],
+            )
+            .await
+            .map_err(be("stream epoch terminate"))?
+                == 1
+        } else {
+            tx.query_one(
+                "SELECT EXISTS(SELECT 1 FROM cirislens.federation_stream_deks \
+                                WHERE stream_id = $1 AND epoch = $2 \
+                                  AND closed_at IS NULL AND terminated_at IS NULL) AS b",
+                &[&c.stream_id, &c.epoch_i64],
+            )
+            .await
+            .map_err(be("stream epoch open"))?
+            .safe_get_with("b", crate::federation::BlobError::Backend)?
+        };
+        if !open {
+            return Ok(PgItemAppended::StreamEpochClosed);
+        }
     }
 
     // 3. The stream-index row. The (stream_id, seq) PK enforces
@@ -16529,6 +16597,391 @@ impl crate::federation::BlobStorage for PostgresBackend {
             .collect()
     }
 
+    // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
+
+    async fn stream_key_state(
+        &self,
+        stream_id: &str,
+    ) -> Result<crate::federation::StreamKeyState, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_key_state: {e}"))
+        };
+        let latest = client
+            .query_opt(
+                &format!(
+                    "{PG_STREAM_DEK_SELECT} WHERE d.stream_id = $1 ORDER BY d.epoch DESC LIMIT 1"
+                ),
+                &[&stream_id],
+            )
+            .await
+            .map_err(be)?
+            .map(|r| pg_stream_dek_row(&r))
+            .transpose()?;
+        let has_chunks: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM cirislens.federation_stream_chunks \
+                                WHERE stream_id = $1) AS b",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be)?
+            .safe_get_with("b", crate::federation::BlobError::Backend)?;
+        let owner_key_id: Option<String> = match client
+            .query_opt(
+                "SELECT owner_key_id FROM cirislens.federation_streams WHERE stream_id = $1",
+                &[&stream_id],
+            )
+            .await
+            .map_err(be)?
+        {
+            Some(r) => r.safe_get_with("owner_key_id", crate::federation::BlobError::Backend)?,
+            None => None,
+        };
+        Ok(crate::federation::StreamKeyState {
+            latest,
+            has_chunks,
+            owner_key_id,
+        })
+    }
+
+    async fn stream_dek_list(
+        &self,
+        stream_id: &str,
+    ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        client
+            .query(
+                &format!("{PG_STREAM_DEK_SELECT} WHERE d.stream_id = $1 ORDER BY d.epoch"),
+                &[&stream_id],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_list: {e}")))?
+            .iter()
+            .map(pg_stream_dek_row)
+            .collect()
+    }
+
+    async fn stream_dek_insert(
+        &self,
+        record: &crate::federation::StreamDekRecord,
+    ) -> Result<crate::federation::StreamDekRecord, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = i64::try_from(record.epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument("stream epoch exceeds i64".into())
+        })?;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_dek_insert: {e}"))
+        };
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_stream_deks \
+                    (stream_id, epoch, owner_key_id, cohort_scope, group_key_id, self_retention_wrap) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (stream_id, epoch) DO NOTHING",
+                &[
+                    &record.stream_id,
+                    &ep,
+                    &record.owner_key_id,
+                    &record.cohort_scope,
+                    &record.group_key_id,
+                    &record.self_retention_wrap,
+                ],
+            )
+            .await
+            .map_err(be)?;
+        let row = client
+            .query_one(
+                &format!("{PG_STREAM_DEK_SELECT} WHERE d.stream_id = $1 AND d.epoch = $2"),
+                &[&record.stream_id, &ep],
+            )
+            .await
+            .map_err(be)?;
+        pg_stream_dek_row(&row)
+    }
+
+    async fn stream_dek_close(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        client
+            .execute(
+                "UPDATE cirislens.federation_stream_deks SET closed_at = NOW() \
+                  WHERE stream_id = $1 AND epoch = $2 AND closed_at IS NULL",
+                &[&stream_id, &ep],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_close: {e}")))?;
+        Ok(())
+    }
+
+    async fn stream_dek_put_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+        cohort_scope: &str,
+        wraps: &[crate::federation::GrantWrap],
+    ) -> Result<usize, crate::federation::BlobError> {
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let be = |e: tokio_postgres::Error| {
+            crate::federation::BlobError::Backend(format!("stream_dek_put_grants: {e}"))
+        };
+        // A UNION in one transaction: `DO NOTHING` per row (§13).
+        let tx = client.transaction().await.map_err(be)?;
+        let mut inserted = 0usize;
+        for w in wraps {
+            inserted += tx
+                .execute(
+                    "INSERT INTO cirislens.federation_stream_dek_grants (\
+                        stream_id, epoch, sealer_key_id, recipient_key_id, wrap_algorithm, \
+                        wrapped_dek, cohort_scope\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (stream_id, epoch, sealer_key_id, recipient_key_id) DO NOTHING",
+                    &[
+                        &stream_id,
+                        &ep,
+                        &sealer_key_id,
+                        &w.recipient_key_id,
+                        &w.wrap_algorithm,
+                        &w.wrapped_dek,
+                        &cohort_scope,
+                    ],
+                )
+                .await
+                .map_err(be)? as usize;
+        }
+        tx.commit().await.map_err(be)?;
+        Ok(inserted)
+    }
+
+    async fn stream_dek_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+    ) -> Result<Vec<crate::federation::GrantWrap>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        client
+            .query(
+                "SELECT recipient_key_id, wrap_algorithm, wrapped_dek \
+                   FROM cirislens.federation_stream_dek_grants \
+                  WHERE stream_id = $1 AND epoch = $2 AND sealer_key_id = $3 \
+                  ORDER BY recipient_key_id",
+                &[&stream_id, &ep, &sealer_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("stream_dek_grants: {e}")))?
+            .iter()
+            .map(|r| {
+                Ok(crate::federation::GrantWrap {
+                    recipient_key_id: r
+                        .safe_get_with("recipient_key_id", crate::federation::BlobError::Backend)?,
+                    wrap_algorithm: r
+                        .safe_get_with("wrap_algorithm", crate::federation::BlobError::Backend)?,
+                    wrapped_dek: r
+                        .safe_get_with("wrapped_dek", crate::federation::BlobError::Backend)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn stream_dek_grants_for_recipient(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> Result<Vec<(String, crate::federation::GrantWrap)>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        client
+            .query(
+                "SELECT sealer_key_id, recipient_key_id, wrap_algorithm, wrapped_dek \
+                   FROM cirislens.federation_stream_dek_grants \
+                  WHERE stream_id = $1 AND epoch = $2 AND recipient_key_id = $3 \
+                  ORDER BY sealer_key_id",
+                &[&stream_id, &ep, &recipient_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "stream_dek_grants_for_recipient: {e}"
+                ))
+            })?
+            .iter()
+            .map(|r| {
+                Ok((
+                    r.safe_get_with("sealer_key_id", crate::federation::BlobError::Backend)?,
+                    crate::federation::GrantWrap {
+                        recipient_key_id: r.safe_get_with(
+                            "recipient_key_id",
+                            crate::federation::BlobError::Backend,
+                        )?,
+                        wrap_algorithm: r.safe_get_with(
+                            "wrap_algorithm",
+                            crate::federation::BlobError::Backend,
+                        )?,
+                        wrapped_dek: r
+                            .safe_get_with("wrapped_dek", crate::federation::BlobError::Backend)?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn stream_dek_key_grant_watermark(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let row = client
+            .query_one(
+                "SELECT MAX(g.created_at) FROM cirislens.federation_stream_dek_grants g \
+                   JOIN cirislens.federation_stream_deks d \
+                     ON d.stream_id = g.stream_id AND d.epoch = g.epoch \
+                    AND d.owner_key_id = g.sealer_key_id \
+                  WHERE g.stream_id = $1 AND g.epoch = $2",
+                &[&stream_id, &ep],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "stream_dek_key_grant_watermark: {e}"
+                ))
+            })?;
+        row.safe_get_with(0, crate::federation::BlobError::Backend)
+    }
+
+    async fn stream_dek_mark_key_grant_emitted(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        client
+            .execute(
+                "UPDATE cirislens.federation_stream_deks SET key_grant_emitted_at = $3 \
+                  WHERE stream_id = $1 AND epoch = $2 \
+                    AND (key_grant_emitted_at IS NULL OR key_grant_emitted_at < $3)",
+                &[&stream_id, &ep, &watermark],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "stream_dek_mark_key_grant_emitted: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn stream_dek_list_key_grant_dirty(
+        &self,
+        owner_key_id: &str,
+    ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        client
+            .query(
+                &format!(
+                    "{PG_STREAM_DEK_SELECT} \
+                      WHERE d.owner_key_id = $1 \
+                        AND EXISTS(SELECT 1 FROM cirislens.federation_stream_dek_grants g \
+                                    WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
+                                      AND g.sealer_key_id = d.owner_key_id) \
+                        AND (d.key_grant_emitted_at IS NULL \
+                             OR d.key_grant_emitted_at < (SELECT MAX(g.created_at) \
+                                 FROM cirislens.federation_stream_dek_grants g \
+                                WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
+                                  AND g.sealer_key_id = d.owner_key_id)) \
+                      ORDER BY d.stream_id, d.epoch"
+                ),
+                &[&owner_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "stream_dek_list_key_grant_dirty: {e}"
+                ))
+            })?
+            .iter()
+            .map(pg_stream_dek_row)
+            .collect()
+    }
+
+    async fn stream_dek_list_for_recipients(
+        &self,
+        recipients: &[String],
+        cohort_scope: &str,
+    ) -> Result<Vec<crate::federation::StreamDekRecord>, crate::federation::BlobError> {
+        if recipients.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        client
+            .query(
+                &format!(
+                    "{PG_STREAM_DEK_SELECT} \
+                      WHERE d.cohort_scope = $1 \
+                        AND EXISTS(SELECT 1 FROM cirislens.federation_stream_dek_grants g \
+                                    WHERE g.stream_id = d.stream_id AND g.epoch = d.epoch \
+                                      AND g.sealer_key_id = d.owner_key_id \
+                                      AND g.recipient_key_id = ANY($2)) \
+                      ORDER BY d.stream_id, d.epoch"
+                ),
+                &[&cohort_scope, &recipients],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "stream_dek_list_for_recipients: {e}"
+                ))
+            })?
+            .iter()
+            .map(pg_stream_dek_row)
+            .collect()
+    }
+
     async fn community_dek_member_grants_for_epoch(
         &self,
         community_key_id: &str,
@@ -17875,6 +18328,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let claim = crate::federation::StreamClaim {
             community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
             owner_key_id: Some(author_key_id.to_owned()),
+            stream_key: None,
         };
         let sha = self
             .put_blob_chunk_floor(
@@ -17908,6 +18362,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let claim = crate::federation::StreamClaim {
             community_key_id: binding.as_ref().map(|b| b.community_key_id.clone()),
             owner_key_id: Some(author_key_id.to_owned()),
+            stream_key: None,
         };
         let items = items
             .into_iter()
@@ -20142,6 +20597,7 @@ impl PostgresBackend {
         floor.check_scope(cohort_scope)?;
         crate::federation::stream_sth::refuse_reserved_stream_id(stream_id)?;
         crate::federation::blobs::check_chunk_batch_bounds(&items)?;
+        crate::federation::blobs::check_stream_key_batch(&claim, items.len())?;
         let cap = self.inline_bytes_cap();
         // u64 → i64 binds (tokio_postgres has no ToSql for u64).
         let epoch_i64 = i64::try_from(epoch).map_err(|_| {
@@ -20278,6 +20734,7 @@ impl PostgresBackend {
             owner_key_id: claim.owner_key_id.as_deref(),
             binding: binding.as_ref(),
             bind_as_declared,
+            stream_key: claim.stream_key,
         };
         let mut landed = false;
         for (slot, row) in &ready {
@@ -20320,6 +20777,16 @@ impl PostgresBackend {
                                 community_key_id: b.community_key_id.clone(),
                                 epoch: b.epoch,
                             }
+                        }
+                        PgItemAppended::StreamCounterMoved => {
+                            crate::federation::blobs::stream_counter_moved_refusal(
+                                stream_id,
+                                epoch,
+                                claim.stream_key.map_or(0, |k| k.counter),
+                            )
+                        }
+                        PgItemAppended::StreamEpochClosed => {
+                            crate::federation::blobs::stream_epoch_closed_refusal(stream_id, epoch)
                         }
                         PgItemAppended::Ok => unreachable!("handled above"),
                     })
@@ -44425,16 +44892,19 @@ mod tests {
                     sha: s0,
                     size: c0.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: s1,
                     size: c1.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: s2,
                     size: c2.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -44597,11 +45067,13 @@ mod tests {
                     sha: s0,
                     size: c0.len() as u32,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: s_ext,
                     size: 100,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -44811,6 +45283,7 @@ mod tests {
                 sha: pg_sha256_of(b"AAAA"),
                 size: 4,
                 seq: None,
+                epoch: None,
             }],
         };
         let err = backend

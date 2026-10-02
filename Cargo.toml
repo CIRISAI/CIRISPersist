@@ -574,7 +574,7 @@ ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v19
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v19.0.0", version = "19", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v19.0.0", version = "19", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant", "kdf"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,

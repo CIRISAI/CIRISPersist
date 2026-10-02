@@ -51,7 +51,7 @@ pub(crate) mod bodies {
     /// The cap every body runs the nested manifest at.
     const CAP: usize = 4096;
 
-    async fn kem_of<B: BlobStorage + Sync>(b: &B) -> EncryptionPubkeys {
+    pub(crate) async fn kem_of<B: BlobStorage + Sync>(b: &B) -> EncryptionPubkeys {
         let id = b.load_or_init_content_kem_identity().await.unwrap();
         EncryptionPubkeys {
             x25519_base64: id.x25519_pubkey_b64,
@@ -61,16 +61,23 @@ pub(crate) mod bodies {
 
     /// Two engines that know each other, one owner with BOTH devices bound
     /// on BOTH nodes (the I138 / I144 shape).
-    struct Pair<B> {
-        a: crate::Engine,
-        b: crate::Engine,
-        sa: Arc<B>,
-        key_a: String,
-        key_b: String,
-        owner: String,
+    pub(crate) struct Pair<B> {
+        pub(crate) a: crate::Engine,
+        pub(crate) b: crate::Engine,
+        pub(crate) sa: Arc<B>,
+        pub(crate) sb: Arc<B>,
+        pub(crate) key_a: String,
+        pub(crate) key_b: String,
+        pub(crate) owner: String,
     }
 
-    async fn pair<B>(dsn_a: &str, dsn_b: &str, run: &str, pick: Pick<B>, tag: &str) -> Pair<B>
+    pub(crate) async fn pair<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        tag: &str,
+    ) -> Pair<B>
     where
         B: BlobStorage + FederationDirectory + Sync + 'static,
     {
@@ -113,6 +120,7 @@ pub(crate) mod bodies {
             a,
             b,
             sa,
+            sb,
             key_a,
             key_b,
             owner,
@@ -177,7 +185,8 @@ pub(crate) mod bodies {
         assert_eq!(view.version, 3, "I202: the manifest is a nested root");
         assert!(view.chunks.is_empty(), "I202: a v3 view lists no chunks");
         assert!(view.children.len() >= 2, "I202: {:?}", view.children);
-        assert_eq!(view.children.iter().map(|c| c.chunk_count).sum::<u64>(), 60);
+        // #969 — sixty chunks and the epoch's terminator.
+        assert_eq!(view.children.iter().map(|c| c.chunk_count).sum::<u64>(), 61);
         assert_eq!(view.total_size, plain.len() as u64);
         assert_eq!(
             p.a.read_blob_as(&root, &p.key_a, None).await.unwrap(),
@@ -208,7 +217,7 @@ pub(crate) mod bodies {
             assert_eq!(page.len() as u64, c.chunk_count);
             seqs.extend(page.iter().map(|x| x.seq));
         }
-        assert_eq!(seqs, (0..60).collect::<Vec<u64>>());
+        assert_eq!(seqs, (0..61).collect::<Vec<u64>>());
         // A stranger is refused at the root.
         assert!(matches!(
             p.a.open_sealed_manifest_page_as(&root, 0, &format!("i202-stranger-{run}"), None)
@@ -227,8 +236,8 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .version,
-            2,
-            "I202: a manifest that fits stays v2"
+            crate::federation::CHUNK_MANIFEST_VERSION_STREAM,
+            "I202: a manifest that fits stays flat (v4 since #969: stream-keyed)"
         );
         // Eviction takes the children with the root.
         let kids = p.sa.manifest_children(&root).await.unwrap();
@@ -267,7 +276,11 @@ pub(crate) mod bodies {
                 .await
                 .unwrap()
                 .into_iter()
-                .filter(|x| x.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE)
+                .filter(|x| {
+                    x.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE
+                        || x.attestation_type
+                            == crate::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
+                })
         {
             p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
                 .await
@@ -358,7 +371,7 @@ pub(crate) mod bodies {
                 &stream,
                 c.seq,
                 &env(hexsha(&c.sha256_hex)).await,
-                0,
+                c.epoch.unwrap_or(0),
                 u64::from(c.size),
                 prov.clone(),
             )
@@ -370,7 +383,10 @@ pub(crate) mod bodies {
                 .await
                 .expect("I204: promoted");
         assert!(promoted.promoted);
-        assert_eq!(promoted.chunk_count, 60);
+        assert_eq!(
+            promoted.chunk_count, 61,
+            "sixty chunks and the terminator (#969)"
+        );
         assert_eq!(
             p.b.read_blob_as(&root, &p.key_b, None).await.unwrap(),
             plain,
@@ -557,6 +573,7 @@ mod unit {
                 sha: [i as u8; 32],
                 size: 100,
                 seq: Some(i),
+                epoch: None,
             })
             .collect();
         ChunkManifest {
@@ -703,6 +720,7 @@ mod unit {
                     sha: [1; 32],
                     size,
                     seq: Some(first + i),
+                    epoch: None,
                 })
                 .collect(),
             chunk_tier: Some(CryptoTier::InvisibleEncrypted),

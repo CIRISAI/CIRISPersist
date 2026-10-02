@@ -151,6 +151,43 @@ Evidence only. `evidence/cc_impl.tsv` gains four rows under `CLM-membership-cons
 **Mutation round (#975; on the committed tree; lanes = the I370–I379 runners on memory, sqlite and postgres).** 14 of 14 killed: the put gate removed on memory / sqlite / postgres (I370 each); the carrier match unanchored and the structural compare made case-insensitive (I371); the carrier `kind` and `subject_key_ids` checks dropped (I372); the serve filter dropped on sqlite and on postgres `list_attestations_since`, and the memory filter made always-true (I376); the ask-3 fast exit restored and the composer counter dropped (I374); `claim_token` ignoring the dimension (I377); the assurance rule matched on the type only (I377 — this one SURVIVED the first round, because a non-witness is refused by the dimension policy's role layer either way; a witness with no conferred scope now separates them).
 
 **Adopters.** Server: the `consent` / `watchlist_config` rows are admitted and counted in v53; the `scores` re-author (CIRISServer#714) is what lets a later release enforce. Edge: `holds_bytes:sha256:` is exactly eight lowercase hex characters; a sixteen-hex test fixture is counted now and refused once enforcement flips. Any host matching `holds_bytes:*` by prefix should match the full pattern.
+### #969 — one DEK per (stream, epoch) for self/family chunk streams; the readiness door
+
+A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant` set per chunk, so a 1024-chunk file carried 1024 wraps per recipient and a late device needed 1024 re-grants. CC 5.3.3.1 seals a stream under one DEK per `(stream_id, epoch)` with the STREAM nonce; CC part 5 §5.1 distributes it O(N) per epoch. FSD `BLOB_ENCRYPTION_AT_REST.md` §12.13, `BLOB_REPLICATION.md` §14.1.
+
+- **V168** (both dialects, checksums pinned): `federation_stream_deks` (the epoch's DEK, self-retained; `closed_at`, `terminated_at`, the V146 ledger column) and `federation_stream_dek_grants` (a union, keyed by sealer).
+- **The seal.** `put_blob_chunk_scoped` at self/family mints the epoch's DEK on its first chunk and seals with `stream_nonce(dek, stream_id, epoch, counter, last)` under the unchanged position AAD. `counter` is the V165 count; the chunk floor re-checks it in the insert's transaction (`StreamClaim.stream_key`) and refuses a moved counter (`stream_counter_moved`, nothing stored, the door re-seals). The chunk row's epoch is the DEK's epoch.
+- **One set per epoch.** The epoch's DEK is wrapped at its first chunk and to any recipient who joins later; the stream-axis set (`key_grant:stream:v1`, plane token `"stream"`, appended; registered per the #975 ruling, the existing types unchanged) is emitted then, never per chunk. Admission: the signer must speak for the stream's owner where this node holds the stream; elsewhere the wraps land under the signer as sealer, and a reader takes a wrap only from a sealer speaking for the owner. `RekeyResult.changed_streams` (and the Python `changed_streams`) carries the retroactive walk over stream epochs — O(epochs).
+- **Rolls and terminators.** An epoch closes to data when the next chunk would take the cap's last counter (reserved for the terminator) or when a granted recipient has left the cohort (removal: forward secrecy); the next append mints E+1. The seal appends one empty `last_flag` chunk per unterminated epoch; the floor stamps the epoch terminated in that transaction and refuses anything after it (`stream_epoch_closed`).
+- **Manifest v4** = v2 + `"chunk_keys":"stream_epoch"` + each chunk's `epoch`, sealed; v3 children are v4. No member ⇒ legacy per-chunk keys, read as before. A stream that held per-chunk-keyed chunks before v53 stays per-chunk to its seal. `SealedManifestView.chunks[].epoch` tells the puller where to adopt each chunk.
+- **Reads.** A v4 chunk opens under the viewer's stream grant of its epoch; the stored nonce must BE the recomputed STREAM nonce. The whole read and the promote (from the stored nonces, no key — I45) check each epoch's counters 0, 1, 2, … and its single final `last`; a truncated DAG is refused. A live read by position uses a per-chunk grant if held, else the stream grant.
+- **Readiness door.** `Engine::sealed_dag_readiness` / `sealed_dag_readiness_json` → `{sha256_hex, chunk_keys, held, readable, missing, not_held}` from grant rows, no chunk opened: per epoch (`{axis: "stream", stream_id, epoch, seq_from, seq_to}`) for v4, per chunk (`{axis: "content", seq, chunk_sha256}`) for legacy.
+- **The refusal.** A viewer authorized on the DAG who lacks one chunk's key gets `BlobError::ChunkKeyNotYetGranted` (`blob_chunk_key_not_yet_granted`; Python `ValueError` like the `blob_not_granted` arm it splits from, JSON detail `{sha256, seq, chunk_sha256, key: {axis: content|stream, …}, retryable: true}`). A stranger keeps `blob_not_granted` on the DAG.
+- `SealStreamScopedResult.stream_key_grant_emissions`; the Python seal door now also emits the chunk sets it widened (it emitted only the manifest's).
+- `stream_seal::stream_nonce` / `parse_nonce` compile in every build (`ciris-crypto` gains its `kdf` feature unconditionally); `seal_chunk` / `open_chunk` stay `secrets`-gated.
+
+**Adopters (Edge).** Apply `key_grant:stream:v1` like the other axes; adopt each chunk at the manifest's `epoch`; tolerate zero-length terminator chunks; a v4 DAG has one more chunk per epoch than the producer wrote.
+
+**Witnesses I310–I319** (`federation/stream_key_invariants.rs`, sqlite and postgres; I311/I312/I314 also unit). I34b, I144, I202 and I204 moved to the stream shape (a terminator per epoch; one set per epoch; the authorized-but-unkeyed viewer now gets the typed refusal).
+
+**Mutation round** (on the committed tree; lane = I310–I319 + I34b + I144 + I202–I209, sqlite): twelve mutants, twelve killed.
+
+| Mutant | Result |
+|---|---|
+| M1 a fresh DEK per chunk (the legacy path always) | killed — I310 and nine more |
+| M2 the floor skips the counter check | killed — I319 |
+| M3 the terminator sealed with `last = false` | killed — I312, I310, I313 and seven more |
+| M4 no terminator at the seal | killed — I312, I202, I144 and seven more |
+| M5 the reader skips the nonce recompute | killed — I319 |
+| M6 counters unchecked | killed — I312 (unit) |
+| M7 an epoch with no `last` passes | killed — I312 (unit) |
+| M8 the seal re-grants per chunk | killed — I310, I34b and ten more |
+| M9 the retroactive walk skips stream epochs | killed — I313 |
+| M10 the stream-axis signer check dropped | killed — I313 |
+| M11 no cap roll | killed — I314 |
+| M12 no removal roll | killed — I314 |
+
+Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #969b). A rolled epoch's terminator is written at the seal, not at the roll (persist cannot take a producer's `seq` mid-stream); the epoch is closed to data at the roll.
 
 ### #973 — a charter silent on witness_quorum, or declaring 0, is in witnessed mode off
 CC 3.2 T6 (rc6), on the operator's ruling that the re-mint declares `witness_quorum = 0`: silence and `0` are one state, witnessed mode off, and "a substrate MUST NOT substitute an internal default". Persist substituted a default of 1 (`DEFAULT_WITNESS_QUORUM`) for a silent charter and read `0` as `1`.
