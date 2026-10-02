@@ -455,6 +455,162 @@ pub(crate) mod bodies {
     }
 }
 
+/// **I415b** — the engine: what a node's own `here` means for a chunk DAG.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod engine_bodies {
+    use crate::federation::custody_ack::CustodyState;
+    use crate::federation::durability::{DeficitAudience, DurabilityMode};
+    use crate::federation::epoch_minter_invariants::bodies::Pick;
+    use crate::federation::nested_manifest_invariants::bodies::pair;
+    use crate::federation::types::cohort_scope::SELF;
+    use crate::federation::{BlobError, BlobStorage, FederationDirectory};
+
+    async fn sealed_dag<B>(
+        p: &crate::federation::nested_manifest_invariants::bodies::Pair<B>,
+        stream: &str,
+    ) -> [u8; 32]
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        for i in 0..4u64 {
+            let seg: Vec<u8> = (0..64u8).map(|j| j.wrapping_mul(i as u8 + 3)).collect();
+            p.a.put_blob_chunk_scoped(SELF, Some(&p.owner), stream, i, &seg, 0, None)
+                .await
+                .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+        }
+        p.a.seal_stream_scoped(SELF, Some(&p.owner), stream, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
+            .manifest_sha256
+    }
+
+    pub(crate) async fn i415b_a_dag_is_here_only_with_every_chunk<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i415b").await;
+        // control: every chunk held — `here` is filed and counted
+        let whole = sealed_dag(&p, &format!("i415b-whole-{run}")).await;
+        p.a.put_custody_ack(&whole, CustodyState::Here, None, None)
+            .await
+            .expect("I415b a node holding the manifest and every chunk files `here`");
+        let d =
+            p.a.durability_deficit(&whole, &p.key_a, None)
+                .await
+                .unwrap();
+        assert!(
+            d.live_here.contains(&p.key_a),
+            "I415b the complete holder is a copy: {d:?}"
+        );
+        assert!(
+            matches!(&d.audience, DeficitAudience::Nodes(n) if n.contains(&p.key_a) && n.contains(&p.key_b)),
+            "I415b the owner's two laptops are the audience: {d:?}"
+        );
+        assert!(
+            d.missing.contains(&p.key_b),
+            "I415b the other device, silent, is missing: {d:?}"
+        );
+        assert_eq!(d.mode, Some(DurabilityMode::Full));
+        // a node missing one chunk: no `here`, and the deficit lists it
+        let stream = format!("i415b-part-{run}");
+        let root = sealed_dag(&p, &stream).await;
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        let lost = listing
+            .chunks
+            .iter()
+            .find(|c| c.seq == 1)
+            .expect("chunk 1")
+            .chunk_sha;
+        assert!(
+            p.sa.delete_blob(&lost).await.unwrap(),
+            "I415b chunk 1 is evicted on node A"
+        );
+        let r =
+            p.a.put_custody_ack(&root, CustodyState::Here, None, None)
+                .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_here_dag_incomplete")),
+            "I415b the manifest alone is not a copy: {r:?}"
+        );
+        let d = p.a.durability_deficit(&root, &p.key_a, None).await.unwrap();
+        assert!(
+            !d.live_here.contains(&p.key_a) && d.missing.contains(&p.key_a),
+            "I415b the partial holder is listed missing: {d:?}"
+        );
+        // it can still say it holds nothing whole
+        p.a.put_custody_ack(&root, CustodyState::None, None, None)
+            .await
+            .expect("I415b `none` is always reportable");
+        // node B adopts the manifest AS RECEIVED (inline, not promoted: no
+        // chunk held). Nothing on the row says DAG; the opened plaintext does.
+        p.a.emit_pending_key_grants().await.unwrap();
+        for set in
+            p.sa.list_attestations_by(&p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| {
+                    x.attestation_type
+                        == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
+                        || x.attestation_type
+                            == crate::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
+                })
+        {
+            p.b.apply_replicated_key_grant(crate::federation::key_grant::SignedKeyGrantSet {
+                attestation: set,
+            })
+            .await
+            .expect("B applies A's set");
+        }
+        let Some(crate::federation::BlobBody::Inline(menv)) = p.sa.get_blob(&whole).await.unwrap()
+        else {
+            panic!("the sealed manifest is an inline envelope on A")
+        };
+        p.b.adopt_sealed_blob(
+            &menv,
+            crate::federation::BlobProvenance {
+                author_key_id: p.owner.clone(),
+                cohort_scope: SELF.to_owned(),
+                community_key_id: None,
+                epoch: None,
+                tier: crate::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
+                minter_key_id: Some(p.key_a.clone()),
+            },
+            None,
+            crate::federation::AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B adopts the manifest");
+        assert_eq!(
+            p.sb.blob_head(&whole).await.unwrap().unwrap().storage_kind,
+            "inline",
+            "I415b the adopted manifest is not promoted"
+        );
+        let r =
+            p.b.put_custody_ack(&whole, CustodyState::Here, None, None)
+                .await;
+        assert!(
+            r.as_ref()
+                .is_err_and(|e| e.to_string().contains("custody_ack_here_dag_incomplete")),
+            "I415b an adopted manifest with no chunk is not a copy: {r:?}"
+        );
+        // a stranger learns nothing
+        assert!(
+            matches!(
+                p.a.durability_deficit(&root, &format!("i415b-stranger-{run}"), None)
+                    .await,
+                Err(BlobError::NotGranted { .. })
+            ),
+            "I415b a stranger is refused the deficit"
+        );
+    }
+}
+
 /// **I419** — from disk: the `FountainContent` arm of `projection_for`
 /// resolves no `SelfOwn` at any scope (CC 6.1.5.3). Comments are stripped, so
 /// a commented-out arm cannot satisfy or defeat the count.
@@ -532,6 +688,39 @@ mod runners {
                 case!(i416_an_expired_here_is_missing);
             }
         };
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i415b_a_dag_is_here_only_with_every_chunk_sqlite() {
+        super::engine_bodies::i415b_a_dag_is_here_only_with_every_chunk(
+            "sqlite::memory:",
+            "sqlite::memory:",
+            &suffix(),
+            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::sqlite::SqliteBackend,
+                >,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i415b_a_dag_is_here_only_with_every_chunk_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        super::engine_bodies::i415b_a_dag_is_here_only_with_every_chunk(
+            &a,
+            &b,
+            &suffix(),
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::postgres::PostgresBackend,
+                >,
+        )
+        .await;
     }
 
     dyn_runners!(memory, async {
