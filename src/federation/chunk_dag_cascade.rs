@@ -3234,6 +3234,13 @@ pub mod test_support {
     /// - the public seal door then seals a **v2** manifest (no `chunk_keys`, no
     ///   epochs, no terminators) and grants it.
     ///
+    /// `aad` is the caller AAD a v52 writer passed to BOTH doors (CIRISEdge's
+    /// `content_aad(author, asserted_at, field)` at a sealed tier, `None` at
+    /// plaintext): persist frames it with `(stream_id, seq)` for each chunk and
+    /// binds the manifest to it, so a reader must pass the same bytes to
+    /// `read_blob_as` / `sealed_dag_readiness` (as `caller_aad_b64`) / the adopt
+    /// and promote doors.
+    ///
     /// The content key-grant sets are left pending, as any write leaves them:
     /// `engine.emit_pending_key_grants()` emits them for delivery. No clock is
     /// read here beyond what the public doors read themselves.
@@ -3248,6 +3255,7 @@ pub mod test_support {
         group_key_id: &str,
         stream_id: &str,
         chunks: &[Vec<u8>],
+        aad: Option<&[u8]>,
     ) -> Result<LegacyV2Dag, BlobError>
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -3267,7 +3275,7 @@ pub mod test_support {
         let env = crate::federation::at_rest_cascade::seal(
             &dek,
             first,
-            Some(&super::chunk_aad(None, stream_id, 0)),
+            Some(&super::chunk_aad(aad, stream_id, 0)),
         )
         .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: seal chunk 0: {e}")))?;
         let sha0 = backend
@@ -3307,14 +3315,14 @@ pub mod test_support {
                     i as u64 + 1,
                     seg,
                     0,
-                    None,
+                    aad,
                 )
                 .await?;
             chunk_sha256.push(put.chunk_sha256);
             plaintext.extend_from_slice(seg);
         }
         let sealed = engine
-            .seal_stream_scoped(cohort_scope, Some(group_key_id), stream_id, None, None)
+            .seal_stream_scoped(cohort_scope, Some(group_key_id), stream_id, None, aad)
             .await?;
         Ok(LegacyV2Dag {
             manifest_sha256: sealed.manifest_sha256,

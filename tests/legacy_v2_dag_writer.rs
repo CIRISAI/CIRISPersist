@@ -60,8 +60,48 @@ fn segment(i: usize) -> Vec<u8> {
     (0..60 + (i % 4) * 17).map(|j| (i * 29 + j) as u8).collect()
 }
 
+/// The caller AAD a v52 CIRISEdge node bound every sealed file to: its
+/// `group_content::content_aad(author, asserted_at, field)`, byte for byte
+/// (`ciris.edge.blob.aad.v1\0` then each part as a u32-BE length prefix and
+/// its bytes; the instant rendered by persist's `render_signed_instant`).
+fn edge_content_aad(
+    author: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    field: &str,
+) -> Vec<u8> {
+    fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let instant = ciris_persist::federation::admission::render_signed_instant(asserted_at);
+    let mut out = b"ciris.edge.blob.aad.v1\x00".to_vec();
+    push_lp(&mut out, author.as_bytes());
+    push_lp(&mut out, instant.as_bytes());
+    push_lp(&mut out, field.as_bytes());
+    out
+}
+
 #[tokio::test]
 async fn a_legacy_v2_dag_written_on_a_is_pulled_and_read_on_b() {
+    pull_a_legacy_v2_dag(None).await;
+}
+
+/// The v52 Edge shape: the file sealed under Edge's `content_aad`. B opens it
+/// with the same AAD at every door, and a different AAD opens nothing.
+#[tokio::test]
+async fn a_legacy_v2_dag_sealed_under_edges_content_aad_needs_that_aad() {
+    let aad = edge_content_aad(
+        "v2w-author",
+        chrono::DateTime::parse_from_rfc3339("2026-09-30T12:34:56.789Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        "body",
+    );
+    pull_a_legacy_v2_dag(Some(aad)).await;
+}
+
+async fn pull_a_legacy_v2_dag(aad: Option<Vec<u8>>) {
+    let aad = aad.as_deref();
     let run = run_id();
     let (alias_a, alias_b) = (format!("v2w-a-{run}"), format!("v2w-b-{run}"));
     let (a, sa) = engine(&alias_a).await;
@@ -106,12 +146,12 @@ async fn a_legacy_v2_dag_written_on_a_is_pulled_and_read_on_b() {
     // ── A writes a v2 file, exactly as a v52 node did. ──
     let stream = format!("v2w-{run}");
     let segs: Vec<Vec<u8>> = (0..5).map(segment).collect();
-    let dag = write_legacy_v2_dag(&a, sa.as_ref(), SELF, &owner, &stream, &segs)
+    let dag = write_legacy_v2_dag(&a, sa.as_ref(), SELF, &owner, &stream, &segs, aad)
         .await
         .expect("write v2");
     let root = dag.manifest_sha256;
     let on_a = a
-        .open_sealed_manifest_as(&root, &na.key, None)
+        .open_sealed_manifest_as(&root, &na.key, aad)
         .await
         .unwrap();
     assert_eq!(on_a.version, 2, "the writer wrote a legacy (v2) manifest");
@@ -144,13 +184,13 @@ async fn a_legacy_v2_dag_written_on_a_is_pulled_and_read_on_b() {
     b.adopt_sealed_blob(
         &inline(&sa, &root).await,
         prov.clone(),
-        None,
+        aad,
         AdoptDisposition::LocalOnly,
     )
     .await
     .expect("B adopts the manifest");
     let view = b
-        .open_sealed_manifest_as(&root, &nb.key, None)
+        .open_sealed_manifest_as(&root, &nb.key, aad)
         .await
         .expect("B opens the manifest");
     assert_eq!(view.version, 2, "B sees a legacy (v2) manifest");
@@ -167,21 +207,42 @@ async fn a_legacy_v2_dag_written_on_a_is_pulled_and_read_on_b() {
         .await
         .unwrap_or_else(|e| panic!("B adopts chunk {}: {e}", c.seq));
     }
-    b.promote_adopted_manifest_to_dag(&root, &nb.key, None)
+    b.promote_adopted_manifest_to_dag(&root, &nb.key, aad)
         .await
         .expect("B promotes the v2 DAG");
-    let r = b.sealed_dag_readiness(&root, &nb.key, None).await.unwrap();
+    let r = b.sealed_dag_readiness(&root, &nb.key, aad).await.unwrap();
     assert_eq!(r.chunk_keys, "content", "{r:?}");
     assert!(r.held && r.readable && r.missing.is_empty(), "{r:?}");
     assert_eq!(
-        b.read_blob_as(&root, &nb.key, None).await.unwrap(),
+        b.read_blob_as(&root, &nb.key, aad).await.unwrap(),
         dag.plaintext,
         "B reads the v2 file"
     );
     assert_eq!(
-        b.read_blob_range_as(&root, &nb.key, 70, 200, None)
+        b.read_blob_range_as(&root, &nb.key, 70, 200, aad)
             .await
             .unwrap(),
         dag.plaintext[70..=200].to_vec()
+    );
+    // A different AAD opens nothing: not the manifest, not the file.
+    let wrong: &[u8] = match aad {
+        Some(_) => b"another pointer's aad",
+        None => b"an aad the file was never bound to",
+    };
+    assert!(
+        b.open_sealed_manifest_as(&root, &nb.key, Some(wrong))
+            .await
+            .is_err(),
+        "B must not open the manifest under a different AAD"
+    );
+    assert!(
+        b.read_blob_as(&root, &nb.key, Some(wrong)).await.is_err(),
+        "B must not read the file under a different AAD"
+    );
+    assert!(
+        b.sealed_dag_readiness(&root, &nb.key, Some(wrong))
+            .await
+            .is_err(),
+        "the readiness door opens the manifest with the same AAD"
     );
 }

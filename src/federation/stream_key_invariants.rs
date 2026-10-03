@@ -1125,6 +1125,7 @@ pub(crate) mod bodies {
             &p.owner,
             stream,
             &segs,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("v52 stream {stream}: {e}"));
