@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.0.0] - UNRELEASED
+## [53.0.0] - 2026-10-03
 
 ### Adopters — read first
 
@@ -29,6 +29,8 @@ threat-model citations because this crate's audit story is the point.
 - Row types are checked against the CC registry in REPORT mode (#975): unregistered types are admitted and counted; a later release flips `ROW_TYPE_ENFORCEMENT`.
 
 **Edge #763:** `put_custody_ack` takes `caller_aad` (pyo3 `aad_b64`); re-adopting an identical evicted chunk is idempotent; an eviction keeps the at-rest grants, so a re-fetched file opens with no new key_grant set.
+
+**CC version.** v53 builds to CC rc7 behaviour (commits b578b59 → 5a4b057 on `rc7`) but vendors the CC **`v1.0-rc6` tag** bytes: rc7 is not tagged, and its two manifests differ from rc6 only in `cc_version` and `source_sha256` (the registry and vectors are identical). A later release re-vendors when `v1.0-rc7` is tagged.
 
 **Test support (`test-anchor`, never in a wheel):** `chunk_dag_cascade::test_support::write_legacy_v2_dag(engine, backend, cohort_scope, group_key_id, stream_id, chunks, aad)` writes a v52-shaped v2 DAG for adopters' end-to-end pulls.
 
