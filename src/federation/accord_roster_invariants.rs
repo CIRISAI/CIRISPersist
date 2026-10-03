@@ -12,6 +12,8 @@
 //!   held.
 //! - **I450g** a removal: the charter must drop the removed holder (a charter
 //!   still committing them is a stray at the version), then it is admitted.
+//! - **I450j** a seat goes only to an `accord_holder` key record (both the
+//!   roster change and the recovery door).
 //! - **I450i** from disk: the genesis bundle check runs the same coverage
 //!   rule and propagates its refusal.
 //! - **I450h** the standing roster is the HELD head's: cosigns from the holder
@@ -184,10 +186,53 @@ pub(crate) mod bodies {
         }
     }
 
+    /// A key an accord holder can hold: an `accord_holder` record (CC 4.2.6).
     pub(crate) async fn newcomer(d: &dyn FederationDirectory, tag: &str) -> String {
         let k = format!("ar-new-{tag}");
-        ts::register_hybrid_key_as(d, &k, &k, identity_type::NODE).await;
+        ops::register_accord_holder_as(d, &ops::Identity::new(&k), identity_type::ACCORD_HOLDER)
+            .await
+            .expect("an accord_holder key");
         k
+    }
+
+    /// **I450j** — a seat goes only to an `accord_holder` key: the roster
+    /// change refuses a newcomer whose record lacks it, by name.
+    pub async fn i450j_a_seat_needs_an_accord_holder_key(d: &dyn FederationDirectory, tag: &str) {
+        stand_up(d).await;
+        let before = held(d).await;
+        let holders = ids(&before);
+        let plain = format!("ar-plain-{tag}");
+        ts::register_hybrid_key_as(d, &plain, &plain, identity_type::NODE).await;
+        let change = adding(&plain, before.members[0].role.clone());
+        let mut grown = holders.clone();
+        grown.push(plain.clone());
+        let charter = rescrub(d, &grown, tag).await;
+        let decision = decide(
+            d,
+            &change,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            true,
+            &format!("ar-j-{tag}"),
+        )
+        .await;
+        refused(
+            apply(
+                d,
+                version(
+                    d,
+                    &change,
+                    &decision,
+                    &charter,
+                    &[&holders[0], &holders[1]],
+                    &plain,
+                )
+                .await,
+            )
+            .await,
+            "accord_roster_change_not_a_holder_key",
+            "I450j: a node key takes no accord seat",
+        );
+        assert_eq!(held(d).await, before, "I450j: nothing written");
     }
 
     /// **I450e** — the local door, each leg and the admitted version.
@@ -583,6 +628,11 @@ mod run {
                 async fn i450g() {
                     let Some(b) = $fresh.await else { return };
                     bodies::i450g_a_removal_drops_the_commitment(&b, &suffix()).await
+                }
+                #[tokio::test]
+                async fn i450j() {
+                    let Some(b) = $fresh.await else { return };
+                    bodies::i450j_a_seat_needs_an_accord_holder_key(&b, &suffix()).await
                 }
                 #[tokio::test]
                 async fn i450h() {

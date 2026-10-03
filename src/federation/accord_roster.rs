@@ -84,6 +84,26 @@ pub fn seat_change_digest(family_key_id: &str, change: &SeatChange) -> Result<St
     Ok(hex::encode(sha2::Sha256::digest(&bytes)))
 }
 
+/// **Is `key_id` an accord holder's key** — a `federation_keys` row whose
+/// `identity_type` claims `accord_holder` (CC 4.2.6: "Key material […] lives in
+/// CIRISPersist substrate: `federation_keys` rows with
+/// `identity_type="accord_holder"`")? The predicate the genesis bundle check
+/// applies to its holders (`KeyRecord::claims_role`), shared by the roster
+/// change and the recovery door for a key they seat.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn is_accord_holder_key<F>(directory: &F, key_id: &str) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    Ok(directory
+        .lookup_public_key(key_id)
+        .await?
+        .is_some_and(|r| r.claims_role(super::types::identity_type::ACCORD_HOLDER)))
+}
+
 /// **Verify an offered accord version as a roster change.** `Ok(None)` when it
 /// is not this shape (another family, no proof, another envelope kind);
 /// `Ok(Some(added))` — the holders it seats — when it verifies whole; an
@@ -252,6 +272,14 @@ where
             "accord_roster_change_unconsented",
             format!("added holder {k} did not sign the version that seats them"),
         );
+    }
+    for k in &added {
+        if !is_accord_holder_key(directory, k).await? {
+            return refuse(
+                "accord_roster_change_not_a_holder_key",
+                format!("{k} is not an accord_holder key record (CC 4.2.6)"),
+            );
+        }
     }
     Ok(Some(added))
 }

@@ -370,6 +370,13 @@ where
             format!("{new} already holds a seat"),
         );
     }
+    // v53.0.0 (CC 4.2.6) — the key taking the seat is an accord holder's key.
+    if !super::accord_roster::is_accord_holder_key(directory, new).await? {
+        return refuse(
+            "accord_recovery_not_a_holder_key",
+            format!("{new} is not an accord_holder key record (CC 4.2.6)"),
+        );
+    }
     let joined_at = offered
         .members
         .iter()
