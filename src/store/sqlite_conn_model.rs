@@ -576,6 +576,7 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("blob_head", ConnClass::Read),
     ("stream_chunks", ConnClass::Read),
     ("stream_chunk_at", ConnClass::Read),
+    ("stream_positions_of_chunk", ConnClass::Read),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),
