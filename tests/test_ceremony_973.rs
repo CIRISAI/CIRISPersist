@@ -1141,6 +1141,17 @@ async fn register(d: &dyn FederationDirectory, who: &Identity) {
     .unwrap_or_else(|e| panic!("register {}: {e}", who.key_id));
 }
 
+/// A key that can take an accord seat: an `accord_holder` record (CC 4.2.6).
+async fn register_holder(d: &dyn FederationDirectory, who: &Identity) {
+    ciris_persist::federation::accord_test_support::register_accord_holder_as(
+        d,
+        who,
+        ciris_persist::federation::types::identity_type::ACCORD_HOLDER,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("register holder {}: {e}", who.key_id));
+}
+
 /// Holder `k`'s committed recovery key as a signer.
 fn recovery_identity(k: usize) -> Identity {
     let seed = test_ceremony_recovery_seed(&SEEDS[k]);
@@ -1205,7 +1216,7 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
     posing.key_id = recovery_identity(1).key_id.clone();
     register(d, &posing).await;
     let n1 = Identity::new(&format!("i429-new-1-{tag}"));
-    register(d, &n1).await;
+    register_holder(d, &n1).await;
     let e = rotate(d, "test-accord-holder-1", &n1, &posing, "i429-next-x")
         .await
         .unwrap_err();
@@ -1219,7 +1230,7 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
     let r0 = recovery_identity(0);
     register(d, &r0).await;
     let n0 = Identity::new(&format!("i429-new-0-{tag}"));
-    register(d, &n0).await;
+    register_holder(d, &n0).await;
     // the record signed by a key other than the one taking the seat: refused
     let wrong = Identity::new("i429-wrong");
     {
@@ -1287,6 +1298,17 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
         vec![proposal.digest()],
         "{tag} R2c"
     );
+    // v53.0.0 (CC 4.2.6) — the key taking the seat must be an accord_holder
+    // record: a plain key is refused by name.
+    let plain = Identity::new(&format!("i429-plain-{tag}"));
+    register(d, &plain).await;
+    let e = rotate(d, "test-accord-holder-0", &plain, &r0, "i429-next-0")
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("accord_recovery_not_a_holder_key"),
+        "{tag} I429: a recovery seats only an accord_holder key: {e}"
+    );
     rotate(d, "test-accord-holder-0", &n0, &r0, "i429-next-0")
         .await
         .unwrap_or_else(|e| panic!("{tag} I429: the holder's own recovery: {e}"));
@@ -1343,7 +1365,7 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
     let r_next0 = Identity::new("i429-next-0");
     register(d, &r_next0).await;
     let m = Identity::new(&format!("i429-m-{tag}"));
-    register(d, &m).await;
+    register_holder(d, &m).await;
     let r0_as_id = r0.key_id.clone();
     // the next commitment names r0's own material
     let r0_commitment = ciris_persist::federation::trust_root::recovery_commitment(
@@ -1374,7 +1396,7 @@ async fn recovers(d: &dyn FederationDirectory, c: &TestCeremonyOutputs, tag: &st
         .await
         .unwrap_or_else(|e| panic!("{tag} I429: the second recovery: {e}"));
     let x = Identity::new(&format!("i429-x-{tag}"));
-    register(d, &x).await;
+    register_holder(d, &x).await;
     let e = rotate(d, &m.key_id, &x, &r0, "i429-next-x")
         .await
         .unwrap_err();
@@ -1657,8 +1679,11 @@ async fn recovery_replicates(
     let next0 = Identity::new("i429-next-0");
     let m = Identity::new(&format!("i429b-m-{tag}"));
     for d in [a, b] {
-        for k in [&r0, &n0, &next0, &m] {
+        for k in [&r0, &next0] {
             register(d, k).await;
+        }
+        for k in [&n0, &m] {
+            register_holder(d, k).await;
         }
     }
     // A rotates holder 0 under its recovery key; B learns it by replication.
@@ -1703,7 +1728,7 @@ async fn recovery_replicates(
     posing.key_id = recovery_identity(1).key_id.clone();
     register(b, &posing).await;
     let n1 = Identity::new(&format!("i429b-new-1-{tag}"));
-    register(b, &n1).await;
+    register_holder(b, &n1).await;
     let squat = crafted(b, "test-accord-holder-1", &n1, &posing, "i429b-next-x").await;
     let e = b.put_family(squat).await.unwrap_err();
     assert!(
@@ -1744,7 +1769,7 @@ async fn recovery_replicates(
         .await
         .unwrap_or_else(|e| panic!("{tag} I429b: B admits the second recovery: {e}"));
     let x = Identity::new(&format!("i429b-x-{tag}"));
-    register(b, &x).await;
+    register_holder(b, &x).await;
     let spent = crafted(b, &m.key_id, &x, &r0, "i429b-next-y").await;
     let held = accord_head(b).await;
     let e = b.put_family(spent.clone()).await.unwrap_err();

@@ -331,7 +331,27 @@ CC 3.2 T6 (rc7 `36432c6`, adopting persist's v53 design): every roster-affecting
 
 **A backdated row does not escape (I450b–I450d).** A version answers for the rows that take effect after its predecessor's instant AND the rows THIS node admitted after it, so a row signed with an instant before the held head — a serve-node revocation dated back, admitted later — is a row the head has not covered: (i) refuses a version that still lists the node (it disagrees with the fold at its own instant; I450c), and (ii) lags the head (I450b). The lag is the head against the fold NOW over those rows, each counted once this node has held it one `witness_cadence_secs`, and `since` is the admission instant (I450d, I454): the cadence is timed from admission here, never from the row's signer-chosen `effective_at`. Mutants M19 (a late row not answered) and M20 (cadence from the row's instant): killed by I450b–d and I454.
 
-**Not built (BELIEVED, reported):** the accord's own roster change (`AccordAction::RosterChange` carried as a family supersede) still has no door — R2a's accord head door admits only head moves — so an authorized accord roster-change decision can lag the accord head but no version can cover it, and (iii) for it (the decision taking effect) has no fold to land in. (The late/backdated community row named here before is closed above.)
+**The accord's roster change — the door's third shape** (CC 4.2.6 / CC 3.2 T6, rc7 `5a4b057`; `federation::accord_roster`). A roster change (add / remove / swap) is a new accord version, admitted through the one accord door beside the head move and the recovery, on the local and the replicated route, iff:
+- it names the held head and changes only the seats and the charter it names;
+- its change envelope (`ciris.accord_roster_change.v1`) lists each seat change bound to an authorized accord `roster_change` decision anchored on the held head, whose window has closed (the removed holder's lame duck runs to the close) and whose `payload_sha256` is `seat_change_digest` of exactly that change; applied to the held roster, the changes give the offered roster;
+- yes-cosigns over the envelope come from a strict majority of the STANDING roster, the held head's (a newcomer's yes counts for nothing);
+- every added holder signed the record (consent, #955 Q1);
+- the charter it names covers its roster (below).
+Refusals: `accord_roster_change_{uncovered,short,unconsented,unbound,not_seats}`. A decision a peer does not yet hold refuses the replicated version by name (retryable). The admitted version moves the head, so the decision's lag clears.
+
+**Recovery commitments are judged where the roster is known (ruling (a)).** Charter admission keeps only the SHAPE of `recovery_commitments` (present, 64 lowercase hex, a recovery key apart from every signing key the charter names, no two holders sharing one). Whether they cover EXACTLY a roster is judged at every accord version — head move, recovery, roster change — and at the genesis bundle check (`accord_roster::charter_commitments_cover`): no missing holder (`accord_recovery_commitment_missing`), no stray key (`accord_recovery_commitment_stray`); a seat a recovery took is covered by the recovery's next commitment and the key it replaced is not a stray. The charter a version names must be held (`accord_charter_not_held`, retryable). An added holder's commitment is in the charter at seating (CC 4.2.6), so a change that adds or removes a holder names a re-scrubbed charter. I432 and I433 keep their meaning at the version door; I446 names a held charter that covers the roster.
+
+| Witness | What it pins |
+|---|---|
+| I450e | the local door: no decision, unauthorized, window open, another change, one of three, unconsented, a charter missing the newcomer — each refused by name; the covering change admitted, head moved, lag cleared, roster = fold |
+| I450f | a peer refuses the version while it holds no decision and admits it once it does; both hold one head |
+| I450g | a removal: a charter still committing the removed holder is a stray; the re-scrub admits |
+| I450h | the majority is of the held roster: one standing yes plus two newcomers' is short; two standing yes admits |
+| I450i | from disk: the genesis bundle check runs the coverage rule and propagates its refusal |
+
+Mutation round — the door (memory + sqlite + the I429 integration legs): N1 the standing roster is the offered one — killed (I450e/f/h); N2 an unauthorized decision covers — killed (I450e); N3 an open window covers — killed (I450e); N4 the payload is not checked — killed (I450e); N5 consent not checked — killed (I450e); N6 the door skips coverage — killed (I450e/g, I432, I433); N7 a stray admitted — killed (I450g, I433); N8 the replicated route does not take the shape — killed (I450f); N9 a recovery's replaced key counted stray — killed (I429, I429b); N10 genesis skips coverage — killed by I450i only (from disk).
+
+**A seat goes only to an `accord_holder` key** (CC 4.2.6: holders are `federation_keys` rows with `identity_type="accord_holder"`). Both doors that seat a key ask the predicate the genesis bundle check applies to its holders (`KeyRecord::claims_role(accord_holder)`, via `accord_roster::is_accord_holder_key`): `accord_roster_change_not_a_holder_key`, `accord_recovery_not_a_holder_key`. Witnessed by I450j (memory, sqlite, postgres) and an I429 leg; mutant N11 (any key takes a seat) killed by both.
 
 | Witness | What it pins |
 |---|---|

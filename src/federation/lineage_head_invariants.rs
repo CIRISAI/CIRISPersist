@@ -492,9 +492,22 @@ pub(crate) mod bodies {
         let hash = |f: &crate::federation::Family| {
             crate::federation::types::compute_persist_row_hash(f).unwrap()
         };
+        // v53.0.0 (CC 4.2.6, R2c ruling (a)) — the version names a charter
+        // this node holds whose recovery commitments cover its roster.
+        let fresh = charter(
+            accord,
+            &format!("i446-charter-{tag}"),
+            &ids,
+            serde_json::json!({
+                "recovery_commitments":
+                    crate::federation::trust_root::test_accord_recovery_commitments(&ids),
+            }),
+        );
+        let fresh_digest = ops::charter_digest_of(&fresh);
+        put(d, fresh).await;
         let mut next = held.clone();
         next.prev_head_digest = held.persist_row_hash.clone();
-        next.charter_digest = "5e".repeat(32);
+        next.charter_digest = fresh_digest.clone();
         next.persist_row_hash = String::new();
         let reserved = |e: &Error| matches!(e, Error::ConstitutionalFamilyReserved { .. });
         // Unbound: the quorum signed "the same roster", not this version.
@@ -521,7 +534,7 @@ pub(crate) mod bodies {
             .await
             .unwrap_or_else(|e| panic!("{tag} I446: the bound head-only version: {e}"));
         let moved = head(d, accord).await;
-        assert_eq!(moved.charter_digest, "5e".repeat(32), "{tag} I446");
+        assert_eq!(moved.charter_digest, fresh_digest, "{tag} I446");
         assert_eq!(moved.prev_head_digest, held.persist_row_hash, "{tag} I446");
     }
 

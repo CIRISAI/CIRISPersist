@@ -199,6 +199,7 @@ pub(crate) mod bodies {
         .map(|_| ())
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) async fn withdraw_pub(
         d: &dyn FederationDirectory,
         author: &str,

@@ -36,6 +36,8 @@ pub mod accord_carriage;
 pub mod accord_quorum;
 /// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
 pub mod accord_recovery;
+/// v53.0.0 (CC 4.2.6) — the accord's roster change, the door's third shape.
+pub mod accord_roster;
 pub mod admission;
 pub mod adopt_cascade;
 pub mod age;
@@ -445,6 +447,9 @@ impl ConsentSweepReport {
     }
 }
 
+/// v53.0.0 (CC 4.2.6) — I450e–I450h, the accord's roster change.
+#[cfg(test)]
+mod accord_roster_invariants;
 /// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
 #[cfg(test)]
 mod lineage_head_invariants;
@@ -2241,6 +2246,7 @@ pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
 /// here (the next write rolls the epochs the node held). A lookup that fails
 /// is logged and treated as no change: the row stands, and the pending sweep
 /// is where a missed re-wrap is retried.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn consent_list_change_of<F>(
     directory: &F,
     row: &Attestation,
