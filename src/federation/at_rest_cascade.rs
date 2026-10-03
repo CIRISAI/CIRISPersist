@@ -3196,6 +3196,36 @@ pub mod orchestrate {
                         hex::encode(at_rest_sha256)
                     ))
                 })?;
+                // #969 / #842 — a stream-keyed chunk has no per-row key: the
+                // viewer was authorized by its stream position's epoch grant,
+                // so it opens (or, outside its position-bound data, fails as a
+                // crypto-class error) under that epoch's DEK — never NotGranted.
+                if backend
+                    .get_at_rest_grant(at_rest_sha256, viewer_key_id)
+                    .await?
+                    .is_none()
+                    && backend
+                        .get_at_rest_grant(at_rest_sha256, PERSIST_SELF_RECIPIENT)
+                        .await?
+                        .is_none()
+                {
+                    for (stream_id, chunk) in
+                        backend.stream_positions_of_chunk(at_rest_sha256).await?
+                    {
+                        if let Some(dek) =
+                            crate::federation::chunk_dag_cascade::orchestrate::stream_dek_for_viewer(
+                                backend,
+                                &stream_id,
+                                chunk.epoch,
+                                viewer_key_id,
+                            )
+                            .await?
+                        {
+                            return open(&dek, &envelope, aad)
+                                .map_err(super::open_err(at_rest_sha256, map_at_rest_err));
+                        }
+                    }
+                }
                 read_for_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope, aad).await
             }
             CryptoTier::CommunityDek => {
@@ -3222,6 +3252,15 @@ pub mod orchestrate {
     /// tier, before any body is touched.** Shared by the whole read, the
     /// range read (#832) and the per-chunk checks, so one predicate decides
     /// every read. A refusal names only the sha and the viewer (I4).
+    ///
+    /// v53.0.0 (#969, #842) — a self/family chunk sealed under its stream's
+    /// `(stream, epoch)` DEK carries no per-row grant; the viewer is
+    /// authorized on it by the grant of a stream position it sits at
+    /// ([`stream_grant_sealer`](crate::federation::chunk_dag_cascade::orchestrate::stream_grant_sealer),
+    /// the predicate the position read opens with). So an authorized reader
+    /// who reaches a chunk by its sha alone passes authorization and then
+    /// fails the position-bound open as a crypto-class error, never as
+    /// `NotGranted`.
     pub(crate) async fn authorize_viewer_by_tier<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
@@ -3229,7 +3268,7 @@ pub mod orchestrate {
         viewer_key_id: &str,
     ) -> Result<(), BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         use crate::federation::types::cohort_scope::CryptoTier;
         let not_granted = || BlobError::NotGranted {
@@ -3246,11 +3285,24 @@ pub mod orchestrate {
                 if backend
                     .get_at_rest_grant(at_rest_sha256, viewer_key_id)
                     .await?
-                    .is_none()
+                    .is_some()
                 {
-                    return Err(not_granted());
+                    return Ok(());
                 }
-                Ok(())
+                for (stream_id, chunk) in backend.stream_positions_of_chunk(at_rest_sha256).await? {
+                    if crate::federation::chunk_dag_cascade::orchestrate::stream_grant_sealer(
+                        backend,
+                        &stream_id,
+                        chunk.epoch,
+                        viewer_key_id,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(not_granted())
             }
             CryptoTier::CommunityDek => {
                 let Some((community, minter, epoch)) =

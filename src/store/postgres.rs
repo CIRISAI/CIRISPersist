@@ -19082,6 +19082,39 @@ impl crate::federation::BlobStorage for PostgresBackend {
         row.as_ref().map(pg_stream_chunk_ref).transpose()
     }
 
+    async fn stream_positions_of_chunk(
+        &self,
+        chunk_sha: &[u8; 32],
+    ) -> Result<Vec<(String, crate::federation::StreamChunkRef)>, crate::federation::BlobError>
+    {
+        let sha_vec = chunk_sha.to_vec();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT c.stream_id, c.seq, c.chunk_sha, c.epoch, c.size_bytes, \
+                        c.plaintext_size_bytes, b.crypto_tier, b.cohort_scope \
+                   FROM cirislens.federation_stream_chunks c \
+                   JOIN cirislens.federation_blobs b ON b.sha256 = c.chunk_sha \
+                  WHERE c.chunk_sha = $1 \
+                  ORDER BY c.stream_id, c.seq",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("stream_positions_of_chunk: {e}"))
+            })?;
+        rows.iter()
+            .map(|r| {
+                let stream_id: String =
+                    r.safe_get_with("stream_id", crate::federation::BlobError::Backend)?;
+                Ok((stream_id, pg_stream_chunk_ref(r)?))
+            })
+            .collect()
+    }
+
     async fn promote_adopted_manifest_to_dag(
         &self,
         sha256: &[u8; 32],
