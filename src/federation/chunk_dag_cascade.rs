@@ -2207,6 +2207,102 @@ pub mod orchestrate {
         })
     }
 
+    /// v53.0.0 (CIRISPersist#963 / #942, CC 3.1.3.3) — what a held row is,
+    /// as a custody `here` must know it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DagHolding {
+        /// The row is a whole blob (or no row is held): its row is the copy.
+        NotADag,
+        /// A chunk DAG whose every chunk (and v3 child) is held here.
+        Complete,
+        /// A chunk DAG this node holds only part of: `not_held` names the
+        /// chunks (`seq`) missing here.
+        Incomplete {
+            /// The chunks not held here.
+            not_held: Vec<u64>,
+        },
+        /// A row recorded `chunk_dag` whose manifest `holder_key_id` cannot
+        /// open, so whether every chunk is held cannot be asked.
+        Unverifiable,
+    }
+
+    /// **Is the held row `sha256` a chunk DAG, and is all of it here?** Asked
+    /// as `holder_key_id` (the node filing a custody report), from the
+    /// opened manifest and the chunk rows this node holds.
+    ///
+    /// - a plaintext `chunk_dag` row: the clear manifest's chunks;
+    /// - a sealed row recorded `chunk_dag` (the seal floor's, or a promoted
+    ///   adoption): [`sealed_dag_readiness_for_viewer`]'s `held`;
+    /// - a sealed `inline` row: opened, and a DAG iff its plaintext PARSES as
+    ///   a manifest — the adopted, not-yet-promoted case, whose chunks may be
+    ///   partly here. A sealed inline row the holder cannot open is reported
+    ///   [`DagHolding::NotADag`]: nothing here can tell its bytes apart from a
+    ///   whole blob (the residual, documented on `custody_ack_input_for`).
+    pub async fn held_dag_completeness<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        holder_key_id: &str,
+    ) -> Result<DagHolding, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let Some(head) = backend.blob_head(sha256).await? else {
+            return Ok(DagHolding::NotADag);
+        };
+        let recorded_dag = head.storage_kind == "chunk_dag";
+        if head.crypto_tier == CryptoTier::Plaintext {
+            if !recorded_dag {
+                return Ok(DagHolding::NotADag);
+            }
+            let Some(BlobBody::Inline(bytes)) = backend.get_blob(sha256).await? else {
+                return Ok(DagHolding::Unverifiable);
+            };
+            let mut not_held = Vec::new();
+            match ParsedManifest::parse(&bytes)? {
+                ParsedManifest::Flat(f) => {
+                    for (i, c) in f.chunks.iter().enumerate() {
+                        if backend.blob_head(&c.sha).await?.is_none() {
+                            not_held.push(c.seq.unwrap_or(i as u64));
+                        }
+                    }
+                }
+                ParsedManifest::Nested(_) => return Ok(DagHolding::Unverifiable),
+            }
+            return Ok(if not_held.is_empty() {
+                DagHolding::Complete
+            } else {
+                DagHolding::Incomplete { not_held }
+            });
+        }
+        if !recorded_dag {
+            if head.storage_kind != "inline" {
+                return Ok(DagHolding::NotADag);
+            }
+            let Ok(jcs) = read_sealed_inline_authorized(
+                backend,
+                sha256,
+                head.crypto_tier,
+                holder_key_id,
+                None,
+            )
+            .await
+            else {
+                return Ok(DagHolding::NotADag);
+            };
+            if ParsedManifest::parse(&jcs).is_err() {
+                return Ok(DagHolding::NotADag);
+            }
+        }
+        match sealed_dag_readiness_for_viewer(backend, sha256, holder_key_id, None).await {
+            Ok(r) if r.held => Ok(DagHolding::Complete),
+            Ok(r) => Ok(DagHolding::Incomplete {
+                not_held: r.not_held,
+            }),
+            Err(BlobError::NotGranted { .. }) => Ok(DagHolding::Unverifiable),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The per-chunk promotion checks (#947): each chunk the manifest names
     /// is held at its `(stream_id, seq)` with the named sha, plaintext size
     /// and the manifest's tier.

@@ -7062,6 +7062,50 @@ impl Engine {
         }
     }
 
+    /// v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — **the durability deficit** of
+    /// one blob for `viewer_key_id`: its audience (the claimed nodes its scope
+    /// entitles to hold it, under their owners' allow lists), the audience
+    /// nodes with a live `here` custody report, the rest (`missing`), and the
+    /// placement mode at the shipped tuple. Authorized like
+    /// [`custody_view`](Self::custody_view). Reports; never widens a set.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn durability_deficit(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        stream_id: Option<&str>,
+    ) -> Result<crate::federation::durability::DurabilityDeficit, crate::federation::BlobError>
+    {
+        use crate::federation::durability::{durability_deficit, DEFAULT_FEASIBILITY_FLOOR};
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                durability_deficit(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    stream_id,
+                    DEFAULT_FEASIBILITY_FLOOR,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                durability_deficit(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    stream_id,
+                    DEFAULT_FEASIBILITY_FLOOR,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114; `MEDIA_SOURCE.md`
     /// §9.3) — **seal a small descriptor under an existing blob's DEK.** The
     /// caller is authorized exactly as [`read_blob_as`](Self::read_blob_as)

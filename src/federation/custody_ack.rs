@@ -223,18 +223,18 @@ async fn device_in_cohort(
     target: Option<&str>,
 ) -> Result<bool, Error> {
     let device = row.attesting_key_id.as_str();
-    // A `self` report is the device's own self: the device is local to
-    // itself. Since #963 the self arm otherwise asks the AUTHOR's principals
-    // for this node's class, and a device reporting on itself is not its own
-    // owner's other node. Only `self`: a family or community report still
-    // needs the roster.
-    let own_self = row.cohort_scope == super::types::cohort_scope::SELF;
+    // v53.0.0 (#963) — the ONE audience rule, with no exemption for the
+    // reporter: a `self` report is admitted iff the device is in its
+    // principal's self audience — a claimed personal occurrence (or one its
+    // owner's allow list admits). A server-class or unclaimed key holds none
+    // of an owner's self content, so its `self` report is refused, as the
+    // deficit would never count it.
     super::replication::hold::is_audience(
         directory,
         &row.cohort_scope,
         target,
         device,
-        |k| own_self && k == device,
+        |_| false,
         device,
     )
     .await
@@ -565,6 +565,16 @@ where
 /// the stored row; the cohort is the stored row's, and a caller-named cohort that
 /// differs is refused. With no row held, only `none` can be reported, at the
 /// caller-named cohort.
+///
+/// For a **chunk DAG** (v53.0.0, CIRISPersist#963) `here` means the manifest
+/// AND every chunk it names are held here, asked by
+/// [`held_dag_completeness`](super::chunk_dag_cascade::orchestrate::held_dag_completeness)
+/// as this node: a node missing a chunk is refused
+/// `custody_ack_here_dag_incomplete` (it can report `none`, or nothing), and a
+/// row recorded `chunk_dag` whose manifest this node cannot open is refused
+/// `custody_ack_here_dag_unverifiable`. One residual: an adopted manifest not
+/// yet promoted, which this node cannot open, is indistinguishable from a whole
+/// sealed blob and is reported by its row.
 pub async fn custody_ack_input_for<B>(
     backend: &B,
     blob_sha256: &[u8; 32],
@@ -587,8 +597,35 @@ where
             }
             // The held row IS this node's copy: `blob_head` reads the same
             // stored row `has_blob` counts, so there is no row without bytes
-            // to refuse here. (For a chunk DAG the row is the manifest; whether
-            // every chunk is also held is not asked.)
+            // to refuse here.
+            // v53.0.0 (CIRISPersist#963) — for a chunk DAG the row is only the
+            // manifest, so `here` also asks that every chunk is held: a node
+            // holding the manifest and missing a chunk is not a copy, and the
+            // durability deficit must still list it. Asked as THIS node (the
+            // report's signer); a manifest it cannot open refuses `here`.
+            if state == CustodyState::Here {
+                use super::chunk_dag_cascade::orchestrate::{held_dag_completeness, DagHolding};
+                let me = backend.node_key_id().unwrap_or_default();
+                match held_dag_completeness(backend, blob_sha256, &me)
+                    .await
+                    .map_err(blob_err)?
+                {
+                    DagHolding::NotADag | DagHolding::Complete => {}
+                    DagHolding::Incomplete { not_held } => {
+                        return Err(Error::InvalidArgument(format!(
+                            "custody_ack_here_dag_incomplete: this node holds the manifest but \
+                             not chunks {not_held:?}, so it cannot report `here` (CC 3.1.3.3)"
+                        )));
+                    }
+                    DagHolding::Unverifiable => {
+                        return Err(Error::InvalidArgument(
+                            "custody_ack_here_dag_unverifiable: this node cannot open the DAG's \
+                             manifest, so it cannot say every chunk is held (CC 3.1.3.3)"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             let size = match state {
                 CustodyState::Here => Some(h.size_bytes),
                 CustodyState::None => None,
