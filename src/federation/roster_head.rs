@@ -124,11 +124,30 @@ pub async fn fold_disagreement<F>(
 where
     F: FederationDirectory + ?Sized,
 {
-    let answered = |e: &super::RosterEvent| since.is_none_or(|floor| e.effective_at > floor);
+    fold_disagreement_by(
+        directory,
+        record,
+        &|e: &super::RosterEvent| since.is_none_or(|floor| e.effective_at > floor),
+        as_of,
+    )
+    .await
+}
+
+/// [`fold_disagreement`] over the rows `answered` keeps: the one comparison
+/// every caller shares, whichever rows it holds a version to.
+async fn fold_disagreement_by<F>(
+    directory: &F,
+    record: LineageRecord<'_>,
+    answered: &(dyn Fn(&super::RosterEvent) -> bool + Sync),
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let folded: std::collections::BTreeMap<String, String> = match record {
         LineageRecord::Family(f) => {
             let mut events = Box::pin(super::family_roster_events(directory, f)).await?;
-            events.retain(answered);
+            events.retain(|e| answered(e));
             let members: Vec<super::types::CommunityMember> = f
                 .members
                 .iter()
@@ -142,7 +161,7 @@ where
         LineageRecord::Community(c) => {
             let nodes = Box::pin(super::community_node_bearing_seats(directory, c)).await?;
             let mut events = Box::pin(super::community_roster_events(directory, c, &nodes)).await?;
-            events.retain(answered);
+            events.retain(|e| answered(e));
             super::authorized_roster_at(
                 &c.members,
                 super::RosterRules::of_community(c, &nodes),
@@ -194,6 +213,106 @@ where
                 .map(|held| super::canonical_community::head_instant(&held))
         }
     })
+}
+
+/// When THIS node admitted each roster-plane row of a lineage, keyed by what
+/// the fold's events carry: `(is_add, member key, effective_at)`. The
+/// signer-chosen `effective_at` says when a row takes effect; it is no axis for
+/// which version answers for the row or when its lag is due — a row signed
+/// with an instant before the held head, admitted after it, is still a row the
+/// head has not covered.
+type Admissions = std::collections::BTreeMap<
+    (bool, String, chrono::DateTime<chrono::Utc>),
+    chrono::DateTime<chrono::Utc>,
+>;
+
+async fn admissions<F>(directory: &F, record: LineageRecord<'_>) -> Result<Admissions, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut out = Admissions::new();
+    let mut note = |add: bool, key: &str, eff, at| {
+        let slot = out.entry((add, key.to_owned(), eff)).or_insert(at);
+        if at > *slot {
+            *slot = at;
+        }
+    };
+    match record {
+        LineageRecord::Family(f) => {
+            let id = &f.family_key_id;
+            for s in directory
+                .list_signed_family_membership_widenings_since(None, u32::MAX)
+                .await?
+            {
+                let w = &s.widening.family_membership_widening;
+                if &w.family_key_id == id {
+                    note(true, &w.member_key_id, w.effective_at, s.admitted_at);
+                }
+            }
+            for s in directory
+                .list_signed_family_membership_revocations_since(None, u32::MAX)
+                .await?
+            {
+                let r = &s.revocation.family_membership_revocation;
+                if &r.family_key_id == id {
+                    note(
+                        false,
+                        &r.removed_identity_key_id,
+                        r.effective_at,
+                        s.admitted_at,
+                    );
+                }
+            }
+        }
+        LineageRecord::Community(c) => {
+            let id = &c.community_key_id;
+            for s in directory
+                .list_signed_community_membership_widenings_since(None, u32::MAX)
+                .await?
+            {
+                let w = &s.widening.community_membership_widening;
+                if &w.community_key_id == id {
+                    note(true, &w.member_key_id, w.effective_at, s.admitted_at);
+                }
+            }
+            for s in directory
+                .list_signed_community_membership_revocations_since(None, u32::MAX)
+                .await?
+            {
+                let r = &s.revocation.community_membership_revocation;
+                if &r.community_key_id == id {
+                    note(
+                        false,
+                        &r.removed_identity_key_id,
+                        r.effective_at,
+                        s.admitted_at,
+                    );
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// When this node admitted the row behind `e` (its own `effective_at` when no
+/// served row matches — a row this node did not admit through a door).
+fn admitted_at(index: &Admissions, e: &super::RosterEvent) -> chrono::DateTime<chrono::Utc> {
+    index
+        .get(&(e.is_add, e.member.key_id.clone(), e.effective_at))
+        .copied()
+        .unwrap_or(e.effective_at)
+}
+
+/// The rows a version succeeding a head of instant `floor` answers for: those
+/// that take effect after it, AND those this node admitted after it (a late or
+/// backdated row the held head could not have covered). No floor (the family
+/// arm): every row.
+fn answered_after(
+    floor: Option<chrono::DateTime<chrono::Utc>>,
+    index: &Admissions,
+    e: &super::RosterEvent,
+) -> bool {
+    floor.is_none_or(|f| e.effective_at > f || admitted_at(index, e) > f)
 }
 
 /// **Consequence (i).** Refuse a new version of a witnessed lineage whose
@@ -259,7 +378,14 @@ where
             return Ok(());
         }
     }
-    let keys = fold_disagreement(directory, record, since, as_of).await?;
+    let index = admissions(directory, record).await?;
+    let keys = fold_disagreement_by(
+        directory,
+        record,
+        &|e: &super::RosterEvent| answered_after(since, &index, e),
+        as_of,
+    )
+    .await?;
     if keys.is_empty() {
         return Ok(());
     }
@@ -284,8 +410,8 @@ pub struct RosterLag {
     /// decision names this head as its `prior_family_digest`, with a window
     /// closed before the cutoff. Empty for every lineage but the accord.
     pub uncovered_decisions: Vec<String>,
-    /// The earliest `effective_at` among the uncovered rows (a decision counts
-    /// at its window's close).
+    /// The earliest instant THIS node admitted an uncovered row (a decision
+    /// counts at its window's close).
     pub since: chrono::DateTime<chrono::Utc>,
     /// The charter's `witness_cadence_secs` the lag was judged with (`0` when
     /// the charter declares none: an uncovered row lags from its effective
@@ -297,10 +423,11 @@ pub struct RosterLag {
 /// root is not a witnessed lineage this node holds, or its head covers every
 /// roster row older than one cadence.
 ///
-/// The cutoff is `at − witness_cadence_secs` (the cadence of the charter in
-/// force). The judgment is [`fold_disagreement`] of the held head over the rows
-/// it answers for (`held_floor`) up to the cutoff, so a row younger than one
-/// cadence never lags and a row the head reflects never does.
+/// The judgment is the held head against the fold at `at` over the rows it
+/// answers for — those effective after its instant or admitted here after it —
+/// that this node admitted at least one `witness_cadence_secs` (the charter in
+/// force) before `at`. A row younger here than one cadence never lags, a row
+/// the head reflects never does, and a backdated row does not escape.
 ///
 /// # Errors
 ///
@@ -335,8 +462,15 @@ where
         .and_then(chrono::Duration::try_seconds)
         .and_then(|d| at.checked_sub_signed(d))
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+    // The fold NOW over the rows the head answers for, each counted once
+    // this node has held it for one cadence (timed from its admission here,
+    // never from its signer-chosen instant).
     let since = held_floor(directory, record).await?;
-    let uncovered_keys = fold_disagreement(directory, record, since, cutoff).await?;
+    let index = admissions(directory, record).await?;
+    let due = |e: &super::RosterEvent| {
+        answered_after(since, &index, e) && admitted_at(&index, e) <= cutoff
+    };
+    let uncovered_keys = fold_disagreement_by(directory, record, &due, at).await?;
     let head_digest = match record {
         LineageRecord::Family(f) => f.persist_row_hash.clone(),
         LineageRecord::Community(c) => c.persist_row_hash.clone(),
@@ -345,8 +479,22 @@ where
     let mut earliest = |t: chrono::DateTime<chrono::Utc>| {
         first = Some(first.map_or(t, |s| s.min(t)));
     };
-    for t in plane_instants(directory, record, &uncovered_keys, since, cutoff).await? {
-        earliest(t);
+    for ((add, key, eff), admitted) in &index {
+        let row = super::RosterEvent {
+            effective_at: *eff,
+            is_add: *add,
+            member: super::types::CommunityMember {
+                key_id: key.clone(),
+                joined_at: *eff,
+                role: None,
+            },
+            signers: Default::default(),
+            moderator_roots: Default::default(),
+            reversed: false,
+        };
+        if uncovered_keys.contains(key) && due(&row) {
+            earliest(*admitted);
+        }
     }
     let mut uncovered_decisions = Vec::new();
     if root == super::canonical_community::accord_family_key_id() {
@@ -366,59 +514,6 @@ where
         since: first.unwrap_or(cutoff),
         cadence_secs,
     }))
-}
-
-/// The `effective_at` of every plane row about one of `keys`, at or before
-/// `cutoff` — the instants an uncovered key's rows took effect.
-async fn plane_instants<F>(
-    directory: &F,
-    record: LineageRecord<'_>,
-    keys: &[String],
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    cutoff: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<chrono::DateTime<chrono::Utc>>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
-    let in_window =
-        |t: chrono::DateTime<chrono::Utc>| t <= cutoff && since.is_none_or(|floor| t > floor);
-    let named = |k: &str| keys.iter().any(|x| x == k);
-    let mut out = Vec::new();
-    match record {
-        LineageRecord::Family(f) => {
-            let id = &f.family_key_id;
-            for w in directory.list_family_membership_widenings_for(id).await? {
-                if named(&w.member_key_id) && in_window(w.effective_at) {
-                    out.push(w.effective_at);
-                }
-            }
-            for r in directory.list_family_membership_revocations_for(id).await? {
-                if named(&r.removed_identity_key_id) && in_window(r.effective_at) {
-                    out.push(r.effective_at);
-                }
-            }
-        }
-        LineageRecord::Community(c) => {
-            let id = &c.community_key_id;
-            for w in directory
-                .list_community_membership_widenings_for(id)
-                .await?
-            {
-                if named(&w.member_key_id) && in_window(w.effective_at) {
-                    out.push(w.effective_at);
-                }
-            }
-            for r in directory
-                .list_community_membership_revocations_for(id)
-                .await?
-            {
-                if named(&r.removed_identity_key_id) && in_window(r.effective_at) {
-                    out.push(r.effective_at);
-                }
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// The accord `roster_change` proposals anchored on `head_digest` (CC 3.2 T6:

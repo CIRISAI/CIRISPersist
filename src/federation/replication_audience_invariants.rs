@@ -199,6 +199,14 @@ pub(crate) mod bodies {
         .map(|_| ())
     }
 
+    pub(crate) async fn withdraw_pub(
+        d: &dyn FederationDirectory,
+        author: &str,
+        target: &Attestation,
+    ) {
+        withdraw(d, author, target).await
+    }
+
     async fn withdraw(d: &dyn FederationDirectory, author: &str, target: &Attestation) {
         let id = uuid::Uuid::new_v4().to_string();
         let env =
@@ -959,6 +967,137 @@ pub(crate) mod key_bodies {
             "I392c no further rotation once the set is steady"
         );
     }
+
+    /// The owner's deny-everything grant for `node`, admitted; the row.
+    async fn deny_all<B: FederationDirectory + Sync>(
+        b: &B,
+        owner: &str,
+        node: &str,
+    ) -> crate::federation::Attestation {
+        let g = grant(owner, Some(node), Some(serde_json::json!([])));
+        put(b as &dyn FederationDirectory, &g).await.unwrap();
+        g
+    }
+
+    /// **I397e** (v53.0.0, #963) — a cohort the owner ALLOWS on a node after
+    /// the fact (here: withdrawing the grant that denied it) reaches the node
+    /// with its EARLIER keys: the family blob sealed while it was denied, and
+    /// the room epoch minted while it was denied. The write door that admits
+    /// the withdrawal runs the same walk a re-class does.
+    pub(crate) async fn i397e_an_allow_after_the_fact_brings_the_earlier_keys<B>(
+        b: &B,
+        s: &str,
+        set_node: fn(&B, String),
+    ) where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let d = b as &dyn FederationDirectory;
+        let (owner, laptop, phone, cid, fam) = (
+            format!("i397e-o-{s}"),
+            format!("i397e-l-{s}"),
+            format!("i397e-p-{s}"),
+            format!("i397e-c-{s}"),
+            format!("i397e-f-{s}"),
+        );
+        users(d, &[&owner]).await;
+        nodes(d, &[&laptop, &phone]).await;
+        keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
+        keyed_claim(b, &owner, &phone, device_class::PHONE).await;
+        room(d, &cid, &[&owner]).await;
+        family(d, &fam, &[&owner]).await;
+        let m = minter(b, s).await;
+        set_node(b, m.clone());
+        let deny = deny_all(b, &owner, &laptop).await;
+        let sealed = encrypt_and_cascade(b, FAMILY, &fam, b"i397e family", None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            sealed.granted.contains(&phone) && !sealed.granted.contains(&laptop),
+            "I397e precondition — the denied laptop gets no family key: {:?}",
+            sealed.granted
+        );
+        let (e0, r0) = room_epoch(b, &cid, &m).await;
+        assert!(
+            !r0.contains(&laptop) && r0.contains(&phone),
+            "I397e precondition — nor the room's e{e0}: {r0:?}"
+        );
+
+        super::bodies::withdraw_pub(d, &owner, &deny).await;
+        assert!(
+            b.get_at_rest_grant(&sealed.at_rest_sha256, &laptop)
+                .await
+                .unwrap()
+                .is_some(),
+            "I397e the allowed laptop holds the family blob sealed while it was denied"
+        );
+        let held = b
+            .community_dek_member_grant_recipients(&cid, &m, e0)
+            .await
+            .unwrap();
+        assert!(
+            held.contains(&laptop),
+            "I397e and the room epoch minted while it was denied: {held:?}"
+        );
+    }
+
+    /// **I397f** (v53.0.0, #963) — a cohort the owner DENIES after the fact:
+    /// the door admitting the deny hands the node nothing, the room's epoch
+    /// rolls at the next seal and skips it, and later family content skips it.
+    pub(crate) async fn i397f_a_deny_after_the_fact_rolls_and_grants_nothing<B>(
+        b: &B,
+        s: &str,
+        set_node: fn(&B, String),
+    ) where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let d = b as &dyn FederationDirectory;
+        let (owner, laptop, phone, cid, fam) = (
+            format!("i397f-o-{s}"),
+            format!("i397f-l-{s}"),
+            format!("i397f-p-{s}"),
+            format!("i397f-c-{s}"),
+            format!("i397f-f-{s}"),
+        );
+        users(d, &[&owner]).await;
+        nodes(d, &[&laptop, &phone]).await;
+        keyed_claim(b, &owner, &laptop, device_class::LAPTOP).await;
+        keyed_claim(b, &owner, &phone, device_class::PHONE).await;
+        room(d, &cid, &[&owner]).await;
+        family(d, &fam, &[&owner]).await;
+        let m = minter(b, s).await;
+        set_node(b, m.clone());
+        let (e0, r0) = room_epoch(b, &cid, &m).await;
+        assert!(
+            r0.contains(&laptop),
+            "I397f precondition — the laptop holds e{e0}"
+        );
+        let before = encrypt_and_cascade(b, FAMILY, &fam, b"i397f before", None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            before.granted.contains(&laptop),
+            "I397f precondition — and family"
+        );
+
+        deny_all(b, &owner, &laptop).await;
+        let after = encrypt_and_cascade(b, FAMILY, &fam, b"i397f after", None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !after.granted.contains(&laptop) && after.granted.contains(&phone),
+            "I397f family content after the deny skips the laptop: {:?}",
+            after.granted
+        );
+        let (e1, r1) = room_epoch(b, &cid, &m).await;
+        assert!(
+            e1 > e0,
+            "I397f the deny rolled the room epoch: e{e0} → e{e1}"
+        );
+        assert!(
+            !r1.contains(&laptop) && r1.contains(&phone),
+            "I397f the new epoch skips the denied laptop: {r1:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1081,4 +1220,71 @@ mod key_runners {
         b.run_migrations().await.unwrap();
         Some(b)
     });
+}
+
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod consent_change_runners {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
+    }
+    use crate::federation::replication_audience_invariants::key_bodies as kb;
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite {
+        use super::{kb, suffix};
+        use crate::store::sqlite::SqliteBackend;
+        async fn fresh() -> SqliteBackend {
+            use crate::store::Backend as _;
+            let b = SqliteBackend::open_in_memory().await.unwrap();
+            b.run_migrations().await.unwrap();
+            b
+        }
+        fn set_node(b: &SqliteBackend, k: String) {
+            b.set_node_key_id(k)
+        }
+        #[tokio::test]
+        async fn i397e() {
+            kb::i397e_an_allow_after_the_fact_brings_the_earlier_keys(
+                &fresh().await,
+                &suffix(),
+                set_node,
+            )
+            .await
+        }
+        #[tokio::test]
+        async fn i397f() {
+            kb::i397f_a_deny_after_the_fact_rolls_and_grants_nothing(
+                &fresh().await,
+                &suffix(),
+                set_node,
+            )
+            .await
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    mod postgres {
+        use super::{kb, suffix};
+        use crate::store::postgres::PostgresBackend;
+        async fn fresh() -> Option<PostgresBackend> {
+            use crate::store::Backend as _;
+            let dsn = crate::test_pg::empty_dsn()?;
+            let b = PostgresBackend::connect(&dsn).await.unwrap();
+            b.run_migrations().await.unwrap();
+            Some(b)
+        }
+        fn set_node(b: &PostgresBackend, k: String) {
+            b.set_node_key_id(k)
+        }
+        #[tokio::test]
+        async fn i397e() {
+            let Some(b) = fresh().await else { return };
+            kb::i397e_an_allow_after_the_fact_brings_the_earlier_keys(&b, &suffix(), set_node).await
+        }
+        #[tokio::test]
+        async fn i397f() {
+            let Some(b) = fresh().await else { return };
+            kb::i397f_a_deny_after_the_fact_rolls_and_grants_nothing(&b, &suffix(), set_node).await
+        }
+    }
 }

@@ -223,12 +223,18 @@ async fn device_in_cohort(
     target: Option<&str>,
 ) -> Result<bool, Error> {
     let device = row.attesting_key_id.as_str();
+    // A `self` report is the device's own self: the device is local to
+    // itself. Since #963 the self arm otherwise asks the AUTHOR's principals
+    // for this node's class, and a device reporting on itself is not its own
+    // owner's other node. Only `self`: a family or community report still
+    // needs the roster.
+    let own_self = row.cohort_scope == super::types::cohort_scope::SELF;
     super::replication::hold::is_audience(
         directory,
         &row.cohort_scope,
         target,
         device,
-        |_| false,
+        |k| own_self && k == device,
         device,
     )
     .await

@@ -2379,7 +2379,7 @@ pub mod test_support {
 
     /// v38.6.0 (#773) — a live `delegates_to(owner → node)` carrying the
     /// CC 1.13.3.3 ownership dimension, sealed by the owner.
-    pub(crate) async fn put_owner_binding(
+    pub async fn put_owner_binding(
         dir: &dyn crate::federation::FederationDirectory,
         owner: &str,
         node: &str,
