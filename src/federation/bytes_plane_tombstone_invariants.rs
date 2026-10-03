@@ -2,7 +2,8 @@
 //! **CC 2.3 at the bytes plane**: a withdrawn reference stops the bytes on
 //! every door that reads them, the stored admission rule is never consulted,
 //! one live binding keeps the bytes, the resolver sees the pointer shape, and
-//! `evict_blob` retracts before it deletes.
+//! `evict_blob` retracts before it deletes, and (v53.0.1, I149b) a custody
+//! report is a holding fact, never a binding.
 
 /// The I149–I153 bodies, one per backend runner (sqlite + postgres: the
 /// memory backend has no blob storage).
@@ -373,6 +374,124 @@ pub mod bodies {
         );
     }
 
+    /// A federation-tier `custody:ack:v1` `here` by `device` for `sha`: the
+    /// row node B holds once a device's report reaches it (CIRISEdge#763).
+    #[cfg(test)]
+    async fn custody_here<B>(b: &B, id: &str, device: &str, sha: &[u8; 32])
+    where
+        B: FederationDirectory + Sync,
+    {
+        let mut env = crate::federation::custody_ack::custody_ack_envelope(
+            sha,
+            crate::federation::custody_ack::CustodyState::Here,
+            Some(4096),
+            crate::federation::types::cohort_scope::SELF,
+            None,
+        )
+        .expect("custody envelope");
+        env["id"] = serde_json::json!(id);
+        let mut row = ts::bare_attestation(id, device, device, &env);
+        row.attestation_type = attestation_type::SCORES.into();
+        row.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        ts::seal_row_in_place(device, &mut row);
+        b.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap_or_else(|e| panic!("custody_here {id}: {e}"));
+    }
+
+    /// **I149b — a custody report is a holding fact, never a binding**
+    /// (v53.0.1; CC 2.3 + CC 3.1.3.3; found by CIRISEdge#763). A device that
+    /// filed `here` for a file kept it Live after its author withdrew it, read
+    /// it and served it, and was counted a subject of it.
+    ///
+    /// - (a) the file row withdrawn, the device's `here` standing: Withdrawn,
+    ///   and every door refuses;
+    /// - (b) the report does not make the device a subject (or duty holder)
+    ///   of the content;
+    /// - (d) a GENUINE second referencing row still keeps the bytes Live, so
+    ///   the exclusion is the custody family only.
+    #[cfg(test)]
+    pub async fn i149b_a_custody_report_is_not_a_binding<B>(b: &B, engine: &crate::Engine, s: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let device = crate::federation::custody_ack_invariants::bodies::device(
+            b as &dyn FederationDirectory,
+            &format!("i149b-{s}"),
+        )
+        .await;
+        let (sha, author) = seal_blob(b, &format!("i149b-author-{s}"), b"alice's self file").await;
+        let hx = hex::encode(sha);
+        let file = format!("i149b-file-{s}");
+        bind_row(b, &file, &author, &[&author], &hx, false).await;
+        custody_here(b, &format!("i149b-ack-{s}"), &device, &sha).await;
+
+        let mut ids: Vec<String> = b
+            .attestations_binding_content(&hx)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.attestation_id)
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![file.clone()],
+            "I149b: the resolver returns the file row only — a custody report binds nothing"
+        );
+        // (b)
+        let subjects =
+            crate::federation::admission::subject_of_content(b as &dyn FederationDirectory, &hx)
+                .await
+                .unwrap();
+        assert!(
+            !subjects.contains(&device),
+            "I149b(b): the reporting device is not a subject of the content: {subjects:?}"
+        );
+
+        // (a)
+        withdraw(b, &format!("i149b-w-{s}"), &author, &file)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                binding_state(b as &dyn FederationDirectory, &sha)
+                    .await
+                    .unwrap(),
+                BindingState::Withdrawn { .. }
+            ),
+            "I149b(a): the author withdrew the only binding; the device's `here` keeps nothing Live"
+        );
+        assert_eq!(
+            kind_of(&engine.read_blob_as(&sha, &author, None).await),
+            "blob_withdrawn",
+            "I149b(a): the read door refuses"
+        );
+        assert!(
+            engine.serve_blob_to_peer(&sha, "peer").await.is_err(),
+            "I149b(a): the serve door refuses"
+        );
+
+        // (d) — a genuine second reference keeps a second blob Live.
+        let (sha2, a2) = seal_blob(b, &format!("i149b-a2-{s}"), b"quoted twice").await;
+        let hx2 = hex::encode(sha2);
+        let (r1, r2) = (format!("i149b-r1-{s}"), format!("i149b-r2-{s}"));
+        bind_row(b, &r1, &a2, &[&a2], &hx2, false).await;
+        bind_row(b, &r2, &a2, &[&a2], &hx2, true).await;
+        custody_here(b, &format!("i149b-ack2-{s}"), &device, &sha2).await;
+        withdraw(b, &format!("i149b-w1-{s}"), &a2, &r1)
+            .await
+            .unwrap();
+        assert_eq!(
+            binding_state(b as &dyn FederationDirectory, &sha2)
+                .await
+                .unwrap(),
+            BindingState::Live,
+            "I149b(d): one genuine reference still stands — the exclusion is custody only"
+        );
+        assert_eq!(kind_of(&engine.read_blob_as(&sha2, &a2, None).await), "ok");
+    }
+
     /// **I152 — the resolver sees the pointer shape** (#862 part 2), and an
     /// unreadable pointer at that sha still counts as binding.
     pub async fn i152_the_resolver_sees_the_pointer_shape<B>(b: &B, s: &str)
@@ -592,6 +711,18 @@ mod run {
                     };
                     super::super::bodies::i152_the_resolver_sees_the_pointer_shape(
                         &*b,
+                        &super::suffix(),
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i149b() {
+                    let Some((engine, b)) = $fresh.await else {
+                        return;
+                    };
+                    super::super::bodies::i149b_a_custody_report_is_not_a_binding(
+                        &*b,
+                        &engine,
                         &super::suffix(),
                     )
                     .await

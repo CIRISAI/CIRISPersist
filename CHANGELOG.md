@@ -7,6 +7,26 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.0.1] - 2026-10-03
+
+### Fixed — a custody report kept a withdrawn file Live (CC 2.3; found by CIRISEdge#763)
+
+v53.0.0's `custody:ack:v1` (S2) is a `scores` row that names its blob in `evidence_refs`, which is how it says WHICH bytes its device holds. The shared predicate `admission::envelope_binds_content` counted it as a row that BINDS the content. So on a node that filed `here` for a file:
+- after the author withdrew the file, `blob_tombstone::binding_state` still saw one live binding (the node's own custody report): the node's `read_blob_as` returned the bytes, and its serve door (`serve_blob_to_peer` / `serve_blob_range_to_peer`, the doors a peer pull reaches) served them;
+- `admission::subject_of_content` (and `duty_holders_for_content`, which reads it) counted the reporting DEVICE as a subject of the content.
+
+Every node that reports `here` was affected; Edge files `here` after every self/family pull and re-files it daily.
+
+**Fix.** `envelope_binds_content` returns false for any row under the `custody:` family: a custody report is a holding fact, never a binding. Every reader of "which rows bind this sha" goes through that one predicate. Postgres's `attestations_binding_content` now post-filters through it as sqlite and memory already did; before, it took any `scores` row whose envelope MENTIONED the sha as a binding (a second, wider miscount on postgres only).
+
+**Swept** (READ): `binding_state` / `refuse_if_withdrawn` (the read and serve doors), `subject_of_content` / `duty_holders_for_content`, the replication hold provenance check (`hold::HeldBlob::from_attestation`: a custody report is no longer accepted as the row bytes flowed from, which is correct), and `renditions::sized_holder_claims` all route through the predicate. The holder, eviction, census and community-epoch readers (`list_holders`, `list_local_holders`, `list_held_by`, `evict_actor`, `evict_blob_on`, `community_dek_evict_epoch_objects`) select `holds_bytes:*` rows only, and topology reads `delegates_to` only: not affected.
+
+**Not fixed here (pre-existing since v47.2.0, filed as CIRISPersist#979):** persist's serve door judges a DAG CHUNK by the chunk's own bindings, and no row binds a chunk (rows bind the manifest), so a chunk of a withdrawn DAG reads Unbound at persist's door. Edge's revocation register in front of that door (CIRISEdge#606) is what refuses it today. Persist stores no chunk→manifest link (the manifest is sealed), so closing it needs a link written at seal and adopt.
+
+**Witness I149b** (sqlite, postgres): the file row withdrawn with a device's `here` standing reads Withdrawn, and the read and serve doors refuse; the device is not a subject of the content; a genuine second referencing row still keeps a blob Live. Dropping the exclusion fails it.
+
+**Adopters.** Nothing to call. Edge: move the pin to v53.0.1; your #763 witness that pinned Live on B goes red as intended. Server: pin v53.0.1 for 0.5.220.
+
 ## [53.0.0] - 2026-10-03
 
 ### Adopters — read first
