@@ -12,6 +12,8 @@
 //!   held.
 //! - **I450g** a removal: the charter must drop the removed holder (a charter
 //!   still committing them is a stray at the version), then it is admitted.
+//! - **I450i** from disk: the genesis bundle check runs the same coverage
+//!   rule and propagates its refusal.
 //! - **I450h** the standing roster is the HELD head's: cosigns from the holder
 //!   being added do not count toward the majority.
 
@@ -519,6 +521,38 @@ pub(crate) mod bodies {
         )
         .await
         .unwrap_or_else(|e| panic!("I450h: two of the standing three: {e}"));
+    }
+}
+
+#[cfg(test)]
+mod pure {
+    /// **I450i** — from disk, comments stripped: the genesis bundle check runs
+    /// the same coverage rule as the version door and PROPAGATES its refusal.
+    /// A bundle whose charter misses a holder cannot be built here without also
+    /// breaking the record-equality leg that runs first, so the leg is pinned by
+    /// its code; `charter_commitments_cover` itself is witnessed by I432, I433,
+    /// I450e and I450g through the door.
+    #[test]
+    fn i450i_genesis_runs_the_coverage_rule() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/federation/genesis/ceremony_verify.rs");
+        let code: String = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("fn check_family_record(")
+            .expect("check_family_record");
+        let body = &code[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("accord_roster::charter_commitments_cover(")
+                && flat.contains(".map_err(|(token, detail)| format!(\"{token}: {detail}\"))?;"),
+            "I450i: the genesis check propagates the coverage refusal"
+        );
     }
 }
 
