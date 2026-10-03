@@ -154,6 +154,16 @@ pub(crate) mod bodies {
         }
     }
 
+    /// CC 2.x `group_kind`: `family` | `community` (an affiliation is a
+    /// community record, CC 4.4.3.2.8).
+    fn group_kind(scope: &str) -> &'static str {
+        if scope == FAMILY {
+            "family"
+        } else {
+            "community"
+        }
+    }
+
     /// An inviter's proposal of `invitee` into `group`.
     pub(crate) fn proposal(
         proposer: &str,
@@ -171,7 +181,7 @@ pub(crate) mod bodies {
             serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "dimension": PROPOSAL_DIMENSION,
-                "group_kind": scope,
+                "group_kind": group_kind(scope),
                 target_key(scope): group,
                 "role": role,
             }),
@@ -197,7 +207,7 @@ pub(crate) mod bodies {
         let mut env = serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
             "dimension": if accept { ACCEPTANCE_DIMENSION } else { DECLINE_DIMENSION },
-            "group_kind": p.cohort_scope,
+            "group_kind": group_kind(&p.cohort_scope),
             target_key(&p.cohort_scope): group,
             "references_attestation_id": p.attestation_id,
             "proposal_hash": p.original_content_hash,

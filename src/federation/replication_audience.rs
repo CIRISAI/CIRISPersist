@@ -311,7 +311,8 @@ where
 }
 
 /// **Is `group` a public group** (CC 5.4.6 / 4.4.3.2.1, CIRISEdge#761)? An
-/// authority-gated `infrastructure` community, the accord family, a family
+/// authority-gated `infrastructure` community, a ROOTED trust-root community
+/// (keyless: rooted by its accord birth chain), the accord family, a family
 /// holding a live `trust:charter:v1` (a conferring family), or the
 /// deployment's WA family (`ReclaimPolicy::WA_FAMILY_ENV`). Config- and
 /// state-derived ids only; never a name match.
@@ -330,6 +331,16 @@ where
     match dir.lookup_community(group).await {
         Ok(Some(c)) => {
             if super::admission::is_authorized_infrastructure_community(dir, &c).await? {
+                return Ok(true);
+            }
+            // v53.0.0 — a KEYLESS trust-root community (`ciris-canonical`) has
+            // no key record to carry `substrate_persist`; its authority is
+            // its chain from an accord birth. ROOTED by the one rooting
+            // function ⇒ public. A squat at the id, or a stalled row, is not.
+            if matches!(
+                super::canonical_community::stored_standing(dir, group).await?,
+                super::canonical_community::StoredStanding::Rooted(_)
+            ) {
                 return Ok(true);
             }
         }
@@ -489,11 +500,14 @@ impl Verdict {
 /// 2. refers-to — the recipient is the row's `attested_key_id`, one of its
 ///    `subject_key_ids`, or the `for_key_id` it is FOR (so a node receives
 ///    its own grant, config and revocations, and a sibling node does not);
-/// 3. an owner's grant FOR another node goes no further (a node receives
+/// 3. a membership ceremony row (CC 3.1.3.2): a proposal reaches every node
+///    whose principals include its invitee; every stage reaches the group's
+///    membership-plane audience ([`may_receive_group_plane`]);
+/// 4. an owner's grant FOR another node goes no further (a node receives
 ///    only its own allow list);
-/// 4. the commons, or a public group;
-/// 5. the row's cohort [`audience_nodes`] contains the recipient;
-/// 6. else no.
+/// 5. the commons, or a public group;
+/// 6. the row's cohort [`audience_nodes`] contains the recipient;
+/// 7. else no.
 pub async fn may_receive<D>(dir: &D, recipient: &str, row: &Attestation) -> Result<Verdict, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -514,6 +528,45 @@ where
                 == Some(recipient))
     {
         return Ok(Verdict::Yes(Reason::RefersTo));
+    }
+    // v53.0.0 (CIRISEdge#761) — **a membership ceremony row is roster, not
+    // content.** CC 3.1.3.2: the invitee K is named in `subject_key_ids`
+    // because it is "the key the substrate delivers on — a proposal is
+    // readable by, and applied on, any node whose self-collective contains
+    // that entry, without that node holding the group's roster". So a
+    // proposal reaches every node whose principals include K. An acceptance
+    // or decline goes back to whoever asked: the proposer's nodes, resolved
+    // from the proposal it answers (the invitee's node does not hold the
+    // roster, so the proposal is the only fact it has about the proposer).
+    // Every stage also reaches the group's membership-plane audience
+    // ([`may_receive_group_plane`]: member nodes and live invitees' nodes by
+    // principal binding, not the per-node content allow list).
+    if !key_set {
+        if let Some((stage, group)) = super::membership_acceptance::membership_group_of(row) {
+            let mut mine: HashSet<String> = super::self_collective::principals_of(dir, recipient)
+                .await?
+                .into_iter()
+                .collect();
+            mine.insert(recipient.to_owned());
+            if stage == super::membership_acceptance::MembershipRow::Proposal {
+                if row.subject_key_ids.iter().any(|k| mine.contains(k)) {
+                    return Ok(Verdict::Yes(Reason::RefersTo));
+                }
+            } else if let Some(p) =
+                super::membership_acceptance::answered_proposal_of(dir, row).await?
+            {
+                let mut theirs: HashSet<String> =
+                    super::self_collective::principals_of(dir, &p.attesting_key_id)
+                        .await?
+                        .into_iter()
+                        .collect();
+                theirs.insert(p.attesting_key_id.clone());
+                if theirs.iter().any(|k| mine.contains(k)) {
+                    return Ok(Verdict::Yes(Reason::RefersTo));
+                }
+            }
+            return may_receive_group_plane(dir, recipient, &row.cohort_scope, &group, None).await;
+        }
     }
     // CC 6.1.5.3 — "a node receives only its own allowlist": an owner's
     // grant FOR another node reaches that node (refers-to, above) and its
