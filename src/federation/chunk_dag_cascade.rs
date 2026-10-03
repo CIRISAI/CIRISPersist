@@ -2238,10 +2238,16 @@ pub mod orchestrate {
     ///   partly here. A sealed inline row the holder cannot open is reported
     ///   [`DagHolding::NotADag`]: nothing here can tell its bytes apart from a
     ///   whole blob (the residual, documented on `custody_ack_input_for`).
+    ///
+    /// `caller_aad` is the associated data the DAG was sealed under (an edge
+    /// file pointer binds `content_aad(attester, asserted_at, content_field)`),
+    /// passed to the manifest open exactly as a read passes it. A manifest that
+    /// does not open under it is `SealDidNotOpen`, never "not a DAG".
     pub async fn held_dag_completeness<B>(
         backend: &B,
         sha256: &[u8; 32],
         holder_key_id: &str,
+        caller_aad: Option<&[u8]>,
     ) -> Result<DagHolding, BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
@@ -2278,22 +2284,26 @@ pub mod orchestrate {
             if head.storage_kind != "inline" {
                 return Ok(DagHolding::NotADag);
             }
-            let Ok(jcs) = read_sealed_inline_authorized(
+            let jcs = match read_sealed_inline_authorized(
                 backend,
                 sha256,
                 head.crypto_tier,
                 holder_key_id,
-                None,
+                caller_aad,
             )
             .await
-            else {
-                return Ok(DagHolding::NotADag);
+            {
+                Ok(jcs) => jcs,
+                // The holder is authorized and the bytes did not open under
+                // the caller's data: the caller named the wrong context.
+                Err(e @ BlobError::SealDidNotOpen { .. }) => return Err(e),
+                Err(_) => return Ok(DagHolding::NotADag),
             };
             if ParsedManifest::parse(&jcs).is_err() {
                 return Ok(DagHolding::NotADag);
             }
         }
-        match sealed_dag_readiness_for_viewer(backend, sha256, holder_key_id, None).await {
+        match sealed_dag_readiness_for_viewer(backend, sha256, holder_key_id, caller_aad).await {
             Ok(r) if r.held => Ok(DagHolding::Complete),
             Ok(r) => Ok(DagHolding::Incomplete {
                 not_held: r.not_held,

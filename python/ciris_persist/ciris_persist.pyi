@@ -1833,7 +1833,7 @@ class Engine:
     def provenance_chain(self, key_id: str) -> str:
         """(derived) testimonial — Verify-consumable provenance read (CIRISVerify WS-4)."""
 
-    def put_custody_ack(self, at_rest_sha256_hex: str, state: str, cohort_scope: str | None = None, cohort_target: str | None = None) -> str:
+    def put_custody_ack(self, at_rest_sha256_hex: str, state: str, cohort_scope: str | None = None, cohort_target: str | None = None, aad_b64: str | None = None) -> str:
         """(derived) testimonial — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — this node's custody report for one blob: state is "here" or "none". here needs the bytes on this no..."""
 
     def put_delivery_receipt(self, receipt_json: str) -> None:

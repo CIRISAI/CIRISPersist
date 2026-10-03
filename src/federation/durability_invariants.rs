@@ -495,7 +495,7 @@ pub(crate) mod engine_bodies {
         let p = pair(dsn_a, dsn_b, run, pick, "i415b").await;
         // control: every chunk held — `here` is filed and counted
         let whole = sealed_dag(&p, &format!("i415b-whole-{run}")).await;
-        p.a.put_custody_ack(&whole, CustodyState::Here, None, None)
+        p.a.put_custody_ack(&whole, CustodyState::Here, None, None, None)
             .await
             .expect("I415b a node holding the manifest and every chunk files `here`");
         let d =
@@ -530,7 +530,7 @@ pub(crate) mod engine_bodies {
             "I415b chunk 1 is evicted on node A"
         );
         let r =
-            p.a.put_custody_ack(&root, CustodyState::Here, None, None)
+            p.a.put_custody_ack(&root, CustodyState::Here, None, None, None)
                 .await;
         assert!(
             r.as_ref()
@@ -543,7 +543,7 @@ pub(crate) mod engine_bodies {
             "I415b the partial holder is listed missing: {d:?}"
         );
         // it can still say it holds nothing whole
-        p.a.put_custody_ack(&root, CustodyState::None, None, None)
+        p.a.put_custody_ack(&root, CustodyState::None, None, None, None)
             .await
             .expect("I415b `none` is always reportable");
         // node B adopts the manifest AS RECEIVED (inline, not promoted: no
@@ -592,7 +592,7 @@ pub(crate) mod engine_bodies {
             "I415b the adopted manifest is not promoted"
         );
         let r =
-            p.b.put_custody_ack(&whole, CustodyState::Here, None, None)
+            p.b.put_custody_ack(&whole, CustodyState::Here, None, None, None)
                 .await;
         assert!(
             r.as_ref()

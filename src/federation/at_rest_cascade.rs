@@ -4907,13 +4907,38 @@ pub mod blob_invariants {
             "{tag} I19: a deleted blob holds the epoch's object count above zero — its DEK \
              can never be destroyed"
         );
+        // v53.0.0 (CIRISEdge#763) — the grant is a key-plane fact, not a
+        // byte holding: an eviction keeps it, so re-fetched bytes open. Asked
+        // of a SELF blob, which carries a per-blob grant (a community blob is
+        // keyed by its epoch's member grants and never has one — the pre-v53
+        // leg here asked a community blob and could not fail).
+        let own = super::orchestrate::encrypt_and_cascade(
+            backend,
+            crate::federation::types::cohort_scope::SELF,
+            &alice,
+            b"y",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             backend
-                .get_at_rest_grant(&sealed.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
+                .get_at_rest_grant(&own.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
                 .await
                 .unwrap()
-                .is_none(),
-            "{tag} I19: an at-rest grant OUTLIVED its blob"
+                .is_some(),
+            "{tag} I19 precondition: a self blob carries its self-retention grant"
+        );
+        assert!(backend.delete_blob(&own.at_rest_sha256).await.unwrap());
+        assert!(
+            backend
+                .get_at_rest_grant(&own.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I19: an eviction deleted the at-rest grant — re-fetched bytes could never open"
         );
     }
 

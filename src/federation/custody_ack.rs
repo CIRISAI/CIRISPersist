@@ -575,12 +575,18 @@ where
 /// `custody_ack_here_dag_unverifiable`. One residual: an adopted manifest not
 /// yet promoted, which this node cannot open, is indistinguishable from a whole
 /// sealed blob and is reported by its row.
+///
+/// `caller_aad` is the associated data the DAG was sealed under (an edge file
+/// pointer's `content_aad`); the completeness check opens the manifest with it,
+/// as a read would. A manifest that does not open under it is refused
+/// `custody_ack_here_seal_did_not_open`.
 pub async fn custody_ack_input_for<B>(
     backend: &B,
     blob_sha256: &[u8; 32],
     state: CustodyState,
     cohort_scope: Option<&str>,
     cohort_target: Option<&str>,
+    caller_aad: Option<&[u8]>,
 ) -> Result<super::EmitAttestationInput, Error>
 where
     B: BlobStorage + FederationDirectory + Sync,
@@ -606,10 +612,20 @@ where
             if state == CustodyState::Here {
                 use super::chunk_dag_cascade::orchestrate::{held_dag_completeness, DagHolding};
                 let me = backend.node_key_id().unwrap_or_default();
-                match held_dag_completeness(backend, blob_sha256, &me)
-                    .await
-                    .map_err(blob_err)?
-                {
+                let holding =
+                    match held_dag_completeness(backend, blob_sha256, &me, caller_aad).await {
+                        Ok(h) => h,
+                        Err(BlobError::SealDidNotOpen { .. }) => {
+                            return Err(Error::InvalidArgument(
+                            "custody_ack_here_seal_did_not_open: the DAG's manifest did not open \
+                             under the associated data given; pass the data it was sealed under \
+                             (CC 3.1.3.3)"
+                                .into(),
+                        ));
+                        }
+                        Err(e) => return Err(blob_err(e)),
+                    };
+                match holding {
                     DagHolding::NotADag | DagHolding::Complete => {}
                     DagHolding::Incomplete { not_held } => {
                         return Err(Error::InvalidArgument(format!(

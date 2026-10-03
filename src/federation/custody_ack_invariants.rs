@@ -622,7 +622,7 @@ mod engine_bodies {
             .await
             .unwrap();
         let head = l.ba.blob_head(&s.at_rest_sha256).await.unwrap().unwrap();
-        e.put_custody_ack(&s.at_rest_sha256, CustodyState::Here, None, None)
+        e.put_custody_ack(&s.at_rest_sha256, CustodyState::Here, None, None, None)
             .await
             .expect("I400e the node reports a blob it holds");
         let v = e
@@ -657,7 +657,7 @@ mod engine_bodies {
         let mut absent = s.at_rest_sha256;
         absent[0] ^= 0xff;
         let r = e
-            .put_custody_ack(&absent, CustodyState::Here, None, None)
+            .put_custody_ack(&absent, CustodyState::Here, None, None, None)
             .await;
         assert!(
             r.as_ref()
@@ -665,18 +665,24 @@ mod engine_bodies {
             "I400e here for a blob not held: {r:?}"
         );
         let r = e
-            .put_custody_ack(&absent, CustodyState::None, None, None)
+            .put_custody_ack(&absent, CustodyState::None, None, None, None)
             .await;
         assert!(
             r.as_ref()
                 .is_err_and(|e| e.to_string().contains("custody_ack_malformed")),
             "I400e none with no row names the cohort: {r:?}"
         );
-        e.put_custody_ack(&absent, CustodyState::None, Some(SELF), None)
+        e.put_custody_ack(&absent, CustodyState::None, Some(SELF), None, None)
             .await
             .expect("I400e none for a dropped blob at its named cohort");
         let r = e
-            .put_custody_ack(&s.at_rest_sha256, CustodyState::None, Some(COMMUNITY), None)
+            .put_custody_ack(
+                &s.at_rest_sha256,
+                CustodyState::None,
+                Some(COMMUNITY),
+                None,
+                None,
+            )
             .await;
         assert!(
             r.as_ref()
@@ -684,7 +690,7 @@ mod engine_bodies {
             "I400e a cohort that differs from the held row's: {r:?}"
         );
         // I409e — a newer none is the verdict, re-derived on every read.
-        e.put_custody_ack(&s.at_rest_sha256, CustodyState::None, None, None)
+        e.put_custody_ack(&s.at_rest_sha256, CustodyState::None, None, None, None)
             .await
             .expect("I409e the node reports it dropped the copy");
         let v = e
@@ -702,7 +708,7 @@ mod engine_bodies {
             .put_blob_scoped(COMMUNITY, Some(&l.comm), b"room bytes", None, None)
             .await
             .unwrap();
-        e.put_custody_ack(&c.at_rest_sha256, CustodyState::Here, None, None)
+        e.put_custody_ack(&c.at_rest_sha256, CustodyState::Here, None, None, None)
             .await
             .expect("I400e a member reports a community blob; the target comes from the epoch");
         // a stranger learns nothing

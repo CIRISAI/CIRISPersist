@@ -6999,6 +6999,9 @@ impl Engine {
     /// `cohort_scope` is refused. `cohort_target` names the family or
     /// community (a community blob's is read from its sealing epoch when
     /// omitted). Re-acknowledge about daily: a report is live for 72 h.
+    /// `caller_aad` is the associated data a chunk DAG was sealed under (an
+    /// edge file pointer's `content_aad`): `here` opens the manifest with it
+    /// to check every chunk is held.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn put_custody_ack(
         &self,
@@ -7006,6 +7009,7 @@ impl Engine {
         state: crate::federation::custody_ack::CustodyState,
         cohort_scope: Option<&str>,
         cohort_target: Option<&str>,
+        caller_aad: Option<&[u8]>,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::custody_ack::custody_ack_input_for;
         let input = match &self.backend {
@@ -7017,6 +7021,7 @@ impl Engine {
                     state,
                     cohort_scope,
                     cohort_target,
+                    caller_aad,
                 )
                 .await?
             }
@@ -7028,6 +7033,7 @@ impl Engine {
                     state,
                     cohort_scope,
                     cohort_target,
+                    caller_aad,
                 )
                 .await?
             }

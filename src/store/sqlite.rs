@@ -19252,11 +19252,41 @@ fn sqlite_append_chunk_item(
     row: &SqliteChunkRow,
     steps: &mut u64,
 ) -> Result<ItemAppended, rusqlite::Error> {
+    let sha_vec = row.sha256.to_vec();
+    // 0. v53.0.0 (CIRISEdge#763) — REPAIR. An eviction removes a chunk's
+    //    bytes and keeps its stream position; re-adopting the IDENTICAL
+    //    `(seq, chunk_sha)` brings the bytes back at that position and counts
+    //    nothing (the position was counted when it was first stored). A
+    //    DIFFERENT sha at a held position is still a conflict. Adoption only:
+    //    a producer append never re-uses a position.
+    let repair = if c.bind_as_declared {
+        let held: Option<(Vec<u8>, i64)> = {
+            let mut st = conn.prepare_cached(
+                "SELECT chunk_sha, epoch FROM federation_stream_chunks \
+                  WHERE stream_id = ?1 AND seq = ?2",
+            )?;
+            let v = st
+                .query_row(rusqlite::params![c.stream_id, row.seq_i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            *steps += vm_steps(&st);
+            v
+        };
+        match held {
+            None => false,
+            Some((held_sha, held_epoch)) if held_sha == sha_vec && held_epoch == c.epoch_i64 => {
+                true
+            }
+            Some(_) => return Ok(ItemAppended::SeqConflict),
+        }
+    } else {
+        false
+    };
     // 1. The chunk's bytes as a normal federation_blobs row
     //    (content-addressed + idempotent), carrying the cohort and the tier
     //    the door resolved (§11.1 / §12.1). #846 (§5) — the chunk's author is
     //    the claimed owner.
-    let sha_vec = row.sha256.to_vec();
     {
         let mut st = conn.prepare_cached(
             "INSERT INTO federation_blobs (\
@@ -19277,6 +19307,21 @@ fn sqlite_append_chunk_item(
             c.owner_key_id,
         ])?;
         *steps += vm_steps(&st);
+    }
+    if repair {
+        // The position and its count stand; only the binding (removed with
+        // the bytes) comes back, as declared.
+        if let Some(b) = c.binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            conn.execute(
+                "INSERT INTO federation_community_blob_epoch \
+                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING",
+                rusqlite::params![sha_vec, b.community_key_id, b.minter_key_id, ep],
+            )?;
+        }
+        return Ok(ItemAppended::Ok);
     }
     // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b): a (stream_id,
     //    epoch) holds at most MAX_CHUNKS_PER_EPOCH chunks; past that the
@@ -19831,10 +19876,14 @@ impl SqliteBackend {
         sha256: &[u8; 32],
     ) -> Result<bool, crate::federation::BlobError> {
         let sha_vec = sha256.to_vec();
-        // v43.0.0 (§11.5, I19) — the satellites die with the blob, in one
+        // v43.0.0 (§11.5, I19) — the epoch binding dies with the blob, in one
         // transaction: a binding that outlives its blob holds the epoch's
-        // object count above zero forever; a grant that outlives its blob is
-        // key material for nothing.
+        // object count above zero forever. v53.0.0 (CIRISEdge#763) — the
+        // at-rest key GRANTS do not: an eviction removes BYTES, and a grant
+        // is a key-plane fact (who may open the content), not a byte holding.
+        // A device that re-fetches evicted bytes opens them with the grant it
+        // already held; no key_grant set is re-applied. A tombstone is judged
+        // at the read and serve doors (#853), never by deleting a grant here.
         self.write(move |conn| -> Result<usize, rusqlite::Error> {
             let tx = conn.transaction()?;
             // v52.0.0 (#954) — a v3 root's children die with it (found by
@@ -19848,10 +19897,6 @@ impl SqliteBackend {
                 it.collect::<Result<_, _>>()?
             };
             for sha in children.iter().chain(std::iter::once(&sha_vec)) {
-                tx.execute(
-                    "DELETE FROM federation_blob_key_grants WHERE at_rest_sha256 = ?1",
-                    rusqlite::params![sha],
-                )?;
                 tx.execute(
                     "DELETE FROM federation_community_blob_epoch WHERE at_rest_sha256 = ?1",
                     rusqlite::params![sha],

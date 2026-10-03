@@ -14330,8 +14330,11 @@ impl PyEngine {
     /// takes the stored length as its size. `cohort_scope` is needed only when
     /// no row is held (`none` for a dropped blob); `cohort_target` names the
     /// family or community. Returns the new `attestation_id`. Re-acknowledge
-    /// about daily: a report is live for 72 hours.
-    #[pyo3(signature = (at_rest_sha256_hex, state, cohort_scope=None, cohort_target=None))]
+    /// about daily: a report is live for 72 hours. `aad_b64` is the associated
+    /// data a chunk DAG was sealed under (an edge file pointer's
+    /// `content_aad`); `here` opens the manifest with it, and a manifest that
+    /// does not open under it is refused `custody_ack_here_seal_did_not_open`.
+    #[pyo3(signature = (at_rest_sha256_hex, state, cohort_scope=None, cohort_target=None, aad_b64=None))]
     fn put_custody_ack(
         &self,
         py: Python<'_>,
@@ -14339,10 +14342,12 @@ impl PyEngine {
         state: &str,
         cohort_scope: Option<String>,
         cohort_target: Option<String>,
+        aad_b64: Option<String>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let aad = decode_aad_b64(aad_b64.as_deref())?;
             let state =
                 crate::federation::custody_ack::CustodyState::parse(state).ok_or_else(|| {
                     PyValueError::new_err(format!(
@@ -14367,6 +14372,7 @@ impl PyEngine {
                             state,
                             cohort_scope.as_deref(),
                             cohort_target.as_deref(),
+                            aad.as_deref(),
                         )
                         .await
                         .map_err(federation_err_to_py)

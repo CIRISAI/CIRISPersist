@@ -1041,11 +1041,42 @@ async fn pg_append_chunk_item(
             crate::federation::BlobError::Backend(format!("put_blob_chunk {what}: {e}"))
         }
     };
+    let sha_vec = row.sha256.to_vec();
+    // 0. v53.0.0 (CIRISEdge#763) — REPAIR. An eviction removes a chunk's
+    //    bytes and keeps its stream position; re-adopting the IDENTICAL
+    //    `(seq, chunk_sha)` brings the bytes back at that position and counts
+    //    nothing (the position was counted when it was first stored). A
+    //    DIFFERENT sha at a held position is still a conflict. Adoption only:
+    //    a producer append never re-uses a position.
+    let repair = if c.bind_as_declared {
+        let held = tx
+            .query_opt(
+                "SELECT chunk_sha, epoch FROM cirislens.federation_stream_chunks \
+                  WHERE stream_id = $1 AND seq = $2",
+                &[&c.stream_id, &row.seq_i64],
+            )
+            .await
+            .map_err(be("held position"))?;
+        match held {
+            None => false,
+            Some(r) => {
+                let held_sha: Vec<u8> =
+                    r.safe_get_with("chunk_sha", crate::federation::BlobError::Backend)?;
+                let held_epoch: i64 =
+                    r.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+                if held_sha != sha_vec || held_epoch != c.epoch_i64 {
+                    return Ok(PgItemAppended::SeqConflict);
+                }
+                true
+            }
+        }
+    } else {
+        false
+    };
     // 1. The chunk's bytes land as a normal federation_blobs row.
     //    Content-addressed + idempotent. Carries the cohort and the tier the
     //    door resolved (§11.1 / §12.1). #846 (§5) — the chunk's author is the
     //    claimed owner.
-    let sha_vec = row.sha256.to_vec();
     let media_type_null: Option<String> = None;
     tx.execute(
         "INSERT INTO cirislens.federation_blobs (\
@@ -1067,6 +1098,23 @@ async fn pg_append_chunk_item(
     )
     .await
     .map_err(be("blob insert"))?;
+    if repair {
+        // The position and its count stand; only the binding (removed with
+        // the bytes) comes back, as declared.
+        if let Some(b) = c.binding {
+            let ep = i64::try_from(b.epoch).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO cirislens.federation_community_blob_epoch \
+                    (at_rest_sha256, community_key_id, minter_key_id, epoch) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING",
+                &[&sha_vec, &b.community_key_id, &b.minter_key_id, &ep],
+            )
+            .await
+            .map_err(be("repair bind"))?;
+        }
+        return Ok(PgItemAppended::Ok);
+    }
 
     // 2. Nonce-safety cap (CEG §10.5.2/§10.5.3, Cut C3b). v52.0.0 (#957):
     //    the V165 counter, stepped and read back in one statement — a

@@ -1984,9 +1984,15 @@ pub trait BlobStorage: Send + Sync {
         Output = Result<Option<crate::federation::types::cohort_scope::CryptoTier>, BlobError>,
     > + Send;
 
-    /// v43.0.0 (§11.5, I19) — delete a blob row **and its satellites** (the
-    /// epoch binding, the at-rest grants) in one transaction. `Ok(false)` if
-    /// no blob row existed. The floor every eviction path ends at.
+    /// v43.0.0 (§11.5, I19) — delete a blob row **and its epoch binding** in
+    /// one transaction. `Ok(false)` if no blob row existed. The floor every
+    /// eviction path ends at.
+    ///
+    /// v53.0.0 (CIRISEdge#763) — the at-rest key **grants stay**: an eviction
+    /// removes BYTES, and a grant is a key-plane fact, not a byte holding. A
+    /// device that re-fetches the bytes opens them with the grant it held, with
+    /// no key_grant set re-applied. Grants are removed only where the key plane
+    /// says so: an epoch's destruction sweep and an abandoned stream.
     fn delete_blob(
         &self,
         sha256: &[u8; 32],

@@ -201,6 +201,10 @@ pub(crate) mod rc7_accord_invariants;
 /// CIRISPersist#973 — I345–I349, the community boot leg and the re-bake path.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod remint_invariants;
+/// v53.0.0 (CIRISEdge#763) — I415c–I415f: repair after eviction, and the
+/// custody report under the data a DAG was sealed with.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod repair_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
