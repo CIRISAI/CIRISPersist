@@ -459,10 +459,24 @@ pub(crate) mod bodies {
         stand_up(d).await;
         let before = held(d).await;
         let holders = ids(&before);
-        let new = newcomer(d, tag).await;
-        let change = adding(&new, before.members[0].role.clone());
+        let role = before.members[0].role.clone();
+        let n1 = newcomer(d, &format!("{tag}1")).await;
+        let n2 = newcomer(d, &format!("{tag}2")).await;
+        let change = SeatChange {
+            remove: vec![],
+            add: vec![
+                SeatAdd {
+                    key_id: n1.clone(),
+                    role: role.clone(),
+                },
+                SeatAdd {
+                    key_id: n2.clone(),
+                    role,
+                },
+            ],
+        };
         let mut grown = holders.clone();
-        grown.push(new.clone());
+        grown.extend([n1.clone(), n2.clone()]);
         let charter = rescrub(d, &grown, tag).await;
         let decision = decide(
             d,
@@ -472,15 +486,39 @@ pub(crate) mod bodies {
             &format!("ar-h-{tag}"),
         )
         .await;
+        // One standing yes and both newcomers' are 3 of the OFFERED 5 but 1 of
+        // the standing 3.
         refused(
             apply(
                 d,
-                version(d, &change, &decision, &charter, &[&holders[0], &new], &new).await,
+                version(
+                    d,
+                    &change,
+                    &decision,
+                    &charter,
+                    &[&holders[0], &n1, &n2],
+                    &n1,
+                )
+                .await,
             )
             .await,
             "accord_roster_change_short",
-            "I450h: one standing yes plus the newcomer's",
+            "I450h: the newcomers' yes counts for nothing",
         );
+        apply(
+            d,
+            version(
+                d,
+                &change,
+                &decision,
+                &charter,
+                &[&holders[0], &holders[1]],
+                &n1,
+            )
+            .await,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("I450h: two of the standing three: {e}"));
     }
 }
 
