@@ -614,13 +614,13 @@ pub mod orchestrate {
                 "carries a nonce that is not the STREAM nonce of its stream, epoch and DEK",
             ));
         }
+        // #842 — the authorized viewer's open failing under the data presented
+        // is the typed crypto-class refusal, as on every other sealed row.
         let plain = crate::federation::at_rest_cascade::open_aad(dek, Some(bound_aad), envelope)
-            .map_err(|e| {
-                BlobError::Backend(format!(
-                    "stream chunk {} did not open ({e})",
-                    hex::encode(chunk_sha)
-                ))
-            })?;
+            .map_err(crate::federation::at_rest_cascade::open_err(
+                chunk_sha,
+                |e| BlobError::Backend(format!("stream chunk did not open ({e})")),
+            ))?;
         Ok((plain, crate::federation::StreamKeySlot { counter, last }))
     }
 
