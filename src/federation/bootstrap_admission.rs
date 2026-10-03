@@ -1525,6 +1525,8 @@ pub mod test_support {
         dir.put_community(ts::sign_community(
             &producer,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: format!("{tag}-community-{run}"),
                 members: vec![crate::federation::types::CommunityMember {
@@ -1543,6 +1545,8 @@ pub mod test_support {
         dir.put_family(ts::sign_family(
             &producer,
             crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: format!("{tag}-family-{run}"),
                 members: vec![crate::federation::types::FamilyMember {
@@ -2525,6 +2529,8 @@ pub mod test_support {
         dir.put_community(ts::sign_community(
             &us,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: format!("{tag}-c-{run}"),
                 members: vec![

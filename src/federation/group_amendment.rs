@@ -156,6 +156,10 @@ struct Offer<'a> {
     /// from the held family record: that member and the held record. Its
     /// signature alone authorizes it.
     self_leave: Option<(&'a str, &'a super::types::Family)>,
+    /// v53.0.0 (CC 4.2.6) — the amendment is an accord holder's recovery,
+    /// verified on its own proof ([`verify_accord_recovery`](super::accord_recovery::verify_accord_recovery)):
+    /// the recovery key's signature over the statement, no quorum, one seat.
+    recovery: bool,
 }
 
 /// What this node holds under the offered id.
@@ -203,6 +207,14 @@ where
         entrenched: Some(f.consensus_protocol_entrenched),
         proof: family.supersede_proof.as_ref(),
         self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
+        recovery: super::accord_recovery::verify_accord_recovery(dir, family)
+            .await?
+            .is_some()
+            // v53.0.0 (CC 4.2.6) — a roster change is verified whole on its
+            // own proof too: decisions, standing majority, consent.
+            || super::accord_roster::verify_accord_roster_change(dir, family)
+                .await?
+                .is_some(),
     };
     let stored = Stored {
         persist_row_hash: held.persist_row_hash.clone(),
@@ -213,6 +225,14 @@ where
     }
     super::check_consensus_protocol_form(&f.consensus_protocol)?;
     super::admission::validate_family_members(dir, f).await?;
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — a family version carries no
+    // signed instant, so it is judged at admission.
+    super::roster_head::check_version_covers_fold(
+        dir,
+        super::roster_head::LineageRecord::Family(f),
+        chrono::Utc::now(),
+    )
+    .await?;
     let snapshot = serde_json::to_value(family)
         .map_err(|e| Error::Backend(format!("family amendment snapshot serialize: {e}")))?;
     dir.supersede_group_row(Cohort::Family, snapshot, Some(authorization(&offer)))
@@ -265,6 +285,7 @@ where
         entrenched: None,
         proof: community.supersede_proof.as_ref(),
         self_leave: None,
+        recovery: false,
     };
     let stored = Stored {
         persist_row_hash: stored.persist_row_hash,
@@ -332,16 +353,9 @@ where
                 .map(|c| c.authority_key_id.as_str()),
         )
         .collect();
-    let members: Vec<&str> = community
-        .community
-        .members
-        .iter()
-        .map(|m| m.key_id.as_str())
-        .collect();
-    super::membership_acceptance::check_founding_signers(
+    super::membership_acceptance::check_community_founding_signers(
         dir,
-        &community.community.community_key_id,
-        &members,
+        &community.community,
         &signers,
     )
     .await
@@ -396,6 +410,13 @@ where
         proof,
         &stored.persist_row_hash,
     )?;
+    // v53.0.0 (CC 4.2.6) — a recovery's proof is not a membership change
+    // envelope and carries no quorum: it was verified whole (statement bound
+    // to this prior and this version, one seat, the recovery key's stored
+    // material and signature, not spent) before this offer was built.
+    if offer.recovery {
+        return Ok(true);
+    }
     if let Some(offered_entrenched) = offer.entrenched {
         check_family_entrenchment(
             stored.entrenched,
@@ -495,6 +516,52 @@ pub(crate) fn check_proof_names_prior(
     ))
 }
 
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **a
+/// version names the head it succeeds.** The record at a version IS the
+/// lineage head, and its signed `prev_head_digest` must be the
+/// `persist_row_hash` of the version this node holds: a version that names
+/// another predecessor (or none) is not the successor of this head. Run inside
+/// each backend's supersede transaction, against the row it replaces, so the
+/// check and the write see the same head. The one exception is an accord birth
+/// the trust-root door stores over a squat or a stalled chain: its
+/// `authorization` names the replaced row, and a birth names no predecessor.
+/// An insert under an unoccupied id is
+/// not judged: a node that never held the earlier versions takes the served
+/// version as it finds it, as it always has (a served family carries no
+/// chain), so a non-empty value there is not evidence of anything.
+pub(crate) fn check_prev_head_names_held(
+    kind: &str,
+    group_key_id: &str,
+    offered_prev_head_digest: &str,
+    stored_persist_row_hash: &str,
+    authorization: Option<&serde_json::Value>,
+) -> Result<(), Error> {
+    if offered_prev_head_digest == stored_persist_row_hash {
+        return Ok(());
+    }
+    // An accord BIRTH that the trust-root door stores over a squat or a
+    // stalled chain does not succeed the row it replaces: it is a new
+    // lineage's first version (empty prev), recorded as a replacement of
+    // exactly the held row.
+    let replaces_held = authorization.is_some_and(|a| {
+        [
+            super::canonical_community::BIRTH_REPLACES_UNROOTED,
+            super::canonical_community::REBIRTH_REPLACES_STALLED,
+        ]
+        .iter()
+        .any(|label| a.get(*label).and_then(|v| v.as_str()) == Some(stored_persist_row_hash))
+    });
+    if offered_prev_head_digest.is_empty() && replaces_held {
+        return Ok(());
+    }
+    Err(Error::Conflict(format!(
+        "{kind} {group_key_id}: lineage_prev_head_mismatch — the version names \
+         prev_head_digest {named:?}, but this node holds head {stored_persist_row_hash}; \
+         a version must name the head it succeeds (CC 3.2 T6)",
+        named = offered_prev_head_digest
+    )))
+}
+
 /// The STALE refusal, spelled once for the pre-check and the in-transaction
 /// check.
 fn stale_proof(kind: &str, group_key_id: &str, named: &str, held: &str) -> Error {
@@ -550,7 +617,23 @@ where
     // v52.0.0 (#956) — a dissolved family admits no change, on either door.
     super::family_dissolution::refuse_if_held_family_dissolved(dir, &new.family.family_key_id)
         .await?;
-    // v52.0.0 (#955, Q2) — an amendment never adds a member.
+    // v52.0.0 (#955, Q2) — an amendment never adds a member. v53.0.0 (CC
+    // 4.2.6): the one exception is an accord holder's recovery, whose new key
+    // takes the holder's own seat and signed the version that seats it.
+    let mut allowed = super::membership_acceptance::supersede_allowed_members(
+        dir,
+        Cohort::Family,
+        &new.family.family_key_id,
+    )
+    .await?;
+    if let Some(recovered) = super::accord_recovery::verify_accord_recovery(dir, &new).await? {
+        allowed.insert(recovered);
+    }
+    // v53.0.0 (CC 4.2.6) — an accord roster change seats the holders the
+    // decisions added, each of whom signed the version (consent, #955 Q1).
+    if let Some(added) = super::accord_roster::verify_accord_roster_change(dir, &new).await? {
+        allowed.extend(added);
+    }
     super::membership_acceptance::check_supersede_adds_no_member(
         &new.family.family_key_id,
         &new.family
@@ -558,13 +641,17 @@ where
             .iter()
             .map(|m| m.key_id.as_str())
             .collect::<Vec<_>>(),
-        &super::membership_acceptance::supersede_allowed_members(
-            dir,
-            Cohort::Family,
-            &new.family.family_key_id,
-        )
-        .await?,
+        &allowed,
     )?;
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — a version of a witnessed lineage
+    // reflects the roster planes; a family version carries no signed instant,
+    // so it is judged at admission.
+    super::roster_head::check_version_covers_fold(
+        dir,
+        super::roster_head::LineageRecord::Family(&new.family),
+        chrono::Utc::now(),
+    )
+    .await?;
     // The snapshot is the SIGNED WRAPPER, not the bare record: the record and
     // the signature that authorizes it travel together, because the way they
     // go stale is by being able to move apart (#651).
@@ -633,6 +720,14 @@ where
     let new =
         super::canonical_community::prepare_trust_root_supersede(dir, new, generic_quorum_skipped)
             .await?;
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — judged at the version's own
+    // signer-stamped instant (a trust-root link's `amended_at`).
+    super::roster_head::check_version_covers_fold(
+        dir,
+        super::roster_head::LineageRecord::Community(&new.community),
+        super::canonical_community::head_instant(&new),
+    )
+    .await?;
     let snapshot = serde_json::to_value(&new).map_err(|e| {
         Error::Backend(format!(
             "supersede_{} snapshot serialize: {e}",

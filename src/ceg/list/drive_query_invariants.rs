@@ -43,6 +43,8 @@ pub mod bodies {
         let at = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
         ts::register_identity_key(b, comm, crate::federation::types::identity_type::USER).await;
         let community = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: comm.to_owned(),
             community_name: "Room".into(),
             members: members
@@ -160,24 +162,8 @@ pub mod bodies {
         }
         let owner = format!("i142-owner-{s}");
         ts::register_identity_key(b, &owner, crate::federation::types::identity_type::USER).await;
-        seed(
-            b,
-            &format!("i142-f1-{s}"),
-            &owner,
-            "self",
-            None,
-            "file:photo:v1",
-        )
-        .await;
-        seed(
-            b,
-            &format!("i142-f2-{s}"),
-            &owner,
-            "self",
-            None,
-            "file:video:v1",
-        )
-        .await;
+        seed(b, &format!("i142-f1-{s}"), &owner, "self", None, "file:v1").await;
+        seed(b, &format!("i142-f2-{s}"), &owner, "self", None, "file:v1").await;
         seed(
             b,
             &format!("i142-note-{s}"),
@@ -193,7 +179,7 @@ pub mod bodies {
             &owner,
             "federation",
             None,
-            "file:public:v1",
+            "file:v1",
         )
         .await;
 
@@ -331,7 +317,7 @@ pub mod bodies {
             &owner,
             "self",
             None,
-            "file:photo:v1",
+            "file:v1",
         )
         .await;
         seed(
@@ -340,7 +326,7 @@ pub mod bodies {
             &owner,
             "federation",
             None,
-            "file:public:v1",
+            "file:v1",
         )
         .await;
         let page = |f: AttestationFilter| {
@@ -411,7 +397,7 @@ pub mod bodies {
         // The row: AV-84 shape — attested to its own PRODUCER, room named in
         // the signed envelope.
         let id = format!("i144-row-{s}");
-        seed(b, &id, &producer, "community", Some(&room), "file:doc:v1").await;
+        seed(b, &id, &producer, "community", Some(&room), "file:v1").await;
         // A targeted row that names NO room cannot be STORED: the write gate
         // has nothing to check membership against and refuses. So the read
         // gate's fail-closed arm (`cohort_target.is_some_and(..)`) is defence
@@ -423,7 +409,7 @@ pub mod bodies {
             &producer,
             "community",
             None,
-            "file:doc:v1",
+            "file:v1",
         )
         .await
         .expect_err("I144: a community row naming NO room must be refused at the write gate");

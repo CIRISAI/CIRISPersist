@@ -114,10 +114,173 @@ pub struct GenesisAuthorization {
     pub signature_pqc: String,
 }
 
+/// v53.0.0 (CC 3.2 T6 / 5.3.4, rc7 b578b59) — **a lineage's genesis head, as
+/// the bundle carries it**: the signed roster record at its first version.
+/// CC: "the `humanity-accord` family record and the `ciris-canonical` birth
+/// record are members of `bundle.attestations`, pinned by
+/// `bundle_fingerprint`". On the wire each is an element of the
+/// `attestations` array, after every delegation row, recognised by its key
+/// (`"family"` / `"community"`, where a delegation row has `"attestation"`).
+///
+/// Parsed by its key, never as an untagged enum: serde's untagged buffering
+/// does not round-trip a row's numbers and instants.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum GenesisRosterRecord {
+    /// A family record (the `humanity-accord` genesis head).
+    Family(super::super::types::SignedFamily),
+    /// A community record (the `ciris-canonical` birth).
+    Community(super::super::types::SignedCommunity),
+}
+
+impl GenesisRosterRecord {
+    /// The record's key id (`family_key_id` / `community_key_id`).
+    #[must_use]
+    pub fn key_id(&self) -> &str {
+        match self {
+            Self::Family(f) => &f.family.family_key_id,
+            Self::Community(c) => &c.community.community_key_id,
+        }
+    }
+
+    /// The signed content's projection into [`authorization_digest`]: the
+    /// record's own signing envelope under its kind. The signatures are
+    /// evidence the ceremony accumulates, not content (the module doc's rule).
+    fn digest_projection(&self) -> serde_json::Value {
+        match self {
+            Self::Family(f) => serde_json::json!({ "family": f.family.signing_envelope() }),
+            Self::Community(c) => {
+                serde_json::json!({ "community": c.community.signing_envelope() })
+            }
+        }
+    }
+}
+
+/// One element of the wire `attestations` array, as written.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum GenesisBundleMember {
+    Row(SignedAttestation),
+    Record(GenesisRosterRecord),
+}
+
+/// The bundle as it is written: the delegation rows and the roster records
+/// share one `attestations` array (CC 5.3.4).
+#[derive(Debug, Clone, Serialize)]
+struct GenesisBundleWire {
+    version: u32,
+    family_key_id: String,
+    holders: Vec<SignedKeyRecord>,
+    serve_nodes: Vec<SignedKeyRecord>,
+    consensus_protocol: String,
+    attestations: Vec<GenesisBundleMember>,
+    authorizations: Vec<GenesisAuthorization>,
+    produced_at: String,
+}
+
+/// The bundle as it is read: each `attestations` element is dispatched by its
+/// one key (`attestation` / `family` / `community`).
+#[derive(Debug, Clone, Deserialize)]
+struct GenesisBundleWireIn {
+    version: u32,
+    family_key_id: String,
+    holders: Vec<SignedKeyRecord>,
+    serve_nodes: Vec<SignedKeyRecord>,
+    consensus_protocol: String,
+    attestations: Vec<serde_json::Value>,
+    authorizations: Vec<GenesisAuthorization>,
+    produced_at: String,
+}
+
+impl TryFrom<GenesisBundleWireIn> for GenesisBundle {
+    type Error = String;
+
+    fn try_from(w: GenesisBundleWireIn) -> Result<Self, String> {
+        let mut attestations = Vec::new();
+        let mut roster_records = Vec::new();
+        for (n, member) in w.attestations.into_iter().enumerate() {
+            let has = |k: &str| member.get(k).is_some();
+            let kinds = [has("attestation"), has("family"), has("community")];
+            let parse_err = |e: serde_json::Error| format!("bundle attestations[{n}]: {e}");
+            match kinds {
+                [true, false, false] => {
+                    // One spelling: every delegation row precedes every roster
+                    // record, so a parse and a re-serialization are the same
+                    // bytes.
+                    if !roster_records.is_empty() {
+                        return Err(format!(
+                            "bundle attestations[{n}]: a delegation row follows a roster record; \
+                             the roster records (family, community) come after every row"
+                        ));
+                    }
+                    attestations.push(serde_json::from_value(member).map_err(parse_err)?);
+                }
+                [false, true, false] => roster_records.push(GenesisRosterRecord::Family(
+                    serde_json::from_value(member).map_err(parse_err)?,
+                )),
+                [false, false, true] => roster_records.push(GenesisRosterRecord::Community(
+                    serde_json::from_value(member).map_err(parse_err)?,
+                )),
+                _ => {
+                    return Err(format!(
+                        "bundle attestations[{n}]: an element is exactly one of a delegation row \
+                         (`attestation`), a family record (`family`) or a community record \
+                         (`community`)"
+                    ))
+                }
+            }
+        }
+        Ok(Self {
+            version: w.version,
+            family_key_id: w.family_key_id,
+            holders: w.holders,
+            serve_nodes: w.serve_nodes,
+            consensus_protocol: w.consensus_protocol,
+            attestations,
+            roster_records,
+            authorizations: w.authorizations,
+            produced_at: w.produced_at,
+        })
+    }
+}
+
+impl From<GenesisBundle> for GenesisBundleWire {
+    fn from(b: GenesisBundle) -> Self {
+        Self {
+            version: b.version,
+            family_key_id: b.family_key_id,
+            holders: b.holders,
+            serve_nodes: b.serve_nodes,
+            consensus_protocol: b.consensus_protocol,
+            attestations: b
+                .attestations
+                .into_iter()
+                .map(GenesisBundleMember::Row)
+                .chain(
+                    b.roster_records
+                        .into_iter()
+                        .map(GenesisBundleMember::Record),
+                )
+                .collect(),
+            authorizations: b.authorizations,
+            produced_at: b.produced_at,
+        }
+    }
+}
+
+/// The bundle version the v53 assembler emits: the first that carries the
+/// roster records (CC rc7). A version-2 bundle carries none.
+pub const GENESIS_BUNDLE_VERSION: u32 = 3;
+
 /// The assembled genesis artifact (wire-compatible with CIRISServer
 /// `mesh_genesis::GenesisBundle` — same field names, same persist row
 /// types inside).
+///
+/// v53.0.0 — on the wire, [`Self::roster_records`] are further elements of
+/// `attestations` (see [`GenesisRosterRecord`]); in Rust they are their own
+/// field, so every reader of the delegation plane keeps reading rows only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "GenesisBundleWireIn", into = "GenesisBundleWire")]
 pub struct GenesisBundle {
     /// Artifact schema version.
     pub version: u32,
@@ -134,11 +297,44 @@ pub struct GenesisBundle {
     pub consensus_protocol: String,
     /// The delegation plane: the root charter + serve grants.
     pub attestations: Vec<SignedAttestation>,
+    /// v53.0.0 (CC rc7) — the genesis heads: the accord family record and the
+    /// `ciris-canonical` birth. Serialized inside `attestations`, after the
+    /// rows; bound by [`authorization_digest`] the same way.
+    pub roster_records: Vec<GenesisRosterRecord>,
     /// The accumulated holder authorizations over [`authorization_digest`].
     pub authorizations: Vec<GenesisAuthorization>,
     /// Ceremony timestamp (RFC 3339) — in the digest, so two ceremonies
     /// are distinguishable.
     pub produced_at: String,
+}
+
+impl GenesisBundle {
+    /// v53.0.0 — the community record the bundle carries under `community_key_id`
+    /// (the `ciris-canonical` birth), if any.
+    #[must_use]
+    pub fn community_record(
+        &self,
+        community_key_id: &str,
+    ) -> Option<&super::super::types::SignedCommunity> {
+        self.roster_records.iter().find_map(|r| match r {
+            GenesisRosterRecord::Community(c)
+                if c.community.community_key_id == community_key_id =>
+            {
+                Some(c)
+            }
+            _ => None,
+        })
+    }
+
+    /// v53.0.0 — the family record the bundle carries under `family_key_id`
+    /// (the accord family's genesis head), if any.
+    #[must_use]
+    pub fn family_record(&self, family_key_id: &str) -> Option<&super::super::types::SignedFamily> {
+        self.roster_records.iter().find_map(|r| match r {
+            GenesisRosterRecord::Family(f) if f.family.family_key_id == family_key_id => Some(f),
+            _ => None,
+        })
+    }
 }
 
 /// The fields of [`KeyRecord`] that are **node-local** and therefore must
@@ -304,6 +500,9 @@ pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
             .iter()
             .map(|n| authorized_record_projection(&n.record))
             .collect::<Result<Vec<_>, Error>>()?,
+        // v53.0.0 (CC rc7) — the roster records follow the rows, as on the
+        // wire, each projected to its signed content. A version-2 bundle has
+        // none, so its preimage is unchanged.
         "attestations": bundle
             .attestations
             .iter()
@@ -316,6 +515,7 @@ pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
                     "attestation_envelope": a.attestation.attestation_envelope,
                 })
             })
+            .chain(bundle.roster_records.iter().map(GenesisRosterRecord::digest_projection))
             .collect::<Vec<_>>(),
     });
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(&preimage)

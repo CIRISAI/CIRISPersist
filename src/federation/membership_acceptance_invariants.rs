@@ -69,6 +69,8 @@ pub(crate) mod bodies {
             })
             .collect();
         let c = Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: cid.to_owned(),
             community_name: "I21x co-op".into(),
             members,
@@ -101,6 +103,8 @@ pub(crate) mod bodies {
             })
             .collect();
         let f = Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: fid.to_owned(),
             family_name: "I21x household".into(),
             members,
@@ -150,6 +154,16 @@ pub(crate) mod bodies {
         }
     }
 
+    /// CC 2.x `group_kind`: `family` | `community` (an affiliation is a
+    /// community record, CC 4.4.3.2.8).
+    fn group_kind(scope: &str) -> &'static str {
+        if scope == FAMILY {
+            "family"
+        } else {
+            "community"
+        }
+    }
+
     /// An inviter's proposal of `invitee` into `group`.
     pub(crate) fn proposal(
         proposer: &str,
@@ -167,7 +181,7 @@ pub(crate) mod bodies {
             serde_json::json!({
                 "id": uuid::Uuid::new_v4().to_string(),
                 "dimension": PROPOSAL_DIMENSION,
-                "group_kind": scope,
+                "group_kind": group_kind(scope),
                 target_key(scope): group,
                 "role": role,
             }),
@@ -193,7 +207,7 @@ pub(crate) mod bodies {
         let mut env = serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
             "dimension": if accept { ACCEPTANCE_DIMENSION } else { DECLINE_DIMENSION },
-            "group_kind": p.cohort_scope,
+            "group_kind": group_kind(&p.cohort_scope),
             target_key(&p.cohort_scope): group,
             "references_attestation_id": p.attestation_id,
             "proposal_hash": p.original_content_hash,
@@ -813,6 +827,8 @@ pub(crate) mod bodies {
         // a forged co-signature is refused, never counted as consent
         {
             let f = Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: f2.clone(),
                 family_name: "forged".into(),
                 members: [&founder, &cofounder]
@@ -868,6 +884,7 @@ pub(crate) mod bodies {
             .await
             .unwrap();
         let mut c = d.lookup_community(&cid).await.unwrap().unwrap();
+        c.prev_head_digest = c.persist_row_hash.clone();
         c.members.push(CommunityMember {
             key_id: k.clone(),
             joined_at: ms(Utc::now()),

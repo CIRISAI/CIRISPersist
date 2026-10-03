@@ -26,20 +26,34 @@
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
 pub mod bundle;
+/// v53.0.0 (CIRISPersist#973, CC rc7) — the genesis ceremony assembler.
+pub mod ceremony;
+/// CIRISPersist#973 — verify a ceremony's two outputs before they are baked.
+pub mod ceremony_verify;
+pub use ceremony_verify::{
+    verify_ceremony_outputs, CeremonyOutputsRefusal, CeremonyOutputsRefused,
+    CeremonyOutputsVerified,
+};
 /// v47.4.0 (CIRISPersist#805) — the `CIRIS_TEST_TRUST_ROOT*` block minter.
 #[cfg(feature = "test-anchor")]
 pub mod test_anchor_block;
+/// CIRISPersist#973 — the software ceremony minter (dry run).
+#[cfg(feature = "test-anchor")]
+pub mod test_ceremony;
 pub use bundle::{
     bake_assembled_genesis, parse_genesis_bundle, verify_bundle_quorum, BakeItemOutcome,
-    GenesisAuthorization, GenesisBakeReport, GenesisBundle,
+    GenesisAuthorization, GenesisBakeReport, GenesisBundle, GenesisRosterRecord,
+    GENESIS_BUNDLE_VERSION,
 };
 #[cfg(feature = "test-anchor")]
 pub use test_anchor_block::*;
+#[cfg(feature = "test-anchor")]
+pub use test_ceremony::*;
 
 pub mod posture;
 pub use posture::{
-    constitutional_seat, genesis_posture, require_constitutional_root, GenesisFault, GenesisLeg,
-    GenesisPosture, ROOT_REQUIRING_GATES,
+    constitutional_seat, genesis_posture, require_constitutional_root, AbsentReason,
+    BakeNotAdoptedReason, GenesisFault, GenesisLeg, GenesisPosture, ROOT_REQUIRING_GATES,
 };
 
 use super::SignedKeyRecord;
@@ -116,6 +130,62 @@ pub fn test_anchor_registration_envelope(
     envelope
 }
 
+/// The synthesized test-anchor holder row for one slot — the ONE spelling,
+/// shared by [`test_anchor_genesis_records`] (slots read from the env) and
+/// the dry-run ceremony minter (slots taken from a minted block,
+/// CIRISPersist#973), so a bundle's carried holders are byte-for-byte the
+/// rows the boot seed installs.
+#[cfg(feature = "test-anchor")]
+pub(crate) fn test_anchor_holder_record(
+    key_id: &str,
+    pubkey_ed25519_base64: String,
+    pqc_pubkey: Option<String>,
+    envelope: serde_json::Value,
+    canonical: &[u8],
+    scrub_ed: Option<String>,
+    scrub_pqc: Option<String>,
+) -> SignedKeyRecord {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
+        .parse()
+        .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
+    SignedKeyRecord {
+        record: crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64,
+            pqc_completed_at: pqc_pubkey.as_ref().map(|_| ts),
+            pubkey_ml_dsa_65_base64: pqc_pubkey,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::ACCORD_HOLDER.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: ts,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: hex::encode(Sha256::digest(canonical)),
+            scrub_signature_classical: scrub_ed
+                .unwrap_or_else(|| B64.encode(b"test-anchor-placeholder")),
+            scrub_signature_pqc: scrub_pqc,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: ts,
+            persist_row_hash: String::new(),
+            capability_roles: Vec::new(),
+            // The V-schema requires accord_holder rows to CARRY evidence;
+            // this is the SoftwareOnly_TEST custody marker (the tier
+            // verify's accord_custody_attestation admits under the same
+            // gate, CIRISVerify#202) — honest about what it is, never a
+            // fabricated hardware claim.
+            attestation_evidence: Some(serde_json::json!({
+                "tier": "SoftwareOnly_TEST",
+                "test_anchor": true,
+            })),
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        },
+    }
+}
+
 /// v17.1.0 (CIRISPersist#449, CIRISVerify#202) — the SYNTHESIZED test-anchor
 /// holder rows: one deterministic self-signed `accord_holder` record per
 /// `CIRIS_TEST_TRUST_ROOT` pubkey (`test-accord-holder-{i}`), so the genesis
@@ -187,7 +257,6 @@ pub fn test_anchor_registration_envelope(
 pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
-    use sha2::{Digest, Sha256};
 
     /// The i-th comma-separated slot of `var`, trimmed; `None` when the var
     /// is unset or the slot is missing/empty.
@@ -214,9 +283,6 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
             );
         }
     }
-    let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
-        .parse()
-        .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
     let mut out = Vec::with_capacity(keys.len());
     for (i, ed) in keys.iter().enumerate() {
         let key_id = format!("test-accord-holder-{i}");
@@ -266,39 +332,15 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
                 );
             }
         }
-        out.push(SignedKeyRecord {
-            record: crate::federation::KeyRecord {
-                key_id: key_id.clone(),
-                pubkey_ed25519_base64,
-                pqc_completed_at: pqc_pubkey.as_ref().map(|_| ts),
-                pubkey_ml_dsa_65_base64: pqc_pubkey,
-                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-                identity_type: crate::federation::types::identity_type::ACCORD_HOLDER.to_owned(),
-                identity_ref: key_id.clone(),
-                valid_from: ts,
-                valid_until: None,
-                registration_envelope: envelope,
-                original_content_hash: hex::encode(Sha256::digest(&canonical)),
-                scrub_signature_classical: scrub_ed
-                    .unwrap_or_else(|| B64.encode(b"test-anchor-placeholder")),
-                scrub_signature_pqc: scrub_pqc,
-                scrub_key_id: key_id.clone(),
-                scrub_timestamp: ts,
-                persist_row_hash: String::new(),
-                capability_roles: Vec::new(),
-                // The V-schema requires accord_holder rows to CARRY evidence;
-                // this is the SoftwareOnly_TEST custody marker (the tier
-                // verify's accord_custody_attestation admits under the same
-                // gate, CIRISVerify#202) — honest about what it is, never a
-                // fabricated hardware claim.
-                attestation_evidence: Some(serde_json::json!({
-                    "tier": "SoftwareOnly_TEST",
-                    "test_anchor": true,
-                })),
-                consent_role: None,
-                additional_scrubs: Vec::new(),
-            },
-        });
+        out.push(test_anchor_holder_record(
+            &key_id,
+            pubkey_ed25519_base64,
+            pqc_pubkey,
+            envelope,
+            &canonical,
+            scrub_ed,
+            scrub_pqc,
+        ));
     }
     Some(out)
 }
@@ -445,30 +487,93 @@ const ACCORD_FAMILY_FOUNDED_AT: &str = "2026-05-01T00:00:00Z";
 /// `key_id`s from [`accord_holder_genesis_records`], so the family stays
 /// coherent with the seeded holders by construction.
 pub fn accord_family_genesis_record() -> crate::federation::types::Family {
+    // #449 — founder seats follow the EFFECTIVE roster so the family stays
+    // coherent with the seeded holders (test or baked) by construction.
+    // v53.0.0 (CC 3.2 T6) — the genesis version names the charter it was
+    // minted with, or no charter is in force for the accord at all.
+    accord_family_genesis_record_for(
+        ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+        ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+        effective_accord_holder_records()
+            .iter()
+            .map(|sr| sr.record.key_id.as_str()),
+        &genesis_family_charter_digest(),
+    )
+}
+
+/// v53.0.0 (CC 3.2 T6) — the accord family's genesis record over a given
+/// founder set: what [`accord_family_genesis_record`] builds from this build's
+/// roster, and what the ceremony assembler signs as the family's genesis head.
+/// One construction, so the signed head and the seeded row cannot differ.
+/// `charter_digest` is the stored row hash of the charter the genesis version
+/// names ([`bundle_family_charter_digest`]); a genesis version names no
+/// predecessor.
+pub fn accord_family_genesis_record_for<'a>(
+    family_key_id: &str,
+    consensus_protocol: &str,
+    founders: impl IntoIterator<Item = &'a str>,
+    charter_digest: &str,
+) -> crate::federation::types::Family {
     use crate::federation::types::{Family, FamilyMember};
     let founded_at = ACCORD_FAMILY_FOUNDED_AT
         .parse()
         .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
-    // #449 — founder seats follow the EFFECTIVE roster so the family stays
-    // coherent with the seeded holders (test or baked) by construction.
-    let members = effective_accord_holder_records()
-        .iter()
-        .map(|sr| FamilyMember {
-            key_id: sr.record.key_id.clone(),
+    let members = founders
+        .into_iter()
+        .map(|key_id| FamilyMember {
+            key_id: key_id.to_owned(),
             joined_at: founded_at,
             role: Some("founder".to_owned()),
         })
         .collect();
     Family {
-        family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+        prev_head_digest: String::new(),
+        charter_digest: charter_digest.to_owned(),
+        family_key_id: family_key_id.to_owned(),
         family_name: "HUMANITY_ACCORD".to_owned(),
         members,
         founded_at,
-        consensus_protocol: ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL.to_owned(),
+        consensus_protocol: consensus_protocol.to_owned(),
         consensus_protocol_entrenched: true,
         dissolved_at: None,
         persist_row_hash: String::new(),
     }
+}
+
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
+/// charter the accord family's genesis version names**: the `persist_row_hash`
+/// of the bundle's charter of the family (`delegates_to` toward
+/// `humanity-accord` carrying the charter reading — `genesis-charter`). The
+/// head names the charter in force, and a charter no version names is not in
+/// force ([`charter_in_force`](crate::federation::canonical_community::charter_in_force)),
+/// so the genesis version must name the bundle's. Empty when the bundle in
+/// force carries none.
+#[must_use]
+pub fn genesis_family_charter_digest() -> String {
+    bundle_family_charter_digest(canonical_genesis_bundle())
+}
+
+/// [`genesis_family_charter_digest`] over a given bundle: the stored row hash
+/// of the bundle's charter of the accord family, empty when it carries none.
+/// The ceremony verifier reads the bundle it verifies through this, never the
+/// compiled one.
+#[must_use]
+pub fn bundle_family_charter_digest(bundle: &GenesisBundle) -> String {
+    let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    bundle
+        .attestations
+        .iter()
+        .map(|s| &s.attestation)
+        .find(|a| {
+            a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+                && a.attested_key_id == family
+                && crate::federation::trust_root::job_dimension_admits(
+                    &a.attestation_envelope,
+                    crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+                )
+        })
+        .and_then(|a| crate::federation::canonical_community::stored_row_hash(a).ok())
+        .unwrap_or_default()
 }
 
 /// First-boot-seed the baked HUMANITY_ACCORD **family row** (CIRISPersist#386).
@@ -494,13 +599,16 @@ where
     // load-bearing rather than an optimisation. A new ceremony ADDS a root
     // (roots co-exist and are addressed per-`root_ref`); nothing here mutates
     // one that already stands.
-    if dir
+    if let Some(held) = dir
         .lookup_family(&family.family_key_id)
         .await
         .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup_family: {e}")))?
-        .is_some()
     {
-        return Ok(()); // already entrenched (reboot) — idempotent no-op.
+        // v53.0.0 (CC 3.2 T6) — the one exception: an accord row that names no
+        // charter (stored before v53 gave the record its head fields) has no
+        // charter in force, so its root is invalid. It is replaced by this
+        // bundle's genesis record; anything else held is left standing.
+        return replace_chartless_accord(dir, &held, family).await;
     }
     // v21.0.0 (CIRISPersist#502 E4) — `put_family` now hybrid-Strict-verifies
     // an authority signature; the baked HUMANITY_ACCORD family is a
@@ -511,6 +619,91 @@ where
         GenesisFault::absent(
             LEG,
             format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"),
+        )
+    })
+}
+
+/// v53.0.0 (CC 3.2 T5/T6) — **a node upgrading from v52 holds an accord row
+/// that names no charter.** Under v53 the charter in force is the one the
+/// head names ([`charter_in_force`](super::canonical_community::charter_in_force)),
+/// so that row leaves the accord with no charter and its root invalid until a
+/// version naming one arrives.
+///
+/// CC T6: the genesis head carries an empty `prev_head_digest`, and the
+/// genesis head is the bundle's. A fresh node seeds exactly that record. If an
+/// upgraded node instead chained a version onto its v52 row, the two nodes
+/// would hold DIFFERENT head digests for one lineage, and every attach naming
+/// a head would split the mesh. So the upgraded node takes the genesis record
+/// itself, unchanged, and the v52 row becomes a superseded prior version
+/// labelled `accord_birth_replaces_unrooted` (the label R2a's prev-head check
+/// admits for a birth stored over an un-rooted row). The write stays inside
+/// this seeder, the door the accord id has always entered by; no peer-reachable
+/// door is opened.
+///
+/// It replaces ONLY a held row that names no charter and no predecessor, and
+/// equals the genesis record in everything a head does not carry (name, seats,
+/// founding instant, protocol, entrenchment, dissolution). A held row naming a
+/// charter or a predecessor is a version chain and is never overwritten, and a
+/// row of other content is a different accord and is left standing (#648).
+/// When the bundle carries the accord's signed genesis record (version 3), its
+/// signatures travel with the stored version.
+async fn replace_chartless_accord<D>(
+    dir: &D,
+    held: &crate::federation::types::Family,
+    genesis: crate::federation::types::Family,
+) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Family;
+    let unrooted = held.charter_digest.is_empty() && held.prev_head_digest.is_empty();
+    let same_roster = held.family_name == genesis.family_name
+        && held.members == genesis.members
+        && held.founded_at == genesis.founded_at
+        && held.consensus_protocol == genesis.consensus_protocol
+        && held.consensus_protocol_entrenched == genesis.consensus_protocol_entrenched
+        && held.dissolved_at == genesis.dissolved_at;
+    if !unrooted || genesis.charter_digest.is_empty() || !genesis.prev_head_digest.is_empty() {
+        return Ok(());
+    }
+    if !same_roster {
+        tracing::warn!(
+            family_key_id = %held.family_key_id,
+            "genesis family seed: the held accord row names no charter but is not this \
+             build's accord (other seats or protocol) — left standing"
+        );
+        return Ok(());
+    }
+    let signed = canonical_genesis_bundle()
+        .family_record(&genesis.family_key_id)
+        .filter(|carried| carried.family == genesis)
+        .cloned()
+        .unwrap_or_else(|| crate::federation::types::SignedFamily {
+            family: genesis.clone(),
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            supersede_proof: None,
+            cosignatures: Vec::new(),
+        });
+    let snapshot = serde_json::to_value(&signed)
+        .map_err(|e| GenesisFault::absent(LEG, format!("accord genesis snapshot: {e}")))?;
+    dir.supersede_group_row(
+        super::cohort::Cohort::Family,
+        snapshot,
+        Some(serde_json::json!({
+            super::canonical_community::BIRTH_REPLACES_UNROOTED: held.persist_row_hash,
+        })),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| {
+        GenesisFault::absent(
+            LEG,
+            format!(
+                "replace the chartless accord row {} with the bundle's genesis record: {e}",
+                held.persist_row_hash
+            ),
         )
     })
 }
@@ -603,6 +796,62 @@ where
 /// requires.
 const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 
+/// CIRISPersist#973 — the software ceremony this process boots against, when
+/// one is installed. Test-anchor only.
+#[cfg(feature = "test-anchor")]
+type InstalledTestCeremony = &'static GenesisBundle;
+
+#[cfg(feature = "test-anchor")]
+static TEST_CEREMONY: std::sync::RwLock<Option<InstalledTestCeremony>> =
+    std::sync::RwLock::new(None);
+
+/// CIRISPersist#973 — **install a software ceremony's outputs for this
+/// process**: from now on, while the test anchor is live, every reader of the
+/// compiled bundle reads this one instead (v53.0.0: the community birth is a
+/// member of the bundle, CC rc7), and the boot seed
+/// runs its full leg order against them (it otherwise skips everything past
+/// the family under a test anchor). The dry run of a re-mint: mint (or have
+/// the host's ceremony routes produce) the bundle, install it, boot.
+///
+/// A second call replaces the first (a re-mint). The values are leaked: this
+/// is a per-process test fixture, never a production path — the whole seam is
+/// compiled out without the `test-anchor` feature, and inert unless the
+/// runtime test-anchor override is armed.
+#[cfg(feature = "test-anchor")]
+pub fn install_test_ceremony_outputs(bundle: GenesisBundle) {
+    let bundle: &'static GenesisBundle = Box::leak(Box::new(bundle));
+    *TEST_CEREMONY.write().expect("test ceremony lock") = Some(bundle);
+}
+
+/// CIRISPersist#973 — remove an installed software ceremony.
+#[cfg(feature = "test-anchor")]
+pub fn clear_test_ceremony_outputs() {
+    *TEST_CEREMONY.write().expect("test ceremony lock") = None;
+}
+
+/// The installed software ceremony, honoured ONLY while the test-anchor
+/// override is live.
+#[cfg(feature = "test-anchor")]
+fn installed_test_ceremony() -> Option<InstalledTestCeremony> {
+    if !test_anchor_override_active() {
+        return None;
+    }
+    *TEST_CEREMONY.read().expect("test ceremony lock")
+}
+
+/// CIRISPersist#973 — is a software ceremony installed and honoured? Const
+/// `false` on a production build.
+pub(crate) fn test_ceremony_installed() -> bool {
+    #[cfg(feature = "test-anchor")]
+    {
+        installed_test_ceremony().is_some()
+    }
+    #[cfg(not(feature = "test-anchor"))]
+    {
+        false
+    }
+}
+
 /// Parse-once accessor for the baked canonical genesis **bundle**
 /// (v23.0.0, CIRISPersist#551 item 1 — replaces `canonical_genesis_records`;
 /// the bare `[{record}]` parse path is deleted, see [`parse_genesis_bundle`]).
@@ -614,10 +863,54 @@ const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 /// constant; caught by [`tests::canonical_seed_is_a_bundle_and_is_2of3_accord_conferred`]).
 pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     use std::sync::OnceLock;
+    // #973 — under a live test anchor with a software ceremony installed, the
+    // ceremony's bundle stands in for the compiled one. Compiled out of a
+    // production build.
+    #[cfg(feature = "test-anchor")]
+    if let Some(bundle) = installed_test_ceremony() {
+        return bundle;
+    }
     static PARSED: OnceLock<GenesisBundle> = OnceLock::new();
     PARSED.get_or_init(|| {
         parse_genesis_bundle(CANONICAL_SEED_JSON)
             .expect("embedded canonical_seed.json must be a valid GenesisBundle")
+    })
+}
+
+/// CIRISPersist#973 (CC 3.2 T4a, "bundle only") — **is `row` a member of the
+/// pinned GenesisBundle?** "An unlabelled row that is a member of the pinned
+/// GenesisBundle (T5, `bundle_fingerprint`) keeps the reading its direction
+/// gives it, because the three rows baked into the shipped bundle were minted
+/// before the job labels existed and a fresh node could not otherwise seed."
+///
+/// Membership is the baked id AND the baked signed statement: the row's
+/// canonical envelope equals the bundle row's, so a different statement stored
+/// under a baked id is not a member. The bundle is the one this build pins
+/// ([`canonical_genesis_bundle`]: the compiled artifact, or under a live test
+/// anchor the installed software ceremony). A row that cannot be canonicalized
+/// is not a member.
+#[must_use]
+pub fn is_pinned_bundle_row(row: &super::Attestation) -> bool {
+    is_pinned_bundle_statement(&row.attestation_id, &row.attestation_envelope)
+        && canonical_genesis_bundle().attestations.iter().any(|sa| {
+            sa.attestation.attestation_id == row.attestation_id
+                && sa.attestation.attesting_key_id == row.attesting_key_id
+                && sa.attestation.attested_key_id == row.attested_key_id
+                && sa.attestation.attestation_type == row.attestation_type
+        })
+}
+
+/// [`is_pinned_bundle_row`] for a row not yet assembled: the id it will be
+/// stored under and its signed envelope (the write gate's view).
+#[must_use]
+pub fn is_pinned_bundle_statement(attestation_id: &str, envelope: &serde_json::Value) -> bool {
+    let Ok(got) = super::canonical_at_rest::canonical_bytes(envelope) else {
+        return false;
+    };
+    canonical_genesis_bundle().attestations.iter().any(|sa| {
+        sa.attestation.attestation_id == attestation_id
+            && super::canonical_at_rest::canonical_bytes(&sa.attestation.attestation_envelope)
+                .is_ok_and(|want| want == got)
     })
 }
 
@@ -1011,10 +1304,34 @@ where
 /// binary that RUNS the ceremony, and a posture that bricked the node on the
 /// exact state the release ships in would put the ceremony out of reach.
 ///
-/// A row present whose `original_content_hash` is not the baked one is
-/// [`GenesisFault::divergent`] — not a stale artifact but a SUBSTITUTED
-/// conferral row, and the one case here that must not serve. Same split, and
-/// the same reasoning, as the canonical leg's squatting check.
+/// A row present whose `original_content_hash` is not the baked one, and that
+/// is NOT a verifiable statement by a seated accord holder, is
+/// [`GenesisFault::divergent`] — a SUBSTITUTED conferral row, and the one case
+/// here that must not serve. Same split, and the same reasoning, as the
+/// canonical leg's squatting check.
+///
+/// # The (stored, baked) relations (CIRISPersist#973)
+///
+/// | stored vs the compiled-in row | this leg |
+/// |---|---|
+/// | identical | `Ok` |
+/// | a verified holder statement STRICTLY NEWER | `Ok` (the mesh is ahead of this binary) |
+/// | a verified holder statement OLDER | `absent` — the bake was not adopted |
+/// | a verified holder statement of the SAME vintage, different content | `absent` — a tie, not adopted |
+/// | same signed envelope, altered around it | `divergent` |
+/// | not a verifiable holder statement | `divergent` |
+/// | missing, or pre-v31 shaped | `absent` |
+///
+/// The OLDER arm is what an upgrading node holds when the boot seed could not
+/// install the re-mint (refused at the door — a bake stamped ahead of this
+/// node's clock — or the seed has not run). It is not `divergent`: that
+/// refuses to boot, and an upgrade must never brick a node over a row its own
+/// holders signed. It is not `Ok` either: before #973 it was, because the raw
+/// bundle row was compared as a stored row and lost to every conformant one,
+/// so the node reported `Entrenched` on the previous root with nothing to say
+/// the new one had not landed. A rollback written beneath persist (an old
+/// genuine row put back) is the same state and gets the same answer: not
+/// entrenched, and the next boot's seed supersedes it.
 pub async fn verify_delegation_plane_seeded<D>(dir: &D) -> Result<(), GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
@@ -1053,10 +1370,11 @@ where
         // **This is a narrowing of what counts as sound in every direction
         // except one.** Still `Divergent`, still refusing to serve: an injected
         // squat, a row renamed onto a genesis id, a fabricated row claiming a
-        // holder's `key_id`, a corrupted signature — and now ROLLBACK, a
-        // holder-signed row OLDER than the compiled-in one, which the old
-        // equality check accepted or rejected purely by accident of hashing.
-        // The single thing that stops being called tampering is a newer,
+        // holder's `key_id`, a corrupted signature. A holder-signed row OLDER
+        // than the compiled-in one (a rollback, or an upgrade whose re-mint
+        // did not land) and a same-vintage twin are NOT sound either, but they
+        // are `Absent`, not `Divergent` (#973; see the table on this fn).
+        // The single thing that is served on in place of the bake is a newer,
         // quorum-verified, holder-signed root.
         //
         // ── THE PROPERTY, ASKED FIRST: CAN THIS PLANE CONFER RIGHT NOW? ──
@@ -1177,24 +1495,59 @@ where
             // give identical hashes and the damage arm above owns them. Every row
             // that arrives here is a genuinely different statement.
             let stored_supersedes = stored_is_acceptable_successor(&row, want);
-            if !real || !stored_supersedes {
+            if !real {
                 return Err(GenesisFault::divergent(
                     LEG,
                     format!(
                         "delegation row {id} is present with a content hash that is not the baked \
-                         one (stored {}, baked {}) and is {} — a substituted conferral row",
-                        row.original_content_hash,
-                        want.original_content_hash,
-                        if !real {
-                            "not a verifiable statement by a seated accord holder"
-                        } else if candidate_is_strictly_newer(want, &row) {
-                            "OLDER than the compiled-in artifact (a rollback)"
-                        } else {
-                            "NEITHER older nor newer than the compiled-in artifact — two \
-                             different statements of the same vintage, which this node cannot \
-                             adjudicate and must not serve on"
-                        },
+                         one (stored {}, baked {}) and is not a verifiable statement by a seated \
+                         accord holder — a substituted conferral row",
+                        row.original_content_hash, want.original_content_hash,
                     ),
+                ));
+            }
+            if !stored_supersedes {
+                // CIRISPersist#973 — a VERIFIED holder statement that does not
+                // supersede the bake: the previous ceremony's row (the boot
+                // seed could not install its successor — refused at the door,
+                // or not yet run), or a twin of the same vintage. Neither is a
+                // substitution, so neither is `Divergent` (which refuses to
+                // boot, and would brick an upgrading node whose re-mint was
+                // refused for its clock). Neither is `Entrenched` either: this
+                // binary's root was NOT adopted, and the operator must see
+                // that. `Absent` boots, raises the banner, and matches what
+                // the boot seed itself reports for the same state. The next
+                // boot's seed supersedes an older row as soon as the door
+                // admits the bake.
+                // CIRISPersist#973 — the cause, typed. The read path sees a
+                // verified older (or same-vintage) row and a bake that is
+                // not installed; WHY the seed did not install it is the
+                // seed's fault to carry (`Refused`), not this leg's to guess.
+                let stored_older = candidate_is_strictly_newer(want, &row);
+                return Err(GenesisFault::bake_not_adopted(
+                    LEG,
+                    format!(
+                        "delegation row {id}: the compiled-in root was not adopted — the stored \
+                         row is a verified accord-holder statement (asserted {}, content {}) \
+                         that is {} the baked one (asserted {}, content {})",
+                        row.asserted_at,
+                        row.original_content_hash,
+                        if stored_older {
+                            "OLDER than"
+                        } else {
+                            "of the SAME vintage as, and different from,"
+                        },
+                        want.asserted_at,
+                        want.original_content_hash,
+                    ),
+                    if stored_older {
+                        BakeNotAdoptedReason::StoredOlder
+                    } else {
+                        BakeNotAdoptedReason::EqualVintage
+                    },
+                    // `real` held above: the stored row is a verified
+                    // accord-holder statement, so the previous root stands.
+                    true,
                 ));
             }
             // A verified holder statement at least as new as ours. The mesh's
@@ -1484,6 +1837,27 @@ pub(crate) async fn exercise_genesis_seed_installs(dir: &dyn super::FederationDi
                 );
             }
         }
+    }
+    // v53.0.0 (CC 3.2 T6) — I446: the seeded family's genesis version names
+    // the charter the bundle installs, by the hash THIS backend stored for it,
+    // so the charter in force on a freshly seeded node is `genesis-charter`.
+    if row_bound.is_ok() {
+        let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+        let stored = dir
+            .get_attestation("genesis-charter")
+            .await
+            .expect("read back")
+            .expect("genesis-charter installed");
+        let (owner, head) = crate::federation::canonical_community::charter_in_force(dir, family)
+            .await
+            .expect("charter in force");
+        assert_eq!(owner, family, "I446");
+        assert!(
+            head.admits(&stored),
+            "I446: the seeded accord family's head names the stored genesis-charter \
+             ({head:?} vs stored {})",
+            stored.persist_row_hash
+        );
     }
 }
 
@@ -2954,7 +3328,9 @@ where
     // canonical under the test anchor instead (CIRISVerify#202 /
     // CIRISServer#258), so skip the bake rather than brick the boot. Dead
     // code on a prod build (the fence compiles the branch out).
-    if test_anchor_override_active() {
+    // #973 — unless a software ceremony is installed: then every leg below
+    // runs against ITS bundle and community, which the test roster signed.
+    if test_anchor_override_active() && !test_ceremony_installed() {
         tracing::warn!(
             "CIRIS_TESTING_MODE: test trust root active — skipping the baked \
              2-of-3 canonical genesis seed (the harness mints its own canonical \
@@ -2966,7 +3342,151 @@ where
     verify_canonical_seeded(dir).await?;
     seed_delegation_plane(dir).await?;
     verify_delegation_plane_seeded(dir).await?;
+    // #973 — the community birth, last: it is admitted THROUGH the key plane
+    // and the delegation plane above. Inert until a ceremony bakes the asset.
+    seed_canonical_community(dir).await?;
+    verify_canonical_community_seeded(dir).await?;
     Ok(())
+}
+
+/// CIRISPersist#973 / v53.0.0 (CC rc7, T5) — the `ciris-canonical` birth
+/// record **the pinned bundle carries**. The bundle is the only genesis
+/// artifact: a community seeded from anything the bundle does not pin has no
+/// anchor, so there is no separate community asset any more. `None` while the
+/// bundle carries no birth (a version-2 bundle) — every caller treats `None` as
+/// "this leg does not exist yet". Under a live test anchor with a software
+/// ceremony installed this reads that ceremony's bundle, through
+/// [`canonical_genesis_bundle`].
+pub fn canonical_community_asset() -> Option<&'static super::SignedCommunity> {
+    canonical_genesis_bundle()
+        .community_record(super::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID)
+}
+
+/// CIRISPersist#973 — what the community boot leg did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommunityLegOutcome {
+    /// No asset is compiled in: nothing read, nothing written.
+    NotBaked,
+    /// The birth was admitted through the signed door.
+    Installed,
+    /// This node already holds exactly the baked birth.
+    AlreadyHeld,
+    /// This node holds a DIFFERENT record under the id — a chain that has
+    /// moved past the birth, or another ceremony's. Left untouched: the
+    /// compiled asset is a floor, never the identity (the #665 rule).
+    HeldDiffers,
+}
+
+/// CIRISPersist#973 — **seed the baked community birth at boot.** See
+/// [`seed_canonical_community_from`]; this passes the compiled asset.
+///
+/// # Errors
+///
+/// As [`seed_canonical_community_from`].
+pub async fn seed_canonical_community<D>(dir: &D) -> Result<CommunityLegOutcome, GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    seed_canonical_community_from(dir, canonical_community_asset()).await
+}
+
+/// CIRISPersist#973 — the community boot leg over a given asset.
+///
+/// - no asset ⇒ [`CommunityLegOutcome::NotBaked`], without a read;
+/// - the id is held ⇒ nothing is written ([`AlreadyHeld`](CommunityLegOutcome::AlreadyHeld)
+///   or [`HeldDiffers`](CommunityLegOutcome::HeldDiffers));
+/// - otherwise the birth goes through the ordinary SIGNED
+///   [`put_community`](super::FederationDirectory::put_community) door —
+///   signature, trust-root shape, founders, accord quorum, founding rule —
+///   never a trusted-local write.
+///
+/// # Errors
+///
+/// Only [`GenesisFault::Absent`] (the door refused or errored: a node
+/// awaiting its ceremony) and [`GenesisFault::Unreadable`] (the directory
+/// could not be asked). NEVER `Divergent`: nothing this leg finds may stop a
+/// boot.
+pub async fn seed_canonical_community_from<D>(
+    dir: &D,
+    asset: Option<&super::SignedCommunity>,
+) -> Result<CommunityLegOutcome, GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Community;
+    let Some(birth) = asset else {
+        return Ok(CommunityLegOutcome::NotBaked);
+    };
+    let id = &birth.community.community_key_id;
+    let held = dir
+        .lookup_community(id)
+        .await
+        .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup community {id}: {e}")))?;
+    if let Some(held) = held {
+        let same = match (
+            super::types::compute_persist_row_hash(&held),
+            super::types::compute_persist_row_hash(&birth.community),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        if same {
+            return Ok(CommunityLegOutcome::AlreadyHeld);
+        }
+        tracing::info!(
+            community_key_id = %id,
+            "genesis community seed: this node holds a record under the baked id that is not              the baked birth — leaving it in place (CIRISPersist#973)"
+        );
+        return Ok(CommunityLegOutcome::HeldDiffers);
+    }
+    match dir.put_community(birth.clone()).await {
+        Ok(()) => Ok(CommunityLegOutcome::Installed),
+        Err(e) => Err(GenesisFault::absent(
+            LEG,
+            format!("seed community {id}: {e} (is the key and delegation plane seeded first?)"),
+        )),
+    }
+}
+
+/// CIRISPersist#973 — the community leg's presence check: with an asset
+/// baked, the id it names is held. `Ok` without a read when no asset is baked.
+///
+/// # Errors
+///
+/// [`GenesisFault::Absent`] / [`GenesisFault::Unreadable`] only.
+pub async fn verify_canonical_community_seeded<D>(dir: &D) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    verify_canonical_community_seeded_for(dir, canonical_community_asset()).await
+}
+
+/// [`verify_canonical_community_seeded`] over a given asset.
+///
+/// # Errors
+///
+/// [`GenesisFault::Absent`] / [`GenesisFault::Unreadable`] only.
+pub async fn verify_canonical_community_seeded_for<D>(
+    dir: &D,
+    asset: Option<&super::SignedCommunity>,
+) -> Result<(), GenesisFault>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    const LEG: GenesisLeg = GenesisLeg::Community;
+    let Some(birth) = asset else { return Ok(()) };
+    let id = &birth.community.community_key_id;
+    match dir.lookup_community(id).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(GenesisFault::absent(
+            LEG,
+            format!("community {id} not seeded"),
+        )),
+        Err(e) => Err(GenesisFault::unreadable(
+            LEG,
+            format!("lookup community {id}: {e}"),
+        )),
+    }
 }
 
 /// v31.1.0 — **install the baked bundle's DELEGATION PLANE at boot.**
@@ -3421,9 +3941,15 @@ where
         // place — see `Error::is_duplicate_key`, which also records why it is a
         // string test and what would have to change to make it a typed one.
         Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
-        Err(e) => Err(GenesisFault::absent(
+        // CIRISPersist#973 — the bake was offered and refused, and no row is
+        // held under this id: nothing is in force on this row.
+        Err(e) => Err(GenesisFault::bake_not_adopted(
             LEG,
             format!("delegation row {id} could not be installed: {e}"),
+            BakeNotAdoptedReason::Refused {
+                refusal: e.kind().to_owned(),
+            },
+            false,
         )),
     }
 }
@@ -3549,13 +4075,22 @@ where
     // deliberately not pre-flighted; it is neither pure nor deterministic, and
     // a door that could refuse for a transient reason is exactly the one whose
     // retry the next boot fixes.
+    // CIRISPersist#973 — on the SUPERSEDE arm the row being replaced is a
+    // verified holder statement of an earlier ceremony: while it is still
+    // present, the previous root is in force. (The repair arm replaces this
+    // ceremony's own damaged row; nothing older stands behind it.)
+    let predecessor_stands = outcome == DelegationRowOutcome::Superseded;
     if let Err(e) = preflight_replacement_admission(&sa.attestation) {
-        return Err(GenesisFault::absent(
+        return Err(GenesisFault::bake_not_adopted(
             LEG,
             format!(
                 "refusing to remove the installed delegation row {id}: the replacement would be \
                  refused at the write door anyway ({e}) — nothing deleted"
             ),
+            BakeNotAdoptedReason::Refused {
+                refusal: e.kind().to_owned(),
+            },
+            predecessor_stands,
         ));
     }
 
@@ -3581,18 +4116,26 @@ where
         // `verify_delegation_plane_seeded`, so such a node comes up awaiting its
         // ceremony rather than bricked by a fault it cannot clear.
         Err(e @ super::Error::Unsupported { .. }) => {
-            return Err(GenesisFault::absent(
+            return Err(GenesisFault::bake_not_adopted(
                 LEG,
                 format!(
                     "delegation row {id} needs replacing and this directory has no re-bake \
                      replacement door: {e}"
                 ),
+                BakeNotAdoptedReason::Refused {
+                    refusal: e.kind().to_owned(),
+                },
+                predecessor_stands,
             ))
         }
         Err(e) => {
-            return Err(GenesisFault::absent(
+            return Err(GenesisFault::bake_not_adopted(
                 LEG,
                 format!("delegation row {id} could not be removed for replacement: {e}"),
+                BakeNotAdoptedReason::Refused {
+                    refusal: e.kind().to_owned(),
+                },
+                predecessor_stands,
             ))
         }
     }
@@ -3604,9 +4147,15 @@ where
         // Somebody else completed the same replacement first. The plane holds
         // the baked row either way, which is what this was for.
         Err(e) if e.is_duplicate_key() => Ok(DelegationRowOutcome::Raced),
-        Err(e) => Err(GenesisFault::absent(
+        // The predecessor was removed above and the bake was then refused:
+        // nothing stands under this id.
+        Err(e) => Err(GenesisFault::bake_not_adopted(
             LEG,
             format!("baked delegation row {id} could not be installed over its predecessor: {e}"),
+            BakeNotAdoptedReason::Refused {
+                refusal: e.kind().to_owned(),
+            },
+            false,
         )),
     }
 }
@@ -3775,8 +4324,24 @@ where
 /// of equal vintage with different content needs holder keys. This predicate is
 /// pure, so `equal_vintage_is_not_a_successor_665` drives the rule itself
 /// rather than a caller that happens to reach it.
+///
+/// # The baked side is normalized HERE (CIRISPersist#973)
+///
+/// [`candidate_is_strictly_newer`] judges its second argument as a STORED row
+/// and does not normalize it. The compiled-in bundle row is not canonical at
+/// rest, so handed raw it classifies `Legacy` and loses to every conformant
+/// stored row: the posture leg passed it raw, and a stored row OLDER than the
+/// bake — or of the same vintage with different content — read as its
+/// successor. `Entrenched` was reported on a root the binary's own bake had
+/// not replaced. The unit witness above this function normalized the baked
+/// row in its fixture, which is why it never saw the caller's shape. A baked
+/// row that cannot be normalized supersedes nothing and is superseded by
+/// nothing: `false`.
 fn stored_is_acceptable_successor(stored: &super::Attestation, baked: &super::Attestation) -> bool {
-    candidate_is_strictly_newer(stored, baked)
+    match baked_row_as_stored(baked) {
+        Ok(baked_as_stored) => candidate_is_strictly_newer(stored, &baked_as_stored),
+        Err(_) => false,
+    }
 }
 
 /// v31.1.0 (CIRISPersist#665 review) — **the deterministic doors
@@ -3919,6 +4484,79 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// CIRISPersist#973 — **the software-ceremony seam is fenced, from disk.**
+    /// Every item that lets a process boot against something other than the
+    /// compiled bundle and community asset sits directly under
+    /// `#[cfg(feature = "test-anchor")]`, and the accessors consult the seam
+    /// only inside that cfg. A production build therefore contains none of it
+    /// (the `sqlite`-only build compiling is the other half).
+    #[test]
+    fn the_test_ceremony_seam_is_fenced_973() {
+        let src = include_str!("mod.rs");
+        let cfg = "#[cfg(feature = \"test-anchor\")]";
+        for item in [
+            "pub mod test_ceremony;",
+            "pub use test_ceremony::*;",
+            "type InstalledTestCeremony",
+            "static TEST_CEREMONY:",
+            "pub fn install_test_ceremony_outputs(",
+            "pub fn clear_test_ceremony_outputs(",
+            "fn installed_test_ceremony(",
+            "pub(crate) fn test_anchor_holder_record(",
+        ] {
+            let at = src
+                .find(item)
+                .unwrap_or_else(|| panic!("seam item {item:?} not found"));
+            let before: Vec<&str> = src[..at]
+                .lines()
+                .rev()
+                .skip_while(|l| l.trim().is_empty())
+                .take_while(|l| !l.trim().is_empty())
+                .collect();
+            assert!(
+                before.iter().any(|l| l.trim() == cfg),
+                "{item:?} is not under {cfg}: {before:?}"
+            );
+        }
+        // Each READ of the seam is itself under the cfg. The needle is
+        // assembled so this test's own text does not count.
+        let call = ["installed_test_", "ceremony()"].concat();
+        let fenced: usize = [
+            format!("{cfg}\n    if let Some(bundle) = {call}"),
+            format!("{cfg}\n    {{\n        {call}.is_some()"),
+        ]
+        .iter()
+        .map(|p| src.matches(p.as_str()).count())
+        .sum();
+        assert_eq!(fenced, 2, "the two fenced reads");
+        assert_eq!(
+            src.matches(&call).count(),
+            fenced + 1,
+            "a read of the test-ceremony seam outside {cfg} (the definition + 2 reads)"
+        );
+        assert!(include_str!("test_ceremony.rs").contains("`test-anchor` feature"));
+    }
+
+    /// v53.0.0 (CC rc7, T5) — **the community birth is a member of the pinned
+    /// bundle, never a file beside it.** The separate asset is gone; the
+    /// shipped bundle is version 2 and carries no birth, so the leg is inert
+    /// until the final ceremony's bundle is baked.
+    #[test]
+    fn the_community_birth_lives_in_the_bundle() {
+        assert!(
+            !include_str!("mod.rs").contains(&["canonical_community_seed", ".json\")"].concat()),
+            "a community asset is compiled in beside the bundle"
+        );
+        // Not baked on this branch: the leg must not exist for a boot.
+        assert!(super::canonical_community_asset().is_none());
+        assert_eq!(super::GenesisLeg::Community.as_str(), "community");
+        assert_eq!(
+            super::GenesisLeg::ALL.last(),
+            Some(&super::GenesisLeg::Community),
+            "the community leg is established last"
+        );
+    }
+
     /// v31.1.0 (CIRISPersist#665 review) — **equal vintage is not a successor.**
     ///
     /// Two v31-conformant statements bearing the same envelope-bound
@@ -3975,6 +4613,43 @@ mod tests {
             !super::stored_is_acceptable_successor(baked, &same_age),
             "and the relation is symmetric: neither wins, so neither is a successor"
         );
+        // CIRISPersist#973 — the PRODUCTION shape: the posture leg hands the
+        // predicate the RAW bundle row. Raw, it used to classify Legacy and
+        // lose to every conformant stored row, so a tie (and an OLDER stored
+        // row) read as a successor.
+        let raw = &super::canonical_genesis_bundle().attestations[0].attestation;
+        assert!(
+            !super::stored_is_acceptable_successor(&same_age, raw),
+            "a tie against the RAW baked row is not a successor either"
+        );
+        let mut older = baked.clone();
+        older.asserted_at = baked.asserted_at - chrono::Duration::seconds(60);
+        older.attestation_envelope["asserted_at"] =
+            serde_json::json!(older.asserted_at.to_rfc3339());
+        assert!(
+            super::candidate_is_v31_conformant_as_stored(&older),
+            "the older fixture must stay v31-conformant, or the shape arm answers"
+        );
+        {
+            assert!(
+                !super::stored_is_acceptable_successor(&older, raw),
+                "a stored row OLDER than the RAW baked row is not its successor"
+            );
+        }
+        let mut newer = baked.clone();
+        newer.asserted_at = baked.asserted_at + chrono::Duration::seconds(60);
+        newer.attestation_envelope["asserted_at"] =
+            serde_json::json!(newer.asserted_at.to_rfc3339());
+        assert!(
+            super::candidate_is_v31_conformant_as_stored(&newer),
+            "the newer fixture must stay v31-conformant, or the shape arm answers"
+        );
+        {
+            assert!(
+                super::stored_is_acceptable_successor(&newer, raw),
+                "a stored row strictly NEWER than the RAW baked row is its successor"
+            );
+        }
     }
 
     /// v31.0.0 (CIRISPersist#660) — **the delegation leg's verdict must not
@@ -4023,6 +4698,7 @@ mod tests {
             serve_nodes: Vec::new(),
             consensus_protocol: "quorum:2/3".to_owned(),
             attestations: vec![crate::federation::SignedAttestation { attestation: row }],
+            roster_records: Vec::new(),
             authorizations: Vec::new(),
             produced_at: "2026-08-12T00:00:00Z".to_owned(),
         };
@@ -4166,10 +4842,21 @@ mod tests {
         let node = "dryrun-fresh-node";
         crate::federation::tier_ingest::test_support::register_hybrid_key(&sq, node).await;
         let edge_id = uuid::Uuid::new_v4().to_string();
+        // #973 (CC 3.2 T4a) — a new acceptance edge names the head it
+        // attaches on: the family head this node holds (witnessed mode off).
+        let head = crate::federation::canonical_community::attach_head_for(
+            &sq,
+            FAMILY,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("attach head")
+        .expect("the family lineage is held");
         let envelope = serde_json::json!({
             "id": edge_id,
             "dimension": TRUST_ACCEPTS_DIMENSION,
             "scope": ["infra:serve", "infra:attest", "infra:store", "infra:transport"],
+            "attached_head_digest": head,
         });
         // v31.2.0 — build the row, then SEAL it through the substrate's own
         // helper rather than hand-rolling the signature. `seal_row_in_place`
@@ -4732,6 +5419,8 @@ mod tests {
         )
         .await;
         let bad = Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "test-fam".into(),
             family_name: "T".into(),
             members: vec![FamilyMember {

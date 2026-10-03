@@ -161,11 +161,14 @@ pub(crate) mod bodies {
             .filter(|x| {
                 x.attestation_type
                     == crate::federation::key_grant::KEY_GRANT_CONTENT_ATTESTATION_TYPE
+                    || x.attestation_type
+                        == crate::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
             })
             .collect();
+        // #969 — a set per stream EPOCH and one per manifest, not one per chunk.
         assert!(
-            sets.len() >= 4,
-            "a set per chunk and one for the manifest: {}",
+            sets.len() >= 2,
+            "a stream set and one for the manifest: {}",
             sets.len()
         );
         for a in &sets {
@@ -225,11 +228,18 @@ pub(crate) mod bodies {
         assert_eq!(view.storage_kind, "inline");
         assert_eq!(view.stream_id, stream);
         assert_eq!(view.total_size, plain.len() as u64);
-        assert_eq!(view.chunks.len(), 3);
+        // #969 — three chunks and the epoch's terminator.
+        assert_eq!(view.chunks.len(), 4);
         assert_eq!(
             view.chunks.iter().map(|c| c.seq).collect::<Vec<_>>(),
-            vec![0, 1, 2]
+            vec![
+                0,
+                1,
+                2,
+                crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE
+            ]
         );
+        assert_eq!(view.chunks[3].size, 0, "the terminator is empty");
         assert_eq!(view.chunks[1].size, 900);
         // Promotion before the chunks are held is refused, naming the first missing one.
         let e = engine_b
@@ -322,6 +332,18 @@ pub(crate) mod bodies {
             )
             .await
             .unwrap();
+        // #969 — and the epoch's terminator.
+        engine_b
+            .adopt_sealed_chunk(
+                &v3.stream_id,
+                v3.chunks[1].seq,
+                &chunk_env(&v3.chunks[1].sha256_hex).await,
+                0,
+                0,
+                prov.clone(),
+            )
+            .await
+            .unwrap();
         assert!(
             engine_b
                 .promote_adopted_manifest_to_dag(&m3, &b.key, None)
@@ -383,7 +405,7 @@ pub(crate) mod bodies {
             .await
             .expect("every chunk held: promoted");
         assert!(p.promoted);
-        assert_eq!(p.chunk_count, 3);
+        assert_eq!(p.chunk_count, 4);
         assert_eq!(p.total_size, plain.len() as u64);
         // Now B reads the FILE, whole and by range, across a chunk boundary.
         assert_eq!(
@@ -449,6 +471,7 @@ pub(crate) mod bodies {
                     sha: *sha,
                     size: s.len() as u32,
                     seq: None,
+                    epoch: None,
                 })
                 .collect(),
             chunk_tier: None,

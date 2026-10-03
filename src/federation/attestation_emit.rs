@@ -338,6 +338,10 @@ pub fn assemble(
     // store call one layer away. Also catches an `input` whose envelope was
     // stamped for a DIFFERENT signer than the `key_id` assembling it.
     super::admission::check_row_column_binding(&row)?;
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot at the
+    // mint, for the same reason: a row assembled and put later fails where it
+    // was built. Uncounted; the put door counts what it admits.
+    super::row_type::check_row_type(&row)?;
     let emitted = EmittedAttestation {
         attestation_id: row.attestation_id.clone(),
         attesting_key_id: key_id,

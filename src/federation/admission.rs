@@ -748,14 +748,12 @@ pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
 ///   registers it, forcing removal instead of letting a stale excuse outlive
 ///   its reason. It has now done that once, for real.
 pub const UNREGISTERED_GATED_FAMILIES: &[&str] = &[
-    // v52.0.0 (CIRISPersist#955) — `membership:` (proposal / acceptance /
-    // decline): the operator ruled on 2026-09-30 that nobody joins a family or
-    // community without their own signed acceptance, and the rows that carry
-    // it ship ahead of the CC text. CIRISConstitution#133 registers them; the
-    // re-vendor deletes this line (the test below fails until it does). NOT a
-    // staged family: a staged family refuses at federation tier, which would
-    // stop the proposal reaching its invitee.
-    "membership:",
+    // EMPTY again as of the rc6 re-vendor. It carried `membership:` (proposal /
+    // acceptance / decline, CIRISPersist#955) from the operator ruling of
+    // 2026-09-30 until CIRISConstitution#133 registered `membership:{stage}`
+    // (CC 4.4.3.2.3); the re-vendor brought the row in,
+    // `tests::declared_exceptions_are_still_unregistered` failed by name, and
+    // the line was deleted. The stem is now governed by the registry reading.
 ];
 
 /// **Staged families** `(stem, tracking ref)` — governed NOW, registered NOT
@@ -1255,9 +1253,10 @@ impl DimensionAdmissionPolicy {
     ///
     /// * `attn_type` — the wire-shape `attestation_type` token
     ///   (one of `"scores"` / `"delegates_to"` / `"supersedes"` /
-    ///   `"withdraws"` / `"recants"`). Structural primitives are
-    ///   exempt; only `"scores"` passes through the dimension
-    ///   tests.
+    ///   `"withdraws"` / `"recants"`). `"scores"` passes through the
+    ///   dimension tests; a composer does only when it carries a
+    ///   dimension (CC 2.4 ask 3, reported under v53's
+    ///   `row_type::ROW_TYPE_ENFORCEMENT`).
     /// * `dimension` — `attestation_envelope["dimension"]` as a
     ///   string. Pass `None` for structural primitives that have
     ///   no dimension. For `scores`, `None` is treated as an empty
@@ -1272,9 +1271,37 @@ impl DimensionAdmissionPolicy {
         dimension: Option<&str>,
         attesting_identity_type: &str,
     ) -> Result<(), Error> {
-        // Structural primitives exempt — see module docs §"Scope".
         if attn_type != attestation_type::SCORES {
-            return Ok(());
+            // v53.0.0 (CIRISPersist#975, CC 2.4 ask 3) — "the dimension gate
+            // follows the dimension, not the row type". A `dimension` on one of
+            // the four composers (the job label on a `delegates_to`) resolves
+            // exactly as on `scores`; a composer with NO dimension is untouched
+            // (a dimension is optional on them, required only on `scores`).
+            // Other types — a carrier, whose shape refuses a dimension, or an
+            // unregistered type the row-type gate reports — are not asked here.
+            //
+            // Under `row_type::ROW_TYPE_ENFORCEMENT = Report` (v53) a refusal is
+            // counted and logged, never returned: CC asks for a report of what
+            // this newly refuses on a production node before it is enforced.
+            use attestation_type::{DELEGATES_TO, RECANTS, SUPERSEDES, WITHDRAWS};
+            if !matches!(attn_type, DELEGATES_TO | SUPERSEDES | WITHDRAWS | RECANTS) {
+                return Ok(());
+            }
+            let Some(dim) = dimension.map(str::trim).filter(|d| !d.is_empty()) else {
+                return Ok(());
+            };
+            return match self.check_dimension(dim, attesting_identity_type) {
+                Ok(()) => Ok(()),
+                Err(e) => match crate::federation::row_type::enforcement() {
+                    crate::federation::row_type::RowTypeEnforcement::Enforce => Err(e),
+                    crate::federation::row_type::RowTypeEnforcement::Report => {
+                        crate::federation::row_type::record_composer_dimension_would_refuse(
+                            attn_type, dim, &e,
+                        );
+                        Ok(())
+                    }
+                },
+            };
         }
 
         let dim = dimension.unwrap_or("").trim();
@@ -1284,7 +1311,12 @@ impl DimensionAdmissionPolicy {
                 reason: DimensionRejectionReason::EmptyOrMissingDimension.as_str(),
             });
         }
+        self.check_dimension(dim, attesting_identity_type)
+    }
 
+    /// The dimension tests themselves, over a non-empty `dim` — shared by the
+    /// `scores` path and (CC 2.4 ask 3) a composer that carries a dimension.
+    fn check_dimension(&self, dim: &str, attesting_identity_type: &str) -> Result<(), Error> {
         // Layer 1 — the `accord:*` × `accord_holder` constitutional
         // rule. FSD-002 §4.1 + §7.1. Checked first because it
         // produces a distinct error variant downstream consumers
@@ -2061,6 +2093,10 @@ pub fn check_local_tier_eligibility(
              — got '{cohort_scope}'"
         )));
     }
+    // (0b) v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot at
+    // the local doors (all three backends call this). The carrier shape is a
+    // property of the row and is asked at the promotion door.
+    crate::federation::row_type::admit_local_row_type(attestation_type)?;
     // (1) capacity:* — never local (anti-Goodhart §7.5 / AV-62). The rule
     // itself lives in [`check_capacity_never_local`] so that `put_attestation`
     // — the OTHER door onto the local tier — asks the identical predicate
@@ -2600,6 +2636,9 @@ pub async fn check_promotion_admission(
     // Pure function of the row (no directory read, no crypto), and a REFUSAL,
     // so it leads with the other free arms.
     check_row_column_binding(row)?;
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot, beside the
+    // binding. Uncounted: the local door counted this row when it was written.
+    crate::federation::row_type::check_row_type(row)?;
 
     // AV-84 — a TARGETED cohort placement (`family` / `community`) is a
     // producer self-declaration or it is refused. Pure and free, so it leads
@@ -2670,6 +2709,9 @@ pub async fn check_promotion_admission(
     // CC 3.3.1 — a `consent:community_trust` grant is the node's own and lists
     // its owner at the grant's instant (v52.0.0, CIRISPersist#946).
     super::community_trust_consent::check_community_trust_grant_admission(directory, row).await?;
+    // CC 3.1.3.3 — a custody report is a holder self-report within the blob's
+    // own cohort (v53.0.0, CIRISPersist#942 part 2).
+    super::custody_ack::check_custody_ack_admission(directory, row).await?;
 
     // CC 3.1 — a dimension's family stem is lowercase, or it evades every
     // family gate in this file (v42.0.0, CIRISPersist#814, found by review).
@@ -11601,6 +11643,28 @@ where
             .is_ok())
 }
 
+/// CIRISPersist#972 (CC 3.1.3.2, "a node gives no acceptance") — does
+/// `key_id`'s OWN key record carry the conferring family's m-of-n scrub? The
+/// accord's blessing of a node, re-verified from the row's cryptography against
+/// the live accord roster ([`verify_accord_family_coscrub`]); no role claim is
+/// read. `false` for an unknown key.
+pub(crate) async fn key_record_carries_accord_scrub<F>(
+    directory: &F,
+    key_id: &str,
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let Some(row) = directory.lookup_public_key(key_id).await? else {
+        return Ok(false);
+    };
+    Ok(
+        verify_accord_family_coscrub(directory, &row, &accord_holder_roster_key_ids())
+            .await
+            .is_ok(),
+    )
+}
+
 /// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
 /// their own signable holders).
 // v30.3.0 (CIRISPersist#611) — `?Sized`-generic for the same reason
@@ -13964,6 +14028,17 @@ pub async fn check_consent_for_key_admission(
         return Ok(());
     };
     if for_key == row.attesting_key_id {
+        // v53.0.0 (#963, CC 3.3.7) — a node naming itself is a node-to-peer
+        // grant, and the cohort allow list rides only an OWNER's grant for
+        // the node (the grammar already refuses it with no `for_key_id`).
+        if env.get("payload").and_then(|p| p.get("cohorts")).is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "consent_cohorts_not_owner_grant: a consent:replication grant by {for_key} for \
+                 itself carries \"cohorts\" — the per-node allow list rides only the owner's \
+                 grant for one of their own nodes, never a node-to-peer grant (CC 3.3.7, \
+                 CIRISPersist#963)"
+            )));
+        }
         return Ok(());
     }
     let Some(rec) = directory.lookup_public_key(&row.attesting_key_id).await? else {
@@ -14838,6 +14913,30 @@ pub async fn check_reserved_prefix_admission(
         });
     }
 
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the same two subject-must-not-emit
+    // rules on the DIMENSION. CC registers `age_assurance:*` and
+    // `capacity_assurance:*` as dimension families, so their emitters move to
+    // `scores` + `dimension`, and `age.rs` / `capacity.rs` now read both shapes
+    // (`row_type::claim_token`). The witness-reserved half already rides the
+    // dimension (`DimensionAdmissionPolicy::check` layer 1b); without these two
+    // arms the scores shape would let a subject mint its own graduation.
+    if row.attesting_key_id == row.attested_key_id {
+        if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
+            if dim.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX) {
+                return Err(Error::CapacitySelfEmissionRejected {
+                    key_id: row.attesting_key_id.clone(),
+                    attestation_type: dim.to_owned(),
+                });
+            }
+            if dim.starts_with("age_assurance:") {
+                return Err(Error::AgeAssuranceSelfEmissionRejected {
+                    key_id: row.attesting_key_id.clone(),
+                    attestation_type: dim.to_owned(),
+                });
+            }
+        }
+    }
+
     // CC 3.4.11 (CIRISPersist#307) — the self-declared age rung carries a
     // `{band}`, NEVER a `{level}`; a `{level}` token belongs to the
     // witness `age_assurance:` rung. Age tokens travel as the
@@ -14919,7 +15018,16 @@ pub async fn check_reserved_prefix_admission(
     //
     // Pure (no directory lookup), so it stays in the cheap tier alongside the
     // attester==attested arms.
-    check_namespace_family_registered(at)?;
+    //
+    // rc6 re-vendor (CC 2.4, CIRISConstitution#137): a registered CARRIER row
+    // type (`key_grant:{axis}:v1`, `holds_bytes:sha256:{prefix}`) is not a
+    // dimension, and the registry now gates `key_grant:` as a stem no dimension
+    // may sit under. The type half therefore skips a registered carrier — the
+    // dimension matcher would refuse the row type it is told is "never a
+    // dimension". A `dimension` naming a carrier token is still refused below.
+    if !crate::federation::namespace::registry::is_registered_carrier_row_type(at) {
+        check_namespace_family_registered(at)?;
+    }
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
     }
@@ -14991,11 +15099,27 @@ pub async fn check_reserved_prefix_admission(
     super::trust_root::check_accord_root_binding(row)?;
 
     // Which (if any) identity-gated reserved prefix does the TYPE carry?
+    //
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — for the two ASSURANCE ladders the
+    // rule follows the claim onto the dimension. Their readers now resolve the
+    // `scores` + `dimension` shape (`row_type::claim_token`), so that shape must
+    // meet the whole rule — the witness role AND the conferred
+    // `infra:attest:assurance` scope — not only the role layer 1b of
+    // `DimensionAdmissionPolicy::check` asks. No emitter in any repo writes the
+    // dimension shape yet, so nothing held is newly refused.
     let is_accord = at.starts_with("accord:");
     let is_hard_case = at.starts_with("hard_case:");
+    let rule_ns = (at == super::types::attestation_type::SCORES)
+        .then(|| envelope_dimension(&row.attestation_envelope))
+        .flatten()
+        .filter(|d| {
+            d.starts_with("age_assurance:")
+                || d.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX)
+        })
+        .unwrap_or(at);
     let matched_rule = default_reserved_prefix_rules()
         .into_iter()
-        .find(|r| at.starts_with(r.pattern_prefix.as_str()));
+        .find(|r| rule_ns.starts_with(r.pattern_prefix.as_str()));
     if !is_accord && !is_hard_case && matched_rule.is_none() {
         return Ok(()); // not a reserved type — no lookup needed.
     }
@@ -15110,7 +15234,7 @@ pub async fn check_reserved_prefix_admission(
         if let Some(scope) = rule.required_delegation_scope.as_deref() {
             let Some(node) = directory.node_key_id() else {
                 return Err(Error::ReservedPrefixEmitterMismatch {
-                    dimension: at.to_owned(),
+                    dimension: rule_ns.to_owned(),
                     prefix: rule.pattern_prefix.clone(),
                     required: vec![format!(
                         "delegated scope {scope} — but this directory has no node identity,                          so conferral cannot be verified. Call set_node_key_id()."
@@ -15127,7 +15251,7 @@ pub async fn check_reserved_prefix_admission(
             .await?;
             if conferred.is_none() {
                 return Err(Error::ReservedPrefixEmitterMismatch {
-                    dimension: at.to_owned(),
+                    dimension: rule_ns.to_owned(),
                     prefix: rule.pattern_prefix.clone(),
                     required: vec![format!(
                         "delegated scope {scope} from a root this node trusts"
@@ -15144,7 +15268,7 @@ pub async fn check_reserved_prefix_admission(
             let mut required = rule.required_identity_types.clone();
             required.sort();
             return Err(Error::ReservedPrefixEmitterMismatch {
-                dimension: at.to_owned(),
+                dimension: rule_ns.to_owned(),
                 prefix: rule.pattern_prefix.clone(),
                 required,
                 got_identity_type: got,
@@ -17831,6 +17955,46 @@ mod tests {
         "trace_summary:",
         "transport:",
         "trust:",
+        // rc6 re-vendor (CIRISConstitution#133) — the rule is per-leaf and
+        // asks who the inviter and the invitee ARE, which no identity type
+        // expresses. The gate is `membership_acceptance::check_membership_row_shape`
+        // + `check_attestation_write_scope` (CIRISPersist#955).
+        "membership:",
+        // rc6 re-vendor (CIRISConstitution#137) — "legacy label on an owner's
+        // own delegates_to row; claims no job, confers nothing; closed". It is
+        // a label on a STRUCTURAL row, outside the `scores` dimension gate; the
+        // reading that it confers nothing is `trust_root`'s (a row whose
+        // dimension is not `trust:{job}` claims no job). Covers both leaves.
+        "self:delegates_to",
+        // v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — a holder self-report
+        // placed within the blob's own cohort: the rule asks whether the
+        // attester IS the attested device and is in the row's cohort, which no
+        // identity type expresses. The gate is
+        // `custody_ack::check_custody_ack_admission`.
+        "custody:",
+    ];
+
+    /// Manifest-reserved families persist has **no gate for yet** — a different
+    /// statement from the list above, kept apart so it cannot hide there. Every
+    /// one arrived REGISTERED AND RESERVED in the rc6 re-vendor; before it the
+    /// same stems were unregistered open vocabulary, so nothing admits today
+    /// that did not admit yesterday — but CC now names an emitter rule and
+    /// persist does not enforce it. Each entry names the ask that builds the
+    /// gate; the entry is deleted in the cut that lands it.
+    const RESERVED_AND_NOT_YET_GATED: &[(&str, &str)] = &[
+        // CC 3.1.3.4 — author-emitted.
+        ("file:", "CIRISPersist#962"),
+        ("collection:", "CIRISPersist#962"),
+        // CC 3.2 T6 — per-leaf: an active founder proposes, the named node's
+        // owner replies. `lineage_witness.rs` gates the COSIGN, not this
+        // ceremony.
+        ("lineage_witness:", "CIRISPersist#974"),
+        // CC 3.1.9.4 — first-person observation; the producer is the
+        // ciris-status node, which does not exist yet.
+        ("observation:reachability", "CIRISPersist#974"),
+        // CC 3.1.1 — owner-signed, self scope only. The server's row
+        // (`self:device_label`, renamed); persist has no emitter.
+        ("device:label", "CIRISConstitution#137"),
     ];
 
     /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
@@ -18282,6 +18446,9 @@ mod tests {
                 && !RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE
                     .iter()
                     .any(|s| dim.starts_with(s))
+                && !RESERVED_AND_NOT_YET_GATED
+                    .iter()
+                    .any(|(s, _)| dim.starts_with(s))
             {
                 under_enforced.push(format!(
                     "{} (CC reserves it: {:?}; persist has no gate and no declared reason)",
@@ -18291,6 +18458,18 @@ mod tests {
             }
         }
 
+        for (stem, tracked) in RESERVED_AND_NOT_YET_GATED {
+            assert!(
+                tracked.contains('#'),
+                "{stem:?} is reserved and ungated with no ask that builds its gate"
+            );
+            assert!(
+                registry::entries()
+                    .iter()
+                    .any(|e| e.prefix.starts_with(stem)),
+                "{stem:?} is recorded as reserved-and-ungated but names no manifest family"
+            );
+        }
         assert!(
             over_refused.is_empty(),
             "SPLIT TRUTH — persist OVER-REFUSES (CIRISPersist#590): {over_refused:?}. \
@@ -22432,7 +22611,7 @@ pub(crate) mod r2_test_support {
         scope: &str,
     ) {
         use crate::federation::trust_root::{
-            pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
+            test_pre_rotation_commitment, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
             TRUST_CONFERS_DIMENSION,
         };
         // The FK on attesting_key_id is real: every signer of the three rows must
@@ -22466,7 +22645,7 @@ pub(crate) mod r2_test_support {
                     "dimension": TRUST_CHARTER_DIMENSION,
                     "scope": ["infra:serve", "infra:attest"],
                     "pre_rotation_commitment":
-                        pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
+                        test_pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
                 }),
             ),
             (
@@ -23639,6 +23818,8 @@ pub(crate) mod r2_test_support {
         dir.put_family(ts::sign_family(
             &author,
             crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: format!("nskinds-family-{tag}"),
                 members: vec![crate::federation::types::FamilyMember {
@@ -23660,6 +23841,8 @@ pub(crate) mod r2_test_support {
         dir.put_community(ts::sign_community(
             &author,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: format!("nskinds-community-{tag}"),
                 members: vec![crate::federation::types::CommunityMember {
@@ -24714,6 +24897,8 @@ pub(crate) mod steward_liveness_test_support {
             crate::federation::tier_ingest::test_support::sign_community(
                 &n1,
                 Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: community.clone(),
                     community_name: format!("node commons {suffix}"),
                     members: [&n1, &n2]
@@ -24949,6 +25134,8 @@ pub(crate) mod moderation_walk_liveness_test_support {
         dir.put_community(sign_community(
             founder,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: community.to_owned(),
                 community_name: format!("moderation commons {suffix}"),
                 members: vec![CommunityMember {
@@ -25900,7 +26087,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
         suffix: &str,
     ) {
         use crate::federation::trust_root::{
-            capability_roots_to_trusted_root, pre_rotation_commitment, trust_root_valid,
+            capability_roots_to_trusted_root, test_pre_rotation_commitment, trust_root_valid,
             TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
         };
         let node = format!("reh-node-{suffix}");
@@ -25929,7 +26116,7 @@ pub(crate) mod moderation_walk_liveness_test_support {
                     "dimension": TRUST_CHARTER_DIMENSION,
                     "scope": charter_scope,
                     "pre_rotation_commitment":
-                        pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
+                        test_pre_rotation_commitment(&[format!("{root}-successor")]).expect("commitment"),
                 }),
             ),
             (

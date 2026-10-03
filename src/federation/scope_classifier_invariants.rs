@@ -51,7 +51,7 @@ pub mod bodies {
         let mut write = BTreeSet::new();
         for c in callers {
             let id = format!("i145-w-{c}");
-            if seed_row(b, &id, c, cs::AFFILIATIONS, Some(&room_a), "file:doc:v1")
+            if seed_row(b, &id, c, cs::AFFILIATIONS, Some(&room_a), "file:v1")
                 .await
                 .is_ok()
             {
@@ -66,7 +66,7 @@ pub mod bodies {
                 &producer,
                 cs::AFFILIATIONS,
                 None,
-                "file:doc:v1"
+                "file:v1"
             )
             .await
             .is_err(),
@@ -99,7 +99,7 @@ pub mod bodies {
             &producer,
             cs::AFFILIATIONS,
             Some(&room_a),
-            "file:doc:v1",
+            "file:v1",
         )
         .await
         .expect("I145: the producer is in A and places the row there");
@@ -238,7 +238,7 @@ pub mod bodies {
                         &writer,
                         scope,
                         Some(&unseen),
-                        "file:doc:v1"
+                        "file:v1"
                     )
                     .await
                 ),
@@ -256,7 +256,7 @@ pub mod bodies {
                         &writer,
                         scope,
                         Some(&theirs),
-                        "file:doc:v1"
+                        "file:v1"
                     )
                     .await
                 ),
@@ -273,7 +273,7 @@ pub mod bodies {
                         &writer,
                         scope,
                         Some(&ours),
-                        "file:doc:v1"
+                        "file:v1"
                     )
                     .await
                 ),

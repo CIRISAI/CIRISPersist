@@ -400,6 +400,8 @@ mod revocation_honesty_tests {
         sq.put_family(crate::federation::tier_ingest::test_support::sign_family(
             "fam-1",
             crate::federation::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: "fam-1".into(),
                 family_name: "Fam".into(),
                 members: vec![crate::federation::FamilyMember {
@@ -466,6 +468,8 @@ mod revocation_honesty_tests {
         sq.put_family(crate::federation::tier_ingest::test_support::sign_family(
             "fam-1",
             crate::federation::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: "fam-1".into(),
                 family_name: "Fam".into(),
                 members: vec![crate::federation::FamilyMember {

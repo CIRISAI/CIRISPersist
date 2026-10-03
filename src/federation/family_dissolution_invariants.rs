@@ -36,11 +36,16 @@ pub mod bodies {
     struct World {
         id: String,
         keys: Vec<String>,
+        /// v53.0.0 (CC 3.2 T6) — the founding version's hash: every amendment
+        /// below supersedes it and names it as `prev_head_digest`.
+        founding_hash: String,
     }
 
     fn family(w: &World, members: &[&String], name: &str) -> Family {
         let joined = at("2026-01-01T00:00:00Z");
         Family {
+            prev_head_digest: w.founding_hash.clone(),
+            charter_digest: String::new(),
             family_key_id: w.id.clone(),
             family_name: name.to_owned(),
             members: members
@@ -69,9 +74,10 @@ pub mod bodies {
                 ts::register_hybrid_key_as(d, k, k, identity_type::USER).await;
             }
         }
-        let w = World {
+        let mut w = World {
             id: format!("{tag}-fam"),
             keys,
+            founding_hash: String::new(),
         };
         let all: Vec<&String> = w.keys.iter().collect();
         let founding = ts::sign_family(&w.keys[0], family(&w, &all, "household"));
@@ -80,6 +86,12 @@ pub mod bodies {
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: founding: {e}"));
         }
+        w.founding_hash = a
+            .lookup_family(&w.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .persist_row_hash;
         w
     }
 
@@ -223,6 +235,7 @@ pub mod bodies {
         let fresh = World {
             id: format!("{tag}-born-dissolved"),
             keys: w.keys.clone(),
+            founding_hash: String::new(),
         };
         let mut born = family(&fresh, &all, "household");
         born.dissolved_at = Some(t);
@@ -490,6 +503,7 @@ pub mod bodies {
         let w = World {
             id: "i285-fam".into(),
             keys: vec!["i285-a".into()],
+            founding_hash: String::new(),
         };
         let all: Vec<&String> = w.keys.iter().collect();
         let live = family(&w, &all, "household");

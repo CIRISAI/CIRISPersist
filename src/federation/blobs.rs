@@ -160,6 +160,13 @@ pub struct ChunkRef {
     /// at another index does not open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// v53.0.0 (CIRISPersist#969) — the stream epoch whose DEK sealed the
+    /// chunk: `Some` in every v4 (stream-keyed) manifest, `None` otherwise.
+    /// Inside the sealed manifest, so it is authoritative: the reader opens
+    /// the chunk under the stream grant of THIS epoch, and the puller adopts
+    /// the chunk at it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 /// v4.1 (CIRISPersist#142, Cut B) — a flat (one-level) content-addressed
@@ -235,6 +242,20 @@ pub const CHUNK_MANIFEST_VERSION: u32 = 1;
 /// ciphertext chunk shas, plaintext sizes, a `chunk_tier` field.
 pub const CHUNK_MANIFEST_VERSION_SEALED: u32 = 2;
 
+/// v53.0.0 (CIRISPersist#969, §12.12) — the `ChunkManifest` schema version of
+/// a sealed DAG whose chunks are sealed under ONE DEK per `(stream_id,
+/// epoch)` with the STREAM nonce (CC 5.3.3.1), not a DEK per chunk. A v2
+/// manifest plus the top-level member `"chunk_keys":"stream_epoch"`, which
+/// sits INSIDE the sealed manifest and is therefore authoritative: the
+/// reader opens each chunk under the stream grant of its epoch, recomputes
+/// its nonce, and checks the epoch's counters and its one terminator. A
+/// manifest without the member (v1/v2, and v3 children at v2) is LEGACY:
+/// per-chunk DEKs, forever readable.
+pub const CHUNK_MANIFEST_VERSION_STREAM: u32 = 4;
+
+/// v53.0.0 (#969) — the one value of a v4 manifest's `chunk_keys` member.
+pub const CHUNK_KEYS_STREAM_EPOCH: &str = "stream_epoch";
+
 /// v4.x (CIRISPersist#142, Cut C3b) — operational cap on chunks per
 /// `(stream_id, epoch)`: a **nonce-safety substrate constant** (CEG 0.15
 /// §10.5.2 / §10.5.3, FSD §5). The STREAM nonce's `counter_be` is a
@@ -275,6 +296,13 @@ impl ChunkManifest {
         // ('_' 0x5F sorts before 's' 0x73). `chunk_tier` and `stream_id`
         // are present iff this is a sealed (v2) manifest (#832, #838).
         buf.push(b'{');
+        // v53.0.0 (#969) — `"chunk_keys"` sorts first ("chunk_k" < "chunk_t")
+        // and is present iff this is a v4 (stream-keyed) manifest.
+        if self.v == CHUNK_MANIFEST_VERSION_STREAM {
+            buf.extend_from_slice(b"\"chunk_keys\":\"");
+            buf.extend_from_slice(CHUNK_KEYS_STREAM_EPOCH.as_bytes());
+            buf.extend_from_slice(b"\",");
+        }
         if let Some(tier) = self.chunk_tier {
             buf.extend_from_slice(b"\"chunk_tier\":\"");
             buf.extend_from_slice(tier.as_str().as_bytes());
@@ -285,9 +313,15 @@ impl ChunkManifest {
             if i > 0 {
                 buf.push(b',');
             }
-            // Per-chunk keys, lexicographically: "seq" < "sha" < "size".
-            // `seq` is present iff this is a v2 manifest (#838).
+            // Per-chunk keys, lexicographically: "epoch" < "seq" < "sha" <
+            // "size". `seq` is present iff this is a sealed manifest (#838);
+            // `epoch` iff it is a v4 (stream-keyed) one (#969).
             buf.push(b'{');
+            if let Some(epoch) = c.epoch {
+                buf.extend_from_slice(b"\"epoch\":");
+                buf.extend_from_slice(epoch.to_string().as_bytes());
+                buf.push(b',');
+            }
             if let Some(seq) = c.seq {
                 buf.extend_from_slice(b"\"seq\":");
                 buf.extend_from_slice(seq.to_string().as_bytes());
@@ -331,6 +365,8 @@ impl ChunkManifest {
             size: u32,
             #[serde(default)]
             seq: Option<u64>,
+            #[serde(default)]
+            epoch: Option<u64>,
         }
         #[derive(Deserialize)]
         struct ManifestWire {
@@ -341,6 +377,8 @@ impl ChunkManifest {
             chunk_tier: Option<String>,
             #[serde(default)]
             stream_id: Option<String>,
+            #[serde(default)]
+            chunk_keys: Option<String>,
         }
         // v52.0.0 (#954) — a v3 root is refused by NAME, before its absent
         // `chunks` member turns it into a parse error that says nothing.
@@ -364,7 +402,26 @@ impl ChunkManifest {
         // sealed manifest without them was written by v44.0.0 and is refused
         // rather than opened under a guessed binding.
         let positioned = wire.stream_id.is_some();
-        let sealed = wire.v == CHUNK_MANIFEST_VERSION_SEALED;
+        // v53.0.0 (#969) — v4 is v2 plus `chunk_keys: "stream_epoch"`; the
+        // member is required at v4 and refused at every other version, so a
+        // reader never guesses which keys sealed the chunks.
+        let stream_keyed = wire.v == CHUNK_MANIFEST_VERSION_STREAM;
+        match (stream_keyed, wire.chunk_keys.as_deref()) {
+            (true, Some(CHUNK_KEYS_STREAM_EPOCH)) | (false, None) => {}
+            (true, other) => {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest v4 carries chunk_keys {other:?}; only \
+                     {CHUNK_KEYS_STREAM_EPOCH:?} is defined (CIRISPersist#969)"
+                )))
+            }
+            (false, Some(_)) => {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest v{} carries a chunk_keys member; only a v4 manifest does",
+                    wire.v
+                )))
+            }
+        }
+        let sealed = wire.v == CHUNK_MANIFEST_VERSION_SEALED || stream_keyed;
         if sealed && !positioned {
             return Err(BlobError::Backend(
                 "chunk_dag manifest v2 carries no stream_id: sealed before #838 (v44.0.0) — \
@@ -376,6 +433,21 @@ impl ChunkManifest {
             return Err(BlobError::Backend(
                 "chunk_dag manifest v1 carries a stream_id field".into(),
             ));
+        }
+        // v53.0.0 (#969) — a v4 chunk names the epoch whose DEK sealed it; no
+        // other version carries one.
+        if let Some(c) = wire
+            .chunks
+            .iter()
+            .find(|c| c.epoch.is_some() != stream_keyed)
+        {
+            return Err(BlobError::Backend(format!(
+                "chunk_dag manifest v{} chunk {} {} an epoch; exactly the v4 chunks carry one \
+                 (CIRISPersist#969)",
+                wire.v,
+                c.sha,
+                if stream_keyed { "lacks" } else { "carries" }
+            )));
         }
         let mut last_seq: Option<u64> = None;
         for c in &wire.chunks {
@@ -412,7 +484,7 @@ impl ChunkManifest {
                     "chunk_dag manifest v1 carries a chunk_tier field".into(),
                 ))
             }
-            (CHUNK_MANIFEST_VERSION_SEALED, Some(t)) => Some(
+            (CHUNK_MANIFEST_VERSION_SEALED | CHUNK_MANIFEST_VERSION_STREAM, Some(t)) => Some(
                 crate::federation::types::cohort_scope::CryptoTier::parse_str(t).ok_or_else(
                     || {
                         BlobError::Backend(format!(
@@ -421,16 +493,17 @@ impl ChunkManifest {
                     },
                 )?,
             ),
-            (CHUNK_MANIFEST_VERSION_SEALED, None) => {
-                return Err(BlobError::Backend(
-                    "chunk_dag manifest v2 carries no chunk_tier field".into(),
-                ))
+            (CHUNK_MANIFEST_VERSION_SEALED | CHUNK_MANIFEST_VERSION_STREAM, None) => {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag manifest v{} carries no chunk_tier field",
+                    wire.v
+                )))
             }
             (other, _) => {
                 return Err(BlobError::Backend(format!(
                     "chunk_dag manifest schema version {other} is not a flat manifest \
-                     (1 = plaintext DAG, 2 = sealed DAG; 3 = a nested root, read through \
-                     ParsedManifest)"
+                     (1 = plaintext DAG, 2 = sealed DAG, 4 = stream-keyed sealed DAG; 3 = a \
+                     nested root, read through ParsedManifest)"
                 )))
             }
         };
@@ -451,6 +524,7 @@ impl ChunkManifest {
                 sha,
                 size: c.size,
                 seq: c.seq,
+                epoch: c.epoch,
             });
         }
         Ok(ChunkManifest {
@@ -462,10 +536,18 @@ impl ChunkManifest {
         })
     }
 
-    /// #832 — `true` iff this manifest describes a sealed DAG (v2).
+    /// #832 — `true` iff this manifest describes a sealed DAG (v2 / v4).
     #[must_use]
     pub fn is_sealed(&self) -> bool {
         self.chunk_tier.is_some()
+    }
+
+    /// v53.0.0 (#969) — `true` iff the chunks are sealed under the stream's
+    /// `(stream_id, epoch)` DEKs (a v4 manifest, `chunk_keys:
+    /// "stream_epoch"`); `false` means per-chunk DEKs (legacy).
+    #[must_use]
+    pub fn is_stream_keyed(&self) -> bool {
+        self.v == CHUNK_MANIFEST_VERSION_STREAM
     }
 
     /// #832 (§12.4) — the chunk slices covering the inclusive PLAINTEXT
@@ -930,8 +1012,13 @@ impl NestedManifest {
                 "chunk_dag manifest v3 child [{index}] {why}"
             )))
         };
-        if child.v != CHUNK_MANIFEST_VERSION_SEALED {
-            return bad(format!("is v{}, not a v2 manifest (depth is 2)", child.v));
+        // v53.0.0 (#969) — a child is v2 (per-chunk keys) or v4 (stream
+        // keys); the member rides the child, which is what the reader opens.
+        if child.v != CHUNK_MANIFEST_VERSION_SEALED && child.v != CHUNK_MANIFEST_VERSION_STREAM {
+            return bad(format!(
+                "is v{}, not a v2 / v4 manifest (depth is 2)",
+                child.v
+            ));
         }
         if child.chunk_tier != Some(self.chunk_tier)
             || child.stream_id.as_deref() != Some(self.stream_id.as_str())
@@ -1109,6 +1196,19 @@ pub fn check_chunk_batch_bounds(items: &[ChunkFloorItem]) -> Result<(), BlobErro
     Ok(())
 }
 
+/// v53.0.0 (#969) — a stream-keyed claim names ONE STREAM-nonce slot, so it
+/// rides a batch of exactly one item (the write door's); a batch of several
+/// under one slot would store at most its first.
+pub fn check_stream_key_batch(claim: &StreamClaim, items: usize) -> Result<(), BlobError> {
+    if claim.stream_key.is_some() && items != 1 {
+        return Err(BlobError::InvalidArgument(format!(
+            "put_blob_chunk: a stream-keyed append names one STREAM-nonce slot and carries one \
+             chunk, not {items}"
+        )));
+    }
+    Ok(())
+}
+
 /// v52.0.0 (#957) — the one spelling of the nonce-cap refusal (CEG §10.5.3):
 /// both backends refuse by this text, as `InvalidArgument`.
 #[must_use]
@@ -1277,6 +1377,129 @@ pub struct StreamClaim {
     pub community_key_id: Option<String>,
     /// The writer's derived key id; `None` for an unattributed append.
     pub owner_key_id: Option<String>,
+    /// v53.0.0 (CIRISPersist#969) — a chunk sealed under the stream's
+    /// `(stream_id, epoch)` DEK names the STREAM-nonce counter it sealed at
+    /// and whether it is the epoch's last chunk. The floor checks it in the
+    /// append's own transaction: the counter must be the V165 count before
+    /// this insert (else nothing is stored and the door re-seals), the epoch
+    /// must hold a `federation_stream_deks` row that is not terminated (and
+    /// not closed, for a data chunk), and a `last` chunk stamps the epoch
+    /// terminated. `None` for every other append (legacy per-chunk DEKs,
+    /// community, commons, adopt).
+    pub stream_key: Option<StreamKeySlot>,
+}
+
+/// v53.0.0 (CIRISPersist#969, CC 5.3.3.1) — where a stream-keyed chunk sits
+/// in its epoch: the STREAM nonce's `counter` and `last_flag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamKeySlot {
+    /// The chunk's index within its `(stream_id, epoch)`.
+    pub counter: u32,
+    /// `true` for the epoch's terminator (the final chunk of the epoch).
+    pub last: bool,
+}
+
+/// v53.0.0 (CIRISPersist#969) — one `federation_stream_deks` row: the DEK of
+/// a self/family stream's epoch, held by the node that seals it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamDekRecord {
+    /// The stream.
+    pub stream_id: String,
+    /// The epoch (the chunk rows' recorded epoch).
+    pub epoch: u64,
+    /// The stream's owner — the writer, the only sealer (single sender).
+    pub owner_key_id: String,
+    /// `self` or `family`.
+    pub cohort_scope: String,
+    /// The self identity or the family key the stream is sealed for.
+    pub group_key_id: String,
+    /// The DEK wrapped under this node's content master.
+    pub self_retention_wrap: String,
+    /// How many chunk rows the epoch holds (the V165 counter): the next
+    /// chunk's STREAM-nonce counter.
+    pub chunk_count: u64,
+    /// No further data chunk may be sealed under the epoch.
+    pub closed: bool,
+    /// The epoch's terminator is stored; nothing more may be appended.
+    pub terminated: bool,
+}
+
+/// v53.0.0 (CIRISPersist#969) — the key set a chunk is sealed under, as a
+/// refusal and the readiness door name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "axis", rename_all = "snake_case")]
+pub enum ChunkKeyRef {
+    /// A legacy chunk's own content-axis grant (`key_grant:content:v1`).
+    Content {
+        /// The chunk's content address, hex.
+        at_rest_sha256: String,
+    },
+    /// The stream-axis grant of the chunk's epoch (`key_grant:stream:v1`).
+    Stream {
+        /// The stream.
+        stream_id: String,
+        /// The epoch.
+        epoch: u64,
+    },
+}
+
+impl std::fmt::Display for ChunkKeyRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChunkKeyRef::Content { at_rest_sha256 } => {
+                write!(f, "key_grant:content:v1 for {at_rest_sha256}")
+            }
+            ChunkKeyRef::Stream { stream_id, epoch } => {
+                write!(
+                    f,
+                    "key_grant:stream:v1 for stream {stream_id} epoch {epoch}"
+                )
+            }
+        }
+    }
+}
+
+/// v53.0.0 (CIRISPersist#969) — what [`BlobStorage::stream_key_state`]
+/// reads in one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamKeyState {
+    /// The stream's NEWEST `federation_stream_deks` row (highest epoch) with
+    /// its epoch's V165 count; `None` when this node sealed no stream epoch.
+    pub latest: Option<StreamDekRecord>,
+    /// The stream holds at least one chunk index row. With `latest: None`
+    /// this is a stream written before #969: its chunks carry per-chunk DEKs
+    /// and it stays that way to its seal (one DAG never mixes the two).
+    pub has_chunks: bool,
+    /// `federation_streams.owner_key_id` — the stream's single sender, as
+    /// this node recorded it (the writer here; the declared author on an
+    /// adopter). `None` for an unknown or unattributed stream.
+    pub owner_key_id: Option<String>,
+}
+
+/// v53.0.0 (CIRISPersist#969) — the refusal tokens the chunk floor answers a
+/// stream-keyed append with. Both are `InvalidArgument`, prefixed by the
+/// token, so the door can tell "re-seal at the new counter" from "roll".
+pub const STREAM_COUNTER_MOVED: &str = "stream_counter_moved";
+/// See [`STREAM_COUNTER_MOVED`].
+pub const STREAM_EPOCH_CLOSED: &str = "stream_epoch_closed";
+
+/// v53.0.0 (#969) — the one spelling of "another append took this counter".
+#[must_use]
+pub fn stream_counter_moved_refusal(stream_id: &str, epoch: u64, counter: u32) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "{STREAM_COUNTER_MOVED}: (stream_id={stream_id}, epoch={epoch}) is no longer at counter \
+         {counter}; nothing was stored — re-seal at the current counter (CC 5.3.3.1)"
+    ))
+}
+
+/// v53.0.0 (#969) — the one spelling of "this epoch takes no more chunks".
+#[must_use]
+pub fn stream_epoch_closed_refusal(stream_id: &str, epoch: u64) -> BlobError {
+    BlobError::InvalidArgument(format!(
+        "{STREAM_EPOCH_CLOSED}: (stream_id={stream_id}, epoch={epoch}) is closed or terminated, \
+         or holds no stream DEK; a chunk after an epoch's last is refused (CC 5.3.3.1 append \
+         resistance)"
+    ))
 }
 
 /// #832 (§12.3) — an epoch binding the chunk / manifest floor must write
@@ -1761,9 +1984,15 @@ pub trait BlobStorage: Send + Sync {
         Output = Result<Option<crate::federation::types::cohort_scope::CryptoTier>, BlobError>,
     > + Send;
 
-    /// v43.0.0 (§11.5, I19) — delete a blob row **and its satellites** (the
-    /// epoch binding, the at-rest grants) in one transaction. `Ok(false)` if
-    /// no blob row existed. The floor every eviction path ends at.
+    /// v43.0.0 (§11.5, I19) — delete a blob row **and its epoch binding** in
+    /// one transaction. `Ok(false)` if no blob row existed. The floor every
+    /// eviction path ends at.
+    ///
+    /// v53.0.0 (CIRISEdge#763) — the at-rest key **grants stay**: an eviction
+    /// removes BYTES, and a grant is a key-plane fact, not a byte holding. A
+    /// device that re-fetches the bytes opens them with the grant it held, with
+    /// no key_grant set re-applied. Grants are removed only where the key plane
+    /// says so: an epoch's destruction sweep and an abandoned stream.
     fn delete_blob(
         &self,
         sha256: &[u8; 32],
@@ -1986,6 +2215,108 @@ pub trait BlobStorage: Send + Sync {
         stream_id: &str,
         seq: u64,
     ) -> impl Future<Output = Result<Option<StreamChunkRef>, BlobError>> + Send;
+
+    /// v53.0.0 (#969, #842) — **every stream position a chunk row sits at**,
+    /// by its content address: `(stream_id, chunk)` pairs, empty for a row
+    /// that is no stream's chunk. A stream-keyed chunk carries no per-chunk
+    /// grant, so the whole-blob doors authorize it through its position's
+    /// `(stream, epoch)` grant; this is the lookup (V175 indexes it).
+    fn stream_positions_of_chunk(
+        &self,
+        chunk_sha: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<(String, StreamChunkRef)>, BlobError>> + Send;
+
+    // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
+
+    /// The stream's key state in one snapshot — see [`StreamKeyState`].
+    fn stream_key_state(
+        &self,
+        stream_id: &str,
+    ) -> impl Future<Output = Result<StreamKeyState, BlobError>> + Send;
+
+    /// Every `federation_stream_deks` row of the stream, ascending epoch,
+    /// each with its V165 count.
+    fn stream_dek_list(
+        &self,
+        stream_id: &str,
+    ) -> impl Future<Output = Result<Vec<StreamDekRecord>, BlobError>> + Send;
+
+    /// Insert the epoch's DEK row if absent and return the row as stored —
+    /// two racing first chunks resolve to ONE DEK (the loser's is dropped
+    /// before anything is sealed under it). `chunk_count`, `closed` and
+    /// `terminated` of the argument are ignored.
+    fn stream_dek_insert(
+        &self,
+        record: &StreamDekRecord,
+    ) -> impl Future<Output = Result<StreamDekRecord, BlobError>> + Send;
+
+    /// Close the epoch to further DATA chunks (a forced or removal roll).
+    /// Idempotent. The terminator may still be appended.
+    fn stream_dek_close(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// Write `wraps` for `(stream_id, epoch)` under `sealer_key_id` — ONE
+    /// transaction, a UNION (`DO NOTHING`). Returns the rows inserted.
+    fn stream_dek_put_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+        cohort_scope: &str,
+        wraps: &[GrantWrap],
+    ) -> impl Future<Output = Result<usize, BlobError>> + Send;
+
+    /// Every wrap of `(stream_id, epoch)` under `sealer_key_id`, by recipient.
+    fn stream_dek_grants(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        sealer_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<GrantWrap>, BlobError>> + Send;
+
+    /// The wraps of `(stream_id, epoch)` addressed to `recipient_key_id`, as
+    /// `(sealer_key_id, wrap)` — every sealer (the reader keeps the one that
+    /// speaks for the stream's owner).
+    fn stream_dek_grants_for_recipient(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        recipient_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<(String, GrantWrap)>, BlobError>> + Send;
+
+    /// The V146 watermark of a stream epoch: the newest grant's `created_at`
+    /// under the epoch's owner, `None` when it has none.
+    fn stream_dek_key_grant_watermark(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<chrono::DateTime<chrono::Utc>>, BlobError>> + Send;
+
+    /// Stamp the epoch's set emitted at `watermark` (never backwards).
+    fn stream_dek_mark_key_grant_emitted(
+        &self,
+        stream_id: &str,
+        epoch: u64,
+        watermark: chrono::DateTime<chrono::Utc>,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// Every stream epoch `owner_key_id` sealed whose set is dirty (a grant
+    /// newer than the stamp, or never emitted).
+    fn stream_dek_list_key_grant_dirty(
+        &self,
+        owner_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<StreamDekRecord>, BlobError>> + Send;
+
+    /// The retroactive-ADD walk's set: every stream epoch THIS node sealed at
+    /// `cohort_scope` on which any of `recipients` holds a wrap.
+    fn stream_dek_list_for_recipients(
+        &self,
+        recipients: &[String],
+        cohort_scope: &str,
+    ) -> impl Future<Output = Result<Vec<StreamDekRecord>, BlobError>> + Send;
 
     /// #832 (§12.4) — the row HEAD a read door dispatches on:
     /// `(storage_kind, crypto_tier, cohort_scope, size_bytes)`, or `None`
@@ -3882,6 +4213,30 @@ pub enum BlobError {
         viewer_key_id: String,
     },
 
+    /// v53.0.0 (CIRISPersist#969) — a viewer AUTHORIZED on a sealed DAG
+    /// (they hold its manifest's grant) lacks the key of one of its chunks:
+    /// the chunk's own content grant on a legacy DAG, or the stream grant of
+    /// the chunk's epoch on a stream-keyed one. **Retryable**: key sets
+    /// replicate on their own plane and may still be arriving; `key` says
+    /// which set to wait for or ask for. A stranger (no manifest grant) is
+    /// still `NotGranted` and learns nothing about the chunks.
+    #[error(
+        "viewer {viewer_key_id} is authorized on blob {sha256_hex} but holds no key yet for its \
+         chunk seq {seq} ({chunk_sha_hex}): {key}"
+    )]
+    ChunkKeyNotYetGranted {
+        /// The DAG the viewer asked for.
+        sha256_hex: String,
+        /// The viewer.
+        viewer_key_id: String,
+        /// The chunk's position.
+        seq: u64,
+        /// The chunk's content address.
+        chunk_sha_hex: String,
+        /// The key set the viewer lacks.
+        key: ChunkKeyRef,
+    },
+
     /// v4.14.0 (CIRISPersist#152) — the at-rest blob bytes are not held
     /// by this substrate (no `federation_blobs` row for the SHA).
     /// Distinct from [`Self::NotGranted`] (bytes present, no grant).
@@ -4049,6 +4404,7 @@ impl BlobError {
             BlobError::RangeNotSatisfiable { .. } => "blob_range_not_satisfiable",
             BlobError::RangeSpansExternalChunk { .. } => "blob_range_spans_external_chunk",
             BlobError::NotGranted { .. } => "blob_not_granted",
+            BlobError::ChunkKeyNotYetGranted { .. } => "blob_chunk_key_not_yet_granted",
             BlobError::NotHeld { .. } => "blob_not_held",
             BlobError::DiskPressureProxyRefused { .. } => "blob_disk_pressure_proxy_refused",
             BlobError::QuarantineWithheld { .. } => "blob_quarantine_withheld",
@@ -4957,6 +5313,7 @@ pub(crate) fn prepare_sealed_manifest_row(
             sha: *sha,
             size,
             seq: None,
+            epoch: None,
         });
     }
     let manifest = ChunkManifest {
@@ -5591,11 +5948,13 @@ mod tests {
                     sha: c0,
                     size: 10,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: c1,
                     size: 9,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -5626,6 +5985,7 @@ mod tests {
                 sha: c0,
                 size: 10,
                 seq: Some(7),
+                epoch: None,
             }],
             chunk_tier: Some(CryptoTier::CommunityDek),
             stream_id: Some("cam-1/\"live\"".into()),
@@ -5651,6 +6011,7 @@ mod tests {
                 sha: c0,
                 size: 10,
                 seq: None,
+                epoch: None,
             }],
             total_size: 10,
         };
@@ -5673,6 +6034,7 @@ mod tests {
                 sha: c0,
                 size: 3,
                 seq: Some(0),
+                epoch: None,
             }],
             chunk_tier: Some(CryptoTier::InvisibleEncrypted),
             stream_id: Some("s".into()),
@@ -5722,21 +6084,25 @@ mod tests {
                     sha: [1; 32],
                     size: 4,
                     seq: None,
+                    epoch: None,
                 }, // bytes 0..=3
                 ChunkRef {
                     sha: [2; 32],
                     size: 0,
                     seq: None,
+                    epoch: None,
                 }, // empty, skipped
                 ChunkRef {
                     sha: [3; 32],
                     size: 3,
                     seq: None,
+                    epoch: None,
                 }, // bytes 4..=6
                 ChunkRef {
                     sha: [4; 32],
                     size: 3,
                     seq: None,
+                    epoch: None,
                 }, // bytes 7..=9
             ],
             chunk_tier: None,
@@ -5821,11 +6187,13 @@ mod tests {
                     sha: c0,
                     size: 1,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: c1,
                     size: 2,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -5846,11 +6214,13 @@ mod tests {
                     sha: [0; 32],
                     size: 2,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: [1; 32],
                     size: 3,
                     seq: None,
+                    epoch: None,
                 },
             ],
         };
@@ -5880,6 +6250,7 @@ mod tests {
                 sha: fake,
                 size: 4,
                 seq: None,
+                epoch: None,
             }],
         };
         let chunks = vec![(fake, BlobBody::Inline(b"real".to_vec()))];
@@ -5904,6 +6275,7 @@ mod tests {
                 sha: c,
                 size: 4,
                 seq: None,
+                epoch: None,
             }],
         };
         let chunks = vec![(c, BlobBody::Inline(b"abcd".to_vec()))];
@@ -5925,6 +6297,7 @@ mod tests {
                 sha: c,
                 size: 3,
                 seq: None,
+                epoch: None,
             }],
         };
         let chunks = vec![(c, BlobBody::Inline(b"xyz".to_vec()))];
@@ -5972,6 +6345,7 @@ mod tests {
                 sha: [0; 32],
                 size: 42,
                 seq: None,
+                epoch: None,
             }],
         };
         let body = BlobBody::ChunkDag(manifest);

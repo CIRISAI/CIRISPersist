@@ -332,6 +332,140 @@ where
     Ok(computed_hash)
 }
 
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) — **the
+/// one record the reserved `humanity-accord` id admits through a door: a new
+/// version of the HELD accord that moves only its head.**
+///
+/// The accord's head is its family record at a version and names the charter
+/// in force; a charter re-scrub takes effect only through a new version. The
+/// id stays reserved against every founding and every roster, protocol or
+/// entrenchment change (a squat, or a roster change by another rule). What
+/// passes is exactly: this node holds the accord; the offered record equals
+/// it in everything but `prev_head_digest` / `charter_digest`; it carries a
+/// supersede proof naming the held version, whose change envelope binds the
+/// offered record's content hash (`next_persist_row_hash` — the quorum signs
+/// WHICH charter, not only "the same roster"); and that envelope verifies to
+/// the held roster's own protocol. The prev-head check then runs in the
+/// supersede transaction.
+async fn is_accord_head_version<F>(
+    directory: &F,
+    signed: &super::SignedFamily,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let offered = &signed.family;
+    let Some(proof) = signed.supersede_proof.as_ref() else {
+        return Ok(false);
+    };
+    let Some(held) = directory.lookup_family(&offered.family_key_id).await? else {
+        return Ok(false);
+    };
+    let head_only = offered.family_name == held.family_name
+        && offered.members == held.members
+        && offered.founded_at == held.founded_at
+        && offered.consensus_protocol == held.consensus_protocol
+        && offered.consensus_protocol_entrenched == held.consensus_protocol_entrenched
+        && offered.dissolved_at == held.dissolved_at;
+    if !head_only || proof.prior_persist_row_hash != held.persist_row_hash {
+        return Ok(false);
+    }
+    let bound = proof
+        .change_envelope
+        .get(super::canonical_community::NEXT_PERSIST_ROW_HASH)
+        .and_then(|v| v.as_str());
+    if bound != Some(super::types::compute_persist_row_hash(offered)?.as_str()) {
+        return Ok(false);
+    }
+    match directory
+        .verify_membership_quorum(
+            super::cohort::Cohort::Family,
+            &offered.family_key_id,
+            &proof.change_envelope,
+            &proof.quorum_signatures,
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(Error::Backend(m)) => return Err(Error::Backend(m)),
+        Err(_) => return Ok(false),
+    }
+    // v53.0.0 (CC 3.2 T6 / CC 4.2.6, rc7 `36432c6`) — the accord's version
+    // needs yes-votes from a strict majority of its STANDING roster, whatever
+    // its `consensus_protocol` reads (`quorum:2/3` is that majority only while
+    // the roster is three).
+    accord_standing_majority_signed(directory, &offered.family_key_id, proof).await
+}
+
+/// v53.0.0 (CC 3.2 T6 / CC 4.2.6) — do distinct members of `family`'s standing
+/// roster (the one fold, [`FederationDirectory::active_family_members`]) that
+/// make a strict majority of it sign `proof.change_envelope`? Each signature
+/// is verified against the member's REGISTERED pinned hybrid key, one member
+/// at a time, so a key counts once however many signatures name it.
+pub(crate) async fn accord_standing_majority_signed<F>(
+    directory: &F,
+    family_key_id: &str,
+    proof: &super::types::GroupSupersedeProof,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let standing: Vec<String> = directory
+        .active_family_members(family_key_id)
+        .await?
+        .into_iter()
+        .map(|m| m.key_id)
+        .collect();
+    standing_majority_signed_by(directory, &standing, proof).await
+}
+
+/// Do distinct members of `standing` that make a strict majority of it sign
+/// `proof.change_envelope`? Each signature is verified against the member's
+/// REGISTERED pinned hybrid key, one member at a time, so a key counts once
+/// however many signatures name it.
+pub(crate) async fn standing_majority_signed_by<F>(
+    directory: &F,
+    standing: &[String],
+    proof: &super::types::GroupSupersedeProof,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use ciris_verify_core::accord_genesis as ag;
+    let Ok(bytes) = ag::accord_family_signing_bytes(&proof.change_envelope) else {
+        return Ok(false);
+    };
+    let mut signed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key_id in standing {
+        let Some(rec) = directory.lookup_public_key(key_id).await? else {
+            continue;
+        };
+        let member = ciris_verify_core::threshold::ThresholdMember {
+            member_id: rec.key_id,
+            ed25519_public_key_base64: rec.pubkey_ed25519_base64,
+            mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
+            role: None,
+        };
+        let verified = proof
+            .quorum_signatures
+            .iter()
+            .filter(|sig| sig.member_id == member.member_id)
+            .any(|sig| {
+                ciris_verify_core::threshold::verify_threshold_signatures(
+                    &bytes,
+                    std::slice::from_ref(&member),
+                    std::slice::from_ref(sig),
+                    1,
+                )
+                .is_ok()
+            });
+        if verified {
+            signed.insert(member.member_id);
+        }
+    }
+    Ok(signed.len() >= ag::strict_majority(standing.len()))
+}
+
 /// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
 /// [`SignedFamily`](super::SignedFamily): hybrid-Strict verify the scrub
 /// signature against the **claimed authority**'s REGISTERED pubkeys, over
@@ -373,11 +507,41 @@ where
 {
     if signed.family.family_key_id
         == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+        && !is_accord_head_version(directory, signed).await?
+        // v53.0.0 (CC 4.2.6) — the door's second admitted shape: a holder's
+        // own seat rotated under their pre-committed recovery key. A version
+        // shaped as a recovery that fails a check is refused by that check's
+        // name (`accord_recovery_*`), here and on every peer.
+        && super::accord_recovery::verify_accord_recovery(directory, signed)
+            .await?
+            .is_none()
+        // v53.0.0 (CC 4.2.6) — the third: a roster change covering authorized
+        // decisions, under a strict majority of the standing roster.
+        && super::accord_roster::verify_accord_roster_change(directory, signed)
+            .await?
+            .is_none()
     {
         return Err(Error::ConstitutionalFamilyReserved {
             family_key_id: signed.family.family_key_id.clone(),
             attesting_key_id: signed.authority_key_id.clone(),
         });
+    }
+    // v53.0.0 (CC 4.2.6, R2c ruling (a)) — every accord version, whichever
+    // shape, names a charter whose recovery commitments cover exactly its
+    // roster (a recovery's next commitment stands in for its seat's entry).
+    if signed.family.family_key_id
+        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+    {
+        let recovery = signed
+            .supersede_proof
+            .as_ref()
+            .map(|p| &p.change_envelope)
+            .filter(|e| {
+                e.get("kind").and_then(|k| k.as_str())
+                    == Some(super::accord_recovery::RECOVERY_STATEMENT_KIND)
+            });
+        super::accord_roster::check_charter_covers_roster(directory, &signed.family, recovery)
+            .await?;
     }
     let envelope = signed.family.signing_envelope();
     verify_envelope_hybrid_signature(
@@ -1582,6 +1746,38 @@ pub mod test_support {
         crate::federation::envelope::RowMirror::stamp_row(row).expect("finite weight");
     }
 
+    /// v53.0.0 (CC 3.2 T6) — `f` as the version that succeeds the head `d`
+    /// holds: `prev_head_digest` set to the held hash, signed again by the
+    /// same authority (the field is signed).
+    pub async fn family_naming_held<D: crate::federation::FederationDirectory + ?Sized>(
+        d: &D,
+        f: crate::federation::SignedFamily,
+    ) -> crate::federation::SignedFamily {
+        let mut rec = f.family;
+        rec.prev_head_digest = d
+            .lookup_family(&rec.family_key_id)
+            .await
+            .expect("lookup_family")
+            .map(|h| h.persist_row_hash)
+            .unwrap_or_default();
+        sign_family(&f.authority_key_id, rec)
+    }
+
+    /// The community twin of [`family_naming_held`].
+    pub async fn community_naming_held<D: crate::federation::FederationDirectory + ?Sized>(
+        d: &D,
+        c: crate::federation::SignedCommunity,
+    ) -> crate::federation::SignedCommunity {
+        let mut rec = c.community;
+        rec.prev_head_digest = d
+            .lookup_community(&rec.community_key_id)
+            .await
+            .expect("lookup_community")
+            .map(|h| h.persist_row_hash)
+            .unwrap_or_default();
+        sign_community(&c.authority_key_id, rec)
+    }
+
     /// v21.0.0 (CIRISPersist#502 E4) — sign a [`Family`](crate::federation::types::Family)
     /// for submission: hybrid-signs `family.signing_envelope()` with
     /// `authority_key_id`'s deterministic keypair and wraps the result as a
@@ -2225,7 +2421,7 @@ pub mod test_support {
 
     /// v38.6.0 (#773) — a live `delegates_to(owner → node)` carrying the
     /// CC 1.13.3.3 ownership dimension, sealed by the owner.
-    pub(crate) async fn put_owner_binding(
+    pub async fn put_owner_binding(
         dir: &dyn crate::federation::FederationDirectory,
         owner: &str,
         node: &str,
@@ -3198,6 +3394,8 @@ pub mod test_support {
         dir.put_community(sign_community(
             member_a,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: community_key_id.to_owned(),
                 community_name: "chat-pair".to_owned(),
                 members,
@@ -3241,6 +3439,8 @@ pub mod test_support {
         // Both ends DERIVE the same community from the same member pair, so
         // the content is byte-identical; only the signer differs.
         let derived = |name: &str| crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: cid.clone(),
             community_name: name.to_owned(),
             members: vec![

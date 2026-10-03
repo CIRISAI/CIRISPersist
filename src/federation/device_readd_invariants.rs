@@ -196,6 +196,8 @@ pub(crate) mod bodies {
         b.put_community(ts::sign_community(
             &comm,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: "second device".into(),
                 members: [(&alice, true), (&bob, false), (&carol, false)]
@@ -1510,6 +1512,79 @@ pub(crate) mod two_node {
             .unwrap_or_else(|e| panic!("(k) the device opens its wrap: {e}"));
         assert_eq!(dek.len(), 32, "(k) a 32-byte DEK");
     }
+
+    /// Re-open `dsn` as a FRESH backend handle — one no `Engine` has ever told
+    /// its node key; the shape a host hands `Engine::from_shared*`.
+    pub(crate) type Reopen = fn(
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::engine::BackendDispatch> + Send>,
+    >;
+
+    /// **I380 (CIRISPersist#966)** — an `Engine` over a SHARED backend tells
+    /// that backend its node key at construction, so the backend's own
+    /// receive door (the one every host's sync reaches, no signer in hand)
+    /// re-wraps the node's epochs to a member's late device. Before the fix
+    /// the shared backend's node key was `None` and the door re-wrapped
+    /// nothing: "none set: nothing is theirs to re-wrap".
+    pub(crate) async fn i380_a_shared_engine_rewraps_for_a_late_device<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        reopen: Reopen,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let l = ladder(dsn_a, dsn_b, run, pick).await;
+        let bob = format!("em-bob-{run}");
+        l.engine_a
+            .put_blob_scoped(COMMUNITY, Some(&l.comm), b"before the device", None, None)
+            .await
+            .unwrap_or_else(|e| panic!("I380 A seals at epoch 0: {e}"));
+
+        // Both shared constructors, each over its own fresh handle.
+        let plain =
+            crate::Engine::from_shared(reopen(dsn_a.to_owned()).await, l.engine_a.signer().clone());
+        let with_local = crate::Engine::from_shared_with_local(
+            reopen(dsn_a.to_owned()).await,
+            l.engine_a.signer().clone(),
+            None,
+        );
+        for (name, e) in [
+            ("from_shared", &plain),
+            ("from_shared_with_local", &with_local),
+        ] {
+            assert_eq!(
+                pick(e).node_key_id().as_deref(),
+                Some(l.node_a.as_str()),
+                "I380 {name} tells the shared backend its node key — the same id \
+                 `register_self_federation_key` uses"
+            );
+        }
+
+        let shared = pick(&plain);
+        let b = l.bb.as_ref();
+        let d = device(shared.as_ref(), b, &format!("d380-{run}")).await;
+        anchor_local(shared.as_ref(), &bob, &d).await;
+        let binding = bind_on_b(b, &bob, &d.key, run).await;
+        // The backend's own receive door — not the Engine's, which tells the
+        // backend its key on the way in (#916 N1) and so hides the gap.
+        plain
+            .federation_directory()
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("I380 the shared backend admits bob's binding: {e}"));
+        assert!(
+            shared
+                .community_dek_has_member_grant(&l.comm, &l.node_a, 0, &d.key)
+                .await
+                .unwrap(),
+            "I380 the shared backend re-wrapped its own epoch to the late device"
+        );
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
@@ -1547,6 +1622,60 @@ mod run_two_node {
                 as crate::federation::epoch_minter_invariants::bodies::Pick<
                     crate::store::postgres::PostgresBackend,
                 >,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i380_shared_engine_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        super::two_node::i380_a_shared_engine_rewraps_for_a_late_device(
+            &format!("sqlite:///{}", path.display()),
+            "sqlite::memory:",
+            &suffix(),
+            (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::sqlite::SqliteBackend,
+                >,
+            |dsn| {
+                Box::pin(async move {
+                    let path = dsn.strip_prefix("sqlite:///").unwrap().to_owned();
+                    crate::engine::BackendDispatch::Sqlite(std::sync::Arc::new(
+                        crate::store::sqlite::SqliteBackend::open(path)
+                            .await
+                            .unwrap(),
+                    ))
+                })
+            },
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i380_shared_engine_postgres() {
+        let (Some(a), Some(b)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn()) else {
+            return;
+        };
+        super::two_node::i380_a_shared_engine_rewraps_for_a_late_device(
+            &a,
+            &b,
+            &suffix(),
+            (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+                as crate::federation::epoch_minter_invariants::bodies::Pick<
+                    crate::store::postgres::PostgresBackend,
+                >,
+            |dsn| {
+                Box::pin(async move {
+                    crate::engine::BackendDispatch::Postgres(std::sync::Arc::new(
+                        crate::store::postgres::PostgresBackend::connect(&dsn)
+                            .await
+                            .unwrap(),
+                    ))
+                })
+            },
         )
         .await;
     }

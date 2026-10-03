@@ -3,8 +3,10 @@
 //! incoming age attestations, so the CC 3.2 user-target steward-binding gate
 //! and the minor-stewardship liveness predicate can be machine-checked.
 //!
-//! Age tokens travel as the **`attestation_type`** string (NOT the `scores`
-//! envelope `dimension`):
+//! Age tokens travel as the `dimension` of a `scores` row (CC 2.4 registers
+//! both stems as dimension families), or — for rows written before v53.0.0
+//! (CIRISPersist#975) — as the **`attestation_type`** string itself. Both
+//! shapes resolve identically ([`super::row_type::claim_token`]):
 //!
 //! - `age_assurance:*` — the **witness** rung (provider/government). The
 //!   `attestation_type` is reserved to a `witness`-role emitter at admission
@@ -235,7 +237,12 @@ pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<Ag
                 continue;
             }
         }
-        let at = r.attestation_type.as_str();
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — both shapes: the `scores` +
+        // `dimension` shape CC registers, and the type-slot shape rows
+        // already held were written in.
+        let Some(at) = super::row_type::claim_token(&r) else {
+            continue;
+        };
         if at.starts_with("age_assurance:") {
             // v13.0.0 (CIRISPersist#368, CC 3.4.11) — read-side
             // defense-in-depth: a SELF-emitted witness row (attester ==
@@ -298,7 +305,12 @@ pub async fn age_band_fine(
                 continue;
             }
         }
-        let at = r.attestation_type.as_str();
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — both shapes: the `scores` +
+        // `dimension` shape CC registers, and the type-slot shape rows
+        // already held were written in.
+        let Some(at) = super::row_type::claim_token(&r) else {
+            continue;
+        };
         if at.starts_with("age_assurance:") {
             // v13.0.0 (CIRISPersist#368, CC 3.4.11) — a self-emitted witness
             // row confers nothing (see `age_band`; same defense-in-depth).

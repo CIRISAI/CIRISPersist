@@ -17,9 +17,20 @@ use serde::{Deserialize, Serialize};
 /// The domain label, a signed member of the envelope.
 pub const LINEAGE_HEAD_COSIGN_DOMAIN: &str = "ciris.lineage_head_cosign.v1";
 
-/// The default witness quorum when a charter declares none (`witness_quorum`):
-/// ONE independent witness. Persist's choice pending CC text (FSD §1.3).
-pub const DEFAULT_WITNESS_QUORUM: u32 = 1;
+/// #973 (CC 3.2 T6, "Witnessed mode off") — **the quorum a charter declares,
+/// with no default substituted.** A charter silent on `witness_quorum`, or
+/// declaring `0`, is in witnessed mode OFF: this returns `0`, and every reader
+/// asks [`witnessed_mode_on`] before it counts a cosign.
+#[must_use]
+pub fn declared_witness_quorum(charter_value: Option<u32>) -> u32 {
+    charter_value.unwrap_or(0)
+}
+
+/// Witnessed mode is on only by an explicit non-zero charter value.
+#[must_use]
+pub fn witnessed_mode_on(quorum: u32) -> bool {
+    quorum > 0
+}
 
 /// A witness's cosignature over one head of one lineage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +109,12 @@ pub enum LineageCosignRefusal {
     Skew,
     /// The object is malformed (not a hex64 digest, not RFC 3339, empty ids).
     Malformed,
+    /// v53.0.0 (CC 3.2 T6, consequence (ii)) — witnessed mode is on and the
+    /// cosigned head is the held head, which lags its roster at the cosign's
+    /// `signed_at`: a roster row older than one cadence no version covers.
+    /// Witnesses do not cosign a lagging head
+    /// ([`crate::federation::roster_head::roster_lag`]).
+    HeadLagsRoster,
 }
 
 impl LineageCosignRefusal {
@@ -113,6 +130,7 @@ impl LineageCosignRefusal {
             Self::PriorNotAncestor => "prior_not_ancestor",
             Self::Skew => "skew",
             Self::Malformed => "malformed",
+            Self::HeadLagsRoster => crate::federation::roster_head::LINEAGE_HEAD_LAGS_ROSTER,
         }
     }
 }
@@ -273,6 +291,33 @@ where
                 // equivocation this node has not seen (evidence), or a version
                 // not yet received.
             }
+            // 7b (v53.0.0, CC 3.2 T6 consequence (ii)) — witnesses do not
+            //    cosign a lagging head. Only the HELD head can lag (an older
+            //    version is history), judged at the witness's own instant so
+            //    every node holding the same rows agrees. With witnessed mode
+            //    off the lag is reported and nothing else changes.
+            let is_held_head = held_versions
+                .last()
+                .is_some_and(|(d, _)| d == &cosign.head_digest_sha256_hex);
+            if is_held_head
+                && witnessed_mode_on(declared_witness_quorum(
+                    crate::federation::canonical_community::charter_members_for(
+                        directory,
+                        &cosign.lineage_key_id,
+                    )
+                    .await?
+                    .and_then(|c| c.witness_quorum),
+                ))
+                && crate::federation::roster_head::roster_lag(
+                    directory,
+                    &cosign.lineage_key_id,
+                    signed_at,
+                )
+                .await?
+                .is_some()
+            {
+                return refused(LineageCosignRefusal::HeadLagsRoster);
+            }
             LineageCosignOutcome::Inserted
         }
     };
@@ -432,14 +477,16 @@ where
 
 /// `witnessed(head)` — at least `quorum` effective cosigns for `head_digest`
 /// from DISTINCT PERSONS, none of whom is a founder's person (FSD §3.2; PR
-/// #943 review: one identity's several keys count once). Pure.
+/// #943 review: one identity's several keys count once). Pure. With witnessed
+/// mode off (`quorum == 0`, #973) nothing is witnessed, whatever is held.
 pub fn witnessed(
     effective: &[EffectiveCosign],
     head_digest: &str,
     founder_principals: &std::collections::BTreeSet<String>,
     quorum: u32,
 ) -> bool {
-    witnesses_of(effective, head_digest, founder_principals).len() as u32 >= quorum.max(1)
+    witnessed_mode_on(quorum)
+        && witnesses_of(effective, head_digest, founder_principals).len() as u32 >= quorum
 }
 
 /// The distinct non-founder persons whose effective cosigns name `head_digest`.
@@ -524,6 +571,13 @@ mod tests {
             !witnessed(&only_founder, "h", &founders, 1),
             "a lineage witnessed solely by its founders is unwitnessed"
         );
-        assert!(witnessed(&cs, "h", &founders, 0), "quorum 0 reads as 1");
+        assert!(
+            !witnessed(&cs, "h", &founders, 0),
+            "quorum 0 is witnessed mode off: nothing is witnessed (#973)"
+        );
+        assert_eq!(declared_witness_quorum(None), 0, "silence is not a default");
+        assert_eq!(declared_witness_quorum(Some(0)), 0);
+        assert_eq!(declared_witness_quorum(Some(2)), 2);
+        assert!(!witnessed_mode_on(0) && witnessed_mode_on(2));
     }
 }

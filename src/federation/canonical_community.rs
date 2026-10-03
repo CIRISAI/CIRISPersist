@@ -202,32 +202,83 @@ pub fn check_trust_root_shape(community: &Community) -> Result<(), Error> {
     Ok(())
 }
 
-/// #925 (CC 3.2 rc5, "infrastructure does not vote") plus CC 3.2 T2 — a
-/// founder of a trust-root community is a HUMAN key at `at`: `user` in its own
-/// `identity_type` set, and NOT node-bearing by #925's one predicate
-/// ([`is_node_bearing_key_at`](super::is_node_bearing_key_at) — its own set,
-/// or an agreed occurrence of a `node` identity at `at`). Also returns the
-/// earliest occurrence-interval edge after `at`, where the answer may change
-/// ([`node_bearing_at_with_next`](super::node_bearing_at_with_next)).
-async fn founder_is_human_at<F>(
+/// CIRISPersist#972 — the arm a founder of an infrastructure
+/// community counts under at an instant. ONE predicate, read by the door
+/// ([`check_founder_eligible`]) and by the chain / liveness folds
+/// ([`Memo::founder_counts`]): two copies of "who is a founder" is how a row
+/// is admitted and then counts nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FounderArm {
+    /// A CURRENT seat of the conferring accord family (its revocation-folded
+    /// roster at the instant). Human-held by the holder triple (CC 4.2.3): no
+    /// `user` type and no `steward` conferral are asked. Leaving the accord
+    /// roster ends it (CC 3.2 T7).
+    Holder,
+    /// A `user` key that still has to show an accord-conferred `steward`
+    /// (CC 3.2 T2) — the rule for every founder who is not an accord holder.
+    Steward,
+    /// Node-bearing (#925, "infrastructure does not vote"), or neither a
+    /// seated holder nor a `user` key.
+    Neither,
+}
+
+/// Is `key_id` a seat of the conferring accord family at `at`? Asked of this
+/// node's stored family and its roster planes
+/// ([`authorized_family_roster_at`](super::authorized_family_roster_at), the
+/// fold the accord quorum itself is counted over) — never of the key's own
+/// `identity_type`, which is the key's word.
+async fn accord_holder_seated_at<F>(
+    directory: &F,
+    key_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(family) =
+        super::trust_root::resolve_family_root(directory, accord_family_key_id()).await?
+    else {
+        return Ok(false);
+    };
+    match super::authorized_family_roster_at(directory, &family, at).await {
+        Ok(seats) => Ok(seats.iter().any(|m| m.key_id == key_id)),
+        Err(Error::Unsupported { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`FounderArm`] of `record` at `at`, plus the earliest occurrence-interval
+/// edge after `at` where the node-bearing answer may change
+/// ([`node_bearing_at_with_next`](super::node_bearing_at_with_next)). The
+/// holder arm changes at the accord family's roster events
+/// ([`family_event_instants`]), which the caller bounds.
+async fn founder_arm_at<F>(
     directory: &F,
     record: &KeyRecord,
     at: chrono::DateTime<chrono::Utc>,
-) -> Result<(bool, Option<chrono::DateTime<chrono::Utc>>), Error>
+) -> Result<(FounderArm, Option<chrono::DateTime<chrono::Utc>>), Error>
 where
     F: FederationDirectory + ?Sized,
 {
     let (node_bearing, next_edge) =
         super::node_bearing_at_with_next(directory, &record.key_id, at).await?;
-    Ok((
-        identity_type::set_contains(&record.identity_type, identity_type::USER) && !node_bearing,
-        next_edge,
-    ))
+    let arm = if node_bearing {
+        FounderArm::Neither
+    } else if accord_holder_seated_at(directory, &record.key_id, at).await? {
+        FounderArm::Holder
+    } else if identity_type::set_contains(&record.identity_type, identity_type::USER) {
+        FounderArm::Steward
+    } else {
+        FounderArm::Neither
+    };
+    Ok((arm, next_edge))
 }
 
-/// One founder is eligible: a key record here, human (#925), and an
-/// accord-conferred `steward` whose conferral has not been withdrawn (CC 3.2
-/// T2). The conferral is judged against the COMPILED accord holder roster
+/// One founder is eligible ([`founder_arm_at`]): a key record here, not
+/// node-bearing (#925), and EITHER a current seat of the conferring accord
+/// family (#972 — nothing more is asked of a seated holder) OR a `user` key
+/// with an accord-conferred `steward` whose conferral has not been withdrawn
+/// (CC 3.2 T2). The conferral is judged against the COMPILED accord holder roster
 /// (`accord_holder_roster_key_ids`, the ceremony plane every key-plane
 /// conferral uses); the row's own quorum is judged against the family's
 /// revocation-folded roster ([`accord_quorum_over_community`]).
@@ -253,13 +304,18 @@ where
             format!("founder {founder:?} has no key record on this node"),
         ));
     };
-    if !founder_is_human_at(directory, &record, now).await?.0 {
+    let arm = founder_arm_at(directory, &record, now).await?.0;
+    if arm == FounderArm::Holder {
+        return Ok(());
+    }
+    if arm == FounderArm::Neither {
         return Err(violation(
             community_key_id,
             super::admission::INFRA_RULE_NODE_BEARING_FOUNDER,
             format!(
-                "founder {founder:?} is not a human key (identity_type {:?}): a node-bearing key \
-                 MUST NOT be a founder of an infrastructure community (CIRISPersist#925)",
+                "founder {founder:?} is not a human key (identity_type {:?}, and not a current \
+                 seat of the accord family): a node-bearing key MUST NOT be a founder of an \
+                 infrastructure community (CIRISPersist#925)",
                 record.identity_type
             ),
         ));
@@ -542,6 +598,9 @@ struct Memo {
     valid_until: Option<chrono::DateTime<chrono::Utc>>,
     records: std::collections::HashMap<String, Option<KeyRecord>>,
     conferred: std::collections::HashMap<String, bool>,
+    /// The accord family's roster event instants (#972): the holder arm of
+    /// [`FounderArm`] changes at them. Read once per verdict.
+    accord_events: Option<Vec<chrono::DateTime<chrono::Utc>>>,
     /// Per community: every self-signed resignation instant of each key,
     /// ascending (a re-seated founder may resign again; the earliest alone
     /// would mask the later one behind the re-seat floor).
@@ -558,6 +617,7 @@ impl Memo {
             valid_until: None,
             records: std::collections::HashMap::new(),
             conferred: std::collections::HashMap::new(),
+            accord_events: None,
             resignations: std::collections::HashMap::new(),
         }
     }
@@ -695,7 +755,9 @@ impl Memo {
     }
 
     /// Does `key_id` count as a founder of `community_key_id` at `at` (`None`
-    /// = the verdict's `now`)? A human key at that instant (#925's
+    /// = the verdict's `now`)? By the ONE founder predicate
+    /// ([`founder_arm_at`], #972): a seated accord holder at that instant, not
+    /// resigned by its own signature — or a human key at that instant (#925's
     /// [`is_node_bearing_key_at`](super::is_node_bearing_key_at)),
     /// accord-conferred as a steward, not resigned by its own signature, and
     /// not withdrawn — or, for a link instant, withdrawn only AFTER it (a
@@ -729,9 +791,18 @@ impl Memo {
             return Ok(false);
         };
         let when = at.unwrap_or(self.now);
-        let (human, next_edge) = founder_is_human_at(directory, &rec, when).await?;
+        let (arm, next_edge) = founder_arm_at(directory, &rec, when).await?;
         if at.is_none() {
             if let Some(t) = next_edge {
+                self.bound(t);
+            }
+            // #972 — a holder joining or leaving the accord roster changes
+            // the arm, so those instants bound the verdict too.
+            if self.accord_events.is_none() {
+                self.accord_events =
+                    Some(family_event_instants(directory, accord_family_key_id()).await?);
+            }
+            for t in self.accord_events.clone().unwrap_or_default() {
                 self.bound(t);
             }
             for r in self
@@ -741,14 +812,22 @@ impl Memo {
                 self.bound(r);
             }
         }
-        if !human || !self.conferred(directory, key_id).await? {
-            return Ok(false);
+        match arm {
+            FounderArm::Neither => return Ok(false),
+            FounderArm::Steward if !self.conferred(directory, key_id).await? => return Ok(false),
+            FounderArm::Holder | FounderArm::Steward => {}
         }
         if self
             .resigned_within(directory, community_key_id, key_id, seated_since, when)
             .await?
         {
             return Ok(false);
+        }
+        // The `steward` role withdrawal is the steward arm's alone: a seated
+        // holder was never conferred `steward`, and leaves by leaving the
+        // accord roster.
+        if arm == FounderArm::Holder {
+            return Ok(true);
         }
         Ok(
             match directory
@@ -1739,7 +1818,104 @@ pub struct CharterMembers {
     pub witness_quorum: Option<u32>,
 }
 
-/// Read a root's charter members from the charter row this node holds.
+/// v53.0.0 (CC 3.2 T6, operator ruling B-1 on CIRISConstitution#136) —
+/// **which charter rows a root's lineage head puts in force.** The head is the
+/// family record at a version and names the charter in force at that version
+/// (`charter_digest`); a charter row no version names is not in force, so a
+/// charter re-scrub takes effect only through a new version, and the head
+/// moves with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadCharter {
+    /// The root holds no lineage record here (a key root): there is no head to
+    /// name a charter, so every live charter-shaped row stands, as before.
+    KeyRoot,
+    /// The head names this charter (`persist_row_hash` of the
+    /// `trust:charter:v1` row).
+    Named(String),
+    /// The head names no charter: none is in force.
+    Unnamed,
+}
+
+impl HeadCharter {
+    /// Read a head's `charter_digest`.
+    #[must_use]
+    pub fn of(charter_digest: &str) -> Self {
+        if charter_digest.is_empty() {
+            Self::Unnamed
+        } else {
+            Self::Named(charter_digest.to_owned())
+        }
+    }
+
+    /// Does this head put `charter` in force?
+    #[must_use]
+    pub fn admits(&self, charter: &super::Attestation) -> bool {
+        match self {
+            Self::KeyRoot => true,
+            Self::Named(digest) => charter.persist_row_hash == *digest,
+            Self::Unnamed => false,
+        }
+    }
+}
+
+/// v53.0.0 (CC 3.2 T6) — **the digest a version names a charter by, computed
+/// before the row is stored**: the `persist_row_hash` every backend assigns
+/// the row, which is taken over the envelope in its at-rest canonical form
+/// (`canonical_at_rest::canonicalize_in_place`, run at every put door before
+/// the hash). A producer minting a version together with its charter (a
+/// genesis, a ceremony) names the charter by this.
+///
+/// # Errors
+///
+/// An envelope the at-rest canonicalizer refuses, or a row that does not hash.
+pub fn stored_row_hash(charter: &super::Attestation) -> Result<String, Error> {
+    let mut row = charter.clone();
+    super::canonical_at_rest::canonicalize_in_place(&mut row.attestation_envelope)?;
+    row.persist_row_hash = String::new();
+    super::types::compute_persist_row_hash(&row)
+}
+
+/// v53.0.0 (CC 3.2 T6) — **the ONE answer to "which charter is in force for
+/// `root`"**: the lineage whose head decides, and what that head names.
+///
+/// - a family root: its own head;
+/// - a community: its conferring family's head — a community's legs are the
+///   family's (CC 4.4: `{community_key_id: ciris-canonical, family:
+///   humanity-accord}`), and every trust-root community is accord-rooted;
+/// - anything else: a key root ([`HeadCharter::KeyRoot`]), whose charter is
+///   its own self-loop.
+///
+/// Returns the key id the charter rows name (`attested_key_id`) with the
+/// verdict. Every reader of a root's charter — the trust-root charter leg,
+/// the charter members (attach window, witness cadence and quorum) — routes
+/// through here, so they cannot disagree about which charter stands.
+///
+/// # Errors
+///
+/// Directory read failures.
+pub async fn charter_in_force<F>(
+    directory: &F,
+    root_key_id: &str,
+) -> Result<(String, HeadCharter), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if let Some(fam) = directory.lookup_family(root_key_id).await? {
+        return Ok((root_key_id.to_owned(), HeadCharter::of(&fam.charter_digest)));
+    }
+    if directory.lookup_community(root_key_id).await?.is_some() {
+        let family = accord_family_key_id();
+        let head = match directory.lookup_family(family).await? {
+            Some(fam) => HeadCharter::of(&fam.charter_digest),
+            None => HeadCharter::Unnamed,
+        };
+        return Ok((family.to_owned(), head));
+    }
+    Ok((root_key_id.to_owned(), HeadCharter::KeyRoot))
+}
+
+/// Read a root's charter members from the charter in force
+/// ([`charter_in_force`]).
 pub async fn charter_members_for<F>(
     directory: &F,
     root_key_id: &str,
@@ -1748,11 +1924,6 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::envelope::paths;
-    // The charter names the root as its ATTESTED key (a key root charters
-    // itself; the accord's holders charter their family). A community root
-    // has no signing key: its charter is its conferring family's — for a
-    // trust-root-grade community, the accord family's.
-    let mut rows = directory.list_attestations_for(root_key_id).await?;
     let is_charter = |a: &super::Attestation| {
         a.attestation_type == super::types::attestation_type::DELEGATES_TO
             && super::trust_root::job_dimension_admits(
@@ -1760,12 +1931,29 @@ where
                 super::trust_root::TRUST_CHARTER_DIMENSION,
             )
     };
-    if !rows.iter().any(is_charter) && root_key_id != accord_family_key_id() {
-        rows = directory
-            .list_attestations_for(accord_family_key_id())
-            .await?;
+    // The charter names its lineage as its ATTESTED key (a key root charters
+    // itself; the accord's holders charter their family).
+    let in_force = |owner: String, head: HeadCharter| async move {
+        let mut rows = directory.list_attestations_for(&owner).await?;
+        // #973 (CC 3.2 T4a) — an unlabelled row is a charter only where its
+        // direction reading stands (held, or a pinned-bundle row).
+        let denied = super::trust_root::direction_denied_ids(
+            directory,
+            rows.iter().filter(|a| is_charter(a)),
+        )
+        .await?;
+        rows.retain(|a| is_charter(a) && !denied.contains(&a.attestation_id) && head.admits(a));
+        Ok::<_, Error>(rows)
+    };
+    let (owner, head) = charter_in_force(directory, root_key_id).await?;
+    let key_root = head == HeadCharter::KeyRoot;
+    let mut rows = in_force(owner, head).await?;
+    // A key root with no charter of its own reads the accord's, as before.
+    if rows.is_empty() && key_root && root_key_id != accord_family_key_id() {
+        let (owner, head) = charter_in_force(directory, accord_family_key_id()).await?;
+        rows = in_force(owner, head).await?;
     }
-    let charter = rows.iter().find(|a| is_charter(a));
+    let charter = rows.first();
     Ok(charter.map(|a| {
         let e = &a.attestation_envelope;
         CharterMembers {
@@ -1779,15 +1967,17 @@ where
     }))
 }
 
-/// The witness quorum a lineage's charter declares, or the default (FSD §1.3).
+/// The witness quorum a lineage's charter declares; `0` when the charter is
+/// silent or declares zero — witnessed mode off (#973, CC 3.2 T6).
 async fn witness_quorum_for<F>(directory: &F, community: &Community) -> Result<u32, Error>
 where
     F: FederationDirectory + ?Sized,
 {
-    Ok(charter_members_for(directory, &community.community_key_id)
-        .await?
-        .and_then(|c| c.witness_quorum)
-        .unwrap_or(super::lineage_witness::DEFAULT_WITNESS_QUORUM))
+    Ok(super::lineage_witness::declared_witness_quorum(
+        charter_members_for(directory, &community.community_key_id)
+            .await?
+            .and_then(|c| c.witness_quorum),
+    ))
 }
 
 /// The witnessed-head computation over the chain this node holds and every
@@ -1831,6 +2021,17 @@ where
         .collect();
     let founder_principals = principals_of(directory, &founders_all).await?;
     let quorum = witness_quorum_for(directory, &head.community).await?;
+    // #973 (CC 3.2 T6) — witnessed mode OFF: the head is current on the
+    // founders' quorum and its descent, exactly as before rc6. Cosigns held
+    // are evidence and judge nothing: no witnessed prefix, no equivocation.
+    if !super::lineage_witness::witnessed_mode_on(quorum) {
+        return Ok(WitnessedHead {
+            judged: None,
+            unwitnessed_tail: 0,
+            equivocation: None,
+            latest_cosign_at,
+        });
+    }
     // Witnessed mode engages only once some version of this chain has actually
     // reached the QUORUM (PR #943 review: one cosign under a quorum of two
     // must not roll a multi-version lineage back to its birth). Until then the
@@ -1950,6 +2151,29 @@ where
     }
 }
 
+/// #973 — which door an acceptance edge is arriving through at
+/// [`check_attach_freshness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachDoor {
+    /// This node authored the edge in-process: its own attach, judged in full.
+    Author,
+    /// The edge arrived from elsewhere (a peer, a sync, an import): another
+    /// node's attach, already admitted at its own door.
+    Replicated,
+}
+
+impl AttachDoor {
+    /// The door a stored write's origin names.
+    #[must_use]
+    pub fn of(origin: &super::replication::admission::WriteOrigin) -> Self {
+        match origin {
+            super::replication::admission::WriteOrigin::Authored => Self::Author,
+            super::replication::admission::WriteOrigin::Wire
+            | super::replication::admission::WriteOrigin::Sync { .. } => Self::Replicated,
+        }
+    }
+}
+
 /// **T4a — the acceptance edge is gated on freshness** (CIRISPersist#937, CC
 /// 3.2 T4a rc6; FSD `TRUST_ROOT_RC6.md` §2.2). For a `delegates_to` carrying
 /// `trust:accepts:v1` whose `attested_key_id` is a root this node holds a
@@ -1961,8 +2185,33 @@ where
 /// no window admits only an edge naming the head (the T5 anchor). Refusals are
 /// `Error::TrustRootHeadStale`. A root with no lineage here (a KEY root) is
 /// not this gate's business; nothing on the ATTACHED side reads this.
+///
+/// #973 (CC 3.2 T4a, rc6 5cceadb) — **only a NEW edge is gated.** "An edge
+/// admitted before a substrate enforced this rule carries no
+/// `attached_head_digest` and stays valid … on every later put, replication
+/// or restore of that same edge; it is read as naming the head the node held
+/// when it was admitted. Only a new edge is gated: a new edge that names no
+/// head is refused in every mode, witnessed mode off included, where the head
+/// it must name is the anchored one." NEW is structural: `attestation_id`
+/// names no row this node holds with the same attester, root and signed
+/// envelope. A held edge re-offered unchanged passes without re-running
+/// freshness; anything else under a held id is judged as new. A new headless
+/// edge is refused `Error::TrustRootHeadUnnamed`.
+///
+/// #973 (CC 3.2 T4a: "a write-side gate … the gate runs on the edge's first
+/// admission only … once the edge is written, T4 governs without exception")
+/// — **a peer does not re-judge another node's attach.** The head and
+/// freshness comparison belongs to the ATTACHING node's own write
+/// ([`AttachDoor::Author`]). At [`AttachDoor::Replicated`] the edge was
+/// already admitted where it was written: this node's head may be ahead of or
+/// behind the one it names, and its witness view is its own, so only the
+/// SHAPE rule runs there (a new labelled edge names a head).
+#[allow(clippy::too_many_arguments)]
 pub async fn check_attach_freshness<F>(
     directory: &F,
+    door: AttachDoor,
+    attestation_id: Option<&str>,
+    attesting_key_id: &str,
     attestation_type_str: &str,
     attested_key_id: &str,
     envelope: &serde_json::Value,
@@ -1980,6 +2229,18 @@ where
     {
         return Ok(());
     }
+    // #973 (CC 3.2 T4a, "bundle only") — "a new row with no `trust:{job}`
+    // label gives no acceptance and is no charter". Outside the pinned bundle
+    // an unlabelled row is therefore not an acceptance edge and there is
+    // nothing to gate: it is stored as a delegation and the readers never
+    // count it (`trust_root::direction_denied_ids`). A pinned-bundle row
+    // keeps the reading its direction gives it, gate included.
+    if super::trust_root::names_no_trust_job(envelope)
+        && !attestation_id
+            .is_some_and(|id| super::genesis::is_pinned_bundle_statement(id, envelope))
+    {
+        return Ok(());
+    }
     let root = attested_key_id;
     let refuse = |detail: String| {
         Err(Error::TrustRootHeadStale {
@@ -1994,30 +2255,72 @@ where
     let Some(view) = root_witness_view(directory, root, now).await? else {
         return Ok(());
     };
+    // T4a: "the gate runs on the edge's first admission only".
+    if edge_already_admitted(directory, attestation_id, attesting_key_id, root, envelope).await? {
+        return Ok(());
+    }
     let charter = charter_members_for(directory, root)
         .await?
         .unwrap_or_default();
     let presented = envelope
         .get(paths::ATTACHED_HEAD_DIGEST)
         .and_then(|v| v.as_str());
-    // The gate is ARMED by the charter: a charter that declares no
-    // `attach_window_secs` is a pre-rc6 charter, and an edge that names no head
-    // under it is the pre-rc6 shape (admitted, stated — CHANGELOG 51.0.0). Once
-    // the conferring roster re-scrubs its charter with a window (the shipped
-    // default for ciris-canonical / humanity-accord is 7 days), every attach
-    // needs the witnessed head; an edge that names a head is judged under any
-    // charter (the T5 anchor).
+    // A new edge that NAMES itself `trust:accepts:v1` names the head it
+    // attaches on, in every mode. A row with no job label reaches this gate
+    // by direction inference only, and the same inference covers a family's
+    // charter and the baked genesis plane (the unlabeled `genesis-charter`),
+    // which are not acceptance edges and carry no head: for those the
+    // pre-#973 reading is kept exactly — armed by the charter's window.
+    let labeled = super::admission::envelope_dimension(envelope)
+        == Some(super::trust_root::TRUST_ACCEPTS_DIMENSION);
+    let off = !super::lineage_witness::witnessed_mode_on(view.quorum);
+    // Another node's attach: the shape rule only. Which head it named, and
+    // whether that head was fresh and witnessed, was its own door's question.
+    if door == AttachDoor::Replicated && (presented.is_some() || !labeled) {
+        return Ok(());
+    }
     let Some(presented) = presented else {
+        if labeled {
+            return Err(Error::TrustRootHeadUnnamed {
+                root_key_id: root.to_owned(),
+                detail: format!(
+                    "a new acceptance edge must name the lineage head it attaches on (`{}`): the \
+                     witnessed head, or the anchored head this node holds while witnessed mode is \
+                     off (CC 3.2 T4a)",
+                    paths::ATTACHED_HEAD_DIGEST
+                ),
+            });
+        }
         if charter.attach_window_secs.is_none() {
             return Ok(());
         }
-        return refuse(format!(
-            "the root's charter declares an attach window of {}s: attaching requires the \
-             witnessed lineage head (`{}`) inside it — never attach on a stale or absent one",
-            charter.attach_window_secs.unwrap_or_default(),
-            paths::ATTACHED_HEAD_DIGEST
-        ));
+        return if off {
+            refuse(format!(
+                "the lineage of {root} is in witnessed mode off: attaching requires an \
+                 out-of-band anchor naming the head (`{}`), never a cosignature (CC 3.2 T6)",
+                paths::ATTACHED_HEAD_DIGEST
+            ))
+        } else {
+            refuse(format!(
+                "the root's charter declares an attach window of {}s: attaching requires the \
+                 witnessed lineage head (`{}`) inside it — never attach on a stale or absent one",
+                charter.attach_window_secs.unwrap_or_default(),
+                paths::ATTACHED_HEAD_DIGEST
+            ))
+        };
     };
+    // #973 (CC 3.2 T6, witnessed mode off) — no head is fresh by cosignature,
+    // so none is attachable by cosignature: an attach is by an out-of-band
+    // anchor to the head this node holds (T5), and the window does not apply.
+    if off {
+        return match view.held_head.as_ref() {
+            Some((held, _)) if presented == held => Ok(()),
+            _ => refuse(format!(
+                "the presented head {presented} is not the head this node holds for {root}: in \
+                 witnessed mode off an attach names the current head as its anchor"
+            )),
+        };
+    }
     let Some((head_digest, head_at)) = view.witnessed_head.clone() else {
         return refuse(format!(
             "the lineage of {root} is not witnessed ({} independent witness cosign(s) required, \
@@ -2054,6 +2357,39 @@ where
     }
 }
 
+/// T4a's "first admission only", decided structurally: this node already holds
+/// a row under `attestation_id` with the same attester, the same root and the
+/// same signed envelope. A directory that cannot answer the lookup, or a held
+/// row that differs in any of the three, is "new".
+async fn edge_already_admitted<F>(
+    directory: &F,
+    attestation_id: Option<&str>,
+    attesting_key_id: &str,
+    root: &str,
+    envelope: &serde_json::Value,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(id) = attestation_id else {
+        return Ok(false);
+    };
+    let held = match directory.get_attestation(id).await {
+        Ok(Some(h)) => h,
+        Ok(None) | Err(Error::Unsupported { .. }) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if held.attesting_key_id != attesting_key_id || held.attested_key_id != root {
+        return Ok(false);
+    }
+    let canonical = |v: &serde_json::Value| -> Result<serde_json::Value, Error> {
+        let mut v = v.clone();
+        super::canonical_at_rest::canonicalize_in_place(&mut v)?;
+        Ok(v)
+    };
+    Ok(canonical(&held.attestation_envelope)? == canonical(envelope)?)
+}
+
 /// The witness plane's view of a ROOT this node holds a lineage for — a
 /// trust-root community (its chain) or a conferring family (its record) —
 /// in the one shape the attach gate and the trust surfaces read (PR #943
@@ -2062,12 +2398,22 @@ where
 pub struct RootWitnessView {
     /// The served head when witnessed: digest and signer-stamped instant.
     pub witnessed_head: Option<(String, chrono::DateTime<chrono::Utc>)>,
-    /// The charter's quorum (default 1).
+    /// The head this node holds for the lineage, witnessed or not: the anchor
+    /// an attach names while witnessed mode is off (#973).
+    pub held_head: Option<(String, chrono::DateTime<chrono::Utc>)>,
+    /// The charter's quorum; `0` = witnessed mode off (a silent charter, or
+    /// one declaring zero — no default is substituted).
     pub quorum: u32,
     /// The community fold's detail (`None` for a family root).
     pub community: Option<WitnessedHead>,
     /// The latest instant a counting cosign was signed.
     pub latest_cosign_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// v53.0.0 (CC 3.2 T6, consequence (ii)) — the held head lags its roster:
+    /// a roster row older than one `witness_cadence_secs` that no version
+    /// covers (`lineage_head_lags_roster`). Reported whatever the witness
+    /// quorum; with witnessed mode on, witnesses do not cosign it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roster_lag: Option<super::roster_head::RosterLag>,
 }
 
 /// See [`RootWitnessView`]. `None` when this node holds no lineage for `root`.
@@ -2080,23 +2426,31 @@ where
     F: FederationDirectory + ?Sized,
 {
     use super::lineage_witness::{effective_cosigns, principals_of, witnessed};
-    let quorum = charter_members_for(directory, root)
-        .await?
-        .and_then(|c| c.witness_quorum)
-        .unwrap_or(super::lineage_witness::DEFAULT_WITNESS_QUORUM);
+    let quorum = super::lineage_witness::declared_witness_quorum(
+        charter_members_for(directory, root)
+            .await?
+            .and_then(|c| c.witness_quorum),
+    );
     if let Some(signed) = lookup_signed_community(directory, root).await? {
         let chain = chain_of(&signed);
+        let held_head = match chain.last() {
+            Some(h) => Some((row_hash(&h.community)?, head_instant(h))),
+            None => None,
+        };
         let w = witnessed_head(directory, &chain, now).await?;
         let witnessed_head = match w.judged {
             Some(i) => Some((row_hash(&chain[i].community)?, head_instant(&chain[i]))),
             None => None,
         };
         let latest = w.latest_cosign_at;
+        let roster_lag = super::roster_head::roster_lag(directory, root, now).await?;
         return Ok(Some(RootWitnessView {
             witnessed_head,
+            held_head,
             quorum,
             community: Some(w),
             latest_cosign_at: latest,
+            roster_lag,
         }));
     }
     let Some(fam) = directory.lookup_family(root).await? else {
@@ -2120,10 +2474,79 @@ where
     .then(|| (fam.persist_row_hash.clone(), fam.founded_at));
     Ok(Some(RootWitnessView {
         witnessed_head,
+        held_head: Some((fam.persist_row_hash.clone(), fam.founded_at)),
         quorum,
         community: None,
         latest_cosign_at: effective.iter().map(|c| c.signed_at).max(),
+        roster_lag: super::roster_head::roster_lag(directory, root, now).await?,
     }))
+}
+
+/// #973 (CC 3.2 T4a) — **the head a NEW acceptance edge must name** for
+/// `root`, as this node sees it now: the witnessed head while witnessed mode
+/// is on (`None` while the held head is not yet witnessed — nothing is
+/// attachable), the held head as the out-of-band anchor while it is off.
+/// `None` also when this node holds no lineage for `root` (a key root: the
+/// gate does not apply and no head is named). A host building an acceptance
+/// edge writes the returned digest as `attached_head_digest`.
+pub async fn attach_head_for<F>(
+    directory: &F,
+    root: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let Some(view) = root_witness_view(directory, root, now).await? else {
+        return Ok(None);
+    };
+    let head = if super::lineage_witness::witnessed_mode_on(view.quorum) {
+        view.witnessed_head
+    } else {
+        view.held_head
+    };
+    Ok(head.map(|(digest, _)| digest))
+}
+
+/// #973 (CC 3.2 T3 / T4a) — **the signed envelope of a NEW acceptance edge**
+/// toward `root`, as a host emits it: the job label, the scope the node
+/// accepts the root for, and the head it attaches on.
+///
+/// ```json
+/// { "dimension": "trust:accepts:v1",
+///   "scope": ["infra:attest", "infra:serve"],
+///   "attached_head_digest": "<64 hex>" }
+/// ```
+///
+/// `attached_head_digest` is [`attach_head_for`]'s answer and is omitted for a
+/// key root (no lineage held: the attach gate does not apply). The host adds
+/// its own `references_attestation_id` if it uses one and emits the row as a
+/// `delegates_to` with `attested_key_id = root`. Since #973 a `delegates_to`
+/// toward a root WITHOUT the label gives no acceptance, and a labelled one
+/// without the head is refused `trust_root_head_unnamed`.
+///
+/// # Errors
+///
+/// A directory read failure. `Ok` with no head while a witnessed lineage has
+/// no witnessed head yet: the edge is then refused at the write door, which is
+/// the honest answer (nothing is attachable).
+pub async fn acceptance_edge_envelope<F>(
+    directory: &F,
+    root: &str,
+    scope: &[&str],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<serde_json::Value, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut envelope = serde_json::json!({
+        "dimension": super::trust_root::TRUST_ACCEPTS_DIMENSION,
+        "scope": scope,
+    });
+    if let Some(head) = attach_head_for(directory, root, now).await? {
+        envelope[super::envelope::paths::ATTACHED_HEAD_DIGEST] = serde_json::Value::String(head);
+    }
+    Ok(envelope)
 }
 
 /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a held trust-root
@@ -2489,6 +2912,13 @@ where
         .is_some())
 }
 
+/// The authorization label of an accord birth stored over an un-rooted row
+/// (a squat) — its value is the replaced row's hash.
+pub(crate) const BIRTH_REPLACES_UNROOTED: &str = "accord_birth_replaces_unrooted";
+/// The authorization label of an accord re-birth stored over a stalled
+/// chain — its value is the replaced row's hash.
+pub(crate) const REBIRTH_REPLACES_STALLED: &str = "accord_rebirth_replaces_stalled";
+
 /// [`apply_trust_root_chain`] reporting what it WROTE (PR #921 review, F3):
 /// `None` — nothing stored, the caller inserts; `Some(0)` — the chain this
 /// node holds is the offered one, nothing written; `Some(n)` — `n` versions
@@ -2521,7 +2951,7 @@ where
                 }
                 Extends::No if is_rebirth_over_stalled(&standing, &chain) => {
                     verify_chain_memo(directory, &chain, &mut memo).await?;
-                    (0, Some(("accord_rebirth_replaces_stalled", held_hash)))
+                    (0, Some((REBIRTH_REPLACES_STALLED, held_hash)))
                 }
                 Extends::No => return Err(does_not_extend(id)),
             }
@@ -2533,9 +2963,26 @@ where
                 .await?
                 .map(|c| c.persist_row_hash)
                 .unwrap_or_default();
-            (0, Some(("accord_birth_replaces_unrooted", stored)))
+            (0, Some((BIRTH_REPLACES_UNROOTED, stored)))
         }
     };
+    // v53.0.0 (CC 3.2 T6, consequence (i)) — the version this apply makes the
+    // head must reflect the roster rows effective after its predecessor in the
+    // chain and up to its own instant (CC 3.2 T8 (iii): a resignation never
+    // reaches behind a link's instant — the predecessor answered for those).
+    // A birth or a re-birth (it replaces a squat or a stalled chain) is a
+    // first version and is not judged against the replaced lineage's rows.
+    if replaces.is_none() && start < chain.len() {
+        if let [.., before, head] = chain.as_slice() {
+            super::roster_head::check_version_covers_fold_since(
+                directory,
+                super::roster_head::LineageRecord::Community(&head.community),
+                Some(head_instant(before)),
+                head_instant(head),
+            )
+            .await?;
+        }
+    }
     let mut written = 0;
     for i in start..chain.len() {
         let mut version = chain[i].clone();

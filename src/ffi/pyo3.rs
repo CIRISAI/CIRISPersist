@@ -6563,7 +6563,9 @@ impl PyEngine {
     /// re-seeding a late device, carries the FULL set again (idempotent on
     /// every receiver, §13). `axis_json` is a `KeyGrantAxis`:
     /// `{"axis":"epoch","community_key_id":…,"minter_key_id":…,"epoch":N}` or
-    /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`.
+    /// `{"axis":"content","at_rest_sha256":hex,"cohort_scope":…,"owner_key_id":…}`
+    /// or (v53.0.0, #969)
+    /// `{"axis":"stream","stream_id":…,"epoch":N,"cohort_scope":…,"owner_key_id":…}`.
     /// Returns the emitted row's `attestation_id`, or `null` when this node
     /// holds no wrap for the axis. Needs the LocalSigner (hybrid).
     fn emit_key_grant(&self, py: Python<'_>, axis_json: &str) -> PyResult<Option<String>> {
@@ -11712,7 +11714,10 @@ impl PyEngine {
     /// v51.0.0 (CIRISPersist#938) — the witness plane's view of a root this
     /// node holds a lineage for (a trust-root community or a conferring
     /// family) as JSON (`witnessed_head`, `quorum`, `community` detail,
-    /// `latest_cosign_at`), or `null` when no lineage is held.
+    /// `latest_cosign_at`), or `null` when no lineage is held. v53.0.0 (CC 3.2
+    /// T6): `roster_lag` (`lineage_head_lags_roster`, the uncovered keys and
+    /// accord decisions, `since`, `cadence_secs`) when the held head lags its
+    /// roster.
     fn lineage_head_json(&self, py: Python<'_>, community_key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -11898,8 +11903,9 @@ impl PyEngine {
     }
 
     /// #302 — record the server's frozen-L decision. `payload_json` =
-    /// `{ "decision": <AccordDecision>, "steward_signatures": <obj|null> }`.
-    /// Immutable (M2).
+    /// `{ "decision": <AccordDecision> }`. Immutable (M2). v53.0.0 (CC 4.2.6
+    /// rc7): a non-null `steward_signatures` is refused — the steward backstop
+    /// it carried is removed, and dropping it silently would hide that.
     fn put_accord_decision_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -11913,16 +11919,19 @@ impl PyEngine {
                         .unwrap_or(serde_json::Value::Null),
                 )
                 .map_err(|e| PyValueError::new_err(format!("decision decode: {e}")))?;
-            let steward_signatures = v
-                .get("steward_signatures")
-                .cloned()
-                .filter(|x| !x.is_null());
+            if v.get("steward_signatures").is_some_and(|x| !x.is_null()) {
+                return Err(PyValueError::new_err(
+                    "steward_signatures: the regional-steward backstop is removed (CC 4.2.6 \
+                     rc7, CIRISConstitution#139); a roster change is counted against the \
+                     standing roster and an accord decision carries no steward signatures",
+                ));
+            }
             py.detach(move || {
                 accord_dispatch!(
                     self,
                     runtime,
                     b,
-                    b.put_accord_decision(decision, steward_signatures)
+                    b.put_accord_decision(decision)
                         .await
                         .map_err(federation_err_to_py)
                 )
@@ -12752,6 +12761,46 @@ impl PyEngine {
                 };
                 serde_json::to_string(&bound)
                     .map_err(|e| PyValueError::new_err(format!("is_steward_bound serialize: {e}")))
+            })
+        })
+    }
+
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — the closed row-type slot's
+    /// report: `{enforcement, held_unregistered: [{attestation_type, type_stem,
+    /// count, oldest, newest}], admitted_unregistered: [{label, count}],
+    /// composer_dimension_would_refuse: [{label, count}]}`. Wraps
+    /// [`row_type_report`](crate::federation::row_type::row_type_report).
+    fn row_type_report_json(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let report = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::row_type::row_type_report(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::row_type::row_type_report(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&report)
+                    .map_err(|e| PyValueError::new_err(format!("row_type_report serialize: {e}")))
             })
         })
     }
@@ -14275,6 +14324,174 @@ impl PyEngine {
         })
     }
 
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **this node's custody
+    /// report** for one blob: `state` is `"here"` or `"none"`. `here` needs the
+    /// bytes on this node (refused `custody_ack_here_not_held` otherwise) and
+    /// takes the stored length as its size. `cohort_scope` is needed only when
+    /// no row is held (`none` for a dropped blob); `cohort_target` names the
+    /// family or community. Returns the new `attestation_id`. Re-acknowledge
+    /// about daily: a report is live for 72 hours. `aad_b64` is the associated
+    /// data a chunk DAG was sealed under (an edge file pointer's
+    /// `content_aad`); `here` opens the manifest with it, and a manifest that
+    /// does not open under it is refused `custody_ack_here_seal_did_not_open`.
+    #[pyo3(signature = (at_rest_sha256_hex, state, cohort_scope=None, cohort_target=None, aad_b64=None))]
+    fn put_custody_ack(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        state: &str,
+        cohort_scope: Option<String>,
+        cohort_target: Option<String>,
+        aad_b64: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let aad = decode_aad_b64(aad_b64.as_deref())?;
+            let state =
+                crate::federation::custody_ack::CustodyState::parse(state).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "custody_ack_malformed: state {state:?} is not \"here\" | \"none\""
+                    ))
+                })?;
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .put_custody_ack(
+                            &sha,
+                            state,
+                            cohort_scope.as_deref(),
+                            cohort_target.as_deref(),
+                            aad.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **the custody view** of
+    /// one blob as JSON: `{sha256_hex, devices: [{device_key_id, state,
+    /// reported_at?, received_at?, size?, challengeable}], copies_here,
+    /// receipts_consulted}`, `state` ∈ `here` | `received` | `none` |
+    /// `unknown`. `stream_id` adds that stream's delivery receipts. Authorized
+    /// like `read_blob_as` (`blob_not_granted` for a stranger). Never render
+    /// `unknown` as `none`, nor a lapsed `here` as a copy.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, stream_id=None))]
+    fn custody_view_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        stream_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::custody_ack::custody_view;
+                let now = chrono::Utc::now();
+                let view = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            custody_view(backend.as_ref(), &sha, &viewer, stream_id.as_deref(), now)
+                                .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            custody_view(backend.as_ref(), &sha, &viewer, stream_id.as_deref(), now)
+                                .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                serde_json::to_string(&view)
+                    .map_err(|e| PyRuntimeError::new_err(format!("custody encode: {e}")))
+            })
+        })
+    }
+
+    /// v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — **the durability deficit** of
+    /// one blob for `viewer_key_id` as JSON: `{sha256_hex, audience: {kind:
+    /// nodes|everyone|unresolvable, nodes?}, live_here: [node], missing:
+    /// [node], mode: full|tuple|null}`. `missing` is the audience minus the
+    /// nodes with a live `here` report (72 h); a node outside the audience is
+    /// never listed. Authorized like `custody_view_json`.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, stream_id=None))]
+    fn durability_deficit_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        stream_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            py.detach(move || {
+                use crate::federation::durability::{
+                    durability_deficit, DEFAULT_FEASIBILITY_FLOOR,
+                };
+                let now = chrono::Utc::now();
+                let deficit = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            durability_deficit(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                stream_id.as_deref(),
+                                DEFAULT_FEASIBILITY_FLOOR,
+                                now,
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            durability_deficit(
+                                backend.as_ref(),
+                                &sha,
+                                &viewer,
+                                stream_id.as_deref(),
+                                DEFAULT_FEASIBILITY_FLOOR,
+                                now,
+                            )
+                            .await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+                serde_json::to_string(&deficit)
+                    .map_err(|e| PyRuntimeError::new_err(format!("deficit encode: {e}")))
+            })
+        })
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114) — **seal a descriptor
     /// under an existing blob's DEK** as `key_id`: `plaintext_b64` (the JCS
     /// `{name, format, codec?}`, ≤ the descriptor cap) → the base64 at-rest
@@ -14805,6 +15022,43 @@ impl PyEngine {
         })
     }
 
+    /// v53.0.0 (CIRISPersist#969) — **the readiness door**: can
+    /// `viewer_key_id` read this sealed DAG on this node now. Returns JSON
+    /// `{"sha256_hex", "chunk_keys": "stream_epoch" | "content", "held",
+    /// "readable", "missing": [{"axis": "stream", "stream_id", "epoch",
+    /// "seq_from", "seq_to"} | {"axis": "content", "seq", "chunk_sha256"} |
+    /// {"axis": "child", "index", "child_sha256"}, …], "not_held": [seq, …]}`,
+    /// from grant rows only (no chunk is opened; O(epochs) for a stream-keyed
+    /// DAG). A stranger raises `ValueError` (`blob_not_granted`), as at
+    /// `open_sealed_manifest_json`.
+    #[pyo3(signature = (at_rest_sha256_hex, viewer_key_id, caller_aad_b64=None))]
+    fn sealed_dag_readiness_json(
+        &self,
+        py: Python<'_>,
+        at_rest_sha256_hex: &str,
+        viewer_key_id: &str,
+        caller_aad_b64: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(at_rest_sha256_hex)?;
+            let viewer = viewer_key_id.to_owned();
+            let aad = decode_aad_b64(caller_aad_b64)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let r = runtime
+                    .block_on(async move {
+                        engine
+                            .sealed_dag_readiness(&sha, &viewer, aad.as_deref())
+                            .await
+                    })
+                    .map_err(blob_err_to_py)?;
+                serde_json::to_string(&r).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
     /// v52.0.0 (CIRISPersist#954) — **one page of a v3 manifest**: the chunks
     /// child `child_index` lists, opened as `viewer_key_id` (authorized on the
     /// root as `read_blob_as`, then on the child row). For a file above the
@@ -15239,6 +15493,15 @@ impl PyEngine {
                 // replicates. An engine that cannot sign it says so rather than
                 // leaving members with bytes and no key.
                 if let Some(axis) = r.key_grant_emission.as_ref() {
+                    runtime.block_on(self.emit_key_grant_axis_async(axis))?;
+                }
+                // #923 (D9) / #969 — the chunk and stream-epoch sets the seal
+                // widened ride beside the manifest's, as at the Engine door.
+                for axis in r
+                    .chunk_key_grant_emissions
+                    .iter()
+                    .chain(r.stream_key_grant_emissions.iter())
+                {
                     runtime.block_on(self.emit_key_grant_axis_async(axis))?;
                 }
                 let readable_by_nobody = r.readable_by_nobody();
@@ -25179,6 +25442,10 @@ impl PyEngine {
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
+                    // #969 — the stream epochs the walk widened.
+                    "changed_streams": r.changed_streams.iter().map(|(sid, epoch, _)| {
+                        serde_json::json!({"stream_id": sid, "epoch": epoch})
+                    }).collect::<Vec<_>>(),
                 }))
                 .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
             })
@@ -25212,6 +25479,10 @@ impl PyEngine {
                     "granted": r.granted,
                     "excluded": r.excluded,
                     "changed_blobs": r.changed_blobs.iter().map(hex::encode).collect::<Vec<_>>(),
+                    // #969 — the stream epochs the walk widened.
+                    "changed_streams": r.changed_streams.iter().map(|(sid, epoch, _)| {
+                        serde_json::json!({"stream_id": sid, "epoch": epoch})
+                    }).collect::<Vec<_>>(),
                 }))
                 .map_err(|e| PyRuntimeError::new_err(format!("rekey encode: {e}")))
             })
@@ -33722,6 +33993,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // rather than as a substrate error the caller cannot act on.
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
         | crate::federation::Error::NamespaceFamilyUnregistered { .. }
+        // v53.0.0 (#975, CC 2.4) — the closed row-type slot and the carrier
+        // shape: the producer chose the type and the shape, so both are its
+        // fault, beside the R2(b) refusal they sit with.
+        | crate::federation::Error::AttestationTypeUnregistered { .. }
+        | crate::federation::Error::CarrierRowMalformed { .. }
         // (#571, CC 3.1.7 R2 Private Use) — offering an `x_private:*` row at
         // federation tier is the same shape: the producer chose a range the
         // Constitution keeps local, and only the producer can act on it.
@@ -33959,7 +34235,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
         // v50.0.0 (CIRISPersist#925/#927) — a non-conformant infrastructure
         // record and a fused node key are the submitter's to re-mint: 4xx.
-        crate::federation::Error::CommunityConsensusProtocolViolation { .. }
+        // v53.0.0 (CC 3.2 T6) — a version that does not reflect the roster
+        // planes replaces the supersede refusals it sits beside (a typed
+        // Conflict before it), which are ValueError.
+        crate::federation::Error::LineageVersionDisagreesWithFold { .. }
+        | crate::federation::Error::CommunityConsensusProtocolViolation { .. }
         | crate::federation::Error::NodeIdentityNotExclusive { .. }
         | crate::federation::Error::NodeIdentityImmutable { .. } => PyValueError::new_err(kind),
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused
@@ -34010,6 +34290,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v19.0.0 — caller-fixable: add the pre-rotation commitment / fix binding.
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
         crate::federation::Error::TrustRootHeadStale { .. } => PyValueError::new_err(kind),
+        crate::federation::Error::TrustRootHeadUnnamed { .. } => PyValueError::new_err(kind),
         // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
         crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
         // v31.0.0 (CIRISPersist#648) — NOT caller-fixable by fixing the
@@ -34245,6 +34526,27 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // Python callers branch on it.
         crate::federation::BlobError::NotGranted { .. }
         | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
+        // v53.0.0 (CIRISPersist#969) — an AUTHORIZED viewer lacking one
+        // chunk's key: its own token, and the type of the arm it splits from
+        // (`blob_not_granted` was a ValueError). The detail rides as JSON after
+        // the token — `{dag, seq, chunk_sha, key: {axis: content|stream, …}}` —
+        // so a host knows which set to wait for; it is retryable.
+        crate::federation::BlobError::ChunkKeyNotYetGranted {
+            ref sha256_hex,
+            seq,
+            ref chunk_sha_hex,
+            ref key,
+            ..
+        } => PyValueError::new_err(format!(
+            "{kind}: {}",
+            serde_json::json!({
+                "sha256": sha256_hex,
+                "seq": seq,
+                "chunk_sha256": chunk_sha_hex,
+                "key": key,
+                "retryable": true,
+            })
+        )),
         // v47.1.0 (CIRISPersist#842) — its OWN kind token, so a host tells "did
         // not open" (look at the row: the associated data) from "may not read"
         // (`blob_not_granted`: get a grant) without reading prose. The sha rides
@@ -34597,6 +34899,7 @@ fn parse_put_blob_chunks_payload(
             sha,
             size: c.size,
             seq: None,
+            epoch: None,
         });
     }
     let manifest = crate::federation::ChunkManifest {
@@ -37280,6 +37583,7 @@ mod tests {
     /// it has provably started — see
     /// [`runtime_with_blocking_task_in_flight`] for why the handshake
     /// is what makes these tests deterministic.
+    #[cfg(feature = "sqlite")]
     #[cfg(test)]
     fn arm_blocking_task(runtime: &SharedRuntime) {
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();

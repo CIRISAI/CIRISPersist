@@ -217,11 +217,80 @@ const TRUST_JOB_DIMENSIONS: &[&str] = &[
 ///   than pick a winner.
 /// - carries no job label → yes; direction inference stands, which is what
 ///   keeps this additive for every row written before v23.0.0.
+///
+/// #973 — for the CHARTER and ACCEPTANCE jobs, "infer when silent" is no
+/// longer the whole answer: a silent row is read by direction only when
+/// [`direction_denied_ids`] says so. A caller reading either job pairs
+/// this with [`direction_denied_ids`]. The CONFERRAL job is unchanged.
 pub(crate) fn job_dimension_admits(envelope: &serde_json::Value, expected: &str) -> bool {
     match super::admission::envelope_dimension(envelope) {
         Some(d) if TRUST_JOB_DIMENSIONS.contains(&d) => d == expected,
         _ => true,
     }
+}
+
+/// Does the envelope carry none of the three `trust:{job}` labels? Any other
+/// dimension (the legacy `self:delegates_to*`, an ownership label) claims no
+/// job (CC 3.1.3) and counts as unlabelled here.
+pub(crate) fn names_no_trust_job(envelope: &serde_json::Value) -> bool {
+    !matches!(
+        super::admission::envelope_dimension(envelope),
+        Some(d) if TRUST_JOB_DIMENSIONS.contains(&d)
+    )
+}
+
+/// CIRISPersist#973 (CC 3.2 T4a, steward ruling 2026-10-01, "bundle only") —
+/// **which of `rows` may NOT be read as a charter or an acceptance edge from
+/// their direction?**
+///
+/// "A new row with no `trust:{job}` label gives no acceptance and is no
+/// charter … One exception stands, as a stop-gap until the re-mint: an
+/// unlabelled row that is a member of the pinned GenesisBundle (T5,
+/// `bundle_fingerprint`) keeps the reading its direction gives it … Unlabelled
+/// rows a node already holds keep their reading under T4."
+///
+/// - a row naming a `trust:{job}` label: its label decides
+///   ([`job_dimension_admits`]); it stands;
+/// - an unlabelled member of the pinned bundle
+///   ([`is_pinned_bundle_row`](super::genesis::is_pinned_bundle_row)): it stands;
+/// - an unlabelled row this node held when the rule arrived
+///   ([`FederationDirectory::trust_direction_held_among`], V167): it stands;
+/// - any other unlabelled row: denied. It stays stored and stays a delegation
+///   for every other reader (conferral, duties, ownership); it is no charter
+///   and no acceptance edge.
+///
+/// Returns the ids among `rows` whose direction reading does NOT stand. Only
+/// `delegates_to` rows are asked about, in one directory read.
+pub(crate) async fn direction_denied_ids<'a, F, I>(
+    directory: &F,
+    rows: I,
+) -> Result<std::collections::HashSet<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+    I: IntoIterator<Item = &'a Attestation>,
+{
+    // Asked of the directory: unlabelled `delegates_to` rows outside the
+    // pinned bundle. One read for the whole set.
+    let mut asked: Vec<String> = rows
+        .into_iter()
+        .filter(|row| {
+            row.attestation_type == attestation_type::DELEGATES_TO
+                && names_no_trust_job(&row.attestation_envelope)
+                && !super::genesis::is_pinned_bundle_row(row)
+        })
+        .map(|row| row.attestation_id.clone())
+        .collect();
+    if asked.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    asked.sort();
+    asked.dedup();
+    let held: std::collections::HashSet<String> = directory
+        .trust_direction_held_among(&asked)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(asked.into_iter().filter(|id| !held.contains(id)).collect())
 }
 
 /// The delegation scope tokens a root self-declaration (its **charter**)
@@ -268,8 +337,8 @@ pub const INFRA_SERVE_SCOPE: &str = "infra:serve";
 
 /// v19.0.0 (#488 delta 1, CRITICAL — the KERI lesson) — the envelope field
 /// a root charter (`delegates_to(root → root)`) MUST carry: the
-/// **pre-rotation commitment**, `lowercase_hex(sha256(JCS(successor_keys)))`
-/// over the sorted JSON array of successor key_ids — the hash of the next
+/// **pre-rotation commitment** ([`pre_rotation_commitment`]: since v53 over
+/// each successor's id AND public keys, CC 3.2 T3 rc7) — the hash of the next
 /// key set, published BEFORE it is ever needed. Tombstone-revocation
 /// assumes the revoker's key is honest: compromise the charter key and the
 /// attacker owns the tombstoning pen, and a self-referential root has no
@@ -291,17 +360,151 @@ pub const CHARTER_RECOVERS_FIELD: &str = super::envelope::paths::RECOVERS;
 /// See [`CHARTER_RECOVERS_FIELD`].
 pub const CHARTER_SUCCESSOR_KEYS_FIELD: &str = super::envelope::paths::SUCCESSOR_KEYS;
 
-/// Compute the pinned pre-rotation commitment over a successor key set:
-/// `lowercase_hex(sha256(JCS(sorted keys as JSON array)))`. The ONE
-/// construction both the charter producer and the recovery verifier use.
-pub fn pre_rotation_commitment(successor_keys: &[String]) -> Result<String, Error> {
+/// v53.0.0 (CC 3.2 T3 / 4.2.6 / 2.1, CIRISConstitution rc7 `5e89627`) — **one
+/// key a commitment binds**: its id AND its public key material, each member
+/// exactly as the key record stores it (standard base64).
+///
+/// > element = JCS `{key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64}`
+///
+/// Before v53 the commitment hashed the key ids alone. `put_public_key` does
+/// not tie a key id to its public keys, so whoever registered a record under a
+/// committed id first — with their own keys — satisfied the commitment. Binding
+/// the key material closes that: an id that matches with keys that do not
+/// reproduces a different digest.
+///
+/// A key with no ML-DSA-65 public key cannot form an element
+/// ([`Self::from_record`] refuses it); the member is never serialized as null.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommittedKey {
+    /// The key's id.
+    pub key_id: String,
+    /// The Ed25519 public key, standard base64, as stored on the key record.
+    pub pubkey_ed25519_base64: String,
+    /// The ML-DSA-65 public key, standard base64, as stored on the key record.
+    pub pubkey_ml_dsa_65_base64: String,
+}
+
+impl CommittedKey {
+    /// The element for a stored key record. Refused when the record carries no
+    /// ML-DSA-65 public key: a hybrid commitment cannot bind half a key.
+    pub fn from_record(record: &super::types::KeyRecord) -> Result<Self, Error> {
+        let Some(mldsa) = record
+            .pubkey_ml_dsa_65_base64
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        else {
+            return Err(Error::CharterInvalid {
+                detail: format!(
+                    "key {} carries no ML-DSA-65 public key, so it cannot be committed to: \
+                     a commitment binds both halves of the hybrid key (CC 3.2 T3)",
+                    record.key_id
+                ),
+            });
+        };
+        if record.pubkey_ed25519_base64.is_empty() {
+            return Err(Error::CharterInvalid {
+                detail: format!(
+                    "key {} carries no Ed25519 public key, so it cannot be committed to",
+                    record.key_id
+                ),
+            });
+        }
+        Ok(Self {
+            key_id: record.key_id.clone(),
+            pubkey_ed25519_base64: record.pubkey_ed25519_base64.clone(),
+            pubkey_ml_dsa_65_base64: mldsa.to_owned(),
+        })
+    }
+}
+
+/// v53.0.0 (CC 3.2 T3, rc7 `5e89627`) — **the pinned commitment over a key
+/// set**: `lowercase_hex(sha256(JCS(elements sorted by key_id as UTF-8
+/// bytes)))`, each element a [`CommittedKey`]. The ONE construction behind the
+/// T3 successor commitment (over the successor set) and the CC 4.2.6
+/// per-holder recovery commitment ([`recovery_commitment`], over one key);
+/// the charter producer and both verifying doors all call it.
+///
+/// Refused: an empty set, and two elements with the same key id (a set names
+/// each key once).
+pub fn pre_rotation_commitment(keys: &[CommittedKey]) -> Result<String, Error> {
     use sha2::Digest as _;
-    let mut sorted: Vec<&str> = successor_keys.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    let value = serde_json::json!(sorted);
+    if keys.is_empty() {
+        return Err(Error::InvalidArgument(
+            "a key commitment needs at least one key".into(),
+        ));
+    }
+    let mut sorted: Vec<&CommittedKey> = keys.iter().collect();
+    // `str` orders by its UTF-8 bytes — the order CC names.
+    sorted.sort_unstable_by(|a, b| a.key_id.cmp(&b.key_id));
+    if sorted.windows(2).any(|w| w[0].key_id == w[1].key_id) {
+        return Err(Error::InvalidArgument(
+            "a key commitment names each key once; a key id repeats".into(),
+        ));
+    }
+    let value = serde_json::to_value(&sorted)
+        .map_err(|e| Error::InvalidArgument(format!("committed keys serialize: {e}")))?;
     let canonical = crate::verify::canonical::ceg_produce_canonicalize(&value)
-        .map_err(|e| Error::InvalidArgument(format!("successor_keys canonicalize: {e}")))?;
+        .map_err(|e| Error::InvalidArgument(format!("committed keys canonicalize: {e}")))?;
     Ok(hex::encode(sha2::Sha256::digest(&canonical)))
+}
+
+/// v53.0.0 (CC 4.2.6, rc7 `5e89627`) — an accord holder's **recovery
+/// commitment**: [`pre_rotation_commitment`] over the one-element array of the
+/// holder's recovery key.
+pub fn recovery_commitment(recovery_key: &CommittedKey) -> Result<String, Error> {
+    pre_rotation_commitment(std::slice::from_ref(recovery_key))
+}
+
+/// Test-only: the [`CommittedKey`] of `key_id`'s deterministic hybrid test
+/// pair — the pair `register_hybrid_key` registers for that id. A fixture
+/// committing to a successor it never registers still commits to real keys.
+#[cfg(any(test, feature = "test-anchor"))]
+pub fn test_committed_key(key_id: &str) -> CommittedKey {
+    let (ed, mldsa) = super::tier_ingest::test_support::hybrid_pubkeys(key_id);
+    CommittedKey {
+        key_id: key_id.to_owned(),
+        pubkey_ed25519_base64: ed,
+        pubkey_ml_dsa_65_base64: mldsa.expect("the test pair is hybrid"),
+    }
+}
+
+/// Test-only: an accord charter's `recovery_commitments` for `holders`, each
+/// committing to the test pair of `<holder>-recovery` (CC 4.2.6).
+#[cfg(any(test, feature = "test-anchor"))]
+pub fn test_accord_recovery_commitments<S: AsRef<str>>(holders: &[S]) -> serde_json::Value {
+    let map: std::collections::BTreeMap<String, String> = holders
+        .iter()
+        .map(|h| {
+            let h = h.as_ref();
+            let key = test_committed_key(&format!("{h}-recovery"));
+            (
+                h.to_owned(),
+                recovery_commitment(&key).expect("test recovery commitment"),
+            )
+        })
+        .collect();
+    serde_json::json!(map)
+}
+
+/// Test-only: [`test_accord_recovery_commitments`] for the accord roster `d`
+/// holds now (the revocation-folded seat set the charter door reads).
+#[cfg(any(test, feature = "test-anchor"))]
+pub async fn test_accord_recovery_commitments_held(
+    d: &(dyn FederationDirectory + '_),
+) -> serde_json::Value {
+    let roster: Vec<String> = d
+        .active_family_members(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+        .await
+        .map(|m| m.into_iter().map(|m| m.key_id).collect())
+        .unwrap_or_default();
+    test_accord_recovery_commitments(&roster)
+}
+
+/// Test-only: [`pre_rotation_commitment`] over the test pairs of `key_ids`.
+#[cfg(any(test, feature = "test-anchor"))]
+pub fn test_pre_rotation_commitment(key_ids: &[String]) -> Result<String, Error> {
+    let keys: Vec<CommittedKey> = key_ids.iter().map(|k| test_committed_key(k)).collect();
+    pre_rotation_commitment(&keys)
 }
 
 /// v24.0.0 (CIRISPersist#557) — WHAT KIND of thing the root reference names.
@@ -762,16 +965,27 @@ where
     };
     let refs: Vec<&Attestation> = by_node.iter().collect();
     let dead = tombstoned_ids(&refs);
-    let mut roots: Vec<String> = by_node
+    // v53.0.0 (CC 3.2 T2) — the same rotation rule as `trust_root_valid`'s
+    // edge leg: a superseded edge is not a subscription, its successor is.
+    let shaped: Vec<&Attestation> = by_node
         .iter()
         .filter(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
+            (a.attestation_type == attestation_type::DELEGATES_TO
+                || a.attestation_type == attestation_type::SUPERSEDES)
                 && a.attested_key_id != node_key_id
                 && !dead.contains(&a.attestation_id)
                 && !is_expired(a, now)
                 && counts_in_capability_walk(a)
                 && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
         })
+        .collect();
+    let candidates = live_conferrals(directory, shaped).await?;
+    // #973 — an unlabelled edge is an acceptance edge only where its
+    // direction reading stands (held, or a pinned-bundle row).
+    let denied = direction_denied_ids(directory, candidates.iter().copied()).await?;
+    let mut roots: Vec<String> = candidates
+        .into_iter()
+        .filter(|a| !denied.contains(&a.attestation_id))
         .map(|a| a.attested_key_id.clone())
         .collect();
     roots.sort();
@@ -1173,16 +1387,31 @@ where
     // SAME predicate that decides `edge_exists` also supplies the edge leg's
     // expiry bound. One predicate, one pass; a second filter written to compute
     // the TTL is a second answer free to disagree with the first.
-    let live_edges: Vec<&Attestation> = by_user
+    //
+    // v53.0.0 (CC 3.2 T2) — an acceptance edge rotates the way a grant does:
+    // the user's own `supersedes` on it is the live edge and the edge it
+    // replaced is not. The SAME [`live_conferrals`] the capability walk reads
+    // grants through, so "is this edge live" has one answer on both reads.
+    let shaped_edges: Vec<&Attestation> = by_user
         .iter()
         .filter(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
+            (a.attestation_type == attestation_type::DELEGATES_TO
+                || a.attestation_type == attestation_type::SUPERSEDES)
                 && a.attested_key_id == root_ref
                 && !user_dead.contains(&a.attestation_id)
                 && !is_expired(a, now)
                 && counts_in_capability_walk(a)
                 && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
         })
+        .collect();
+    let live_edges = live_conferrals(directory, shaped_edges).await?;
+    // #973 (CC 3.2 T4a) — "a new row with no `trust:{job}` label gives no
+    // acceptance": an unlabelled edge counts only where its direction reading
+    // stands (held when the rule arrived, or a pinned-bundle row).
+    let edge_denied = direction_denied_ids(directory, live_edges.iter().copied()).await?;
+    let live_edges: Vec<&Attestation> = live_edges
+        .into_iter()
+        .filter(|a| !edge_denied.contains(&a.attestation_id))
         .collect();
     let edge_exists = !live_edges.is_empty();
 
@@ -1209,6 +1438,16 @@ where
     let about_refs: Vec<&Attestation> = about_root.iter().collect();
     let about_dead = tombstoned_ids(&about_refs);
 
+    // #973 (CC 3.2 T4a) — "… and is no charter": an unlabelled row toward the
+    // root is a charter only where its direction reading stands.
+    let charter_denied = direction_denied_ids(
+        directory,
+        by_root
+            .iter()
+            .chain(about_root.iter())
+            .filter(|a| a.attested_key_id == legs_ref),
+    )
+    .await?;
     let charter_shaped = |a: &&Attestation, dead: &std::collections::HashSet<String>| {
         a.attestation_type == attestation_type::DELEGATES_TO
             && a.attested_key_id == legs_ref
@@ -1216,6 +1455,7 @@ where
             && !is_expired(a, now)
             && counts_in_capability_walk(a)
             && job_dimension_admits(&a.attestation_envelope, TRUST_CHARTER_DIMENSION)
+            && !charter_denied.contains(&a.attestation_id)
             && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
             && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
     };
@@ -1244,7 +1484,17 @@ where
             // the finding a human acts on ("1 of 2 required distinct
             // holders"), so the best candidate's count is carried out.
             let mut best: Option<CharterQuorum> = None;
-            for candidate in about_root.iter().filter(|a| charter_shaped(a, &about_dead)) {
+            // v53.0.0 (CC 3.2 T6) — only the charter the family's HEAD names
+            // is in force: a re-scrub no version names confers nothing, and
+            // the charter the head names stands until a new version names
+            // another (`canonical_community::charter_in_force`, the one
+            // answer every charter reader shares).
+            let (_, head) =
+                super::canonical_community::charter_in_force(directory, &fam.family_key_id).await?;
+            for candidate in about_root
+                .iter()
+                .filter(|a| charter_shaped(a, &about_dead) && head.admits(a))
+            {
                 let (q, signers) = family_quorum_holders_over(directory, candidate, fam).await?;
                 if q.met() {
                     quorate.push(candidate);
@@ -1532,6 +1782,104 @@ where
     .await
 }
 
+/// v53.0.0 (CC 3.2 T2) — how far a `supersedes` chain is followed back to the
+/// `delegates_to` it rotates. A chain longer than this is not walked to its
+/// root and so confers nothing (fail-closed): a root rotates a grant a handful
+/// of times, not this many.
+const MAX_GRANT_ROTATIONS: usize = 64;
+
+/// v53.0.0 (CC 3.2 T2, steward ruling 2026-10-01) — **the conferral-shaped
+/// rows that confer NOW**: rotation is a `supersedes`, compromise is a
+/// `withdraws`.
+///
+/// > A grant that is **superseded** — the root issues the successor grant, to
+/// > a rotated key or with a changed scope, as a `supersedes` on the old one —
+/// > keeps its lineage: a claim made under the superseded grant, with
+/// > `asserted_at` before the successor's, keeps the standing it had, and a
+/// > reader walks the `supersedes` chain to find it. A grant that is
+/// > **withdrawn** or tombstoned has no successor and no lineage to walk:
+/// > standing under it is gone at once, for every claim ever made under it.
+///
+/// - A `supersedes` confers only as a **successor**: its chain, followed
+///   through `references_attestation_id`, reaches a `delegates_to` and every
+///   link is signed by the same root. Anyone else's `supersedes` over the
+///   root's grant is not a rotation of it.
+/// - A grant (or successor) the SAME root has superseded is not a candidate:
+///   its successor is. That holds whether or not the successor still confers,
+///   so withdrawing a successor does not revive what it replaced.
+///
+/// Before v53 a `supersedes` (never a retraction in the §6.1 fold) left the
+/// superseded grant live, so a narrowed scope never narrowed, and the
+/// successor, not a `delegates_to`, conferred nothing.
+///
+/// What this does NOT answer: the standing of a PAST claim made under a
+/// superseded grant. That is an as-of read (`asserted_at` before the
+/// successor's), and no caller of this walk asks it: every caller resolves
+/// standing at use, now. The lineage it would walk is kept (the superseded
+/// row is never deleted and its successor names it).
+async fn live_conferrals<'a, F>(
+    directory: &F,
+    shaped: Vec<&'a Attestation>,
+) -> Result<Vec<&'a Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut live = Vec::with_capacity(shaped.len());
+    for row in shaped {
+        if row.attestation_type == attestation_type::SUPERSEDES
+            && !rotates_own_grant(directory, row).await?
+        {
+            continue;
+        }
+        let superseded = directory
+            .list_attestations_referencing(&row.attestation_id)
+            .await?
+            .iter()
+            .any(|r| {
+                r.attestation_type == attestation_type::SUPERSEDES
+                    && r.attesting_key_id == row.attesting_key_id
+                    && r.attestation_id != row.attestation_id
+            });
+        if !superseded {
+            live.push(row);
+        }
+    }
+    Ok(live)
+}
+
+/// Does the `supersedes` `succ` rotate a grant its own signer made — its chain
+/// reaching a `delegates_to`, every link by the same key?
+async fn rotates_own_grant<F>(directory: &F, succ: &Attestation) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut cur_target =
+        super::precedence::references_attestation_id_from_envelope(&succ.attestation_envelope)
+            .map(str::to_owned);
+    for _ in 0..MAX_GRANT_ROTATIONS {
+        let Some(target_id) = cur_target.take() else {
+            return Ok(false);
+        };
+        let Some(target) = directory.get_attestation(&target_id).await? else {
+            return Ok(false);
+        };
+        if target.attesting_key_id != succ.attesting_key_id {
+            return Ok(false);
+        }
+        if target.attestation_type == attestation_type::DELEGATES_TO {
+            return Ok(true);
+        }
+        if target.attestation_type != attestation_type::SUPERSEDES {
+            return Ok(false);
+        }
+        cur_target = super::precedence::references_attestation_id_from_envelope(
+            &target.attestation_envelope,
+        )
+        .map(str::to_owned);
+    }
+    Ok(false)
+}
+
 /// v22.1.0 (CIRISPersist#548) — the roster-parameterized core of
 /// [`capability_roots_to_trusted_root`], mirroring the
 /// [`has_accord_conferred_role`](super::admission::has_accord_conferred_role) /
@@ -1571,8 +1919,12 @@ where
     // non-expired — #488 delta 3) scoped delegates_to edge to the subject
     // (excluding a self-grant). Dedup so a root that granted twice is
     // walked once.
+    // v53.0.0 (CC 3.2 T2) — a successor grant is a `supersedes` carrying the
+    // conferral body; it is conferral-shaped too, and `live_conferrals` below
+    // admits it only when it rotates its own root's grant.
     let conferral_shaped = |a: &&Attestation| {
-        a.attestation_type == attestation_type::DELEGATES_TO
+        (a.attestation_type == attestation_type::DELEGATES_TO
+            || a.attestation_type == attestation_type::SUPERSEDES)
             && a.attested_key_id == subject_key_id
             && a.attesting_key_id != subject_key_id
             && !dead.contains(&a.attestation_id)
@@ -1585,10 +1937,19 @@ where
             && scope_contains(&a.attestation_envelope, scope)
     };
 
+    // v53.0.0 (CC 3.2 T2, steward ruling 2026-10-01) — rotation is a
+    // `supersedes`, compromise is a `withdraws`. This walk answers "does the
+    // subject hold `scope` NOW", so the head of a grant's `supersedes` chain
+    // is the live candidate and every grant it superseded is not; a withdrawn
+    // link (`dead`) confers nothing and revives nothing. See
+    // [`live_conferrals`].
+    let shaped: Vec<&Attestation> = about_subject.iter().filter(conferral_shaped).collect();
+    let live = live_conferrals(directory, shaped).await?;
+
     let mut seen = std::collections::HashSet::new();
-    let candidates: Vec<(&str, &str)> = about_subject
+    let candidates: Vec<(&str, &str)> = live
         .iter()
-        .filter(conferral_shaped)
+        .copied()
         .filter(|a| seen.insert(a.attesting_key_id.clone()))
         .map(|a| (a.attesting_key_id.as_str(), a.attestation_id.as_str()))
         .collect();
@@ -1618,7 +1979,7 @@ where
     // crypto) and BEFORE the ceremony arm, matching the cheapest-first ordering
     // this walk has always used.
     let mut family_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for grant in about_subject.iter().filter(conferral_shaped) {
+    for grant in live.iter().copied() {
         let families = match directory
             .list_families_for_member(&grant.attesting_key_id)
             .await
@@ -1798,6 +2159,10 @@ pub(crate) struct TransitCandidateRoot {
 ///
 /// `pub(crate)` so the parity harness can assert the bound directly rather
 /// than inferring it from timings.
+///
+/// #973 — this is an ENUMERATION: every candidate is then judged by
+/// [`trust_root_valid`], which is where an unlabelled edge whose direction
+/// reading does not stand ([`direction_denied_ids`]) stops counting.
 pub(crate) fn transit_candidate_roots(
     by_user: &[Attestation],
     user_key_id: &str,
@@ -1809,7 +2174,12 @@ pub(crate) fn transit_candidate_roots(
     by_user
         .iter()
         .filter(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
+            // v53.0.0 (CC 3.2 T2) — a user's successor edge (`supersedes`)
+            // names a candidate too. This is a CANDIDATE set: each root is
+            // then judged by `trust_root_valid`, whose edge leg applies the
+            // rotation rule, so a superseded edge's root drops out there.
+            (a.attestation_type == attestation_type::DELEGATES_TO
+                || a.attestation_type == attestation_type::SUPERSEDES)
                 && a.attested_key_id != user_key_id
                 && !dead.contains(&a.attestation_id)
                 && !is_expired(a, now)
@@ -2638,6 +3008,32 @@ async fn transit_eligibility_walk(
     }
     Ok((TransitEligibility::denied(), roots_walked))
 }
+/// #973 (CC 3.2 T6) — the refusal token for a charter whose non-zero
+/// `witness_quorum` is below a strict majority of its witness directory.
+pub const CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY: &str =
+    "charter_witness_quorum_below_majority";
+
+/// #973 (CC 3.2 T6) — a charter's `witness_quorum` is `0` / absent (witnessed
+/// mode off) or a strict majority of its witness directory and at least 2.
+/// The directory (`witnesses[]`, the parent-directory rule) is not built yet
+/// (FSD `TRUST_ROOT_RC6.md`, "not yet built"), so the one value refusable
+/// without it is refused here: `1`, which no directory makes a majority ≥ 2.
+///
+/// # Errors
+///
+/// [`Error::CharterInvalid`] naming [`CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY`].
+pub fn check_charter_witness_quorum(envelope: &serde_json::Value) -> Result<(), Error> {
+    match envelope.get(super::envelope::paths::WITNESS_QUORUM) {
+        Some(v) if v.as_u64() == Some(1) => Err(Error::CharterInvalid {
+            detail: format!(
+                "{CHARTER_RULE_WITNESS_QUORUM_BELOW_MAJORITY}: `witness_quorum` 1 is not a \
+                 valid charter value — declare 0 (witnessed mode off) or a strict majority \
+                 of the witness directory, at least 2 (CC 3.2 T6)"
+            ),
+        }),
+        _ => Ok(()),
+    }
+}
 
 /// v24.0.0 (CIRISPersist#557) — the FAMILY-charter admission gate: a charter
 /// that names a constitutional family must be signed by that family's QUORUM,
@@ -2695,6 +3091,7 @@ where
         return Ok(());
     }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
+    check_charter_witness_quorum(&row.attestation_envelope)?;
 
     // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
     // item 2 — see the type-level doc.
@@ -2760,6 +3157,116 @@ where
             family.consensus_protocol
         ));
     }
+    if family.family_key_id == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID {
+        check_accord_recovery_commitments(directory, &row.attestation_envelope, &family).await?;
+    }
+    Ok(())
+}
+
+/// v53.0.0 (CC 4.2.6, rc7 `5e89627`, CIRISConstitution#139) — **the accord's
+/// charter commits a recovery key for every holder.**
+///
+/// > Every holder carries a **recovery key**, committed in the accord's charter
+/// > at seating […], held offline and apart from the signing key. A holder who
+/// > has lost signing-key material, and only that holder, rotates by a
+/// > `supersedes` signed under the recovery key; […] it needs no quorum.
+///
+/// `recovery_commitments` is `{holder_key_id: commitment}`, each value
+/// [`recovery_commitment`] of that holder's recovery key. Refused, each with
+/// its own detail:
+///
+/// - the member is absent or not an object of 64-lowercase-hex strings;
+/// - (v53.0.0, R2c ruling (a)) whether the commitments cover EXACTLY a
+///   roster (no missing holder `accord_recovery_commitment_missing`, no stray
+///   key `accord_recovery_commitment_stray`) is judged at the accord version
+///   door against the version that puts this charter in force
+///   (`accord_roster::check_charter_covers_roster`), where the roster is
+///   known. A charter row no version names is not in force (CC 3.2 T6), so
+///   admitting it early grants nothing, and a roster change's re-scrub names
+///   a holder before the version seats them;
+/// - an entry commits to a key that is the SIGNING key of a holder the
+///   charter names
+///   (recomputed from the stored record), or two holders commit to the same
+///   key — `accord_recovery_key_not_apart`. A recovery key held with the
+///   signing key, or shared with another holder, is not "apart": losing one
+///   loses both, or one holder could rotate another's seat.
+///
+/// What this does NOT do: admit the recovery `supersedes` itself (the door that
+/// checks a rotation against these commitments). That rides the record
+/// versioning of CC 3.2 T6 and is a separate slice.
+async fn check_accord_recovery_commitments<F>(
+    directory: &F,
+    envelope: &serde_json::Value,
+    _family: &super::types::Family,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use super::envelope::paths::RECOVERY_COMMITMENTS;
+    let refuse = |token: &str, detail: String| {
+        Err(Error::CharterInvalid {
+            detail: format!("{token}: {detail}"),
+        })
+    };
+    let well_formed = |h: &str| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    };
+    let commitments: std::collections::BTreeMap<String, String> = match envelope
+        .get(RECOVERY_COMMITMENTS)
+        .map(|v| serde_json::from_value(v.clone()))
+    {
+        Some(Ok(m)) => m,
+        Some(Err(_)) | None => {
+            return refuse(
+                "accord_recovery_commitment_missing",
+                format!(
+                    "the accord's charter must carry \"{RECOVERY_COMMITMENTS}\": an object \
+                     naming each holder's pre-committed recovery key (CC 4.2.6)"
+                ),
+            )
+        }
+    };
+    if let Some((holder, _)) = commitments.iter().find(|(_, c)| !well_formed(c)) {
+        return refuse(
+            "accord_recovery_commitment_missing",
+            format!(
+                "the recovery commitment for {holder} is not 64 lowercase hex (a sha256 \
+                 over the recovery key, CC 3.2 T3)"
+            ),
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(dup) = commitments.values().find(|c| !seen.insert(c.as_str())) {
+        return refuse(
+            "accord_recovery_key_not_apart",
+            format!("two holders commit to the same recovery key (commitment {dup})"),
+        );
+    }
+    // Apart from every signing key the charter names (its own holders): judged
+    // on the charter alone, so it holds whatever roster a version later puts
+    // it in force for.
+    for holder in commitments.keys() {
+        let Some(record) = directory.lookup_public_key(holder).await? else {
+            continue;
+        };
+        // A record that cannot form an element cannot be the key a commitment
+        // names, so it cannot collide either.
+        let Ok(signing) = CommittedKey::from_record(&record) else {
+            continue;
+        };
+        let signing = recovery_commitment(&signing)?;
+        if let Some((owner, _)) = commitments.iter().find(|(_, c)| **c == signing) {
+            return refuse(
+                "accord_recovery_key_not_apart",
+                format!(
+                    "the recovery commitment for {owner} is the signing key of standing \
+                     holder {holder}; a recovery key is held apart from every signing key"
+                ),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2815,6 +3322,7 @@ where
         return Ok(());
     }
     let refuse = |detail: String| Err(Error::CharterInvalid { detail });
+    check_charter_witness_quorum(envelope)?;
 
     // 1. Pre-rotation commitment: present + well-formed, always.
     if !charter_commitment_well_formed(envelope) {
@@ -2849,9 +3357,25 @@ where
                      the charter"
                 ));
             }
+            // v53.0.0 (CC 3.2 T3, rc7 `5e89627`) — the element of each
+            // successor is recomputed from the key record THIS node stores
+            // under its id. Id membership is not the check: a record that
+            // matches the id but carries other keys reproduces a different
+            // digest and is refused below.
+            let mut presented = Vec::with_capacity(successor_keys.len());
+            for key_id in &successor_keys {
+                let Some(record) = directory.lookup_public_key(key_id).await? else {
+                    return refuse(format!(
+                        "recovery declaration names successor {key_id}, but this node holds \
+                         no key record for it: the commitment binds public key material, so \
+                         an unregistered successor cannot be checked against it"
+                    ));
+                };
+                presented.push(CommittedKey::from_record(&record)?);
+            }
             // The predecessor's live charter commitment must equal the hash
             // of THIS successor set (the pre-commitment binding).
-            let claimed = pre_rotation_commitment(&successor_keys)?;
+            let claimed = pre_rotation_commitment(&presented)?;
             let by_old = directory.list_attestations_by(old_root).await?;
             let old_refs: Vec<&Attestation> = by_old.iter().collect();
             let old_dead = tombstoned_ids(&old_refs);
@@ -2870,8 +3394,9 @@ where
             if !bound {
                 return refuse(format!(
                     "recovery declaration does not bind: no live charter of {old_root} \
-                     pre-committed to this successor key set \
-                     (computed commitment {claimed})"
+                     pre-committed to the public keys these successor records carry \
+                     (computed commitment {claimed}); a record under a committed id with \
+                     other keys does not satisfy the commitment"
                 ));
             }
             Ok(())
@@ -3545,6 +4070,8 @@ mod charter_threshold_tests {
 
     fn family(cp: &str) -> Family {
         Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "fam".into(),
             family_name: "fam".into(),
             members: vec![],

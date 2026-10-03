@@ -1,0 +1,1834 @@
+//! v53.0.0 (CIRISPersist#969; `FSD/BLOB_ENCRYPTION_AT_REST.md` §12.13,
+//! `FSD/BLOB_REPLICATION.md` §14.1) — **one DEK per (stream, epoch) for a
+//! self/family chunk stream, sealed with the CC 5.3.3.1 STREAM nonce.**
+//!
+//! - **I310** (sqlite, postgres) — a 1024-chunk `self` stream carries exactly
+//!   R stream wraps (R = the owner's occurrences) and ZERO per-chunk wraps,
+//!   and emits ONE stream-axis set. Before #969: 1024·R content wraps.
+//! - **I311** (unit in `stream_seal`, and here on both backends) — every
+//!   stored chunk's nonce IS `stream_nonce(dek, stream_id, epoch, counter,
+//!   last)`, counters 0, 1, 2, … in seq order.
+//! - **I312** — the seal closes every epoch with ONE terminator (`last`), the
+//!   final chunk of its epoch; a chunk after it is refused at the floor; a
+//!   DAG whose terminator is dropped, or whose counters skip, is refused by
+//!   the structure check the promote and the whole read run (unit).
+//! - **I313** (two nodes, sqlite and postgres) — the owner's second device
+//!   holds the bytes before the stream set: readiness names the EPOCH, a read
+//!   is the typed retryable refusal naming `Stream{stream_id, epoch}`; after
+//!   ONE set per epoch it reads whole and by range. A late device costs one
+//!   re-grant per epoch, not per chunk. A stranger keeps `NotGranted`.
+//! - **I314** (sqlite, postgres) — an append that would take the epoch's last
+//!   counter (reserved for the terminator) rolls to E+1 under a fresh DEK
+//!   with its own set, counter reset; E's terminator is written AT THE ROLL
+//!   in the slot the cap reserved.
+//! - **I314b** (sqlite, postgres) — a REMOVAL roll writes the outgoing
+//!   epoch's terminator at the roll: the epoch, never sealed, carries exactly
+//!   one `last`, its final chunk, at persist's own position
+//!   (`TERMINATOR_SEQ_BASE + epoch`), and reads by position.
+//! - **I314c** (sqlite, postgres) — the readiness door over a LEGACY (v2,
+//!   per-chunk-keyed) DAG: the granted viewer reads it ready; a viewer
+//!   granted the manifest and every chunk but one is told exactly that
+//!   chunk (`Content{seq, chunk_sha256}`); a stranger is `NotGranted`. So a
+//!   host can ask the door about every DAG, not only v4 ones.
+//! - **I315** (sqlite, postgres) — a stream that already holds per-chunk-keyed
+//!   chunks (the v52 shape) stays per-chunk to its seal, seals as v2, and
+//!   reads whole and by range.
+//! - **I316** (two nodes) — a forwarder with no grant adopts every chunk (I45:
+//!   nothing is opened); the promote's structure check reads the nonces only.
+//! - **I317** (sqlite, postgres) — a nested (v3) root over stream-keyed (v4)
+//!   children reads whole and by range.
+//! - **I318** (two nodes) — the batched adopt of stream-keyed chunks, then
+//!   promote and read.
+//! - **I319** (sqlite, postgres) — single sender: a second floor append at an
+//!   already-used counter is refused `stream_counter_moved` and stores
+//!   nothing; a foreign writer is refused at its first chunk (I41).
+
+// Test-only (the module is `cfg(test)` at its declaration too); marked here
+// so the from-disk floor gate (I14) reads its direct floor calls as tests.
+#[cfg(test)]
+pub(crate) mod bodies {
+    use crate::federation::adopt_batch_invariants::bodies::CounterProbe;
+    use crate::federation::chunk_dag_cascade::orchestrate::{
+        check_stream_epoch_structure, MissingChunkKey,
+    };
+    use crate::federation::epoch_minter_invariants::bodies::Pick;
+    use crate::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_CONTENT_ATTESTATION_TYPE, KEY_GRANT_STREAM_ATTESTATION_TYPE,
+    };
+    use crate::federation::nested_manifest_invariants::bodies::{kem_of, pair, Pair, SetCap};
+    use crate::federation::self_collective_invariants::bodies::bind;
+    use crate::federation::types::cohort_scope::{self, CryptoTier};
+    use crate::federation::{
+        AdoptChunkItem, AdoptDisposition, BlobBody, BlobError, BlobProvenance, BlobStorage,
+        ChunkKeyRef, FederationDirectory, StreamKeySlot,
+    };
+
+    fn segment(i: usize) -> Vec<u8> {
+        (0..40 + (i % 5) * 11).map(|j| (i * 17 + j) as u8).collect()
+    }
+
+    async fn write_self(e: &crate::Engine, owner: &str, stream: &str, n: usize) -> Vec<u8> {
+        let mut plain = Vec::new();
+        for i in 0..n {
+            let seg = segment(i);
+            e.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(owner),
+                stream,
+                i as u64,
+                &seg,
+                0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("chunk {i}: {err}"));
+            plain.extend_from_slice(&seg);
+        }
+        plain
+    }
+
+    async fn seal(p: &Pair<impl BlobStorage>, stream: &str) -> [u8; 32] {
+        p.a.seal_stream_scoped(cohort_scope::SELF, Some(&p.owner), stream, None, None)
+            .await
+            .unwrap_or_else(|e| panic!("seal {stream}: {e}"))
+            .manifest_sha256
+    }
+
+    async fn inline<B: BlobStorage + Sync>(b: &B, sha: &[u8; 32]) -> Vec<u8> {
+        let Some(BlobBody::Inline(v)) = b.get_blob(sha).await.unwrap() else {
+            panic!("{} is inline", hex::encode(sha))
+        };
+        v
+    }
+
+    fn hexsha(h: &str) -> [u8; 32] {
+        let mut sha = [0u8; 32];
+        hex::decode_to_slice(h, &mut sha).unwrap();
+        sha
+    }
+
+    /// The (stream, epoch) DEK this node sealed under.
+    async fn epoch_dek<B: BlobStorage + Sync>(b: &B, stream: &str, epoch: u64) -> [u8; 32] {
+        let rec = b
+            .stream_dek_list(stream)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.epoch == epoch)
+            .expect("the epoch's DEK row");
+        let cm = b.load_or_init_content_master().await.unwrap();
+        crate::federation::at_rest_cascade::unwrap_dek_for_persist(&cm, &rec.self_retention_wrap)
+            .unwrap()
+    }
+
+    pub(crate) async fn i310_one_wrap_per_recipient_per_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        n: usize,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i310").await;
+        let stream = format!("i310-{run}");
+        let plain = write_self(&p.a, &p.owner, &stream, n).await;
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        assert_eq!(listing.chunks.len(), n);
+        for c in &listing.chunks {
+            assert!(
+                p.sa.list_at_rest_grants(&c.chunk_sha)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "I310: chunk seq {} carries a per-chunk wrap",
+                c.seq
+            );
+            assert!(
+                p.sa.get_at_rest_grant(
+                    &c.chunk_sha,
+                    crate::federation::at_rest_cascade::PERSIST_SELF_RECIPIENT
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "I310: chunk seq {} carries a per-chunk self-retention row",
+                c.seq
+            );
+        }
+        let epochs = p.sa.stream_dek_list(&stream).await.unwrap();
+        assert_eq!(epochs.len(), 1, "I310: one epoch");
+        let wraps = p.sa.stream_dek_grants(&stream, 0, &p.key_a).await.unwrap();
+        let mut recipients: Vec<&str> = wraps.iter().map(|w| w.recipient_key_id.as_str()).collect();
+        recipients.sort_unstable();
+        let mut want = vec![p.key_a.as_str(), p.key_b.as_str()];
+        want.sort_unstable();
+        assert_eq!(recipients, want, "I310: exactly R = 2 stream wraps");
+        let sets: Vec<_> =
+            p.sa.list_attestations_by(&p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+                .collect();
+        assert_eq!(
+            sets.iter()
+                .filter(|x| x.attestation_type == KEY_GRANT_STREAM_ATTESTATION_TYPE)
+                .count(),
+            1,
+            "I310: ONE stream-axis set for the epoch"
+        );
+        assert_eq!(
+            sets.iter()
+                .filter(|x| x.attestation_type == KEY_GRANT_CONTENT_ATTESTATION_TYPE)
+                .count(),
+            0,
+            "I310: no per-chunk content set"
+        );
+        // I311 — every stored nonce is the STREAM nonce at its counter.
+        let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
+        for (i, c) in listing.chunks.iter().enumerate() {
+            let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+                &inline(p.sa.as_ref(), &c.chunk_sha).await,
+            )
+            .unwrap();
+            let want = crate::federation::stream_seal::stream_nonce(
+                &dek,
+                &stream,
+                0,
+                u32::try_from(i).unwrap(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(env.nonce, want, "I311: chunk seq {} nonce", c.seq);
+        }
+        // The live read by position: per epoch, not per chunk.
+        assert_eq!(
+            p.a.read_stream_chunk_as(&stream, 3, &p.key_a, None)
+                .await
+                .unwrap(),
+            segment(3)
+        );
+        let root = seal(&p, &stream).await;
+        let view =
+            p.a.open_sealed_manifest_as(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert!(
+            view.version == crate::federation::CHUNK_MANIFEST_VERSION_STREAM
+                || view.version == crate::federation::CHUNK_MANIFEST_VERSION_NESTED,
+            "I310: a stream-keyed manifest ({})",
+            view.version
+        );
+        assert_eq!(
+            p.a.read_blob_as(&root, &p.key_a, None).await.unwrap(),
+            plain,
+            "I310: the file reads whole"
+        );
+    }
+
+    pub(crate) async fn i312_every_epoch_ends_in_one_terminator<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i312").await;
+        let stream = format!("i312-{run}");
+        let plain = write_self(&p.a, &p.owner, &stream, 5).await;
+        let root = seal(&p, &stream).await;
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        assert_eq!(
+            listing.chunks.len(),
+            6,
+            "I312: five chunks and a terminator"
+        );
+        let last = listing.chunks.last().unwrap();
+        assert_eq!(
+            (last.seq, last.plaintext_size),
+            (
+                crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE,
+                0
+            ),
+            "I312: the terminator, at persist's position for epoch 0"
+        );
+        let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
+        let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+            &inline(p.sa.as_ref(), &last.chunk_sha).await,
+        )
+        .unwrap();
+        assert_eq!(
+            env.nonce,
+            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 5, true).unwrap(),
+            "I312: the terminator carries last_flag at the epoch's final counter"
+        );
+        let rec = p.sa.stream_dek_list(&stream).await.unwrap().remove(0);
+        assert!(rec.terminated && rec.closed, "I312: {rec:?}");
+        // The whole read runs the structure check and passes.
+        assert_eq!(
+            p.a.read_blob_as(&root, &p.key_a, None).await.unwrap(),
+            plain
+        );
+        // A chunk after the epoch's last is refused at the floor, in its own
+        // transaction — data or a second terminator alike.
+        for last in [false, true] {
+            let slot = StreamKeySlot { counter: 6, last };
+            let envelope = crate::federation::at_rest_cascade::seal_aad_at_nonce(
+                &dek,
+                crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 6, last).unwrap(),
+                &crate::federation::chunk_dag_cascade::chunk_aad(None, &stream, 9),
+                b"late",
+            )
+            .unwrap();
+            let e =
+                p.sa.put_blob_chunk_with_scope(
+                    &stream,
+                    9,
+                    BlobBody::Inline(envelope.to_bytes()),
+                    0,
+                    4,
+                    cohort_scope::SELF,
+                    crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                    None,
+                    crate::federation::StreamClaim {
+                        community_key_id: Some(p.owner.clone()),
+                        owner_key_id: Some(p.key_a.clone()),
+                        stream_key: Some(slot),
+                    },
+                )
+                .await
+                .expect_err("I312: nothing follows an epoch's last");
+            assert!(
+                matches!(&e, BlobError::InvalidArgument(m)
+                    if m.starts_with(crate::federation::blobs::STREAM_EPOCH_CLOSED)),
+                "I312: {e:?}"
+            );
+        }
+        assert!(p.sa.stream_chunk_at(&stream, 9).await.unwrap().is_none());
+    }
+
+    pub(crate) async fn i313_the_second_device_needs_one_set_per_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i313").await;
+        let stream = format!("i313-{run}");
+        let plain = write_self(&p.a, &p.owner, &stream, 12).await;
+        let root = seal(&p, &stream).await;
+        p.a.emit_pending_key_grants().await.unwrap();
+        let sets: Vec<_> =
+            p.sa.list_attestations_by(&p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+                .collect();
+        let (stream_sets, content_sets): (Vec<_>, Vec<_>) = sets
+            .into_iter()
+            .partition(|x| x.attestation_type == KEY_GRANT_STREAM_ATTESTATION_TYPE);
+        assert_eq!(stream_sets.len(), 1, "I313: one stream set per epoch");
+        assert_eq!(
+            content_sets.len(),
+            1,
+            "I313: one content set, the manifest's"
+        );
+        for set in content_sets {
+            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+                .await
+                .expect("B applies the manifest's set");
+        }
+        let prov = BlobProvenance {
+            author_key_id: p.owner.clone(),
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: CryptoTier::InvisibleEncrypted,
+            minter_key_id: Some(p.key_a.clone()),
+        };
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root).await,
+            prov.clone(),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B adopts the manifest");
+        let view =
+            p.b.open_sealed_manifest_as(&root, &p.key_b, None)
+                .await
+                .expect("B opens the manifest");
+        assert_eq!(view.chunks.len(), 13);
+        // Before any chunk: not held, and the epoch's key is missing.
+        let r =
+            p.b.sealed_dag_readiness(&root, &p.key_b, None)
+                .await
+                .unwrap();
+        assert!(!r.held && !r.readable, "I313: {r:?}");
+        assert_eq!(r.chunk_keys, "stream_epoch");
+        assert_eq!(r.not_held.len(), 13);
+        for c in &view.chunks {
+            p.b.adopt_sealed_chunk(
+                &stream,
+                c.seq,
+                &inline(p.sa.as_ref(), &hexsha(&c.sha256_hex)).await,
+                c.epoch.expect("a v4 chunk names its epoch"),
+                u64::from(c.size),
+                prov.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I313: chunk {}: {e}", c.seq));
+        }
+        p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
+            .await
+            .expect("I313: promoted (the structure check reads nonces only)");
+        // Held, but the epoch's set has not arrived: ONE missing entry for the
+        // epoch, spanning every chunk of it.
+        let r =
+            p.b.sealed_dag_readiness(&root, &p.key_b, None)
+                .await
+                .unwrap();
+        assert!(r.held && !r.readable, "I313: {r:?}");
+        assert_eq!(
+            r.missing,
+            vec![MissingChunkKey::Stream {
+                stream_id: stream.clone(),
+                epoch: 0,
+                seq_from: 0,
+                seq_to: crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE
+            }],
+            "I313: O(epochs) — one entry"
+        );
+        // The authorized viewer is told WHICH key, retryably.
+        match p.b.read_blob_as(&root, &p.key_b, None).await {
+            Err(BlobError::ChunkKeyNotYetGranted { key, seq, .. }) => {
+                assert_eq!(
+                    key,
+                    ChunkKeyRef::Stream {
+                        stream_id: stream.clone(),
+                        epoch: 0
+                    }
+                );
+                assert_eq!(seq, 0);
+            }
+            other => panic!("I313: {other:?}"),
+        }
+        // A stranger keeps the DAG-only refusal.
+        let stranger = format!("i313-stranger-{run}");
+        assert!(matches!(
+            p.b.read_blob_as(&root, &stranger, None).await,
+            Err(BlobError::NotGranted { .. })
+        ));
+        assert!(matches!(
+            p.b.sealed_dag_readiness(&root, &stranger, None).await,
+            Err(BlobError::NotGranted { .. })
+        ));
+        for set in stream_sets {
+            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+                .await
+                .expect("B applies the stream set");
+        }
+        let r =
+            p.b.sealed_dag_readiness(&root, &p.key_b, None)
+                .await
+                .unwrap();
+        assert!(r.readable && r.missing.is_empty(), "I313: {r:?}");
+        assert_eq!(
+            p.b.read_blob_as(&root, &p.key_b, None).await.unwrap(),
+            plain,
+            "I313: the second device reads the file"
+        );
+        assert_eq!(
+            p.b.read_blob_range_as(&root, &p.key_b, 50, 140, None)
+                .await
+                .unwrap(),
+            plain[50..=140].to_vec(),
+            "I313: and by range"
+        );
+        // The stream's single sender grants its keys. B is the same person's
+        // other node and speaks for A (#884); a party that shares no
+        // principal with the stream's owner does not, and its set is refused
+        // before the attestation plane is asked.
+        let forged = crate::federation::key_grant::KeyGrantSet {
+            axis: crate::federation::key_grant::KeyGrantAxis::Stream {
+                stream_id: stream.clone(),
+                epoch: 0,
+                cohort_scope: cohort_scope::SELF.to_owned(),
+                owner_key_id: p.owner.clone(),
+            },
+            wraps: p
+                .sa
+                .stream_dek_grants(&stream, 0, &p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .take(1)
+                .map(|mut w| {
+                    w.recipient_key_id = format!("i313-evil-{run}");
+                    w
+                })
+                .collect(),
+        };
+        let id =
+            p.b.emit_attestation_self(forged.emit_input())
+                .await
+                .unwrap();
+        let mut row = p.sb.get_attestation(&id).await.unwrap().expect("B's row");
+        let outsider = format!("i313-outsider-{run}");
+        row.attesting_key_id = outsider.clone();
+        row.scrub_key_id = outsider;
+        let e =
+            p.a.apply_replicated_key_grant(SignedKeyGrantSet { attestation: row })
+                .await
+                .expect_err("I313: a set signed by a party that does not speak for the owner");
+        assert!(
+            matches!(&e, crate::federation::Error::KeyGrantRefused { reason, .. }
+                if *reason == "signer_not_stream_owner"),
+            "I313: {e:?}"
+        );
+        // A late device: one re-grant per EPOCH (and the manifest), not per chunk.
+        let late = format!("i313-late-{run}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key_as(
+            p.sa.as_ref(),
+            &late,
+            &late,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await;
+        bind(
+            p.sa.as_ref(),
+            &p.owner,
+            &late,
+            Some(kem_of(p.sb.as_ref()).await),
+        )
+        .await;
+        let rk =
+            p.a.rekey_self_occurrence_add(&p.owner, std::slice::from_ref(&late))
+                .await
+                .unwrap();
+        assert_eq!(
+            rk.changed_streams,
+            vec![(stream.clone(), 0, p.owner.clone())],
+            "I313: the late device's stream re-grant is O(epochs)"
+        );
+        assert_eq!(rk.changed_blobs, vec![root], "I313: and the manifest");
+        assert!(
+            p.sa.stream_dek_grants(&stream, 0, &p.key_a)
+                .await
+                .unwrap()
+                .iter()
+                .any(|w| w.recipient_key_id == late),
+            "I313: the late device holds the epoch's wrap"
+        );
+    }
+
+    /// **I314d** (v53.0.0, #963 — coordinator ruling) — a DENY added later
+    /// is a recipient leaving the audience: the next family chunk rolls the
+    /// epoch, and the new epoch's key never reaches the denied device.
+    pub(crate) async fn i314d_a_deny_rolls_the_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        let p = pair(dsn_a, dsn_b, run, pick, "i314d").await;
+        let d = p.sa.as_ref() as &dyn FederationDirectory;
+        let fam = format!("i314d-fam-{run}");
+        ra::family(d, &fam, &[&p.owner]).await;
+        let stream = format!("i314d-{run}");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::FAMILY,
+            Some(&fam),
+            &stream,
+            0,
+            b"before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            p.sa.stream_dek_grants(&stream, 0, &p.key_a)
+                .await
+                .unwrap()
+                .iter()
+                .any(|w| w.recipient_key_id == p.key_b),
+            "I314d precondition — the second device holds E0's wrap"
+        );
+        ra::put(
+            d,
+            &ra::grant(&p.owner, Some(&p.key_b), Some(serde_json::json!([]))),
+        )
+        .await
+        .expect("I314d the owner denies every cohort on the second device");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::FAMILY,
+            Some(&fam),
+            &stream,
+            1,
+            b"after",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p.sa.stream_chunk_at(&stream, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1,
+            "I314d the deny rolled the epoch"
+        );
+        let after = p.sa.stream_dek_grants(&stream, 1, &p.key_a).await.unwrap();
+        assert!(
+            !after.iter().any(|w| w.recipient_key_id == p.key_b),
+            "I314d the denied device holds no wrap of E1: {after:?}"
+        );
+    }
+
+    /// A third device of `p.owner` for the re-class witnesses: its own signer
+    /// and content-KEM keys, registered as a NODE and owner-bound on both
+    /// nodes. It publishes its own occurrence (`publish_signed_content_only_occurrence`,
+    /// the receive door a replicated republish reaches).
+    struct Reclassed {
+        key: String,
+        signer: std::sync::Arc<crate::signing::LocalSigner>,
+        keys: crate::federation::EncryptionPubkeys,
+    }
+
+    async fn reclassed<B>(p: &Pair<B>, run: &str, tag: &str) -> Reclassed
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::tier_ingest::test_support as ts;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let alias = format!("{tag}-phone-{run}");
+        let signer = ts::local_signer(&alias);
+        let key = signer.derived_key_id();
+        for n in [p.sa.as_ref(), p.sb.as_ref()] {
+            ts::register_hybrid_key_as(
+                n,
+                &key,
+                &alias,
+                crate::federation::types::identity_type::NODE,
+            )
+            .await;
+            ts::put_owner_binding(n, &p.owner, &key).await;
+        }
+        let (_x_priv, x_pub, _ml_priv, ml_pub) =
+            crate::federation::identity_aggregate::mint_content_kem_keypair().unwrap();
+        Reclassed {
+            key,
+            signer,
+            keys: crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(&ml_pub),
+            },
+        }
+    }
+
+    /// `dev` republishes its occurrence on `backend` under `class`, signed
+    /// now (millisecond instant; the pause keeps successive ones distinct).
+    async fn publish_as<B>(backend: &B, owner: &str, dev: &Reclassed, class: &str)
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        crate::federation::key_grant::publish_signed_content_only_occurrence(
+            backend,
+            &dev.signer,
+            owner,
+            &dev.key,
+            class,
+            None,
+            dev.keys.clone(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{} publishes as {class}: {e}", dev.key));
+    }
+
+    async fn holds_stream<B: BlobStorage + Sync>(
+        b: &B,
+        stream: &str,
+        epoch: u64,
+        owner: &str,
+        dev: &str,
+    ) -> bool {
+        b.stream_dek_grants(stream, epoch, owner)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.recipient_key_id == dev)
+    }
+
+    /// `dev`'s signed occurrence as `b` serves it on its since-read.
+    async fn signed_occurrence_on<B: FederationDirectory + Sync>(
+        b: &B,
+        dev: &str,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        b.list_signed_identity_occurrences_since(None, 10_000)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.occurrence.identity_occurrence.occurrence_key_id == dev)
+            .expect("the device's signed occurrence")
+            .occurrence
+    }
+
+    /// **I397b** (v53.0.0, #963) — a device first published under a server
+    /// class, then republished (same key, same keys, newer instant) as a
+    /// phone, is a newcomer to the self/family keys THIS node holds: the
+    /// receive door wraps it every self stream epoch, the sealed manifest and
+    /// every family stream epoch written while it was server-class, and leaves
+    /// each set dirty for the pending loop.
+    pub(crate) async fn i397b_a_reclass_into_the_audience_is_a_newcomer<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::replication_audience_invariants::bodies as ra;
+        use crate::federation::types::device_class;
+        let p = pair(dsn_a, dsn_b, run, pick, "i397b").await;
+        let phone = reclassed(&p, run, "i397b").await;
+        publish_as(p.sa.as_ref(), &p.owner, &phone, device_class::SERVER).await;
+        let fam = format!("i397b-fam-{run}");
+        ra::family(p.sa.as_ref() as &dyn FederationDirectory, &fam, &[&p.owner]).await;
+        let (stream, fstream) = (format!("i397b-{run}"), format!("i397b-f-{run}"));
+        write_self(&p.a, &p.owner, &stream, 3).await;
+        let root = seal(&p, &stream).await;
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::FAMILY,
+            Some(&fam),
+            &fstream,
+            0,
+            b"family before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let sa = p.sa.as_ref();
+        assert!(
+            holds_stream(sa, &stream, 0, &p.key_a, &p.key_b).await
+                && holds_stream(sa, &fstream, 0, &p.key_a, &p.key_b).await,
+            "I397b precondition — the laptop holds both epochs"
+        );
+        assert!(
+            !holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await
+                && !holds_stream(sa, &fstream, 0, &p.key_a, &phone.key).await
+                && sa
+                    .get_at_rest_grant(&root, &phone.key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+            "I397b precondition — server-class, the phone holds no self/family key"
+        );
+        p.a.emit_pending_key_grants().await.unwrap();
+
+        publish_as(sa, &p.owner, &phone, device_class::PHONE).await;
+        assert!(
+            holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await,
+            "I397b the re-classed phone holds the self stream's earlier epoch"
+        );
+        assert!(
+            sa.get_at_rest_grant(&root, &phone.key)
+                .await
+                .unwrap()
+                .is_some(),
+            "I397b and the sealed manifest"
+        );
+        assert!(
+            holds_stream(sa, &fstream, 0, &p.key_a, &phone.key).await,
+            "I397b and the family stream's earlier epoch"
+        );
+        let dirty = crate::federation::key_grant::dirty_axes(sa, &p.key_a)
+            .await
+            .unwrap();
+        assert!(
+            dirty.iter().any(|a| matches!(a,
+                crate::federation::key_grant::KeyGrantAxis::Stream { stream_id, epoch: 0, .. }
+                    if *stream_id == stream)),
+            "I397b the widened self epoch's set is pending emission: {dirty:?}"
+        );
+    }
+
+    /// **I397c** (v53.0.0, #963) — the reverse re-class, phone → server: the
+    /// device gets no key for what is written after, and the self stream epoch
+    /// it held rolls at the next chunk (a recipient leaving is a removal).
+    pub(crate) async fn i397c_a_reclass_out_of_the_audience_rolls<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::types::device_class;
+        let p = pair(dsn_a, dsn_b, run, pick, "i397c").await;
+        let phone = reclassed(&p, run, "i397c").await;
+        publish_as(p.sa.as_ref(), &p.owner, &phone, device_class::PHONE).await;
+        let stream = format!("i397c-{run}");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &stream,
+            0,
+            b"before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let sa = p.sa.as_ref();
+        assert!(
+            holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await,
+            "I397c precondition — the phone holds E0"
+        );
+        publish_as(sa, &p.owner, &phone, device_class::SERVER).await;
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &stream,
+            1,
+            b"after",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sa.stream_chunk_at(&stream, 1).await.unwrap().unwrap().epoch,
+            1,
+            "I397c the re-class out of the audience rolled the epoch"
+        );
+        assert!(
+            !holds_stream(sa, &stream, 1, &p.key_a, &phone.key).await
+                && holds_stream(sa, &stream, 1, &p.key_a, &p.key_b).await,
+            "I397c E1's key skips the re-classed server, reaches the laptop"
+        );
+    }
+
+    /// **I397d** (v53.0.0, #963) — a re-class signed EARLIER than the stored
+    /// row (or a replay of the stored row) changes nothing: last-signed-wins
+    /// keeps the server class, and the receive door grants no key.
+    pub(crate) async fn i397d_a_stale_reclass_changes_nothing<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        use crate::federation::types::device_class;
+        let p = pair(dsn_a, dsn_b, run, pick, "i397d").await;
+        let phone = reclassed(&p, run, "i397d").await;
+        // The phone-class row is signed FIRST, on B; the server-class row
+        // after it, on A.
+        publish_as(p.sb.as_ref(), &p.owner, &phone, device_class::PHONE).await;
+        publish_as(p.sa.as_ref(), &p.owner, &phone, device_class::SERVER).await;
+        let stream = format!("i397d-{run}");
+        write_self(&p.a, &p.owner, &stream, 2).await;
+        let sa = p.sa.as_ref();
+        let older = signed_occurrence_on(p.sb.as_ref(), &phone.key).await;
+        let current = signed_occurrence_on(sa, &phone.key).await;
+        for (label, row) in [("older", older), ("replayed", current)] {
+            sa.put_identity_occurrence(row)
+                .await
+                .unwrap_or_else(|e| panic!("I397d A admits the {label} row: {e}"));
+            let class = sa
+                .list_identity_occurrences_active(&p.owner)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|o| o.occurrence_key_id == phone.key)
+                .expect("the phone's row")
+                .device_class;
+            assert_eq!(
+                class,
+                device_class::SERVER,
+                "I397d the {label} row keeps the class"
+            );
+            assert!(
+                !holds_stream(sa, &stream, 0, &p.key_a, &phone.key).await,
+                "I397d the {label} row grants the server-class phone no self key"
+            );
+        }
+    }
+
+    pub(crate) async fn i314_the_cap_rolls_the_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + CounterProbe + Sync + 'static,
+    {
+        use crate::federation::blobs::MAX_CHUNKS_PER_EPOCH;
+        let p = pair(dsn_a, dsn_b, run, pick, "i314").await;
+        let stream = format!("i314-{run}");
+        write_self(&p.a, &p.owner, &stream, 1).await;
+        // Shrink the epoch's headroom: the next data chunk takes the
+        // second-to-last counter; the one after would take the terminator's.
+        let max = i64::try_from(MAX_CHUNKS_PER_EPOCH).unwrap();
+        p.sa.set_counter(&stream, 0, max - 2).await;
+        let r1 =
+            p.a.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(&p.owner),
+                &stream,
+                1,
+                b"near",
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            r1.key_grant_emission.is_none(),
+            "I314: same epoch, no new set"
+        );
+        let r2 =
+            p.a.put_blob_chunk_scoped(
+                cohort_scope::SELF,
+                Some(&p.owner),
+                &stream,
+                2,
+                b"rolled",
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &r2.key_grant_emission,
+                Some(crate::federation::key_grant::KeyGrantAxis::Stream { epoch: 1, .. })
+            ),
+            "I314: E+1 carries its own set: {:?}",
+            r2.key_grant_emission
+        );
+        let at = p.sa.stream_chunk_at(&stream, 2).await.unwrap().unwrap();
+        assert_eq!(at.epoch, 1, "I314: the chunk is recorded at E+1");
+        let deks = p.sa.stream_dek_list(&stream).await.unwrap();
+        assert_eq!(deks.len(), 2);
+        assert!(
+            deks[0].closed && deks[0].terminated,
+            "I314: the roll terminated E (its last written at the roll, not at a seal)"
+        );
+        assert_ne!(
+            deks[0].self_retention_wrap, deks[1].self_retention_wrap,
+            "I314: a fresh DEK"
+        );
+        let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+            &inline(p.sa.as_ref(), &at.chunk_sha).await,
+        )
+        .unwrap();
+        let dek1 = epoch_dek(p.sa.as_ref(), &stream, 1).await;
+        assert_eq!(
+            env.nonce,
+            crate::federation::stream_seal::stream_nonce(&dek1, &stream, 1, 0, false).unwrap(),
+            "I314: the counter resets at E+1"
+        );
+        // The producer naming the old epoch is carried to the open one.
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &stream,
+            3,
+            b"more",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p.sa.stream_chunk_at(&stream, 3)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            1
+        );
+        // The seal terminates both: E at its last counter, E+1 after its two.
+        seal(&p, &stream).await;
+        let deks = p.sa.stream_dek_list(&stream).await.unwrap();
+        assert!(deks.iter().all(|d| d.terminated), "I314: {deks:?}");
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        let dek0 = epoch_dek(p.sa.as_ref(), &stream, 0).await;
+        let t0 = listing
+            .chunks
+            .iter()
+            .find(|c| {
+                c.seq == crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE
+            })
+            .unwrap();
+        assert_eq!(t0.epoch, 0);
+        assert_eq!(
+            crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+                &inline(p.sa.as_ref(), &t0.chunk_sha).await
+            )
+            .unwrap()
+            .nonce,
+            crate::federation::stream_seal::stream_nonce(
+                &dek0,
+                &stream,
+                0,
+                u32::try_from(max - 1).unwrap(),
+                true
+            )
+            .unwrap(),
+            "I314: E's terminator takes the slot the roll reserved"
+        );
+
+        // The REMOVAL roll: a recipient granted on the open epoch leaves the
+        // self-collective; the next chunk is sealed under E+1, whose DEK the
+        // removed device never receives (CC 5.1 forward secrecy).
+        let gone = format!("i314-removal-{run}");
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &gone,
+            0,
+            b"before",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(p
+            .sa
+            .stream_dek_grants(&gone, 0, &p.key_a)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.recipient_key_id == p.key_b));
+        p.sa.put_identity_occurrence_revocation_local(
+            crate::federation::types::IdentityOccurrenceRevocation {
+                identity_key_id: p.owner.clone(),
+                occurrence_key_id: p.key_b.clone(),
+                revoked_at: chrono::Utc::now(),
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![p.owner.clone()],
+                persist_row_hash: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &gone,
+            1,
+            b"after",
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            p.sa.stream_chunk_at(&gone, 1).await.unwrap().unwrap().epoch,
+            1,
+            "I314: a removal rolls the epoch"
+        );
+        let after = p.sa.stream_dek_grants(&gone, 1, &p.key_a).await.unwrap();
+        assert!(
+            !after.iter().any(|w| w.recipient_key_id == p.key_b),
+            "I314: the removed device holds no wrap of E+1: {after:?}"
+        );
+        // I314b — the epoch the removal closed carries exactly one `last`, as
+        // its final chunk, though the stream was NEVER sealed: the roll
+        // wrote it. Read from the stored nonces (no key), and by position.
+        let rows = p.sa.stream_chunks(&gone).await.unwrap().chunks;
+        let mut slots = Vec::new();
+        for c in rows.iter().filter(|c| c.epoch == 0) {
+            let env = crate::federation::at_rest_cascade::AtRestEnvelope::from_bytes(
+                &inline(p.sa.as_ref(), &c.chunk_sha).await,
+            )
+            .unwrap();
+            let (counter, last) = crate::federation::stream_seal::parse_nonce(&env.nonce).unwrap();
+            slots.push((c.seq, c.epoch, StreamKeySlot { counter, last }));
+        }
+        assert_eq!(
+            slots.iter().filter(|(_, _, s)| s.last).count(),
+            1,
+            "I314b: exactly one last in the removed epoch: {slots:?}"
+        );
+        check_stream_epoch_structure(&[0; 32], &slots)
+            .expect("I314b: the unsealed, rolled epoch is whole");
+        assert_eq!(
+            p.a.read_stream_chunk_as(
+                &gone,
+                crate::federation::chunk_dag_cascade::orchestrate::TERMINATOR_SEQ_BASE,
+                &p.key_a,
+                None
+            )
+            .await
+            .expect("I314b: the terminator reads by position"),
+            Vec::<u8>::new()
+        );
+        assert!(
+            p.sa.stream_dek_list(&gone).await.unwrap()[0].terminated,
+            "I314b: the roll terminated the epoch"
+        );
+        // The producer's own roll (a higher epoch label) terminates the
+        // outgoing epoch too.
+        p.a.put_blob_chunk_scoped(
+            cohort_scope::SELF,
+            Some(&p.owner),
+            &gone,
+            2,
+            b"later",
+            5,
+            None,
+        )
+        .await
+        .unwrap();
+        let deks = p.sa.stream_dek_list(&gone).await.unwrap();
+        assert_eq!(
+            deks.iter()
+                .map(|d| (d.epoch, d.terminated))
+                .collect::<Vec<_>>(),
+            vec![(0, true), (1, true), (5, false)],
+            "I314b: the producer's roll terminated E+1"
+        );
+    }
+
+    /// The v52 shape (a per-chunk-keyed stream, sealed as v2): `n` chunks
+    /// through the ONE v2 writer, the exported
+    /// [`write_legacy_v2_dag`](crate::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag)
+    /// (the v52 chunk door's steps for chunk 0, the door for the rest, then
+    /// the seal). Returns the plaintext and the DAG's root.
+    async fn write_v52_stream<B>(p: &Pair<B>, stream: &str, n: usize) -> (Vec<u8>, [u8; 32])
+    where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let segs: Vec<Vec<u8>> = (0..n).map(segment).collect();
+        let dag = crate::federation::chunk_dag_cascade::test_support::write_legacy_v2_dag(
+            &p.a,
+            p.sa.as_ref(),
+            cohort_scope::SELF,
+            &p.owner,
+            stream,
+            &segs,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("v52 stream {stream}: {e}"));
+        assert!(
+            p.sa.stream_dek_list(stream).await.unwrap().is_empty(),
+            "a v52 stream never gains a stream DEK"
+        );
+        (dag.plaintext, dag.manifest_sha256)
+    }
+
+    pub(crate) async fn i315_a_v52_stream_reads_forever<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i315").await;
+        let stream = format!("i315-{run}");
+        let (plain, root) = write_v52_stream(&p, &stream, 6).await;
+        let view =
+            p.a.open_sealed_manifest_as(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert_eq!(view.version, 2, "I315: legacy stays v2");
+        assert_eq!(view.chunks.len(), 6, "I315: no terminator on a legacy DAG");
+        assert!(view.chunks.iter().all(|c| c.epoch.is_none()));
+        assert_eq!(
+            p.a.read_blob_as(&root, &p.key_a, None).await.unwrap(),
+            plain
+        );
+        assert_eq!(
+            p.a.read_blob_range_as(&root, &p.key_a, 30, 120, None)
+                .await
+                .unwrap(),
+            plain[30..=120].to_vec()
+        );
+        let r =
+            p.a.sealed_dag_readiness(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert!(r.readable && r.chunk_keys == "content", "I315: {r:?}");
+        // An authorized viewer missing ONE chunk's grant: per-chunk, typed.
+        let stranger_dev = format!("i315-dev-{run}");
+        p.sa.put_at_rest_grants(
+            &root,
+            cohort_scope::SELF,
+            &[crate::federation::GrantWrap {
+                recipient_key_id: stranger_dev.clone(),
+                wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+                wrapped_dek: "{}".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let r =
+            p.a.sealed_dag_readiness(&root, &stranger_dev, None)
+                .await
+                .unwrap();
+        assert_eq!(r.missing.len(), 6, "I315: legacy names each chunk: {r:?}");
+        assert!(matches!(
+            &r.missing[0],
+            MissingChunkKey::Content { seq: 0, .. }
+        ));
+    }
+
+    pub(crate) async fn i314c_readiness_over_a_legacy_dag<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i314c").await;
+        let stream = format!("i314c-{run}");
+        let (_, root) = write_v52_stream(&p, &stream, 5).await;
+        let view =
+            p.a.open_sealed_manifest_as(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert_eq!(view.version, 2, "I314c: a legacy (v2) DAG");
+        assert_eq!(view.chunks.len(), 5);
+
+        // (a) The granted viewer: readable, nothing missing, every chunk held.
+        let r =
+            p.a.sealed_dag_readiness(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert_eq!(r.chunk_keys, "content", "I314c (a): {r:?}");
+        assert!(r.held && r.readable, "I314c (a): {r:?}");
+        assert!(
+            r.missing.is_empty() && r.not_held.is_empty(),
+            "I314c (a): {r:?}"
+        );
+
+        // (b) A viewer granted the manifest and every chunk but ONE: not
+        // readable, and `missing` names exactly that chunk by seq and sha.
+        let dev = format!("i314c-dev-{run}");
+        let wrap = || crate::federation::GrantWrap {
+            recipient_key_id: dev.clone(),
+            wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.into(),
+            wrapped_dek: "{}".into(),
+        };
+        p.sa.put_at_rest_grants(&root, cohort_scope::SELF, &[wrap()])
+            .await
+            .unwrap();
+        let lacking = &view.chunks[3];
+        for c in view.chunks.iter().filter(|c| c.seq != lacking.seq) {
+            p.sa.put_at_rest_grants(&hexsha(&c.sha256_hex), cohort_scope::SELF, &[wrap()])
+                .await
+                .unwrap();
+        }
+        let r = p.a.sealed_dag_readiness(&root, &dev, None).await.unwrap();
+        assert!(r.held && !r.readable, "I314c (b): {r:?}");
+        assert_eq!(
+            r.missing,
+            vec![MissingChunkKey::Content {
+                seq: lacking.seq,
+                chunk_sha256: lacking.sha256_hex.clone(),
+            }],
+            "I314c (b): exactly the one chunk"
+        );
+
+        // (c) A stranger (no grant on the manifest) learns nothing.
+        let stranger = format!("i314c-stranger-{run}");
+        assert!(matches!(
+            p.a.sealed_dag_readiness(&root, &stranger, None).await,
+            Err(BlobError::NotGranted { .. })
+        ));
+    }
+
+    pub(crate) async fn i316_a_forwarder_holds_without_a_key<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i316").await;
+        let stream = format!("i316-{run}");
+        write_self(&p.a, &p.owner, &stream, 4).await;
+        let root = seal(&p, &stream).await;
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        // B holds no set at all: the adopt stores every chunk unopened.
+        let prov = BlobProvenance {
+            author_key_id: p.owner.clone(),
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: CryptoTier::InvisibleEncrypted,
+            minter_key_id: Some(p.key_a.clone()),
+        };
+        for c in &listing.chunks {
+            p.b.adopt_sealed_chunk(
+                &stream,
+                c.seq,
+                &inline(p.sa.as_ref(), &c.chunk_sha).await,
+                c.epoch,
+                c.plaintext_size,
+                prov.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("I316: a keyless adopt of seq {}: {e}", c.seq));
+        }
+        let held = p.sb.stream_chunks(&stream).await.unwrap();
+        assert_eq!(
+            held.chunks
+                .iter()
+                .map(|c| (c.seq, c.chunk_sha, c.epoch))
+                .collect::<Vec<_>>(),
+            listing
+                .chunks
+                .iter()
+                .map(|c| (c.seq, c.chunk_sha, c.epoch))
+                .collect::<Vec<_>>(),
+            "I316: the forwarder holds every chunk at its seq and epoch"
+        );
+        assert!(
+            p.sb.stream_dek_list(&stream).await.unwrap().is_empty(),
+            "I316: a forwarder mints and holds no stream key"
+        );
+        // It cannot read what it holds: it is no viewer of the DAG.
+        assert!(matches!(
+            p.b.read_blob_as(&root, &p.key_b, None).await,
+            Err(BlobError::NotHeld { .. } | BlobError::NotGranted { .. })
+        ));
+    }
+
+    pub(crate) async fn i317_a_nested_root_over_stream_keyed_children<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+        set_cap: SetCap<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i317").await;
+        set_cap(p.sa.as_ref(), 4096);
+        let stream = format!("i317-{run}");
+        let plain = write_self(&p.a, &p.owner, &stream, 60).await;
+        let root = seal(&p, &stream).await;
+        let view =
+            p.a.open_sealed_manifest_as(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert_eq!(view.version, 3, "I317: a nested root");
+        let page =
+            p.a.open_sealed_manifest_page_as(&root, 0, &p.key_a, None)
+                .await
+                .unwrap();
+        assert!(page.iter().all(|c| c.epoch == Some(0)), "I317: v4 children");
+        assert_eq!(
+            p.a.read_blob_as(&root, &p.key_a, None).await.unwrap(),
+            plain
+        );
+        let b0 = view.children[0].size;
+        assert_eq!(
+            p.a.read_blob_range_as(&root, &p.key_a, b0 - 3, b0 + 3, None)
+                .await
+                .unwrap(),
+            plain[b0 as usize - 3..=b0 as usize + 3].to_vec()
+        );
+        let r =
+            p.a.sealed_dag_readiness(&root, &p.key_a, None)
+                .await
+                .unwrap();
+        assert!(r.readable && r.chunk_keys == "stream_epoch", "I317: {r:?}");
+    }
+
+    pub(crate) async fn i318_the_batched_adopt_of_stream_keyed_chunks<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i318").await;
+        let stream = format!("i318-{run}");
+        let plain = write_self(&p.a, &p.owner, &stream, 9).await;
+        let root = seal(&p, &stream).await;
+        p.a.emit_pending_key_grants().await.unwrap();
+        for set in
+            p.sa.list_attestations_by(&p.key_a)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|x| x.attestation_type.starts_with("key_grant:"))
+        {
+            p.b.apply_replicated_key_grant(SignedKeyGrantSet { attestation: set })
+                .await
+                .expect("B applies A's sets");
+        }
+        let prov = BlobProvenance {
+            author_key_id: p.owner.clone(),
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            community_key_id: None,
+            epoch: None,
+            tier: CryptoTier::InvisibleEncrypted,
+            minter_key_id: Some(p.key_a.clone()),
+        };
+        p.b.adopt_sealed_blob(
+            &inline(p.sa.as_ref(), &root).await,
+            prov.clone(),
+            None,
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .unwrap();
+        let view =
+            p.b.open_sealed_manifest_as(&root, &p.key_b, None)
+                .await
+                .unwrap();
+        let mut bodies = Vec::new();
+        for c in &view.chunks {
+            bodies.push((
+                c.seq,
+                inline(p.sa.as_ref(), &hexsha(&c.sha256_hex)).await,
+                u64::from(c.size),
+            ));
+        }
+        let items: Vec<AdoptChunkItem<'_>> = bodies
+            .iter()
+            .map(|(seq, env, size)| AdoptChunkItem {
+                seq: *seq,
+                envelope: env,
+                plaintext_size: *size,
+            })
+            .collect();
+        let out =
+            p.b.adopt_sealed_chunks(&stream, &items, 0, prov.clone())
+                .await
+                .unwrap();
+        assert!(out.iter().all(Result::is_ok), "I318: {out:?}");
+        p.b.promote_adopted_manifest_to_dag(&root, &p.key_b, None)
+            .await
+            .expect("I318: promoted");
+        assert_eq!(
+            p.b.read_blob_as(&root, &p.key_b, None).await.unwrap(),
+            plain
+        );
+    }
+
+    pub(crate) async fn i319_one_sender_one_counter<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i319").await;
+        let stream = format!("i319-{run}");
+        write_self(&p.a, &p.owner, &stream, 2).await;
+        // A second append at counter 1 (already used by seq 1).
+        let dek = epoch_dek(p.sa.as_ref(), &stream, 0).await;
+        let envelope = crate::federation::at_rest_cascade::seal_aad_at_nonce(
+            &dek,
+            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 1, false).unwrap(),
+            &crate::federation::chunk_dag_cascade::chunk_aad(None, &stream, 7),
+            b"reuse",
+        )
+        .unwrap();
+        let e =
+            p.sa.put_blob_chunk_with_scope(
+                &stream,
+                7,
+                BlobBody::Inline(envelope.to_bytes()),
+                0,
+                5,
+                cohort_scope::SELF,
+                crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                None,
+                crate::federation::StreamClaim {
+                    community_key_id: Some(p.owner.clone()),
+                    owner_key_id: Some(p.key_a.clone()),
+                    stream_key: Some(StreamKeySlot {
+                        counter: 1,
+                        last: false,
+                    }),
+                },
+            )
+            .await
+            .expect_err("I319: a (DEK, nonce) pair is never reused");
+        assert!(
+            matches!(&e, BlobError::InvalidArgument(m)
+                if m.starts_with(crate::federation::blobs::STREAM_COUNTER_MOVED)),
+            "I319: {e:?}"
+        );
+        assert!(p.sa.stream_chunk_at(&stream, 7).await.unwrap().is_none());
+        assert_eq!(
+            p.sa.stream_dek_list(&stream).await.unwrap()[0].chunk_count,
+            2,
+            "I319: the refused append stepped nothing"
+        );
+        // A chunk at the right slot sealed under the right DEK, with the
+        // right counter and flag, whose nonce PREFIX is not the stream's: the
+        // DEK opens it, so only the reader's recompute refuses it.
+        let mut nonce =
+            crate::federation::stream_seal::stream_nonce(&dek, &stream, 0, 2, false).unwrap();
+        nonce[0] ^= 0xff;
+        let random = crate::federation::at_rest_cascade::seal_aad_at_nonce(
+            &dek,
+            nonce,
+            &crate::federation::chunk_dag_cascade::chunk_aad(None, &stream, 7),
+            b"random",
+        )
+        .unwrap();
+        p.sa.put_blob_chunk_with_scope(
+            &stream,
+            7,
+            BlobBody::Inline(random.to_bytes()),
+            0,
+            6,
+            cohort_scope::SELF,
+            crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+            None,
+            crate::federation::StreamClaim {
+                community_key_id: Some(p.owner.clone()),
+                owner_key_id: Some(p.key_a.clone()),
+                stream_key: Some(StreamKeySlot {
+                    counter: 2,
+                    last: false,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let e =
+            p.a.read_stream_chunk_as(&stream, 7, &p.key_a, None)
+                .await
+                .expect_err("I319: a nonce that is not the STREAM nonce");
+        assert!(
+            matches!(&e, BlobError::Backend(m) if m.contains("not the STREAM nonce")),
+            "I319: {e:?}"
+        );
+        // A foreign writer is refused by the stream's floor (I41).
+        let foreign =
+            p.sa.put_blob_chunk_with_scope(
+                &stream,
+                8,
+                BlobBody::Inline(envelope.to_bytes()),
+                0,
+                5,
+                cohort_scope::SELF,
+                crate::federation::StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                None,
+                crate::federation::StreamClaim {
+                    community_key_id: Some(p.owner.clone()),
+                    owner_key_id: Some(p.key_b.clone()),
+                    stream_key: Some(StreamKeySlot {
+                        counter: 3,
+                        last: false,
+                    }),
+                },
+            )
+            .await
+            .expect_err("I319: one sender per stream");
+        assert!(
+            matches!(foreign, BlobError::InvalidArgument(_)),
+            "{foreign:?}"
+        );
+    }
+
+    /// I319b (#969, #842) — a stream-keyed chunk reached by its sha alone:
+    /// the holder of its stream-epoch grant is AUTHORIZED (the whole-blob door
+    /// asks the chunk's stream position) and then fails the position-bound
+    /// open as a crypto-class error; a stranger is `NotGranted`.
+    pub(crate) async fn i319b_a_stream_chunk_by_sha_authorizes_by_its_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i319b").await;
+        let stream = format!("i319b-{run}");
+        write_self(&p.a, &p.owner, &stream, 2).await;
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        let sha = listing.chunks[0].chunk_sha;
+        assert!(
+            p.sa.get_at_rest_grant(&sha, &p.key_a)
+                .await
+                .unwrap()
+                .is_none(),
+            "I319b: the chunk carries no per-chunk grant (the premise)"
+        );
+        let authorized =
+            p.a.read_blob_as(&sha, &p.key_a, None)
+                .await
+                .expect_err("I319b: a chunk does not open by its sha alone");
+        assert!(
+            matches!(authorized, BlobError::SealDidNotOpen { .. }),
+            "I319b: the epoch-grant holder is authorized, then the open fails: {authorized:?}"
+        );
+        let stranger = format!("i319b-stranger-{run}");
+        let refused =
+            p.a.read_blob_as(&sha, &stranger, None)
+                .await
+                .expect_err("I319b: a stranger reads nothing");
+        assert!(
+            matches!(refused, BlobError::NotGranted { .. }),
+            "I319b: a stranger is NotGranted: {refused:?}"
+        );
+        // The position read is unchanged.
+        assert_eq!(
+            p.a.read_stream_chunk_as(&stream, 0, &p.key_a, None)
+                .await
+                .unwrap(),
+            segment(0)
+        );
+    }
+
+    /// I312 (unit) — the structure check over `(seq, epoch, slot)`.
+    pub(crate) fn i312_the_structure_check() {
+        let s = |counter, last| StreamKeySlot { counter, last };
+        let dag = [7u8; 32];
+        let whole = [
+            (0, 0, s(0, false)),
+            (1, 0, s(1, false)),
+            (2, 1, s(0, false)),
+            (3, 0, s(2, true)),
+            (4, 1, s(1, true)),
+        ];
+        check_stream_epoch_structure(&dag, &whole).expect("whole");
+        // The terminator dropped: truncated.
+        let e = check_stream_epoch_structure(&dag, &whole[..4]).unwrap_err();
+        assert!(e.to_string().contains("no last chunk"), "{e}");
+        // A middle chunk dropped: the counter skips.
+        let e = check_stream_epoch_structure(&dag, &[whole[0], whole[3]]).unwrap_err();
+        assert!(e.to_string().contains("counter"), "{e}");
+        // Something after the last.
+        let e = check_stream_epoch_structure(&dag, &[(0, 0, s(0, true)), (1, 0, s(1, false))])
+            .unwrap_err();
+        assert!(e.to_string().contains("after"), "{e}");
+        // Two lasts.
+        let e = check_stream_epoch_structure(&dag, &[(0, 0, s(0, true)), (1, 0, s(1, true))])
+            .unwrap_err();
+        assert!(e.to_string().contains("after"), "{e}");
+        // Reordered counters.
+        let e = check_stream_epoch_structure(
+            &dag,
+            &[(0, 0, s(1, false)), (1, 0, s(0, false)), (2, 0, s(2, true))],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("counter"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    #[test]
+    fn i312_the_structure_check() {
+        super::bodies::i312_the_structure_check();
+    }
+
+    /// The roll rule (pure): never below the stream's open epoch, past a
+    /// closed one, and the producer's higher label wins.
+    #[test]
+    fn i314_the_target_epoch() {
+        use crate::federation::chunk_dag_cascade::orchestrate::stream_target_epoch;
+        let rec = |epoch, closed| crate::federation::StreamDekRecord {
+            stream_id: "s".into(),
+            epoch,
+            owner_key_id: "o".into(),
+            cohort_scope: "self".into(),
+            group_key_id: "g".into(),
+            self_retention_wrap: String::new(),
+            chunk_count: 0,
+            closed,
+            terminated: false,
+        };
+        assert_eq!(stream_target_epoch(None, 4), 4);
+        assert_eq!(stream_target_epoch(Some(&rec(3, false)), 0), 3);
+        assert_eq!(stream_target_epoch(Some(&rec(3, true)), 0), 4);
+        assert_eq!(stream_target_epoch(Some(&rec(3, false)), 9), 9);
+        assert_eq!(stream_target_epoch(Some(&rec(3, true)), 9), 9);
+    }
+}
+
+#[cfg(test)]
+mod runners {
+    fn suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    }
+    macro_rules! runners {
+        ($modname:ident, $dsns:expr, $pick:expr, $cap:expr) => {
+            mod $modname {
+                use super::super::bodies;
+                #[tokio::test]
+                async fn i310() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i310_one_wrap_per_recipient_per_epoch(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                        1024,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i312() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i312_every_epoch_ends_in_one_terminator(&a, &b, &super::suffix(), $pick)
+                        .await
+                }
+                #[tokio::test]
+                async fn i313() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i313_the_second_device_needs_one_set_per_epoch(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i314() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i314_the_cap_rolls_the_epoch(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i314c() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i314c_readiness_over_a_legacy_dag(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i314d() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i314d_a_deny_rolls_the_epoch(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i397b() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i397b_a_reclass_into_the_audience_is_a_newcomer(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i397c() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i397c_a_reclass_out_of_the_audience_rolls(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i397d() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i397d_a_stale_reclass_changes_nothing(&a, &b, &super::suffix(), $pick)
+                        .await
+                }
+                #[tokio::test]
+                async fn i315() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i315_a_v52_stream_reads_forever(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i316() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i316_a_forwarder_holds_without_a_key(&a, &b, &super::suffix(), $pick)
+                        .await
+                }
+                #[tokio::test]
+                async fn i317() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i317_a_nested_root_over_stream_keyed_children(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                        $cap,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i318() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i318_the_batched_adopt_of_stream_keyed_chunks(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+                #[tokio::test]
+                async fn i319() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i319_one_sender_one_counter(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i319b() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i319b_a_stream_chunk_by_sha_authorizes_by_its_epoch(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
+                }
+            }
+        };
+    }
+    #[cfg(feature = "sqlite")]
+    runners!(
+        sqlite,
+        Some(("sqlite::memory:".to_owned(), "sqlite::memory:".to_owned())),
+        (|e: &crate::Engine| e.sqlite_backend().expect("sqlite").clone())
+            as crate::federation::epoch_minter_invariants::bodies::Pick<
+                crate::store::sqlite::SqliteBackend,
+            >,
+        (|b: &crate::store::sqlite::SqliteBackend, cap: usize| b.set_inline_bytes_cap(cap))
+            as crate::federation::nested_manifest_invariants::bodies::SetCap<
+                crate::store::sqlite::SqliteBackend,
+            >
+    );
+    #[cfg(feature = "postgres")]
+    runners!(
+        postgres,
+        (|| Some((crate::test_pg::empty_dsn()?, crate::test_pg::empty_dsn()?)))(),
+        (|e: &crate::Engine| e.postgres_backend().expect("postgres").clone())
+            as crate::federation::epoch_minter_invariants::bodies::Pick<
+                crate::store::postgres::PostgresBackend,
+            >,
+        (|b: &crate::store::postgres::PostgresBackend, cap: usize| b.set_inline_bytes_cap(cap))
+            as crate::federation::nested_manifest_invariants::bodies::SetCap<
+                crate::store::postgres::PostgresBackend,
+            >
+    );
+}

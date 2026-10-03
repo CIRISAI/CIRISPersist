@@ -73,6 +73,8 @@ pub mod bodies {
         ts::sign_family(
             &keys[0],
             Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.to_owned(),
                 family_name: "household".into(),
                 members: keys

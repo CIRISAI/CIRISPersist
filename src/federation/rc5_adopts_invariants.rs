@@ -46,6 +46,8 @@ pub mod bodies {
 
     fn infra_room(room: &str, protocol: &str, members: Vec<CommunityMember>) -> Community {
         Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: room.to_owned(),
             community_name: "trust root".into(),
             members,
@@ -1240,7 +1242,10 @@ pub mod bodies {
                     .await
                     .unwrap_or_else(|e| panic!("build change: {e}"));
                 let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
-                let mut signed = ts::sign_community(&h1, infra_room(&room, &protocol, members));
+                // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+                let mut next = infra_room(&room, &protocol, members);
+                next.prev_head_digest = prior.persist_row_hash.clone();
+                let mut signed = ts::sign_community(&h1, next);
                 signed.supersede_proof = Some(crate::federation::types::GroupSupersedeProof {
                     prior_persist_row_hash: prior.persist_row_hash,
                     change_envelope: change,
@@ -1521,7 +1526,7 @@ pub mod bodies {
         register(d, &author, &[it::PRIMITIVE]).await;
         let bind = |id: &str, sha: &[u8; 32]| {
             let env = serde_json::json!({
-                "id": id, "dimension": "file:doc:v1", "cohort_scope": "federation",
+                "id": id, "dimension": "file:v1", "cohort_scope": "federation",
                 "evidence_refs": [hex::encode(sha)]
             });
             let mut row = ts::bare_attestation(id, &author, &author, &env);
@@ -1648,7 +1653,7 @@ pub mod bodies {
             attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
                 serde_json::json!({
                     "id": uuid::Uuid::new_v4().to_string(),
-                    "dimension": "file:doc:v1",
+                    "dimension": "file:v1",
                     "references_attestation_id": format!("absent-{tag}"),
                     "withdrawal_reason": "CC 2.3",
                 }),
@@ -1896,7 +1901,10 @@ pub mod bodies {
             .await
             .unwrap_or_else(|e| panic!("build change: {e}"));
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
-        let mut signed = ts::sign_community(founders[0], infra_room(room, protocol, members));
+        // v53.0.0 (CC 3.2 T6) — the version names the head it succeeds.
+        let mut next = infra_room(room, protocol, members);
+        next.prev_head_digest = prior.persist_row_hash.clone();
+        let mut signed = ts::sign_community(founders[0], next);
         signed.supersede_proof = Some(crate::federation::types::GroupSupersedeProof {
             prior_persist_row_hash: prior.persist_row_hash,
             change_envelope: change,

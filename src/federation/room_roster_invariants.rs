@@ -56,6 +56,8 @@ pub mod bodies {
         b.put_community(ts::sign_community(
             &alice,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: room.clone(),
                 community_name: "keyless room".into(),
                 members: roster,
@@ -235,6 +237,8 @@ pub mod bodies {
         d.put_community(ts::sign_community(
             &alice,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: room.clone(),
                 community_name: "keyless room".into(),
                 members: roster,
@@ -611,6 +615,8 @@ pub mod bodies {
         d.put_community(ts::sign_community(
             &alice,
             Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: room.clone(),
                 community_name: "i166 room".into(),
                 members: vec![CommunityMember {

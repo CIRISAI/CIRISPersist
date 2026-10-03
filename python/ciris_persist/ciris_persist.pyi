@@ -945,7 +945,7 @@ class Engine:
         """(derived) deontic — CIRISPersist#851 (BLOB_REPLICATION.md §20.3) — publish this node's own content-only occurrence under identity_key_id (its owner), signed with the L..."""
 
     def put_accord_decision_json(self, payload_json: str) -> None:
-        """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision>, "steward_signatures": <obj|null> }. Immutable (M2)."""
+        """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision> }. Immutable (M2). v53.0.0 (CC 4.2.6 rc7): a non-null s..."""
 
     def put_accord_participation_json(self, payload_json: str) -> None:
         """(derived) deontic — #302 — admit an accord_participation. payload_json = { "participation": <AccordParticipation>, "standing_roster": [<ThresholdMember>...] }. Verify-..."""
@@ -1833,6 +1833,9 @@ class Engine:
     def provenance_chain(self, key_id: str) -> str:
         """(derived) testimonial — Verify-consumable provenance read (CIRISVerify WS-4)."""
 
+    def put_custody_ack(self, at_rest_sha256_hex: str, state: str, cohort_scope: str | None = None, cohort_target: str | None = None, aad_b64: str | None = None) -> str:
+        """(derived) testimonial — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — this node's custody report for one blob: state is "here" or "none". here needs the bytes on this no..."""
+
     def put_delivery_receipt(self, receipt_json: str) -> None:
         """(derived) testimonial — v4.1 (CIRISPersist#142, Cut C4, CEG §10.5.4) — store a subscriber delivery receipt (receipt_json is a serialized DeliveryReceipt). Runs the JOIN-ag..."""
 
@@ -2206,11 +2209,17 @@ class Engine:
     def cross_agent_divergence(self, deployment_domain: str, window_json: str, metric: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) epistemic — Cross-agent divergence z-scores. metric is one of "csdma_plausibility", "dsdma_domain_alignment", "idma_k_eff", "idma_correlation_risk", "conscienc..."""
 
+    def custody_view_json(self, at_rest_sha256_hex: str, viewer_key_id: str, stream_id: str | None = None) -> str:
+        """(derived) epistemic — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — the custody view of one blob as JSON: {sha256_hex, devices: [{device_key_id, state, reported_at?, r..."""
+
     def describe_crossing(self, attestation_id: str, scope: str, cohort_target: str | None, basis: str) -> str:
         """(derived) epistemic — v39.0.0 — the nine-axis description a truthful caller would state for attestation_id at scope, as JSON: the starting point for enter_mesh / widen_a..."""
 
     def disk_pressure_state(self) -> dict[str, Any]:
         """(derived) epistemic — v6.8.0 (CIRISPersist#149) — live disk-pressure snapshot for monitoring. Re-polls the (injectable) free-bytes source, returns a dict: {free_bytes, t..."""
+
+    def durability_deficit_json(self, at_rest_sha256_hex: str, viewer_key_id: str, stream_id: str | None = None) -> str:
+        """(derived) epistemic — v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — the durability deficit of one blob for viewer_key_id as JSON: {sha256_hex, audience: {kind: nodes|everyone..."""
 
     def get_repository_statistics(self, filter_json: str, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) epistemic — Corpus-shape rollup for a window — distinct trace counts by task_class, QA language / question_num, agent name / version, primary model, deployment..."""
@@ -3181,6 +3190,12 @@ class Engine:
 
     def revocations_for(self, revoked_key_id: str) -> str:
         """(derived) empirical — Federation directory: list revocations targeting revoked_key_id."""
+
+    def row_type_report_json(self) -> str:
+        """(derived) empirical — v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — the closed row-type slot's report: {enforcement, held_unregistered: [{attestation_type, type_stem, count..."""
+
+    def sealed_dag_readiness_json(self, at_rest_sha256_hex: str, viewer_key_id: str, caller_aad_b64: str | None = None) -> str:
+        """(derived) empirical — v53.0.0 (CIRISPersist#969) — the readiness door: can viewer_key_id read this sealed DAG on this node now. Returns JSON {"sha256_hex", "chunk_keys":..."""
 
     def secrets_get_access_logs(self, secret_uuid: str | None, limit: int) -> str:
         """(derived) empirical — v0.6.1 — Audit-log query. secret_uuid=None returns the global tail. Returns JSON array of AccessLogEntry. [build-conditional: #[cfg(feature = "secrets")]]"""

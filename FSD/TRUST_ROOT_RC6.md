@@ -47,7 +47,7 @@ Storage: **V159** `federation_lineage_head_cosigns` on both dialects — PK `(li
 `trust:charter:v1` (the self-loop `delegates_to` with `infra:` scope) gains two typed envelope members, carried in the scrub-signed bytes so changing either is a charter re-scrub by the conferring roster, refused as a plain config edit:
 - `attach_window_secs: u64` — the freshness window for attaching;
 - `witness_cadence_secs: u64` — the re-commit cadence (T6 §3);
-- `witness_quorum: u32` (optional, default 1) — how many independent witnesses make a head "witnessed". The rulings say "the witness quorum" without a number; persist's default is ONE independent witness, charter-overridable, stated here so it is not re-asked.
+- `witness_quorum: u32` (optional) — how many independent witnesses make a head "witnessed". **Absent or `0` is witnessed mode off (§8, CIRISPersist#973); persist substitutes no default.** A value of `1` is refused at charter admission.
 
 They are typed members of `EnvelopeCore` (`paths::ATTACH_WINDOW_SECS`, `paths::WITNESS_CADENCE_SECS`, `paths::WITNESS_QUORUM`), so **`ENVELOPE_VOCABULARY_SHA256` re-pins** (the I120 discipline: the test that asserts the pin stays; the CHANGELOG names old and new). Shipped defaults for `ciris-canonical` / `humanity-accord`: `attach_window_secs = 604800` (7 d), `witness_cadence_secs = 86400` (24 h) — CC 5.3.4. A charter that declares no `attach_window_secs` makes its root attachable only through an out-of-band anchor naming a specific head (T5).
 
@@ -135,7 +135,7 @@ Domain label dropped (STH cosign accepted as lineage cosign); founder-witness ad
 - A v50 node adopts unwitnessed heads first-seen-wins; a v51 node holding a witnessed head refuses a v50 peer's unwitnessed competitor. Until the first witness cosigns a lineage, v51 behaves as v50 (`ever_witnessed`).
 - Server#693 serves the cosign route and the head beside the bundle; Edge attaches through `pin_trust_from_bundle_response`; the canonical node re-commits both lineages at least once per cadence (Server).
 - Residual: the witness set's own standing is judged by `identity_type` and non-foundership only; a witness's revocation un-counts its cosigns from its `revoked_after` (every instant keyed, `valid_until`-bounded).
-- Residual: `witness_quorum` default 1 is persist's choice pending CC text; a charter may raise it.
+- `witness_quorum`: superseded by §8 — silence and `0` are witnessed mode off; there is no default.
 
 ### 6.1 Mutation round (v51.0.0, on the committed tree; lane = rc6 + v51 + I190 + media + #929 witnesses on memory, sqlite, postgres)
 
@@ -189,3 +189,132 @@ Lane: rc6 + v51 + I190 + lineage_witness + I34b, on memory, sqlite and postgres.
 | R16b | the window addition is unchecked | KILLED | I194 (2^53 − 1 s window) |
 
 Two first-draft witnesses were measuring a neighbouring fact, and both were rebuilt before their mutant was killed. I125b read the attested column, which the projections never write; it now reads the replication peer set. I194 used a `u64::MAX` window, which canonicalization turns into a float; it now uses 2^53 − 1. A third lane stall came from the harness (`empty_dsn` never reaped) and was fixed there.
+
+## 8. Witnessed mode off (CIRISPersist#973; CC 3.2 T6, operator ruling 2026-10-01)
+
+CC 3.2 T6: "A charter MAY declare `witness_quorum: 0` with no `witnesses[]`: the lineage's **witnessed mode is off**. Then a head counts as current when it carries a valid founder-quorum signature and descends by `prev_head_digest` from a head the consumer holds out of band … and T4a's attach gate reads as *attach only through an out-of-band anchor* (T5): no head is fresh by cosignature, so none is attachable by cosignature." And: "**A charter silent on `witness_quorum` is in witnessed mode off**, exactly as one declaring `0` … a substrate MUST NOT substitute an internal default." And: "A non-zero `witness_quorum` below ⌊n/2⌋ + 1 stays refused."
+
+As built:
+
+- `lineage_witness::declared_witness_quorum` is the one reading of the charter member: absent → `0`. `DEFAULT_WITNESS_QUORUM` is removed. `witnessed()` is false at quorum `0`.
+- `witnessed_head` returns "never witnessed" (`judged: None`, no tail, no equivocation) when the mode is off, whatever cosigns are held. The head is the founders' latest admitted version, as before rc6. Cosigns are still admitted and stored by the door as evidence.
+- `check_attach_freshness` in off mode: an edge naming the head this node holds attaches (the T5 anchor; the window is not applied, since no cosignature exists to be fresh); an edge naming another head is refused; an edge naming no head is refused when the charter declares a window, and admitted when it declares none (the pre-rc6 edge shape under a pre-rc6 charter, unchanged — the gate re-runs wherever an edge is put, so refusing that shape would refuse edges already in the field).
+- `RootWitnessView` gains `held_head`; `quorum` is `0` in off mode.
+- Charter admission (`trust_root::check_charter_witness_quorum`, both charter doors) refuses `witness_quorum: 1` naming `charter_witness_quorum_below_majority`.
+
+**In the field.** A lineage whose charter is silent and for which no cosign is held (every lineage in production today) reads the same before and after: it was "never witnessed, judged as before rc6", and it still is. The reading changes only where a silent charter met a held cosign: one cosign used to engage witnessed mode (the default of 1) and no longer does. An anchor attach naming the held head used to be refused as unwitnessed under a silent charter and is now admitted.
+
+### Only a new acceptance edge is gated (T4a, rc6 5cceadb)
+
+The attach gate runs on an edge's FIRST admission. First admission is decided structurally: the edge's id names no row this node holds with the same attester, root and signed envelope. A held edge re-put or replicated back is not re-judged, with or without `attached_head_digest`; it is read as naming the head the node held when it was admitted. A held id offered with a different envelope is a new edge.
+
+A new edge that names itself `trust:accepts:v1` names its head in every mode: the witnessed head while witnessed mode is on, the held (anchored) head while it is off. Without one it is refused `trust_root_head_unnamed`. `attach_head_for(dir, root, now)` returns the head to name.
+
+A row with no job label is not an acceptance edge. See "An unlabelled row" below, which replaces the earlier reading (admitted with no head under a charter with no window, refused under one that declares a window).
+
+### An unlabelled row is no charter and no acceptance edge (T4a, rc6 22ea349, "bundle only")
+
+CC 3.2 T4a: "A new row with no `trust:{job}` label gives no acceptance and is no charter … One exception stands, as a stop-gap until the re-mint: an unlabelled row that is a member of the pinned GenesisBundle (T5, `bundle_fingerprint`) keeps the reading its direction gives it … Unlabelled rows a node already holds keep their reading under T4."
+
+As built:
+
+- **Three ways a `delegates_to` is read by direction.** It names a `trust:{job}` label (the label decides); it is a row of the pinned bundle (`genesis::is_pinned_bundle_row`: baked id, signer, subject, type and canonical envelope all equal); or the node held it when the rule arrived. Every other unlabelled row is stored and stays a delegation for conferral, duties and ownership, and is never a charter or an acceptance edge. `trust_root::direction_denied_ids` is the one place this is decided.
+- **Held is a recorded fact.** V167 creates `federation_trust_direction_held` and fills it once, at upgrade, with every unlabelled `delegates_to` in `federation_attestations`. No door writes to it afterwards, so a row put, replicated or imported after the upgrade is new. A signer-chosen instant is not consulted. `trust_direction_held_among(ids)` is the read (all backends, capsule op, directory double).
+- **Readers.** `trusted_roots_of`, `trust_root_valid` (edge and charter), `charter_members_for`. `transit_candidate_roots` still enumerates; both of its callers judge each candidate with `trust_root_valid`. Conferral readers are unchanged.
+- **The attach gate** returns early for a new unlabelled row outside the bundle: there is no acceptance edge to gate. Bundle rows keep the earlier unlabelled path.
+- **The envelope a host writes.** `acceptance_edge_envelope(dir, root, scope, now)` (Engine: `trust_acceptance_envelope`) returns `{"dimension": "trust:accepts:v1", "scope": [...], "attached_head_digest": ...}`.
+
+Consequences to plan for:
+
+- A node that upgrades reads its held unlabelled rows as before. A fresh peer receiving those rows by replication does not. Hosts re-author their acceptance edges labelled, with a head.
+- A portable bundle minted before the labels, imported on a fresh node, yields no charter. The shipped bundle is the one exception, by membership.
+- The exception ends with the re-mint: once the baked rows carry labels, `is_pinned_bundle_row` has no unlabelled row to match and can be removed.
+
+Witnesses: I366–I371 (CHANGELOG `[53.0.0]`, with the mutation table).
+
+Witnesses: I356 (a new headless edge refused by name in off mode, in witnessed mode, with and without a window; the unlabeled row's reading), I357 (a held headless edge re-put, re-put under a later windowed charter, and replicated back), I358 (a changed envelope under a held id is new), I359 (a new edge naming the held head attaches in off mode).
+
+### A peer does not re-judge another node's attach (T4a)
+
+T4a is "a write-side gate" that "runs on the edge's first admission only"; "once the edge is written, T4 governs without exception". The attaching node's own write is that first admission. `AttachDoor` carries which door an edge arrives through:
+
+| door | origins | what runs |
+|---|---|---|
+| `Author` | `WriteOrigin::Authored`, the local-tier write | the full gate: the named head is the held (off) or witnessed (on) head, inside the window |
+| `Replicated` | `WriteOrigin::Wire`, `WriteOrigin::Sync` | the shape rule only: a new labelled edge names a head |
+
+A peer whose head is ahead of or behind the head an edge names, or that has not witnessed it, admits the replicated edge and reads its author as attached. A node therefore never re-authors its edge because the head advanced. A host writes its own edge through the authored door. Witnesses I372–I375.
+
+### Not yet built
+
+- The witness directory: `witnesses[]` inside the charter, a head's cosignatures judged against its PARENT's directory, and the majority check `witness_quorum = ⌊n/2⌋ + 1` over that directory's size. Until it exists a non-zero quorum counts any registered key typed `witness` that is not a founder's person (§3.2), and only the value `1` is refused at admission. Tracked on CIRISPersist#974.
+- Descent from an out-of-band head by `prev_head_digest`: persist's chain is the stored version lineage each put door verified from the accord birth; the `lineage_head` object of CC 3.2 T6 is not a separate stored object.
+
+Invariants I340–I344 (memory, sqlite, postgres): a silent charter is off; an explicit `0` is the same state; off mode attaches by anchor only; an explicit quorum of 2 still witnesses; a quorum of 1 is refused at the charter.
+
+## 9. The community boot leg and the re-bake (CIRISPersist#973)
+
+**Boot leg.** After the delegation plane, boot seeds the baked `ciris-canonical` birth record through the signed `put_community` door (`genesis::seed_canonical_community`). v53.0.0 (CC rc7, T5): the birth is a member of the pinned bundle's `attestations` (after every delegation row, as `{"community": …}`), never a file beside it; `canonical_community_asset()` reads it from the bundle, and a version-2 bundle carries none, so the leg is inert until the final ceremony's bundle is baked.
+
+| state | what the leg does | reported |
+|---|---|---|
+| no asset baked | nothing: no read, no write | not evaluated |
+| id not held | `put_community` (every gate runs) | `Installed`, or `Absent(community)` if the door refuses |
+| the baked birth is held | nothing | `AlreadyHeld` |
+| a different record is held | nothing; the held record stays | `HeldDiffers` |
+
+The leg's fault is only ever `Absent` (the door refused: a node awaiting its ceremony) or `Unreadable` (the directory could not be asked). It is never `Divergent`, so it cannot stop a boot. `GenesisLeg::Community` is reported by `genesis_posture` once an asset is baked and is not required by `require_constitutional_root`.
+
+**Re-bake on an upgrading node.** The three delegation ids are kept. A re-minted row replaces the stored one only when it is a verifiable holder statement with a STRICTLY newer signed `asserted_at` (#665). Rules the ceremony must follow:
+- stamp instants strictly newer than the stored rows: an equal instant with different content is not a successor and the stored row stays;
+- do not stamp instants ahead of the fleet's clocks: a row more than 300 s in the future is refused at the write door;
+- a third co-scrub is admitted and stored;
+- the canonical server record, if unchanged, must be byte-identical (`Unchanged`); if it changes it needs a strictly newer `valid_from`.
+
+The `humanity-accord` family row needs nothing: the seats and the protocol are unchanged.
+
+Witnesses I345–I349 (memory, sqlite, postgres). Not yet built: the software ceremony minter for a dry run, and a boot test over a baked asset (it reads the compiled file).
+
+### 9.1 Posture after a refused or older bake
+
+The boot seed and the live posture leg (`verify_delegation_plane_seeded`, read by `genesis_posture` without the seed) must give one answer for one state. They did not: the leg compared the stored row against the RAW compiled-in row, which is not canonical at rest and so classified as legacy, and every verified holder statement that differed from the bake read as its successor. A node whose re-mint was refused at the door kept reporting `Entrenched` on the previous root.
+
+The rule, by relation of the stored row to the compiled-in one:
+
+- identical, or a verified holder statement strictly newer: sound.
+- a verified holder statement that is older, or of the same vintage with different content: **Absent**. The node boots, the banner is raised, and the detail says the compiled-in root was not adopted. Not `Divergent`: that refuses to boot and is reserved for a row that is not a verifiable holder statement.
+- an old binary on a newer database (the bake older than stored): the stored rows are never downgraded and the posture is sound.
+
+For the re-mint ceremony this means: a bake stamped ahead of a node's clock by more than the skew bound leaves that node on its previous root, visibly pre-genesis on the delegation leg, until its clock passes the instant and it is rebooted. Witnesses I360–I365.
+
+**The typed reason (requested by CIRISServer).** A host must not read the detail sentence to tell these states apart. `GenesisFault::Absent` and `GenesisPosture::PreGenesis` carry `reason: AbsentReason`:
+
+- `NotSeeded`: the leg is not installed (a node awaiting its ceremony). A posture serialized before the field existed reads as this.
+- `BakeNotAdopted { why, held_root_in_force }`: this binary's root was not adopted. `why` is `Refused { refusal }` (the boot seed offered the bake and a door refused it; `refusal` is the error's stable `kind()` token), `StoredOlder` (the live posture: a verified older row is held and the bake is not installed) or `EqualVintage` (a tie). `held_root_in_force` is true when the held row is a verified accord-holder statement, so the previous root still stands.
+
+The boot seed reports `Refused`, because only it sees the refusal. The live posture reports `StoredOlder` or `EqualVintage`, because it sees the rows and not the door. `GenesisPosture::held_root_in_force()` answers the one question a host asks before telling an operator that no trust root is configured, and `banner()` says "ROOT NOT ADOPTED … the previous root stays in force" in that state.
+
+Wire shape (the `state` tokens are unchanged; `reason` is additive):
+
+```json
+{"state":"pre_genesis","leg":"delegation","detail":"…",
+ "reason":{"kind":"bake_not_adopted","why":{"cause":"stored_older"},"held_root_in_force":true}}
+```
+
+`why` is one of `{"cause":"refused","refusal":"<token>"}`, `{"cause":"stored_older"}`, `{"cause":"equal_vintage"}`; a plain pre-ceremony node carries `"reason":{"kind":"not_seeded"}`.
+
+## 10. The dry run: software ceremony, boot seam, outputs verifier (CIRISPersist#973)
+
+**Minter.** `genesis::mint_test_ceremony(ed_seeds[3], node_seed, produced_at)` (feature `test-anchor`) returns the anchor block (unchanged from `mint_test_anchor_block`), the bundle and the `ciris-canonical` birth, signed by the three software holders the block defines. The charter carries `witness_quorum: 0`. A re-mint is the same call with a later `produced_at`: ids kept, instants forward.
+
+**Dry-run order for a host.**
+1. Mint (or have the host's own ceremony routes produce the two files with the software holders' seeds).
+2. Arm the block (`CIRIS_TEST_TRUST_ROOT*`, `CIRIS_TESTING_MODE=true`).
+3. `genesis::install_test_ceremony_outputs_json(bundle_json, Some(community_json))`.
+4. Construct the Engine. The boot seed runs anchor → family → serve nodes → delegation plane → community against the installed artifacts; `genesis_posture` reports every leg.
+5. `genesis::verify_ceremony_outputs(bundle_json, community_json)` is the same check the real bake will run on the real files.
+
+**The real bake.** Before the ceremony's bundle replaces `canonical_seed.json`, `verify_ceremony_outputs` must return `Ok` on a build whose accord roster is the production one. It applies the bundle — its delegation plane, the accord family record and the birth it carries — through the ordinary doors on an in-memory directory, so a file the boot path would refuse is refused here, by stage.
+
+**Not built:** a pyo3 door for the minter (the block minter has none); a postgres run of I352–I355 (the bodies are backend-generic; the boot, I351, runs on all three).
+

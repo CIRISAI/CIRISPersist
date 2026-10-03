@@ -159,6 +159,11 @@ pub struct SealStreamScopedResult {
     /// written across an occurrence change). Each is a content-axis key-grant
     /// set the caller emits, as it emits [`Self::key_grant_emission`].
     pub chunk_key_grant_emissions: Vec<crate::federation::key_grant::KeyGrantAxis>,
+    /// v53.0.0 (CIRISPersist#969) — the stream epochs the seal wrapped to a
+    /// recipient that lacked them: one stream-axis set per such epoch, which
+    /// the caller emits beside [`Self::key_grant_emission`]. A stream-keyed
+    /// DAG's [`Self::chunk_key_grant_emissions`] is empty.
+    pub stream_key_grant_emissions: Vec<crate::federation::key_grant::KeyGrantAxis>,
 }
 
 impl SealStreamScopedResult {
@@ -176,7 +181,7 @@ impl SealStreamScopedResult {
 pub mod orchestrate {
     use super::*;
     use crate::federation::at_rest_cascade::orchestrate::{
-        authorize_viewer_by_tier, grant_dek_to_cohort, grant_deks_to_cohort, read_for_viewer_sealed,
+        authorize_viewer_by_tier, grant_dek_to_cohort, read_for_viewer_sealed,
     };
     use crate::federation::at_rest_cascade::{
         fresh_dek, resolve_write_tier, seal, sealed_plaintext_len, unwrap_dek_for_persist,
@@ -255,6 +260,7 @@ pub mod orchestrate {
         let claim = || StreamClaim {
             community_key_id: community_key_id.map(str::to_owned),
             owner_key_id: Some(owner_key_id.clone()),
+            stream_key: None,
         };
         // §11.2 (5) / I21 — the matcher sees the PLAINTEXT, once, before
         // anything is sealed; the chunk floor never screens.
@@ -296,6 +302,30 @@ pub mod orchestrate {
                          in the community_key_id argument"
                     ))
                 })?;
+                // v53.0.0 (#969, CC 5.3.3.1) — a stream is sealed under ONE
+                // DEK per (stream_id, epoch) with the STREAM nonce. Only a
+                // stream that already holds per-chunk-keyed chunks (written
+                // before #969: chunks and no stream DEK) keeps per-chunk DEKs
+                // to its seal — one DAG never mixes the two.
+                let state = backend.stream_key_state(stream_id).await?;
+                if state.latest.is_some() || !state.has_chunks {
+                    return put_stream_keyed_chunk(
+                        backend,
+                        StreamWrite {
+                            cohort_scope,
+                            group_key_id: owner,
+                            writer_key_id: &owner_key_id,
+                            community_key_id,
+                            stream_id,
+                            epoch,
+                        },
+                        seq,
+                        plaintext,
+                        aad,
+                        state,
+                    )
+                    .await;
+                }
                 let dek = fresh_dek().map_err(map_at_rest_err)?;
                 let envelope = seal(&dek, plaintext, Some(&bound_aad)).map_err(map_at_rest_err)?;
                 let sha = backend
@@ -398,6 +428,520 @@ pub mod orchestrate {
         }
     }
 
+    // ── the stream-epoch DEK (v53.0.0, CIRISPersist#969) ────────────────
+
+    /// How many times a stream-keyed append re-reads the stream's key state
+    /// and re-seals: a lost counter race, a roll (cap or removal) between
+    /// the read and the floor. Each pass either stores or moves the state
+    /// forward, so the bound is never reached by a single writer.
+    const STREAM_SEAL_ATTEMPTS: usize = 8;
+
+    /// The fixed facts of one stream-keyed append (or terminator).
+    #[derive(Clone, Copy)]
+    struct StreamWrite<'a> {
+        cohort_scope: &'a str,
+        group_key_id: &'a str,
+        writer_key_id: &'a str,
+        community_key_id: Option<&'a str>,
+        stream_id: &'a str,
+        epoch: u64,
+    }
+
+    /// v53.0.0 (#969) — the epoch a stream-keyed append seals under, given
+    /// the stream's newest DEK row: the producer's epoch label, never below
+    /// the stream's current epoch, and past it once that epoch is closed (a
+    /// forced roll at the nonce cap, a removal roll, or a terminator). Pure.
+    pub(crate) fn stream_target_epoch(
+        latest: Option<&crate::federation::StreamDekRecord>,
+        producer_epoch: u64,
+    ) -> u64 {
+        match latest {
+            None => producer_epoch,
+            Some(l) if l.closed || l.terminated => producer_epoch.max(l.epoch.saturating_add(1)),
+            Some(l) => producer_epoch.max(l.epoch),
+        }
+    }
+
+    /// v53.0.0 (#969) — the epoch's DEK row: the stream's newest when it is
+    /// the target, else minted (a fresh DEK, self-retained under the content
+    /// master) — TERMINATING the previous epoch first (the producer rolled
+    /// to a higher label), so a stream has ONE open epoch and every epoch it
+    /// leaves carries its `last`. Two racing first chunks resolve to one row
+    /// (`stream_dek_insert` returns the stored row).
+    async fn ensure_stream_epoch<B>(
+        backend: &B,
+        w: StreamWrite<'_>,
+        latest: Option<crate::federation::StreamDekRecord>,
+        aad: Option<&[u8]>,
+    ) -> Result<crate::federation::StreamDekRecord, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let target = stream_target_epoch(latest.as_ref(), w.epoch);
+        if let Some(l) = latest {
+            if l.epoch == target {
+                return Ok(l);
+            }
+            if !l.terminated {
+                write_terminator(backend, w, l, aad).await?;
+            }
+        }
+        let dek = fresh_dek().map_err(map_at_rest_err)?;
+        let content_master = backend.load_or_init_content_master().await?;
+        let self_retention_wrap =
+            crate::federation::at_rest_cascade::wrap_dek_for_persist(&content_master, &dek)
+                .map_err(map_at_rest_err)?;
+        backend
+            .stream_dek_insert(&crate::federation::StreamDekRecord {
+                stream_id: w.stream_id.to_owned(),
+                epoch: target,
+                owner_key_id: w.writer_key_id.to_owned(),
+                cohort_scope: w.cohort_scope.to_owned(),
+                group_key_id: w.group_key_id.to_owned(),
+                self_retention_wrap,
+                chunk_count: 0,
+                closed: false,
+                terminated: false,
+            })
+            .await
+    }
+
+    /// v53.0.0 (#969) — recover a stream epoch's DEK from its row's
+    /// self-retention wrap (this node sealed it).
+    async fn stream_epoch_dek<B>(
+        backend: &B,
+        rec: &crate::federation::StreamDekRecord,
+    ) -> Result<[u8; 32], BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let content_master = backend.load_or_init_content_master().await?;
+        unwrap_dek_for_persist(&content_master, &rec.self_retention_wrap).map_err(map_at_rest_err)
+    }
+
+    /// v53.0.0 (#969) — wrap the epoch's DEK to every target lacking a wrap
+    /// under the stream's owner. Returns the recipients written.
+    async fn grant_stream_epoch<B>(
+        backend: &B,
+        rec: &crate::federation::StreamDekRecord,
+        dek: &[u8; 32],
+        targets: &[(String, crate::federation::types::EncryptionPubkeys)],
+        held: &std::collections::HashSet<String>,
+    ) -> Result<usize, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let mut wraps = Vec::new();
+        for (occ, k) in targets {
+            if held.contains(occ) {
+                continue;
+            }
+            wraps.push(crate::federation::GrantWrap {
+                recipient_key_id: occ.clone(),
+                wrap_algorithm: crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2.to_owned(),
+                wrapped_dek: crate::federation::at_rest_cascade::wrap_dek_v2(
+                    &k.x25519_base64,
+                    &k.ml_kem_768_base64,
+                    dek,
+                )
+                .map_err(map_at_rest_err)?,
+            });
+        }
+        if wraps.is_empty() {
+            return Ok(0);
+        }
+        backend
+            .stream_dek_put_grants(
+                &rec.stream_id,
+                rec.epoch,
+                &rec.owner_key_id,
+                &rec.cohort_scope,
+                &wraps,
+            )
+            .await?;
+        Ok(wraps.len())
+    }
+
+    /// v53.0.0 (#969) — seal one chunk under the stream epoch's DEK with the
+    /// STREAM nonce `(counter, last)` and the position-bound AAD.
+    fn seal_stream_chunk(
+        dek: &[u8; 32],
+        stream_id: &str,
+        epoch: u64,
+        slot: crate::federation::StreamKeySlot,
+        plaintext: &[u8],
+        bound_aad: &[u8],
+    ) -> Result<AtRestEnvelope, BlobError> {
+        let nonce = crate::federation::stream_seal::stream_nonce(
+            dek,
+            stream_id,
+            epoch,
+            slot.counter,
+            slot.last,
+        )
+        .map_err(|e| BlobError::Backend(format!("stream nonce: {e}")))?;
+        crate::federation::at_rest_cascade::seal_aad_at_nonce(dek, nonce, bound_aad, plaintext)
+            .map_err(map_at_rest_err)
+    }
+
+    /// v53.0.0 (#969, CC 5.3.3.1) — open a stream-keyed chunk: read
+    /// `(counter, last)` from the stored nonce, require the stored nonce to
+    /// BE `stream_nonce(dek, stream_id, epoch, counter, last)` (a prefix that
+    /// does not belong to this DEK, stream and epoch fails closed before the
+    /// open), then open under the position-bound AAD. Returns the plaintext
+    /// and the slot, for the caller's per-epoch structure check.
+    pub(crate) fn open_stream_keyed_chunk(
+        dek: &[u8; 32],
+        stream_id: &str,
+        epoch: u64,
+        chunk_sha: &[u8; 32],
+        envelope: &AtRestEnvelope,
+        bound_aad: &[u8],
+    ) -> Result<(Vec<u8>, crate::federation::StreamKeySlot), BlobError> {
+        let refuse = |why: &str| {
+            BlobError::Backend(format!(
+                "stream chunk {} {why} (CC 5.3.3.1; CIRISPersist#969)",
+                hex::encode(chunk_sha)
+            ))
+        };
+        let (counter, last) = crate::federation::stream_seal::parse_nonce(&envelope.nonce)
+            .ok_or_else(|| refuse("carries a nonce whose flag byte is not a STREAM flag"))?;
+        let expect =
+            crate::federation::stream_seal::stream_nonce(dek, stream_id, epoch, counter, last)
+                .map_err(|e| BlobError::Backend(format!("stream nonce: {e}")))?;
+        if expect != envelope.nonce {
+            return Err(refuse(
+                "carries a nonce that is not the STREAM nonce of its stream, epoch and DEK",
+            ));
+        }
+        // #842 — the authorized viewer's open failing under the data presented
+        // is the typed crypto-class refusal, as on every other sealed row.
+        let plain = crate::federation::at_rest_cascade::open_aad(dek, Some(bound_aad), envelope)
+            .map_err(crate::federation::at_rest_cascade::open_err(
+                chunk_sha,
+                |e| BlobError::Backend(format!("stream chunk did not open ({e})")),
+            ))?;
+        Ok((plain, crate::federation::StreamKeySlot { counter, last }))
+    }
+
+    /// v53.0.0 (#969) — the chunk door's stream-keyed arm. Per pass: the
+    /// epoch's DEK row (minted on its first chunk), the ONE recipient set
+    /// resolved now, a REMOVAL roll if a recipient granted on the epoch has
+    /// left it (forward secrecy keeps CC 5.1's shape: the next chunk is under
+    /// a DEK the removed party never held), a CAP roll if only the
+    /// terminator's slot is left, a wrap to every new recipient (the
+    /// stream-axis set is emitted then — at the epoch's first chunk and when
+    /// the set grows, never per chunk), the seal at the V165 counter, and
+    /// the floor, which re-checks the counter and the epoch in the insert's
+    /// own transaction. A lost race re-reads and re-seals.
+    async fn put_stream_keyed_chunk<B>(
+        backend: &B,
+        w: StreamWrite<'_>,
+        seq: u64,
+        plaintext: &[u8],
+        aad: Option<&[u8]>,
+        first_state: crate::federation::StreamKeyState,
+    ) -> Result<PutChunkScopedResult, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        // The terminators' positions are persist's (`terminator_seq`); a
+        // producer's data chunk stays below them.
+        if seq >= TERMINATOR_SEQ_BASE {
+            return Err(BlobError::InvalidArgument(format!(
+                "put_blob_chunk_scoped: seq {seq} is in the range persist reserves for epoch \
+                 terminators (≥ {TERMINATOR_SEQ_BASE}); a producer's seq stays below it \
+                 (CIRISPersist#969)"
+            )));
+        }
+        let bound_aad = chunk_aad(aad, w.stream_id, seq);
+        let bound_aad = bound_aad.as_slice();
+        let plaintext_size = plaintext.len() as u64;
+        let mut state = Some(first_state);
+        for _ in 0..STREAM_SEAL_ATTEMPTS {
+            let latest = match state.take() {
+                Some(s) => s.latest,
+                None => backend.stream_key_state(w.stream_id).await?.latest,
+            };
+            let rec = ensure_stream_epoch(backend, w, latest, aad).await?;
+            // The terminator's slot is the cap's last: a data chunk that
+            // would take it rolls the epoch instead (CEG §10.5.3) — the
+            // outgoing epoch's terminator takes that slot now.
+            if rec.chunk_count.saturating_add(1) >= crate::federation::blobs::MAX_CHUNKS_PER_EPOCH {
+                write_terminator(backend, w, rec, aad).await?;
+                continue;
+            }
+            let (targets, report) =
+                crate::federation::at_rest_cascade::orchestrate::resolve_cohort_targets(
+                    backend,
+                    w.cohort_scope,
+                    w.group_key_id,
+                )
+                .await?;
+            let held: std::collections::HashSet<String> = backend
+                .stream_dek_grants(w.stream_id, rec.epoch, &rec.owner_key_id)
+                .await?
+                .into_iter()
+                .map(|g| g.recipient_key_id)
+                .collect();
+            let current: std::collections::HashSet<&str> =
+                targets.iter().map(|(k, _)| k.as_str()).collect();
+            if held.iter().any(|r| !current.contains(r.as_str())) {
+                // A recipient the epoch was granted to is no longer in the
+                // cohort: terminate it and seal under a fresh epoch.
+                write_terminator(backend, w, rec, aad).await?;
+                continue;
+            }
+            let dek = stream_epoch_dek(backend, &rec).await?;
+            let granted_new = grant_stream_epoch(backend, &rec, &dek, &targets, &held).await?;
+            let counter = u32::try_from(rec.chunk_count).map_err(|_| {
+                BlobError::Backend(format!(
+                    "stream {} epoch {} counts {} chunks, past the STREAM counter",
+                    w.stream_id, rec.epoch, rec.chunk_count
+                ))
+            })?;
+            let slot = crate::federation::StreamKeySlot {
+                counter,
+                last: false,
+            };
+            let envelope =
+                seal_stream_chunk(&dek, w.stream_id, rec.epoch, slot, plaintext, bound_aad)?;
+            match backend
+                .put_blob_chunk_with_scope(
+                    w.stream_id,
+                    seq,
+                    BlobBody::Inline(envelope.to_bytes()),
+                    rec.epoch,
+                    plaintext_size,
+                    w.cohort_scope,
+                    StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                    None,
+                    StreamClaim {
+                        community_key_id: w.community_key_id.map(str::to_owned),
+                        owner_key_id: Some(w.writer_key_id.to_owned()),
+                        stream_key: Some(slot),
+                    },
+                )
+                .await
+            {
+                Ok(sha) => {
+                    return Ok(PutChunkScopedResult {
+                        chunk_sha256: sha,
+                        tier: CryptoTier::InvisibleEncrypted,
+                        epoch: None,
+                        granted: report.granted,
+                        excluded: report.excluded,
+                        roster: report.roster,
+                        // #969 — the stream-axis set, when this append wrote
+                        // a wrap (the epoch's first chunk, a new recipient).
+                        key_grant_emission: (granted_new > 0).then(|| {
+                            crate::federation::key_grant::KeyGrantAxis::Stream {
+                                stream_id: w.stream_id.to_owned(),
+                                epoch: rec.epoch,
+                                cohort_scope: w.cohort_scope.to_owned(),
+                                owner_key_id: w.group_key_id.to_owned(),
+                            }
+                        }),
+                    });
+                }
+                Err(BlobError::InvalidArgument(m))
+                    if m.starts_with(crate::federation::blobs::STREAM_COUNTER_MOVED)
+                        || m.starts_with(crate::federation::blobs::STREAM_EPOCH_CLOSED) =>
+                {
+                    tracing::debug!(
+                        stream = %w.stream_id,
+                        epoch = rec.epoch,
+                        seq,
+                        "stream-keyed append lost its slot; nothing stored, re-sealing"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(BlobError::Backend(format!(
+            "put_blob_chunk_scoped: stream {} could not settle a STREAM-nonce slot in \
+             {STREAM_SEAL_ATTEMPTS} attempts",
+            w.stream_id
+        )))
+    }
+
+    /// v53.0.0 (#969) — the first `seq` persist reserves for epoch
+    /// terminators. A terminator's position is persist's own act — the roll
+    /// is — so it is allocated by persist, not taken from the producer:
+    /// epoch E's terminator sits at `TERMINATOR_SEQ_BASE + E`. It sorts after
+    /// every data chunk (a producer's seq is refused at or above the base),
+    /// so in seq order each epoch's terminator is its final chunk, and a
+    /// manifest's positions stay strictly increasing. `2^62` keeps every
+    /// position inside the index's signed 64-bit column.
+    pub(crate) const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
+
+    /// The position of epoch `epoch`'s terminator.
+    pub(crate) fn terminator_seq(epoch: u64) -> Result<u64, BlobError> {
+        TERMINATOR_SEQ_BASE
+            .checked_add(epoch)
+            .filter(|s| i64::try_from(*s).is_ok())
+            .ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "stream epoch {epoch} is past the terminator range (CIRISPersist#969)"
+                ))
+            })
+    }
+
+    /// v53.0.0 (#969, CC 5.3.3.1) — **terminate one epoch**: an empty chunk
+    /// sealed under the epoch's DEK with `last_flag = 0x01` at the epoch's
+    /// next counter (the V165 count), at `terminator_seq(epoch)`. The floor
+    /// stamps the epoch closed AND terminated in the terminator's own insert
+    /// transaction — that IS the roll's close — so nothing can follow it.
+    /// Called at every roll (cap, removal, a producer's higher label) and at
+    /// the seal. Idempotent: an epoch found terminated is done.
+    async fn write_terminator<B>(
+        backend: &B,
+        w: StreamWrite<'_>,
+        rec: crate::federation::StreamDekRecord,
+        aad: Option<&[u8]>,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        if rec.owner_key_id != w.writer_key_id {
+            return Err(BlobError::InvalidArgument(format!(
+                "stream {} epoch {} was sealed by another writer; a terminator is appended only \
+                 by the stream's single sender (CC 5.3.3.1)",
+                w.stream_id, rec.epoch
+            )));
+        }
+        let seq = terminator_seq(rec.epoch)?;
+        let dek = stream_epoch_dek(backend, &rec).await?;
+        let mut rec = rec;
+        for _ in 0..STREAM_SEAL_ATTEMPTS {
+            if rec.terminated {
+                return Ok(());
+            }
+            let counter = u32::try_from(rec.chunk_count).map_err(|_| {
+                BlobError::Backend(format!(
+                    "stream {} epoch {} past the STREAM counter",
+                    w.stream_id, rec.epoch
+                ))
+            })?;
+            let slot = crate::federation::StreamKeySlot {
+                counter,
+                last: true,
+            };
+            let bound = chunk_aad(aad, w.stream_id, seq);
+            let envelope = seal_stream_chunk(&dek, w.stream_id, rec.epoch, slot, &[], &bound)?;
+            match backend
+                .put_blob_chunk_with_scope(
+                    w.stream_id,
+                    seq,
+                    BlobBody::Inline(envelope.to_bytes()),
+                    rec.epoch,
+                    0,
+                    w.cohort_scope,
+                    StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                    None,
+                    StreamClaim {
+                        community_key_id: w.community_key_id.map(str::to_owned),
+                        owner_key_id: Some(w.writer_key_id.to_owned()),
+                        stream_key: Some(slot),
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(BlobError::InvalidArgument(m))
+                    if m.starts_with(crate::federation::blobs::STREAM_COUNTER_MOVED)
+                        || m.starts_with(crate::federation::blobs::STREAM_EPOCH_CLOSED) =>
+                {
+                    let epoch = rec.epoch;
+                    rec = backend
+                        .stream_dek_list(w.stream_id)
+                        .await?
+                        .into_iter()
+                        .find(|r| r.epoch == epoch)
+                        .ok_or_else(|| {
+                            BlobError::Backend(format!(
+                                "stream {} epoch {epoch} lost its DEK row",
+                                w.stream_id
+                            ))
+                        })?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(BlobError::Backend(format!(
+            "stream {} epoch {} could not settle its terminator",
+            w.stream_id, rec.epoch
+        )))
+    }
+
+    /// v53.0.0 (#969) — **close every epoch with its terminator** at the
+    /// seal ([`write_terminator`] for each epoch not yet terminated). Returns
+    /// how many were written.
+    async fn terminate_stream_epochs<B>(
+        backend: &B,
+        w: StreamWrite<'_>,
+        aad: Option<&[u8]>,
+    ) -> Result<u64, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let mut written = 0u64;
+        for rec in backend.stream_dek_list(w.stream_id).await? {
+            if rec.terminated {
+                continue;
+            }
+            write_terminator(backend, w, rec, aad).await?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// v53.0.0 (#969, CC 5.3.3.1) — **the per-epoch structure of a
+    /// stream-keyed DAG**: `entries` are `(seq, epoch, slot)` in seq order.
+    /// Within each epoch the counters run 0, 1, 2, … in seq order (strictly
+    /// increasing and gap-free — a dropped or reordered chunk breaks it), and
+    /// exactly ONE chunk carries `last`, the epoch's final one. A DAG whose
+    /// terminator was dropped — truncated — is refused. Pure.
+    pub(crate) fn check_stream_epoch_structure(
+        dag_sha: &[u8; 32],
+        entries: &[(u64, u64, crate::federation::StreamKeySlot)],
+    ) -> Result<(), BlobError> {
+        let mut per_epoch: std::collections::BTreeMap<u64, (u32, bool)> =
+            std::collections::BTreeMap::new();
+        for (seq, epoch, slot) in entries {
+            let refuse = |why: String| {
+                BlobError::Backend(format!(
+                    "chunk_dag {} chunk seq {seq} (epoch {epoch}): {why} (CC 5.3.3.1; \
+                     CIRISPersist#969)",
+                    hex::encode(dag_sha)
+                ))
+            };
+            let (next, closed) = per_epoch.entry(*epoch).or_insert((0, false));
+            if *closed {
+                return Err(refuse(
+                    "follows its epoch's last chunk — nothing may be appended after it".into(),
+                ));
+            }
+            if slot.counter != *next {
+                return Err(refuse(format!(
+                    "carries counter {} where its epoch's next is {next} — a chunk was dropped, \
+                     duplicated or moved",
+                    slot.counter
+                )));
+            }
+            *next = next.saturating_add(1);
+            *closed = slot.last;
+        }
+        if let Some((epoch, _)) = per_epoch.iter().find(|(_, (_, closed))| !*closed) {
+            return Err(BlobError::Backend(format!(
+                "chunk_dag {} epoch {epoch} carries no last chunk: the DAG is truncated (CC \
+                 5.3.3.1; CIRISPersist#969)",
+                hex::encode(dag_sha)
+            )));
+        }
+        Ok(())
+    }
+
     // ── the seal door ────────────────────────────────────────────────────
 
     /// §12.3 — **seal a live stream into a `chunk_dag` at `cohort_scope`,
@@ -433,7 +977,7 @@ pub mod orchestrate {
         B: BlobStorage + FederationDirectory + Sync,
     {
         let tier = resolve_write_tier(backend, cohort_scope, community_key_id).await?;
-        let listing = backend.stream_chunks(stream_id).await?;
+        let mut listing = backend.stream_chunks(stream_id).await?;
         if listing.chunks.is_empty() {
             return Err(BlobError::InvalidArgument(format!(
                 "stream {stream_id} has no chunks"
@@ -462,7 +1006,54 @@ pub mod orchestrate {
             community_key_id,
         )
         .await?;
-        let manifest = build_manifest(stream_id, &listing.chunks, tier)?;
+        // v53.0.0 (#969, CC 5.3.3.1) — a stream-keyed stream: every epoch is
+        // closed by its terminator BEFORE the manifest lists the chunks, so
+        // the manifest names each epoch's last chunk, and every chunk must
+        // sit at an epoch this node holds the DEK of.
+        let stream_epochs = if tier == CryptoTier::InvisibleEncrypted {
+            backend.stream_dek_list(stream_id).await?
+        } else {
+            Vec::new()
+        };
+        let stream_keyed = !stream_epochs.is_empty();
+        if stream_keyed {
+            let group = community_key_id.ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "cohort_scope {cohort_scope:?} requires the owner (self) or family key id \
+                     in the community_key_id argument"
+                ))
+            })?;
+            let w = StreamWrite {
+                cohort_scope,
+                group_key_id: group,
+                writer_key_id: &signer_key_id,
+                community_key_id,
+                stream_id,
+                epoch: 0,
+            };
+            if terminate_stream_epochs(backend, w, aad).await? > 0 {
+                listing = backend.stream_chunks(stream_id).await?;
+                check_chunk_rows_match_dag(
+                    backend,
+                    &listing.chunks,
+                    tier,
+                    cohort_scope,
+                    community_key_id,
+                )
+                .await?;
+            }
+            let known: std::collections::HashSet<u64> =
+                stream_epochs.iter().map(|r| r.epoch).collect();
+            if let Some(c) = listing.chunks.iter().find(|c| !known.contains(&c.epoch)) {
+                return Err(BlobError::InvalidArgument(format!(
+                    "seal_stream_scoped: chunk seq {} of stream {stream_id} is at epoch {}, which \
+                     holds no stream DEK on this node — one DAG never mixes per-chunk and \
+                     stream keys (CIRISPersist#969)",
+                    c.seq, c.epoch
+                )));
+            }
+        }
+        let manifest = build_manifest(stream_id, &listing.chunks, tier, stream_keyed)?;
         let chunk_count = listing.chunks.len() as u64;
         let total_size = manifest.total_size;
         let jcs = manifest.to_jcs_bytes();
@@ -515,6 +1106,7 @@ pub mod orchestrate {
                     roster: RosterPartition::default(),
                     key_grant_emission: None,
                     chunk_key_grant_emissions: Vec::new(),
+                    stream_key_grant_emissions: Vec::new(),
                 })
             }
             CryptoTier::InvisibleEncrypted => {
@@ -564,7 +1156,13 @@ pub mod orchestrate {
                 let mut items: Vec<([u8; 32], [u8; 32])> = vec![(sha, dek)];
                 // #954 (D9) — the children join the one access set.
                 items.extend(child_items);
-                for c in &listing.chunks {
+                // v53.0.0 (#969) — a stream-keyed DAG's chunks carry no
+                // per-chunk DEK: the manifest (and children) take content
+                // grants, and each EPOCH's DEK is wrapped to the same one
+                // recipient set — O(epochs × recipients), never per chunk.
+                let chunk_rows: &[StreamChunkRef] =
+                    if stream_keyed { &[] } else { &listing.chunks };
+                for c in chunk_rows {
                     let self_grant = backend
                         .get_at_rest_grant(&c.chunk_sha, PERSIST_SELF_RECIPIENT)
                         .await?
@@ -579,8 +1177,50 @@ pub mod orchestrate {
                         .map_err(map_at_rest_err)?;
                     items.push((c.chunk_sha, chunk_dek));
                 }
-                let (report, changed) =
-                    grant_deks_to_cohort(backend, &items, cohort_scope, owner).await?;
+                crate::federation::at_rest_cascade::orchestrate::self_retain_deks(
+                    backend,
+                    &items,
+                    cohort_scope,
+                )
+                .await?;
+                let (targets, report) =
+                    crate::federation::at_rest_cascade::orchestrate::resolve_cohort_targets(
+                        backend,
+                        cohort_scope,
+                        owner,
+                    )
+                    .await?;
+                let changed =
+                    crate::federation::at_rest_cascade::orchestrate::grant_deks_to_targets(
+                        backend,
+                        &items,
+                        cohort_scope,
+                        &targets,
+                    )
+                    .await?;
+                let mut stream_key_grant_emissions = Vec::new();
+                for rec in &stream_epochs {
+                    let held: std::collections::HashSet<String> = backend
+                        .stream_dek_grants(stream_id, rec.epoch, &rec.owner_key_id)
+                        .await?
+                        .into_iter()
+                        .map(|g| g.recipient_key_id)
+                        .collect();
+                    if targets.iter().all(|(k, _)| held.contains(k)) {
+                        continue;
+                    }
+                    let epoch_dek = stream_epoch_dek(backend, rec).await?;
+                    if grant_stream_epoch(backend, rec, &epoch_dek, &targets, &held).await? > 0 {
+                        stream_key_grant_emissions.push(
+                            crate::federation::key_grant::KeyGrantAxis::Stream {
+                                stream_id: stream_id.to_owned(),
+                                epoch: rec.epoch,
+                                cohort_scope: cohort_scope.to_owned(),
+                                owner_key_id: owner.to_owned(),
+                            },
+                        );
+                    }
+                }
                 let axis = |s: &[u8; 32]| crate::federation::key_grant::KeyGrantAxis::Content {
                     at_rest_sha256: hex::encode(s),
                     cohort_scope: cohort_scope.to_owned(),
@@ -603,6 +1243,7 @@ pub mod orchestrate {
                         .filter(|s| **s != sha)
                         .map(axis)
                         .collect(),
+                    stream_key_grant_emissions,
                 })
             }
             CryptoTier::CommunityDek => {
@@ -686,6 +1327,7 @@ pub mod orchestrate {
                                     }
                                 }),
                                 chunk_key_grant_emissions: Vec::new(),
+                                stream_key_grant_emissions: Vec::new(),
                             });
                         }
                         Err(BlobError::EpochNotCurrent { .. }) => {
@@ -805,6 +1447,7 @@ pub mod orchestrate {
         stream_id: &str,
         chunks: &[StreamChunkRef],
         tier: CryptoTier,
+        stream_keyed: bool,
     ) -> Result<ChunkManifest, BlobError> {
         let mut total_size: u64 = 0;
         let mut refs = Vec::with_capacity(chunks.len());
@@ -823,12 +1466,19 @@ pub mod orchestrate {
                 sha: c.chunk_sha,
                 size,
                 seq: positioned.then_some(c.seq),
+                // #969 — the epoch whose DEK sealed it, authoritative inside
+                // the sealed v4 manifest.
+                epoch: stream_keyed.then_some(c.epoch),
             });
         }
         let (v, chunk_tier, stream_id) = match tier {
             CryptoTier::Plaintext => (CHUNK_MANIFEST_VERSION, None, None),
             sealed => (
-                CHUNK_MANIFEST_VERSION_SEALED,
+                if stream_keyed {
+                    crate::federation::blobs::CHUNK_MANIFEST_VERSION_STREAM
+                } else {
+                    CHUNK_MANIFEST_VERSION_SEALED
+                },
                 Some(sealed),
                 Some(stream_id.to_owned()),
             ),
@@ -859,13 +1509,15 @@ pub mod orchestrate {
         let budget =
             cap.saturating_sub(crate::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD);
         let entry_len = |c: &ChunkRef| {
-            format!(
-                "{{\"seq\":{},\"sha\":\"{}\",\"size\":{}}}",
-                c.seq.unwrap_or_default(),
-                hex::encode(c.sha),
-                c.size
-            )
-            .len()
+            // #969 — a v4 entry carries `"epoch":E,` ahead of its seq.
+            c.epoch.map_or(0, |e| format!("\"epoch\":{e},").len())
+                + format!(
+                    "{{\"seq\":{},\"sha\":\"{}\",\"size\":{}}}",
+                    c.seq.unwrap_or_default(),
+                    hex::encode(c.sha),
+                    c.size
+                )
+                .len()
         };
         // The wrapper with a 20-digit total: an upper bound for any child.
         let wrapper = ChunkManifest {
@@ -982,6 +1634,10 @@ pub mod orchestrate {
         pub size: u32,
         /// The chunk's position in the stream — adopt it at `(stream_id, seq)`.
         pub seq: u64,
+        /// v53.0.0 (#969) — the epoch to adopt it at: `Some` for a v4
+        /// (stream-keyed) manifest, whose reader opens the chunk under the
+        /// stream grant of this epoch; `None` for a v2 one.
+        pub epoch: Option<u64>,
     }
 
     /// `Engine::open_sealed_manifest_as` — a sealed DAG's manifest, opened for
@@ -1114,7 +1770,8 @@ pub mod orchestrate {
         let ParsedManifest::Flat(ref f) = m else {
             unreachable!("the nested arm returned")
         };
-        if f.v != CHUNK_MANIFEST_VERSION_SEALED
+        if (f.v != CHUNK_MANIFEST_VERSION_SEALED
+            && f.v != crate::federation::blobs::CHUNK_MANIFEST_VERSION_STREAM)
             || f.chunk_tier != Some(tier)
             || f.stream_id.is_none()
         {
@@ -1216,6 +1873,7 @@ pub mod orchestrate {
                 sha256_hex: hex::encode(c.sha),
                 size: c.size,
                 seq: c.seq.unwrap_or_default(),
+                epoch: c.epoch,
             })
             .collect()
     }
@@ -1301,9 +1959,15 @@ pub mod orchestrate {
         let listing = backend.stream_chunks(&stream_id).await?;
         let by_seq: std::collections::HashMap<u64, &StreamChunkRef> =
             listing.chunks.iter().map(|r| (r.seq, r)).collect();
+        // v53.0.0 (#969) — a stream-keyed DAG's chunks, for the structure
+        // check below (read from the stored nonces: I45, nothing is opened).
+        let mut keyed_chunks: Vec<ChunkRef> = Vec::new();
         match &m {
             ParsedManifest::Flat(f) => {
-                check_chunks_held(&by_seq, &f.chunks, sha256, &stream_id, head.crypto_tier)?
+                check_chunks_held(&by_seq, &f.chunks, sha256, &stream_id, head.crypto_tier)?;
+                if f.is_stream_keyed() {
+                    keyed_chunks.extend(f.chunks.iter().cloned());
+                }
             }
             ParsedManifest::Nested(root) => {
                 // #954 — every child held AND recorded (so eviction finds it
@@ -1329,13 +1993,324 @@ pub mod orchestrate {
                         &stream_id,
                         head.crypto_tier,
                     )?;
+                    if child.is_stream_keyed() {
+                        keyed_chunks.extend(child.chunks.iter().cloned());
+                    }
                 }
             }
+        }
+        if !keyed_chunks.is_empty() {
+            check_held_stream_structure(backend, sha256, &keyed_chunks).await?;
         }
         let promoted = backend
             .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
             .await?;
         Ok(done(promoted))
+    }
+
+    /// v53.0.0 (#969, CC 5.3.3.1) — **the promote's truncation check, without
+    /// a key**: each held chunk's STREAM `(counter, last)` is read from the
+    /// nonce stored in its envelope — the clear half of the envelope, so
+    /// nothing is opened (I45) — and the epochs must be whole
+    /// ([`check_stream_epoch_structure`]). A DAG whose terminator was dropped
+    /// is refused here, before it becomes a `chunk_dag`. The nonce's prefix
+    /// is bound to the DEK, which the reader checks when it opens.
+    async fn check_held_stream_structure<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        chunks: &[ChunkRef],
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        let mut slots = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let (Some(seq), Some(epoch)) = (c.seq, c.epoch) else {
+                return Err(BlobError::InvalidArgument(format!(
+                    "manifest {} is stream-keyed but chunk {} carries no seq or epoch",
+                    hex::encode(sha256),
+                    hex::encode(c.sha)
+                )));
+            };
+            let Some(BlobBody::Inline(bytes)) = backend.get_blob(&c.sha).await? else {
+                return Err(BlobError::NotHeld {
+                    sha256_hex: hex::encode(c.sha),
+                });
+            };
+            let envelope = AtRestEnvelope::from_bytes(&bytes).map_err(|e| {
+                BlobError::Backend(format!(
+                    "chunk {} is not an at-rest envelope ({e})",
+                    hex::encode(c.sha)
+                ))
+            })?;
+            let (counter, last) = crate::federation::stream_seal::parse_nonce(&envelope.nonce)
+                .ok_or_else(|| {
+                    BlobError::InvalidArgument(format!(
+                        "chunk {} of stream-keyed manifest {} carries no STREAM nonce",
+                        hex::encode(c.sha),
+                        hex::encode(sha256)
+                    ))
+                })?;
+            slots.push((
+                seq,
+                epoch,
+                crate::federation::StreamKeySlot { counter, last },
+            ));
+        }
+        slots.sort_by_key(|(seq, _, _)| *seq);
+        check_stream_epoch_structure(sha256, &slots)
+            .map_err(|e| BlobError::InvalidArgument(e.to_string()))
+    }
+
+    /// v53.0.0 (CIRISPersist#969) — one key a viewer lacks, as
+    /// [`sealed_dag_readiness_for_viewer`] names it.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    #[serde(tag = "axis", rename_all = "snake_case")]
+    pub enum MissingChunkKey {
+        /// A legacy chunk's own content grant.
+        Content {
+            /// The chunk's position.
+            seq: u64,
+            /// The chunk's content address, hex.
+            chunk_sha256: String,
+        },
+        /// A stream epoch's grant, covering the chunks `seq_from ..= seq_to`
+        /// of the DAG at that epoch.
+        Stream {
+            /// The stream.
+            stream_id: String,
+            /// The epoch.
+            epoch: u64,
+            /// The first chunk of the DAG at this epoch.
+            seq_from: u64,
+            /// The last chunk of the DAG at this epoch.
+            seq_to: u64,
+        },
+        /// A v3 root's child manifest the viewer holds no grant on.
+        Child {
+            /// The child's index in the root.
+            index: u64,
+            /// The child row's content address, hex.
+            child_sha256: String,
+        },
+    }
+
+    /// v53.0.0 (CIRISPersist#969) — **can `viewer` read this sealed DAG on
+    /// this node now, and if not, what is missing** — answered from the
+    /// index and grant rows, without opening any chunk.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    pub struct SealedDagReadiness {
+        /// The DAG's address.
+        pub sha256_hex: String,
+        /// `stream_epoch` (v4) or `content` (per-chunk keys, legacy).
+        pub chunk_keys: &'static str,
+        /// Every chunk (and v3 child) the manifest names is held here.
+        pub held: bool,
+        /// `held` and nothing `missing`: a whole read would open every chunk.
+        pub readable: bool,
+        /// The keys the viewer lacks: per EPOCH for a stream-keyed DAG
+        /// (O(epochs)), per chunk for a legacy one.
+        pub missing: Vec<MissingChunkKey>,
+        /// The chunks (`seq`) not held here, so a host knows what to fetch.
+        pub not_held: Vec<u64>,
+    }
+
+    /// `Engine::sealed_dag_readiness` — see [`SealedDagReadiness`]. The
+    /// manifest is opened for `viewer_key_id` exactly as
+    /// [`open_sealed_manifest_for_viewer`] opens it: a stranger (no grant on
+    /// the manifest) is `NotGranted` and learns nothing about the chunks.
+    pub async fn sealed_dag_readiness_for_viewer<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<SealedDagReadiness, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let (_, m) = opened_sealed_manifest(backend, sha256, viewer_key_id, caller_aad).await?;
+        let stream_id = m.stream_id().unwrap_or_default().to_owned();
+        let mut missing = Vec::new();
+        let mut not_held = Vec::new();
+        let mut held = true;
+        let mut runs: Vec<ChunkManifest> = Vec::new();
+        match &m {
+            ParsedManifest::Flat(f) => runs.push(f.clone()),
+            ParsedManifest::Nested(root) => {
+                for (i, entry) in root.children.iter().enumerate() {
+                    match open_manifest_child(backend, root, i, viewer_key_id, caller_aad).await {
+                        Ok(child) => runs.push(child),
+                        Err(BlobError::NotHeld { .. }) => held = false,
+                        Err(BlobError::NotGranted { .. }) => missing.push(MissingChunkKey::Child {
+                            index: i as u64,
+                            child_sha256: hex::encode(entry.sha),
+                        }),
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        let stream_keyed = runs.iter().any(ChunkManifest::is_stream_keyed);
+        // Per epoch, the DAG's seq span (stream-keyed), in epoch order.
+        let mut epochs: std::collections::BTreeMap<u64, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for c in runs.iter().flat_map(|r| r.chunks.iter()) {
+            let seq = c.seq.unwrap_or_default();
+            if backend.blob_head(&c.sha).await?.is_none() {
+                held = false;
+                not_held.push(seq);
+            }
+            match c.epoch {
+                Some(epoch) => {
+                    let span = epochs.entry(epoch).or_insert((seq, seq));
+                    span.0 = span.0.min(seq);
+                    span.1 = span.1.max(seq);
+                }
+                None => {
+                    if backend
+                        .get_at_rest_grant(&c.sha, viewer_key_id)
+                        .await?
+                        .is_none()
+                    {
+                        missing.push(MissingChunkKey::Content {
+                            seq,
+                            chunk_sha256: hex::encode(c.sha),
+                        });
+                    }
+                }
+            }
+        }
+        for (epoch, (seq_from, seq_to)) in epochs {
+            if stream_grant_sealer(backend, &stream_id, epoch, viewer_key_id)
+                .await?
+                .is_none()
+            {
+                missing.push(MissingChunkKey::Stream {
+                    stream_id: stream_id.clone(),
+                    epoch,
+                    seq_from,
+                    seq_to,
+                });
+            }
+        }
+        Ok(SealedDagReadiness {
+            sha256_hex: hex::encode(sha256),
+            chunk_keys: if stream_keyed {
+                crate::federation::blobs::CHUNK_KEYS_STREAM_EPOCH
+            } else {
+                "content"
+            },
+            held,
+            readable: held && missing.is_empty(),
+            missing,
+            not_held,
+        })
+    }
+
+    /// v53.0.0 (CIRISPersist#963 / #942, CC 3.1.3.3) — what a held row is,
+    /// as a custody `here` must know it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DagHolding {
+        /// The row is a whole blob (or no row is held): its row is the copy.
+        NotADag,
+        /// A chunk DAG whose every chunk (and v3 child) is held here.
+        Complete,
+        /// A chunk DAG this node holds only part of: `not_held` names the
+        /// chunks (`seq`) missing here.
+        Incomplete {
+            /// The chunks not held here.
+            not_held: Vec<u64>,
+        },
+        /// A row recorded `chunk_dag` whose manifest `holder_key_id` cannot
+        /// open, so whether every chunk is held cannot be asked.
+        Unverifiable,
+    }
+
+    /// **Is the held row `sha256` a chunk DAG, and is all of it here?** Asked
+    /// as `holder_key_id` (the node filing a custody report), from the
+    /// opened manifest and the chunk rows this node holds.
+    ///
+    /// - a plaintext `chunk_dag` row: the clear manifest's chunks;
+    /// - a sealed row recorded `chunk_dag` (the seal floor's, or a promoted
+    ///   adoption): [`sealed_dag_readiness_for_viewer`]'s `held`;
+    /// - a sealed `inline` row: opened, and a DAG iff its plaintext PARSES as
+    ///   a manifest — the adopted, not-yet-promoted case, whose chunks may be
+    ///   partly here. A sealed inline row the holder cannot open is reported
+    ///   [`DagHolding::NotADag`]: nothing here can tell its bytes apart from a
+    ///   whole blob (the residual, documented on `custody_ack_input_for`).
+    ///
+    /// `caller_aad` is the associated data the DAG was sealed under (an edge
+    /// file pointer binds `content_aad(attester, asserted_at, content_field)`),
+    /// passed to the manifest open exactly as a read passes it. A manifest that
+    /// does not open under it is `SealDidNotOpen`, never "not a DAG".
+    pub async fn held_dag_completeness<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        holder_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<DagHolding, BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let Some(head) = backend.blob_head(sha256).await? else {
+            return Ok(DagHolding::NotADag);
+        };
+        let recorded_dag = head.storage_kind == "chunk_dag";
+        if head.crypto_tier == CryptoTier::Plaintext {
+            if !recorded_dag {
+                return Ok(DagHolding::NotADag);
+            }
+            let Some(BlobBody::Inline(bytes)) = backend.get_blob(sha256).await? else {
+                return Ok(DagHolding::Unverifiable);
+            };
+            let mut not_held = Vec::new();
+            match ParsedManifest::parse(&bytes)? {
+                ParsedManifest::Flat(f) => {
+                    for (i, c) in f.chunks.iter().enumerate() {
+                        if backend.blob_head(&c.sha).await?.is_none() {
+                            not_held.push(c.seq.unwrap_or(i as u64));
+                        }
+                    }
+                }
+                ParsedManifest::Nested(_) => return Ok(DagHolding::Unverifiable),
+            }
+            return Ok(if not_held.is_empty() {
+                DagHolding::Complete
+            } else {
+                DagHolding::Incomplete { not_held }
+            });
+        }
+        if !recorded_dag {
+            if head.storage_kind != "inline" {
+                return Ok(DagHolding::NotADag);
+            }
+            let jcs = match read_sealed_inline_authorized(
+                backend,
+                sha256,
+                head.crypto_tier,
+                holder_key_id,
+                caller_aad,
+            )
+            .await
+            {
+                Ok(jcs) => jcs,
+                // The holder is authorized and the bytes did not open under
+                // the caller's data: the caller named the wrong context.
+                Err(e @ BlobError::SealDidNotOpen { .. }) => return Err(e),
+                Err(_) => return Ok(DagHolding::NotADag),
+            };
+            if ParsedManifest::parse(&jcs).is_err() {
+                return Ok(DagHolding::NotADag);
+            }
+        }
+        match sealed_dag_readiness_for_viewer(backend, sha256, holder_key_id, caller_aad).await {
+            Ok(r) if r.held => Ok(DagHolding::Complete),
+            Ok(r) => Ok(DagHolding::Incomplete {
+                not_held: r.not_held,
+            }),
+            Err(BlobError::NotGranted { .. }) => Ok(DagHolding::Unverifiable),
+            Err(e) => Err(e),
+        }
     }
 
     /// The per-chunk promotion checks (#947): each chunk the manifest names
@@ -1384,6 +2359,17 @@ pub mod orchestrate {
                      manifest is at {:?}",
                     row.crypto_tier, tier
                 )));
+            }
+            // #969 — a v4 manifest names the epoch whose DEK sealed the chunk;
+            // the adopt must have recorded it there (the reader opens by it).
+            if let Some(epoch) = c.epoch {
+                if row.epoch != epoch {
+                    return Err(BlobError::InvalidArgument(format!(
+                        "chunk seq {seq} of stream {stream_id} was adopted at epoch {} but the \
+                         manifest says {epoch}: adopt it at the manifest's epoch",
+                        row.epoch
+                    )));
+                }
             }
         }
         Ok(())
@@ -1668,11 +2654,13 @@ pub mod orchestrate {
         // A sealed DAG: only the covering chunks, each opened on its own.
         let mut out = Vec::with_capacity((end - start + 1) as usize);
         // I38 — per-epoch authorization memo for a community DAG: one grant
-        // lookup per distinct epoch in the range, not one per chunk.
-        let mut authorized_epochs: std::collections::HashSet<(String, String, u64)> =
-            std::collections::HashSet::new();
+        // lookup per distinct epoch in the range, not one per chunk. #969 —
+        // and one stream-epoch DEK recovery per epoch.
+        let mut memo = ChunkReadMemo::default();
+        let mut stream_keyed = false;
         match &manifest {
             ParsedManifest::Flat(m) => {
+                stream_keyed = m.is_stream_keyed();
                 read_flat_chunks(
                     backend,
                     sha256,
@@ -1682,7 +2670,7 @@ pub mod orchestrate {
                     aad,
                     (start, end),
                     &mut out,
-                    &mut authorized_epochs,
+                    &mut memo,
                 )
                 .await?
             }
@@ -1691,6 +2679,7 @@ pub mod orchestrate {
             ParsedManifest::Nested(root) => {
                 for (i, ls, le) in root.children_for_range(start, end) {
                     let child = open_manifest_child(backend, root, i, viewer_key_id, aad).await?;
+                    stream_keyed |= child.is_stream_keyed();
                     read_flat_chunks(
                         backend,
                         sha256,
@@ -1700,13 +2689,103 @@ pub mod orchestrate {
                         aad,
                         (ls, le),
                         &mut out,
-                        &mut authorized_epochs,
+                        &mut memo,
                     )
                     .await?;
                 }
             }
         }
+        // v53.0.0 (#969, CC 5.3.3.1) — a WHOLE read of a stream-keyed DAG
+        // opened every chunk: their counters and terminators must form each
+        // epoch whole (truncation resistance). Zero-length terminators lie
+        // outside every byte range, so they are opened here for the check.
+        if stream_keyed && range.is_none() {
+            check_whole_stream_structure(
+                backend,
+                sha256,
+                &manifest,
+                tier,
+                viewer_key_id,
+                aad,
+                &mut memo,
+            )
+            .await?;
+        }
         Ok(out)
+    }
+
+    /// v53.0.0 (#969) — the whole-read structure check: open the chunks the
+    /// byte loop skipped (zero-length — the terminators), then
+    /// [`check_stream_epoch_structure`] over every slot in seq order.
+    #[allow(clippy::too_many_arguments)]
+    async fn check_whole_stream_structure<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        manifest: &ParsedManifest,
+        tier: CryptoTier,
+        viewer_key_id: &str,
+        aad: Option<&[u8]>,
+        memo: &mut ChunkReadMemo,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let chunks: Vec<(String, ChunkRef)> = match manifest {
+            ParsedManifest::Flat(m) => {
+                let sid = m.stream_id.clone().unwrap_or_default();
+                m.chunks.iter().map(|c| (sid.clone(), c.clone())).collect()
+            }
+            ParsedManifest::Nested(root) => {
+                let mut v = Vec::new();
+                for i in 0..root.children.len() {
+                    let child = open_manifest_child(backend, root, i, viewer_key_id, aad).await?;
+                    v.extend(
+                        child
+                            .chunks
+                            .into_iter()
+                            .map(|c| (root.stream_id.clone(), c)),
+                    );
+                }
+                v
+            }
+        };
+        for (sid, c) in chunks.iter().filter(|(_, c)| c.size == 0) {
+            let (Some(seq), Some(epoch)) = (c.seq, c.epoch) else {
+                return Err(BlobError::Backend(format!(
+                    "chunk_dag {} v4 chunk {} lacks its seq or epoch",
+                    hex::encode(sha256),
+                    hex::encode(c.sha)
+                )));
+            };
+            open_stream_chunk_row_for_viewer(
+                backend,
+                sha256,
+                &c.sha,
+                tier,
+                viewer_key_id,
+                &chunk_aad(aad, sid, seq),
+                ChunkPos {
+                    stream_id: sid,
+                    seq,
+                    keys: ChunkKeys::StreamEpoch(epoch),
+                    dag_authorized: true,
+                },
+                memo,
+            )
+            .await?;
+        }
+        let mut slots = std::mem::take(&mut memo.stream_slots);
+        slots.sort_by_key(|(seq, _, _)| *seq);
+        slots.dedup_by_key(|(seq, _, _)| *seq);
+        if slots.len() != chunks.len() {
+            return Err(BlobError::Backend(format!(
+                "chunk_dag {}: {} of its {} chunks were opened under a stream key",
+                hex::encode(sha256),
+                slots.len(),
+                chunks.len()
+            )));
+        }
+        check_stream_epoch_structure(sha256, &slots)
     }
 
     /// The chunk loop of a sealed v2 manifest (or one v3 child) over its
@@ -1722,7 +2801,7 @@ pub mod orchestrate {
         aad: Option<&[u8]>,
         (start, end): (u64, u64),
         out: &mut Vec<u8>,
-        authorized_epochs: &mut std::collections::HashSet<(String, String, u64)>,
+        memo: &mut ChunkReadMemo,
     ) -> Result<(), BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
@@ -1745,6 +2824,18 @@ pub mod orchestrate {
                 ))
             })?;
             let bound_aad = chunk_aad(aad, stream_id, seq);
+            // #969 — a v4 manifest names the epoch whose DEK sealed the chunk.
+            let keys = match (manifest.is_stream_keyed(), cref.epoch) {
+                (false, _) => ChunkKeys::PerChunk,
+                (true, Some(e)) => ChunkKeys::StreamEpoch(e),
+                (true, None) => {
+                    return Err(BlobError::Backend(format!(
+                        "blob {} is a v4 chunk_dag whose chunk {} carries no epoch",
+                        hex::encode(sha256),
+                        hex::encode(cref.sha)
+                    )))
+                }
+            };
             let plain = open_stream_chunk_row_for_viewer(
                 backend,
                 sha256,
@@ -1752,7 +2843,13 @@ pub mod orchestrate {
                 tier,
                 viewer_key_id,
                 &bound_aad,
-                authorized_epochs,
+                ChunkPos {
+                    stream_id,
+                    seq,
+                    keys,
+                    dag_authorized: true,
+                },
+                memo,
             )
             .await?;
             if plain.len() as u64 != u64::from(cref.size) {
@@ -1770,16 +2867,132 @@ pub mod orchestrate {
         Ok(())
     }
 
+    /// v53.0.0 (CIRISPersist#969) — which keys sealed a chunk, as the reader
+    /// knows it: from the manifest (`PerChunk` for v2, `StreamEpoch` for v4,
+    /// with the epoch the manifest names), or — for a live chunk read by
+    /// position, before any manifest exists — `Live` with the index row's
+    /// epoch: a per-chunk grant if the viewer holds one (a pre-#969 stream),
+    /// else the stream grant of that epoch.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ChunkKeys {
+        /// A legacy chunk: its own DEK and grants.
+        PerChunk,
+        /// A stream-keyed chunk at this epoch (a v4 manifest says so).
+        StreamEpoch(u64),
+        /// A live chunk at this index-row epoch: per-chunk if granted, else
+        /// stream-keyed.
+        Live(u64),
+    }
+
+    /// Where a chunk sits and how the read reached it.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct ChunkPos<'a> {
+        /// The stream the chunk was sealed in.
+        pub stream_id: &'a str,
+        /// Its position.
+        pub seq: u64,
+        /// Which keys sealed it.
+        pub keys: ChunkKeys,
+        /// The viewer was authorized on the DAG's manifest: a missing chunk
+        /// key is then the typed, RETRYABLE refusal naming the key (sets may
+        /// still be arriving), never the stranger's `NotGranted`.
+        pub dag_authorized: bool,
+    }
+
+    /// What one sealed read remembers across its chunks: the community epochs
+    /// already authorized (I38), the stream-epoch DEKs already recovered
+    /// (#969 — one recovery per epoch, not per chunk), and the STREAM slots
+    /// opened, in order, for the whole read's structure check.
+    #[derive(Default)]
+    pub(crate) struct ChunkReadMemo {
+        community_epochs: std::collections::HashSet<(String, String, u64)>,
+        stream_deks: std::collections::HashMap<(String, u64), [u8; 32]>,
+        stream_slots: Vec<(u64, u64, crate::federation::StreamKeySlot)>,
+    }
+
+    /// v53.0.0 (#969) — the viewer's wrap of `(stream_id, epoch)`, taken only
+    /// from a sealer that speaks for the stream's owner as THIS node records
+    /// it (a set for another owner's stream id grants nothing), and the DEK
+    /// it carries: through the epoch's self-retention when this node sealed
+    /// the stream, else by opening the viewer's wrap with this node's
+    /// content-KEM identity. `None` when the viewer holds no such wrap.
+    pub(crate) async fn stream_dek_for_viewer<B>(
+        backend: &B,
+        stream_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<Option<[u8; 32]>, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let Some(sealer) = stream_grant_sealer(backend, stream_id, epoch, viewer_key_id).await?
+        else {
+            return Ok(None);
+        };
+        let (sealer, wrap) = sealer;
+        if let Some(rec) = backend
+            .stream_dek_list(stream_id)
+            .await?
+            .into_iter()
+            .find(|r| r.epoch == epoch && r.owner_key_id == sealer)
+        {
+            return stream_epoch_dek(backend, &rec).await.map(Some);
+        }
+        let private = backend.load_content_kem_private_halves().await?;
+        crate::federation::at_rest_cascade::unwrap_dek_v2_json(&private, &wrap.wrapped_dek)
+            .map(Some)
+            .map_err(|e| {
+                BlobError::Backend(format!(
+                    "stream {stream_id} epoch {epoch}: the wrap addressed to {viewer_key_id:?} \
+                     does not open with this node's content-KEM identity — that occurrence's \
+                     private half lives on another device ({e})"
+                ))
+            })
+    }
+
+    /// v53.0.0 (#969) — the viewer's admissible wrap of `(stream_id, epoch)`
+    /// with its sealer, WITHOUT opening it: what authorization and the
+    /// readiness door ask.
+    pub(crate) async fn stream_grant_sealer<B>(
+        backend: &B,
+        stream_id: &str,
+        epoch: u64,
+        viewer_key_id: &str,
+    ) -> Result<Option<(String, crate::federation::GrantWrap)>, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let Some(owner) = backend.stream_key_state(stream_id).await?.owner_key_id else {
+            return Ok(None);
+        };
+        for (sealer, wrap) in backend
+            .stream_dek_grants_for_recipient(stream_id, epoch, viewer_key_id)
+            .await?
+        {
+            if sealer == owner
+                || crate::federation::self_collective::speaks_for(backend, &sealer, &owner)
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("stream grant sealer: {e}")))?
+            {
+                return Ok(Some((sealer, wrap)));
+            }
+        }
+        Ok(None)
+    }
+
     /// §12.4 / §12.10 — **open ONE sealed stream chunk row for a viewer,
     /// under its position-bound AAD.** The row must exist (else the shared
     /// #833 refusal — swept or never ours, told only to an authorized
-    /// viewer), must record `tier`, its sha is re-verified over the stored
-    /// bytes (CEG §10.1.1), the viewer is authorized on THIS chunk — their
-    /// grant on the row at `self` / `family`, their grant on the row's OWN
-    /// binding's epoch at `community` (I38; memoized in `authorized_epochs`
-    /// so a range costs one lookup per distinct epoch) — and only then the
-    /// envelope opens under `bound_aad`. A refusal names `refused_sha` (the
-    /// DAG the viewer asked for, or the chunk itself).
+    /// viewer) and must record `tier`; the viewer is authorized on THIS
+    /// chunk BEFORE its body is read — their grant on the row (a legacy
+    /// self/family chunk), their grant on the chunk's stream epoch (#969), or
+    /// their grant on the row's OWN binding's epoch at `community` (I38) —
+    /// then the sha is re-verified over the stored bytes (CEG §10.1.1) and
+    /// the envelope opens under `bound_aad`. A stream-keyed chunk's nonce is
+    /// recomputed and must match (#969). A refusal names `refused_sha` (the
+    /// DAG the viewer asked for, or the chunk itself); a viewer authorized
+    /// on the DAG who lacks the chunk's key is told WHICH key, retryably.
+    #[allow(clippy::too_many_arguments)]
     async fn open_stream_chunk_row_for_viewer<B>(
         backend: &B,
         refused_sha: &[u8; 32],
@@ -1787,7 +3000,8 @@ pub mod orchestrate {
         tier: CryptoTier,
         viewer_key_id: &str,
         bound_aad: &[u8],
-        authorized_epochs: &mut std::collections::HashSet<(String, String, u64)>,
+        pos: ChunkPos<'_>,
+        memo: &mut ChunkReadMemo,
     ) -> Result<Vec<u8>, BlobError>
     where
         B: BlobStorage + crate::federation::FederationDirectory + Sync,
@@ -1812,6 +3026,125 @@ pub mod orchestrate {
                 chunk_head.crypto_tier
             )));
         }
+        let missing_key = |key: crate::federation::blobs::ChunkKeyRef| {
+            if pos.dag_authorized {
+                BlobError::ChunkKeyNotYetGranted {
+                    sha256_hex: hex::encode(refused_sha),
+                    viewer_key_id: viewer_key_id.to_owned(),
+                    seq: pos.seq,
+                    chunk_sha_hex: hex::encode(chunk_sha),
+                    key,
+                }
+            } else {
+                BlobError::NotGranted {
+                    sha256_hex: hex::encode(refused_sha),
+                    viewer_key_id: viewer_key_id.to_owned(),
+                }
+            }
+        };
+        // AUTHORIZE, then read (I4): which key, and does the viewer hold it.
+        enum Material {
+            PerChunk,
+            Stream(u64, [u8; 32]),
+            Community(String, String, u64),
+        }
+        let material = match tier {
+            CryptoTier::Plaintext => {
+                return Err(BlobError::Backend(format!(
+                    "stream chunk {} is plaintext; nothing to open",
+                    hex::encode(chunk_sha)
+                )))
+            }
+            CryptoTier::InvisibleEncrypted => {
+                let keys = match pos.keys {
+                    ChunkKeys::Live(epoch) => {
+                        if backend
+                            .get_at_rest_grant(chunk_sha, viewer_key_id)
+                            .await?
+                            .is_some()
+                        {
+                            ChunkKeys::PerChunk
+                        } else {
+                            ChunkKeys::StreamEpoch(epoch)
+                        }
+                    }
+                    k => k,
+                };
+                match keys {
+                    ChunkKeys::StreamEpoch(epoch) => {
+                        let memo_key = (pos.stream_id.to_owned(), epoch);
+                        let dek = match memo.stream_deks.get(&memo_key) {
+                            Some(d) => *d,
+                            None => {
+                                let Some(d) = stream_dek_for_viewer(
+                                    backend,
+                                    pos.stream_id,
+                                    epoch,
+                                    viewer_key_id,
+                                )
+                                .await?
+                                else {
+                                    return Err(missing_key(
+                                        crate::federation::blobs::ChunkKeyRef::Stream {
+                                            stream_id: pos.stream_id.to_owned(),
+                                            epoch,
+                                        },
+                                    ));
+                                };
+                                memo.stream_deks.insert(memo_key, d);
+                                d
+                            }
+                        };
+                        Material::Stream(epoch, dek)
+                    }
+                    _ => {
+                        // The viewer's grant on THIS chunk row (I38).
+                        if backend
+                            .get_at_rest_grant(chunk_sha, viewer_key_id)
+                            .await?
+                            .is_none()
+                        {
+                            return Err(missing_key(
+                                crate::federation::blobs::ChunkKeyRef::Content {
+                                    at_rest_sha256: hex::encode(chunk_sha),
+                                },
+                            ));
+                        }
+                        Material::PerChunk
+                    }
+                }
+            }
+            CryptoTier::CommunityDek => {
+                // The chunk's OWN binding names the DEK that sealed it — a
+                // pre-rotation chunk opens under its old epoch (I38) — and the
+                // viewer must hold a grant on that epoch. #848 — the binding
+                // is `(community, minter, epoch)`.
+                let (community, minter, epoch) = backend
+                    .community_dek_blob_epoch(chunk_sha)
+                    .await?
+                    .ok_or_else(|| {
+                        BlobError::Backend(format!(
+                            "stream chunk {} is recorded at community_dek but carries no epoch \
+                             binding",
+                            hex::encode(chunk_sha)
+                        ))
+                    })?;
+                let key = (community.clone(), minter.clone(), epoch);
+                if !memo.community_epochs.contains(&key) {
+                    if !backend
+                        .community_dek_has_member_grant(&community, &minter, epoch, viewer_key_id)
+                        .await?
+                    {
+                        return Err(BlobError::NotGranted {
+                            sha256_hex: hex::encode(refused_sha),
+                            viewer_key_id: viewer_key_id.to_owned(),
+                        });
+                    }
+                    memo.community_epochs.insert(key);
+                }
+                Material::Community(community, minter, epoch)
+            }
+        };
         let Some(BlobBody::Inline(bytes)) = backend.get_blob(chunk_sha).await? else {
             return Err(BlobError::Backend(format!(
                 "stream chunk {} is not an inline row",
@@ -1832,23 +3165,8 @@ pub mod orchestrate {
                 hex::encode(chunk_sha)
             ))
         })?;
-        match tier {
-            CryptoTier::Plaintext => Err(BlobError::Backend(format!(
-                "stream chunk {} is plaintext; nothing to open",
-                hex::encode(chunk_sha)
-            ))),
-            CryptoTier::InvisibleEncrypted => {
-                // The viewer's grant on THIS chunk row (I38).
-                if backend
-                    .get_at_rest_grant(chunk_sha, viewer_key_id)
-                    .await?
-                    .is_none()
-                {
-                    return Err(BlobError::NotGranted {
-                        sha256_hex: hex::encode(refused_sha),
-                        viewer_key_id: viewer_key_id.to_owned(),
-                    });
-                }
+        match material {
+            Material::PerChunk => {
                 read_for_viewer_sealed(
                     backend,
                     chunk_sha,
@@ -1858,34 +3176,19 @@ pub mod orchestrate {
                 )
                 .await
             }
-            CryptoTier::CommunityDek => {
-                // The chunk's OWN binding names the DEK that sealed it — a
-                // pre-rotation chunk opens under its old epoch (I38) — and the
-                // viewer must hold a grant on that epoch. #848 — the binding
-                // is `(community, minter, epoch)`.
-                let (community, minter, epoch) = backend
-                    .community_dek_blob_epoch(chunk_sha)
-                    .await?
-                    .ok_or_else(|| {
-                        BlobError::Backend(format!(
-                            "stream chunk {} is recorded at community_dek but carries no epoch \
-                             binding",
-                            hex::encode(chunk_sha)
-                        ))
-                    })?;
-                let key = (community.clone(), minter.clone(), epoch);
-                if !authorized_epochs.contains(&key) {
-                    if !backend
-                        .community_dek_has_member_grant(&community, &minter, epoch, viewer_key_id)
-                        .await?
-                    {
-                        return Err(BlobError::NotGranted {
-                            sha256_hex: hex::encode(refused_sha),
-                            viewer_key_id: viewer_key_id.to_owned(),
-                        });
-                    }
-                    authorized_epochs.insert(key);
-                }
+            Material::Stream(epoch, dek) => {
+                let (plain, slot) = open_stream_keyed_chunk(
+                    &dek,
+                    pos.stream_id,
+                    epoch,
+                    chunk_sha,
+                    &envelope,
+                    bound_aad,
+                )?;
+                memo.stream_slots.push((pos.seq, epoch, slot));
+                Ok(plain)
+            }
+            Material::Community(community, minter, epoch) => {
                 open_community_row_for_viewer(
                     backend,
                     chunk_sha,
@@ -1937,8 +3240,13 @@ pub mod orchestrate {
                 .await?,
             );
         };
-        // 2. AUTHORIZE BY TIER, BEFORE TOUCHING ANY BODY (§11.3 / I4).
-        authorize_viewer_by_tier(backend, &c.chunk_sha, head.crypto_tier, viewer_key_id).await?;
+        // 2. AUTHORIZE BY TIER, BEFORE TOUCHING ANY BODY (§11.3 / I4). A
+        //    self/family chunk is authorized inside the opener, before its
+        //    body: per-chunk grant, or (#969) the stream grant of its epoch.
+        if head.crypto_tier != CryptoTier::InvisibleEncrypted {
+            authorize_viewer_by_tier(backend, &c.chunk_sha, head.crypto_tier, viewer_key_id)
+                .await?;
+        }
         // 3. Open under the position.
         let plain = match head.crypto_tier {
             CryptoTier::Plaintext => {
@@ -1967,7 +3275,13 @@ pub mod orchestrate {
                     tier,
                     viewer_key_id,
                     &bound_aad,
-                    &mut std::collections::HashSet::new(),
+                    ChunkPos {
+                        stream_id,
+                        seq,
+                        keys: ChunkKeys::Live(c.epoch),
+                        dag_authorized: false,
+                    },
+                    &mut ChunkReadMemo::default(),
                 )
                 .await?
             }
@@ -1981,6 +3295,146 @@ pub mod orchestrate {
             )));
         }
         Ok(plain)
+    }
+}
+
+/// v53.0.0 (CIRISPersist#969) — **test-only: write a legacy (manifest v2,
+/// per-chunk-keyed) sealed DAG the way v52 wrote it**, so a consumer crate can
+/// test the pull of an old-format file END TO END. v53 seals every new
+/// self/family stream under one key per (stream, epoch) (manifest v4); v52's
+/// files stay readable forever, but after v53 no public door writes one. This
+/// is the one v2 writer: persist's own witnesses (I315, I314c) call it too.
+///
+/// Compiled only under `test` or the `test-anchor` feature (never in a
+/// published wheel; Edge's dev-dependency enables `ciris-persist/test-anchor`).
+#[cfg(all(
+    any(test, feature = "test-anchor"),
+    any(feature = "postgres", feature = "sqlite")
+))]
+pub mod test_support {
+    use crate::federation::blobs::{BlobBody, BlobError, BlobStorage};
+    use crate::federation::types::cohort_scope::CryptoTier;
+    use crate::federation::{FederationDirectory, StorageFloor, StreamClaim};
+
+    /// What [`write_legacy_v2_dag`] wrote: the identifiers a consumer pulls by.
+    #[derive(Debug, Clone)]
+    pub struct LegacyV2Dag {
+        /// The DAG's content address: the sealed v2 manifest's sha256.
+        pub manifest_sha256: [u8; 32],
+        /// Each chunk's content address (of its ciphertext), in `seq` order.
+        pub chunk_sha256: Vec<[u8; 32]>,
+        /// The file's plaintext: the chunks concatenated.
+        pub plaintext: Vec<u8>,
+    }
+
+    /// Write `chunks` to `stream_id` as a v52 node did, then seal it, on the
+    /// node `engine` runs over `backend` (the same backend, as a consumer holds
+    /// it next to its `Engine`).
+    ///
+    /// - chunk 0 goes through the v52 chunk door's steps verbatim: a fresh DEK,
+    ///   the position AAD, the floor with no stream slot, the per-chunk content
+    ///   grants to `group_key_id`'s cohort (the owner for `self`, the family key
+    ///   for `family`);
+    /// - every later chunk goes through the public chunk door, which keeps a
+    ///   stream that already holds a per-chunk-keyed chunk per-chunk;
+    /// - the public seal door then seals a **v2** manifest (no `chunk_keys`, no
+    ///   epochs, no terminators) and grants it.
+    ///
+    /// `aad` is the caller AAD a v52 writer passed to BOTH doors (CIRISEdge's
+    /// `content_aad(author, asserted_at, field)` at a sealed tier, `None` at
+    /// plaintext): persist frames it with `(stream_id, seq)` for each chunk and
+    /// binds the manifest to it, so a reader must pass the same bytes to
+    /// `read_blob_as` / `sealed_dag_readiness` (as `caller_aad_b64`) / the adopt
+    /// and promote doors.
+    ///
+    /// The content key-grant sets are left pending, as any write leaves them:
+    /// `engine.emit_pending_key_grants()` emits them for delivery. No clock is
+    /// read here beyond what the public doors read themselves.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for no chunks; otherwise whatever the doors refuse.
+    pub async fn write_legacy_v2_dag<B>(
+        engine: &crate::Engine,
+        backend: &B,
+        cohort_scope: &str,
+        group_key_id: &str,
+        stream_id: &str,
+        chunks: &[Vec<u8>],
+        aad: Option<&[u8]>,
+    ) -> Result<LegacyV2Dag, BlobError>
+    where
+        B: BlobStorage + FederationDirectory + Sync,
+    {
+        let Some((first, rest)) = chunks.split_first() else {
+            return Err(BlobError::InvalidArgument(
+                "write_legacy_v2_dag: a DAG has at least one chunk".into(),
+            ));
+        };
+        let node_key = engine
+            .local_derived_key_id()
+            .await
+            .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: node key: {e}")))?;
+        // The v52 chunk door, verbatim.
+        let dek = crate::federation::at_rest_cascade::fresh_dek()
+            .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: dek: {e}")))?;
+        let env = crate::federation::at_rest_cascade::seal(
+            &dek,
+            first,
+            Some(&super::chunk_aad(aad, stream_id, 0)),
+        )
+        .map_err(|e| BlobError::Backend(format!("write_legacy_v2_dag: seal chunk 0: {e}")))?;
+        let sha0 = backend
+            .put_blob_chunk_with_scope(
+                stream_id,
+                0,
+                BlobBody::Inline(env.to_bytes()),
+                0,
+                first.len() as u64,
+                cohort_scope,
+                StorageFloor::resolved(CryptoTier::InvisibleEncrypted),
+                None,
+                StreamClaim {
+                    community_key_id: Some(group_key_id.to_owned()),
+                    owner_key_id: Some(node_key),
+                    stream_key: None,
+                },
+            )
+            .await?;
+        crate::federation::at_rest_cascade::orchestrate::grant_dek_to_cohort(
+            backend,
+            &sha0,
+            cohort_scope,
+            group_key_id,
+            &dek,
+        )
+        .await?;
+        let mut chunk_sha256 = vec![sha0];
+        let mut plaintext = first.clone();
+        // The stream continues on the per-chunk path through the door.
+        for (i, seg) in rest.iter().enumerate() {
+            let put = engine
+                .put_blob_chunk_scoped(
+                    cohort_scope,
+                    Some(group_key_id),
+                    stream_id,
+                    i as u64 + 1,
+                    seg,
+                    0,
+                    aad,
+                )
+                .await?;
+            chunk_sha256.push(put.chunk_sha256);
+            plaintext.extend_from_slice(seg);
+        }
+        let sealed = engine
+            .seal_stream_scoped(cohort_scope, Some(group_key_id), stream_id, None, aad)
+            .await?;
+        Ok(LegacyV2Dag {
+            manifest_sha256: sealed.manifest_sha256,
+            chunk_sha256,
+            plaintext,
+        })
     }
 }
 
@@ -2194,6 +3648,7 @@ pub mod invariants {
                     StreamClaim {
                         community_key_id: Some(comm.clone()),
                         owner_key_id: Some(owner.clone()),
+                        stream_key: None,
                     },
                 )
                 .await
@@ -2493,10 +3948,11 @@ pub mod invariants {
     }
 
     // ── I34b — self/family ───────────────────────────────────────────────
-    /// **A `self` DAG is a per-chunk fresh-DEK DAG**: each chunk row and
-    /// the manifest carry persist's self-retention grant and the owner's
-    /// occurrence grant; the occurrence reads whole and by range; a stranger
-    /// is refused; nothing is announced.
+    /// **A `self` DAG is stream-keyed** (v53.0.0, #969): the manifest carries
+    /// persist's self-retention grant and the owner's occurrence grant; the
+    /// chunk rows carry NONE — the stream epoch's DEK is wrapped once to the
+    /// occurrence; the occurrence reads whole and by range; a stranger is
+    /// refused; nothing is announced.
     pub async fn exercise_i34b_self_dag_reads_by_grant<B>(backend: &B, tag: &str)
     where
         B: BlobStorage + FederationDirectory + Sync,
@@ -2541,20 +3997,43 @@ pub mod invariants {
             .await
             .unwrap_or_else(|e| panic!("{tag} I34b: seal: {e}"));
         let manifest = sealed.manifest_sha256;
-        for s in chunk_shas.iter().chain(std::iter::once(&manifest)) {
+        assert!(
+            backend
+                .get_at_rest_grant(&manifest, PERSIST_SELF_RECIPIENT)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I34b: persist self-retention on the manifest"
+        );
+        assert!(
+            backend
+                .get_at_rest_grant(&manifest, &occ)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I34b: the occurrence's grant on the manifest"
+        );
+        for s in &chunk_shas {
             assert!(
-                backend
-                    .get_at_rest_grant(s, PERSIST_SELF_RECIPIENT)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "{tag} I34b: persist self-retention on every row"
-            );
-            assert!(
-                backend.get_at_rest_grant(s, &occ).await.unwrap().is_some(),
-                "{tag} I34b: the occurrence's grant on every row"
+                backend.list_at_rest_grants(s).await.unwrap().is_empty()
+                    && backend
+                        .get_at_rest_grant(s, PERSIST_SELF_RECIPIENT)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                "{tag} I34b: a stream-keyed chunk row carries no per-chunk grant (#969)"
             );
         }
+        let writer = signer.derived_key_id();
+        assert!(
+            backend
+                .stream_dek_grants(&stream, 0, &writer)
+                .await
+                .unwrap()
+                .iter()
+                .any(|w| w.recipient_key_id == occ),
+            "{tag} I34b: the occurrence holds the stream epoch's wrap"
+        );
         assert!(
             backend.list_holders(&manifest).await.unwrap().is_empty(),
             "{tag} I34b: a self DAG is structurally invisible — no holds_bytes"
@@ -2640,16 +4119,26 @@ pub mod invariants {
             );
             assert!(
                 backend
-                    .get_at_rest_grant(&c.chunk_sha256, &later_occ)
+                    .stream_dek_grants(&stream2, 0, &signer.derived_key_id())
                     .await
                     .unwrap()
-                    .is_some(),
-                "{tag} D9: the seal widened the chunk row to the stream's access set"
+                    .iter()
+                    .any(|w| w.recipient_key_id == later_occ),
+                "{tag} D9: the seal widened the stream epoch to the stream's access set"
             );
+            assert!(
+                backend
+                    .list_at_rest_grants(&c.chunk_sha256)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{tag} D9: and not the chunk row (#969)"
+            );
+            assert!(sealed2.chunk_key_grant_emissions.is_empty());
             assert_eq!(
-                sealed2.chunk_key_grant_emissions.len(),
+                sealed2.stream_key_grant_emissions.len(),
                 1,
-                "{tag} D9: the widened chunk's key-grant set is emitted"
+                "{tag} D9: the widened epoch's key-grant set is emitted, once"
             );
             assert_eq!(
                 read_any_for_viewer(backend, &sealed2.manifest_sha256, &later_occ, None)
@@ -2680,10 +4169,14 @@ pub mod invariants {
                         None
                     )
                     .await,
-                    Err(BlobError::NotGranted { .. })
+                    Err(BlobError::ChunkKeyNotYetGranted {
+                        key: crate::federation::ChunkKeyRef::Stream { .. },
+                        ..
+                    })
                 ),
-                "{tag} I34b: a viewer granted on the manifest but not on the chunk row read the \
-                 chunk — the reader trusted the manifest's grant for every chunk"
+                "{tag} I34b: a viewer granted on the manifest but not on the chunk's epoch read \
+                 the chunk — the reader trusted the manifest's grant for every chunk (#969: \
+                 the refusal names the stream key, retryably)"
             );
         }
     }
@@ -3004,6 +4497,7 @@ pub mod invariants {
                     StreamClaim {
                         community_key_id: Some(comm.clone()),
                         owner_key_id: Some(owner.clone()),
+                        stream_key: None,
                     },
                 )
                 .await;
@@ -3370,6 +4864,7 @@ pub mod invariants {
                 StreamClaim {
                     community_key_id: Some(comm.clone()),
                     owner_key_id: Some(key_a.clone()),
+                    stream_key: None,
                 },
             )
             .await
@@ -3410,6 +4905,7 @@ pub mod invariants {
                 StreamClaim {
                     community_key_id: Some(comm.clone()),
                     owner_key_id: Some(key_a.clone()),
+                    stream_key: None,
                 },
             )
             .await
@@ -3574,11 +5070,13 @@ pub mod invariants {
                     sha: shas[1],
                     size: 200,
                     seq: Some(0),
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: shas[0],
                     size: 100,
                     seq: Some(1),
+                    epoch: None,
                 },
             ],
             chunk_tier: Some(CryptoTier::CommunityDek),
@@ -3658,6 +5156,7 @@ pub mod invariants {
                 StreamClaim {
                     community_key_id: Some(comm.clone()),
                     owner_key_id: Some(owner.clone()),
+                    stream_key: None,
                 },
             )
             .await
@@ -3837,7 +5336,7 @@ pub mod invariants {
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
                 identity_key_id: identity_key_id.to_owned(),
                 occurrence_key_id: occurrence_key_id.to_owned(),
-                device_class: crate::federation::types::device_class::SERVER.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: chrono::Utc::now(),
                 valid_until: None,

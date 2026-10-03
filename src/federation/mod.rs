@@ -34,6 +34,10 @@
 
 pub mod accord_carriage;
 pub mod accord_quorum;
+/// v53.0.0 (CC 4.2.6) — an accord holder's recovery under a pre-committed key.
+pub mod accord_recovery;
+/// v53.0.0 (CC 4.2.6) — the accord's roster change, the door's third shape.
+pub mod accord_roster;
 pub mod admission;
 pub mod adopt_cascade;
 pub mod age;
@@ -69,8 +73,15 @@ pub mod community_dek;
 pub mod consent;
 pub mod consent_grammar;
 pub mod consent_peer_set;
+/// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — `custody:ack:v1`: which of
+/// a cohort's own devices hold a blob, folded at read time.
+pub mod custody_ack;
+mod custody_ack_invariants;
 /// v51.0.0 (CIRISPersist#938/#937) — the lineage-head cosign object and predicates.
 pub mod lineage_witness;
+/// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — roster rows and the head: a version
+/// must reflect the fold, an uncovered row lags the head.
+pub mod roster_head;
 // CIRISPersist#857 (`FSD/CONSENT_BY_HUMANS.md`) — consent is by humans: the
 // principal walk in the consent doors, one combine rule.
 pub mod consent_by_humans;
@@ -119,6 +130,10 @@ pub mod self_collective;
 pub(crate) mod adopt_batch_invariants;
 /// v47.2.0 (CIRISPersist#853) — CC 2.3 at the bytes plane: the binding fold.
 pub mod blob_tombstone;
+/// CIRISPersist#973 — I366–I370, an unlabelled delegation is no charter and
+/// no acceptance edge ("bundle only").
+#[cfg(test)]
+mod bundle_only_invariants;
 /// v47.2.0 (CIRISPersist#853, #862) — I149–I153.
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod bytes_plane_tombstone_invariants;
@@ -136,6 +151,10 @@ pub(crate) mod family_dissolution_invariants;
 /// v49.0.0 (CIRISPersist#910) — I177 / I179: the family roster plane.
 #[cfg(test)]
 pub mod family_roster_invariants;
+/// v53.0.0 (CC 3.2 T2) — I383–I386, a superseded grant hands standing to its
+/// successor; a withdrawn one has none.
+#[cfg(test)]
+pub(crate) mod grant_supersede_invariants;
 /// v49.0.0 (CIRISPersist#910.5) — I178: a group amendment replicates.
 #[cfg(test)]
 pub mod group_amendment_invariants;
@@ -157,6 +176,14 @@ pub mod moderation_walk_asof_invariants;
 /// (I202–I209).
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
+// v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
+/// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod node_seat_invariants;
+/// v53.0.0 (CIRISPersist#965) — I381/I382, an occurrence's consent is never
+/// demoted to the identity's word alone.
+#[cfg(test)]
+pub(crate) mod occurrence_consent_invariants;
 /// v52.0.0 (CIRISPersist#930) — the occurrence history witnesses, every backend.
 #[cfg(test)]
 pub(crate) mod occurrence_history_invariants;
@@ -166,6 +193,18 @@ pub mod rc5_adopts_invariants;
 /// v51.0.0 — the rc6 trust-root security set (I191–I196).
 #[cfg(test)]
 pub(crate) mod rc6_invariants;
+/// v53.0.0 (CC rc7, CIRISConstitution#139) — I430–I439: commitments bind key
+/// material, the accord commits a recovery key per holder, no steward backstop,
+/// acceptance edges rotate as grants do, a keyless family confers at its quorum.
+#[cfg(test)]
+pub(crate) mod rc7_accord_invariants;
+/// CIRISPersist#973 — I345–I349, the community boot leg and the re-bake path.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod remint_invariants;
+/// v53.0.0 (CIRISEdge#763) — I415c–I415f: repair after eviction, and the
+/// custody report under the data a DAG was sealed with.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod repair_invariants;
 #[cfg(test)]
 pub mod room_roster_authority_invariants;
 /// v48.0.0 (CIRISPersist#860) — the room-roster planes witnesses.
@@ -178,6 +217,8 @@ pub mod scope_classifier_invariants;
 pub(crate) mod sealed_dag_adopt_invariants;
 #[cfg(any(test, feature = "test-anchor"))]
 pub mod self_collective_invariants;
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod stream_key_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod stream_sth_producer_invariants;
 /// v50.0.0 (CIRISPersist#919) — I186: the consent sweep never widens a placed row.
@@ -410,14 +451,40 @@ impl ConsentSweepReport {
     }
 }
 
+/// v53.0.0 (CC 4.2.6) — I450e–I450h, the accord's roster change.
+#[cfg(test)]
+mod accord_roster_invariants;
+/// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
+#[cfg(test)]
+mod lineage_head_invariants;
 pub mod register;
+/// v53.0.0 (CC 3.2 T6, rc7 `36432c6`) — I450–I459, roster rows and the head.
+#[cfg(test)]
+mod roster_head_invariants;
+/// v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: the
+/// `attestation_type` allowlist, the carrier shape, the report door.
+pub mod row_type;
+/// CIRISPersist#975 — I370–I379, the closed row-type slot.
+#[cfg(test)]
+mod row_type_invariants;
 // v45.0.0 (CIRISPersist#871, `FSD/MEDIA_SOURCE.md` §4–§5) — the rendition
 // index (V149 `blob_renditions`) and the sized holder claim, the pure half.
 pub mod renditions;
 // CIRISPersist#571 — `regime:*` experimental-regime research artifacts:
+// v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — durability at every tier: the
+// content audience of a stored blob, the small-audience target rule, the
+// deficit read.
+pub mod durability;
+#[cfg(test)]
+pub mod durability_invariants;
 // the CC-blocked registry finding + the replication decision.
 pub mod regime;
 pub mod replication;
+// v53.0.0 (CIRISPersist#963 / CIRISEdge#761) — the one audience resolver:
+// per-node cohort allow lists, public groups, `may_receive`.
+pub mod replication_audience;
+#[cfg(test)]
+pub mod replication_audience_invariants;
 pub mod replication_policy;
 pub mod rooting;
 // v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.
@@ -454,7 +521,8 @@ pub mod wire_index;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
 // nonce. Gated on `secrets`: routes through that feature's
 // `secrets::crypto` facade (MISSION §1.4 sole symmetric-crypto site).
-#[cfg(feature = "secrets")]
+// v53.0.0 (CIRISPersist#969) — compiled in every build: the self/family chunk
+// cascade seals under the STREAM nonce (its AEAD helpers stay `secrets`-gated).
 pub mod stream_seal;
 // v4.1 (CIRISPersist#142 Cut C4) — delivery-receipt canonical bytes +
 // subscriber-signature verify. Backend-agnostic; the JOIN-against-STH
@@ -528,13 +596,14 @@ pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, sign_holds_bytes_claim,
     AbandonFloorReport, BlobBody, BlobEpochBinding, BlobError, BlobHead, BlobProvenanceRow,
-    BlobRange, BlobStorage, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState, EpochBinding,
-    EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef, ManifestChildRef,
-    ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest, ParsedManifest,
-    PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition, ScopeBlobSymbol,
-    StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamHead, CHUNK_MANIFEST_VERSION,
-    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, DEFAULT_INLINE_BYTES_CAP,
-    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    BlobRange, BlobStorage, ChunkKeyRef, ChunkManifest, ChunkRef, ChunkSlice, DekKeyState,
+    EpochBinding, EvictActorReport, EvictBlobReport, ExternalRef, GrantWrap, GroupDekRef,
+    ManifestChildRef, ManifestChildRow, ManifestRowSpec, MemberGrant, NestedManifest,
+    ParsedManifest, PreparedHoldsBytes, PutBlobAttestation, PutBlobScopedResult, RosterPartition,
+    ScopeBlobSymbol, StorageFloor, StreamChunkRef, StreamChunks, StreamClaim, StreamDekRecord,
+    StreamHead, StreamKeySlot, StreamKeyState, CHUNK_KEYS_STREAM_EPOCH, CHUNK_MANIFEST_VERSION,
+    CHUNK_MANIFEST_VERSION_NESTED, CHUNK_MANIFEST_VERSION_SEALED, CHUNK_MANIFEST_VERSION_STREAM,
+    DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
@@ -833,6 +902,10 @@ pub const DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE: &str = "device_rekey_member_not_a
 /// `encryption_pubkeys`: there is nothing to wrap to, and there is no
 /// plaintext fallback (§10.1.4).
 pub const DEVICE_REKEY_RULE_NO_ENCRYPTION_PUBKEYS: &str = "device_rekey_no_encryption_pubkeys";
+/// v53.0.0 (CIRISPersist#963, CC 3.3.7) — the member's per-node allow list
+/// (or, absent one, the device's class) keeps this room off the device: a
+/// node that may not receive a cohort's content gets no key for it.
+pub const DEVICE_REKEY_RULE_NOT_IN_AUDIENCE: &str = "device_rekey_not_in_audience";
 
 /// v49.0.0 (CIRISPersist#908, FSD `ROOM_ROSTER_AUTHORITY.md` §3) — the room
 /// state a standing question is asked against: each key that has appeared, and
@@ -2169,6 +2242,49 @@ pub(crate) fn owner_binding_of(row: &Attestation) -> Option<(String, String)> {
     .then(|| (row.attesting_key_id.clone(), row.attested_key_id.clone()))
 }
 
+/// v53.0.0 (#963) — `(owner, node)` when `row` changes `owner`'s cohort allow
+/// list for `node`: a `consent:replication` grant `owner` authored FOR `node`,
+/// or `owner`'s `withdraws` / `recants` / `supersedes` of one. The write doors
+/// re-wrap on it ([`rewrap_after_admission`]), so a cohort the owner allows
+/// after the fact reaches the node with its earlier keys; a deny needs no walk
+/// here (the next write rolls the epochs the node held). A lookup that fails
+/// is logged and treated as no change: the row stands, and the pending sweep
+/// is where a missed re-wrap is retried.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) async fn consent_list_change_of<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Option<(String, String)>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let grant_for = |g: &Attestation| -> Option<String> {
+        (admission::envelope_dimension(&g.attestation_envelope)
+            == Some(consent_grammar::GRANT_DIMENSION))
+        .then(|| consent_by_humans::for_key_id_of(&g.attestation_envelope))
+        .flatten()
+        .filter(|node| *node != g.attesting_key_id)
+        .map(str::to_owned)
+    };
+    if let Some(node) = grant_for(row) {
+        return Some((row.attesting_key_id.clone(), node));
+    }
+    if !precedence::is_structural_composer(&row.attestation_type) {
+        return None;
+    }
+    let target = precedence::references_attestation_id_from_envelope(&row.attestation_envelope)?;
+    match directory.get_attestation(target).await {
+        Ok(Some(g)) if g.attesting_key_id == row.attesting_key_id => {
+            grant_for(&g).map(|node| (g.attesting_key_id.clone(), node))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, target = %target, "consent list change: lookup failed (#963)");
+            None
+        }
+    }
+}
+
 /// v50.0.0 (CIRISPersist#916) — run
 /// [`FederationDirectory::rewrap_own_epochs_for_device`] after a receive door
 /// admitted its row. The row stands whatever happens here: a failure is
@@ -2559,6 +2675,23 @@ pub trait FederationDirectory: Send + Sync {
         Ok(None)
     }
 
+    /// CIRISPersist#973 (CC 3.2 T4a, "bundle only"; V167) — was this
+    /// `delegates_to` row, carrying no `trust:{job}` label, already held when
+    /// this node began enforcing the rule that an unlabelled row is no charter
+    /// and no acceptance edge? "Unlabelled rows a node already holds keep
+    /// their reading under T4." The set is recorded once, by the V167
+    /// migration, and never grows afterwards. Returns the subset of
+    /// `attestation_ids` that is held, in one read. The default answers with
+    /// none: a directory that recorded nothing holds nothing under the old
+    /// reading.
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, Error> {
+        let _ = attestation_ids;
+        Ok(Vec::new())
+    }
+
     /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated
     /// Key-plane apply** for anti-entropy replication, dyn-dispatchable.
     ///
@@ -2942,6 +3075,10 @@ pub trait FederationDirectory: Send + Sync {
     /// epochs to re-wrap. The sqlite and postgres backends run
     /// [`at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices`](crate::federation::at_rest_cascade::orchestrate::rewrap_own_epochs_to_member_devices)
     /// under their node key (none set: nothing is theirs to re-wrap).
+    /// v53.0.0 (#963) — and, first, the self/family walk
+    /// ([`at_rest_cascade::orchestrate::rekey_self_family_for_device`](crate::federation::at_rest_cascade::orchestrate::rekey_self_family_for_device)):
+    /// a device re-classed into its owner's self/family audience gets the
+    /// self/family keys this node holds.
     async fn rewrap_own_epochs_for_device(&self, owner: &str, device: &str) -> Result<(), Error> {
         let _ = (owner, device);
         Ok(())
@@ -5193,6 +5330,13 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ServedAttestation>, Error>;
 
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — every stored
+    /// `attestation_type` with its row count and `asserted_at` span, every
+    /// tier. The inventory [`row_type::row_type_report`] filters to the types
+    /// the closed slot does not register. Bounded by the number of DISTINCT
+    /// types, not rows.
+    async fn attestation_type_census(&self) -> Result<Vec<row_type::AttestationTypeCount>, Error>;
+
     /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
     /// [`SignedIdentityOccurrenceRevocation`] wrappers since a cursor — the
     /// bulk-read mirror of
@@ -5575,8 +5719,9 @@ pub trait FederationDirectory: Send + Sync {
     /// - it is TRUSTED-LOCAL (no signature columns: `self_at_login`, the HTTP
     ///   self-bind — produced by this node for its own user, never reachable
     ///   from the replication apply), or
-    /// - a stored signed row for the pair was signed by the OCCURRENCE
-    ///   ([`occurrence_agreed_to`]).
+    /// - the OCCURRENCE itself ever signed an admitted assertion of the pair
+    ///   ([`occurrence_agreed_to`], over the V161 history — v53.0.0, #965: a
+    ///   later re-signing by the identity does not erase it).
     async fn active_identities_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -5601,9 +5746,16 @@ pub trait FederationDirectory: Send + Sync {
                 .filter(|s| s.identity_occurrence.occurrence_key_id == occurrence_key_id)
                 .collect();
             let trusted_local = signed_for_pair.is_empty();
-            let agreed = signed_for_pair
-                .iter()
-                .any(|s| s.attesting_key_id == occurrence_key_id);
+            // v53.0.0 (CIRISPersist#965) — agreement is read from the V161
+            // HISTORY (#930), not the current row. The current row is
+            // last-signed-wins over `(identity, occurrence)`, so an identity
+            // re-signing the pair (`self_at_login` naming a node's own engine
+            // occurrence) replaced the occurrence's own row and the binding
+            // resolved nothing: the node stopped being party to its owner's
+            // rooms (CIRISEdge#768). The re-signing never erased agreement
+            // (I271); the resolver now agrees with that fold.
+            let agreed = !trusted_local
+                && occurrence_agreed_to(self, &io.identity_key_id, occurrence_key_id).await?;
             if !(trusted_local || agreed) {
                 continue;
             }
@@ -8826,12 +8978,13 @@ pub trait FederationDirectory: Send + Sync {
 
     /// #302 — record the server's frozen-L decision (M2). IMMUTABLE: a
     /// differing re-PUT for the same proposal is [`Error::Conflict`]; an
-    /// identical one is an idempotent no-op. `steward_signatures` carries the
-    /// |L|<L_FLOOR backstop (H6) when present.
+    /// identical one is an idempotent no-op.
+    ///
+    /// v53.0.0 (CC 4.2.6 rc7, CIRISConstitution#139) — the steward-signature
+    /// argument is gone with the regional-steward backstop (H6) it carried.
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), Error>;
 
     /// #302 — the stored decision for `proposal_digest`, or `None`.
@@ -9068,6 +9221,17 @@ pub enum Error {
     /// none: ATTACHING is gated on freshness; attached never is.
     #[error("trust root head stale: attaching {root_key_id} refused — {detail}")]
     TrustRootHeadStale {
+        /// The root being attached.
+        root_key_id: String,
+        /// The rule that refused, in words.
+        detail: String,
+    },
+    /// CIRISPersist#973 (CC 3.2 T4a, rc6) — a NEW acceptance edge
+    /// (`trust:accepts:v1`) named no lineage head. A new edge names the head
+    /// it attaches on in every mode; an edge this node already holds is not
+    /// re-judged.
+    #[error("trust root head unnamed: attaching {root_key_id} refused — {detail}")]
+    TrustRootHeadUnnamed {
         /// The root being attached.
         root_key_id: String,
         /// The rule that refused, in words.
@@ -9591,6 +9755,44 @@ pub enum Error {
         family_stem: &'static str,
         /// Stable machine-readable reason token, via
         /// [`admission::NamespaceConformanceReason::as_str`].
+        reason: &'static str,
+    },
+
+    /// v53.0.0 (CIRISPersist#975, **CC 2.4** "The row-type slot is closed").
+    /// The row's `attestation_type` is neither one of the five structural
+    /// types nor a whole-string, byte-exact match for a registered carrier in
+    /// the vendored registry's `_meta.row_types`.
+    ///
+    /// Raised only under [`row_type::RowTypeEnforcement::Enforce`]. v53 ships
+    /// [`row_type::ROW_TYPE_ENFORCEMENT`] = `Report`: the row is admitted and
+    /// counted, because CIRISServer's legacy `consent` rows (CIRISServer#713)
+    /// must be re-authored as `scores` fleet-wide before a release refuses them.
+    #[error(
+        "attestation type unregistered (CC 2.4): {attestation_type:?} is not one of the five row          types (scores, delegates_to, supersedes, withdraws, recants) nor a registered carrier —          the row-type slot is closed; a claim rides `scores` with its family in `dimension`"
+    )]
+    AttestationTypeUnregistered {
+        /// The refused `attestation_type`, verbatim.
+        attestation_type: String,
+        /// CC's refusal token, read from `_meta.row_types.refusal`
+        /// (`attestation_type_unregistered`).
+        reason: &'static str,
+    },
+
+    /// v53.0.0 (CIRISPersist#975, **CC 2.4** carrier shape). A row of a
+    /// registered CARRIER type (`holds_bytes:sha256:{prefix}`,
+    /// `key_grant:{axis}:v1`) whose shape is not a carrier's: not a
+    /// self-attestation, an envelope `kind` other than the carrier's, or a
+    /// `dimension` / `score` / `confidence` / `weight` / non-empty
+    /// `subject_key_ids` — the members that would make it a claim. Enforced in
+    /// v53 at every admission door (no emitter anywhere writes another shape).
+    #[error(
+        "carrier row malformed (CC 2.4): {attestation_type:?} is a registered carrier row type,          and a carrier is a self-attestation whose envelope `kind` is the carrier's and which          carries no claim members — refused: {reason}"
+    )]
+    CarrierRowMalformed {
+        /// The carrier `attestation_type`.
+        attestation_type: String,
+        /// Which part of the carrier shape the row broke
+        /// ([`row_type::CarrierShapeViolation::as_str`]).
         reason: &'static str,
     },
 
@@ -10538,6 +10740,23 @@ pub enum Error {
         member_role: &'static str,
     },
 
+    /// v53.0.0 (CC 3.2 T6, rc7 `36432c6`, consequence (i)) — a new version of
+    /// a witnessed lineage whose roster disagrees with the fold of the roster
+    /// rows effective up to it. `keys` are the seats (or roles) the roster
+    /// planes move that the version does not reflect. The conferring quorum
+    /// re-signs a version that covers them; nothing is written
+    /// ([`roster_head::check_version_covers_fold`]).
+    #[error(
+        "lineage_version_disagrees_with_roster_fold: {lineage_key_id}: the version's roster \
+         disagrees with the fold of the roster rows effective up to it at {keys:?} (CC 3.2 T6)"
+    )]
+    LineageVersionDisagreesWithFold {
+        /// The lineage (family or community id).
+        lineage_key_id: String,
+        /// The keys the roster planes move that the version does not reflect.
+        keys: Vec<String>,
+    },
+
     /// v50.0.0 (CIRISPersist#925/#927, CC 3.2 / CC 3.4.2) — an
     /// `infrastructure` community record (or its supersede, or a widening
     /// that promotes a founder) is non-conformant:
@@ -10928,6 +11147,7 @@ impl Error {
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
             Error::TrustRootHeadStale { .. } => "trust_root_head_stale",
+            Error::TrustRootHeadUnnamed { .. } => "trust_root_head_unnamed",
             Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
             Error::NoConstitutionalRootYet { .. } => "federation_no_constitutional_root_yet",
             Error::ConstitutionalFamilyReserved { .. } => {
@@ -10964,6 +11184,8 @@ impl Error {
             Error::NamespacePrivateUseNotFederatable { .. } => {
                 "federation_namespace_private_use_not_federatable"
             }
+            Error::AttestationTypeUnregistered { .. } => "federation_attestation_type_unregistered",
+            Error::CarrierRowMalformed { .. } => "federation_carrier_row_malformed",
             Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
             Error::AccordHolderRequiresAttestationEvidence { .. } => {
                 "federation_accord_holder_requires_attestation_evidence"
@@ -11013,6 +11235,9 @@ impl Error {
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::CommunityConsensusProtocolViolation { .. } => {
                 "federation_community_consensus_protocol_violation"
+            }
+            Error::LineageVersionDisagreesWithFold { .. } => {
+                roster_head::LINEAGE_VERSION_DISAGREES_WITH_FOLD
             }
             Error::NodeIdentityNotExclusive { .. } => "federation_node_identity_not_exclusive",
             Error::NodeIdentityImmutable { .. } => "federation_node_identity_immutable",

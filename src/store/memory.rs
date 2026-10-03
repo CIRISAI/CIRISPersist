@@ -154,6 +154,10 @@ struct State {
     /// v50.0.0 (CIRISPersist#928, V157 mirror) — the delegation depth each
     /// admitted `withdraws` was admitted under.
     federation_withdraws_admission_depths: HashMap<String, usize>,
+    /// #973 (V167) — unlabelled `delegates_to` ids held before the "bundle
+    /// only" rule. A memory backend is born after the rule, so this is empty
+    /// outside tests ([`MemoryBackend::mark_trust_direction_held`]).
+    federation_trust_direction_held: std::collections::HashSet<String>,
     /// v17.4.0 (V106) — the in-memory mirror of the `attestation_subjects`
     /// projection: `subject_key_id → [attestation_id, …]`. Maintained on every
     /// attestation write (put + local upsert/insert). Advisory: reads still
@@ -929,6 +933,7 @@ impl Default for MemoryBackend {
                 federation_keys: HashMap::new(),
                 federation_attestations: Vec::new(),
                 federation_withdraws_admission_depths: HashMap::new(),
+                federation_trust_direction_held: std::collections::HashSet::new(),
                 subject_index: HashMap::new(),
                 announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
@@ -1108,6 +1113,19 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// #973 — record `attestation_id` as an unlabelled `delegates_to` this
+    /// backend held before the "bundle only" rule (what V167 records on the
+    /// SQL backends at upgrade). A memory backend never upgrades, so this is
+    /// the only way its tests reach the held-row arm.
+    #[cfg(any(test, feature = "test-anchor"))]
+    pub fn mark_trust_direction_held(&self, attestation_id: &str) {
+        self.state
+            .lock()
+            .expect("memory backend lock")
+            .federation_trust_direction_held
+            .insert(attestation_id.to_owned());
     }
 
     /// v31.0.0 (CIRISPersist#646) — the memory twin of
@@ -1558,6 +1576,9 @@ impl MemoryBackend {
         // witnessed lineage head inside the root's attach window.
         crate::federation::canonical_community::check_attach_freshness(
             self,
+            crate::federation::canonical_community::AttachDoor::Author,
+            input.attestation_id.as_deref(),
+            &input.attesting_key_id,
             &input.attestation_type,
             input
                 .attested_key_id
@@ -1926,6 +1947,8 @@ impl MemoryBackend {
             })
             .collect();
         let community = crate::federation::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_key_id.to_owned(),
             community_name: format!("test-community:{community_key_id}"),
             members,
@@ -2900,6 +2923,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .copied())
     }
 
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(attestation_ids
+            .iter()
+            .filter(|id| state.federation_trust_direction_held.contains(*id))
+            .cloned()
+            .collect())
+    }
+
     fn node_key_id(&self) -> Option<String> {
         self.node_key_id.read().expect("node_key_id lock").clone()
     }
@@ -3548,6 +3583,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // and promoting), and backend-symmetric across memory / sqlite /
         // postgres.
         crate::federation::admission::check_row_column_binding(&row)?;
+        // v53.0.0 (CIRISPersist#975, CC 2.4) — THE CLOSED ROW-TYPE SLOT, beside
+        // the binding that makes the type a signed fact. The five + registered
+        // carriers; a carrier of the wrong shape refused; an unregistered type
+        // reported (refused once `row_type::ROW_TYPE_ENFORCEMENT` flips). Pure
+        // ⇒ AV-76 TIER 1, backend-symmetric.
+        crate::federation::row_type::admit_row_type(&row)?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate VALUE validation. Rejects out-of-closed-set values
@@ -3882,6 +3923,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // witnessed lineage head inside the root's attach window.
         crate::federation::canonical_community::check_attach_freshness(
             self,
+            crate::federation::canonical_community::AttachDoor::of(&origin),
+            Some(&row.attestation_id),
+            &row.attesting_key_id,
             &row.attestation_type,
             &row.attested_key_id,
             &row.attestation_envelope,
@@ -3950,6 +3994,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             self, &row,
         )
         .await?;
+        // CC 3.1.3.3 — `custody:ack:v1` is a holder self-report, placed within
+        // the blob's own cohort (v53.0.0, CIRISPersist#942 part 2).
+        crate::federation::custody_ack::check_custody_ack_admission(self, &row).await?;
         // CC 3.1 — a lowercase family stem, or the row evades every family gate
         // (v42.0.0, CIRISPersist#814).
         crate::federation::admission::check_dimension_case_rule(&row)?;
@@ -4399,6 +4446,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .iter()
                 .filter(|r| {
                     r.tier == crate::federation::types::attestation_tier::FEDERATION
+                        // v53.0.0 (#975) — the replicable set excludes an
+                        // unregistered type under enforcement.
+                        && crate::federation::row_type::served_under_enforcement(r)
                         && subject_key_id
                             .is_none_or(|subj| r.subject_key_ids.iter().any(|s| s == subj))
                 })
@@ -6177,6 +6227,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             &prior.persist_row_hash,
                         )?;
                     }
+                    // v53.0.0 (CC 3.2 T6) — the version names the head it
+                    // succeeds; checked under the same lock that replaces it.
+                    crate::federation::group_amendment::check_prev_head_names_held(
+                        &cohort_str,
+                        &key,
+                        &new_fam.prev_head_digest,
+                        &prior.persist_row_hash,
+                        authorization.as_ref(),
+                    )?;
                     let cur_ver = *state
                         .federation_group_current_version
                         .get(&(cohort_str.clone(), key.clone()))
@@ -6267,6 +6326,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                             &prior.persist_row_hash,
                         )?;
                     }
+                    // v53.0.0 (CC 3.2 T6) — the version names the head it
+                    // succeeds; checked under the same lock that replaces it.
+                    crate::federation::group_amendment::check_prev_head_names_held(
+                        &cohort_str,
+                        &key,
+                        &new_comm.prev_head_digest,
+                        &prior.persist_row_hash,
+                        authorization.as_ref(),
+                    )?;
                     let cur_ver = *state
                         .federation_group_current_version
                         .get(&(cohort_str.clone(), key.clone()))
@@ -6765,19 +6833,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::Error;
-        let prep = crate::federation::accord_quorum::prepare_decision(
-            &decision,
-            steward_signatures,
-            chrono::Utc::now(),
-        )?;
+        let prep =
+            crate::federation::accord_quorum::prepare_decision(&decision, chrono::Utc::now())?;
         let crate::federation::accord_quorum::PreparedDecision {
             proposal_digest,
             persist_row_hash,
             decided_at,
-            steward_signatures,
             ..
         } = prep;
         let mut state = self.state.lock().expect("memory backend lock");
@@ -6794,7 +6857,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             proposal_digest,
             crate::federation::accord_quorum::StoredDecision {
                 decision,
-                steward_signatures,
                 persist_row_hash,
                 decided_at,
             },
@@ -9559,6 +9621,31 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn attestation_type_census(
+        &self,
+    ) -> Result<Vec<crate::federation::row_type::AttestationTypeCount>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut by: std::collections::BTreeMap<
+            String,
+            crate::federation::row_type::AttestationTypeCount,
+        > = std::collections::BTreeMap::new();
+        for a in &state.federation_attestations {
+            let e = by.entry(a.attestation_type.clone()).or_insert_with(|| {
+                crate::federation::row_type::AttestationTypeCount {
+                    attestation_type: a.attestation_type.clone(),
+                    count: 0,
+                    oldest: a.asserted_at,
+                    newest: a.asserted_at,
+                }
+            });
+            e.count += 1;
+            e.oldest = e.oldest.min(a.asserted_at);
+            e.newest = e.newest.max(a.asserted_at);
+        }
+        Ok(by.into_values().collect())
+    }
+
     async fn list_attestations_since(
         &self,
         since: Option<(chrono::DateTime<chrono::Utc>, String)>,
@@ -9585,6 +9672,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .iter()
             .filter(|a| {
                 a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    // v53.0.0 (#975, CC 2.4) — under enforcement a held row of
+                    // an unregistered type is neither served nor replicated.
+                    && crate::federation::row_type::served_under_enforcement(a)
                     && since.as_ref().is_none_or(|(s_at, s_id)| {
                         (position(a), a.attestation_id.as_str()) > (*s_at, s_id.as_str())
                     })
@@ -16643,6 +16733,16 @@ mod tests {
         d
     }
 
+    /// #973 — a node's acceptance edge toward a root, naming its job
+    /// (`trust:accepts:v1`). An unlabelled `delegates_to` gives no acceptance.
+    fn fix_accepts(id: &str, node: &str, root: &str, scope: serde_json::Value) -> Attestation {
+        let mut d = fix_delegates_to(id, node, root, scope);
+        d.attestation_envelope["dimension"] =
+            serde_json::json!(crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION);
+        resign_fix(&mut d);
+        d
+    }
+
     /// v18.2.0 (CIRISPersist#481) — the pluggable-trust-root witnesses, all
     /// four asks through the REAL write + walk surfaces:
     /// 1. self-root `attestation(user → user)` ADMITS;
@@ -16702,7 +16802,7 @@ mod tests {
         // The user's trust edge.
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to(
+                attestation: fix_accepts(
                     "tr-edge",
                     "tr-user",
                     "tr-root",
@@ -17002,12 +17102,20 @@ mod tests {
             "(1) correctly-named rows walk: {v:?}"
         );
 
-        // ── (2) UNDIMENSIONED rows still walk. This is the additive
-        //    guarantee for every row written before v23.0.0: no wire break,
-        //    no migration, no re-signing. Asserted deliberately here rather
-        //    than left to whichever fixture happened not to be stamped.
+        // ── (2) UNDIMENSIONED rows. #973 (CC 3.2 T4a): a NEW unlabelled row
+        //    is no charter and gives no acceptance; the rows a node HELD when
+        //    that rule arrived still walk by direction — no wire break and no
+        //    re-signing for every row written before v23.0.0.
+        let unlabelled = |mut a: Attestation| {
+            a.attestation_envelope
+                .as_object_mut()
+                .unwrap()
+                .remove("dimension");
+            resign_fix(&mut a);
+            a
+        };
         for a in [
-            fix_charter("d551-plaincharter", "d551-plain", scope()),
+            unlabelled(fix_charter("d551-plaincharter", "d551-plain", scope())),
             fix_delegates_to("d551-plainedge", "d551-user", "d551-plain", scope()),
             lifecycle("d551-plainlc", "d551-plain"),
         ] {
@@ -17020,8 +17128,18 @@ mod tests {
             .await
             .expect("walk");
         assert!(
+            !plain.edge_exists && !plain.root_self_declares && !plain.valid,
+            "(2) a NEW unlabeled row is neither charter nor acceptance: {plain:?}"
+        );
+        for id in ["d551-plaincharter", "d551-plainedge"] {
+            backend.mark_trust_direction_held(id);
+        }
+        let plain = trust_root_valid(&backend, "d551-user", "d551-plain")
+            .await
+            .expect("walk");
+        assert!(
             plain.edge_exists && plain.root_self_declares && plain.valid,
-            "(2) direction inference still decides an unlabeled row: {plain:?}"
+            "(2) direction inference still decides a HELD unlabeled row: {plain:?}"
         );
 
         // ── (3) CONTRADICTION: same shapes, labels swapped. The charter
@@ -17434,7 +17552,7 @@ mod tests {
     /// dead to the walk as a tombstoned one.
     #[tokio::test]
     async fn rc3_charter_deltas_488() {
-        use crate::federation::trust_root::{pre_rotation_commitment, trust_root_valid};
+        use crate::federation::trust_root::{test_pre_rotation_commitment, trust_root_valid};
         let backend = MemoryBackend::new();
         for (k, it) in [
             ("rc-user", "user"),
@@ -17484,7 +17602,7 @@ mod tests {
             .expect("serve-only self-loop admits (charter-shaped, commitment present)");
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to(
+                attestation: fix_accepts(
                     "rc-edge2",
                     "rc-user",
                     "rc-root2",
@@ -17529,7 +17647,7 @@ mod tests {
         // successor set; the bound successor charter ADMITS; a non-binding
         // one REFUSES; a non-member attester REFUSES.
         let successors = vec!["rc-root2".to_owned(), "rc-user".to_owned()];
-        let commitment = pre_rotation_commitment(&successors).unwrap();
+        let commitment = test_pre_rotation_commitment(&successors).unwrap();
         let mut pred = fix_delegates_to(
             "rc-pred",
             "rc-root",
@@ -17557,7 +17675,7 @@ mod tests {
             "references_attestation_id": "rc-succ",
             "scope": ["infra:serve", "infra:attest"],
             "pre_rotation_commitment":
-                pre_rotation_commitment(&["rc-next-a".to_owned()]).unwrap(),
+                test_pre_rotation_commitment(&["rc-next-a".to_owned()]).unwrap(),
             "recovers": "rc-root",
             "successor_keys": successors,
         });
@@ -17690,7 +17808,7 @@ mod tests {
             .unwrap();
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to("cr-edge", "cr-user", "cr-root", infra()),
+                attestation: fix_accepts("cr-edge", "cr-user", "cr-root", infra()),
             })
             .await
             .unwrap();
@@ -18260,7 +18378,7 @@ mod tests {
     fn fix_charter(id: &str, root: &str, scope: serde_json::Value) -> Attestation {
         let successors = vec![format!("{root}-succ-a"), format!("{root}-succ-b")];
         let commitment =
-            crate::federation::trust_root::pre_rotation_commitment(&successors).unwrap();
+            crate::federation::trust_root::test_pre_rotation_commitment(&successors).unwrap();
         let mut d = fix_attestation(id, root, root, root);
         d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
         crate::federation::tier_ingest::test_support::reseal(&mut d);
@@ -18268,6 +18386,8 @@ mod tests {
             "references_attestation_id": id,
             "scope": scope,
             "pre_rotation_commitment": commitment,
+            // #973 — a charter names its job; an unlabelled one is no charter.
+            "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
         });
         resign_fix(&mut d);
         d
@@ -18413,6 +18533,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: community_id.into(),
                         community_name: "test-community".into(),
                         members: vec![crate::federation::types::CommunityMember {
@@ -19088,6 +19210,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: community_id.into(),
                         community_name: "ob-test".into(),
                         members: crate::federation::tier_ingest::test_support::fixture_members(
@@ -19485,6 +19609,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "ob-owner",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "ob-owner".into(),
                         community_name: "fixture room".into(),
                         members: vec![],
@@ -20159,6 +20285,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 family_key,
                 Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: family_key.into(),
                     family_name: "Test Household".into(),
                     members: vec![FamilyMember {
@@ -20965,6 +21093,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "mod-comm",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "mod-comm".into(),
                         community_name: "mods".into(),
                         members: vec![crate::federation::types::CommunityMember {
@@ -21074,6 +21204,8 @@ mod tests {
             let policy_blob =
                 infra.then(|| serde_json::json!({ "cohort_subkind": "infrastructure" }));
             let community = crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: cid.into(),
                 community_name: "dt".into(),
                 members: vec![crate::federation::types::CommunityMember {
@@ -21215,6 +21347,8 @@ mod tests {
                     crate::federation::tier_ingest::test_support::sign_community(
                         cid,
                         crate::federation::types::Community {
+                            prev_head_digest: String::new(),
+                            charter_digest: String::new(),
                             community_key_id: cid.into(),
                             community_name: "bk".into(),
                             members: vec![crate::federation::types::CommunityMember {
@@ -23000,6 +23134,8 @@ mod tests {
         b.put_family(ts::sign_family(
             fam,
             crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.into(),
                 family_name: "861".into(),
                 members: [alice, bob]
@@ -23664,9 +23800,9 @@ mod tests {
             };
             if id == "n607-charter" {
                 envelope["pre_rotation_commitment"] =
-                    serde_json::json!(crate::federation::trust_root::pre_rotation_commitment(&[
-                        "n607-root-successor".to_owned()
-                    ])
+                    serde_json::json!(crate::federation::trust_root::test_pre_rotation_commitment(
+                        &["n607-root-successor".to_owned()]
+                    )
                     .expect("commitment"));
             }
             let envelope = envelope;
@@ -24870,6 +25006,8 @@ mod tests {
                 .unwrap();
         }
         let fam = |key_id: &str| crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: key_id.into(),
             family_name: "E4 Household".into(),
             members: vec![crate::federation::types::FamilyMember {
@@ -24937,6 +25075,8 @@ mod tests {
                 .unwrap();
         }
         let comm = |key_id: &str| crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: key_id.into(),
             community_name: "E4 Co-op".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -25004,6 +25144,8 @@ mod tests {
             .put_family(crate::federation::tier_ingest::test_support::sign_family(
                 "e4-fmr-fam",
                 crate::federation::types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: "e4-fmr-fam".into(),
                     family_name: "E4 FMR Household".into(),
                     members: vec![
@@ -25109,6 +25251,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_community(
                     "e4-cmr-authority",
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: "e4-cmr-comm".into(),
                         community_name: "E4 CMR Co-op".into(),
                         members: vec![crate::federation::types::CommunityMember {
@@ -25315,6 +25459,8 @@ mod tests {
                 .unwrap();
         }
         let fam = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "e4sig-family".into(),
             family_name: "E4 Signature Household".into(),
             members: vec![crate::federation::types::FamilyMember {

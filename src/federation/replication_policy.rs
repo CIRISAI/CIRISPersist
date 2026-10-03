@@ -245,6 +245,27 @@ pub enum WireTier {
     FederationOnly,
 }
 
+/// v53.0.0 (CIRISEdge#761, CIRISPersist#963) — **who a kind's rows are
+/// SERVED to.** Admission (the rest of [`KindPolicy`]) says what a node may
+/// accept; this says which peers a serving node may send it to, and names
+/// the persist predicate the serve gate calls so edge does not restate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServeAudience {
+    /// Placed content: per row, per peer,
+    /// [`may_receive`](super::replication_audience::may_receive) (origin,
+    /// refers-to, public, the cohort's per-node audience).
+    Cohort,
+    /// A group's record and its membership planes:
+    /// [`may_receive_group_plane`](super::replication_audience::may_receive_group_plane)
+    /// (public groups to every peer; a private group's to members' nodes,
+    /// live invitees' nodes and the nodes of the member a row names).
+    MembershipPlane,
+    /// Every peer (keys, occurrences, revocations, the operational and
+    /// accord planes — what trust resolution needs everywhere).
+    Public,
+}
+
 /// A read-projection maintained IN-TX as a feature of admitting a claim
 /// (the #501 fan-out; improves on the trust plane's post-commit hook).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +315,8 @@ pub struct KindPolicy {
     pub tier: WireTier,
     /// Read-projections maintained in the same admit transaction.
     pub projections: &'static [Projection],
+    /// v53.0.0 (CIRISEdge#761) — who the kind's rows are served to.
+    pub audience: ServeAudience,
 }
 
 /// The ONE admission policy for a kind. Exhaustive `match`: adding an
@@ -400,6 +423,26 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
             &[P::KeyGrants],
         ),
     };
+    let audience = match kind {
+        K::Attestation | K::KeyGrant => ServeAudience::Cohort,
+        K::Family
+        | K::Community
+        | K::FamilyMembershipRevocation
+        | K::CommunityMembershipRevocation
+        | K::CommunityMembershipWidening
+        | K::FamilyMembershipWidening
+        | K::CommunityMembershipListing => ServeAudience::MembershipPlane,
+        K::Key
+        | K::Revocation
+        | K::IdentityOccurrence
+        | K::IdentityOccurrenceRevocation
+        | K::TransportDestination
+        | K::LocationProof
+        | K::Organization
+        | K::OrgMembership
+        | K::PartnerRecord
+        | K::AccordQuorumEvidence => ServeAudience::Public,
+    };
     KindPolicy {
         kind,
         signer,
@@ -407,6 +450,7 @@ pub fn policy_for(kind: EnvelopeKind) -> KindPolicy {
         pop_on_insert: pop,
         tier: WireTier::FederationOnly,
         projections,
+        audience,
     }
 }
 
@@ -462,8 +506,13 @@ pub fn replication_policy_sha256() -> String {
 /// and `SelfOwn` — the member's own disclosure). Previous value:
 /// `7d0e97b45c83b4ef4f0cc49a2c75f2064b2f9bd090ee2b89264ab2c8da084bae` (the
 /// 18-kind v49.0.0 development value). CIRISEdge appends the 19th name.
+/// v53.0.0 (CIRISEdge#761, CIRISPersist#963) — re-pinned: every
+/// [`KindPolicy`] gains `audience` ([`ServeAudience`]: who a serving node may
+/// send the kind's rows to). Previous value:
+/// `5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a`
+/// (from v49.0.0 until this re-pin). CIRISEdge and CIRISServer re-pin.
 pub const REPLICATION_POLICY_HASH: &str =
-    "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a";
+    "1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869";
 
 /// v52.0.0 (CIRISPersist#672) — **settle a re-offer of a record this node
 /// already holds, before any verification.**

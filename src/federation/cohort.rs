@@ -216,6 +216,8 @@ pub mod test_support {
             .put_family(ts::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "roster growth".into(),
                     members: vec![types::FamilyMember {
@@ -308,6 +310,8 @@ pub mod test_support {
             .put_community(ts::sign_community(
                 &comm,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "roster growth".into(),
                     members: vec![types::CommunityMember {

@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 109 delegations, generated. Every one: fault first, then delegate.
+// 111 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -200,6 +200,12 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.attestation_insert_local(input).await
+    }
+    async fn attestation_type_census(&self) -> Result<Vec<row_type::AttestationTypeCount>, Error> {
+        if let Some(e) = self.faulted("attestation_type_census") {
+            return Err(e);
+        }
+        self.inner.attestation_type_census().await
     }
     async fn attestation_upsert_local(
         &self,
@@ -958,14 +964,11 @@ impl FederationDirectory for FaultInjectingDirectory {
     async fn put_accord_decision(
         &self,
         decision: ciris_verify_core::accord_live_quorum::AccordDecision,
-        steward_signatures: Option<serde_json::Value>,
     ) -> Result<(), Error> {
         if let Some(e) = self.faulted("put_accord_decision") {
             return Err(e);
         }
-        self.inner
-            .put_accord_decision(decision, steward_signatures)
-            .await
+        self.inner.put_accord_decision(decision).await
     }
     async fn put_accord_participation(
         &self,
@@ -1189,6 +1192,15 @@ impl FederationDirectory for FaultInjectingDirectory {
         self.inner
             .supersede_group_row(cohort, new_snapshot, authorization)
             .await
+    }
+    async fn trust_direction_held_among(
+        &self,
+        attestation_ids: &[String],
+    ) -> Result<Vec<String>, Error> {
+        if let Some(e) = self.faulted("trust_direction_held_among") {
+            return Err(e);
+        }
+        self.inner.trust_direction_held_among(attestation_ids).await
     }
     fn trust_root_standing_cache(&self) -> Option<&canonical_community::StandingCache> {
         self.inner.trust_root_standing_cache()

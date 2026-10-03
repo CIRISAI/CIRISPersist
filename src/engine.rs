@@ -1307,7 +1307,7 @@ impl Engine {
     /// re-wrapping the singleton's own `BackendDispatch` by cloning the
     /// inner `Arc<…Backend>`) shares the same connection pool.
     pub fn from_shared(backend: BackendDispatch, signer: Arc<dyn HardwareSigner>) -> Engine {
-        Engine {
+        let engine = Engine {
             backend,
             signer,
             // v2.12.0 (#112) — `from_shared` only takes the hybrid
@@ -1323,7 +1323,9 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
-        }
+        };
+        engine.tell_shared_backend_its_node_key();
+        engine
     }
 
     /// v2.12.0 (CIRISPersist#112) — variant of [`Engine::from_shared`]
@@ -1340,7 +1342,7 @@ impl Engine {
         signer: Arc<dyn HardwareSigner>,
         local_signer: Option<Arc<LocalSigner>>,
     ) -> Engine {
-        Engine {
+        let engine = Engine {
             backend,
             signer,
             local_signer,
@@ -1349,6 +1351,61 @@ impl Engine {
             disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+        };
+        engine.tell_shared_backend_its_node_key();
+        engine
+    }
+
+    /// v53.0.0 (CIRISPersist#966) — a shared constructor tells the backend
+    /// its node key, as [`Engine::with_signer`] does (#607): the backend's
+    /// receive doors (an owner-binding or a device's occurrence landing over
+    /// sync, no signer in hand) re-wrap "this node's" epochs only under a
+    /// known node key, and a host that hands persist a backend it opened
+    /// itself never calls a door that would tell it.
+    ///
+    /// The constructors stay synchronous (Edge and the pyo3 singleton call
+    /// them outside a runtime), so the key id is derived by polling
+    /// [`local_derived_key_id`](Self::local_derived_key_id) ONCE: a software
+    /// signer answers on the first poll. A signer that does not (a hardware
+    /// round-trip) leaves the key to the lazy path the #916 doors already
+    /// run (`ensure_backend_node_key`) — never a guessed id. A key the
+    /// backend already knows is kept: it was told by the Engine that opened
+    /// it, which is the same id.
+    fn tell_shared_backend_its_node_key(&self) {
+        #[cfg(any(feature = "postgres", feature = "sqlite"))]
+        {
+            let known = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    crate::federation::FederationDirectory::node_key_id(b.as_ref()).is_some()
+                }
+            };
+            if known {
+                return;
+            }
+            let fut = std::pin::pin!(self.local_derived_key_id());
+            // `Waker::noop` is 1.85 (the MSRV is 1.83) and the crate denies
+            // `unsafe`: a `Wake` impl that does nothing. One poll never wakes.
+            struct NoWake;
+            impl std::task::Wake for NoWake {
+                fn wake(self: Arc<Self>) {}
+            }
+            let waker = std::task::Waker::from(Arc::new(NoWake));
+            let mut cx = std::task::Context::from_waker(&waker);
+            match std::future::Future::poll(fut, &mut cx) {
+                std::task::Poll::Ready(Ok(k)) => self.set_backend_node_key_id(&k),
+                std::task::Poll::Ready(Err(e)) => tracing::warn!(
+                    error = %e,
+                    "from_shared: no node key for the shared backend; the #916 doors derive it lazily"
+                ),
+                std::task::Poll::Pending => tracing::debug!(
+                    "from_shared: the signer answers asynchronously; the #916 doors derive the node key lazily"
+                ),
+            }
         }
     }
 
@@ -5544,6 +5601,35 @@ impl Engine {
         .await
     }
 
+    /// CIRISPersist#973 (CC 3.2 T3 / T4a) — **the signed envelope of a new
+    /// acceptance edge toward `root_key_id`**: `dimension: trust:accepts:v1`,
+    /// the `scope` this node accepts the root for, and the
+    /// `attached_head_digest` of the lineage head it attaches on (omitted for
+    /// a key root). Emit it as a `delegates_to` with `attested_key_id` = the
+    /// root. A `delegates_to` toward a root without the label gives no
+    /// acceptance; a labelled one without the head is refused
+    /// `trust_root_head_unnamed`. See
+    /// [`acceptance_edge_envelope`](crate::federation::canonical_community::acceptance_edge_envelope).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn trust_acceptance_envelope(
+        &self,
+        root_key_id: &str,
+        scope: &[&str],
+    ) -> Result<serde_json::Value, crate::federation::Error> {
+        use crate::federation::canonical_community::acceptance_edge_envelope;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                acceptance_edge_envelope(arc.as_ref(), root_key_id, scope, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                acceptance_edge_envelope(arc.as_ref(), root_key_id, scope, now).await
+            }
+        }
+    }
+
     /// v52.0.0 (CIRISPersist#946; CC 3.3.1) — **the standing
     /// `consent:community_trust` grant for `node`**, or `None`: the capture
     /// gate's answer, folded from the rows about the node (latest grant after
@@ -5592,6 +5678,52 @@ impl Engine {
             chrono::Utc::now(),
         )
         .await
+    }
+
+    /// v53.0.0 (CIRISPersist#969) — **the readiness door: can
+    /// `viewer_key_id` read this sealed DAG here now, and what is missing.**
+    /// Answered from the index and grant rows — no chunk is opened: for a
+    /// stream-keyed DAG one check per EPOCH (`missing` names
+    /// `{stream_id, epoch, seq_from, seq_to}`), for a legacy one per chunk
+    /// (`{seq, chunk_sha256}`). The manifest is opened as
+    /// [`open_sealed_manifest_as`](Self::open_sealed_manifest_as) opens it,
+    /// so a stranger is `NotGranted` and learns nothing.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sealed_dag_readiness(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<
+        crate::federation::chunk_dag_cascade::orchestrate::SealedDagReadiness,
+        crate::federation::BlobError,
+    > {
+        self.ensure_minter_sentinels_resolved().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!("V145 minter sentinel (#848): {e}"))
+        })?;
+        use crate::federation::chunk_dag_cascade::orchestrate::sealed_dag_readiness_for_viewer;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                sealed_dag_readiness_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                sealed_dag_readiness_for_viewer(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    caller_aad,
+                )
+                .await
+            }
+        }
     }
 
     /// v51.3.0 (CIRISPersist#947, `BLOB_REPLICATION.md` §6.5) — **the chunk
@@ -6858,6 +6990,128 @@ impl Engine {
         }
     }
 
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **this node's custody
+    /// report for one blob**: a `custody:ack:v1` `scores` row it signs about
+    /// itself, placed at the blob's own cohort. `Here` needs the bytes on this
+    /// node and takes the stored length as `size`; `None` is "responsive, no
+    /// copy". With no row held only `None` can be reported, at the
+    /// caller-named `cohort_scope`; with a row held a different
+    /// `cohort_scope` is refused. `cohort_target` names the family or
+    /// community (a community blob's is read from its sealing epoch when
+    /// omitted). Re-acknowledge about daily: a report is live for 72 h.
+    /// `caller_aad` is the associated data a chunk DAG was sealed under (an
+    /// edge file pointer's `content_aad`): `here` opens the manifest with it
+    /// to check every chunk is held.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_custody_ack(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        state: crate::federation::custody_ack::CustodyState,
+        cohort_scope: Option<&str>,
+        cohort_target: Option<&str>,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::custody_ack::custody_ack_input_for;
+        let input = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                custody_ack_input_for(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    state,
+                    cohort_scope,
+                    cohort_target,
+                    caller_aad,
+                )
+                .await?
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                custody_ack_input_for(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    state,
+                    cohort_scope,
+                    cohort_target,
+                    caller_aad,
+                )
+                .await?
+            }
+        };
+        self.emit_attestation_self(input).await
+    }
+
+    /// v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — **the custody view** of
+    /// one blob for `viewer_key_id`: per device, `here` | `received` | `none`
+    /// | `unknown`, folded at this node's clock. `stream_id`, when the caller
+    /// knows the blob's stream, adds its delivery receipts (a receipt with no
+    /// later live report reads `received`). Authorized like
+    /// [`blob_custody`](Self::blob_custody): a stranger is `NotGranted`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn custody_view(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        stream_id: Option<&str>,
+    ) -> Result<crate::federation::custody_ack::CustodyView, crate::federation::BlobError> {
+        use crate::federation::custody_ack::custody_view;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                custody_view(arc.as_ref(), at_rest_sha256, viewer_key_id, stream_id, now).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                custody_view(arc.as_ref(), at_rest_sha256, viewer_key_id, stream_id, now).await
+            }
+        }
+    }
+
+    /// v53.0.0 (CIRISPersist#963, CC 6.1.5.3) — **the durability deficit** of
+    /// one blob for `viewer_key_id`: its audience (the claimed nodes its scope
+    /// entitles to hold it, under their owners' allow lists), the audience
+    /// nodes with a live `here` custody report, the rest (`missing`), and the
+    /// placement mode at the shipped tuple. Authorized like
+    /// [`custody_view`](Self::custody_view). Reports; never widens a set.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn durability_deficit(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        viewer_key_id: &str,
+        stream_id: Option<&str>,
+    ) -> Result<crate::federation::durability::DurabilityDeficit, crate::federation::BlobError>
+    {
+        use crate::federation::durability::{durability_deficit, DEFAULT_FEASIBILITY_FLOOR};
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                durability_deficit(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    stream_id,
+                    DEFAULT_FEASIBILITY_FLOOR,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                durability_deficit(
+                    arc.as_ref(),
+                    at_rest_sha256,
+                    viewer_key_id,
+                    stream_id,
+                    DEFAULT_FEASIBILITY_FLOOR,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
     /// v51.0.0 (CIRISPersist#923, CIRISConstitution#114; `MEDIA_SOURCE.md`
     /// §9.3) — **seal a small descriptor under an existing blob's DEK.** The
     /// caller is authorized exactly as [`read_blob_as`](Self::read_blob_as)
@@ -7159,6 +7413,10 @@ impl Engine {
         for axis in &r.chunk_key_grant_emissions {
             self.emit_key_grant(axis).await?;
         }
+        // #969 — and the stream epochs it widened, one set per epoch.
+        for axis in &r.stream_key_grant_emissions {
+            self.emit_key_grant(axis).await?;
+        }
         Ok(r)
     }
 
@@ -7291,6 +7549,16 @@ impl Engine {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: crate::federation::types::cohort_scope::FAMILY.to_owned(),
                 owner_key_id: family_key_id.to_owned(),
+            })
+            .await?;
+        }
+        // #969 — and each stream epoch the walk widened: one set per epoch.
+        for (stream_id, epoch, group) in &r.changed_streams {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Stream {
+                stream_id: stream_id.clone(),
+                epoch: *epoch,
+                cohort_scope: crate::federation::types::cohort_scope::FAMILY.to_owned(),
+                owner_key_id: group.clone(),
             })
             .await?;
         }
@@ -7567,6 +7835,16 @@ impl Engine {
                 at_rest_sha256: hex::encode(sha),
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
                 owner_key_id: identity_key_id.to_owned(),
+            })
+            .await?;
+        }
+        // #969 — and each stream epoch the walk widened: one set per epoch.
+        for (stream_id, epoch, group) in &r.changed_streams {
+            self.emit_key_grant(&crate::federation::key_grant::KeyGrantAxis::Stream {
+                stream_id: stream_id.clone(),
+                epoch: *epoch,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                owner_key_id: group.clone(),
             })
             .await?;
         }
@@ -8515,6 +8793,18 @@ impl Engine {
         key_id: &str,
     ) -> Result<crate::federation::age::AgeBand, crate::federation::Error> {
         crate::federation::age::age_band(&*self.federation_directory(), key_id).await
+    }
+
+    /// v53.0.0 (CIRISPersist#975, CC 2.4 ask 4) — what the closed row-type
+    /// slot sees on this node: held rows of an unregistered `attestation_type`
+    /// (by exact type, never deleted), and since process start the unregistered
+    /// admissions and composer dimensions the gate reported rather than
+    /// refused. See [`crate::federation::row_type::row_type_report`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn row_type_report(
+        &self,
+    ) -> Result<crate::federation::row_type::RowTypeReport, crate::federation::Error> {
+        crate::federation::row_type::row_type_report(&*self.federation_directory()).await
     }
 
     // ── #249 Cut B ── CEG-native graph DX enumerators + community-roster
@@ -10502,6 +10792,65 @@ pub enum EngineError {
     GenesisSeed(String),
 }
 
+/// The body of [`Engine::evict_blob`], generic over the backend.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn evict_blob_on<B>(
+    backend: &B,
+    node: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    use crate::federation::{BlobError, EvictBlobReport};
+    let sha_hex = hex::encode(sha256);
+    let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
+    let mine = backend
+        .list_attestations_by(node)
+        .await
+        .map_err(|e| BlobError::Backend(format!("evict_blob: list claims: {e}")))?;
+    // A retry after a partial failure must find nothing to retract: the
+    // node's own earlier withdraws is in `mine`, so fold it (the same
+    // `retired_ids` every retraction reader uses) and skip retired claims.
+    let retired = {
+        let refs: Vec<&crate::federation::Attestation> = mine.iter().collect();
+        crate::federation::precedence::retired_ids(&refs)
+    };
+    let claims: Vec<_> = mine
+        .into_iter()
+        .filter(|a| {
+            !retired.contains(&a.attestation_id)
+                && a.attestation_type.starts_with(prefix)
+                && a.attestation_envelope
+                    .get("evidence_refs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    == Some(sha_hex.as_str())
+        })
+        .collect();
+    let mut report = EvictBlobReport::default();
+    for prior in &claims {
+        // RETRACT FIRST. A refused retraction aborts: bytes and binding stay.
+        crate::federation::blobs::emit_withdraws_attestation_helper(
+            prior, node, signer, backend, now,
+        )
+        .await
+        .map_err(|e| {
+            BlobError::Backend(format!(
+                "evict_blob: the withdraws for {} was not admitted — eviction ABORTED, the \
+                     bytes stay (I18): {e}",
+                prior.attestation_id
+            ))
+        })?;
+        report.withdraws_emitted += 1;
+    }
+    report.blob_deleted = backend.delete_blob(sha256).await?;
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10587,6 +10936,8 @@ mod tests {
 
         let now: chrono::DateTime<chrono::Utc> = "2026-06-25T00:00:00Z".parse().unwrap();
         let community = crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: kid.clone(),
             community_name: "T".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -11007,6 +11358,8 @@ mod tests {
         // A hostile re-assemble: same family id, the node owner's own sole seat,
         // `founder_only` so the charter threshold would resolve to 1.
         let hostile = crate::federation::types::Family {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             family_key_id: "humanity-accord".into(),
             family_name: "MINE".into(),
             members: vec![crate::federation::types::FamilyMember {
@@ -11068,6 +11421,8 @@ mod tests {
 
         let squat = crate::federation::SignedFamily {
             family: crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: "humanity-accord".into(),
                 family_name: "MINE".into(),
                 members: vec![crate::federation::types::FamilyMember {
@@ -17666,6 +18021,8 @@ mod tests {
             .await
             .expect("seed community key");
         let community = crate::federation::types::Community {
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
             community_key_id: community_id.into(),
             community_name: "cut-c-community".into(),
             members: vec![crate::federation::types::CommunityMember {
@@ -18873,6 +19230,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &founder,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "g1-fam".into(),
                 members: vec![types::FamilyMember {
@@ -18893,6 +19252,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &founder,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "g1-comm".into(),
                     members: vec![types::CommunityMember {
@@ -19205,6 +19566,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "accord".into(),
                 members: mk_members(5),
@@ -19217,6 +19580,13 @@ mod tests {
         ))
         .await
         .expect("genesis put_family");
+        // v53.0.0 (CC 3.2 T6) — every version below names v1 as its head.
+        let v1_hash = d
+            .lookup_family(&fam)
+            .await
+            .unwrap()
+            .expect("v1")
+            .persist_row_hash;
 
         // Supersede → 3-member quorum:2/3 (a contraction; growth is the
         // widening plane's, #955 Q2).
@@ -19241,6 +19611,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: v1_hash.clone(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: {
@@ -19277,6 +19649,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: v1_hash.clone(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "accord".into(),
                         members: mk_members(3),
@@ -19337,6 +19711,8 @@ mod tests {
                 crate::federation::tier_ingest::test_support::sign_family(
                     &fam,
                     types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: format!("g2-ghost-{s}"),
                         family_name: "ghost".into(),
                         members: vec![],
@@ -19415,6 +19791,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "accord".into(),
                     members: members
@@ -19458,7 +19836,11 @@ mod tests {
         // 3 of the 5 PRIOR members cosign → meets quorum:3/5.
         let v = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 change.clone(),
                 vec![
                     threshold_sign(&m[0], &bytes),
@@ -19495,7 +19877,11 @@ mod tests {
         // (a) Insufficient quorum: 1 cosignature where M=3 → rejected.
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 change2.clone(),
                 vec![threshold_sign(&m[0], &bytes2)],
             )
@@ -19514,7 +19900,11 @@ mod tests {
         let tbytes = ciris_verify_core::jcs::canonicalize(&tampered).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(m[..4].to_vec(), "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(m[..4].to_vec(), "quorum:3/4"),
+                )
+                .await,
                 tampered,
                 vec![
                     threshold_sign(&m[0], &tbytes),
@@ -19544,7 +19934,11 @@ mod tests {
         let sbytes = ciris_verify_core::jcs::canonicalize(&seat_change).unwrap();
         let err = d
             .supersede_family_with_quorum(
-                fam_row(seat_roster, "quorum:3/4"),
+                crate::federation::tier_ingest::test_support::family_naming_held(
+                    d,
+                    fam_row(seat_roster, "quorum:3/4"),
+                )
+                .await,
                 seat_change,
                 vec![
                     threshold_sign(&m[0], &sbytes),
@@ -19612,6 +20006,8 @@ mod tests {
             ts::sign_community(
                 &members[0],
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: room.to_owned(),
                     community_name: "protocol room".into(),
                     members: members
@@ -19667,7 +20063,11 @@ mod tests {
                 .map(|m| ts::threshold_sign(m, &bytes))
                 .collect();
             d.supersede_community_with_quorum(
-                community(&room, &new_members, founders, cp),
+                crate::federation::tier_ingest::test_support::community_naming_held(
+                    d,
+                    community(&room, &new_members, founders, cp),
+                )
+                .await,
                 change,
                 sigs,
             )
@@ -19885,6 +20285,8 @@ mod tests {
             ts::sign_family(
                 &fam,
                 types::Family {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     family_key_id: fam.clone(),
                     family_name: "household".into(),
                     members: members
@@ -19918,7 +20320,8 @@ mod tests {
         let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
         refused(
             d.supersede_family_with_quorum(
-                family(&fk),
+                crate::federation::tier_ingest::test_support::family_naming_held(d, family(&fk))
+                    .await,
                 change.clone(),
                 vec![ts::threshold_sign(&fk[1], &bytes)],
             )
@@ -19931,7 +20334,8 @@ mod tests {
         );
         refused_add(
             d.supersede_family_with_quorum(
-                family(&fk),
+                crate::federation::tier_ingest::test_support::family_naming_held(d, family(&fk))
+                    .await,
                 change,
                 vec![ts::threshold_sign(&fk[0], &bytes)],
             )
@@ -20013,6 +20417,8 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_community(
                 &comm,
                 types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "c".into(),
                     members: cm
@@ -20110,6 +20516,8 @@ mod tests {
         d.put_family(crate::federation::tier_ingest::test_support::sign_family(
             &fam,
             types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: "f".into(),
                 // v49.0.0 (#910): fmk[0] founds the `founder_only` family, so
@@ -21637,17 +22045,20 @@ mod tests {
         assert_eq!(app_dests[0].transport_kind, "reticulum");
         assert_eq!(app_dests[0].destination, "dest-hash-app");
 
-        // (2) Both occurrences are valid wrap targets → neither
-        // fail-secure-excluded. `self_dek_granted` counts both (0 grants
-        // each since no prior self-blobs existed, but they are in the
-        // cohort). The cascade composes over the v6.2.0 re-key.
+        // (2) Neither occurrence is fail-secure-excluded. v53.0.0 (#963,
+        // CC 3.3.7 and the coordinator ruling): only the APP occurrence (a
+        // personal device) is in the self key cohort — the AGENT occurrence
+        // is server class and receives none of its owner's `self` content,
+        // so no `self` key, unless the owner's grant for it lists the cohort
+        // (and `self` is never listed). The cascade composes over the v6.2.0
+        // re-key.
         assert!(
             outcome.self_dek_excluded.is_empty(),
             "no fail-secure exclusions"
         );
         assert_eq!(
-            outcome.self_dek_granted, 2,
-            "both occurrences in self cohort"
+            outcome.self_dek_granted, 1,
+            "the app occurrence is in the self cohort; the agent is not"
         );
     }
 
@@ -21713,7 +22124,7 @@ mod tests {
                     .put_identity_occurrence_local(types::IdentityOccurrence {
                         identity_key_id: identity_key,
                         occurrence_key_id: occ,
-                        device_class: types::device_class::SERVER.into(),
+                        device_class: types::device_class::LAPTOP.into(),
                         hardware_attestation: None,
                         asserted_at: chrono::Utc::now(),
                         valid_until: None,
@@ -22000,7 +22411,8 @@ mod tests {
 
         assert!(outcome.delegation_promoted);
         assert!(outcome.self_dek_excluded.is_empty());
-        assert_eq!(outcome.self_dek_granted, 2);
+        // v53.0.0 (#963) — the agent occurrence is server class: no self key.
+        assert_eq!(outcome.self_dek_granted, 1);
         assert_eq!(outcome.transport_destinations_registered, 1);
 
         let dir = engine.federation_directory();
@@ -22494,63 +22906,4 @@ mod register_self_canonicalizer_parity {
              fixture, or the assertion above is vacuous"
         );
     }
-}
-
-/// The body of [`Engine::evict_blob`], generic over the backend.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-async fn evict_blob_on<B>(
-    backend: &B,
-    node: &str,
-    signer: &crate::signing::LocalSigner,
-    sha256: &[u8; 32],
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
-where
-    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
-{
-    use crate::federation::{BlobError, EvictBlobReport};
-    let sha_hex = hex::encode(sha256);
-    let prefix = crate::federation::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX;
-    let mine = backend
-        .list_attestations_by(node)
-        .await
-        .map_err(|e| BlobError::Backend(format!("evict_blob: list claims: {e}")))?;
-    // A retry after a partial failure must find nothing to retract: the
-    // node's own earlier withdraws is in `mine`, so fold it (the same
-    // `retired_ids` every retraction reader uses) and skip retired claims.
-    let retired = {
-        let refs: Vec<&crate::federation::Attestation> = mine.iter().collect();
-        crate::federation::precedence::retired_ids(&refs)
-    };
-    let claims: Vec<_> = mine
-        .into_iter()
-        .filter(|a| {
-            !retired.contains(&a.attestation_id)
-                && a.attestation_type.starts_with(prefix)
-                && a.attestation_envelope
-                    .get("evidence_refs")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    == Some(sha_hex.as_str())
-        })
-        .collect();
-    let mut report = EvictBlobReport::default();
-    for prior in &claims {
-        // RETRACT FIRST. A refused retraction aborts: bytes and binding stay.
-        crate::federation::blobs::emit_withdraws_attestation_helper(
-            prior, node, signer, backend, now,
-        )
-        .await
-        .map_err(|e| {
-            BlobError::Backend(format!(
-                "evict_blob: the withdraws for {} was not admitted — eviction ABORTED, the \
-                     bytes stay (I18): {e}",
-                prior.attestation_id
-            ))
-        })?;
-        report.withdraws_emitted += 1;
-    }
-    report.blob_deleted = backend.delete_blob(sha256).await?;
-    Ok(report)
 }

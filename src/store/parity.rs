@@ -183,6 +183,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // v52.0.0 (CIRISPersist#946, CC 3.3.1) — Gate: refuses a `consent:community_trust`
     // row whose grant shape or granter is not admissible. A statement about the input.
     ("check_community_trust_grant_admission", Class::Gate),
+    // v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — Gate: refuses a `custody:ack:v1`
+    // row that is not a holder self-report, is malformed, or sits outside the
+    // device's cohort. A statement about the input.
+    ("check_custody_ack_admission", Class::Gate),
     // v52.0.0 (CIRISPersist#672) — Plumbing: the held-record settle. Its `?`
     // propagates only a serialization failure (the substrate's own terms); a
     // lookup error falls through to the full apply, and a settle returns early
@@ -339,6 +343,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // idempotent no-op and only a genuine disagreement refuses, which is a
     // policy question about the caller's input rather than a substrate one.
     ("attestation_reput_verdict", Class::Gate),
+    // v53.0.0 (CIRISPersist#975, CC 2.4) — the closed row-type slot: a fact
+    // about the caller's row (its type, a carrier's shape), immediately after
+    // the binding on all three backends.
+    ("admit_row_type", Class::Gate),
     ("check_single_node_owner_admission", Class::Gate),
     // v50.0.0 (CIRISPersist#924, CC 5.4.6) — a minor's owner-binding is
     // refused at `cohort_scope: federation`.
@@ -516,6 +524,10 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // transaction: a proof over a version this node does not hold is refused
     // as stale. Gate.
     ("check_proof_names_prior", Class::Gate),
+    // v53.0.0 (CC 3.2 T6) — inside every backend's supersede transaction: a
+    // version whose signed `prev_head_digest` is not the head this node holds
+    // is refused. Gate.
+    ("check_prev_head_names_held", Class::Gate),
     // v39.0.0 — the whole crossing decision: custody verification, every
     // inherited co-scrub, `check_promotion_admission`, and the nine
     // contextual-integrity axes. Delegates, not Gate: it is the door's helper
@@ -654,6 +666,9 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     // #957 — Gate: refuses an empty batch, more than MAX_CHUNKS_PER_BATCH
     // items, or more than MAX_BATCH_BYTES. A statement about the input.
     ("check_chunk_batch_bounds", Class::Gate),
+    // v53.0.0 (#969) — Gate: refuses a stream-keyed claim on a batch of more
+    // than one item (one STREAM-nonce slot names one chunk).
+    ("check_stream_key_batch", Class::Gate),
     // #957 — Plumbing: a savepoint and a cached statement fail only on the
     // substrate's own terms (the connection, the SQL text), never on input.
     ("savepoint", Class::Plumbing),

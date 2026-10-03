@@ -552,6 +552,9 @@ Engine	lineage_head_json	epistemic
 Engine	seal_descriptor_for_blob	deontic	
 Engine	open_descriptor_for_blob	deontic	
 Engine	blob_custody_json	epistemic	
+Engine	custody_view_json	epistemic	
+Engine	durability_deficit_json	epistemic	
+Engine	put_custody_ack	testimonial	self_audit
 Engine	read_stream_chunk_as	deontic	
 Engine	rebind_key_record	deontic	
 Engine	rebind_self_federation_key	deontic	
@@ -579,6 +582,7 @@ Engine	revocations_for	empirical
 Engine	revoke_delegation	deontic	
 Engine	revoke_trust_grant	deontic	
 Engine	root_binding	ontological	
+Engine	row_type_report_json	empirical	
 Engine	run_consent_expiry_sweep_json	procedural	
 Engine	run_deletion_window_watch_json	procedural	
 Engine	run_legacy_graph_migration	procedural	
@@ -753,3 +757,4 @@ Engine	abandon_stream_json	deontic
 Engine	put_blob_chunks_signing_json	deontic	
 Engine	sign_stream_sth_json	deontic	
 Engine	community_trust_consent_json	deontic	
+Engine	sealed_dag_readiness_json	empirical	

@@ -95,11 +95,65 @@ pub fn is_invitee_subject_list(row: &Attestation) -> bool {
     membership_row(row) == Some(MembershipRow::Proposal) && row.subject_key_ids.len() == 1
 }
 
-fn group_kind_for_scope(scope: &str) -> Option<&'static str> {
-    match scope {
-        cohort_scope::FAMILY => Some("family"),
-        cohort_scope::COMMUNITY => Some("community"),
+/// v53.0.0 (CIRISEdge#761) — **the roster plane a membership row is placed
+/// on**: the family's, or the room's. `community` and `affiliations` are ONE
+/// plane ([`TargetPlane::Room`](cohort_scope::TargetPlane::Room)): an
+/// affiliation is a community record and runs "all the community machinery
+/// (… `consensus_protocol` admission)" (CC 4.4.3.2.8), so its membership
+/// ceremony is the community's. `None` for a scope no roster answers (self,
+/// the commons). Every membership comparison of two scopes asks this.
+fn membership_plane(scope: &str) -> Option<cohort_scope::TargetPlane> {
+    match cohort_scope::Scope::parse(scope).map(cohort_scope::Scope::placement) {
+        Some(cohort_scope::Placement::Targeted(plane)) => Some(plane),
         _ => None,
+    }
+}
+
+/// v53.0.0 (CIRISEdge#761) — **the group a well-formed membership row is
+/// about**, for the delivery rule ([`may_receive`](super::replication_audience::may_receive)):
+/// `(stage, group)`, or `None` for a non-membership or malformed row.
+#[must_use]
+pub fn membership_group_of(row: &Attestation) -> Option<(MembershipRow, String)> {
+    let kind = membership_row(row)?;
+    Some((kind, group_of(row).ok()?))
+}
+
+/// v53.0.0 (CIRISEdge#761) — **the held federation-tier proposal an
+/// acceptance or decline answers** (by `references_attestation_id`), if this
+/// node holds it and the answer matches it. `None` for a proposal row, a
+/// non-membership row, or an answer whose proposal is not held here.
+pub async fn answered_proposal_of<F>(
+    dir: &F,
+    row: &Attestation,
+) -> Result<Option<Attestation>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match membership_row(row) {
+        Some(MembershipRow::Acceptance | MembershipRow::Decline) => {}
+        _ => return Ok(None),
+    }
+    let Some(pid) = env_str(row, "references_attestation_id") else {
+        return Ok(None);
+    };
+    Ok(dir
+        .get_attestation(pid)
+        .await?
+        .filter(|p| p.tier == attestation_tier::FEDERATION)
+        .and_then(as_proposal)
+        .filter(|p| reply_matches(row, p))
+        .map(|p| p.row))
+}
+
+/// Do two placements name the same membership plane?
+fn same_membership_plane(a: &str, b: &str) -> bool {
+    membership_plane(a).is_some() && membership_plane(a) == membership_plane(b)
+}
+
+fn group_kind_for_scope(scope: &str) -> Option<&'static str> {
+    match membership_plane(scope)? {
+        cohort_scope::TargetPlane::Family => Some("family"),
+        cohort_scope::TargetPlane::Room => Some("community"),
     }
 }
 
@@ -218,7 +272,7 @@ fn as_proposal(row: Attestation) -> Option<Proposal> {
 /// The reply's own claims about its proposal agree with the proposal.
 fn reply_matches(reply: &Attestation, p: &Proposal) -> bool {
     group_of(reply).is_ok_and(|g| g == p.group)
-        && reply.cohort_scope == p.row.cohort_scope
+        && same_membership_plane(&reply.cohort_scope, &p.row.cohort_scope)
         && env_str(reply, "proposal_hash") == Some(p.row.original_content_hash.as_str())
         && reply.attested_key_id == p.invitee
         && (membership_row(reply) != Some(MembershipRow::Acceptance)
@@ -275,8 +329,8 @@ async fn group_is_held<F>(dir: &F, scope: &str, group: &str) -> Result<bool, Err
 where
     F: FederationDirectory + ?Sized,
 {
-    Ok(match scope {
-        cohort_scope::FAMILY => dir.lookup_family(group).await?.is_some(),
+    Ok(match membership_plane(scope) {
+        Some(cohort_scope::TargetPlane::Family) => dir.lookup_family(group).await?.is_some(),
         _ => dir.lookup_community(group).await?.is_some(),
     })
 }
@@ -405,6 +459,38 @@ where
     }
 }
 
+/// **A node gives no acceptance** (CIRISPersist#972; CC 3.1.3.2: "a node
+/// member of an `infrastructure` community is seated by the founders' quorum
+/// … the seat is valid when the founders' quorum signed the record and the
+/// node's own key record carries the conferring family's m-of-n scrub").
+///
+/// The ONE predicate both the growth gate and the founding rule read: `member`
+/// needs no acceptance in `community` at `at` iff the community is
+/// `infrastructure`, the key is node-bearing at `at` (#925's predicate), and
+/// its own key record carries the accord's m-of-n scrub. The founders' quorum
+/// is the caller's roster-authority check and is not weakened here. The owner
+/// binding is NOT read: it is `self`-scope on the node and no other node can
+/// see it; the claim is enforced where the node operates. A person in the
+/// same community, and a node anywhere else, still needs what they needed.
+pub async fn node_seated_without_acceptance<F>(
+    dir: &F,
+    community: &super::types::Community,
+    member: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if super::community_subkind(community) != Some(super::admission::COHORT_SUBKIND_INFRASTRUCTURE)
+    {
+        return Ok(false);
+    }
+    if !super::is_node_bearing_key_at(dir, member, at).await? {
+        return Ok(false);
+    }
+    super::admission::key_record_carries_accord_scrub(dir, member).await
+}
+
 /// **The growth gate** (FSD §5): `member` joins `group` at `growth_instant`
 /// with `role` only on an admitted acceptance of a live proposal for that
 /// group and role, not declined, signed no later than the proposal's
@@ -421,6 +507,16 @@ pub async fn check_growth_accepted<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    // #972 — a node of an infrastructure community is seated by the founders'
+    // quorum (the caller's standing check, already passed) and gives no
+    // acceptance.
+    if membership_plane(scope) == Some(cohort_scope::TargetPlane::Room) {
+        if let Some(c) = dir.lookup_community(group).await? {
+            if node_seated_without_acceptance(dir, &c, member, growth_instant).await? {
+                return Ok(());
+            }
+        }
+    }
     let replies = replies_of(dir, member).await?;
     let mut worst: Option<&'static str> = None;
     let mut note = |rule: &'static str| {
@@ -438,7 +534,9 @@ where
         .iter()
         .filter(|r| membership_row(r) == Some(MembershipRow::Acceptance))
     {
-        if a.cohort_scope != scope || group_of(a).ok().as_deref() != Some(group) {
+        if !same_membership_plane(&a.cohort_scope, scope)
+            || group_of(a).ok().as_deref() != Some(group)
+        {
             continue;
         }
         let pid = env_str(a, "references_attestation_id").unwrap_or_default();
@@ -475,8 +573,9 @@ where
     // terminally, not "not held yet". Only when no acceptance for the group
     // exists: a decline of an older invitation must not turn a newer
     // acceptance whose proposal has not arrived into a terminal refusal.
-    let in_group =
-        |r: &&Attestation| r.cohort_scope == scope && group_of(r).ok().as_deref() == Some(group);
+    let in_group = |r: &&Attestation| {
+        same_membership_plane(&r.cohort_scope, scope) && group_of(r).ok().as_deref() == Some(group)
+    };
     let any_acceptance = replies
         .iter()
         .filter(in_group)
@@ -523,6 +622,27 @@ where
         return Err(refuse(group, m, RULE_FOUNDING_MEMBER_UNSIGNED));
     }
     Ok(())
+}
+
+/// The founding rule for a COMMUNITY (#972): the persons it lists signed it
+/// ([`check_founding_signers`]); a node of an `infrastructure` community is
+/// seated by those signatures and never signs
+/// ([`node_seated_without_acceptance`], at the record's `founded_at`).
+pub async fn check_community_founding_signers<F>(
+    dir: &F,
+    community: &super::types::Community,
+    signers: &[&str],
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let mut persons: Vec<&str> = Vec::with_capacity(community.members.len());
+    for m in &community.members {
+        if !node_seated_without_acceptance(dir, community, &m.key_id, community.founded_at).await? {
+            persons.push(m.key_id.as_str());
+        }
+    }
+    check_founding_signers(dir, &community.community_key_id, &persons, signers).await
 }
 
 /// **The supersede rule** (Q2): an amendment's roster may keep, re-list or
@@ -575,6 +695,58 @@ where
         }
     }
     Ok(out)
+}
+
+/// v53.0.0 (CIRISEdge#761, CC 5.4.6) — **the live invitees of a private
+/// group**: the subjects of held federation-tier proposals for `group` at
+/// `scope` that are unexpired, not withdrawn by their proposer and not
+/// declined by their invitee. A proposal comes from a member (AV-45), so the
+/// proposals are found among the rows `members` (and their active
+/// occurrences) signed. Sorted, deduped.
+pub async fn live_invitees_of<F>(
+    dir: &F,
+    scope: &str,
+    group: &str,
+    members: &[String],
+) -> Result<Vec<String>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let now = chrono::Utc::now();
+    let mut signers: std::collections::BTreeSet<String> = members.iter().cloned().collect();
+    for m in members {
+        for o in dir.list_identity_occurrences_active(m).await? {
+            signers.insert(o.occurrence_key_id);
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for s in &signers {
+        for row in dir.list_attestations_by(s).await? {
+            if row.tier != attestation_tier::FEDERATION {
+                continue;
+            }
+            let Some(p) = as_proposal(row) else {
+                continue;
+            };
+            if !same_membership_plane(&p.row.cohort_scope, scope)
+                || p.group != group
+                || p.expires_at <= now
+            {
+                continue;
+            }
+            if proposal_withdrawn(dir, &p).await? {
+                continue;
+            }
+            let replies = replies_of(dir, &p.invitee).await?;
+            let declined = replies_to(&replies, &p.row.attestation_id)
+                .iter()
+                .any(|r| membership_row(r) == Some(MembershipRow::Decline));
+            if !declined {
+                out.insert(p.invitee);
+            }
+        }
+    }
+    Ok(out.into_iter().collect())
 }
 
 /// The emit input for a proposal (the inviter signs it through any emit door).

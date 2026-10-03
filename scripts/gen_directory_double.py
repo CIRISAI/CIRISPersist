@@ -89,6 +89,10 @@ DELEGATED_DEFAULTS = (
     # reads still goes through this double's fault table. Without it a fault
     # injected here could never meet a cached verdict.
     "trust_root_standing_cache",
+    # #973 (CC 3.2 T4a) — defaulted "none held", overridden by every backend;
+    # the trust-root reads ask it for every unlabelled `delegates_to`, so
+    # through the double it must reach the backend's held set.
+    "trust_direction_held_among",
 )
 
 ROOT = Path(__file__).resolve().parent.parent

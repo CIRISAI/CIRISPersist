@@ -133,6 +133,8 @@ pub(crate) mod bodies {
         dir.put_family(ts::sign_family(
             &author,
             crate::federation::types::Family {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 family_key_id: fam.clone(),
                 family_name: format!("i230-family-{tag}"),
                 members: vec![crate::federation::types::FamilyMember {
@@ -152,6 +154,8 @@ pub(crate) mod bodies {
         dir.put_community(ts::sign_community(
             &author,
             crate::federation::types::Community {
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
                 community_key_id: comm.clone(),
                 community_name: format!("i230-community-{tag}"),
                 members: vec![crate::federation::types::CommunityMember {

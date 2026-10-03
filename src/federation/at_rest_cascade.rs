@@ -758,6 +758,24 @@ pub fn open_aad(
     )
 }
 
+/// v53.0.0 (CIRISPersist#969, §12.12) — [`seal_aad`] under a nonce the
+/// CALLER derived: the STREAM nonce of CC 5.3.3.1
+/// ([`stream_nonce`](crate::federation::stream_seal::stream_nonce)), never a
+/// random one. The envelope's byte layout is unchanged (`magic ‖ nonce ‖
+/// ciphertext‖tag`); the nonce is stored and every reader recomputes it and
+/// refuses a mismatch. Crate-private: a deterministic nonce is safe only
+/// where the caller owns the counter (the chunk cascade, single sender).
+pub(crate) fn seal_aad_at_nonce(
+    dek: &[u8; DEK_LEN],
+    nonce: [u8; NONCE_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<AtRestEnvelope, AtRestError> {
+    let ciphertext = ciris_crypto::aes_gcm::encrypt_aad(dek, &nonce, aad, plaintext)
+        .map_err(|e| AtRestError::Crypto(format!("aes-gcm seal under associated data: {e}")))?;
+    Ok(AtRestEnvelope { nonce, ciphertext })
+}
+
 /// v47.2.0 (CIRISPersist#853, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.3) — the ONE
 /// place the read doors ask the tombstone fold. Sits AFTER authorization on
 /// every viewer door (whole-blob, range, and the serve door has no viewer),
@@ -1112,6 +1130,33 @@ pub mod orchestrate {
             .filter(|k| !k.x25519_base64.is_empty() && !k.ml_kem_768_base64.is_empty())
     }
 
+    /// v53.0.0 (CIRISPersist#963, coordinator ruling) — the occurrences of
+    /// `member` that may hold `cohort`'s content key: the ONE audience rule
+    /// ([`occurrence_may_hold_key`](crate::federation::replication_audience::occurrence_may_hold_key)),
+    /// so a node denied a cohort's content is denied its key too.
+    async fn keyable<B>(
+        backend: &B,
+        member: &str,
+        occ: Vec<crate::federation::types::IdentityOccurrence>,
+        cohort: crate::federation::replication_audience::OwnerCohort<'_>,
+    ) -> Result<Vec<crate::federation::types::IdentityOccurrence>, BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
+        let mut out = Vec::with_capacity(occ.len());
+        for o in occ {
+            if crate::federation::replication_audience::occurrence_may_hold_key(
+                backend, member, &o, cohort,
+            )
+            .await
+            .map_err(map_dir_err)?
+            {
+                out.push(o);
+            }
+        }
+        Ok(out)
+    }
+
     /// Resolve the active recipients for a self/family write, BY MEMBER:
     /// each roster identity with its `(occurrence_key_id,
     /// encryption_pubkeys?)` pairs (#843 — a member with none is still
@@ -1135,6 +1180,15 @@ pub mod orchestrate {
                     .list_identity_occurrences_active(owner_or_family_key_id)
                     .await
                     .map_err(map_dir_err)?;
+                // v53.0.0 (#963) — only the occurrences the owner's allow list
+                // (or class) lets `self` content reach get its key.
+                let occ = keyable(
+                    backend,
+                    owner_or_family_key_id,
+                    occ,
+                    crate::federation::replication_audience::OwnerCohort::SelfContent,
+                )
+                .await?;
                 Ok(vec![(
                     owner_or_family_key_id.to_owned(),
                     occ.into_iter()
@@ -1171,6 +1225,17 @@ pub mod orchestrate {
                         .list_identity_occurrences_active(&member.key_id)
                         .await
                         .map_err(map_dir_err)?;
+                    // v53.0.0 (#963) — the member's allow list for each device.
+                    let occ = keyable(
+                        backend,
+                        &member.key_id,
+                        occ,
+                        crate::federation::replication_audience::OwnerCohort::Group {
+                            scope: FAMILY,
+                            target: owner_or_family_key_id,
+                        },
+                    )
+                    .await?;
                     out.push((
                         member.key_id.clone(),
                         occ.into_iter()
@@ -1311,8 +1376,31 @@ pub mod orchestrate {
     where
         B: FederationDirectory + BlobStorage + Sync,
     {
-        // persist self-retention: wrap the DEK under the content master so
-        // the read door can recover it in the default tier.
+        self_retain_deks(backend, items, cohort_scope).await?;
+
+        // Recipient cascade — wrap the DEK to each active recipient whose
+        // occurrence carries valid encryption_pubkeys; fail-secure exclude
+        // the rest (no plaintext / v1 fallback). #843: the partition is
+        // decided by roster MEMBER in `partition_roster`, once, for every
+        // cascade.
+        let (targets, report) =
+            resolve_cohort_targets(backend, cohort_scope, owner_or_family_key_id).await?;
+        let changed = grant_deks_to_targets(backend, items, cohort_scope, &targets).await?;
+        Ok((report, changed))
+    }
+
+    /// persist self-retention: wrap each DEK under the content master so the
+    /// read door can recover it in the default tier. The first half of
+    /// [`grant_deks_to_cohort`]; the seal door calls it beside
+    /// [`resolve_cohort_targets`] (v53.0.0, #969).
+    pub(crate) async fn self_retain_deks<B>(
+        backend: &B,
+        items: &[([u8; 32], [u8; DEK_LEN])],
+        cohort_scope: &str,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
         let content_master = backend.load_or_init_content_master().await?;
         for (sha, dek) in items {
             let self_wrap = wrap_dek_for_persist(&content_master, dek).map_err(map_at_rest_err)?;
@@ -1326,19 +1414,43 @@ pub mod orchestrate {
                 )
                 .await?;
         }
+        Ok(())
+    }
 
-        // Recipient cascade — wrap the DEK to each active recipient whose
-        // occurrence carries valid encryption_pubkeys; fail-secure exclude
-        // the rest (no plaintext / v1 fallback). #843: the partition is
-        // decided by roster MEMBER in `partition_roster`, once, for every
-        // cascade.
+    /// v53.0.0 (CIRISPersist#969) — the recipient half of a self/family
+    /// cascade, resolved ONCE: every active recipient occurrence with usable
+    /// keys (the wrap targets) and the report naming who was granted,
+    /// excluded or absent. The seal door resolves it once and wraps the
+    /// manifest's DEK and every stream epoch's DEK to the same set (D9).
+    pub(crate) async fn resolve_cohort_targets<B>(
+        backend: &B,
+        cohort_scope: &str,
+        owner_or_family_key_id: &str,
+    ) -> Result<(Vec<(String, EncryptionPubkeys)>, GrantReport), BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
         let recipients = resolve_recipients(backend, cohort_scope, owner_or_family_key_id).await?;
-        let (targets, report) = partition_roster(recipients);
+        Ok(partition_roster(recipients))
+    }
+
+    /// The wrap half of [`grant_deks_to_cohort`] over targets already
+    /// resolved: a v2 wrap of each blob's DEK to every target that lacks one.
+    /// Returns the blobs on which a NEW grant was written.
+    pub(crate) async fn grant_deks_to_targets<B>(
+        backend: &B,
+        items: &[([u8; 32], [u8; DEK_LEN])],
+        cohort_scope: &str,
+        targets: &[(String, EncryptionPubkeys)],
+    ) -> Result<Vec<[u8; 32]>, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
         let v2_algo = WRAP_ALGORITHM_V2;
         let mut changed: Vec<[u8; 32]> = Vec::new();
         for (sha, dek) in items {
             let mut wrote = false;
-            for (occ_key_id, k) in &targets {
+            for (occ_key_id, k) in targets {
                 if items.len() > 1 && backend.get_at_rest_grant(sha, occ_key_id).await?.is_some() {
                     continue;
                 }
@@ -1353,7 +1465,7 @@ pub mod orchestrate {
                 changed.push(*sha);
             }
         }
-        Ok((report, changed))
+        Ok(changed)
     }
 
     /// One newcomer's wrap target for the [`rekey_for_newcomers`] walk:
@@ -1386,6 +1498,12 @@ pub mod orchestrate {
         /// must emit (the full set, re-read), or the newcomer's remote node
         /// never receives the key for historical bytes (CIRISPersist#850).
         pub changed_blobs: Vec<[u8; 32]>,
+        /// v53.0.0 (CIRISPersist#969) — the stream epochs `(stream_id,
+        /// epoch, group_key_id)` this node sealed on which a NEW grant was
+        /// written: each a stream-axis `KeyGrant` set the caller emits. A
+        /// newcomer to a stream-keyed file costs one wrap per epoch, not one
+        /// per chunk.
+        pub changed_streams: Vec<(String, u64, String)>,
     }
 
     /// The **retroactive key-grant ADD re-wrap** (CIRISPersist#161 Ask 2/4,
@@ -1455,13 +1573,24 @@ pub mod orchestrate {
                 .await?
         };
 
+        // v53.0.0 (#969) — the stream epochs this node sealed that the
+        // existing cohort holds wraps on: O(epochs), walked beside the blobs.
+        let streams = if existing_recipients.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .stream_dek_list_for_recipients(existing_recipients, cohort_scope)
+                .await?
+        };
+
         let mut granted: Vec<(String, usize)> = keyed.iter().map(|(k, _)| (k.clone(), 0)).collect();
-        if keyed.is_empty() || blobs.is_empty() {
+        if keyed.is_empty() || (blobs.is_empty() && streams.is_empty()) {
             return Ok(RekeyResult {
                 blobs_scanned: blobs.len(),
                 granted,
                 excluded,
                 changed_blobs: Vec::new(),
+                changed_streams: Vec::new(),
             });
         }
 
@@ -1538,11 +1667,57 @@ pub mod orchestrate {
             }
         }
 
+        // v53.0.0 (#969) — each stream epoch: recover its DEK through the
+        // self-retention wrap on its row, wrap it to every newcomer lacking a
+        // wrap under the stream's owner.
+        let mut changed_streams: Vec<(String, u64, String)> = Vec::new();
+        for rec in &streams {
+            let already: std::collections::HashSet<String> = backend
+                .stream_dek_grants(&rec.stream_id, rec.epoch, &rec.owner_key_id)
+                .await?
+                .into_iter()
+                .map(|w| w.recipient_key_id)
+                .collect();
+            let needs: Vec<usize> = keyed
+                .iter()
+                .enumerate()
+                .filter(|(_, (k, _))| !already.contains(k))
+                .map(|(i, _)| i)
+                .collect();
+            if needs.is_empty() {
+                continue;
+            }
+            let dek = unwrap_dek_for_persist(&content_master, &rec.self_retention_wrap)
+                .map_err(map_at_rest_err)?;
+            let mut wraps = Vec::with_capacity(needs.len());
+            for i in needs {
+                let (occ_key_id, keys) = &keyed[i];
+                wraps.push(crate::federation::GrantWrap {
+                    recipient_key_id: occ_key_id.clone(),
+                    wrap_algorithm: WRAP_ALGORITHM_V2.to_owned(),
+                    wrapped_dek: wrap_dek_v2(&keys.x25519_base64, &keys.ml_kem_768_base64, &dek)
+                        .map_err(map_at_rest_err)?,
+                });
+                granted[i].1 += 1;
+            }
+            backend
+                .stream_dek_put_grants(
+                    &rec.stream_id,
+                    rec.epoch,
+                    &rec.owner_key_id,
+                    cohort_scope,
+                    &wraps,
+                )
+                .await?;
+            changed_streams.push((rec.stream_id.clone(), rec.epoch, rec.group_key_id.clone()));
+        }
+
         Ok(RekeyResult {
             blobs_scanned: blobs.len(),
             granted,
             excluded,
             changed_blobs,
+            changed_streams,
         })
     }
 
@@ -1720,16 +1895,25 @@ pub mod orchestrate {
         }
 
         // Newcomers = the new member identity's active occurrences.
-        let newcomers: Vec<Newcomer> = backend
-            .list_identity_occurrences_active(new_member_identity_key_id)
-            .await
-            .map_err(map_dir_err)?
-            .into_iter()
-            .map(|o| Newcomer {
-                occurrence_key_id: o.occurrence_key_id,
-                encryption_pubkeys: o.encryption_pubkeys,
-            })
-            .collect();
+        let newcomers: Vec<Newcomer> = keyable(
+            backend,
+            new_member_identity_key_id,
+            backend
+                .list_identity_occurrences_active(new_member_identity_key_id)
+                .await
+                .map_err(map_dir_err)?,
+            crate::federation::replication_audience::OwnerCohort::Group {
+                scope: FAMILY,
+                target: family_key_id,
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|o| Newcomer {
+            occurrence_key_id: o.occurrence_key_id,
+            encryption_pubkeys: o.encryption_pubkeys,
+        })
+        .collect();
 
         // Existing cohort = every OTHER current member's active occurrences —
         // the authorized fold (v49.0.0, #910.3), not the raw record.
@@ -1777,6 +1961,19 @@ pub mod orchestrate {
         let mut existing: Vec<String> = Vec::new();
         for o in active {
             if newset.contains(o.occurrence_key_id.as_str()) {
+                // v53.0.0 (#963) — a device `self` content may not reach is no
+                // newcomer to its keys.
+                if !crate::federation::replication_audience::occurrence_may_hold_key(
+                    backend,
+                    identity_key_id,
+                    &o,
+                    crate::federation::replication_audience::OwnerCohort::SelfContent,
+                )
+                .await
+                .map_err(map_dir_err)?
+                {
+                    continue;
+                }
                 newcomers.push(Newcomer {
                     occurrence_key_id: o.occurrence_key_id,
                     encryption_pubkeys: o.encryption_pubkeys,
@@ -1789,6 +1986,148 @@ pub mod orchestrate {
         let result = rekey_for_newcomers(backend, SELF, &existing, &newcomers).await?;
         emit_membership_hard_cases(backend, SELF, identity_key_id, &result, observed_at).await?;
         Ok(result)
+    }
+
+    /// v53.0.0 (#963) — **a device that comes INTO its owner's self or family
+    /// audience is a newcomer to the keys this node holds.** The case is a
+    /// re-class: an occurrence the owner first published under a server class
+    /// (no self/family key, CC 3.3.7) is republished, same key, newer
+    /// `asserted_at`, under a personal class. Nothing about the device is new,
+    /// so no host calls [`rekey_self_occurrence_add`]; the receive doors run
+    /// this beside the #916 epoch re-wrap
+    /// ([`FederationDirectory::rewrap_own_epochs_for_device`](crate::federation::FederationDirectory::rewrap_own_epochs_for_device)).
+    ///
+    /// For `self` and for every family the owner is an active member of, when
+    /// the device may now hold that cohort's key (the one audience rule) and
+    /// lacks a blob or stream epoch the rest of the cohort holds here, the
+    /// [`rekey_for_newcomers`] walk wraps it. The cohort here is every OTHER
+    /// active occurrence, the owner's own included: a re-classed device was
+    /// beside them all along. Grants only; each leaves its set dirty for the
+    /// pending-`KeyGrant` loop. A device that already holds everything costs
+    /// four index reads, so the idempotent re-deliveries stay cheap.
+    pub async fn rekey_self_family_for_device<B>(
+        backend: &B,
+        owner: &str,
+        device: &str,
+    ) -> Result<Vec<(&'static str, String, RekeyResult)>, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::replication_audience::{occurrence_may_hold_key, OwnerCohort};
+        let mut out = Vec::new();
+        if owner == device {
+            return Ok(out);
+        }
+        let mine = backend
+            .list_identity_occurrences_active(owner)
+            .await
+            .map_err(map_dir_err)?;
+        let Some(occ) = mine.iter().find(|o| o.occurrence_key_id == device).cloned() else {
+            return Ok(out);
+        };
+        let newcomer = [Newcomer {
+            occurrence_key_id: occ.occurrence_key_id.clone(),
+            encryption_pubkeys: occ.encryption_pubkeys.clone(),
+        }];
+
+        let mut cohorts: Vec<(&'static str, String, Vec<String>)> = Vec::new();
+        if occurrence_may_hold_key(backend, owner, &occ, OwnerCohort::SelfContent)
+            .await
+            .map_err(map_dir_err)?
+        {
+            let others = mine
+                .iter()
+                .map(|o| o.occurrence_key_id.clone())
+                .filter(|k| k != device)
+                .collect();
+            cohorts.push((SELF, owner.to_owned(), others));
+        }
+        for fam in backend
+            .list_families_for_member_active(owner)
+            .await
+            .map_err(map_dir_err)?
+        {
+            let cohort = OwnerCohort::Group {
+                scope: FAMILY,
+                target: &fam.family_key_id,
+            };
+            if !occurrence_may_hold_key(backend, owner, &occ, cohort)
+                .await
+                .map_err(map_dir_err)?
+            {
+                continue;
+            }
+            let mut others = Vec::new();
+            for m in backend
+                .active_family_members(&fam.family_key_id)
+                .await
+                .map_err(map_dir_err)?
+            {
+                for o in backend
+                    .list_identity_occurrences_active(&m.key_id)
+                    .await
+                    .map_err(map_dir_err)?
+                {
+                    if o.occurrence_key_id != device {
+                        others.push(o.occurrence_key_id);
+                    }
+                }
+            }
+            cohorts.push((FAMILY, fam.family_key_id.clone(), others));
+        }
+
+        for (scope, group, others) in cohorts {
+            if !device_lacks_cohort_keys(backend, scope, &others, device).await? {
+                continue;
+            }
+            let r = rekey_for_newcomers(backend, scope, &others, &newcomer).await?;
+            out.push((scope, group, r));
+        }
+        Ok(out)
+    }
+
+    /// Does `device` lack a blob or stream epoch wrap that `others` hold in
+    /// `scope` on this node? Index reads only.
+    async fn device_lacks_cohort_keys<B>(
+        backend: &B,
+        scope: &str,
+        others: &[String],
+        device: &str,
+    ) -> Result<bool, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        if others.is_empty() {
+            return Ok(false);
+        }
+        let me = [device.to_owned()];
+        let held: std::collections::HashSet<[u8; 32]> = backend
+            .list_at_rest_blobs_for_recipients(&me, scope)
+            .await?
+            .into_iter()
+            .collect();
+        if backend
+            .list_at_rest_blobs_for_recipients(others, scope)
+            .await?
+            .iter()
+            .any(|sha| !held.contains(sha))
+        {
+            return Ok(true);
+        }
+        let key = |r: &crate::federation::StreamDekRecord| {
+            (r.stream_id.clone(), r.epoch, r.owner_key_id.clone())
+        };
+        let held: std::collections::HashSet<_> = backend
+            .stream_dek_list_for_recipients(&me, scope)
+            .await?
+            .iter()
+            .map(key)
+            .collect();
+        Ok(backend
+            .stream_dek_list_for_recipients(others, scope)
+            .await?
+            .iter()
+            .any(|r| !held.contains(&key(r))))
     }
 
     /// #249 Cut G4 (§7) — forward-secrecy re-key on **community** member
@@ -2028,6 +2367,36 @@ pub mod orchestrate {
     /// member owns but does not speak through (infrastructure the member
     /// operates for others) is not a device of theirs and receives none of
     /// their history.
+    /// v53.0.0 (CIRISPersist#963, coordinator ruling) — may `device` (an
+    /// occurrence of `member`) hold `community_key_id`'s epoch keys? The ONE
+    /// audience rule over the member's newest active row for the device.
+    async fn device_may_hold_room_key<B>(
+        backend: &B,
+        member_key_id: &str,
+        device: &str,
+        community_key_id: &str,
+    ) -> Result<bool, crate::federation::Error>
+    where
+        B: FederationDirectory + Sync,
+    {
+        let Some(occ) = backend
+            .list_identity_occurrences_active(member_key_id)
+            .await?
+            .into_iter()
+            .filter(|o| o.occurrence_key_id == device)
+            .max_by_key(|o| o.asserted_at)
+        else {
+            return Ok(false);
+        };
+        crate::federation::replication_audience::occurrence_may_hold_room_key(
+            backend,
+            member_key_id,
+            &occ,
+            community_key_id,
+        )
+        .await
+    }
+
     async fn is_member_device<B>(
         backend: &B,
         member_key_id: &str,
@@ -2269,6 +2638,18 @@ pub mod orchestrate {
                 crate::federation::DEVICE_REKEY_RULE_MEMBER_NOT_ACTIVE,
             ));
         }
+        // 4b — v53.0.0 (#963) — the member's allow list (or the device's
+        // class) lets this room reach the device: a denied device gets no key.
+        if !device_may_hold_room_key(
+            backend,
+            member_key_id,
+            new_occurrence_key_id,
+            community_key_id,
+        )
+        .await?
+        {
+            return Err(refuse(crate::federation::DEVICE_REKEY_RULE_NOT_IN_AUDIENCE));
+        }
 
         // 5 — the device's content-KEM keys, revocation- and validity-aware.
         let keys = backend
@@ -2430,6 +2811,13 @@ pub mod orchestrate {
                 }
                 let holders = &holders_of[member];
                 for device in devices {
+                    // v53.0.0 (#963) — a device the member's list denies this
+                    // room gets none of its epochs.
+                    if !device_may_hold_room_key(backend, member, &device, &community_key_id)
+                        .await?
+                    {
+                        continue;
+                    }
                     let keys = backend.resolve_encryption_keys(&device).await?;
                     let Some(keys) = usable_keys(&keys).cloned() else {
                         report
@@ -2808,6 +3196,36 @@ pub mod orchestrate {
                         hex::encode(at_rest_sha256)
                     ))
                 })?;
+                // #969 / #842 — a stream-keyed chunk has no per-row key: the
+                // viewer was authorized by its stream position's epoch grant,
+                // so it opens (or, outside its position-bound data, fails as a
+                // crypto-class error) under that epoch's DEK — never NotGranted.
+                if backend
+                    .get_at_rest_grant(at_rest_sha256, viewer_key_id)
+                    .await?
+                    .is_none()
+                    && backend
+                        .get_at_rest_grant(at_rest_sha256, PERSIST_SELF_RECIPIENT)
+                        .await?
+                        .is_none()
+                {
+                    for (stream_id, chunk) in
+                        backend.stream_positions_of_chunk(at_rest_sha256).await?
+                    {
+                        if let Some(dek) =
+                            crate::federation::chunk_dag_cascade::orchestrate::stream_dek_for_viewer(
+                                backend,
+                                &stream_id,
+                                chunk.epoch,
+                                viewer_key_id,
+                            )
+                            .await?
+                        {
+                            return open(&dek, &envelope, aad)
+                                .map_err(super::open_err(at_rest_sha256, map_at_rest_err));
+                        }
+                    }
+                }
                 read_for_viewer_sealed(backend, at_rest_sha256, viewer_key_id, &envelope, aad).await
             }
             CryptoTier::CommunityDek => {
@@ -2834,6 +3252,15 @@ pub mod orchestrate {
     /// tier, before any body is touched.** Shared by the whole read, the
     /// range read (#832) and the per-chunk checks, so one predicate decides
     /// every read. A refusal names only the sha and the viewer (I4).
+    ///
+    /// v53.0.0 (#969, #842) — a self/family chunk sealed under its stream's
+    /// `(stream, epoch)` DEK carries no per-row grant; the viewer is
+    /// authorized on it by the grant of a stream position it sits at
+    /// ([`stream_grant_sealer`](crate::federation::chunk_dag_cascade::orchestrate::stream_grant_sealer),
+    /// the predicate the position read opens with). So an authorized reader
+    /// who reaches a chunk by its sha alone passes authorization and then
+    /// fails the position-bound open as a crypto-class error, never as
+    /// `NotGranted`.
     pub(crate) async fn authorize_viewer_by_tier<B>(
         backend: &B,
         at_rest_sha256: &[u8; 32],
@@ -2841,7 +3268,7 @@ pub mod orchestrate {
         viewer_key_id: &str,
     ) -> Result<(), BlobError>
     where
-        B: BlobStorage + Sync,
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
     {
         use crate::federation::types::cohort_scope::CryptoTier;
         let not_granted = || BlobError::NotGranted {
@@ -2858,11 +3285,24 @@ pub mod orchestrate {
                 if backend
                     .get_at_rest_grant(at_rest_sha256, viewer_key_id)
                     .await?
-                    .is_none()
+                    .is_some()
                 {
-                    return Err(not_granted());
+                    return Ok(());
                 }
-                Ok(())
+                for (stream_id, chunk) in backend.stream_positions_of_chunk(at_rest_sha256).await? {
+                    if crate::federation::chunk_dag_cascade::orchestrate::stream_grant_sealer(
+                        backend,
+                        &stream_id,
+                        chunk.epoch,
+                        viewer_key_id,
+                    )
+                    .await?
+                    .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(not_granted())
             }
             CryptoTier::CommunityDek => {
                 let Some((community, minter, epoch)) =
@@ -4519,13 +4959,38 @@ pub mod blob_invariants {
             "{tag} I19: a deleted blob holds the epoch's object count above zero — its DEK \
              can never be destroyed"
         );
+        // v53.0.0 (CIRISEdge#763) — the grant is a key-plane fact, not a
+        // byte holding: an eviction keeps it, so re-fetched bytes open. Asked
+        // of a SELF blob, which carries a per-blob grant (a community blob is
+        // keyed by its epoch's member grants and never has one — the pre-v53
+        // leg here asked a community blob and could not fail).
+        let own = super::orchestrate::encrypt_and_cascade(
+            backend,
+            crate::federation::types::cohort_scope::SELF,
+            &alice,
+            b"y",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             backend
-                .get_at_rest_grant(&sealed.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
+                .get_at_rest_grant(&own.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
                 .await
                 .unwrap()
-                .is_none(),
-            "{tag} I19: an at-rest grant OUTLIVED its blob"
+                .is_some(),
+            "{tag} I19 precondition: a self blob carries its self-retention grant"
+        );
+        assert!(backend.delete_blob(&own.at_rest_sha256).await.unwrap());
+        assert!(
+            backend
+                .get_at_rest_grant(&own.at_rest_sha256, super::PERSIST_SELF_RECIPIENT)
+                .await
+                .unwrap()
+                .is_some(),
+            "{tag} I19: an eviction deleted the at-rest grant — re-fetched bytes could never open"
         );
     }
 
@@ -5752,7 +6217,7 @@ pub mod blob_invariants {
             .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
                 identity_key_id: identity_key_id.to_owned(),
                 occurrence_key_id: occurrence_key_id.to_owned(),
-                device_class: crate::federation::types::device_class::SERVER.into(),
+                device_class: crate::federation::types::device_class::LAPTOP.into(),
                 hardware_attestation: None,
                 asserted_at: chrono::Utc::now(),
                 valid_until: None,

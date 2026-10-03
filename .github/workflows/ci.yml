@@ -300,7 +300,16 @@ jobs:
         # runner-stall backstop, not the hang detector — `.config/nextest.toml`
         # still kills a hung test by name at its own bound — so the headroom
         # costs no diagnostic sharpness.
-        timeout-minutes: ${{ matrix.substrate.leg == 'rest' && 50 || 35 }}
+        #
+        # v53.0.0 — 35 → 50 for every leg. PR #978's run timed `cirisaudit` out
+        # at 35.2 min with 4391/4392 tests done, and `cirisgraph` (34.1) and
+        # `telemetry` (34.2) finished within a minute of the bound. The slow
+        # test runs 27.3s on v53 vs 26.2s on v52.0.2 locally, so the code did
+        # not slow down. The same legs vary 17–34 min between runs of one tree
+        # (cirisgraph 16.9 on v52.0.2's main run, 34.1 here), so the bound was
+        # inside the runner's variance. Same reasoning as above: the per-test
+        # hang detector is `.config/nextest.toml`, this is the runner backstop.
+        timeout-minutes: 50
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         # v30.2.0 (CIRISPersist#17) — `--test-threads=1` is GONE, and with it

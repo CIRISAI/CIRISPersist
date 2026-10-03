@@ -148,7 +148,7 @@ pub mod two_node {
                             crate::federation::types::IdentityOccurrence {
                                 identity_key_id: (*ident).to_owned(),
                                 occurrence_key_id: o.key.clone(),
-                                device_class: crate::federation::types::device_class::SERVER.into(),
+                                device_class: crate::federation::types::device_class::LAPTOP.into(),
                                 hardware_attestation: None,
                                 asserted_at: chrono::Utc::now(),
                                 valid_until: None,
@@ -173,6 +173,8 @@ pub mod two_node {
                 .put_community(ts::sign_community(
                     comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.to_owned(),
                         community_name: "Two-node Co-op".into(),
                         members: roster,
@@ -918,7 +920,7 @@ pub mod two_node {
                     .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
                         identity_key_id: owner.clone(),
                         occurrence_key_id: dev.key.clone(),
-                        device_class: crate::federation::types::device_class::SERVER.into(),
+                        device_class: crate::federation::types::device_class::LAPTOP.into(),
                         hardware_attestation: None,
                         asserted_at: chrono::Utc::now(),
                         valid_until: None,
@@ -1177,11 +1179,13 @@ pub mod two_node {
             ts::register_hybrid_key_as(n.backend, &fam, &fam, USER).await;
             for (ident, dev) in [(&alice, a), (&bob, b)] {
                 ts::register_hybrid_key_as(n.backend, ident, ident, USER).await;
+                // v53.0.0 (#963, CC 3.3.7) — a member's PERSONAL device: a
+                // server-class occurrence holds no family content by default.
                 n.backend
                     .put_identity_occurrence_local(crate::federation::types::IdentityOccurrence {
                         identity_key_id: ident.clone(),
                         occurrence_key_id: dev.key.clone(),
-                        device_class: crate::federation::types::device_class::SERVER.into(),
+                        device_class: crate::federation::types::device_class::LAPTOP.into(),
                         hardware_attestation: None,
                         asserted_at: chrono::Utc::now(),
                         valid_until: None,
@@ -1204,6 +1208,8 @@ pub mod two_node {
                 .put_family(ts::sign_family(
                     &fam,
                     crate::federation::types::Family {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         family_key_id: fam.clone(),
                         family_name: "I199 Household".into(),
                         members,
@@ -1450,6 +1456,8 @@ pub mod two_node {
                 .put_community(ts::sign_community(
                     &comm,
                     crate::federation::types::Community {
+                        prev_head_digest: String::new(),
+                        charter_digest: String::new(),
                         community_key_id: comm.clone(),
                         community_name: "Principal Co-op".into(),
                         members: [&alice, &bob]
@@ -1601,6 +1609,8 @@ pub mod two_node {
             c.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob]
@@ -1724,6 +1734,8 @@ pub mod two_node {
             d.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob]
@@ -1823,6 +1835,8 @@ pub mod two_node {
             e.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob, &carol]
@@ -1949,6 +1963,8 @@ pub mod two_node {
             f.put_community(ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Principal Co-op".into(),
                     members: [&alice, &bob]
@@ -2502,7 +2518,7 @@ mod tests {
         );
         assert_eq!(
             REPLICATION_POLICY_HASH,
-            "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a"
+            "1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869"
         );
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("WIRE_VOCABULARY_KINDS.md"),
@@ -3447,7 +3463,7 @@ mod tests {
                 |occ: &str, pk: EncryptionPubkeys| crate::federation::types::IdentityOccurrence {
                     identity_key_id: owner.clone(),
                     occurrence_key_id: occ.to_owned(),
-                    device_class: crate::federation::types::device_class::SERVER.into(),
+                    device_class: crate::federation::types::device_class::LAPTOP.into(),
                     hardware_attestation: None,
                     asserted_at: chrono::Utc::now(),
                     valid_until: None,
@@ -3694,6 +3710,8 @@ mod tests {
             let community = ts::sign_community(
                 &comm,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm.clone(),
                     community_name: "Delivered Co-op".into(),
                     members: [&alice, &bob]
@@ -4514,6 +4532,8 @@ mod tests {
             sq.put_community(ts::sign_community(
                 &comm2,
                 crate::federation::types::Community {
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                     community_key_id: comm2.clone(),
                     community_name: "Second Co-op".into(),
                     members: roster,
