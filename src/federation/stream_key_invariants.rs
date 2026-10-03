@@ -1554,6 +1554,56 @@ pub(crate) mod bodies {
         );
     }
 
+    /// I319b (#969, #842) — a stream-keyed chunk reached by its sha alone:
+    /// the holder of its stream-epoch grant is AUTHORIZED (the whole-blob door
+    /// asks the chunk's stream position) and then fails the position-bound
+    /// open as a crypto-class error; a stranger is `NotGranted`.
+    pub(crate) async fn i319b_a_stream_chunk_by_sha_authorizes_by_its_epoch<B>(
+        dsn_a: &str,
+        dsn_b: &str,
+        run: &str,
+        pick: Pick<B>,
+    ) where
+        B: BlobStorage + FederationDirectory + Sync + 'static,
+    {
+        let p = pair(dsn_a, dsn_b, run, pick, "i319b").await;
+        let stream = format!("i319b-{run}");
+        write_self(&p.a, &p.owner, &stream, 2).await;
+        let listing = p.sa.stream_chunks(&stream).await.unwrap();
+        let sha = listing.chunks[0].chunk_sha;
+        assert!(
+            p.sa.get_at_rest_grant(&sha, &p.key_a)
+                .await
+                .unwrap()
+                .is_none(),
+            "I319b: the chunk carries no per-chunk grant (the premise)"
+        );
+        let authorized =
+            p.a.read_blob_as(&sha, &p.key_a, None)
+                .await
+                .expect_err("I319b: a chunk does not open by its sha alone");
+        assert!(
+            matches!(authorized, BlobError::SealDidNotOpen { .. }),
+            "I319b: the epoch-grant holder is authorized, then the open fails: {authorized:?}"
+        );
+        let stranger = format!("i319b-stranger-{run}");
+        let refused =
+            p.a.read_blob_as(&sha, &stranger, None)
+                .await
+                .expect_err("I319b: a stranger reads nothing");
+        assert!(
+            matches!(refused, BlobError::NotGranted { .. }),
+            "I319b: a stranger is NotGranted: {refused:?}"
+        );
+        // The position read is unchanged.
+        assert_eq!(
+            p.a.read_stream_chunk_as(&stream, 0, &p.key_a, None)
+                .await
+                .unwrap(),
+            segment(0)
+        );
+    }
+
     /// I312 (unit) — the structure check over `(seq, epoch, slot)`.
     pub(crate) fn i312_the_structure_check() {
         let s = |counter, last| StreamKeySlot { counter, last };
@@ -1740,6 +1790,17 @@ mod runners {
                 async fn i319() {
                     let Some((a, b)) = $dsns else { return };
                     bodies::i319_one_sender_one_counter(&a, &b, &super::suffix(), $pick).await
+                }
+                #[tokio::test]
+                async fn i319b() {
+                    let Some((a, b)) = $dsns else { return };
+                    bodies::i319b_a_stream_chunk_by_sha_authorizes_by_its_epoch(
+                        &a,
+                        &b,
+                        &super::suffix(),
+                        $pick,
+                    )
+                    .await
                 }
             }
         };

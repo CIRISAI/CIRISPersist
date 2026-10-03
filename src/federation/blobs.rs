@@ -2210,6 +2210,16 @@ pub trait BlobStorage: Send + Sync {
         seq: u64,
     ) -> impl Future<Output = Result<Option<StreamChunkRef>, BlobError>> + Send;
 
+    /// v53.0.0 (#969, #842) — **every stream position a chunk row sits at**,
+    /// by its content address: `(stream_id, chunk)` pairs, empty for a row
+    /// that is no stream's chunk. A stream-keyed chunk carries no per-chunk
+    /// grant, so the whole-blob doors authorize it through its position's
+    /// `(stream, epoch)` grant; this is the lookup (V175 indexes it).
+    fn stream_positions_of_chunk(
+        &self,
+        chunk_sha: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<(String, StreamChunkRef)>, BlobError>> + Send;
+
     // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
 
     /// The stream's key state in one snapshot — see [`StreamKeyState`].

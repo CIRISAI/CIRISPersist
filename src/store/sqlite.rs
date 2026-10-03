@@ -17486,6 +17486,48 @@ impl crate::federation::BlobStorage for SqliteBackend {
         row.map(sqlite_stream_chunk_ref).transpose()
     }
 
+    async fn stream_positions_of_chunk(
+        &self,
+        chunk_sha: &[u8; 32],
+    ) -> Result<Vec<(String, crate::federation::StreamChunkRef)>, crate::federation::BlobError>
+    {
+        let sha_vec = chunk_sha.to_vec();
+        type Row = (String, (i64, Vec<u8>, i64, i64, i64, String, String));
+        let rows: Vec<Row> = self
+            .read(move |conn| -> Result<Vec<Row>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT c.stream_id, c.seq, c.chunk_sha, c.epoch, c.size_bytes, \
+                            c.plaintext_size_bytes, b.crypto_tier, b.cohort_scope \
+                       FROM federation_stream_chunks c \
+                       JOIN federation_blobs b ON b.sha256 = c.chunk_sha \
+                      WHERE c.chunk_sha = ?1 \
+                      ORDER BY c.stream_id, c.seq",
+                )?;
+                let it = stmt.query_map([sha_vec], |r| {
+                    Ok((
+                        r.get(0)?,
+                        (
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                        ),
+                    ))
+                })?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("stream_positions_of_chunk: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(stream_id, r)| Ok((stream_id, sqlite_stream_chunk_ref(r)?)))
+            .collect()
+    }
+
     async fn promote_adopted_manifest_to_dag(
         &self,
         sha256: &[u8; 32],

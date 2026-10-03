@@ -118,8 +118,14 @@ def test_encrypted_chunk_dag_round_trips_through_the_wheel_832(tmp_path) -> None
 
         sealed = json.loads(eng.seal_stream_scoped("self", stream, community_key_id=kid))
         assert sealed["tier"] == "invisible_encrypted"
-        assert sealed["chunk_count"] == 2
+        # v53 (#969) — `chunk_count` is how many chunks the MANIFEST lists:
+        # the two producer chunks plus the epoch's zero-length terminator.
+        assert sealed["chunk_count"] == 3
         assert sealed["total_size"] == 4500
+        sealed_listing = json.loads(eng.stream_chunks_json(stream))["chunks"]
+        assert [c["seq"] for c in sealed_listing[:2]] == [0, 1]
+        assert sealed_listing[-1]["seq"] == 2**62, sealed_listing[-1]
+        assert sealed_listing[-1]["plaintext_size"] == 0
         manifest = sealed["manifest_sha256"]
 
         plain = segs[0] + segs[1]
