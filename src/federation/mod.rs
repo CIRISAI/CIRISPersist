@@ -447,6 +447,9 @@ impl ConsentSweepReport {
     }
 }
 
+/// v53.0.0 (CC 4.2.6) — I450e–I450h, the accord's roster change.
+#[cfg(test)]
+mod accord_roster_invariants;
 /// v53.0.0 (CC 3.2 T6) — I440–I449, the head moves with the record.
 #[cfg(test)]
 mod lineage_head_invariants;
