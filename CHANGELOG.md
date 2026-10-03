@@ -332,7 +332,7 @@ Refusals: `accord_roster_change_{uncovered,short,unconsented,unbound,not_seats}`
 
 Mutation round — the door (memory + sqlite + the I429 integration legs): N1 the standing roster is the offered one — killed (I450e/f/h); N2 an unauthorized decision covers — killed (I450e); N3 an open window covers — killed (I450e); N4 the payload is not checked — killed (I450e); N5 consent not checked — killed (I450e); N6 the door skips coverage — killed (I450e/g, I432, I433); N7 a stray admitted — killed (I450g, I433); N8 the replicated route does not take the shape — killed (I450f); N9 a recovery's replaced key counted stray — killed (I429, I429b); N10 genesis skips coverage — killed by I450i only (from disk).
 
-**Not built (BELIEVED):** the door does not require an added holder's key record to carry `identity_type` `accord_holder` (it requires a registered key, its consent and its recovery commitment).
+**A seat goes only to an `accord_holder` key** (CC 4.2.6: holders are `federation_keys` rows with `identity_type="accord_holder"`). Both doors that seat a key ask the predicate the genesis bundle check applies to its holders (`KeyRecord::claims_role(accord_holder)`, via `accord_roster::is_accord_holder_key`): `accord_roster_change_not_a_holder_key`, `accord_recovery_not_a_holder_key`. Witnessed by I450j (memory, sqlite, postgres) and an I429 leg; mutant N11 (any key takes a seat) killed by both.
 
 | Witness | What it pins |
 |---|---|
