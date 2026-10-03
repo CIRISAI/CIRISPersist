@@ -28,6 +28,8 @@ threat-model citations because this crate's audit story is the point.
 - Old unlabelled portable bundles yield no charter (`delegates_to` needs a `trust:` job label, V167).
 - Row types are checked against the CC registry in REPORT mode (#975): unregistered types are admitted and counted; a later release flips `ROW_TYPE_ENFORCEMENT`.
 
+**Edge #763:** `put_custody_ack` takes `caller_aad` (pyo3 `aad_b64`); re-adopting an identical evicted chunk is idempotent; an eviction keeps the at-rest grants, so a re-fetched file opens with no new key_grant set.
+
 **Test support (`test-anchor`, never in a wheel):** `chunk_dag_cascade::test_support::write_legacy_v2_dag(engine, backend, cohort_scope, group_key_id, stream_id, chunks, aad)` writes a v52-shaped v2 DAG for adopters' end-to-end pulls.
 
 ### S2 — custody:ack:v1 (CIRISPersist#942 part 2; CC 3.1.3.3, CIRISConstitution#130)
@@ -71,6 +73,8 @@ A family can now see how many copies of its content exist without weakening encr
 | M12 `here` for a row-held blob without bytes | equivalent — `blob_head` and `has_blob` read one stored row; the unreachable branch was removed |
 | M13 a commons placement admitted | killed — I407 |
 | M14 the fold reads rows ABOUT the device instead of BY it | equivalent — a third-party report is refused at admission, so the two sets agree |
+
+**`here` under the sealed data (CIRISEdge#763).** `Engine::put_custody_ack(sha, state, cohort_scope, cohort_target, caller_aad)` / pyo3 `put_custody_ack(..., aad_b64=None)`: the DAG-completeness check opens the manifest under the associated data it was sealed with (an edge file pointer binds `content_aad(attester, asserted_at, content_field)`), through the same `sealed_dag_readiness_for_viewer` predicate. Without it every edge DAG was refused "AEAD tag did not verify". A manifest that does not open under the data given is refused `custody_ack_here_seal_did_not_open`, never filed as a whole blob. Witness I415c (sqlite, postgres); mutant M1 (the check drops the data) killed.
 
 ### The final-genesis assembler (CIRISPersist#973; CC rc7 T5, T6, 3.4.7, 4.2.6)
 
@@ -304,6 +308,13 @@ A self/family chunk was a whole blob: a fresh DEK and a content-axis `key_grant`
 Not built: the CC 5.3.3.1 nonce for COMMUNITY chunks (still a random nonce under the epoch DEK; follow-up #977).
 
 **A stream-keyed chunk read by its sha alone (#842 kept).** A self/family chunk sealed under its stream's `(stream, epoch)` DEK carries no per-row grant, so the whole-blob doors (`read_blob_as` and the shared `authorize_viewer_by_tier`) answered `blob_not_granted` to a reader who held the epoch's grant. They now authorize through the chunk's stream position (`BlobStorage::stream_positions_of_chunk`, new; V175 indexes `federation_stream_chunks.chunk_sha`) with the same `stream_grant_sealer` the position read uses, and open under that epoch's DEK: outside its position-bound data the open fails as `blob_seal_did_not_open`, never `blob_not_granted`; a stranger is still `blob_not_granted` (I319b, sqlite and postgres). `seal_stream_scoped`'s `chunk_count` is how many chunks the manifest lists, so a v4 DAG counts its terminator: the wheel test expects 3 for two producer chunks. A stream-keyed chunk that does not open under the data presented (the position read, a DAG read) is `blob_seal_did_not_open`, as a per-chunk-keyed row always was; it was a generic `blob_backend` since #969.
+
+**Repair after eviction (CIRISEdge#763).**
+- *A lost chunk.* Re-adopting the IDENTICAL `(seq, chunk_sha)` at a held position restores the bytes (and the community binding, as declared) and counts nothing, since the position was counted when first stored; a DIFFERENT sha there is still refused `already exists` and stores nothing. Adoption only: a producer append never re-uses a position. I415d/I415e (two nodes, sqlite and postgres), including V175's by-sha lookup (empty while evicted, the kept position after repair).
+- *A lost file.* `delete_blob`, the eviction floor, now removes the bytes and the epoch binding and **keeps the at-rest key grants**: a grant is a key-plane fact, not a byte holding. A device that re-fetches an evicted manifest and its chunks reads whole with no key_grant set re-applied (I415f, two nodes, sqlite and postgres). Grants are still removed by the epoch destruction sweep and by stream abandon. A tombstone never deleted a grant; it is judged at the read and serve doors, and I149 shows a member holding the grant is refused `Withdrawn`.
+- *I19 was vacuous on its grant leg.* It asked whether a COMMUNITY blob's `__persist_self__` grant outlived the blob, but a community blob never has one (it is keyed by its epoch's member grants), so the leg passed whether or not `delete_blob` touched grants. It now measures a self blob's real grant, with a precondition.
+- Mutants: no repair arm (sqlite and postgres), a different sha repaired, and eviction deleting grants again (sqlite and postgres). All five killed.
+
 ### rc7 accord: key-binding commitments, recovery commitments, no backstop
 
 CIRISConstitution rc7 `5e89627` (CC 3.2 T3, 4.2.6, 2.1) and `fe459cf` (CC 4.2.6, CIRISConstitution#139). Witnesses I430–I439 on memory, sqlite and postgres; I430 is a pure test.

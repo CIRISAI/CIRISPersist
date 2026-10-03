@@ -208,6 +208,13 @@ pub(crate) mod bodies {
             p.b.read_blob_as(&root, &p.key_b, None).await.is_err(),
             "I415d with chunk 1 gone the DAG does not read"
         );
+        assert!(
+            p.sb.stream_positions_of_chunk(&sha)
+                .await
+                .unwrap()
+                .is_empty(),
+            "I415d an evicted chunk resolves to no held position (V175 joins the bytes)"
+        );
         // I415e first, while the position is held and its bytes are gone: a
         // DIFFERENT sha at seq 1 is refused and stores nothing.
         let (_, other_sha, other_env, _, other_size) =
@@ -232,6 +239,16 @@ pub(crate) mod bodies {
                 .expect("I415d re-adopting the identical (seq, chunk_sha) is admitted");
         assert_eq!(got, sha, "I415d the same chunk, by its address");
         assert!(p.sb.blob_head(&sha).await.unwrap().is_some());
+        assert_eq!(
+            p.sb.stream_positions_of_chunk(&sha)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(s, c)| (s, c.seq))
+                .collect::<Vec<_>>(),
+            vec![(stream.clone(), seq)],
+            "I415d the repaired chunk resolves to its kept position"
+        );
         assert_eq!(
             p.b.read_blob_as(&root, &p.key_b, None).await.unwrap(),
             plain,
