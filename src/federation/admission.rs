@@ -1698,9 +1698,23 @@ pub fn is_owner_binding_envelope(envelope: &serde_json::Value) -> bool {
 /// backends confirm against the parsed envelope (the SQLite LIKE / PG
 /// `@>` prefilters narrow the scan; this is the authoritative check).
 ///
+/// v53.0.1 — a **custody report** (`custody:` family, CC 3.1.3.3) never binds
+/// content. It names the blob in `evidence_refs` because that is how it says
+/// WHICH bytes its device holds: a holding fact, not a row that establishes or
+/// references the content. v53.0.0 counted it, so a device that filed `here`
+/// kept one live binding after the author withdrew the file, and read and
+/// served it (CC 2.3), and it became a "subject" of the content
+/// ([`subject_of_content`]). Every reader of "which rows bind this sha" goes
+/// through this predicate, so the exclusion lives here once.
+///
 /// [`FederationDirectory::attestations_binding_content`]: super::FederationDirectory::attestations_binding_content
 #[must_use]
 pub fn envelope_binds_content(envelope: &serde_json::Value, content_sha256: &str) -> bool {
+    if envelope_dimension(envelope)
+        .is_some_and(|d| d.starts_with(super::custody_ack::CUSTODY_FAMILY_STEM))
+    {
+        return false;
+    }
     let by_evidence = envelope
         .get("evidence_refs")
         .and_then(|v| v.as_array())

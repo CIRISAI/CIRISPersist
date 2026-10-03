@@ -7808,7 +7808,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("attestations_binding_content: {e}"))
             })?;
-        rows.into_iter().map(pg_row_to_attestation).collect()
+        // v53.0.1 — the SQL above is a PREFILTER (any envelope mentioning the
+        // sha). The authoritative check is the shared predicate, as on sqlite
+        // and memory: without it a mention was a binding here, and a custody
+        // report (which names the sha and binds nothing) kept a withdrawn
+        // file Live on postgres.
+        let atts: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<_, _>>()?;
+        Ok(atts
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_binds_content(
+                    &a.attestation_envelope,
+                    content_sha256,
+                )
+            })
+            .collect())
     }
 
     async fn put_revocation(
