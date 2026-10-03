@@ -715,6 +715,332 @@ pub(crate) mod bodies {
         }
     }
 
+    /// **I398b** (CIRISEdge#761, CC 3.1.3.2) — a proposal reaches every node
+    /// whose principals include its invitee K, whatever K's node's class or
+    /// list: the invitee is not a member, so no cohort view admits it. A
+    /// stranger's node is not reached.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i398b_a_proposal_reaches_the_invitees_nodes(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::membership_acceptance_invariants::bodies as ma;
+        let (cid, founder, k, kphone, kserver, stranger, snode) = (
+            format!("i398b-c-{s}"),
+            format!("i398b-f-{s}"),
+            format!("i398b-k-{s}"),
+            format!("i398b-kp-{s}"),
+            format!("i398b-ks-{s}"),
+            format!("i398b-x-{s}"),
+            format!("i398b-xn-{s}"),
+        );
+        ma::reg(d, &[&cid, &founder, &k, &stranger]).await;
+        nodes(d, &[&kphone, &kserver, &snode]).await;
+        claim(d, &k, &kphone, device_class::PHONE).await;
+        claim(d, &k, &kserver, device_class::SERVER).await;
+        claim(d, &stranger, &snode, device_class::PHONE).await;
+        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+            .await
+            .unwrap();
+        let p = ma::proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &k,
+            None,
+            Utc::now(),
+            Some(Duration::days(7)),
+        );
+        ma::put(d, &p).await.unwrap();
+        for n in [&kphone, &kserver] {
+            assert_eq!(
+                ra::may_receive(d, n, &p).await.unwrap(),
+                ra::Verdict::Yes(ra::Reason::RefersTo),
+                "I398b the invitee's node {n} receives the proposal (CC 3.1.3.2)"
+            );
+        }
+        assert!(
+            !ra::may_receive(d, &snode, &p).await.unwrap().allowed(),
+            "I398b a stranger's node does not"
+        );
+    }
+
+    /// **I398c** — an acceptance or decline goes back to the proposer's
+    /// nodes (resolved from the proposal it answers), and to nobody else
+    /// outside the group's plane.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i398c_an_answer_returns_to_the_proposers_nodes(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::membership_acceptance_invariants::bodies as ma;
+        let (cid, founder, fnode, k, j, stranger, snode) = (
+            format!("i398c-c-{s}"),
+            format!("i398c-f-{s}"),
+            format!("i398c-fn-{s}"),
+            format!("i398c-k-{s}"),
+            format!("i398c-j-{s}"),
+            format!("i398c-x-{s}"),
+            format!("i398c-xn-{s}"),
+        );
+        ma::reg(d, &[&cid, &founder, &k, &j, &stranger]).await;
+        nodes(d, &[&fnode, &snode]).await;
+        claim(d, &founder, &fnode, device_class::SERVER).await;
+        claim(d, &stranger, &snode, device_class::PHONE).await;
+        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+            .await
+            .unwrap();
+        // A server-class node that denies the room as CONTENT still gets the
+        // ceremony: a roster row is not content.
+        put(
+            d,
+            &grant(&founder, Some(&fnode), Some(serde_json::json!([]))),
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let pk = ma::proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &k,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        let pj = ma::proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &j,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        ma::put(d, &pk).await.unwrap();
+        ma::put(d, &pj).await.unwrap();
+        let accept = ma::reply(&k, &k, &pk, true, now);
+        let decline = ma::reply(&j, &j, &pj, false, now);
+        ma::put(d, &accept).await.unwrap();
+        ma::put(d, &decline).await.unwrap();
+        for (a, what) in [(&accept, "acceptance"), (&decline, "decline")] {
+            assert_eq!(
+                ra::may_receive(d, &fnode, a).await.unwrap(),
+                ra::Verdict::Yes(ra::Reason::RefersTo),
+                "I398c the {what} returns to the proposer's node"
+            );
+            assert!(
+                !ra::may_receive(d, &snode, a).await.unwrap().allowed(),
+                "I398c a stranger's node does not receive the {what}"
+            );
+        }
+    }
+
+    /// **I398d** — `affiliations` is the room's plane (CC 4.4.3.2.8: an
+    /// affiliation runs all the community machinery). A proposal placed at
+    /// `affiliations` is admitted, counts as a live invitation when the group
+    /// is asked about at `community`, and its answer matches it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i398d_affiliations_is_the_rooms_plane(
+        d: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::membership_acceptance as mac;
+        use crate::federation::membership_acceptance_invariants::bodies as ma;
+        use crate::federation::types::cohort_scope::AFFILIATIONS;
+        let (cid, founder, k, knode) = (
+            format!("i398d-c-{s}"),
+            format!("i398d-f-{s}"),
+            format!("i398d-k-{s}"),
+            format!("i398d-n-{s}"),
+        );
+        ma::reg(d, &[&cid, &founder, &k]).await;
+        nodes(d, &[&knode]).await;
+        claim(d, &k, &knode, device_class::PHONE).await;
+        ma::found_community(d, &cid, "founder_only", &[&founder], &[])
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let p = ma::proposal(
+            &founder,
+            AFFILIATIONS,
+            &cid,
+            &k,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        ma::put(d, &p)
+            .await
+            .expect("I398d an affiliations proposal is admitted");
+        assert_eq!(
+            mac::live_invitees_of(d, COMMUNITY, &cid, std::slice::from_ref(&founder))
+                .await
+                .unwrap(),
+            vec![k.clone()],
+            "I398d the affiliations proposal is a live invitation of the room"
+        );
+        assert!(
+            ra::may_receive_group_plane(d, &knode, COMMUNITY, &cid, None)
+                .await
+                .unwrap()
+                .allowed(),
+            "I398d the invitee's node receives the room's planes"
+        );
+        let a = ma::reply(&k, &k, &p, true, now);
+        ma::put(d, &a).await.unwrap();
+        assert_eq!(
+            mac::answered_proposal_of(d, &a)
+                .await
+                .unwrap()
+                .map(|r| r.attestation_id),
+            Some(p.attestation_id.clone()),
+            "I398d the answer matches its affiliations proposal"
+        );
+    }
+
+    /// **I398e** — two nodes, through `may_receive` as the sender's verdict:
+    /// A (the room's) sends the proposal to K's node B; B, holding no roster,
+    /// sends K's acceptance back to the proposer's node.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    pub(crate) async fn i398e_the_ceremony_crosses_two_nodes(
+        a: &dyn FederationDirectory,
+        b: &dyn FederationDirectory,
+        s: &str,
+    ) {
+        use crate::federation::membership_acceptance_invariants::bodies as ma;
+        let (cid, founder, fnode, k, knode) = (
+            format!("i398e-c-{s}"),
+            format!("i398e-f-{s}"),
+            format!("i398e-fn-{s}"),
+            format!("i398e-k-{s}"),
+            format!("i398e-kn-{s}"),
+        );
+        for d in [a, b] {
+            ma::reg(d, &[&cid, &founder, &k]).await;
+            nodes(d, &[&fnode, &knode]).await;
+        }
+        claim(a, &founder, &fnode, device_class::LAPTOP).await;
+        claim(b, &k, &knode, device_class::PHONE).await;
+        ma::found_community(a, &cid, "founder_only", &[&founder], &[])
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let p = ma::proposal(
+            &founder,
+            COMMUNITY,
+            &cid,
+            &k,
+            None,
+            now,
+            Some(Duration::days(7)),
+        );
+        ma::put(a, &p).await.unwrap();
+        assert!(
+            !ra::may_receive(a, &knode, &p).await.unwrap().allowed(),
+            "I398e precondition — A does not know K's node is K's"
+        );
+        // A learns K's binding the way a peer does: the node's occurrence.
+        claim(a, &k, &knode, device_class::PHONE).await;
+        assert!(
+            ra::may_receive(a, &knode, &p).await.unwrap().allowed(),
+            "I398e A sends the proposal to K's node"
+        );
+        ma::put(b, &p)
+            .await
+            .expect("I398e B admits the proposal (no roster held)");
+        let acc = ma::reply(&k, &k, &p, true, now);
+        ma::put(b, &acc)
+            .await
+            .expect("I398e B admits K's acceptance");
+        assert!(
+            ra::may_receive(b, &founder, &acc).await.unwrap().allowed(),
+            "I398e B sends the acceptance back to the proposer"
+        );
+        assert!(
+            !ra::may_receive(b, &fnode, &acc).await.unwrap().allowed(),
+            "I398e B cannot resolve a node of the proposer it holds no binding for"
+        );
+        ma::put(a, &acc)
+            .await
+            .expect("I398e A admits the acceptance");
+        assert!(
+            ra::may_receive(a, &fnode, &acc).await.unwrap().allowed(),
+            "I398e on A the acceptance reaches the proposer's node"
+        );
+    }
+
+    /// **I398f** — the keyless trust-root community (`ciris-canonical`) is
+    /// public when ROOTED by its accord birth: an outside node receives its
+    /// record's planes and its rows. A constraint row at another id that is
+    /// not accord-born (NotRooted) is not public.
+    pub(crate) async fn i398f_a_rooted_trust_root_is_public(d: &dyn FederationDirectory, s: &str) {
+        use crate::federation::canonical_community::{
+            self as cc, CIRIS_CANONICAL_COMMUNITY_KEY_ID as CANON,
+        };
+        use crate::federation::canonical_community_invariants::bodies as ccb;
+        ccb::stand_up(d).await;
+        d.put_community(ccb::signed(
+            ccb::canonical_row(&ccb::FOUNDERS),
+            &["A1", "B1"],
+        ))
+        .await
+        .expect("the accord births the row");
+        assert!(matches!(
+            cc::stored_standing(d, CANON).await.unwrap(),
+            cc::StoredStanding::Rooted(_)
+        ));
+        assert!(
+            d.lookup_public_key(CANON).await.unwrap().is_none(),
+            "I398f precondition — ciris-canonical has no key record"
+        );
+        let (outsider, onode) = (format!("i398f-o-{s}"), format!("i398f-on-{s}"));
+        users(d, &[&outsider]).await;
+        nodes(d, &[&onode]).await;
+        claim(d, &outsider, &onode, device_class::PHONE).await;
+        assert!(
+            ra::is_public_group(d, CANON).await.unwrap(),
+            "I398f rooted ⇒ public"
+        );
+        assert_eq!(
+            ra::may_receive_group_plane(d, &onode, COMMUNITY, CANON, None)
+                .await
+                .unwrap(),
+            ra::Verdict::Yes(ra::Reason::Public),
+            "I398f an outside node receives the record's planes"
+        );
+        let mut row = ts::bare_attestation(
+            &format!("i398f-row-{s}"),
+            ccb::FOUNDERS[0],
+            ccb::FOUNDERS[0],
+            &serde_json::json!({ "community_key_id": CANON }),
+        );
+        row.cohort_scope = COMMUNITY.into();
+        assert_eq!(
+            ra::may_receive(d, &onode, &row).await.unwrap(),
+            ra::Verdict::Yes(ra::Reason::Public),
+            "I398f an outside node receives a row placed at ciris-canonical"
+        );
+        // Another id declaring the same constraint, never accord-born: kept
+        // as data by the replicated door, NotRooted, NOT public.
+        let other_id = format!("i398f-q-{s}");
+        let mut other = ccb::canonical_row(&ccb::FOUNDERS);
+        other.community_key_id = other_id.clone();
+        other.members.retain(|m| m.key_id != ccb::SERVE_NODE);
+        let _ = d
+            .apply_replicated_community(ts::sign_community(ccb::FOUNDERS[0], other))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cc::stored_standing(d, &other_id).await.unwrap(),
+            cc::StoredStanding::NotRooted { .. }
+        ));
+        assert!(
+            !ra::is_public_group(d, &other_id).await.unwrap(),
+            "I398f an unrooted constraint row is not public"
+        );
+    }
+
     /// **I399** — live lists intersect; withdrawing one leaves the other.
     pub(crate) async fn i399_lists_intersect_until_withdrawn(d: &dyn FederationDirectory, s: &str) {
         let (owner, laptop, a, b) = (
@@ -1129,6 +1455,7 @@ mod runners {
                 case!(i397_origin_and_refers_to);
                 case!(i398_receiver_agrees_with_the_cohort_view);
                 case!(i399_lists_intersect_until_withdrawn);
+                case!(i398f_a_rooted_trust_root_is_public);
                 $(case!($extra);)*
             }
         };
@@ -1151,7 +1478,12 @@ mod runners {
             b.run_migrations().await.unwrap();
             Some(b)
         },
-        [i395_live_invitee_receives_the_planes]
+        [
+            i395_live_invitee_receives_the_planes,
+            i398b_a_proposal_reaches_the_invitees_nodes,
+            i398c_an_answer_returns_to_the_proposers_nodes,
+            i398d_affiliations_is_the_rooms_plane
+        ]
     );
 
     #[cfg(feature = "postgres")]
@@ -1166,8 +1498,60 @@ mod runners {
             b.run_migrations().await.unwrap();
             Some(b)
         },
-        [i395_live_invitee_receives_the_planes]
+        [
+            i395_live_invitee_receives_the_planes,
+            i398b_a_proposal_reaches_the_invitees_nodes,
+            i398c_an_answer_returns_to_the_proposers_nodes,
+            i398d_affiliations_is_the_rooms_plane
+        ]
     );
+
+    /// I398e — two directories of one backend kind.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn i398e_sqlite() {
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let mk = || async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .unwrap();
+            b.run_migrations().await.unwrap();
+            b
+        };
+        let (a, b) = (mk().await, mk().await);
+        super::bodies::i398e_the_ceremony_crosses_two_nodes(
+            &a as &dyn FederationDirectory,
+            &b as &dyn FederationDirectory,
+            &suffix(),
+        )
+        .await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn i398e_postgres() {
+        use crate::federation::FederationDirectory;
+        use crate::store::Backend as _;
+        let (Some(da), Some(db)) = (crate::test_pg::empty_dsn(), crate::test_pg::empty_dsn())
+        else {
+            return;
+        };
+        let a = crate::store::postgres::PostgresBackend::connect(&da)
+            .await
+            .unwrap();
+        a.run_migrations().await.unwrap();
+        let b = crate::store::postgres::PostgresBackend::connect(&db)
+            .await
+            .unwrap();
+        b.run_migrations().await.unwrap();
+        super::bodies::i398e_the_ceremony_crosses_two_nodes(
+            &a as &dyn FederationDirectory,
+            &b as &dyn FederationDirectory,
+            &suffix(),
+        )
+        .await;
+    }
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
