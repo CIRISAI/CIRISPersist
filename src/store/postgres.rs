@@ -21054,8 +21054,9 @@ impl PostgresBackend {
             .await
             .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
         let sha_vec = sha256.to_vec();
-        // v43.0.0 (§11.5, I19) — the satellites die with the blob, in one
-        // transaction (see the sqlite twin).
+        // v43.0.0 (§11.5, I19) — the epoch binding dies with the blob, in one
+        // transaction; v53.0.0 (CIRISEdge#763) the at-rest key grants do not
+        // (an eviction removes bytes, not keys — see the sqlite twin).
         let tx = client
             .transaction()
             .await
@@ -21075,14 +21076,14 @@ impl PostgresBackend {
             .map(|r| r.safe_get_with("child_sha256", crate::federation::BlobError::Backend))
             .collect::<Result<_, _>>()?;
         for sha in children.iter().chain(std::iter::once(&sha_vec)) {
-            for stmt in [
-                "DELETE FROM cirislens.federation_blob_key_grants WHERE at_rest_sha256 = $1",
+            tx.execute(
                 "DELETE FROM cirislens.federation_community_blob_epoch WHERE at_rest_sha256 = $1",
-            ] {
-                tx.execute(stmt, &[sha]).await.map_err(|e| {
-                    crate::federation::BlobError::Backend(format!("delete_blob satellites: {e}"))
-                })?;
-            }
+                &[sha],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("delete_blob satellites: {e}"))
+            })?;
         }
         for sha in &children {
             tx.execute(
