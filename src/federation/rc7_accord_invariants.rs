@@ -260,7 +260,7 @@ pub(crate) mod bodies {
     async fn charter_accord(
         d: &dyn FederationDirectory,
         recovery: Option<serde_json::Value>,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
         let family = crate::federation::canonical_community::accord_family_key_id();
         let id = uuid::Uuid::new_v4().to_string();
         let mut env = serde_json::json!({
@@ -284,9 +284,25 @@ pub(crate) mod bodies {
             env,
             &["B1", "C1"],
         );
+        let digest = ops::charter_digest_of(&charter);
         d.put_attestation(SignedAttestation {
             attestation: charter,
         })
+        .await
+        .map(|_| digest)
+    }
+
+    /// v53.0.0 (R2c ruling (a)) — a head version of the accord naming the
+    /// charter `digest`, under the accord's quorum: where the roster is known,
+    /// so where a charter's commitments are judged against it.
+    async fn version_naming(d: &dyn FederationDirectory, digest: &str) -> Result<(), Error> {
+        let holders = roster(d).await;
+        ops::version_family_naming_charter(
+            d,
+            crate::federation::canonical_community::accord_family_key_id(),
+            digest,
+            &holders,
+        )
         .await
         .map(|_| ())
     }
@@ -303,7 +319,8 @@ pub(crate) mod bodies {
         r
     }
 
-    /// **I432** — the member is required, one entry per standing holder.
+    /// **I432** — the member is required (charter admission); one entry per
+    /// standing holder (judged at the version naming it, R2c ruling (a)).
     pub(crate) async fn i432_the_accord_charter_commits_every_holder(d: &dyn FederationDirectory) {
         stand_up(d).await;
         let holders = roster(d).await;
@@ -312,41 +329,56 @@ pub(crate) mod bodies {
             "I432 fixture: the accord roster is seated"
         );
         refused_with(
-            charter_accord(d, None).await,
+            charter_accord(d, None).await.map(|_| ()),
             "accord_recovery_commitment_missing",
             "I432: no recovery_commitments at all",
         );
+        // v53.0.0 (R2c ruling (a)) — a charter missing a holder is admitted (it
+        // is in force for nothing) and refused where a version puts it in force.
+        let partial = charter_accord(d, Some(test_accord_recovery_commitments(&holders[..2])))
+            .await
+            .expect("I432: charter admission judges shape only");
         refused_with(
-            charter_accord(d, Some(test_accord_recovery_commitments(&holders[..2]))).await,
+            version_naming(d, &partial).await,
             "accord_recovery_commitment_missing",
-            "I432: a standing holder without a recovery commitment",
+            "I432: a version naming a charter that misses a holder",
         );
         let mut malformed = test_accord_recovery_commitments(&holders);
         malformed[holders[0].as_str()] = serde_json::json!("AB".repeat(32));
         refused_with(
-            charter_accord(d, Some(malformed)).await,
+            charter_accord(d, Some(malformed)).await.map(|_| ()),
             "accord_recovery_commitment_missing",
             "I432: a commitment that is not lowercase hex",
         );
         refused_with(
-            charter_accord(d, Some(serde_json::json!(["not", "an", "object"]))).await,
+            charter_accord(d, Some(serde_json::json!(["not", "an", "object"])))
+                .await
+                .map(|_| ()),
             "accord_recovery_commitment_missing",
             "I432: a member that is not an object",
         );
-        charter_accord(d, Some(test_accord_recovery_commitments(&holders)))
+        let full = charter_accord(d, Some(test_accord_recovery_commitments(&holders)))
             .await
             .expect("I432: one recovery commitment per standing holder admits");
+        version_naming(d, &full)
+            .await
+            .expect("I432: the version naming the covering charter is admitted");
     }
 
-    /// **I433** — a commitment for a non-holder is refused.
+    /// **I433** — a commitment for a non-holder is refused at the version that
+    /// names the charter (R2c ruling (a)).
     pub(crate) async fn i433_a_stray_commitment_is_refused(d: &dyn FederationDirectory) {
         stand_up(d).await;
         let mut holders = roster(d).await;
         holders.push("not-a-holder".to_owned());
+        // v53.0.0 (R2c ruling (a)) — judged at the version that names it.
+        let stray = charter_accord(d, Some(test_accord_recovery_commitments(&holders)))
+            .await
+            .expect("I433: charter admission judges shape only");
         refused_with(
-            charter_accord(d, Some(test_accord_recovery_commitments(&holders))).await,
+            version_naming(d, &stray).await,
             "accord_recovery_commitment_stray",
-            "I433: a recovery commitment for a key that holds no seat",
+            "I433: a version naming a charter that commits a key holding no seat",
         );
     }
 
@@ -363,7 +395,7 @@ pub(crate) mod bodies {
         let mut signing = test_accord_recovery_commitments(&holders);
         signing[holders[0].as_str()] = serde_json::json!(b_signing);
         refused_with(
-            charter_accord(d, Some(signing)).await,
+            charter_accord(d, Some(signing)).await.map(|_| ()),
             "accord_recovery_key_not_apart",
             "I434: a recovery key that is a standing holder's signing key",
         );
@@ -373,7 +405,7 @@ pub(crate) mod bodies {
         shared[holders[0].as_str()] = serde_json::json!(shared_key);
         shared[holders[1].as_str()] = serde_json::json!(shared_key);
         refused_with(
-            charter_accord(d, Some(shared)).await,
+            charter_accord(d, Some(shared)).await.map(|_| ()),
             "accord_recovery_key_not_apart",
             "I434: one recovery key for two holders",
         );

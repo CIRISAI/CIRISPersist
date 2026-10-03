@@ -245,6 +245,33 @@ fn check_family_record(
             expected.family_key_id
         ));
     }
+    // v53.0.0 (CC 4.2.6, R2c ruling (a)) — the genesis version passes the same
+    // coverage rule every accord version does: the bundle's charter commits a
+    // recovery key for exactly the genesis roster.
+    let commitments: std::collections::BTreeMap<String, String> = bundle
+        .attestations
+        .iter()
+        .map(|s| &s.attestation)
+        .find(|a| {
+            crate::federation::canonical_community::stored_row_hash(a)
+                .ok()
+                .as_deref()
+                == Some(expected.charter_digest.as_str())
+        })
+        .and_then(|a| {
+            a.attestation_envelope
+                .get(crate::federation::envelope::paths::RECOVERY_COMMITMENTS)
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        })
+        .unwrap_or_default();
+    let seats: Vec<&str> = expected.members.iter().map(|m| m.key_id.as_str()).collect();
+    crate::federation::accord_roster::charter_commitments_cover(
+        &commitments,
+        &seats,
+        &Default::default(),
+        &Default::default(),
+    )
+    .map_err(|(token, detail)| format!("{token}: {detail}"))?;
     let bytes =
         crate::verify::canonical::ceg_produce_canonicalize(&carried.family.signing_envelope())
             .map_err(|e| format!("canonicalize the family record: {e}"))?;

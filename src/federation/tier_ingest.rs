@@ -410,14 +410,34 @@ pub(crate) async fn accord_standing_majority_signed<F>(
 where
     F: FederationDirectory + ?Sized,
 {
+    let standing: Vec<String> = directory
+        .active_family_members(family_key_id)
+        .await?
+        .into_iter()
+        .map(|m| m.key_id)
+        .collect();
+    standing_majority_signed_by(directory, &standing, proof).await
+}
+
+/// Do distinct members of `standing` that make a strict majority of it sign
+/// `proof.change_envelope`? Each signature is verified against the member's
+/// REGISTERED pinned hybrid key, one member at a time, so a key counts once
+/// however many signatures name it.
+pub(crate) async fn standing_majority_signed_by<F>(
+    directory: &F,
+    standing: &[String],
+    proof: &super::types::GroupSupersedeProof,
+) -> Result<bool, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     use ciris_verify_core::accord_genesis as ag;
-    let standing = directory.active_family_members(family_key_id).await?;
     let Ok(bytes) = ag::accord_family_signing_bytes(&proof.change_envelope) else {
         return Ok(false);
     };
     let mut signed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for m in &standing {
-        let Some(rec) = directory.lookup_public_key(&m.key_id).await? else {
+    for key_id in standing {
+        let Some(rec) = directory.lookup_public_key(key_id).await? else {
             continue;
         };
         let member = ciris_verify_core::threshold::ThresholdMember {
@@ -495,11 +515,33 @@ where
         && super::accord_recovery::verify_accord_recovery(directory, signed)
             .await?
             .is_none()
+        // v53.0.0 (CC 4.2.6) — the third: a roster change covering authorized
+        // decisions, under a strict majority of the standing roster.
+        && super::accord_roster::verify_accord_roster_change(directory, signed)
+            .await?
+            .is_none()
     {
         return Err(Error::ConstitutionalFamilyReserved {
             family_key_id: signed.family.family_key_id.clone(),
             attesting_key_id: signed.authority_key_id.clone(),
         });
+    }
+    // v53.0.0 (CC 4.2.6, R2c ruling (a)) — every accord version, whichever
+    // shape, names a charter whose recovery commitments cover exactly its
+    // roster (a recovery's next commitment stands in for its seat's entry).
+    if signed.family.family_key_id
+        == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+    {
+        let recovery = signed
+            .supersede_proof
+            .as_ref()
+            .map(|p| &p.change_envelope)
+            .filter(|e| {
+                e.get("kind").and_then(|k| k.as_str())
+                    == Some(super::accord_recovery::RECOVERY_STATEMENT_KIND)
+            });
+        super::accord_roster::check_charter_covers_roster(directory, &signed.family, recovery)
+            .await?;
     }
     let envelope = signed.family.signing_envelope();
     verify_envelope_hybrid_signature(

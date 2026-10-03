@@ -3176,11 +3176,16 @@ where
 /// its own detail:
 ///
 /// - the member is absent or not an object of 64-lowercase-hex strings;
-/// - a standing holder (the revocation-folded roster this node holds) has no
-///   entry — `accord_recovery_commitment_missing`;
-/// - an entry names a key that is not a standing holder —
-///   `accord_recovery_commitment_stray`;
-/// - an entry commits to a key that is a standing holder's own SIGNING key
+/// - (v53.0.0, R2c ruling (a)) whether the commitments cover EXACTLY a
+///   roster (no missing holder `accord_recovery_commitment_missing`, no stray
+///   key `accord_recovery_commitment_stray`) is judged at the accord version
+///   door against the version that puts this charter in force
+///   (`accord_roster::check_charter_covers_roster`), where the roster is
+///   known. A charter row no version names is not in force (CC 3.2 T6), so
+///   admitting it early grants nothing, and a roster change's re-scrub names
+///   a holder before the version seats them;
+/// - an entry commits to a key that is the SIGNING key of a holder the
+///   charter names
 ///   (recomputed from the stored record), or two holders commit to the same
 ///   key — `accord_recovery_key_not_apart`. A recovery key held with the
 ///   signing key, or shared with another holder, is not "apart": losing one
@@ -3192,7 +3197,7 @@ where
 async fn check_accord_recovery_commitments<F>(
     directory: &F,
     envelope: &serde_json::Value,
-    family: &super::types::Family,
+    _family: &super::types::Family,
 ) -> Result<(), Error>
 where
     F: FederationDirectory + ?Sized,
@@ -3232,30 +3237,6 @@ where
             ),
         );
     }
-    let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await {
-        Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
-        Err(Error::Unsupported { .. }) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if let Some(missing) = roster.iter().find(|h| !commitments.contains_key(*h)) {
-        return refuse(
-            "accord_recovery_commitment_missing",
-            format!(
-                "standing holder {missing} has no recovery commitment in the accord's \
-                 charter; a holder who loses signing-key material could not be restored"
-            ),
-        );
-    }
-    if let Some(stray) = commitments.keys().find(|k| !roster.contains(k)) {
-        return refuse(
-            "accord_recovery_commitment_stray",
-            format!(
-                "the accord's charter commits a recovery key for {stray}, which is not a \
-                 standing holder of {}",
-                family.family_key_id
-            ),
-        );
-    }
     let mut seen = std::collections::BTreeSet::new();
     if let Some(dup) = commitments.values().find(|c| !seen.insert(c.as_str())) {
         return refuse(
@@ -3263,7 +3244,10 @@ where
             format!("two holders commit to the same recovery key (commitment {dup})"),
         );
     }
-    for holder in &roster {
+    // Apart from every signing key the charter names (its own holders): judged
+    // on the charter alone, so it holds whatever roster a version later puts
+    // it in force for.
+    for holder in commitments.keys() {
         let Some(record) = directory.lookup_public_key(holder).await? else {
             continue;
         };

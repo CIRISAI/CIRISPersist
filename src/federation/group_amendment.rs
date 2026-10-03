@@ -209,7 +209,12 @@ where
         self_leave: super::family_dissolution::self_leave_member(&held, f).map(|l| (l, &held)),
         recovery: super::accord_recovery::verify_accord_recovery(dir, family)
             .await?
-            .is_some(),
+            .is_some()
+            // v53.0.0 (CC 4.2.6) — a roster change is verified whole on its
+            // own proof too: decisions, standing majority, consent.
+            || super::accord_roster::verify_accord_roster_change(dir, family)
+                .await?
+                .is_some(),
     };
     let stored = Stored {
         persist_row_hash: held.persist_row_hash.clone(),
@@ -623,6 +628,11 @@ where
     .await?;
     if let Some(recovered) = super::accord_recovery::verify_accord_recovery(dir, &new).await? {
         allowed.insert(recovered);
+    }
+    // v53.0.0 (CC 4.2.6) — an accord roster change seats the holders the
+    // decisions added, each of whom signed the version (consent, #955 Q1).
+    if let Some(added) = super::accord_roster::verify_accord_roster_change(dir, &new).await? {
+        allowed.extend(added);
     }
     super::membership_acceptance::check_supersede_adds_no_member(
         &new.family.family_key_id,

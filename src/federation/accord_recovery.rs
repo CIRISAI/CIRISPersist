@@ -238,7 +238,7 @@ pub fn recovery_version(
 }
 
 /// The recovery statements this accord's version chain records, oldest first.
-async fn recorded_statements<F>(
+pub(crate) async fn recorded_statements<F>(
     directory: &F,
     family_key_id: &str,
 ) -> Result<Vec<serde_json::Value>, Error>
