@@ -9,6 +9,27 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.0.0] - UNRELEASED
 
+### Adopters — read first
+
+**One MAJOR, no cross-version compatibility.** v53 is the release CIRISServer 0.5.220 runs its FINAL genesis on. A v52 node and a v53 node do not interoperate on the changed wire shapes below; upgrade the fleet together. It carries everything since v52.0.2 (merged forward: CIRISServer#705's pool-connector fix is in).
+
+**Hard requirements of the adopting release (CIRISServer 0.5.220 + CIRISEdge):**
+- **Real `device_class` on every occurrence.** S1 reads a node's class from its owner's occurrence: personal (`phone|laptop`) gets the owner's self/family content and keys; `server|embedded|service|agent` gets none (rooms still reach it). Server ≤0.5.219 provisioned every owned node as `server`; 0.5.220 publishes the real class and Edge republishes an occurrence whose only change is its class. Persist admits the re-class (last-signed-wins) and re-keys the device for content written before it (I397b–d); a cohort allowed after the fact does the same (I397e).
+- **Re-pin** `REPLICATION_POLICY_HASH` = `1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869` and `CONSENT_GRAMMAR_HASH` = `4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`; route send/receive through `replication_audience::may_receive` / `may_receive_group_plane`.
+- **Genesis is the v3 bundle.** `genesis::ceremony` assembles it (instants are inputs, never a clock read); the `humanity-accord` family record and the `ciris-canonical` birth are members of `bundle.attestations`, pinned by `bundle_fingerprint`. The separate community seed asset is gone. `ciris-canonical` is keyless and public when rooted — do not mint a key for it.
+- **Commitments bind key material** (CC 3.2 T3 / 4.2.6, rc7 5e89627): `{key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64}`, JCS, sorted by key_id, sha256. A key with no ML-DSA-65 half cannot be committed to. The accord charter REQUIRES `recovery_commitments`.
+
+**Wire and API breaks, by surface:**
+- Family/community records carry `prev_head_digest` and `charter_digest` (V174); the charter in force is the one the head names. A version must agree with the roster fold (`lineage_version_disagrees_with_roster_fold`); an uncovered roster row lags the head (`lineage_head_lags_roster`).
+- `put_accord_decision` loses `steward_signatures` (V172 drops the column; Python refuses a non-null value).
+- Self/family chunk DAGs: manifest v4, one DEK per (stream, epoch), the `key_grant:stream:v1` plane, one zero-length terminator per epoch at seq `2^62 + epoch` (V168). v2 DAGs still read. `blob_chunk_key_not_yet_granted` is retryable.
+- `DirectoryOp` digest moved (`TrustDirectionHeldAmong`); FederationDirectory and BlobStorage gain required methods (`attestation_type_census`, …) — a host implementing them must add them.
+- `consent:replication` may carry `cohorts: [{scope, target}]` (owner grants only).
+- Old unlabelled portable bundles yield no charter (`delegates_to` needs a `trust:` job label, V167).
+- Row types are checked against the CC registry in REPORT mode (#975): unregistered types are admitted and counted; a later release flips `ROW_TYPE_ENFORCEMENT`.
+
+**Test support (`test-anchor`, never in a wheel):** `chunk_dag_cascade::test_support::write_legacy_v2_dag(engine, backend, cohort_scope, group_key_id, stream_id, chunks, aad)` writes a v52-shaped v2 DAG for adopters' end-to-end pulls.
+
 ### S2 — custody:ack:v1 (CIRISPersist#942 part 2; CC 3.1.3.3, CIRISConstitution#130)
 
 A family can now see how many copies of its content exist without weakening encryption or outsider invisibility. Each device reports its own custody of a blob in a `scores` row on `custody:ack:v1`, and persist folds the reports at read time.
