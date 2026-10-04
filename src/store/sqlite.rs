@@ -564,22 +564,23 @@ impl SqliteBackend {
         manifest: &[u8; 32],
         add: Option<(u64, [u8; 32], &str)>,
     ) {
-        let conn = self.conn.lock();
-        match add {
-            None => conn
-                .execute(
+        let manifest = manifest.to_vec();
+        let add = add.map(|(seq, chunk, stream)| (seq as i64, chunk.to_vec(), stream.to_owned()));
+        self.write(move |conn| -> Result<usize, rusqlite::Error> {
+            match add {
+                None => conn.execute(
                     "DELETE FROM federation_dag_chunks WHERE manifest_sha256 = ?1",
-                    rusqlite::params![manifest.to_vec()],
-                )
-                .expect("unlink"),
-            Some((seq, chunk, stream)) => conn
-                .execute(
+                    rusqlite::params![manifest],
+                ),
+                Some((seq, chunk, stream)) => conn.execute(
                     "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
                      VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![manifest.to_vec(), seq as i64, chunk.to_vec(), stream],
-                )
-                .expect("link"),
-        };
+                    rusqlite::params![manifest, seq, chunk, stream],
+                ),
+            }
+        })
+        .await
+        .expect("test_dag_link");
     }
 
     /// CIRISPersist#829 — the read pool, the way [`Self::conn_handle`] is the

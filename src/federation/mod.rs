@@ -143,6 +143,10 @@ pub(crate) mod community_trust_consent_invariants;
 /// v48.0.0 (CIRISPersist#905) — the by-principals consent sweep witnesses.
 #[cfg(test)]
 pub mod consent_sweep_principals_invariants;
+/// v53.1.0 (CIRISPersist#979) — I480–I487: a chunk of a withdrawn file is
+/// judged by its file.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod dag_link_invariants;
 /// v52.0.0 (CIRISPersist#956) — a quorum-family's leave and dissolve replicate as amendments.
 pub mod family_dissolution;
 /// v52.0.0 (CIRISPersist#956) — I280–I285.
@@ -177,7 +181,6 @@ pub mod moderation_walk_asof_invariants;
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod nested_manifest_invariants;
 // v53.0.0 (CIRISPersist#969) — I310–I319: one DEK per (stream, epoch).
-pub(crate) mod dag_link_invariants;
 /// CIRISPersist#972 — I335–I339, a node is seated without an acceptance.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod node_seat_invariants;
