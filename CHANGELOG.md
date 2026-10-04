@@ -36,6 +36,19 @@ Referencing rows bind a sealed DAG's MANIFEST, never its chunks, so a chunk of a
 | M6 the eviction ignores the chunk's own fold | killed — I484 |
 | M7 `dag_contains_chunk` always true | killed — I480 |
 | M8 no backfill on a re-promote | killed — I486/487 |
+### Genesis — one roster-install function for boot and import; a stale genesis head of the same accord takes the bundle's
+
+**Found while building the import door (TESTED, I497):** a node seeded from one ceremony and re-booted with a later ceremony of the SAME holders kept its first accord head. That head names the first ceremony's charter, the re-bake superseded that charter row, and the accord root read **invalid** (`root_self_declares: false`, 0 distinct charter holders) while `genesis_posture` still reported `Entrenched`. Every v53.0.x node holds a head naming the v2 bundle's charter, so this is the path the final ceremony's bake takes on every upgraded node.
+
+- **`genesis::install_accord_genesis_head(dir, bundle)`** — the ONE function that installs the accord family's genesis head. A held head is replaced by the bundle's genesis head only when it is itself a genesis head (no predecessor — a version chain is never overwritten), of the same accord (name, seats, founding instant, protocol, entrenchment, dissolution), and it names no charter (the v52 upgrade, I428) or names a charter that is no longer a live row while the bundle's charter is. A head whose charter still stands is a working root and is never replaced; which ceremony is newer stays the delegation plane's own successor rule. The replacement is stored as the superseded prior version labelled `accord_birth_replaces_unrooted`, so upgraded and fresh nodes hold ONE head digest (CC 3.2 T6).
+- The boot seed runs it twice: as before (`seed_accord_family`, before the serve node and delegation plane — the family's seats are their FK), and again **after** the delegation plane, where a head whose charter the plane just superseded is first recognisable as stale.
+- **`genesis::install_genesis_bundle_roster(dir, &bundle)`** (Engine `install_genesis_bundle_roster`, pyo3 `install_genesis_bundle_roster_json`) — the import door for a verified version-3 bundle: `verify_ceremony_outputs` first (a refusal writes nothing: `federation_genesis_bundle_invalid` naming the stage), then `bake_assembled_genesis` (serve nodes and the delegation plane, with its anti-rollback rule), then `install_bundle_roster_records` — the boot seed's own functions. Returns `{bake, records:[{kind, id, outcome, reason?}]}`, `outcome` ∈ `installed` / `already_held` / `successor` / `refused`. Re-importing writes nothing. This node's own genesis posture is not changed by the door: the posture is computed against the compiled bundle.
+- The `ciris-canonical` birth is installed when the id is free; a different held birth is reported `refused` (`community_held_differs`) and left standing — a rooted birth is never replaced here (#926).
+- I428b's second case was a genesis head naming a charter that is not a row; that is now a stale head the rule replaces, so the case is a real version chain (it names a predecessor).
+
+**Scope, stated plainly:** a version-3 bundle names the reserved `humanity-accord` / `ciris-canonical` ids, and `verify_ceremony_outputs` checks its holders against THIS build's accord roster. A bundle of another accord (other holders) is therefore refused at verification (`ceremony_holder_roster_mismatch`); importing a different root's v3 bundle needs per-root roster ids, which persist does not have.
+
+**Adopters.** CIRISServer (`/v1/trust-root/import`): call `install_genesis_bundle_roster_json` after `verify_bundle`, instead of installing holders, serve nodes and attestations row by row; report `accepted` from its `records`. A different `ciris-canonical` birth already held stays `refused` until a ruling on replacing a rooted birth.
 
 ## [53.0.1] - 2026-10-03
 

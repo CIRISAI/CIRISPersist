@@ -841,6 +841,9 @@ class Engine:
     def has_accord_conferred_role(self, key_id: str, role: str) -> bool:
         """(derived) deontic — v17.0.0 (CIRISPersist#440, CC 3.4.9) — does key_id hold role effectively? True iff the stored federation_keys row claims role on either role surfac..."""
 
+    def install_genesis_bundle_roster_json(self, bundle_json: str) -> str:
+        """(derived) deontic — v53.1.0 — install a verified genesis bundle (the ceremony artifact JSON) on this node: verify its ceremony outputs against THIS build's accord rost... [build-conditional: #[cfg(any(feature = "postgres", feature = "sqlite"))]]"""
+
     def install_storage_budget_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> int:
         """(derived) deontic — #370 (§Q B2/B3, CC 6.1.5.2) — INSTALL a signed StorageBudgetV1 so it governs this node's capacity eviction. Verifies the bound-hybrid signature aga..."""
 
