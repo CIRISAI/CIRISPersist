@@ -306,6 +306,41 @@ impl PostgresBackend {
 /// `apply_replicated_community` the replicated one (a record authored
 /// elsewhere, admitted as data). Every other gate is the same on both.
 impl PostgresBackend {
+    /// v53.1.0 (#979) — TEST SEAM: drop the V176 relation of a manifest (a
+    /// DAG from before V176) or add one row of it (a chunk shared by two DAGs,
+    /// which two real streams never produce: each seal encrypts its own bytes).
+    #[cfg(test)]
+    pub(crate) async fn test_dag_link(
+        &self,
+        manifest: &[u8; 32],
+        add: Option<(u64, [u8; 32], &str)>,
+    ) {
+        let client = self.pool.get().await.expect("pool");
+        match add {
+            None => {
+                client
+                    .execute(
+                        "DELETE FROM cirislens.federation_dag_chunks WHERE manifest_sha256 = $1",
+                        &[&manifest.to_vec()],
+                    )
+                    .await
+                    .expect("unlink");
+            }
+            Some((seq, chunk, stream)) => {
+                client
+                    .execute(
+                        "INSERT INTO cirislens.federation_dag_chunks \
+                         (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4)",
+                        &[&manifest.to_vec(), &(seq as i64), &chunk.to_vec(), &stream],
+                    )
+                    .await
+                    .expect("link");
+            }
+        }
+    }
+}
+
+impl PostgresBackend {
     pub(crate) async fn put_community_at_door(
         &self,
         community: crate::federation::SignedCommunity,
