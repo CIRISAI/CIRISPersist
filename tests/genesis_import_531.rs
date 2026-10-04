@@ -245,6 +245,11 @@ async fn imports_a_later_ceremony(
         posture_before,
         "{tag} I491: the import does not move this node's own posture"
     );
+    assert_eq!(
+        canonical_genesis_bundle().produced_at,
+        v1.bundle.produced_at,
+        "{tag} I491: the bundle this node treats as its own is still the one it was seeded from"
+    );
 }
 
 /// I492 — a tampered bundle (a holder's signature over the family record

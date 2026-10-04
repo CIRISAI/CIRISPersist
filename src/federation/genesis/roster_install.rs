@@ -104,8 +104,10 @@ pub fn bundle_accord_genesis(bundle: &GenesisBundle) -> SignedFamily {
     }
 }
 
-/// Is a row with `persist_row_hash == digest` held live (not retired) toward
-/// `family`? An empty digest names nothing and is never live.
+/// Is the charter `digest` names a live charter of `family` here — a held,
+/// unretired `delegates_to` toward the family with the charter reading, whose
+/// direction reading stands (the same test `charter_members_for` applies)? An
+/// empty digest names nothing and is never live.
 async fn charter_row_live<D>(dir: &D, family: &str, digest: &str) -> Result<bool, Error>
 where
     D: FederationDirectory + ?Sized,
@@ -113,12 +115,26 @@ where
     if digest.is_empty() {
         return Ok(false);
     }
+    let is_charter = |a: &Attestation| {
+        a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+            && a.attested_key_id == family
+            && crate::federation::trust_root::job_dimension_admits(
+                &a.attestation_envelope,
+                crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
+            )
+    };
     let rows = dir.list_attestations_for(family).await?;
     let refs: Vec<&Attestation> = rows.iter().collect();
     let retired = crate::federation::precedence::retired_ids(&refs);
+    let denied = crate::federation::trust_root::direction_denied_ids(
+        dir,
+        rows.iter().filter(|a| is_charter(a)),
+    )
+    .await?;
     Ok(rows.iter().any(|a| {
         a.persist_row_hash == digest
-            && a.attested_key_id == family
+            && is_charter(a)
+            && !denied.contains(&a.attestation_id)
             && !retired.contains(&a.attestation_id)
     }))
 }
@@ -307,4 +323,116 @@ where
     let bake = super::bake_assembled_genesis(dir, &json).await?;
     let records = install_bundle_roster_records(dir, bundle).await?;
     Ok(RosterInstall { bake, records })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::federation::accord_test_support as ops;
+
+    /// A co-signed `trust:charter:v1` of the accord under a fresh id, admitted
+    /// through the ordinary door (it is NOT named by a family version).
+    async fn put_charter(d: &dyn FederationDirectory) -> String {
+        use crate::federation::trust_root::{
+            test_pre_rotation_commitment, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE,
+            TRUST_CHARTER_DIMENSION,
+        };
+        let family = ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+        let id = uuid::Uuid::new_v4().to_string();
+        let env = serde_json::json!({
+            "references_attestation_id": id,
+            "dimension": TRUST_CHARTER_DIMENSION,
+            "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            "pre_rotation_commitment": test_pre_rotation_commitment(&[
+                "accord-succ-a".to_owned(),
+                "accord-succ-b".to_owned(),
+            ])
+            .unwrap(),
+            "recovery_commitments":
+                crate::federation::trust_root::test_accord_recovery_commitments_held(d).await,
+        });
+        let charter = ops::co_signed_trust_attestation(
+            &id,
+            "A1",
+            family,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            env,
+            &["B1", "C1"],
+        );
+        d.put_attestation(crate::federation::SignedAttestation {
+            attestation: charter,
+        })
+        .await
+        .expect("the accord charters itself");
+        d.get_attestation(&id)
+            .await
+            .unwrap()
+            .expect("held")
+            .persist_row_hash
+    }
+
+    /// The compiled bundle, carrying a genesis head naming `digest`.
+    fn bundle_naming(digest: &str) -> GenesisBundle {
+        let mut b = super::super::canonical_genesis_bundle().clone();
+        let family = super::super::accord_family_genesis_record_for(
+            ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+            ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+            super::super::effective_accord_holder_records()
+                .iter()
+                .map(|r| r.record.key_id.as_str()),
+            digest,
+        );
+        b.roster_records = vec![super::super::GenesisRosterRecord::Family(SignedFamily {
+            family,
+            authority_key_id: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            supersede_proof: None,
+            cosignatures: Vec::new(),
+        })];
+        b
+    }
+
+    /// **I499b — a genesis head whose charter still stands is a working root
+    /// and is never replaced**, even when the bundle's charter is live too. The
+    /// held head first moves (through the door) from the compiled charter,
+    /// which this node does not hold, to charter X; a bundle naming charter Y
+    /// is then refused while X stands.
+    #[tokio::test]
+    async fn i499b_a_head_whose_charter_stands_is_never_replaced() {
+        let d = crate::store::memory::MemoryBackend::new();
+        ops::register_genesis_accord_roster(&d).await.unwrap();
+        super::super::seed_accord_family(&d).await.unwrap();
+        let x = put_charter(&d).await;
+        let y = put_charter(&d).await;
+        assert_ne!(x, y);
+        assert_eq!(
+            install_accord_genesis_head(&d, &bundle_naming(&x))
+                .await
+                .unwrap(),
+            RosterRecordOutcome::Successor,
+            "the held head named a charter this node does not hold"
+        );
+        let held = d
+            .lookup_family(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.charter_digest, x);
+        let second = install_accord_genesis_head(&d, &bundle_naming(&y))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&second, RosterRecordOutcome::Refused { reason } if reason.starts_with("accord_head_held_differs")),
+            "X still stands: {second:?}"
+        );
+        assert_eq!(
+            d.lookup_family(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+                .await
+                .unwrap()
+                .unwrap(),
+            held,
+            "the working root is untouched"
+        );
+    }
 }
