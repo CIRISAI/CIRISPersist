@@ -4112,6 +4112,21 @@ pub trait FederationDirectory: Send + Sync {
         content_sha256: &str,
     ) -> Result<Vec<Attestation>, Error>;
 
+    /// v53.1.0 (CIRISPersist#979, CC 2.3) — **the sealed manifests a held
+    /// chunk belongs to**: every manifest the V176 relation names for
+    /// `chunk_sha256` (written by persist at the seal and at the promote of an
+    /// adopted manifest, never from an author's claim), plus every v3 root
+    /// whose recorded child IS `chunk_sha256` (the V160 relation). Empty for a
+    /// row no DAG relation names (a whole blob, or a chunk of a DAG from before
+    /// V176). The tombstone fold judges an unbound chunk by these manifests.
+    ///
+    /// # Default impl rationale
+    ///
+    /// No default — a backend without blob storage answers empty itself, so
+    /// the absence is a decision per backend, never a silent fallback.
+    async fn dag_manifests_of_chunk(&self, chunk_sha256: &[u8; 32])
+        -> Result<Vec<[u8; 32]>, Error>;
+
     // ── Revocations ────────────────────────────────────────────────
 
     /// Insert a new revocation row. Append-only — revocations of an

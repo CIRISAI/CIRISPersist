@@ -7,6 +7,10 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.0] - UNRELEASED
+
+### #979 — a chunk of a withdrawn file is judged by its file (CC 2.3; CIRISEdge#771)
+
 ## [53.0.1] - 2026-10-03
 
 ### Fixed — a custody report kept a withdrawn file Live (CC 2.3; found by CIRISEdge#763)

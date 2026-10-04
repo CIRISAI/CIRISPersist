@@ -6382,6 +6382,37 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(n > 0)
     }
 
+    async fn dag_manifests_of_chunk(
+        &self,
+        chunk_sha256: &[u8; 32],
+    ) -> Result<Vec<[u8; 32]>, crate::federation::Error> {
+        // v53.1.0 (#979) — V176 (chunk → manifest) and V160 (child → root).
+        let sha = chunk_sha256.to_vec();
+        let rows: Vec<Vec<u8>> = self
+            .read(move |conn| -> Result<Vec<Vec<u8>>, rusqlite::Error> {
+                let mut stmt = conn.prepare(
+                    "SELECT manifest_sha256 FROM federation_dag_chunks WHERE chunk_sha256 = ?1 \
+                     UNION \
+                     SELECT root_sha256 FROM federation_manifest_children WHERE child_sha256 = ?1",
+                )?;
+                let it = stmt.query_map(rusqlite::params![sha], |r| r.get(0))?;
+                it.collect()
+            })
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("dag_manifests_of_chunk: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|v| {
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::Error::Backend(
+                        "dag_manifests_of_chunk: a 32-byte sha".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,
@@ -17117,6 +17148,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     rusqlite::params![sha_vec, index, child_sha],
                 )?;
             }
+            // v53.1.0 (#979) — the manifest's chunks, from the stream's own
+            // rows (whose count was checked above), in this transaction.
+            sqlite_link_dag_chunks(&tx, &sha_vec, &stream_id_owned)?;
             tx.execute(
                 "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
                 rusqlite::params![stream_id_owned, now_iso],
@@ -17562,6 +17596,18 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     return Ok(Promote::NoRow);
                 };
                 if kind == "chunk_dag" {
+                    // v53.1.0 (#979) — a DAG promoted or sealed before V176
+                    // gains its chunk relation when a viewer promotes it again
+                    // and the stream still holds exactly its chunks.
+                    let count: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM federation_stream_chunks WHERE stream_id = ?1",
+                        rusqlite::params![stream],
+                        |r| r.get(0),
+                    )?;
+                    if count == expected {
+                        sqlite_link_dag_chunks(&tx, &sha_vec, &stream)?;
+                        tx.commit()?;
+                    }
                     return Ok(Promote::Already);
                 }
                 if kind != "inline" {
@@ -17584,6 +17630,9 @@ impl crate::federation::BlobStorage for SqliteBackend {
                     "UPDATE federation_blobs SET storage_kind = 'chunk_dag' WHERE sha256 = ?1",
                     rusqlite::params![sha_vec],
                 )?;
+                // v53.1.0 (#979) — the orchestration opened this manifest and
+                // checked each chunk it names against these rows.
+                sqlite_link_dag_chunks(&tx, &sha_vec, &stream)?;
                 tx.execute(
                     "UPDATE federation_stream_chunks SET sealed_at = ?2 WHERE stream_id = ?1",
                     rusqlite::params![stream, now_iso],
@@ -19965,6 +20014,24 @@ impl SqliteBackend {
         .map_err(|e| crate::federation::BlobError::Backend(format!("delete_blob: {e}")))
         .map(|n| n > 0)
     }
+}
+
+/// v53.1.0 (CIRISPersist#979, CC 2.3) — relate `manifest_sha` to every chunk
+/// row of `stream_id`, inside the caller's transaction. Called only where the
+/// manifest becomes a `chunk_dag` over exactly those rows (the seal, the
+/// promote of an adopted manifest), so the relation is persist's own state,
+/// never an author's claim. Idempotent.
+fn sqlite_link_dag_chunks(
+    tx: &rusqlite::Transaction<'_>,
+    manifest_sha: &[u8],
+    stream_id: &str,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT INTO federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+         SELECT ?1, seq, chunk_sha, stream_id FROM federation_stream_chunks WHERE stream_id = ?2 \
+         ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+        rusqlite::params![manifest_sha, stream_id],
+    )
 }
 
 /// Convert a SQLite row from the trust columns of `federation_keys`
