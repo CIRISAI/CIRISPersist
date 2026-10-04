@@ -847,13 +847,22 @@ fn i425_digest_binds_record_content_not_signatures() {
     let mut dropped = c.bundle.clone();
     dropped.roster_records.pop();
     assert_ne!(authorization_digest(&dropped).unwrap(), base);
-    // The baked version-2 seed carries no records and still verifies (its
-    // authorizations were taken over the pre-v53 preimage).
-    let baked = parse_genesis_bundle(include_str!(
-        "../src/federation/genesis/canonical_seed.json"
-    ))
-    .unwrap();
-    assert_eq!((baked.version, baked.roster_records.len()), (2, 0));
+    // v53.1.1 — the baked seed IS the final genesis (minted 2026-10-04 on
+    // hardware by A1/B1/C1): version 3, carrying the humanity-accord family
+    // record and the ciris-canonical birth as members of `attestations`, so
+    // the authorization digest binds both heads.
+    let baked_src = include_str!("../src/federation/genesis/canonical_seed.json");
+    let baked = parse_genesis_bundle(baked_src).unwrap();
+    assert_eq!((baked.version, baked.roster_records.len()), (3, 2));
+    // The bake is the ceremony's bytes: sha256 of the compiled-in artifact
+    // equals the bundle_sha256 the ceremony host logged at `finish`. A re-bake
+    // moves this pin on purpose; anything else that moves it is a tamper.
+    use sha2::Digest as _;
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(baked_src.as_bytes())),
+        "db5e8e8391261dca10c7e701e18bcd26bd8f43ab8e5b8c11ede999ca0befe9f2",
+        "the baked canonical_seed.json must be the final genesis's bytes (I500)"
+    );
 }
 
 /// **I426 — the wire: the records are members of `attestations`, after every

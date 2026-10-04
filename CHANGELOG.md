@@ -9,6 +9,15 @@ threat-model citations because this crate's audit story is the point.
 
 ## [53.1.1] - UNRELEASED
 
+### THE FINAL GENESIS IS BAKED
+`src/federation/genesis/canonical_seed.json` is now the real ceremony's bundle, verbatim: minted 2026-10-04T22:43:08Z on the operator's laptop, signed on hardware by A1, B1 and C1, through CIRISServer v0.5.220's ceremony routes on persist v53.0.1's `genesis::ceremony`; `finish` ran `verify_ceremony_outputs` and passed. `sha256(canonical_seed.json) = db5e8e8391261dca10c7e701e18bcd26bd8f43ab8e5b8c11ede999ca0befe9f2`, equal to the ceremony host's logged `bundle_sha256`, and pinned from disk (I500).
+
+What it carries (version 3): family `humanity-accord` (`quorum:2/3`), holders A1/B1/C1 (the same key records as the baked roster — same pubkeys, same signatures), ONE serve node `ciris-canonical-1-d7bdeu223k` (`canonical,node`; `transport_hints` ip `108.61.242.236:4242`), `genesis-charter` (`trust:charter:v1`, three scrubs, `successor_key_ids` [A2, B2, C2] with the key-material commitment, `recovery_commitments` for A1/B1/C1, `witness_quorum` 0), `genesis-grant:ciris-canonical-1-d7bdeu223k` (`trust:confers:v1`, three scrubs), `genesis-lifecycle` (three scrubs), and the two genesis heads as members of `attestations`: the `humanity-accord` family record and the `ciris-canonical` birth. No canonical-2/-3 (operator's call: the registry seats them later).
+
+**Upgrading nodes.** A node seeded from the v2 bake (v23.1 → v53.1.0) holds the old accord head whose charter this bake supersedes; boot's roster install (v53.1.0, I497) replaces that head with the bundle's genesis record and keeps the old row as the superseded prior, so upgraded and fresh nodes hold ONE accord head. A held, rooted `ciris-canonical` row (the production #926 row) is NOT replaced by this bake: a rooted row is never replaced (the #926 rule), and the operator has not ruled otherwise. So an upgraded node keeps that row as its community head while a fresh node holds the ceremony's birth; witnessed mode is off (`witness_quorum` 0), so nothing attaches on the community head today. A ruling to replace it at the bake would be a follow-up patch.
+
+**Adopters.** No wire change. CIRISEdge v40.0.2 re-pins to this tag; CIRISServer 0.5.221 pins it through edge and is the release production nodes take to adopt the final root. Vendored CC remains the `v1.0-rc6` tag bytes (rc7 is untagged).
+
 ### Adopters — #979 reaches every DAG reader, not only the chunk serve door
 Under #979 a withdrawn DAG answers `BlobError::Withdrawn` from **every** door that reads it: `stream_chunks(stream_id)` and a manifest serve (`serve_blob_to_peer`) as well as the chunk serve door. A host that reads a DAG's membership through either and treats an error as "not in this DAG" (CIRISEdge's cold path did: `let Ok(..) else continue`) answers the wrong refusal while its warm path, which reaches the chunk door, answers `Withdrawn`. Handle `Withdrawn` on every path. (Found by CIRISEdge while adopting v53.1.0; fixed on edge's side.)
 
