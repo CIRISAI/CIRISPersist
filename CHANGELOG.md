@@ -7,7 +7,7 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
-## [53.1.0] - UNRELEASED
+## [53.1.0] - 2026-10-04
 
 ### #979 — a chunk of a withdrawn file is judged by its file (CC 2.3; CIRISEdge#771)
 
