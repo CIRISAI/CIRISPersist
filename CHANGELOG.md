@@ -7,6 +7,11 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.1] - UNRELEASED
+
+### Adopters — #979 reaches every DAG reader, not only the chunk serve door
+Under #979 a withdrawn DAG answers `BlobError::Withdrawn` from **every** door that reads it: `stream_chunks(stream_id)` and a manifest serve (`serve_blob_to_peer`) as well as the chunk serve door. A host that reads a DAG's membership through either and treats an error as "not in this DAG" (CIRISEdge's cold path did: `let Ok(..) else continue`) answers the wrong refusal while its warm path, which reaches the chunk door, answers `Withdrawn`. Handle `Withdrawn` on every path. (Found by CIRISEdge while adopting v53.1.0; fixed on edge's side.)
+
 ## [53.1.0] - 2026-10-04
 
 ### #979 — a chunk of a withdrawn file is judged by its file (CC 2.3; CIRISEdge#771)
