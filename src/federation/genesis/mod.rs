@@ -51,9 +51,16 @@ pub use test_anchor_block::*;
 pub use test_ceremony::*;
 
 pub mod posture;
+/// v53.1.0 — a bundle's roster records, one function for the boot seed and
+/// the import door.
+pub mod roster_install;
 pub use posture::{
     constitutional_seat, genesis_posture, require_constitutional_root, AbsentReason,
     BakeNotAdoptedReason, GenesisFault, GenesisLeg, GenesisPosture, ROOT_REQUIRING_GATES,
+};
+pub use roster_install::{
+    bundle_accord_genesis, install_accord_genesis_head, install_bundle_roster_records,
+    install_genesis_bundle_roster, RosterInstall, RosterRecordOutcome, RosterRecordReport,
 };
 
 use super::SignedKeyRecord;
@@ -591,121 +598,24 @@ where
     D: super::FederationDirectory + ?Sized,
 {
     const LEG: GenesisLeg = GenesisLeg::Family;
-    let family = accord_family_genesis_record();
-    // v31.0.0 (CIRISPersist#648) — THE property that keeps a second assemble
-    // from becoming a replacement. An already-entrenched family is a no-op and
-    // has been since #386; making the pre-genesis state reachable must not make
-    // OVERWRITING an established root reachable, so this early return is
-    // load-bearing rather than an optimisation. A new ceremony ADDS a root
-    // (roots co-exist and are addressed per-`root_ref`); nothing here mutates
-    // one that already stands.
-    if let Some(held) = dir
-        .lookup_family(&family.family_key_id)
-        .await
-        .map_err(|e| GenesisFault::unreadable(LEG, format!("lookup_family: {e}")))?
-    {
-        // v53.0.0 (CC 3.2 T6) — the one exception: an accord row that names no
-        // charter (stored before v53 gave the record its head fields) has no
-        // charter in force, so its root is invalid. It is replaced by this
-        // bundle's genesis record; anything else held is left standing.
-        return replace_chartless_accord(dir, &held, family).await;
-    }
-    // v21.0.0 (CIRISPersist#502 E4) — `put_family` now hybrid-Strict-verifies
-    // an authority signature; the baked HUMANITY_ACCORD family is a
-    // bake-what-exists declaration with no private key to sign with
-    // (`family_key_id` is keyless by design, see `put_family_local`'s doc).
-    // Use the trusted-local bypass, exactly as this boot path always has.
-    dir.put_family_local(family).await.map_err(|e| {
-        GenesisFault::absent(
+    // v31.0.0 (CIRISPersist#648) — a second assemble never becomes a
+    // replacement: a held head stands unless the genesis successor rule
+    // ([`roster_install`]) says it is a stale genesis head of this same
+    // accord — one that names no charter (a v52 row, I428) or names a charter
+    // that is no longer a live row while the bundle's is. Anything else held is
+    // left standing (#648, I428b). v53.1.0 — the same function the import door
+    // and the post-delegation-plane boot step use.
+    match roster_install::install_accord_genesis_head(dir, canonical_genesis_bundle()).await {
+        Ok(RosterRecordOutcome::Refused { reason }) => {
+            tracing::warn!(%reason, "genesis family seed: the held accord head is left standing");
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(GenesisFault::absent(
             LEG,
             format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"),
-        )
-    })
-}
-
-/// v53.0.0 (CC 3.2 T5/T6) — **a node upgrading from v52 holds an accord row
-/// that names no charter.** Under v53 the charter in force is the one the
-/// head names ([`charter_in_force`](super::canonical_community::charter_in_force)),
-/// so that row leaves the accord with no charter and its root invalid until a
-/// version naming one arrives.
-///
-/// CC T6: the genesis head carries an empty `prev_head_digest`, and the
-/// genesis head is the bundle's. A fresh node seeds exactly that record. If an
-/// upgraded node instead chained a version onto its v52 row, the two nodes
-/// would hold DIFFERENT head digests for one lineage, and every attach naming
-/// a head would split the mesh. So the upgraded node takes the genesis record
-/// itself, unchanged, and the v52 row becomes a superseded prior version
-/// labelled `accord_birth_replaces_unrooted` (the label R2a's prev-head check
-/// admits for a birth stored over an un-rooted row). The write stays inside
-/// this seeder, the door the accord id has always entered by; no peer-reachable
-/// door is opened.
-///
-/// It replaces ONLY a held row that names no charter and no predecessor, and
-/// equals the genesis record in everything a head does not carry (name, seats,
-/// founding instant, protocol, entrenchment, dissolution). A held row naming a
-/// charter or a predecessor is a version chain and is never overwritten, and a
-/// row of other content is a different accord and is left standing (#648).
-/// When the bundle carries the accord's signed genesis record (version 3), its
-/// signatures travel with the stored version.
-async fn replace_chartless_accord<D>(
-    dir: &D,
-    held: &crate::federation::types::Family,
-    genesis: crate::federation::types::Family,
-) -> Result<(), GenesisFault>
-where
-    D: super::FederationDirectory + ?Sized,
-{
-    const LEG: GenesisLeg = GenesisLeg::Family;
-    let unrooted = held.charter_digest.is_empty() && held.prev_head_digest.is_empty();
-    let same_roster = held.family_name == genesis.family_name
-        && held.members == genesis.members
-        && held.founded_at == genesis.founded_at
-        && held.consensus_protocol == genesis.consensus_protocol
-        && held.consensus_protocol_entrenched == genesis.consensus_protocol_entrenched
-        && held.dissolved_at == genesis.dissolved_at;
-    if !unrooted || genesis.charter_digest.is_empty() || !genesis.prev_head_digest.is_empty() {
-        return Ok(());
+        )),
     }
-    if !same_roster {
-        tracing::warn!(
-            family_key_id = %held.family_key_id,
-            "genesis family seed: the held accord row names no charter but is not this \
-             build's accord (other seats or protocol) — left standing"
-        );
-        return Ok(());
-    }
-    let signed = canonical_genesis_bundle()
-        .family_record(&genesis.family_key_id)
-        .filter(|carried| carried.family == genesis)
-        .cloned()
-        .unwrap_or_else(|| crate::federation::types::SignedFamily {
-            family: genesis.clone(),
-            authority_key_id: String::new(),
-            scrub_signature_classical: String::new(),
-            scrub_signature_pqc: None,
-            supersede_proof: None,
-            cosignatures: Vec::new(),
-        });
-    let snapshot = serde_json::to_value(&signed)
-        .map_err(|e| GenesisFault::absent(LEG, format!("accord genesis snapshot: {e}")))?;
-    dir.supersede_group_row(
-        super::cohort::Cohort::Family,
-        snapshot,
-        Some(serde_json::json!({
-            super::canonical_community::BIRTH_REPLACES_UNROOTED: held.persist_row_hash,
-        })),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| {
-        GenesisFault::absent(
-            LEG,
-            format!(
-                "replace the chartless accord row {} with the bundle's genesis record: {e}",
-                held.persist_row_hash
-            ),
-        )
-    })
 }
 
 /// Fail-secure presence check (CIRISPersist#386): the baked HUMANITY_ACCORD
@@ -3342,6 +3252,12 @@ where
     verify_canonical_seeded(dir).await?;
     seed_delegation_plane(dir).await?;
     verify_delegation_plane_seeded(dir).await?;
+    // v53.1.0 — the accord head again, now that the delegation plane holds
+    // this bundle's charter: a head left from an earlier ceremony, whose
+    // charter the plane just superseded, is a stale genesis head and takes
+    // the bundle's (I497). Before the plane is installed it cannot be told
+    // apart from a working root, so the early call above leaves it.
+    seed_accord_family(dir).await?;
     // #973 — the community birth, last: it is admitted THROUGH the key plane
     // and the delegation plane above. Inert until a ceremony bakes the asset.
     seed_canonical_community(dir).await?;

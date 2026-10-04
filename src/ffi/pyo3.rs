@@ -5363,6 +5363,52 @@ impl PyEngine {
         })
     }
 
+    /// v53.1.0 — install a verified genesis bundle (the ceremony artifact
+    /// JSON) on this node: verify its ceremony outputs against THIS build's
+    /// accord roster, bake its serve nodes and delegation plane, then install
+    /// its roster records (the accord family's genesis head and the
+    /// `ciris-canonical` birth) through the boot seed's own function. Returns
+    /// `{"bake": {...}, "records": [{"kind", "id", "outcome", "reason"?}]}`,
+    /// `outcome` one of `installed` / `already_held` / `successor` /
+    /// `refused`. Raises `ValueError` (`federation_genesis_bundle_invalid`)
+    /// on a bundle that does not verify; NOTHING is written in that case.
+    /// This node's own genesis posture is not changed.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn install_genesis_bundle_roster_json(
+        &self,
+        py: Python<'_>,
+        bundle_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let json = bundle_json.to_owned();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let bundle = crate::federation::genesis::parse_genesis_bundle(&json)
+                        .map_err(federation_err_to_py)?;
+                    let report = match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            crate::federation::genesis::install_genesis_bundle_roster(&**b, &bundle)
+                                .await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            crate::federation::genesis::install_genesis_bundle_roster(&**b, &bundle)
+                                .await
+                        }
+                    }
+                    .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&report).map_err(|e| {
+                        PyRuntimeError::new_err(format!("roster install report serialize: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     /// v19.2.0 (CIRISPersist#493) — the node's own content-tier
     /// self-encryption pubkeys, derived from the engine's local signing
     /// seed (public halves only). Returns

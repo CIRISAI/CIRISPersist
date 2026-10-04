@@ -1029,9 +1029,10 @@ async fn i428_v52_accord_row_takes_the_genesis_head() {
     upgrades_from_v52(&memory().await, &c, "memory").await;
 }
 
-/// **I428b — only a chartless row of this build's accord is replaced**: a held
-/// accord of other seats is left standing (#648), and so is one that already
-/// names a charter (a version chain).
+/// **I428b — a held accord row the successor rule does not cover is left
+/// standing**: one of other seats (#648), and a version chain (it names a
+/// predecessor). v53.1.0: a genesis head naming a charter that is not a live
+/// row is no longer in this set — it is replaced (I497).
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i428b_other_accord_rows_are_left_standing() {
@@ -1053,13 +1054,20 @@ async fn i428b_other_accord_rows_are_left_standing() {
             ),
         ),
         (
-            "names a charter",
-            accord_family_genesis_record_for(
-                accord,
-                ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
-                roster.iter().map(String::as_str),
-                &"ab".repeat(32),
-            ),
+            // v53.1.0 — a VERSION chain (it names a predecessor). A genesis
+            // head naming a charter that is not a live row is a stale head the
+            // successor rule replaces (I497); a chain is never overwritten.
+            "a version chain",
+            {
+                let mut v = accord_family_genesis_record_for(
+                    accord,
+                    ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL,
+                    roster.iter().map(String::as_str),
+                    &"ab".repeat(32),
+                );
+                v.prev_head_digest = "cd".repeat(32);
+                v
+            },
         ),
     ] {
         let d = memory().await;

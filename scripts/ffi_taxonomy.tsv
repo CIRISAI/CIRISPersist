@@ -183,6 +183,7 @@ Engine	audit_verify_chain	testimonial	self_audit
 Engine	backfill_trace_attestations	procedural	
 Engine	backfill_v020_trust_rows	procedural	
 Engine	bake_assembled_genesis	deontic	
+Engine	install_genesis_bundle_roster_json	deontic	
 Engine	blackhole_list_json	empirical	
 Engine	blackhole_prune_expired_iso	deontic	
 Engine	blackhole_record_hit	deontic	

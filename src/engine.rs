@@ -3766,6 +3766,30 @@ impl Engine {
         }
     }
 
+    /// v53.1.0 — **install a verified genesis bundle on this node** (the import
+    /// door): verify the ceremony outputs against THIS build's accord roster
+    /// (a refusal writes nothing), bake its serve nodes and delegation plane,
+    /// then install its roster records — the accord family's genesis head and
+    /// the `ciris-canonical` birth — through the same function the boot seed
+    /// uses. This node's own genesis posture is not changed. See
+    /// [`crate::federation::genesis::install_genesis_bundle_roster`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn install_genesis_bundle_roster(
+        &self,
+        bundle: &crate::federation::genesis::GenesisBundle,
+    ) -> Result<crate::federation::genesis::RosterInstall, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+            }
+        }
+    }
+
     /// "The payload follows the consent edge" (v21.2.0, CIRISPersist#509) —
     /// v39.0.0 — **enter the mesh**: flip a local-tier row to the federation
     /// tier over the SAME bytes (CC 5.3.2.4.2). Replaces `attestation_promote`,
