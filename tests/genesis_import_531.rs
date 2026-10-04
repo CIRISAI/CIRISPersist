@@ -584,6 +584,112 @@ async fn i497_reboot_takes_the_later_genesis() {
     reboot_takes_the_later_genesis(&sqlite().await, &v1, &v2, "sqlite").await;
 }
 
+async fn held_hash(d: &dyn FederationDirectory) -> String {
+    d.lookup_community(CANON)
+        .await
+        .unwrap()
+        .unwrap()
+        .persist_row_hash
+}
+
+fn birth_hash(c: &TestCeremonyOutputs) -> String {
+    compute_persist_row_hash(&c.bundle.community_record(CANON).unwrap().community).unwrap()
+}
+
+/// I501 — **the BAKE replaces a held prior-genesis `ciris-canonical` birth**
+/// (operator ruling 2026-10-04 on the final genesis: "It should replace right?
+/// This is a new seed even if it is the same settings"). The held row is kept
+/// as the superseded prior; a re-boot is idempotent; an IMPORT of a later
+/// ceremony never replaces a held birth; a row that has moved past its birth
+/// (a version chain) is never rolled back by a bake.
+async fn bake_replaces_the_prior_birth(
+    d: &dyn FederationDirectory,
+    v1: &TestCeremonyOutputs,
+    v2: &TestCeremonyOutputs,
+    v3: &TestCeremonyOutputs,
+    tag: &str,
+) {
+    use ciris_persist::federation::cohort::Cohort;
+    boot(d, v1).await;
+    assert_eq!(
+        held_hash(d).await,
+        birth_hash(v1),
+        "{tag} I501: control — v1's birth"
+    );
+    let versions_before = d
+        .list_group_versions(Cohort::Community, CANON)
+        .await
+        .unwrap()
+        .len();
+
+    // The bake of a later ceremony by the same holders replaces the birth.
+    boot(d, v2).await;
+    assert_eq!(
+        held_hash(d).await,
+        birth_hash(v2),
+        "{tag} I501: the re-boot holds v2's birth — the one a fresh node holds"
+    );
+    assert_eq!(
+        d.list_group_versions(Cohort::Community, CANON)
+            .await
+            .unwrap()
+            .len(),
+        versions_before + 1,
+        "{tag} I501: the held birth is kept as the superseded prior"
+    );
+    boot(d, v2).await;
+    assert_eq!(held_hash(d).await, birth_hash(v2), "{tag} I501: idempotent");
+
+    // An IMPORT of a later ceremony never replaces a held birth.
+    let r = install_genesis_bundle_roster(d, &v3.bundle)
+        .await
+        .unwrap_or_else(|e| panic!("{tag} I501: {e}"));
+    assert!(
+        refused_with(outcome(&r, "community"), "community_held_differs"),
+        "{tag} I501: {r:?}"
+    );
+    assert_eq!(
+        held_hash(d).await,
+        birth_hash(v2),
+        "{tag} I501: import never replaces a birth"
+    );
+
+    // A row that moved past its birth (a version chain) is never rolled back:
+    // supersede the held birth with a chained version, then bake v3.
+    let mut chained = v2.bundle.community_record(CANON).unwrap().clone();
+    chained.community.prev_head_digest = birth_hash(v2);
+    chained.community.persist_row_hash = String::new();
+    d.supersede_group_row(
+        Cohort::Community,
+        serde_json::to_value(&chained).unwrap(),
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{tag} I501: chain: {e}"));
+    let chained_hash = held_hash(d).await;
+    assert_ne!(
+        chained_hash,
+        birth_hash(v2),
+        "{tag} I501: the chain moved the head"
+    );
+    boot(d, v3).await;
+    assert_eq!(
+        held_hash(d).await,
+        chained_hash,
+        "{tag} I501: a version chain is never rolled back by a bake"
+    );
+}
+
+#[serial_test::serial(test_anchor_env)]
+#[tokio::test]
+async fn i501_bake_replaces_the_prior_birth() {
+    let (v1, v2) = vintages();
+    let v3 = mint_test_ceremony(&SEEDS, &NODE_SEED, at(-1)).expect("mint v3");
+    let _armed = Armed::with(&v1.block);
+    bake_replaces_the_prior_birth(&memory().await, &v1, &v2, &v3, "memory").await;
+    bake_replaces_the_prior_birth(&sqlite().await, &v1, &v2, &v3, "sqlite").await;
+}
+
 #[serial_test::serial(test_anchor_env)]
 #[tokio::test]
 async fn i498_older_ceremony_is_refused() {
@@ -613,6 +719,7 @@ async fn i490_i499_postgres() {
     }
     let (v1, v2) = vintages();
     let other = mint_test_ceremony(&OTHER_SEEDS, &NODE_SEED, at(-5)).expect("mint other");
+    let v3 = mint_test_ceremony(&SEEDS, &NODE_SEED, at(-1)).expect("mint v3");
     let _armed = Armed::with(&v1.block);
     macro_rules! on_pg {
         ($b:ident => $e:expr) => {{
@@ -634,4 +741,5 @@ async fn i490_i499_postgres() {
     on_pg!(b => reboot_takes_the_later_genesis(b, &v1, &v2, "postgres"));
     on_pg!(b => older_ceremony_is_refused(b, &v1, &v2, "postgres"));
     on_pg!(b => replaced_only_once_the_bundle_charter_is_live(b, &v2, "postgres"));
+    on_pg!(b => bake_replaces_the_prior_birth(b, &v1, &v2, &v3, "postgres"));
 }

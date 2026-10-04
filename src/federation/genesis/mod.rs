@@ -61,6 +61,7 @@ pub use posture::{
 pub use roster_install::{
     bundle_accord_genesis, install_accord_genesis_head, install_bundle_roster_records,
     install_genesis_bundle_roster, RosterInstall, RosterRecordOutcome, RosterRecordReport,
+    RosterSource,
 };
 
 use super::SignedKeyRecord;
@@ -3291,6 +3292,10 @@ pub enum CommunityLegOutcome {
     /// moved past the birth, or another ceremony's. Left untouched: the
     /// compiled asset is a floor, never the identity (the #665 rule).
     HeldDiffers,
+    /// v53.1.1 — this node held a PRIOR genesis's birth (no predecessor,
+    /// another charter) and the BAKE replaced it with the baked birth, keeping
+    /// the held row as the superseded prior (operator ruling 2026-10-04).
+    Replaced,
 }
 
 /// CIRISPersist#973 — **seed the baked community birth at boot.** See
@@ -3303,7 +3308,7 @@ pub async fn seed_canonical_community<D>(dir: &D) -> Result<CommunityLegOutcome,
 where
     D: super::FederationDirectory + ?Sized,
 {
-    seed_canonical_community_from(dir, canonical_community_asset()).await
+    seed_canonical_community_from(dir, canonical_community_asset(), RosterSource::Bake).await
 }
 
 /// CIRISPersist#973 — the community boot leg over a given asset.
@@ -3325,6 +3330,7 @@ where
 pub async fn seed_canonical_community_from<D>(
     dir: &D,
     asset: Option<&super::SignedCommunity>,
+    source: RosterSource,
 ) -> Result<CommunityLegOutcome, GenesisFault>
 where
     D: super::FederationDirectory + ?Sized,
@@ -3348,6 +3354,41 @@ where
         };
         if same {
             return Ok(CommunityLegOutcome::AlreadyHeld);
+        }
+        // v53.1.1 — the operator's ruling on the final genesis (2026-10-04):
+        // "It should replace right? This is a new seed even if it is the same
+        // settings." The BAKE, and only the bake, replaces a held PRIOR-GENESIS
+        // birth: a genesis row (no predecessor) that names another charter.
+        // A version chain (a roster that moved past some birth) is never
+        // rolled back, and an import never replaces a rooted row.
+        if source == RosterSource::Bake
+            && held.prev_head_digest.is_empty()
+            && held.charter_digest != birth.community.charter_digest
+        {
+            let snapshot = serde_json::to_value(birth)
+                .map_err(|e| GenesisFault::unreadable(LEG, format!("birth snapshot: {e}")))?;
+            dir.supersede_group_row(
+                crate::federation::cohort::Cohort::Community,
+                snapshot,
+                Some(serde_json::json!({
+                    crate::federation::canonical_community::BIRTH_REPLACES_UNROOTED:
+                        held.persist_row_hash,
+                })),
+            )
+            .await
+            .map_err(|e| {
+                GenesisFault::absent(
+                    LEG,
+                    format!("replace the held {id} row with the baked birth: {e}"),
+                )
+            })?;
+            tracing::info!(
+                community_key_id = %id,
+                replaced = %held.persist_row_hash,
+                "genesis community seed: the bake replaces the held prior-genesis birth with the \
+                 baked birth (operator ruling 2026-10-04)"
+            );
+            return Ok(CommunityLegOutcome::Replaced);
         }
         tracing::info!(
             community_key_id = %id,
@@ -4464,7 +4505,12 @@ mod tests {
             "a community asset is compiled in beside the bundle"
         );
         // Not baked on this branch: the leg must not exist for a boot.
-        assert!(super::canonical_community_asset().is_none());
+        let birth = super::canonical_community_asset()
+            .expect("v53.1.1: the final genesis bakes the ciris-canonical birth");
+        assert_eq!(
+            birth.community.community_key_id,
+            crate::federation::canonical_community::CIRIS_CANONICAL_COMMUNITY_KEY_ID
+        );
         assert_eq!(super::GenesisLeg::Community.as_str(), "community");
         assert_eq!(
             super::GenesisLeg::ALL.last(),
@@ -4670,11 +4716,11 @@ mod tests {
         use crate::federation::{FederationDirectory, SignedAttestation};
         use crate::store::{Backend as _, SqliteBackend};
 
-        let path =
-            std::env::var("GENESIS3").unwrap_or_else(|_| "/home/emoore/genesis_3.json".into());
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            eprintln!("skipping #557 dry run: no candidate bundle at {path}");
-            return;
+        // v53.1.1 — the candidate is the FINAL GENESIS this build bakes, unless
+        // `GENESIS3` names a later candidate on disk.
+        let raw = match std::env::var("GENESIS3") {
+            Ok(path) => std::fs::read_to_string(&path).expect("GENESIS3 names a readable bundle"),
+            Err(_) => super::CANONICAL_SEED_JSON.to_owned(),
         };
         let b: GenesisBundle =
             serde_json::from_str(&raw).expect("candidate parses as GenesisBundle");
@@ -4959,7 +5005,10 @@ mod tests {
     #[test]
     fn embedded_seed_is_a_genesis_bundle_551() {
         let b = canonical_genesis_bundle();
-        assert_eq!(b.version, 2);
+        assert_eq!(
+            b.version, 3,
+            "v53.1.1: the final genesis is a version-3 bundle"
+        );
         assert_eq!(b.family_key_id, "humanity-accord");
         assert_eq!(b.consensus_protocol, "quorum:2/3");
 
@@ -5007,7 +5056,11 @@ mod tests {
             .iter()
             .map(|a| a.holder_key_id.as_str())
             .collect();
-        assert_eq!(auths, ["A1", "B1"], "2-of-3 holder authorizations");
+        assert_eq!(
+            auths,
+            ["A1", "B1", "C1"],
+            "v53.1.1: the final genesis carries every holder's authorization (3 over a 2/3 quorum)"
+        );
         for a in &b.authorizations {
             assert!(
                 !a.signature_classical.is_empty() && !a.signature_pqc.is_empty(),
@@ -5027,7 +5080,7 @@ mod tests {
         // re-bake is a DELIBERATE edit here, never a silent artifact swap.
         assert_eq!(
             b.serve_nodes[0].record.valid_from.to_rfc3339(),
-            "2026-07-31T13:58:22.147317128+00:00"
+            "2026-10-04T22:43:08.069400+00:00"
         );
     }
 
