@@ -17520,6 +17520,39 @@ impl crate::federation::BlobStorage for SqliteBackend {
         row.map(sqlite_stream_chunk_ref).transpose()
     }
 
+    async fn dag_chunks_of_manifest(
+        &self,
+        manifest_sha: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
+        let sha = manifest_sha.to_vec();
+        let rows: Vec<(i64, Vec<u8>)> = self
+            .read(
+                move |conn| -> Result<Vec<(i64, Vec<u8>)>, rusqlite::Error> {
+                    let mut stmt = conn.prepare(
+                        "SELECT seq, chunk_sha256 FROM federation_dag_chunks \
+                      WHERE manifest_sha256 = ?1 ORDER BY seq",
+                    )?;
+                    let it =
+                        stmt.query_map(rusqlite::params![sha], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    it.collect()
+                },
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("dag_chunks_of_manifest: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|(seq, c)| {
+                let sha = <[u8; 32]>::try_from(c.as_slice()).map_err(|_| {
+                    crate::federation::BlobError::Backend(
+                        "dag_chunks_of_manifest: a 32-byte sha".into(),
+                    )
+                })?;
+                Ok((u64::try_from(seq).unwrap_or(0), sha))
+            })
+            .collect()
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],

@@ -15059,6 +15059,58 @@ impl PyEngine {
         })
     }
 
+    /// v53.1.0 (CIRISPersist#979, CIRISEdge#771) — **the chunks of a sealed
+    /// manifest** on this node, from the relation persist wrote at the seal or
+    /// the promote. Returns JSON `[{"seq", "chunk_sha256"}, …]` in seq order,
+    /// terminators included; `[]` for a whole blob or a DAG from before
+    /// v53.1.0 that no viewer has promoted again. Nothing is opened.
+    fn chunks_of_manifest_json(
+        &self,
+        py: Python<'_>,
+        manifest_sha256_hex: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let sha = parse_sha256_hex(manifest_sha256_hex)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let rows = runtime
+                    .block_on(async move { engine.chunks_of_manifest(&sha).await })
+                    .map_err(blob_err_to_py)?;
+                let out: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(seq, c)| serde_json::json!({"seq": seq, "chunk_sha256": hex::encode(c)}))
+                    .collect();
+                serde_json::to_string(&out).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+        })
+    }
+
+    /// v53.1.0 (CIRISPersist#979, CIRISEdge#766) — **is `chunk_sha256_hex` a
+    /// chunk of the sealed DAG `manifest_sha256_hex` on this node?** The point
+    /// query behind `chunks_of_manifest_json` (a v3 root answers for its
+    /// children too).
+    fn dag_contains_chunk(
+        &self,
+        py: Python<'_>,
+        manifest_sha256_hex: &str,
+        chunk_sha256_hex: &str,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let m = parse_sha256_hex(manifest_sha256_hex)?;
+            let c = parse_sha256_hex(chunk_sha256_hex)?;
+            let engine = self.hold_engine_view();
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime
+                    .block_on(async move { engine.dag_contains_chunk(&m, &c).await })
+                    .map_err(blob_err_to_py)
+            })
+        })
+    }
+
     /// v52.0.0 (CIRISPersist#954) — **one page of a v3 manifest**: the chunks
     /// child `child_index` lists, opened as `viewer_key_id` (authorized on the
     /// root as `read_blob_as`, then on the child row). For a file above the

@@ -2203,6 +2203,9 @@ class Engine:
     def capacity_state_json(self, key_id: str, domain: str) -> str:
         """(derived) epistemic — v11.9.0 (CIRISPersist#309, CC 3.4.12) — the resolved capacity state of key_id for decision-domain, from its incoming witness capacity_assurance::{d..."""
 
+    def chunks_of_manifest_json(self, manifest_sha256_hex: str) -> str:
+        """(derived) epistemic — v53.1.0 (CIRISPersist#979, CIRISEdge#771) — the chunks of a sealed manifest on this node, from the relation persist wrote at the seal or the promot..."""
+
     def corpus_shape(self, filter_json: str, caller_occurrence_key_id: str | None) -> str:
         """(derived) epistemic — Corpus-shape rollup over a filtered window — the coarse distribution a caller reads BEFORE deciding what to query in detail. Reports shape, not row..."""
 
@@ -2211,6 +2214,9 @@ class Engine:
 
     def custody_view_json(self, at_rest_sha256_hex: str, viewer_key_id: str, stream_id: str | None = None) -> str:
         """(derived) epistemic — v53.0.0 (CIRISPersist#942 part 2, CC 3.1.3.3) — the custody view of one blob as JSON: {sha256_hex, devices: [{device_key_id, state, reported_at?, r..."""
+
+    def dag_contains_chunk(self, manifest_sha256_hex: str, chunk_sha256_hex: str) -> bool:
+        """(derived) epistemic — v53.1.0 (CIRISPersist#979, CIRISEdge#766) — is chunk_sha256_hex a chunk of the sealed DAG manifest_sha256_hex on this node? The point query behind..."""
 
     def describe_crossing(self, attestation_id: str, scope: str, cohort_target: str | None, basis: str) -> str:
         """(derived) epistemic — v39.0.0 — the nine-axis description a truthful caller would state for attestation_id at scope, as JSON: the starting point for enter_mesh / widen_a..."""

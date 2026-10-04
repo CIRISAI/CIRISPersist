@@ -758,3 +758,5 @@ Engine	put_blob_chunks_signing_json	deontic
 Engine	sign_stream_sth_json	deontic	
 Engine	community_trust_consent_json	deontic	
 Engine	sealed_dag_readiness_json	empirical	
+Engine	chunks_of_manifest_json	epistemic	
+Engine	dag_contains_chunk	epistemic	

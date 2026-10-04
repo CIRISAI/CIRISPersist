@@ -38,7 +38,44 @@ pub enum BindingState {
 /// shapes since #862): gather the composers naming it from the same slice
 /// every `retired_ids` caller folds over, REPLACE each retraction's stored
 /// entitlement with the one re-derived now, and let §6.1 precedence decide.
+///
+/// v53.1.0 (CIRISPersist#979) — a row nothing binds directly, that a sealed
+/// DAG relation names (a chunk, or a v3 child), is judged by the manifests it
+/// belongs to ([`FederationDirectory::dag_manifests_of_chunk`]): `Withdrawn`
+/// only when EVERY such manifest is withdrawn, `Live` when any is live, and
+/// `Unbound` otherwise. Referencing rows bind the manifest, never its chunks,
+/// so before this a chunk of a withdrawn file read as unbound and was served.
+/// The relation is persist's own (written at the seal and the promote), so no
+/// author-asserted row can tie a chunk to a live manifest.
 pub async fn binding_state(
+    directory: &dyn FederationDirectory,
+    at_rest_sha256: &[u8; 32],
+) -> Result<BindingState, Error> {
+    let own = rows_state(directory, at_rest_sha256).await?;
+    if own != BindingState::Unbound {
+        return Ok(own);
+    }
+    let manifests = directory.dag_manifests_of_chunk(at_rest_sha256).await?;
+    if manifests.is_empty() {
+        return Ok(BindingState::Unbound);
+    }
+    let mut last_withdrawn = None;
+    let mut every_withdrawn = true;
+    for m in &manifests {
+        match rows_state(directory, m).await? {
+            BindingState::Live => return Ok(BindingState::Live),
+            w @ BindingState::Withdrawn { .. } => last_withdrawn = Some(w),
+            BindingState::Unbound => every_withdrawn = false,
+        }
+    }
+    match last_withdrawn {
+        Some(w) if every_withdrawn => Ok(w),
+        _ => Ok(BindingState::Unbound),
+    }
+}
+
+/// The fold over the rows that bind `at_rest_sha256` itself.
+async fn rows_state(
     directory: &dyn FederationDirectory,
     at_rest_sha256: &[u8; 32],
 ) -> Result<BindingState, Error> {
