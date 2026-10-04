@@ -1953,18 +1953,61 @@ pub mod orchestrate {
             chunk_count,
             total_size,
         };
-        if head.storage_kind == "chunk_dag" {
+        // v53.1.0 (#979) — a row that is already a DAG is re-checked so the
+        // floor can relate it to its chunks (a DAG from before V176). Any
+        // check that fails (an evicted chunk, say) answers as before:
+        // `promoted: false`, nothing written.
+        let already = head.storage_kind == "chunk_dag";
+        let checked = promote_checks(
+            backend,
+            sha256,
+            &m,
+            &stream_id,
+            head.crypto_tier,
+            viewer_key_id,
+            caller_aad,
+        )
+        .await;
+        if already {
+            if checked.is_ok() {
+                backend
+                    .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
+                    .await?;
+            }
             return Ok(done(false));
         }
+        checked?;
+        let promoted = backend
+            .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
+            .await?;
+        Ok(done(promoted))
+    }
+
+    /// The promote's checks over a held manifest: every chunk it names held
+    /// at its `seq` with the named sha, size and tier, every v3 child held and
+    /// recorded, and a stream-keyed DAG's epochs whole.
+    async fn promote_checks<B>(
+        backend: &B,
+        sha256: &[u8; 32],
+        m: &ParsedManifest,
+        stream_id: &str,
+        tier: CryptoTier,
+        viewer_key_id: &str,
+        caller_aad: Option<&[u8]>,
+    ) -> Result<(), BlobError>
+    where
+        B: BlobStorage + crate::federation::FederationDirectory + Sync,
+    {
+        let stream_id = stream_id.to_owned();
         let listing = backend.stream_chunks(&stream_id).await?;
         let by_seq: std::collections::HashMap<u64, &StreamChunkRef> =
             listing.chunks.iter().map(|r| (r.seq, r)).collect();
         // v53.0.0 (#969) — a stream-keyed DAG's chunks, for the structure
         // check below (read from the stored nonces: I45, nothing is opened).
         let mut keyed_chunks: Vec<ChunkRef> = Vec::new();
-        match &m {
+        match m {
             ParsedManifest::Flat(f) => {
-                check_chunks_held(&by_seq, &f.chunks, sha256, &stream_id, head.crypto_tier)?;
+                check_chunks_held(&by_seq, &f.chunks, sha256, &stream_id, tier)?;
                 if f.is_stream_keyed() {
                     keyed_chunks.extend(f.chunks.iter().cloned());
                 }
@@ -1986,13 +2029,7 @@ pub mod orchestrate {
                 for i in 0..root.children.len() {
                     let child =
                         open_manifest_child(backend, root, i, viewer_key_id, caller_aad).await?;
-                    check_chunks_held(
-                        &by_seq,
-                        &child.chunks,
-                        sha256,
-                        &stream_id,
-                        head.crypto_tier,
-                    )?;
+                    check_chunks_held(&by_seq, &child.chunks, sha256, &stream_id, tier)?;
                     if child.is_stream_keyed() {
                         keyed_chunks.extend(child.chunks.iter().cloned());
                     }
@@ -2002,10 +2039,7 @@ pub mod orchestrate {
         if !keyed_chunks.is_empty() {
             check_held_stream_structure(backend, sha256, &keyed_chunks).await?;
         }
-        let promoted = backend
-            .promote_adopted_manifest_to_dag(sha256, &stream_id, chunk_count)
-            .await?;
-        Ok(done(promoted))
+        Ok(())
     }
 
     /// v53.0.0 (#969, CC 5.3.3.1) — **the promote's truncation check, without

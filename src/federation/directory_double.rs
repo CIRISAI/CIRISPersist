@@ -134,7 +134,7 @@ impl FaultInjectingDirectory {
     }
 }
 
-// 111 delegations, generated. Every one: fault first, then delegate.
+// 112 delegations, generated. Every one: fault first, then delegate.
 #[async_trait::async_trait]
 impl FederationDirectory for FaultInjectingDirectory {
     async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
@@ -253,6 +253,15 @@ impl FederationDirectory for FaultInjectingDirectory {
             return Err(e);
         }
         self.inner.community_roster_signers(community_key_id).await
+    }
+    async fn dag_manifests_of_chunk(
+        &self,
+        chunk_sha256: &[u8; 32],
+    ) -> Result<Vec<[u8; 32]>, Error> {
+        if let Some(e) = self.faulted("dag_manifests_of_chunk") {
+            return Err(e);
+        }
+        self.inner.dag_manifests_of_chunk(chunk_sha256).await
     }
     async fn enter_mesh(
         &self,

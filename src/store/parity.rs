@@ -719,6 +719,11 @@ pub(crate) const CALL_CLASSES: &[(&str, Class)] = &[
     ("serialize_witness_signatures", Class::Plumbing),
     // v36.0.0 (CIRISPersist#707/#668) — the sqlite allocator spellings.
     // Plumbing, same rationale as `next_key_admission_position` above.
+    // v53.1.0 (#979) — relates a manifest to its stream's chunk rows inside
+    // the seal / promote transaction. It refuses nothing about the caller's
+    // input (the seal and the promote checked the rows before calling it); it
+    // fails only on the database's own terms.
+    ("sqlite_link_dag_chunks", Class::Plumbing),
     ("sqlite_next_key_serve_position", Class::Plumbing),
     ("sqlite_next_plane_position", Class::Plumbing),
     ("sqlite_project_attestation_subjects", Class::Delegates),

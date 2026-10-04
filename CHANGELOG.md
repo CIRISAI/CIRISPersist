@@ -7,6 +7,49 @@ threat-model citations because this crate's audit story is the point.
 
 ## [Unreleased]
 
+## [53.1.0] - 2026-10-04
+
+### #979 — a chunk of a withdrawn file is judged by its file (CC 2.3; CIRISEdge#771)
+
+Referencing rows bind a sealed DAG's MANIFEST, never its chunks, so a chunk of a withdrawn file read as `Unbound` and every door served it (pre-existing since v47.2.0; v53.0.1 recorded it). The chunk-to-manifest link could not be derived soundly: a referencing row's `BlobPointer.stream_id` is author-asserted, so one forged live row would have kept a withdrawn DAG's chunks servable.
+
+- **V176 `federation_dag_chunks(manifest_sha256, seq, chunk_sha256, stream_id)`** (both dialects, indexed on the chunk, checksums pinned). Persist writes it ITSELF, in the transaction that makes the manifest a `chunk_dag`: at the seal (`seal_stream_with_scope`, from the stream's own rows, whose count the seal checks; terminators included) and at the promote of an adopted manifest (`promote_adopted_manifest_to_dag`, after the orchestration opened the manifest and checked each chunk it names). No row comes from an author's claim.
+- **The fold** (`blob_tombstone::binding_state`): a row nothing binds directly, that V176 (or a V160 v3 child relation) names, is `Withdrawn` only when EVERY manifest it belongs to is withdrawn, `Live` when any is live, `Unbound` otherwise. The read doors and the peer-serve disposition (`serve_blob_to_peer`, the ranged serve) refuse through it unchanged.
+- **Eviction reach** (`Engine::evict_blob`): evicting a WITHDRAWN manifest also evicts, retract-then-delete, every related chunk whose own fold is withdrawn. A chunk another live (or unbound) DAG holds stays. `EvictBlobReport` gains `dag_chunks_evicted`. Bytes only: the V176 rows stay, as the at-rest grants do (v53.0.0's eviction ruling).
+- **Lookups:** `Engine::chunks_of_manifest(manifest) -> Vec<(seq, chunk_sha)>` and `Engine::dag_contains_chunk(manifest, chunk) -> bool`; pyo3 `chunks_of_manifest_json` and `dag_contains_chunk` (FFI class `epistemic`). Nothing is opened, so a relay holder answers too.
+- **Backfill:** a viewer's re-promote of an already-sealed DAG (from before V176) writes its relation when the stream still holds exactly its chunks; a re-promote whose checks fail answers `promoted: false` as before.
+- **New required trait methods** (for a host that implements them; Edge implements none): `FederationDirectory::dag_manifests_of_chunk`, `BlobStorage::dag_chunks_of_manifest`. The memory backend answers empty (it stores no blobs); a capsule host answers `Unsupported`, as for `attestations_binding_content`.
+
+**Not covered:** a DAG with no relation stays as before (its chunks read `Unbound`). That is a DAG sealed or promoted before v53.1.0 that no viewer has promoted again, or one held only by a relay that cannot open its manifest. A WITHDRAWN such DAG is never backfilled (the promote opens the manifest, and opening refuses a withdrawn one); the host's revocation register (CIRISEdge#771) refuses its chunks. **BELIEVED, not witnessed:** the V160 arm (a v3 child judged by its root) — a v3 root needs a file above the flat manifest's ceiling (~10 400 chunks).
+
+**Adopters (Edge #771, #766):** evict a withdrawn file with `evict_blob(manifest)` alone; its chunks go with it. Use `dag_contains_chunk` in the serve gate instead of a per-file chunk cache. Call `promote_adopted_manifest_to_dag` after adopting a DAG (as today); that is what writes the relation on the receiving node.
+
+**Witnesses I480–I487** (two nodes, sqlite and postgres; the memory backend has no blob storage): the relation at the seal and at the promote (I480, I481); Edge's leg — B adopted and promoted, the owner withdraws on B, every chunk (terminator included) and the manifest refused at B's peer-serve and read doors (I482); B's eviction takes every chunk, keeps the relation, leaves a live DAG (I483); a chunk two DAGs hold (I484); a forged pointer naming the stream revives nothing (I485); a DAG with no relation behaves as before (I486); the backfill (I487).
+
+| Mutant | Result |
+|---|---|
+| M1 the seal writes no relation | killed — I480 |
+| M2 the promote writes no relation | killed — I480/481, I482/483, I484, I485 |
+| M3 the fold ignores the manifests | killed — I482/483, I484, I485, I486/487 |
+| M4 any withdrawn manifest withdraws the chunk | killed — I484 |
+| M5 the eviction does not reach the chunks | killed — I482/483, I484 |
+| M6 the eviction ignores the chunk's own fold | killed — I484 |
+| M7 `dag_contains_chunk` always true | killed — I480 |
+| M8 no backfill on a re-promote | killed — I486/487 |
+### Genesis — one roster-install function for boot and import; a stale genesis head of the same accord takes the bundle's
+
+**Found while building the import door (TESTED, I497):** a node seeded from one ceremony and re-booted with a later ceremony of the SAME holders kept its first accord head. That head names the first ceremony's charter, the re-bake superseded that charter row, and the accord root read **invalid** (`root_self_declares: false`, 0 distinct charter holders) while `genesis_posture` still reported `Entrenched`. Every v53.0.x node holds a head naming the v2 bundle's charter, so this is the path the final ceremony's bake takes on every upgraded node.
+
+- **`genesis::install_accord_genesis_head(dir, bundle)`** — the ONE function that installs the accord family's genesis head. A held head is replaced by the bundle's genesis head only when it is itself a genesis head (no predecessor — a version chain is never overwritten), of the same accord (name, seats, founding instant, protocol, entrenchment, dissolution), and it names no charter (the v52 upgrade, I428) or names a charter that is no longer a live row while the bundle's charter is. A head whose charter still stands is a working root and is never replaced; which ceremony is newer stays the delegation plane's own successor rule. The replacement is stored as the superseded prior version labelled `accord_birth_replaces_unrooted`, so upgraded and fresh nodes hold ONE head digest (CC 3.2 T6).
+- The boot seed runs it twice: as before (`seed_accord_family`, before the serve node and delegation plane — the family's seats are their FK), and again **after** the delegation plane, where a head whose charter the plane just superseded is first recognisable as stale.
+- **`genesis::install_genesis_bundle_roster(dir, &bundle)`** (Engine `install_genesis_bundle_roster`, pyo3 `install_genesis_bundle_roster_json`) — the import door for a verified version-3 bundle: `verify_ceremony_outputs` first (a refusal writes nothing: `federation_genesis_bundle_invalid` naming the stage), then `bake_assembled_genesis` (serve nodes and the delegation plane, with its anti-rollback rule), then `install_bundle_roster_records` — the boot seed's own functions. Returns `{bake, records:[{kind, id, outcome, reason?}]}`, `outcome` ∈ `installed` / `already_held` / `successor` / `refused`. Re-importing writes nothing. This node's own genesis posture is not changed by the door: the posture is computed against the compiled bundle.
+- The `ciris-canonical` birth is installed when the id is free; a different held birth is reported `refused` (`community_held_differs`) and left standing — a rooted birth is never replaced here (#926).
+- I428b's second case was a genesis head naming a charter that is not a row; that is now a stale head the rule replaces, so the case is a real version chain (it names a predecessor).
+
+**Scope, stated plainly:** a version-3 bundle names the reserved `humanity-accord` / `ciris-canonical` ids, and `verify_ceremony_outputs` checks its holders against THIS build's accord roster. A bundle of another accord (other holders) is therefore refused at verification (`ceremony_holder_roster_mismatch`); importing a different root's v3 bundle needs per-root roster ids, which persist does not have.
+
+**Adopters.** CIRISServer (`/v1/trust-root/import`): call `install_genesis_bundle_roster_json` after `verify_bundle`, instead of installing holders, serve nodes and attestations row by row; report `accepted` from its `records`. A different `ciris-canonical` birth already held stays `refused` until a ruling on replacing a rooted birth.
+
 ## [53.0.1] - 2026-10-03
 
 ### Fixed — a custody report kept a withdrawn file Live (CC 2.3; found by CIRISEdge#763)

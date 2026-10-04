@@ -306,6 +306,41 @@ impl PostgresBackend {
 /// `apply_replicated_community` the replicated one (a record authored
 /// elsewhere, admitted as data). Every other gate is the same on both.
 impl PostgresBackend {
+    /// v53.1.0 (#979) — TEST SEAM: drop the V176 relation of a manifest (a
+    /// DAG from before V176) or add one row of it (a chunk shared by two DAGs,
+    /// which two real streams never produce: each seal encrypts its own bytes).
+    #[cfg(test)]
+    pub(crate) async fn test_dag_link(
+        &self,
+        manifest: &[u8; 32],
+        add: Option<(u64, [u8; 32], &str)>,
+    ) {
+        let client = self.pool.get().await.expect("pool");
+        match add {
+            None => {
+                client
+                    .execute(
+                        "DELETE FROM cirislens.federation_dag_chunks WHERE manifest_sha256 = $1",
+                        &[&manifest.to_vec()],
+                    )
+                    .await
+                    .expect("unlink");
+            }
+            Some((seq, chunk, stream)) => {
+                client
+                    .execute(
+                        "INSERT INTO cirislens.federation_dag_chunks \
+                         (manifest_sha256, seq, chunk_sha256, stream_id) VALUES ($1, $2, $3, $4)",
+                        &[&manifest.to_vec(), &(seq as i64), &chunk.to_vec(), &stream],
+                    )
+                    .await
+                    .expect("link");
+            }
+        }
+    }
+}
+
+impl PostgresBackend {
     pub(crate) async fn put_community_at_door(
         &self,
         community: crate::federation::SignedCommunity,
@@ -7768,6 +7803,36 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("purge_genesis_delegation_row_v31: {e}"))
             })?;
         Ok(n > 0)
+    }
+
+    async fn dag_manifests_of_chunk(
+        &self,
+        chunk_sha256: &[u8; 32],
+    ) -> Result<Vec<[u8; 32]>, crate::federation::Error> {
+        // v53.1.0 (#979) — V176 (chunk → manifest) and V160 (child → root).
+        let client = self.pool.get().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("dag_manifests_of_chunk pool: {e}"))
+        })?;
+        let sha = chunk_sha256.to_vec();
+        let rows = client
+            .query(
+                "SELECT manifest_sha256 AS m FROM cirislens.federation_dag_chunks WHERE chunk_sha256 = $1 \
+                 UNION \
+                 SELECT root_sha256 AS m FROM cirislens.federation_manifest_children WHERE child_sha256 = $1",
+                &[&sha],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("dag_manifests_of_chunk: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                let v: Vec<u8> = r.safe_get_with("m", crate::federation::Error::Backend)?;
+                <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+                    crate::federation::Error::Backend(
+                        "dag_manifests_of_chunk: a 32-byte sha".into(),
+                    )
+                })
+            })
+            .collect()
     }
 
     async fn attestations_binding_content(
@@ -18732,6 +18797,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 crate::federation::BlobError::Backend(format!("seal child relation: {e}"))
             })?;
         }
+        // v53.1.0 (#979) — the manifest's chunks, from the stream's own rows
+        // (whose count was checked above), in this transaction.
+        tx.execute(
+            "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
+             WHERE stream_id = $2 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+            &[&sha_vec, &stream_id],
+        )
+        .await
+        .map_err(|e| crate::federation::BlobError::Backend(format!("seal dag chunk links: {e}")))?;
         tx.execute(
             "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
             &[&stream_id],
@@ -19099,6 +19174,37 @@ impl crate::federation::BlobStorage for PostgresBackend {
         row.as_ref().map(pg_stream_chunk_ref).transpose()
     }
 
+    async fn dag_chunks_of_manifest(
+        &self,
+        manifest_sha: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
+        use crate::federation::BlobError;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| BlobError::Backend(format!("dag_chunks_of_manifest pool: {e}")))?;
+        let sha = manifest_sha.to_vec();
+        let rows = client
+            .query(
+                "SELECT seq, chunk_sha256 FROM cirislens.federation_dag_chunks \
+                  WHERE manifest_sha256 = $1 ORDER BY seq",
+                &[&sha],
+            )
+            .await
+            .map_err(|e| BlobError::Backend(format!("dag_chunks_of_manifest: {e}")))?;
+        rows.iter()
+            .map(|r| {
+                let seq: i64 = r.safe_get_with("seq", BlobError::Backend)?;
+                let c: Vec<u8> = r.safe_get_with("chunk_sha256", BlobError::Backend)?;
+                let sha = <[u8; 32]>::try_from(c.as_slice()).map_err(|_| {
+                    BlobError::Backend("dag_chunks_of_manifest: a 32-byte sha".into())
+                })?;
+                Ok((u64::try_from(seq).unwrap_or(0), sha))
+            })
+            .collect()
+    }
+
     async fn stream_positions_of_chunk(
         &self,
         chunk_sha: &[u8; 32],
@@ -19167,7 +19273,32 @@ impl crate::federation::BlobStorage for PostgresBackend {
         let kind: String = row.safe_get_with("storage_kind", BlobError::Backend)?;
         let tier: String = row.safe_get_with("crypto_tier", BlobError::Backend)?;
         if kind == "chunk_dag" {
-            let _ = tx.rollback().await;
+            // v53.1.0 (#979) — a DAG from before V176 gains its chunk relation
+            // when a viewer promotes it again and the stream still holds
+            // exactly its chunks.
+            let n: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) AS n FROM cirislens.federation_stream_chunks WHERE stream_id = $1",
+                    &[&stream_id],
+                )
+                .await
+                .map_err(|e| BlobError::Backend(format!("promote backfill count: {e}")))?
+                .safe_get_with("n", BlobError::Backend)?;
+            if n == expected {
+                tx.execute(
+                    "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
+             WHERE stream_id = $2 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+                    &[&sha_vec, &stream_id],
+                )
+                .await
+                .map_err(|e| BlobError::Backend(format!("promote backfill links: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| BlobError::Backend(format!("promote backfill commit: {e}")))?;
+            } else {
+                let _ = tx.rollback().await;
+            }
             return Ok(false);
         }
         if kind != "inline" {
@@ -19208,6 +19339,16 @@ impl crate::federation::BlobStorage for PostgresBackend {
         )
         .await
         .map_err(|e| BlobError::Backend(format!("promote_adopted_manifest_to_dag update: {e}")))?;
+        // v53.1.0 (#979) — the orchestration opened this manifest and checked
+        // each chunk it names against these rows.
+        tx.execute(
+            "INSERT INTO cirislens.federation_dag_chunks (manifest_sha256, seq, chunk_sha256, stream_id) \
+             SELECT $1, seq, chunk_sha, stream_id FROM cirislens.federation_stream_chunks \
+             WHERE stream_id = $2 ON CONFLICT (manifest_sha256, seq) DO NOTHING",
+            &[&sha_vec, &stream_id],
+        )
+        .await
+        .map_err(|e| BlobError::Backend(format!("promote dag chunk links: {e}")))?;
         tx.execute(
             "UPDATE cirislens.federation_stream_chunks SET sealed_at = NOW() WHERE stream_id = $1",
             &[&stream_id],

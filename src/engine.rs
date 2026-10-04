@@ -3766,6 +3766,30 @@ impl Engine {
         }
     }
 
+    /// v53.1.0 — **install a verified genesis bundle on this node** (the import
+    /// door): verify the ceremony outputs against THIS build's accord roster
+    /// (a refusal writes nothing), bake its serve nodes and delegation plane,
+    /// then install its roster records — the accord family's genesis head and
+    /// the `ciris-canonical` birth — through the same function the boot seed
+    /// uses. This node's own genesis posture is not changed. See
+    /// [`crate::federation::genesis::install_genesis_bundle_roster`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn install_genesis_bundle_roster(
+        &self,
+        bundle: &crate::federation::genesis::GenesisBundle,
+    ) -> Result<crate::federation::genesis::RosterInstall, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::genesis::install_genesis_bundle_roster(&**b, bundle).await
+            }
+        }
+    }
+
     /// "The payload follows the consent edge" (v21.2.0, CIRISPersist#509) —
     /// v39.0.0 — **enter the mesh**: flip a local-tier row to the federation
     /// tier over the SAME bytes (CC 5.3.2.4.2). Replaces `attestation_promote`,
@@ -8517,6 +8541,48 @@ impl Engine {
         }
     }
 
+    /// v53.1.0 (CIRISPersist#979, CIRISEdge#771) — **the chunks of a sealed
+    /// manifest**, `(seq, chunk_sha)` in seq order (terminators included), from
+    /// the relation persist wrote when the manifest became a DAG on this node:
+    /// at the seal, or at the promote of an adopted manifest. Empty for a
+    /// whole blob, or for a DAG from before v53.1.0 that no viewer has promoted
+    /// again. Nothing is opened, so a relay holder answers too.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn chunks_of_manifest(
+        &self,
+        manifest_sha256: &[u8; 32],
+    ) -> Result<Vec<(u64, [u8; 32])>, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.dag_chunks_of_manifest(manifest_sha256).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.dag_chunks_of_manifest(manifest_sha256).await,
+        }
+    }
+
+    /// v53.1.0 (CIRISPersist#979, CIRISEdge#766) — **does this node's relation
+    /// put `chunk_sha256` in the sealed DAG `manifest_sha256`?** The point
+    /// query behind [`chunks_of_manifest`](Self::chunks_of_manifest) (a v3
+    /// root answers for its children as well), for a serve gate that would
+    /// otherwise cache each file's chunk list.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn dag_contains_chunk(
+        &self,
+        manifest_sha256: &[u8; 32],
+        chunk_sha256: &[u8; 32],
+    ) -> Result<bool, crate::federation::BlobError> {
+        use crate::federation::FederationDirectory;
+        let manifests = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.dag_manifests_of_chunk(chunk_sha256).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.dag_manifests_of_chunk(chunk_sha256).await,
+        }
+        .map_err(|e| crate::federation::BlobError::Backend(format!("dag_contains_chunk: {e}")))?;
+        Ok(manifests.contains(manifest_sha256))
+    }
+
     /// v47.2.0 (CIRISPersist#862, `FSD/BYTES_PLANE_TOMBSTONE.md` §3.6) — evict
     /// ONE sha in the sweep's order: retract this node's live `holds_bytes`
     /// claims (a hybrid-signed federation-tier `withdraws` each), THEN delete
@@ -10793,8 +10859,53 @@ pub enum EngineError {
 }
 
 /// The body of [`Engine::evict_blob`], generic over the backend.
+///
+/// v53.1.0 (CIRISPersist#979, CIRISEdge#771) — evicting a WITHDRAWN sealed
+/// manifest reaches its chunks: every chunk the V176 relation names whose
+/// own fold is withdrawn (every manifest it belongs to is withdrawn) is
+/// evicted the same way, retract-then-delete. A chunk another live (or
+/// unbound) manifest still holds stays. Bytes only: the relation rows and the
+/// at-rest grants stay, as for any eviction.
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 async fn evict_blob_on<B>(
+    backend: &B,
+    node: &str,
+    signer: &crate::signing::LocalSigner,
+    sha256: &[u8; 32],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<crate::federation::EvictBlobReport, crate::federation::BlobError>
+where
+    B: crate::federation::BlobStorage + crate::federation::FederationDirectory + Sync,
+{
+    use crate::federation::blob_tombstone::{binding_state, BindingState};
+    use crate::federation::BlobError;
+    let mut report = evict_one_on(backend, node, signer, sha256, now).await?;
+    let fold = |sha: [u8; 32]| async move {
+        binding_state(backend, &sha)
+            .await
+            .map_err(|e| BlobError::Backend(format!("evict_blob: tombstone fold: {e}")))
+    };
+    if !matches!(fold(*sha256).await?, BindingState::Withdrawn { .. }) {
+        return Ok(report);
+    }
+    for (_, chunk) in backend.dag_chunks_of_manifest(sha256).await? {
+        if !backend.has_blob(&chunk).await? {
+            continue;
+        }
+        if matches!(fold(chunk).await?, BindingState::Withdrawn { .. }) {
+            let r = evict_one_on(backend, node, signer, &chunk, now).await?;
+            report.withdraws_emitted += r.withdraws_emitted;
+            if r.blob_deleted {
+                report.dag_chunks_evicted += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// One sha, retract-then-delete (the pre-#979 [`evict_blob_on`]).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn evict_one_on<B>(
     backend: &B,
     node: &str,
     signer: &crate::signing::LocalSigner,

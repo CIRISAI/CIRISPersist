@@ -577,6 +577,13 @@ pub(crate) const SQLITE_CONN_CLASSES: &[(&str, ConnClass)] = &[
     ("stream_chunks", ConnClass::Read),
     ("stream_chunk_at", ConnClass::Read),
     ("stream_positions_of_chunk", ConnClass::Read),
+    // v53.1.0 (CIRISPersist#979) — the V176 chunk↔manifest relation: two
+    // reads, the helper the seal and the promote call inside their
+    // transaction, and the test seam that edits the rows (a write door).
+    ("dag_manifests_of_chunk", ConnClass::Read),
+    ("dag_chunks_of_manifest", ConnClass::Read),
+    ("sqlite_link_dag_chunks", ConnClass::HelperWrite),
+    ("test_dag_link", ConnClass::Write),
     ("put_blob_chunks", ConnClass::Write),
     ("put_blob_with_scope", ConnClass::Write),
     ("put_calibration_bundle", ConnClass::Write),

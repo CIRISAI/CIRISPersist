@@ -3296,6 +3296,16 @@ impl FederationDirectory for OpsDirectory {
             method: "attestations_binding_content",
         })
     }
+    /// v53.1.0 (#979) — a capsule host stores no blobs through this surface;
+    /// unsupported, as the binding query beside it is.
+    async fn dag_manifests_of_chunk(
+        &self,
+        _chunk_sha256: &[u8; 32],
+    ) -> Result<Vec<[u8; 32]>, Error> {
+        Err(Error::Unsupported {
+            method: "dag_manifests_of_chunk",
+        })
+    }
     /// v31.1.0 (CIRISPersist#655) — routed (was `Error::Unsupported`). An
     /// exclusion plane a capsule host could write and never read back is the
     /// same defect #655 found on the serve side, one surface over.

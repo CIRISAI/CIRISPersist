@@ -2226,6 +2226,17 @@ pub trait BlobStorage: Send + Sync {
         chunk_sha: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<(String, StreamChunkRef)>, BlobError>> + Send;
 
+    /// v53.1.0 (CIRISPersist#979) — **the chunks of a sealed manifest**, from
+    /// the V176 relation persist wrote at the seal or the promote:
+    /// `(seq, chunk_sha)` in seq order, terminators included. Empty for a
+    /// manifest with no relation (a whole blob, or a DAG from before V176
+    /// that no viewer has promoted again). The rows outlive an eviction of the
+    /// bytes, as the at-rest grants do.
+    fn dag_chunks_of_manifest(
+        &self,
+        manifest_sha: &[u8; 32],
+    ) -> impl Future<Output = Result<Vec<(u64, [u8; 32])>, BlobError>> + Send;
+
     // ── v53.0.0 (CIRISPersist#969) — the stream-epoch DEK (V168) ─────────
 
     /// The stream's key state in one snapshot — see [`StreamKeyState`].
@@ -3778,6 +3789,10 @@ pub struct EvictBlobReport {
     pub withdraws_emitted: usize,
     /// Whether a blob row was deleted (false: nothing was held).
     pub blob_deleted: bool,
+    /// v53.1.0 (CIRISPersist#979) — chunks of a withdrawn sealed manifest
+    /// evicted with it (each one whose every manifest is withdrawn).
+    #[serde(default)]
+    pub dag_chunks_evicted: usize,
 }
 
 /// v3.5.0 (CIRISPersist#125) — outcome of

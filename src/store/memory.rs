@@ -5198,6 +5198,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(true)
     }
 
+    async fn dag_manifests_of_chunk(
+        &self,
+        _chunk_sha256: &[u8; 32],
+    ) -> Result<Vec<[u8; 32]>, crate::federation::Error> {
+        // v53.1.0 (#979) — the memory backend stores no blobs, so no chunk
+        // belongs to any DAG here.
+        Ok(Vec::new())
+    }
+
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,
