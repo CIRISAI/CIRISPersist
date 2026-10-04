@@ -3154,6 +3154,12 @@ pub(crate) async fn exercise_duplicate_insert_leaves_plane_fully_seeded(
         .unwrap_or_else(|e| {
             panic!("[{tag}] and the plane must verify, not be half-installed: {e}")
         });
+    // v53.1.1 — the final genesis also bakes the community birth and a family
+    // head that names the charter; a booting node runs those legs after the
+    // plane, and the posture below is entrenched only once it has.
+    seed_family_and_canonical(dir)
+        .await
+        .unwrap_or_else(|e| panic!("[{tag}] the remaining boot legs must seed: {e:?}"));
     for sa in &bundle.attestations {
         let id = &sa.attestation.attestation_id;
         let row = dir
